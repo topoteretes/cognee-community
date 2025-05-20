@@ -1,0 +1,9 @@
+[project]
+name = "cognee-qdrant-adapter"
+version = "1.0.0"
+description = "Qdrant vector database adapter for cognee"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "qdrant-client>=1.14.2",
+]
