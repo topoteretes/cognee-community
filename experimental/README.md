@@ -1,21 +1,19 @@
-# Experimental
+# Experimental Open
 
-This directory contains experimental features, proof-of-concepts, and research work for the Cognee platform.
+This directory contains experimental features and research work that are shared publicly with the Cognee community.
 
 ## Purpose
 
 The code and resources in this directory are:
+- Openly shared with the community
 - Experimental in nature
 - May not be production-ready
-- Under active development and research
-- May change frequently
+- Synced daily to the [cognee-experimental](https://github.com/cognee-experimental) repository
 
-## Usage
+## Contribution
 
-Components in this directory should be used for:
-- Research purposes
-- Evaluating new approaches
-- Testing novel ideas
-- Internal demonstrations
+We welcome contributions to the experimental features in this directory. Please refer to our contribution guidelines in the main README.
 
-Note that these components are not recommended for production use without thorough testing and validation. 
+## Sync Process
+
+The contents of this directory are automatically synced to the public [cognee-experimental](https://github.com/cognee-experimental) repository on a daily basis via GitHub Actions. Any changes made here will be reflected in the public repository within 24 hours. 
