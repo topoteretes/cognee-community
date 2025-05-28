@@ -146,7 +146,7 @@ def main():
     max_depth = 5  # Adjust as needed
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    output_file = os.path.join(script_dir, "docs_quadrant.md")
+    output_file = os.path.join(script_dir, "docs_qdrant.md")
 
     crawl_qdrant_docs(start_url, max_depth, output_file)
 

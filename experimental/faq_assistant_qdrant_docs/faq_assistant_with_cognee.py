@@ -23,7 +23,7 @@ async def main():
     dataset_name = "qdrant_docs_cleaned_dataset"
 
     # 3) Load the .md file
-    md_file_path = current_dir / "docs_quadrant_cleaned.md"  # Adjust if needed
+    md_file_path = current_dir / "docs_qdrant_cleaned.md"  # Adjust if needed
     if not md_file_path.exists():
         raise FileNotFoundError(f"Could not find {md_file_path}")
 

@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-
 import re
 
 def clean_doc(input_file, output_file):
@@ -25,6 +23,6 @@ def clean_doc(input_file, output_file):
     print(f"Successfully cleaned {input_file} and saved to {output_file}")
 
 if __name__ == "__main__":
-    input_file = "docs_quadrant.md"
-    output_file = "docs_quadrant_cleaned.md"
+    input_file = "docs_qdrant.md"
+    output_file = "docs_qdrant_cleaned.md"
     clean_doc(input_file, output_file) 
