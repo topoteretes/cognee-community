@@ -8,10 +8,10 @@ packages_module_path = path.join(pathlib.Path(__file__).parent.parent.parent.par
 sys.path.append(packages_module_path)
 #########
 
-import packages.vector.azureaisearch.register
 
 async def main():
     from cognee import config, prune, add, cognify, search, SearchType
+    import packages.vector.azureaisearch.register
 
     system_path = pathlib.Path(__file__).parent
     config.system_root_directory(path.join(system_path, ".cognee-system"))
