@@ -1,0 +1,17 @@
+[project]
+name = "cognee-redis-adapter"
+version = "1.0.0"
+description = "Redis vector database adapter for cognee"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "redis[hiredis]>=5.0.0",
+    "numpy>=1.26.0",
+]
+
+[tool.uv.sources]
+cognee = { path = "../../../" }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build" 

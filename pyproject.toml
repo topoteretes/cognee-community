@@ -14,4 +14,5 @@ cognee = { path = "../cognee" }
 [tool.uv.workspace]
 members = [
     "packages/vector/qdrant",
+    "packages/vector/redis",
 ]
