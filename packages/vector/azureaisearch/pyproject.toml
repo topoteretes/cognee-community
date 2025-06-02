@@ -1,12 +1,13 @@
 [project]
-name = "cognee-azure-ai-search-adapter"
+name = "cognee-community-vector-adapter-azure"
 version = "1.0.0"
 description = "Azure AI search vector database adapter for cognee"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "azure-search-documents>=11.4.0",
-    "azure-core>=1.29.0"
+    "azure-core>=1.29.0",
+    "cognee>=0.1.41"
 ]
 
 
