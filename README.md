@@ -29,7 +29,7 @@
 Welcome! This repository hosts community-managed plugins and addons for Cognee.
 
 cognee builds AI memory, next generation tooling that is more accurate than RAG
-
+</p>
 
 ## Get started
 
