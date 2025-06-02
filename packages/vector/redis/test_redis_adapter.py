@@ -13,7 +13,7 @@ from redis_adapter import RedisAdapter
 
 
 # Mock embedding engine for testing
-class MockEmbeddingEngine(EmbeddingEngine):
+class MockEmbeddingEngine:
     def __init__(self):
         self.vector_size = 384  # Common size for sentence transformers
     
@@ -40,6 +40,10 @@ async def test_redis_adapter():
     collection_name = "test_collection"
     
     try:
+        # First, let's prune to start fresh
+        print("0. Pruning existing collections...")
+        await adapter.prune()
+        
         # Test 1: Create collection
         print("1. Creating collection...")
         await adapter.create_collection(collection_name)
@@ -69,8 +73,15 @@ async def test_redis_adapter():
                 metadata={"index_fields": ["text"], "category": "technology"}
             ),
         ]
-        await adapter.create_data_points(collection_name, data_points)
-        print(f"   Created {len(data_points)} data points")
+        try:
+            print("   About to create data points...")
+            await adapter.create_data_points(collection_name, data_points)
+            print(f"   Created {len(data_points)} data points")
+        except Exception as e:
+            print(f"   Error creating data points: {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
         
         # Test 4: Search functionality
         print("4. Testing search...")
