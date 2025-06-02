@@ -1,9 +1,10 @@
 import json
 import numpy as np
 from typing import Dict, List, Optional, Any
+from uuid import UUID
 from redis import asyncio as aioredis
 from redis.commands.search.field import TagField, TextField, VectorField
-from redis.commands.search.indexDefinition import IndexDefinition, IndexType
+from redis.commands.search import index_definition
 from redis.commands.search.query import Query
 
 from cognee.exceptions import InvalidValueError
@@ -14,9 +15,30 @@ from cognee.infrastructure.engine.utils import parse_id
 from cognee.infrastructure.databases.vector import VectorDBInterface
 from cognee.infrastructure.databases.vector.models.ScoredResult import ScoredResult
 from cognee.infrastructure.databases.vector.embeddings.EmbeddingEngine import EmbeddingEngine
-from cognee.infrastructure.databases.vector.exceptions import VectorEngineInitializationError, CollectionNotFoundError
 
 logger = get_logger("RedisAdapter")
+
+
+class VectorEngineInitializationError(Exception):
+    """Exception raised when vector engine initialization fails."""
+    pass
+
+
+class CollectionNotFoundError(Exception):
+    """Exception raised when a collection is not found."""
+    pass
+
+
+def serialize_for_json(obj):
+    """Convert objects to JSON-serializable format."""
+    if isinstance(obj, UUID):
+        return str(obj)
+    elif isinstance(obj, dict):
+        return {k: serialize_for_json(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [serialize_for_json(item) for item in obj]
+    else:
+        return obj
 
 
 class IndexSchema(DataPoint):
@@ -119,9 +141,9 @@ class RedisAdapter(VectorDBInterface):
             ]
             
             # Create index definition
-            definition = IndexDefinition(
+            definition = index_definition.IndexDefinition(
                 prefix=[prefix],
-                index_type=IndexType.JSON
+                index_type=index_definition.IndexType.JSON
             )
             
             # Create the index
@@ -145,21 +167,25 @@ class RedisAdapter(VectorDBInterface):
             if not await self.has_collection(collection_name):
                 raise CollectionNotFoundError(f"Collection {collection_name} not found!")
             
-            # Embed the data points
-            texts_to_embed = [DataPoint.get_embeddable_data(dp) for dp in data_points]
-            embeddings = await self.embed_data(texts_to_embed)
+            # Embed the data points - use the same pattern as Qdrant
+            data_vectors = await self.embed_data(
+                [DataPoint.get_embeddable_data(data_point) for data_point in data_points]
+            )
             
             # Store each data point
             pipe = client.pipeline()
-            for data_point, embedding in zip(data_points, embeddings):
+            for data_point, embedding in zip(data_points, data_vectors):
                 key = f"{self._get_key_prefix(collection_name)}{str(data_point.id)}"
                 
                 # Convert data point to dict and prepare for storage
+                # Serialize the payload to handle UUIDs and other non-JSON types
+                payload = serialize_for_json(data_point.model_dump())
+                
                 doc_data = {
                     "id": str(data_point.id),
                     "text": getattr(data_point, data_point.metadata.get("index_fields", ["text"])[0], ""),
                     "vector": embedding,
-                    "payload": data_point.model_dump()
+                    "payload": payload
                 }
                 
                 # Store as JSON
@@ -202,6 +228,7 @@ class RedisAdapter(VectorDBInterface):
                 key = f"{self._get_key_prefix(collection_name)}{data_id}"
                 data = await client.json().get(key)
                 if data:
+                    # Return the payload which contains the full DataPoint data
                     results.append(data["payload"])
             return results
         finally:
@@ -228,7 +255,7 @@ class RedisAdapter(VectorDBInterface):
         
         client = self.get_redis_client()
         try:
-            # Get the query vector
+            # Get the query vector - match Qdrant pattern
             if query_vector is None:
                 query_vector = (await self.embed_data([query_text]))[0]
             
@@ -254,8 +281,11 @@ class RedisAdapter(VectorDBInterface):
             # Convert results to ScoredResult objects
             scored_results = []
             for doc in results.docs:
-                # Parse the stored payload
-                payload = json.loads(doc.payload) if isinstance(doc.payload, str) else doc.payload
+                # Parse the stored payload - it's already serialized as JSON-compatible format
+                if isinstance(doc.payload, str):
+                    payload = json.loads(doc.payload)
+                else:
+                    payload = doc.payload
                 
                 scored_results.append(
                     ScoredResult(
@@ -284,8 +314,8 @@ class RedisAdapter(VectorDBInterface):
         # Redis doesn't have native batch search, so we'll execute searches in parallel
         import asyncio
         
-        # Embed all queries at once
-        query_vectors = await self.embed_data(query_texts)
+        # Embed all queries at once - match Qdrant pattern
+        vectors = await self.embed_data(query_texts)
         
         # Execute searches in parallel
         search_tasks = [
@@ -295,7 +325,7 @@ class RedisAdapter(VectorDBInterface):
                 limit=limit,
                 with_vector=with_vectors
             )
-            for vector in query_vectors
+            for vector in vectors
         ]
         
         results = await asyncio.gather(*search_tasks)

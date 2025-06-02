@@ -6,6 +6,7 @@ for testing the implementation.
 """
 
 import asyncio
+import sys
 from uuid import uuid4
 from cognee.infrastructure.engine import DataPoint
 from cognee.infrastructure.databases.vector.embeddings.EmbeddingEngine import EmbeddingEngine
@@ -20,6 +21,8 @@ class MockEmbeddingEngine:
     async def embed_text(self, texts: list[str]) -> list[list[float]]:
         """Create mock embeddings for testing."""
         import random
+        print("   Embedding texts:", texts)
+        # Return a list of vectors (each vector is a list of floats)
         return [[random.random() for _ in range(self.vector_size)] for _ in texts]
     
     def get_vector_size(self) -> int:
@@ -30,6 +33,7 @@ async def test_redis_adapter():
     """Test the Redis adapter functionality."""
     
     # Initialize the adapter
+    print("Initializing adapter...")
     embedding_engine = MockEmbeddingEngine()
     adapter = RedisAdapter(
         host="localhost",
@@ -60,17 +64,17 @@ async def test_redis_adapter():
             DataPoint(
                 id=str(uuid4()),
                 text="The quick brown fox jumps over the lazy dog",
-                metadata={"index_fields": ["text"], "category": "animals"}
+                metadata={"index_fields": ["text"], "category": "animals", "type": "text"}
             ),
             DataPoint(
                 id=str(uuid4()),
                 text="Redis is an in-memory data structure store",
-                metadata={"index_fields": ["text"], "category": "technology"}
+                metadata={"index_fields": ["text"], "category": "technology", "type": "text"}
             ),
             DataPoint(
                 id=str(uuid4()),
                 text="Vector databases enable similarity search",
-                metadata={"index_fields": ["text"], "category": "technology"}
+                metadata={"index_fields": ["text"], "category": "technology", "type": "text"}
             ),
         ]
         try:
@@ -78,7 +82,7 @@ async def test_redis_adapter():
             await adapter.create_data_points(collection_name, data_points)
             print(f"   Created {len(data_points)} data points")
         except Exception as e:
-            print(f"   Error creating data points: {type(e).__name__}: {e}")
+            print(f"   Error creating data points: {type(e).__name__}: {e}", file=sys.stderr)
             import traceback
             traceback.print_exc()
             raise
@@ -128,7 +132,9 @@ async def test_redis_adapter():
         print("\n✅ All tests passed!")
         
     except Exception as e:
-        print(f"\n❌ Test failed with error: {e}")
+        print(f"\n❌ Test failed with error: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
         raise
 
 
