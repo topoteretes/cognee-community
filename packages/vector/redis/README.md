@@ -20,12 +20,12 @@ pip install cognee-vector-redis
 
 You need a Redis instance with the RediSearch module enabled. You can use:
 
-1. **Redis Stack** (includes RediSearch):
+1. **Redis Stack**:
    ```bash
    docker run -d --name redis-stack -p 6379:6379 -p 8001:8001 redis/redis-stack:latest
    ```
 
-2. **Redis Cloud** with RediSearch module enabled
+2. [**Redis Cloud**](https://redis.io/try-free) with RediSearch module enabled
 
 3. **Redis Enterprise** with RediSearch module
 
