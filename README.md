@@ -28,8 +28,11 @@
 
 Welcome! This repository hosts community-managed plugins and addons for Cognee.
 
-cognee builds AI memory, next generation tooling that is more accurate than RAG
+cognee builds AI memory, next-generation tooling that is more accurate than RAG
 </div>
+
+
+This is community plugins repo, for core repo and on how to get started with cognee, please check: https://github.com/topoteretes/cognee
 
 ## Get started
 
