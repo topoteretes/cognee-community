@@ -32,7 +32,7 @@ cognee builds AI memory, next-generation tooling that is more accurate than RAG
 </div>
 
 
-This is community plugins repo, for core repo and on how to get started with cognee, please check: https://github.com/topoteretes/cognee
+
 
 ## Get started
 
@@ -45,6 +45,10 @@ or any other adapter
 ```bash
 uv pip install cognee-community-vector-adapter-azure
 ```
+
+This is community plugins repo, for core repo and on how to get started with cognee, please check: https://github.com/topoteretes/cognee
+
+
 ### with UV locally with all optional dependencies
 Navigate to the packages folder and the adapter of choice
 
