@@ -47,7 +47,7 @@ async def main():
         ),
         DataPoint(
             id=str(uuid4()),
-            text="Redis provides high-performance vector search capabilities with RediSearch module.",
+            text="Redis provides high-performance vector search capabilities with the Redis Query Engine.",
             metadata={
                 "index_fields": ["text"],
                 "source": "technical",
@@ -101,8 +101,18 @@ async def main():
         for result in results:
             print(f"  - {result.payload.get('text', '')[:60]}... (score: {result.score:.4f})")
     
-    # 7. Clean up (optional)
+    # 7. Test retrieval by IDs
+    document_ids = [str(doc.id) for doc in documents[:2]]
+    retrieved_docs = await redis_adapter.retrieve(collection_name, document_ids)
+    print(f"\nRetrieved {len(retrieved_docs)} documents by ID")
+    
+    # 8. Test deletion
+    await redis_adapter.delete_data_points(collection_name, [document_ids[0]])
+    print(f"Deleted document with ID: {document_ids[0]}")
+    
+    # 9. Clean up (optional)
     # await redis_adapter.prune()  # This will remove all collections
+    print("\nExample completed successfully!")
 
 
 if __name__ == "__main__":
