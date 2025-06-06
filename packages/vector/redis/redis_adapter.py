@@ -64,60 +64,37 @@ class RedisAdapter(VectorDBInterface):
     
     This adapter provides an interface to Redis vector search capabilities,
     supporting embedding generation, vector indexing, and similarity search.
-    
-    Attributes:
-        name: Name identifier for this adapter.
-        host: Redis server hostname.
-        port: Redis server port.
-        password: Redis server password (optional).
-        ssl: Whether to use SSL connection.
-        embedding_engine: Engine for generating embeddings.
     """
     
     name = "Redis"
-    host: Optional[str] = None
-    port: Optional[int] = None
-    password: Optional[str] = None
-    ssl: bool = False
+    url: Optional[str]
+    api_key: Optional[str] = None
     embedding_engine: Optional[EmbeddingEngine] = None
     
     def __init__(
         self, 
-        host: str,
-        port: int = 6379,
-        password: Optional[str] = None,
-        ssl: bool = False,
+        url: str,
+
         embedding_engine: Optional[EmbeddingEngine] = None
     ) -> None:
         """Initialize the Redis adapter.
         
         Args:
-            host: Redis server hostname.
-            port: Redis server port (default: 6379).
-            password: Redis server password (optional).
-            ssl: Whether to use SSL connection (default: False).
+            url (str): Connection string for your Redis instance like redis://localhost:6379.
             embedding_engine: Engine for generating embeddings.
             
         Raises:
             VectorEngineInitializationError: If required parameters are missing.
         """
-        if not host:
-            raise VectorEngineInitializationError("Redis host is required!")
+        if not url:
+            raise VectorEngineInitializationError("Redis connnection URL!")
         if not embedding_engine:
             raise VectorEngineInitializationError("Embedding engine is required!")
         
-        self.host = host
-        self.port = port
-        self.password = password
-        self.ssl = ssl
+        self.url = url
         self.embedding_engine = embedding_engine
         self._indices = {}
         
-        # Build Redis URL
-        protocol = "rediss" if ssl else "redis"
-        auth_part = f":{password}@" if password else ""
-        self._redis_url = f"{protocol}://{auth_part}{host}:{port}"
-    
     async def embed_data(self, data: List[str]) -> List[List[float]]:
         """Embed text data using the embedding engine.
         
@@ -160,7 +137,7 @@ class RedisAdapter(VectorDBInterface):
                         "datatype": "float32"
                     }
                 },
-                {"name": "payload", "type": "text"}
+                {"name": "payload_json", "type": "text"}
             ]
         }
         return IndexSchema.from_dict(schema_dict)
@@ -178,7 +155,7 @@ class RedisAdapter(VectorDBInterface):
             schema = self._create_schema(collection_name)
             self._indices[collection_name] = AsyncSearchIndex(
                 schema=schema,
-                redis_url=self._redis_url,
+                redis_url=self.url,
                 validate_on_load=True
             )
         return self._indices[collection_name]
@@ -256,7 +233,7 @@ class RedisAdapter(VectorDBInterface):
                     "id": str(data_point.id),
                     "text": getattr(data_point, data_point.metadata.get("index_fields", ["text"])[0], ""),
                     "vector": embedding,
-                    "payload": json.dumps(payload)  # Store as JSON string
+                    "payload_json": json.dumps(payload)  # Store as JSON string
                 }
                 documents.append(doc_data)
             
@@ -318,7 +295,7 @@ class RedisAdapter(VectorDBInterface):
                 doc = await index.fetch(data_id)
                 if doc:
                     # Parse the stored payload JSON
-                    payload_str = doc.get("payload", "{}")
+                    payload_str = doc.get("payload_json", "{}")
                     try:
                         payload = json.loads(payload_str)
                         results.append(payload)
@@ -376,11 +353,12 @@ class RedisAdapter(VectorDBInterface):
                 vector=query_vector,
                 vector_field_name="vector",
                 num_results=limit,
-                return_score=True
+                return_score=True,
+                normalize_vector_distance=True
             )
             
             # Set return fields
-            return_fields = ["id", "text", "payload"]
+            return_fields = ["id", "text", "payload_json"]
             if with_vector:
                 return_fields.append("vector")
             vector_query = vector_query.return_fields(*return_fields)
@@ -393,7 +371,7 @@ class RedisAdapter(VectorDBInterface):
             scored_results = []
             for doc in results:
                 # Parse the stored payload - it's stored as JSON string
-                payload_str = doc.get("payload", "{}")
+                payload_str = doc.get("payload_json", "{}")
                 try:
                     payload = json.loads(payload_str)
                 except json.JSONDecodeError:
