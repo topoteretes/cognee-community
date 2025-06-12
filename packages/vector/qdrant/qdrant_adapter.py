@@ -9,7 +9,7 @@ from cognee.infrastructure.engine.utils import parse_id
 from cognee.infrastructure.databases.vector import VectorDBInterface
 from cognee.infrastructure.databases.vector.models.ScoredResult import ScoredResult
 from cognee.infrastructure.databases.vector.embeddings.EmbeddingEngine import EmbeddingEngine
-from cognee.infrastructure.databases.vector.exceptions import VectorEngineInitializationError, CollectionNotFoundError
+from cognee.infrastructure.databases.vector.exceptions import CollectionNotFoundError
 
 logger = get_logger("QDrantAdapter")
 
@@ -46,9 +46,6 @@ class QDrantAdapter(VectorDBInterface):
     qdrant_path: str = None
 
     def __init__(self, url, api_key, embedding_engine: EmbeddingEngine, qdrant_path=None):
-        if not (url and api_key and embedding_engine):
-            raise VectorEngineInitializationError("Missing requred Qdrant credentials!")
-
         self.embedding_engine = embedding_engine
 
         if qdrant_path is not None:
@@ -162,13 +159,7 @@ class QDrantAdapter(VectorDBInterface):
         if query_text is None and query_vector is None:
             raise InvalidValueError(message="One of query_text or query_vector must be provided!")
 
-        if limit <= 0:
-            return []
-
         if not await self.has_collection(collection_name):
-            logger.warning(
-                f"Collection '{collection_name}' not found in QdrantAdapter.search; returning []."
-            )
             return []
 
         if query_vector is None:
@@ -176,6 +167,8 @@ class QDrantAdapter(VectorDBInterface):
 
         try:
             client = self.get_qdrant_client()
+            if limit == 0:
+                collection_size = await client.count(collection_name=collection_name)
 
             results = await client.search(
                 collection_name=collection_name,
@@ -185,7 +178,7 @@ class QDrantAdapter(VectorDBInterface):
                     if query_vector is not None
                     else (await self.embed_data([query_text]))[0],
                 ),
-                limit=limit if limit > 0 else None,
+                limit=limit if limit > 0 else collection_size.count,
                 with_vectors=with_vector,
             )
 
@@ -202,13 +195,6 @@ class QDrantAdapter(VectorDBInterface):
                 )
                 for result in results
             ]
-        except UnexpectedResponse as error:
-            if "Collection not found" in str(error):
-                raise CollectionNotFoundError(
-                    message=f"Collection {collection_name} not found!"
-                ) from error
-            else:
-                raise error
         finally:
             await client.close()
 

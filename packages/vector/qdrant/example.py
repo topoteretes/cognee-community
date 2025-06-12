@@ -8,6 +8,7 @@ packages_module_path = path.join(pathlib.Path(__file__).parent.parent.parent.par
 sys.path.append(packages_module_path)
 #########
 
+# NOTE: Importing the register module we let cognee know it can use the Qdrant vector adapter
 import packages.vector.qdrant.register
 
 async def main():
