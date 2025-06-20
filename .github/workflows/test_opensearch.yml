@@ -2,8 +2,9 @@ name: test | opensearch
  
 on:
   workflow_dispatch:
-  branches:
-    - feature/opensearch-as-vector
+  push:
+    branches:
+      - feature/opensearch-as-vector
   # pull_request:
   #   types: [labeled, synchronize]
 
