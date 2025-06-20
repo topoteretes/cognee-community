@@ -52,7 +52,7 @@ jobs:
           installer-parallel: true
   
       - name: Install dependencies
-        run: poetry install -E . --no-interaction
+        run: poetry install --no-interaction
         working-directory: ./packages/vector/opensearch
   
       - name: Run OpenSearch tests
