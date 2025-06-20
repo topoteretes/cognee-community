@@ -1,0 +1,24 @@
+[project]
+name = "cognee-community-vector-adapter-opensearch"
+version = "1.0.0"
+description = "OpenSearch vector database adapter for cognee"
+readme = "README.md"
+requires-python = "<=3.13,>=3.10"
+dependencies = [
+  "opensearch-py==3.0.0",
+  "cognee>=0.1.41"
+]
+
+[project.urls]
+Homepage = "https://www.cognee.ai"
+Repository = "https://github.com/topoteretes/cognee-community"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build]
+exclude = [
+  "/dist",
+  "/.venv",
+]
