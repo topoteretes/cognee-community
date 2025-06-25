@@ -22,14 +22,6 @@ async def main():
         "vector_db_key": ""
     })
 
-    config.set_relational_db_config({
-        "db_provider": "sqlite",
-    })
-
-    config.set_graph_db_config({
-        "graph_database_provider": "networkx",
-    })
-
     await prune.prune_data()
     await prune.prune_system()
 

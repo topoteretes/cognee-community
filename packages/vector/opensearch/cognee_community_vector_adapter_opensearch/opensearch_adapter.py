@@ -88,7 +88,7 @@ class OpenSearchAdapter(VectorDBInterface):
             }
         )
 
-    def _index_name(self, collection_name: str) -> str:
+    def _get_index_name(self, collection_name: str) -> str:
         """
         Generate the full index name for a given collection.
 
@@ -128,7 +128,7 @@ class OpenSearchAdapter(VectorDBInterface):
         --------
             - bool: True if the collection exists, False otherwise.
         """
-        index = self._index_name(collection_name)
+        index = self._get_index_name(collection_name)
         try:
             exists = await self.client.indices.exists(index=index)
             return exists
@@ -144,7 +144,7 @@ class OpenSearchAdapter(VectorDBInterface):
             - collection_name (str): The name of the collection to create.
             - payload_schema: Optional schema for the payload.
         """
-        index = self._index_name(collection_name)
+        index = self._get_index_name(collection_name)
         if not await self.has_collection(collection_name):
             vector_size = self.embedding_engine.get_vector_size()
             body = {
@@ -214,7 +214,7 @@ class OpenSearchAdapter(VectorDBInterface):
             - collection_name (str): The name of the collection.
             - data_points (List[DataPoint]): List of data points to insert or update.
         """
-        index = self._index_name(collection_name)
+        index = self._get_index_name(collection_name)
         if not await self.has_collection(collection_name):
             await self.create_collection(collection_name, type(data_points[0]))
         vectors = await self.embed_data([DataPoint.get_embeddable_data(dp) for dp in data_points])
@@ -243,7 +243,7 @@ class OpenSearchAdapter(VectorDBInterface):
         --------
             - List[ScoredResult]: List of retrieved data points as ScoredResult objects.
         """
-        index = self._index_name(collection_name)
+        index = self._get_index_name(collection_name)
         docs = []
         for id_ in data_point_ids:
             try:
@@ -287,7 +287,7 @@ class OpenSearchAdapter(VectorDBInterface):
             raise ValueError("One of query_text or query_vector must be provided!")
         if query_vector is None:
             query_vector = (await self.embed_data([query_text]))[0]
-        index = self._index_name(collection_name)
+        index = self._get_index_name(collection_name)
         query = {
             "size": limit,
             "query": {
@@ -359,7 +359,7 @@ class OpenSearchAdapter(VectorDBInterface):
             - collection_name (str): The name of the collection.
             - data_point_ids (List[str]): List of data point IDs to delete.
         """
-        index = self._index_name(collection_name)
+        index = self._get_index_name(collection_name)
         actions = []
         for id_ in data_point_ids:
             actions.append({"delete": {"_index": index, "_id": id_}})

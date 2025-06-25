@@ -19,7 +19,7 @@ pip install .
 ## Configuration
 
 The adapter requires the following credentials:
-- `utl`: The URL of your OpenSearch instance, including the port if necessary (e.g., `https://your-open-search-url:9200`);
+- `url`: The URL of your OpenSearch instance, including the port if necessary (e.g., `https://your-open-search-url:9200`);
 - `api_key`: A base64 encoded string of a JSON object containing connection parameters:
   - `username`: Your OpenSearch username;
   - `password`: Your OpenSearch password;
@@ -54,7 +54,7 @@ api_key = base64.b64encode(json.dumps(connection_parameters).encode()).decode()
 # Initialize the adapter
 embedding_engine = EmbeddingEngine(...)  # Your embedding engine
 adapter = OpenSearchAdapter(
-    utl="https://your-open-search-url-including-port-if-any",
+    url="https://your-open-search-url-including-port-if-any",
     api_key=api_key,
     embedding_engine=embedding_engine
 )
