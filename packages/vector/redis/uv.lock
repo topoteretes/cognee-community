@@ -502,7 +502,7 @@ wheels = [
 
 [[package]]
 name = "cognee-community-vector-adapter-redis"
-version = "1.0.0"
+version = "0.0.1"
 source = { editable = "." }
 dependencies = [
     { name = "cognee" },
@@ -512,7 +512,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "cognee", specifier = ">=0.1.41" },
-    { name = "redisvl", specifier = ">=0.6.0" },
+    { name = "redisvl", specifier = ">=0.6.0,<=1.0.0" },
 ]
 
 [[package]]

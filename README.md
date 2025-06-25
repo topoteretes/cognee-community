@@ -36,13 +36,11 @@ cognee builds AI memory, next-generation tooling that is more accurate than RAG
 
 ## Get started
 
-Install the package via command
+Install the chosen community packaging using `uv pip install ...`
 
 ```bash
 uv pip install cognee-community-vector-adapter-qdrant
-```
-or any other adapter
-```bash
+uv pip install cognee-community-vector-adapter-redis
 uv pip install cognee-community-vector-adapter-azure
 ```
 
@@ -66,6 +64,14 @@ To use different LLM providers, for more info check out our <a href="https://doc
 
 
 Navigate to the vector or graph store provider of choice and run the example
+
+## Supported Adapters
+
+| Package Name | Type | Description |
+|--------------|------|-------------|
+| `cognee-community-vector-adapter-qdrant` | Vector | Qdrant vector database adapter for cognee |
+| `cognee-community-vector-adapter-azure` | Vector | Azure AI search vector database adapter for cognee |
+| `cognee-community-vector-adapter-redis` | Vector | Redis vector database adapter for cognee |
 
 ## Repository Structure
 
