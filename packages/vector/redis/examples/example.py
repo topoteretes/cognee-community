@@ -15,19 +15,11 @@ async def main():
     config.system_root_directory(path.join(system_path, ".cognee-system"))
     config.data_root_directory(path.join(system_path, ".cognee-data"))
 
-    # Please provide your azure ai search instance url and api key
+    # Please provide your Redis instance url
     config.set_vector_db_config({
         "vector_db_provider": "redis",
         "vector_db_url": "redis://localhost:6379",
         "vector_db_key": "",
-    })
-
-    config.set_relational_db_config({
-        "db_provider": "sqlite",
-    })
-
-    config.set_graph_db_config({
-        "graph_database_provider": "networkx",
     })
 
     await prune.prune_data()
@@ -52,8 +44,5 @@ async def main():
     for result_text in search_results:
         print("\nSearch result: \n" + result_text)
     
-    await prune.prune_data()
-    await prune.prune_system()
-
 if __name__ == "__main__":
     asyncio.run(main())
