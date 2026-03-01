@@ -1,0 +1,41 @@
+[project]
+name = "cognee-community-hybrid-adapter-helixdb"
+version = "0.1.0"
+description = "HelixDB hybrid graph-vector database adapter for cognee"
+readme = "README.md"
+requires-python = ">=3.11,<=3.13"
+dependencies = [
+    "helix-py>=0.2.30",
+    "cognee==0.5.3",
+    "starlette>=0.48.0",
+    "instructor>=1.11"
+]
+
+[project.optional-dependencies]
+dev = [
+    "mypy>=1.0.0",
+    "types-requests",
+]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+strict_equality = true
+show_error_codes = true
+
+[[tool.mypy.overrides]]
+module = [
+  "cognee.*",
+  "helix.*",
+]
+ignore_missing_imports = true
