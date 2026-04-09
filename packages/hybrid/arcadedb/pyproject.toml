@@ -1,12 +1,13 @@
 [project]
-name = "cognee-community-graph-adapter-arcadedb"
-version = "0.1.0"
-description = "ArcadeDB graph database adapter for cognee"
+name = "cognee-community-hybrid-adapter-arcadedb"
+version = "0.2.0"
+description = "ArcadeDB hybrid (graph + vector) database adapter for cognee"
 authors = [
     {name = "Luca Garulli", email = "l.garulli@arcadedata.com"},
 ]
 dependencies = [
     "cognee[neo4j]>=0.5.2",
+    "aiohttp>=3.9.0",
     "starlette>=0.48.0",
     "instructor>=1.11"
 ]
@@ -14,7 +15,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 
 [project.urls]
-Homepage = "https://github.com/topoteretes/cognee"
+Homepage = "https://arcadedb.com"
 Repository = "https://github.com/topoteretes/cognee-community"
 
 [build-system]
