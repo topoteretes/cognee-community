@@ -11,7 +11,9 @@ and KNN search).
 
 import asyncio
 import json
+import time
 from collections import defaultdict
+from datetime import datetime
 from enum import Enum
 from textwrap import dedent
 from typing import Any, Optional
@@ -92,6 +94,11 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
     # HTTP API helpers
     # -------------------------------------------------------------------------
 
+    @staticmethod
+    def _now() -> int:
+        """Return current time in milliseconds for updated_at fields."""
+        return int(time.time() * 1000)
+
     def _get_auth(self) -> Optional[aiohttp.BasicAuth]:
         if self.graph_database_username and self.graph_database_password:
             return aiohttp.BasicAuth(
@@ -161,10 +168,10 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
         serialized = self.serialize_properties(node.model_dump())
         return await self._cypher(
             "MERGE (node {id: $node_id}) "
-            "ON CREATE SET node += $properties, node.updated_at = timestamp() "
-            "ON MATCH SET node += $properties, node.updated_at = timestamp() "
+            "ON CREATE SET node += $properties, node.updated_at = $now "
+            "ON MATCH SET node += $properties, node.updated_at = $now "
             "RETURN node.id AS nodeId",
-            {"node_id": str(node.id), "properties": serialized},
+            {"node_id": str(node.id), "properties": serialized, "now": self._now()},
         )
 
     async def add_nodes(self, nodes: list[DataPoint]) -> None:
@@ -178,10 +185,10 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
         return await self._cypher(
             "UNWIND $nodes AS node "
             "MERGE (n {id: node.node_id}) "
-            "ON CREATE SET n += node.properties, n.updated_at = timestamp() "
-            "ON MATCH SET n += node.properties, n.updated_at = timestamp() "
+            "ON CREATE SET n += node.properties, n.updated_at = $now "
+            "ON MATCH SET n += node.properties, n.updated_at = $now "
             "RETURN n.id AS nodeId",
-            {"nodes": nodes_data},
+            {"nodes": nodes_data, "now": self._now()},
         )
 
     async def extract_node(self, node_id: str):
@@ -189,11 +196,11 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
         return results[0] if results else None
 
     async def extract_nodes(self, node_ids: list[str]):
-        results = await self._cypher(
+        # ArcadeDB HTTP Cypher returns vertices as flat dicts
+        return await self._cypher(
             "UNWIND $node_ids AS id MATCH (node {id: id}) RETURN node",
             {"node_ids": node_ids},
         )
-        return [r["node"] for r in results]
 
     async def delete_node(self, node_id: str):
         return await self._cypher(
@@ -257,13 +264,14 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
                 MATCH (from_node {{id: $from_node}}),
                       (to_node {{id: $to_node}})
                 MERGE (from_node)-[r:{relationship_name}]->(to_node)
-                ON CREATE SET r += $properties, r.updated_at = timestamp()
-                ON MATCH SET r += $properties, r.updated_at = timestamp()
+                ON CREATE SET r += $properties, r.updated_at = $now
+                ON MATCH SET r += $properties, r.updated_at = $now
                 RETURN r"""),
             {
                 "from_node": str(from_node),
                 "to_node": str(to_node),
                 "properties": serialized,
+                "now": self._now(),
             },
         )
 
@@ -296,19 +304,20 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
                           source_node_id: edge.from_node,
                           target_node_id: edge.to_node
                       }}]->(to_node)
-                    ON CREATE SET r += edge.properties, r.updated_at = timestamp()
-                    ON MATCH  SET r += edge.properties, r.updated_at = timestamp()
+                    ON CREATE SET r += edge.properties, r.updated_at = $now
+                    ON MATCH  SET r += edge.properties, r.updated_at = $now
                     RETURN count(r) AS merged"""),
-                {"edges": edge_data},
+                {"edges": edge_data, "now": self._now()},
             )
 
     async def get_edges(self, node_id: str):
         results = await self._cypher(
-            "MATCH (n {id: $node_id})-[r]-(m) RETURN n, r, m",
+            "MATCH (n {id: $node_id})-[r]-(m) "
+            "RETURN n.id AS source_id, m.id AS target_id, type(r) AS rel_type",
             {"node_id": node_id},
         )
         return [
-            (r["n"]["id"], r["m"]["id"], {"relationship_name": r["r"][1]})
+            (r["source_id"], r["target_id"], {"relationship_name": r["rel_type"]})
             for r in results
         ]
 
@@ -334,7 +343,7 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
                 "WHERE node.id = $node_id RETURN predecessor",
                 {"node_id": node_id},
             )
-        return [r["predecessor"] for r in results]
+        return results
 
     async def get_successors(
         self, node_id: str, edge_label: Optional[str] = None
@@ -352,7 +361,7 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
                 "WHERE node.id = $node_id RETURN successor",
                 {"node_id": node_id},
             )
-        return [r["successor"] for r in results]
+        return results
 
     async def get_neighbors(self, node_id: str) -> list[dict[str, Any]]:
         predecessors, successors = await asyncio.gather(
@@ -365,36 +374,40 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
             "MATCH (node {id: $node_id}) RETURN node",
             {"node_id": node_id},
         )
-        return results[0]["node"] if results else None
+        return results[0] if results else None
 
     async def get_nodes(self, node_ids: list[str]) -> list[dict[str, Any]]:
-        results = await self._cypher(
+        # ArcadeDB HTTP Cypher returns vertices as flat dicts
+        return await self._cypher(
             "UNWIND $node_ids AS id MATCH (node {id: id}) RETURN node",
             {"node_ids": node_ids},
         )
-        return [r["node"] for r in results]
 
     async def get_connections(self, node_id: UUID) -> list:
         predecessors, successors = await asyncio.gather(
             self._cypher(
-                "MATCH (node)<-[relation]-(neighbour) "
-                "WHERE node.id = $node_id RETURN neighbour, relation, node",
+                "MATCH (node)<-[r]-(neighbour) "
+                "WHERE node.id = $node_id "
+                "RETURN neighbour.id AS src, type(r) AS rel, node.id AS dst",
                 {"node_id": str(node_id)},
             ),
             self._cypher(
-                "MATCH (node)-[relation]->(neighbour) "
-                "WHERE node.id = $node_id RETURN node, relation, neighbour",
+                "MATCH (node)-[r]->(neighbour) "
+                "WHERE node.id = $node_id "
+                "RETURN node.id AS src, type(r) AS rel, neighbour.id AS dst",
                 {"node_id": str(node_id)},
             ),
         )
 
         connections = []
         for r in predecessors:
-            rel = r["relation"]
-            connections.append((rel[0], {"relationship_name": rel[1]}, rel[2]))
+            connections.append(
+                (r["src"], {"relationship_name": r["rel"]}, r["dst"])
+            )
         for r in successors:
-            rel = r["relation"]
-            connections.append((rel[0], {"relationship_name": rel[1]}, rel[2]))
+            connections.append(
+                (r["src"], {"relationship_name": r["rel"]}, r["dst"])
+            )
         return connections
 
     async def remove_connection_to_predecessors_of(
@@ -425,14 +438,20 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
             properties = {}
         serialized = {}
         for key, value in properties.items():
-            if isinstance(value, UUID):
+            if value is None:
+                continue
+            elif isinstance(value, UUID):
                 serialized[key] = str(value)
             elif isinstance(value, Enum):
                 serialized[key] = value.value
+            elif isinstance(value, datetime):
+                serialized[key] = int(value.timestamp() * 1000)
             elif isinstance(value, dict):
                 serialized[key] = json.dumps(value, cls=JSONEncoder)
-            elif isinstance(value, list) and value and isinstance(value[0], float):
-                continue  # Skip vector properties in Cypher serialization
+            elif isinstance(value, list):
+                if value and isinstance(value[0], float):
+                    continue  # Skip vector properties in Cypher serialization
+                serialized[key] = json.dumps(value, cls=JSONEncoder)
             else:
                 serialized[key] = value
         return serialized
@@ -766,10 +785,10 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
             await self._cypher(
                 f"MERGE (node:{node_label} {{id: $node_id}}) "
                 "ON CREATE SET node += $properties, "
-                "node.updated_at = timestamp() "
+                "node.updated_at = $now "
                 "ON MATCH SET node += $properties, "
-                "node.updated_at = timestamp()",
-                {"node_id": dp_key, "properties": properties},
+                "node.updated_at = $now",
+                {"node_id": dp_key, "properties": properties, "now": self._now()},
             )
 
             # Set vector properties via SQL UPDATE
@@ -802,7 +821,7 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
             "MATCH (node) WHERE node.id IN $node_ids RETURN node",
             {"node_ids": [str(dp_id) for dp_id in data_point_ids]},
         )
-        return [r["node"] for r in results]
+        return results
 
     async def search(
         self,
