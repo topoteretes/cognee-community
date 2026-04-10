@@ -4,37 +4,49 @@ ArcadeDB is a multi-model database that natively supports **graph** and **vector
 
 ## Architecture
 
-All communication uses ArcadeDB's HTTP API:
+- **Graph operations** use OpenCypher queries via either:
+  - **Bolt protocol** (binary, faster) if the `BoltProtocolPlugin` is enabled and `neo4j` is installed
+  - **HTTP API** (fallback) if Bolt is not available
+- **Vector operations** always use the HTTP API with SQL for `LSM_VECTOR` index creation and `vectorNeighbors()` KNN search
 
-- **Graph operations** use OpenCypher queries (language="cypher") with parameterized queries
-- **Vector operations** use SQL (language="sql") for LSM_VECTOR index creation and `vectorNeighbors()` KNN search
+The adapter automatically detects Bolt availability on first use and falls back to HTTP transparently.
 
 ## Prerequisites
 
-- ArcadeDB 24.x or later (with vector search support)
+- ArcadeDB 26.2.1 or later
 - HTTP endpoint enabled (default port 2480)
+- (Optional) Bolt plugin enabled for better graph performance (port 7687)
 
 ## Installation
 
 ```bash
+# HTTP only (works out of the box)
 pip install cognee-community-hybrid-adapter-arcadedb
+
+# With Bolt protocol support (recommended for production)
+pip install cognee-community-hybrid-adapter-arcadedb[bolt]
+```
+
+## ArcadeDB Setup
+
+### HTTP only (simplest)
+
+```bash
+docker run -p 2480:2480 \
+  -e JAVA_OPTS="-Darcadedb.server.rootPassword=your_password" \
+  arcadedata/arcadedb:latest
+```
+
+### With Bolt protocol (recommended)
+
+```bash
+docker run -p 2480:2480 -p 7687:7687 \
+  -e JAVA_OPTS="-Darcadedb.server.rootPassword=your_password \
+     -Darcadedb.server.plugins=Bolt:com.arcadedb.bolt.BoltProtocolPlugin" \
+  arcadedata/arcadedb:latest
 ```
 
 ## Configuration
-
-Set these environment variables:
-
-```bash
-GRAPH_DATABASE_PROVIDER=arcadedb
-GRAPH_DATABASE_URL=localhost
-GRAPH_DATABASE_USERNAME=root
-GRAPH_DATABASE_PASSWORD=your_password
-
-VECTOR_DB_PROVIDER=arcadedb
-VECTOR_DB_URL=localhost
-```
-
-Or configure in Python:
 
 ```python
 import cognee
@@ -55,14 +67,12 @@ cognee.config.set_vector_db_config({
 ## How It Works
 
 ### Graph Storage
-Nodes and edges are stored using OpenCypher MERGE operations via HTTP. ArcadeDB's graph engine handles traversals, pattern matching, and relationship management.
+Nodes and edges are stored using OpenCypher MERGE operations. When the Bolt plugin is enabled, the adapter uses the `neo4j` Python driver for binary protocol communication. Otherwise, it sends Cypher queries over the HTTP API.
 
 ### Vector Storage
 Embeddings are stored as `ARRAY_OF_FLOATS` properties on vertices. LSM_VECTOR (HNSW) indexes are created automatically:
 
 ```sql
-CREATE PROPERTY `TypeName`.`text_vector` IF NOT EXISTS ARRAY_OF_FLOATS
-
 CREATE INDEX ON `TypeName` (`text_vector`) LSM_VECTOR METADATA {
   dimensions: 1536,
   similarity: 'COSINE'
@@ -80,9 +90,9 @@ SELECT *, distance FROM (
 ## Features
 
 - Single database for both knowledge graph and vector embeddings
+- Automatic Bolt/HTTP protocol selection (Bolt preferred, HTTP fallback)
 - Native HNSW (LSM_VECTOR) indexes with cosine similarity
 - Full OpenCypher support for graph traversals
 - Batch embedding and upsert support
 - Multi-tenant dataset isolation
 - No external vector database dependency needed
-- Only requires a single HTTP endpoint (port 2480)

@@ -11,6 +11,9 @@ dependencies = [
     "starlette>=0.48.0",
     "instructor>=1.11"
 ]
+
+[project.optional-dependencies]
+bolt = ["neo4j>=5.0.0"]
 readme = "README.md"
 requires-python = ">=3.10"
 

@@ -4,9 +4,12 @@ ArcadeDB is a multi-model database that supports both graph traversal
 (OpenCypher) and vector search (SQL with LSM_VECTOR/HNSW indexes and
 the vectorNeighbors() function).
 
-All operations use ArcadeDB's HTTP API, with Cypher for graph queries
-and SQL for vector operations (index creation, vector property updates,
-and KNN search).
+Graph operations use either:
+- Neo4j Bolt protocol (if the BoltProtocolPlugin is enabled, port 7687)
+- HTTP API with Cypher (fallback, port 2480)
+
+Vector operations always use ArcadeDB's HTTP API for SQL queries
+(index creation, vector property updates, and KNN search).
 """
 
 import asyncio
@@ -55,10 +58,9 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
     """
     Hybrid adapter for ArcadeDB supporting both graph and vector operations.
 
-    All communication uses ArcadeDB's HTTP API:
-    - Graph operations use Cypher (language="cypher") with parameterized queries
-    - Vector operations use SQL (language="sql") for LSM_VECTOR indexes and
-      vectorNeighbors() KNN search
+    Graph operations use the Neo4j Bolt protocol when available (requires
+    the BoltProtocolPlugin on port 7687), falling back to HTTP API Cypher.
+    Vector operations always use the HTTP API for SQL queries.
     """
 
     def __init__(
@@ -78,10 +80,44 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
         self.graph_database_password = graph_database_password
         self.database_name = database_name or "cognee"
 
-        # Derive HTTP base URL
+        # Derive host from URL
         host = raw_url.split("://")[-1].split(":")[0].split("/")[0]
+
+        # HTTP base URL (always needed for SQL/vector operations)
         http_port = kwargs.get("http_port", 2480)
         self.http_base_url = f"http://{host}:{http_port}"
+
+        # Try to set up Bolt driver for graph operations
+        self._bolt_driver = None
+        bolt_port = kwargs.get("bolt_port", 7687)
+
+        if driver is not None:
+            # Pre-built driver provided
+            self._bolt_driver = driver
+            logger.info("Using provided Bolt driver")
+        else:
+            try:
+                from neo4j import AsyncGraphDatabase
+
+                bolt_url = f"bolt://{host}:{bolt_port}"
+                auth = None
+                if graph_database_username and graph_database_password:
+                    auth = (graph_database_username, graph_database_password)
+
+                self._bolt_driver = AsyncGraphDatabase.driver(
+                    bolt_url,
+                    auth=auth,
+                    max_connection_lifetime=120,
+                )
+                logger.info("Bolt driver initialized at %s", bolt_url)
+            except ImportError:
+                logger.info(
+                    "neo4j package not installed, using HTTP for Cypher"
+                )
+            except Exception as e:
+                logger.info(
+                    "Could not initialize Bolt driver: %s, using HTTP", e
+                )
 
         self.embedding_engine = (
             get_embedding_engine() if not embedding_engine else embedding_engine
@@ -89,9 +125,11 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
 
         # Track which vector indexes have been created this session
         self._vector_indexes: set[str] = set()
+        # Track whether Bolt is confirmed working
+        self._bolt_verified = False
 
     # -------------------------------------------------------------------------
-    # HTTP API helpers
+    # Helpers
     # -------------------------------------------------------------------------
 
     @staticmethod
@@ -123,28 +161,102 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
                 return json.loads(body)
 
     async def _sql(self, sql: str) -> dict:
-        """Execute an SQL command."""
+        """Execute an SQL command via HTTP."""
         return await self._http_request(
             "command", {"language": "sql", "command": sql}
         )
 
     async def _sql_query(self, sql: str) -> dict:
-        """Execute an SQL read query."""
+        """Execute an SQL read query via HTTP."""
         return await self._http_request(
             "query", {"language": "sql", "command": sql}
         )
+
+    async def _cypher_via_http(
+        self,
+        cypher: str,
+        params: Optional[dict[str, Any]] = None,
+    ) -> list[dict[str, Any]]:
+        """Execute Cypher via HTTP API. Returns flat dicts."""
+        payload = {"language": "cypher", "command": cypher}
+        if params:
+            payload["params"] = params
+        result = await self._http_request("command", payload)
+        return result.get("result", [])
+
+    async def _cypher_via_bolt(
+        self,
+        cypher: str,
+        params: Optional[dict[str, Any]] = None,
+    ) -> list[dict[str, Any]]:
+        """Execute Cypher via Bolt protocol. Normalizes response to flat dicts."""
+        from neo4j.exceptions import ServiceUnavailable
+
+        try:
+            async with self._bolt_driver.session(
+                database=self.database_name
+            ) as session:
+                result = await session.run(cypher, params)
+                records = await result.data()
+
+            # Normalize: Bolt returns {"alias": <Node/value>} per record.
+            # Convert Node objects to plain dicts for consistency with HTTP.
+            normalized = []
+            for record in records:
+                flat = {}
+                for key, value in record.items():
+                    if hasattr(value, "items"):
+                        # Already a dict (properties)
+                        flat.update(value)
+                    elif hasattr(value, "_properties"):
+                        # neo4j Node object
+                        flat.update(dict(value._properties))
+                    else:
+                        flat[key] = value
+                normalized.append(flat)
+            return normalized
+
+        except (ServiceUnavailable, OSError) as e:
+            # Bolt not available, disable and fall back to HTTP
+            logger.info("Bolt connection failed: %s, falling back to HTTP", e)
+            self._bolt_driver = None
+            self._bolt_verified = False
+            return await self._cypher_via_http(cypher, params)
 
     async def _cypher(
         self,
         cypher: str,
         params: Optional[dict[str, Any]] = None,
     ) -> list[dict[str, Any]]:
-        """Execute a Cypher command with optional parameters."""
-        payload = {"language": "cypher", "command": cypher}
-        if params:
-            payload["params"] = params
-        result = await self._http_request("command", payload)
-        return result.get("result", [])
+        """Execute Cypher query using Bolt if available, otherwise HTTP.
+
+        On the first call, verifies that Bolt is actually reachable.
+        If Bolt fails, permanently falls back to HTTP for the session.
+        """
+        if self._bolt_driver is not None:
+            if not self._bolt_verified:
+                # First call: verify Bolt connectivity
+                try:
+                    result = await self._cypher_via_bolt(
+                        "RETURN true AS ok"
+                    )
+                    if result and result[0].get("ok"):
+                        self._bolt_verified = True
+                        logger.info(
+                            "Bolt protocol verified, using Bolt for Cypher"
+                        )
+                    else:
+                        raise RuntimeError("Bolt verification returned no data")
+                except Exception as e:
+                    logger.info(
+                        "Bolt verification failed: %s, using HTTP", e
+                    )
+                    self._bolt_driver = None
+
+            if self._bolt_driver is not None:
+                return await self._cypher_via_bolt(cypher, params)
+
+        return await self._cypher_via_http(cypher, params)
 
     # -------------------------------------------------------------------------
     # GraphDBInterface - Cypher operations
@@ -196,7 +308,6 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
         return results[0] if results else None
 
     async def extract_nodes(self, node_ids: list[str]):
-        # ArcadeDB HTTP Cypher returns vertices as flat dicts
         return await self._cypher(
             "UNWIND $node_ids AS id MATCH (node {id: id}) RETURN node",
             {"node_ids": node_ids},
@@ -377,7 +488,6 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
         return results[0] if results else None
 
     async def get_nodes(self, node_ids: list[str]) -> list[dict[str, Any]]:
-        # ArcadeDB HTTP Cypher returns vertices as flat dicts
         return await self._cypher(
             "UNWIND $node_ids AS id MATCH (node {id: id}) RETURN node",
             {"node_ids": node_ids},
@@ -650,7 +760,7 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
         return len(result) == 0
 
     # -------------------------------------------------------------------------
-    # VectorDBInterface - SQL operations
+    # VectorDBInterface - SQL operations (always HTTP)
     # -------------------------------------------------------------------------
 
     async def embed_data(self, data: list[str]) -> list[list[float]]:
@@ -704,11 +814,7 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
     async def create_vector_index(
         self, index_name: str, index_property_name: str
     ) -> None:
-        """Create an LSM_VECTOR (HNSW) index on a vertex type property.
-
-        index_name is the vertex type name, index_property_name is the property
-        to index (will be suffixed with _vector).
-        """
+        """Create an LSM_VECTOR (HNSW) index on a vertex type property."""
         vector_prop = f"{index_property_name}_vector"
         index_key = f"{index_name}.{vector_prop}"
 
@@ -742,12 +848,7 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
     async def create_data_points(
         self, collection_name: str, data_points: list[DataPoint]
     ):
-        """Embed and store data points as vertices with vector properties.
-
-        Nodes are upserted via Cypher MERGE, then vector properties are set
-        via SQL UPDATE (vectors use ARRAY_OF_FLOATS properties indexed with
-        LSM_VECTOR).
-        """
+        """Embed and store data points as vertices with vector properties."""
         if not data_points:
             return
 
@@ -811,17 +912,15 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
         index_property_name: str,
         data_points: list[DataPoint],
     ) -> None:
-        """Ensure the vector index exists. Data points are indexed
-        automatically by ArcadeDB when the vector property is set."""
+        """Ensure the vector index exists."""
         await self.create_vector_index(index_name, index_property_name)
 
     async def retrieve(self, collection_name: str, data_point_ids: list[str]):
         """Retrieve data points by their IDs."""
-        results = await self._cypher(
+        return await self._cypher(
             "MATCH (node) WHERE node.id IN $node_ids RETURN node",
             {"node_ids": [str(dp_id) for dp_id in data_point_ids]},
         )
-        return results
 
     async def search(
         self,
@@ -834,13 +933,7 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
         node_name: Optional[list[str]] = None,
         node_name_filter_operator: str = "OR",
     ) -> list:
-        """Perform vector similarity search using ArcadeDB's vectorNeighbors().
-
-        collection_name format: "TypeName_propertyName" (e.g. "IndexSchema_text")
-
-        Uses: SELECT expand(vectorNeighbors('Type[prop_vector]', [vec], k))
-        Returns ScoredResult objects sorted by distance (lower = closer).
-        """
+        """Perform vector similarity search using ArcadeDB's vectorNeighbors()."""
         if query_text is None and query_vector is None:
             raise ValueError(
                 "Either query_text or query_vector must be provided"
@@ -849,7 +942,6 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
         if query_text and not query_vector:
             query_vector = (await self.embed_data([query_text]))[0]
 
-        # Parse collection_name to extract type and property
         if "_" in collection_name:
             type_name, _, attr_name = collection_name.partition("_")
         else:
@@ -903,7 +995,6 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
 
         scored_results = []
         for record in records:
-            # vectorNeighbors() returns a 'distance' field (lower = closer)
             distance = record.get("distance", 0.0)
             record_id = record.get("id", "")
 
