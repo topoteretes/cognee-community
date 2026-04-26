@@ -127,6 +127,8 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
         self._vector_indexes: set[str] = set()
         # Track whether Bolt is confirmed working
         self._bolt_verified = False
+        # Track whether the target database has been ensured to exist
+        self._database_ensured = False
 
     # -------------------------------------------------------------------------
     # Helpers
@@ -144,12 +146,44 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
             )
         return None
 
+    async def _ensure_database(self) -> None:
+        """Create the target database on first use, if it doesn't exist.
+
+        ArcadeDB does not auto-create databases on connect, so the very
+        first HTTP/Bolt call against a fresh server would otherwise fail
+        with a 500 "Database '<name>' is not available". We POST a
+        server-level `create database` command and silently swallow the
+        "already exists" response so the call is idempotent.
+        """
+        if self._database_ensured:
+            return
+
+        url = f"{self.http_base_url}/api/v1/server"
+        payload = {"command": f"create database {self.database_name}"}
+        async with aiohttp.ClientSession(auth=self._get_auth()) as session:
+            async with session.post(url, json=payload) as resp:
+                body = await resp.text()
+                if resp.status == 200:
+                    logger.info(
+                        "Created ArcadeDB database '%s'", self.database_name
+                    )
+                    self._database_ensured = True
+                elif "already exists" in body.lower():
+                    self._database_ensured = True
+                else:
+                    raise RuntimeError(
+                        f"ArcadeDB create database failed "
+                        f"({resp.status}): {body}"
+                    )
+
     async def _http_request(
         self,
         endpoint: str,
         payload: dict,
     ) -> dict:
         """Execute a request via ArcadeDB's HTTP API."""
+        if not self._database_ensured:
+            await self._ensure_database()
         url = f"{self.http_base_url}/api/v1/{endpoint}/{self.database_name}"
         async with aiohttp.ClientSession(auth=self._get_auth()) as session:
             async with session.post(url, json=payload) as resp:
@@ -191,6 +225,9 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
     ) -> list[dict[str, Any]]:
         """Execute Cypher via Bolt protocol. Normalizes response to flat dicts."""
         from neo4j.exceptions import ServiceUnavailable
+
+        if not self._database_ensured:
+            await self._ensure_database()
 
         try:
             async with self._bolt_driver.session(
