@@ -147,21 +147,44 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
         return None
 
     async def _ensure_database(self) -> None:
-        """Create the target database on first use, if it doesn't exist.
+        """Make sure the target database exists before the first real call.
 
         ArcadeDB does not auto-create databases on connect, so the very
         first HTTP/Bolt call against a fresh server would otherwise fail
-        with a 500 "Database '<name>' is not available". We POST a
-        server-level `create database` command and silently swallow the
-        "already exists" response so the call is idempotent.
+        with a 500 "Database '<name>' is not available".
+
+        We first probe `GET /api/v1/exists/<db>`, which any authenticated
+        database user can call. Only if the database is missing do we
+        attempt `POST /api/v1/server create database <db>`, which requires
+        server-level (root) credentials. This keeps the adapter usable
+        for non-root users connecting to a pre-created database.
         """
         if self._database_ensured:
             return
 
-        url = f"{self.http_base_url}/api/v1/server"
-        payload = {"command": f"create database {self.database_name}"}
         async with aiohttp.ClientSession(auth=self._get_auth()) as session:
-            async with session.post(url, json=payload) as resp:
+            exists_url = (
+                f"{self.http_base_url}/api/v1/exists/{self.database_name}"
+            )
+            async with session.get(exists_url) as resp:
+                exists_body = await resp.text()
+                if resp.status == 200:
+                    try:
+                        if json.loads(exists_body).get("result") is True:
+                            self._database_ensured = True
+                            return
+                    except (ValueError, AttributeError):
+                        pass
+                elif resp.status in (401, 403):
+                    raise RuntimeError(
+                        f"ArcadeDB authentication failed on "
+                        f"/api/v1/exists ({resp.status}). Check the "
+                        f"username and password supplied to the adapter."
+                    )
+
+            create_url = f"{self.http_base_url}/api/v1/server"
+            payload = {"command": f"create database {self.database_name}"}
+            async with session.post(create_url, json=payload) as resp:
                 body = await resp.text()
                 if resp.status == 200:
                     logger.info(
@@ -170,6 +193,14 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
                     self._database_ensured = True
                 elif "already exists" in body.lower():
                     self._database_ensured = True
+                elif resp.status in (401, 403):
+                    raise RuntimeError(
+                        f"ArcadeDB database '{self.database_name}' does "
+                        f"not exist and the supplied credentials lack the "
+                        f"server-level privileges required to create it "
+                        f"(HTTP {resp.status}). Either create the database "
+                        f"manually or supply root credentials."
+                    )
                 else:
                     raise RuntimeError(
                         f"ArcadeDB create database failed "
