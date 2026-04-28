@@ -1,0 +1,37 @@
+[project]
+name = "cognee-community-vector-adapter-singlestore"
+version = "0.1.0"
+description = "SingleStore vector database adapter for cognee"
+readme = "README.md"
+requires-python = ">=3.11,<=3.13"
+dependencies = [
+    "singlestoredb>=1.16.0",
+    "cognee==0.5.6",
+    "starlette>=0.48.0",
+    "instructor>=1.11"
+]
+
+[tool.poetry]
+name = "cognee-community-vector-adapter-singlestore"
+version = "0.1.0"
+description = "SingleStore vector database adapter for cognee"
+authors = ["Cognee Community <support@cognee.ai>"]
+readme = "README.md"
+packages = [{ include = "cognee_community_vector_adapter_singlestore" }]
+
+[tool.poetry.dependencies]
+python = ">=3.11,<=3.13"
+singlestoredb = ">=1.16.0"
+cognee = "0.5.6"
+starlette = ">=0.48.0"
+instructor = ">=1.11"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build]
+exclude = [
+  "/dist",
+  "/.venv",
+]

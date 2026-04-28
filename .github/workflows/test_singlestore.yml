@@ -1,0 +1,155 @@
+name: Test SingleStore Community Adapter
+
+on:
+  workflow_call:
+    inputs:
+      event-type:
+        required: false
+        type: string
+        default: "regular-testing-event"
+    secrets:
+      LLM_MODEL:
+        required: true
+      LLM_ENDPOINT:
+        required: true
+      LLM_API_KEY:
+        required: true
+      LLM_API_VERSION:
+        required: true
+      EMBEDDING_MODEL:
+        required: true
+      EMBEDDING_ENDPOINT:
+        required: true
+      EMBEDDING_API_KEY:
+        required: true
+      EMBEDDING_API_VERSION:
+        required: true
+  workflow_dispatch:
+  pull_request:
+    branches: [ main, dev ]
+    paths:
+      - 'packages/vector/singlestore/**'
+      - '.github/workflows/test_singlestore.yml'
+
+concurrency:
+  group: singlestore-test-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+env:
+  SINGLESTORE_PASSWORD: test
+  VECTOR_DB_HOST: 127.0.0.1
+  VECTOR_DB_PORT: 3306
+  VECTOR_DB_NAME: cognee
+  VECTOR_DB_USERNAME: root
+  VECTOR_DB_PASSWORD: test
+  VECTOR_DB_PROVIDER: singlestore
+  VECTOR_DATASET_DATABASE_HANDLER: singlestore
+
+jobs:
+  run-singlestore-example:
+    name: "SingleStore Community Adapter Example"
+    runs-on: ubuntu-22.04
+    services:
+      singlestore:
+        image: ghcr.io/singlestore-labs/singlestoredb-dev:latest
+        env:
+          ROOT_PASSWORD: test
+        ports:
+          - 3306:3306
+          - 8080:8080
+          - 9000:9000
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Community Setup
+        uses: ./.github/actions/community_setup
+        with:
+          python-version: '3.11.x'
+          package-path: packages/vector/singlestore
+          event-type: ${{ inputs.event-type }}
+
+      - name: Prepare SingleStore database
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mysql-client || sudo apt-get install -y default-mysql-client
+          for i in {1..60}; do
+            if mysql -h 127.0.0.1 -P 3306 -u root -ptest -e "SELECT 1"; then
+              mysql -h 127.0.0.1 -P 3306 -u root -ptest -e "CREATE DATABASE IF NOT EXISTS cognee"
+              exit 0
+            fi
+            echo "SingleStore not ready yet... (attempt $i/60)"
+            sleep 2
+          done
+          exit 1
+
+      - name: Run SingleStore Example
+        env:
+          ENV: 'dev'
+          ENABLE_BACKEND_ACCESS_CONTROL: False
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+          LLM_ENDPOINT: ${{ secrets.LLM_ENDPOINT }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_API_VERSION: ${{ secrets.LLM_API_VERSION }}
+          EMBEDDING_MODEL: ${{ secrets.EMBEDDING_MODEL }}
+          EMBEDDING_ENDPOINT: ${{ secrets.EMBEDDING_ENDPOINT }}
+          EMBEDDING_API_KEY: ${{ secrets.EMBEDDING_API_KEY }}
+          EMBEDDING_API_VERSION: ${{ secrets.EMBEDDING_API_VERSION }}
+          SINGLESTORE_URL: '127.0.0.1:3306'
+          SINGLESTORE_KEY: 'test'
+        working-directory: ./packages/vector/singlestore
+        run: poetry run python example.py
+
+  test-singlestore:
+    name: "SingleStore Community Adapter Test"
+    runs-on: ubuntu-22.04
+    services:
+      singlestore:
+        image: ghcr.io/singlestore-labs/singlestoredb-dev:latest
+        env:
+          ROOT_PASSWORD: test
+        ports:
+          - 3306:3306
+          - 8080:8080
+          - 9000:9000
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Community Setup
+        uses: ./.github/actions/community_setup
+        with:
+          python-version: '3.11.x'
+          package-path: packages/vector/singlestore
+          event-type: ${{ inputs.event-type }}
+
+      - name: Prepare SingleStore database
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mysql-client || sudo apt-get install -y default-mysql-client
+          for i in {1..60}; do
+            if mysql -h 127.0.0.1 -P 3306 -u root -ptest -e "SELECT 1"; then
+              mysql -h 127.0.0.1 -P 3306 -u root -ptest -e "CREATE DATABASE IF NOT EXISTS cognee"
+              exit 0
+            fi
+            echo "SingleStore not ready yet... (attempt $i/60)"
+            sleep 2
+          done
+          exit 1
+
+      - name: Run SingleStore Tests
+        env:
+          ENV: 'dev'
+          ENABLE_BACKEND_ACCESS_CONTROL: False
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+          LLM_ENDPOINT: ${{ secrets.LLM_ENDPOINT }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_API_VERSION: ${{ secrets.LLM_API_VERSION }}
+          EMBEDDING_MODEL: ${{ secrets.EMBEDDING_MODEL }}
+          EMBEDDING_ENDPOINT: ${{ secrets.EMBEDDING_ENDPOINT }}
+          EMBEDDING_API_KEY: ${{ secrets.EMBEDDING_API_KEY }}
+          EMBEDDING_API_VERSION: ${{ secrets.EMBEDDING_API_VERSION }}
+          SINGLESTORE_URL: '127.0.0.1:3306'
+          SINGLESTORE_KEY: 'test'
+        working-directory: ./packages/vector/singlestore
+        run: poetry run python tests/test_singlestore.py

@@ -1,0 +1,8 @@
+from cognee.infrastructure.databases.dataset_database_handler import use_dataset_database_handler
+from cognee.infrastructure.databases.vector import use_vector_adapter
+
+from .SingleStoreDatasetDatabaseHandler import SingleStoreDatasetDatabaseHandler
+from .singlestore_adapter import SingleStoreAdapter
+
+use_vector_adapter("singlestore", SingleStoreAdapter)
+use_dataset_database_handler("singlestore", SingleStoreDatasetDatabaseHandler, "singlestore")

@@ -35,7 +35,7 @@ jobs:
         run: |
           if [ "${{ inputs.packages }}" = "all" ]; then
             # Define all available packages
-            packages='["packages/hybrid/duckdb","packages/vector/qdrant","packages/vector/weaviate","packages/vector/opensearch","packages/vector/redis","packages/vector/valkey","packages/vector/milvus","packages/graph/memgraph"]'
+            packages='["packages/hybrid/duckdb","packages/vector/qdrant","packages/vector/weaviate","packages/vector/opensearch","packages/vector/redis","packages/vector/singlestore","packages/vector/valkey","packages/vector/milvus","packages/graph/memgraph"]'
           else
             # Convert comma-separated string to JSON array
             packages=$(echo '${{ inputs.packages }}' | jq -R 'split(",") | map(select(length > 0))')
