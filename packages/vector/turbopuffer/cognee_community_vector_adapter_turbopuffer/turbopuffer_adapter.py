@@ -1,6 +1,6 @@
 import asyncio
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Union, get_args, get_origin
 from uuid import UUID
 
 import turbopuffer
@@ -47,6 +47,20 @@ def _serialize_value(value):
     return value
 
 
+def _coerce_vector(value):
+    """Convert vector-like values (including numpy arrays) to list[float]."""
+    if hasattr(value, "tolist") and not isinstance(value, (str, bytes, bytearray)):
+        value = value.tolist()
+
+    if isinstance(value, tuple):
+        value = list(value)
+
+    if not isinstance(value, list):
+        raise TypeError(f"Vector must be a list-like value, got {type(value).__name__}")
+
+    return [float(v) for v in value]
+
+
 def _truncate_large_values(payload: dict) -> dict:
     """Truncate string values exceeding turbopuffer's filterable attribute limit."""
     result = {}
@@ -58,6 +72,122 @@ def _truncate_large_values(payload: dict) -> dict:
         else:
             result[key] = value
     return result
+
+
+def _strip_optional(annotation):
+    origin = get_origin(annotation)
+    if origin is Union:
+        args = [arg for arg in get_args(annotation) if arg is not type(None)]
+        if len(args) == 1:
+            return args[0]
+    return annotation
+
+
+def _annotation_to_turbopuffer_type(annotation):
+    annotation = _strip_optional(annotation)
+    origin = get_origin(annotation)
+
+    if origin in (list, List):
+        args = get_args(annotation)
+        if len(args) != 1:
+            return None
+        item_type = _strip_optional(args[0])
+        if item_type is str:
+            return "[]string"
+        if item_type is int:
+            return "[]int"
+        if item_type is float:
+            return "[]float"
+        if item_type is bool:
+            return "[]bool"
+        if item_type is UUID:
+            return "[]uuid"
+        if item_type is datetime:
+            return "[]datetime"
+        return None
+
+    if annotation is bool:
+        return "bool"
+    if annotation is int:
+        return "int"
+    if annotation is float:
+        return "float"
+    if annotation is str:
+        return "string"
+    if annotation is UUID:
+        return "uuid"
+    if annotation is datetime:
+        return "datetime"
+
+    return None
+
+
+def _infer_turbopuffer_attribute_type(value):
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int):
+        return "int"
+    if isinstance(value, float):
+        return "float"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        if all(isinstance(item, str) for item in value):
+            return "[]string"
+        if all(isinstance(item, bool) for item in value):
+            return "[]bool"
+        if all(isinstance(item, int) and not isinstance(item, bool) for item in value):
+            return "[]int"
+        if all(isinstance(item, (int, float)) and not isinstance(item, bool) for item in value):
+            return "[]float"
+    return None
+
+
+def _merge_turbopuffer_types(existing_type: str, new_type: str) -> str:
+    if existing_type == new_type:
+        return existing_type
+
+    # Promote numeric types to avoid int schemas rejecting float values later.
+    if {existing_type, new_type} == {"int", "float"}:
+        return "float"
+    if {existing_type, new_type} == {"[]int", "[]float"}:
+        return "[]float"
+
+    # Keep existing type if no safe merge is known.
+    return existing_type
+
+
+def _build_write_schema(data_points: list[DataPoint], rows: list[dict]) -> dict:
+    schema = {}
+
+    # First use model annotations so schema is stable and future fields are auto-covered.
+    for data_point in data_points:
+        for key, field in data_point.model_fields.items():
+            inferred_type = _annotation_to_turbopuffer_type(field.annotation)
+            if inferred_type is None:
+                continue
+            if key not in schema:
+                schema[key] = inferred_type
+            else:
+                schema[key] = _merge_turbopuffer_types(schema[key], inferred_type)
+
+    # Then use actual row values for non-model fields and to widen numeric types when needed.
+    for row in rows:
+        for key, value in row.items():
+            if key in ("id", "vector"):
+                continue
+            if value is None:
+                continue
+
+            inferred_type = _infer_turbopuffer_attribute_type(value)
+            if inferred_type is None:
+                continue
+            if key not in schema:
+                schema[key] = inferred_type
+            else:
+                schema[key] = _merge_turbopuffer_types(schema[key], inferred_type)
+
+    return schema
 
 
 class TurbopufferAdapter(VectorDBInterface):
@@ -133,17 +263,20 @@ class TurbopufferAdapter(VectorDBInterface):
 
             row = {
                 "id": str(data_point.id),
-                "vector": data_vectors[i],
+                "vector": _coerce_vector(data_vectors[i]),
                 "database_name": self.database_name,
                 **payload,
             }
             rows.append(row)
+
+        write_schema = _build_write_schema(data_points, rows)
 
         try:
             await asyncio.to_thread(
                 ns.write,
                 upsert_rows=rows,
                 distance_metric="cosine_distance",
+                schema=write_schema,
             )
         except Exception as error:
             error_msg = str(error)
@@ -222,6 +355,7 @@ class TurbopufferAdapter(VectorDBInterface):
 
         if query_vector is None:
             query_vector = (await self.embed_data([query_text]))[0]
+        query_vector = _coerce_vector(query_vector)
 
         if limit is None:
             limit = 100
