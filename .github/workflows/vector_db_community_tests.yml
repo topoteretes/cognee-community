@@ -75,6 +75,14 @@ jobs:
     uses: ./.github/workflows/test_redis.yml
     secrets: inherit
 
+  test-singlestore:
+    name: "SingleStore Community Adapter Test"
+    if: ${{ inputs.databases == 'all' || contains(inputs.databases, 'singlestore') }}
+    with:
+      event-type: ${{ inputs.event-type }}
+    uses: ./.github/workflows/test_singlestore.yml
+    secrets: inherit
+
   test-valkey:
     name: "Valkey Community Adapter Test"
     if: ${{ inputs.databases == 'all' || contains(inputs.databases, 'valkey') }}
