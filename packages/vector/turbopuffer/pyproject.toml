@@ -1,11 +1,11 @@
 [project]
 name = "cognee-community-vector-adapter-turbopuffer"
-version = "0.1.0"
+version = "0.2.1"
 description = "Turbopuffer vector database adapter for cognee"
 readme = "README.md"
 requires-python = ">=3.11,<=3.13"
 dependencies = [
     "turbopuffer>=0.5.0",
-    "cognee==1.0.0",
+    "cognee==1.0.9",
     "python-dotenv>=1.0.0",
 ]
