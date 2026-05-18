@@ -6,7 +6,15 @@ readme = "README.md"
 requires-python = ">=3.11,<=3.13"
 dependencies = [
     "qdrant-client>=1.16.0",
-    "cognee==0.5.6",
+    "cognee==1.1.0",
     "starlette>=0.48.0",
     "instructor>=1.11"
 ]
+
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["cognee_community_vector_adapter_qdrant*"]
