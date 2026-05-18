@@ -5,6 +5,8 @@ from os import path
 
 import cognee
 from cognee import config
+# NOTE: Importing the register module we let cognee know it can use the Qdrant vector adapter
+# NOTE: The "noqa: F401" mark is to make sure the linter doesn't flag this as an unused import
 from cognee_community_vector_adapter_qdrant import register  # noqa: F401
 
 from dotenv import load_dotenv
