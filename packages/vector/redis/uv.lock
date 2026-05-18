@@ -485,7 +485,7 @@ wheels = [
 
 [[package]]
 name = "cognee"
-version = "1.0.9"
+version = "1.1.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiofiles" },
@@ -531,14 +531,14 @@ dependencies = [
     { name = "uvicorn" },
     { name = "websockets" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/5f/16/5b6b6998e34f28e59d40ee9de2a9004538c927e36a041d6c5be174de1335/cognee-1.0.9.tar.gz", hash = "sha256:2b8024716e8d0b8361960b9475d7e0fc4c2521315ef43b4d2306a0fb050b637f", size = 18619346, upload-time = "2026-05-08T15:34:16.428Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/34/ec/ab50531c89628c2d4f5abd63a35f320b13a2d8d940722ab2987a756d1ce9/cognee-1.1.0.tar.gz", hash = "sha256:41505ae5afcfc43e5f017992b9d9b1c7b5dd77ec057e9c95b722afd781a07ab4", size = 18833971, upload-time = "2026-05-16T18:55:54.324Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/7c/f9/9b8ee342c65873ead37a8d5e6d855193739eade74c357e898a8a4c41c519/cognee-1.0.9-py3-none-any.whl", hash = "sha256:1693b3c06c0b836fb29c976c739faa431943f978d6d7f19af757081e76491eec", size = 2129648, upload-time = "2026-05-08T15:34:19.453Z" },
+    { url = "https://files.pythonhosted.org/packages/54/c1/f29421b5dc16f6eb92c4e4461a04a48ed14808e7944e9b32d81f24586529/cognee-1.1.0-py3-none-any.whl", hash = "sha256:559e0e610304d5d4bdf6fcb6d17d0e3036f464b7da3b1db1d4ffefb3588a6384", size = 2338066, upload-time = "2026-05-16T18:55:57.898Z" },
 ]
 
 [[package]]
 name = "cognee-community-vector-adapter-redis"
-version = "0.2.0"
+version = "0.2.1"
 source = { editable = "." }
 dependencies = [
     { name = "cognee" },
@@ -549,7 +549,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "cognee", specifier = "==1.0.9" },
+    { name = "cognee", specifier = "==1.1.0" },
     { name = "instructor", specifier = ">=1.11" },
     { name = "redisvl", specifier = ">=0.6.0,<=1.0.0" },
     { name = "starlette", specifier = ">=0.48.0" },

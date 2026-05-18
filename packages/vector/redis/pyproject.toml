@@ -1,12 +1,12 @@
 [project]
 name = "cognee-community-vector-adapter-redis"
-version = "0.2.0"
+version = "0.2.1"
 description = "Redis vector database adapter for cognee"
 readme = "README.md"
 requires-python = ">=3.11,<=3.13"
 dependencies = [
     "redisvl>=0.6.0,<=1.0.0",
-    "cognee==1.0.9",
+    "cognee==1.1.0",
     "starlette>=0.48.0",
     "instructor>=1.11"
 ]
