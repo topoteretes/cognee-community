@@ -54,9 +54,11 @@ class QDrantAdapter(VectorDBInterface):
         embedding_engine: EmbeddingEngine,
         qdrant_path=None,
         database_name: str = "cognee_db",
+        timeout: int = 120,
     ):
         self.embedding_engine = embedding_engine
         self.database_name = database_name
+        self.timeout = timeout
 
         if qdrant_path is not None:
             self.qdrant_path = qdrant_path
@@ -69,7 +71,12 @@ class QDrantAdapter(VectorDBInterface):
         if self.qdrant_path is not None:
             return AsyncQdrantClient(path=self.qdrant_path, port=6333)
         elif self.url is not None:
-            return AsyncQdrantClient(url=self.url, api_key=self.api_key, port=6333)
+            return AsyncQdrantClient(
+                url=self.url,
+                api_key=self.api_key,
+                port=6333,
+                timeout=self.timeout,
+            )
 
         return AsyncQdrantClient(location=":memory:")
 
