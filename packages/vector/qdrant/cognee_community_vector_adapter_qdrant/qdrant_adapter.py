@@ -1,4 +1,5 @@
 import asyncio
+import os
 from typing import List, Optional
 
 from cognee.infrastructure.databases.exceptions import MissingQueryParameterError
@@ -13,6 +14,11 @@ from cognee.infrastructure.engine.utils import parse_id
 from cognee.shared.logging_utils import get_logger
 from qdrant_client import AsyncQdrantClient, models
 
+from .quantization import (
+    build_quantization_config,
+    build_search_params,
+)
+
 logger = get_logger("QDrantAdapter")
 
 
@@ -21,24 +27,6 @@ class IndexSchema(DataPoint):
 
     metadata: dict = {"index_fields": ["text"]}
     belongs_to_set: List[str] = []
-
-
-def create_hnsw_config(hnsw_config: dict):
-    if hnsw_config is not None:
-        return models.HnswConfig()
-    return None
-
-
-def create_optimizers_config(optimizers_config: dict):
-    if optimizers_config is not None:
-        return models.OptimizersConfig()
-    return None
-
-
-def create_quantization_config(quantization_config: dict):
-    if quantization_config is not None:
-        return models.QuantizationConfig()
-    return None
 
 
 class QDrantAdapter(VectorDBInterface):
@@ -66,6 +54,13 @@ class QDrantAdapter(VectorDBInterface):
             self.url = url
             self.api_key = api_key
         self.VECTOR_DB_LOCK = asyncio.Lock()
+
+        if os.getenv("QDRANT_QUANTIZATION", "none").lower().startswith("tq"):
+            if not hasattr(models, "TurboQuantization"):
+                raise RuntimeError(
+                    "QDRANT_QUANTIZATION=tq* requires qdrant-client>=1.18. "
+                    "Run: pip install -U 'qdrant-client>=1.18'"
+                )
 
     def get_qdrant_client(self) -> AsyncQdrantClient:
         if self.qdrant_path is not None:
@@ -111,6 +106,7 @@ class QDrantAdapter(VectorDBInterface):
                         payload_m=16,
                         m=0,
                     ),
+                    quantization_config=build_quantization_config(),
                 )
                 # This index co-locates vectors from the same dataset together,
                 # which can improve performance
@@ -123,6 +119,25 @@ class QDrantAdapter(VectorDBInterface):
                     ),
                 )
 
+            await client.close()
+
+    async def update_quantization(
+        self,
+        collection_name: str,
+        quantization_config=None,
+    ):
+        """Apply or change the quantization config on an existing
+        collection without recreating it. Qdrant re-indexes in the
+        background; queries during rebuild may transparently fall back
+        to full vectors."""
+        config = quantization_config if quantization_config is not None else build_quantization_config()
+        client = self.get_qdrant_client()
+        try:
+            await client.update_collection(
+                collection_name=collection_name,
+                quantization_config=config,
+            )
+        finally:
             await client.close()
 
     async def create_data_points(self, collection_name: str, data_points: list[DataPoint]):
@@ -250,6 +265,7 @@ class QDrantAdapter(VectorDBInterface):
                 limit=limit,
                 with_vectors=with_vector,
                 with_payload=include_payload,
+                search_params=build_search_params(),
             )
 
             await client.close()
@@ -348,6 +364,7 @@ class QDrantAdapter(VectorDBInterface):
                 limit=limit,
                 with_vectors=with_vectors,
                 with_payload=include_payload,
+                search_params=build_search_params(),
             )
 
             await client.close()

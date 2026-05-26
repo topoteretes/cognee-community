@@ -39,5 +39,45 @@ Also, specify the dataset handler in the .env file:
 VECTOR_DATASET_DATABASE_HANDLER="qdrant"
 ```
 
+## Quantization
+
+The adapter supports Qdrant's quantization methods, including TurboQuant (introduced in Qdrant 1.18). Quantization compresses stored vectors and reduces memory cost; it is disabled by default.
+
+| Mode  | Compression | Notes                                                  |
+|-------|-------------|--------------------------------------------------------|
+| `tq4` | 8x          | TurboQuant 4-bit. Recommended default; SQ-level recall |
+| `tq2` | 16x         | TurboQuant 2-bit. Beats binary 2-bit by 9–24 pp        |
+| `tq1.5` | ~21x      | TurboQuant 1.5-bit                                     |
+| `tq1` | 32x         | TurboQuant 1-bit. Beats binary 1-bit by 9–21 pp        |
+| `sq`  | 4x          | Scalar int8 — safe baseline                            |
+| `bq1` | 32x         | Binary 1-bit                                           |
+| `bq2` | 16x         | Binary 2-bit                                           |
+| `pq`  | 16x         | Product quantization (compression ratio X16)           |
+| `none` | 1x         | No quantization (default, backward-compatible)         |
+
+Set the mode via env var:
+
+```dotenv
+QDRANT_QUANTIZATION=tq4
+QDRANT_QUANTIZATION_ALWAYS_RAM=true
+QDRANT_QUANTIZATION_RESCORE=true
+QDRANT_QUANTIZATION_OVERSAMPLING=2.0
+```
+
+Requires `qdrant-client>=1.18` and Qdrant server `>=1.18` for any `tq*` mode.
+
+### Migrating existing collections
+
+Setting `QDRANT_QUANTIZATION` only affects newly created collections. To enable quantization on an existing collection without re-ingesting data, call `update_quantization`:
+
+```python
+from cognee.infrastructure.databases.vector import get_vector_engine
+adapter = get_vector_engine()
+await adapter.update_quantization("Entity_name")
+await adapter.update_quantization("DocumentChunk_text")
+```
+
+Qdrant rebuilds the affected index in the background; queries during the rebuild transparently fall back to full vectors.
+
 ## Example
 See example in `example.py` file.
