@@ -1,6 +1,8 @@
 import os
 import pathlib
 
+import pytest
+
 import cognee
 from cognee.infrastructure.files.storage import get_storage_config
 from cognee.modules.data.models import Data
@@ -108,6 +110,25 @@ async def test_vector_engine_search_none_limit():
     # Check that we did not accidentally use any default value for limit
     # in vector search along the way (like 5, 10, or 15)
     assert len(result) > 15
+
+
+async def test_collection_has_turboquant_config():
+    """Verify that when QDRANT_QUANTIZATION=tq4 is set, newly created
+    collections carry the TurboQuant config on the Qdrant server."""
+    if os.getenv("QDRANT_QUANTIZATION", "").lower() != "tq4":
+        return  # only run when explicitly opted in via env
+
+    from cognee.infrastructure.databases.vector import get_vector_engine
+    adapter = get_vector_engine()
+    client = adapter.get_qdrant_client()
+    try:
+        info = await client.get_collection("Entity_name")
+        qc = info.config.quantization_config
+        assert qc is not None, "Expected TurboQuant config on Entity_name"
+        # qc is one of the union variants; assert it's TurboQuantization-shaped
+        assert hasattr(qc, "turbo") and qc.turbo.bits == "bits4"
+    finally:
+        await client.close()
 
 
 async def test_vector_engine_search_with_nodeset_filtering():
@@ -358,6 +379,8 @@ async def main():
     # and the second one depends on it. Done like this to minimize number of cognify invocations.
     await test_vector_nodeset_filtering_retriever_integration()
 
+    await test_collection_has_turboquant_config()
+
     await cognee.prune.prune_data()
     data_root_directory = get_storage_config()["data_root_directory"]
     assert not os.path.isdir(data_root_directory), "Local data files are not deleted"
@@ -365,6 +388,56 @@ async def main():
     await cognee.prune.prune_system(metadata=True)
     tables_in_database = await vector_engine.get_collection_names()
     assert len(tables_in_database) == 0, "Qdrant database is not empty"
+
+
+def test_build_quantization_config_default(monkeypatch):
+    from cognee_community_vector_adapter_qdrant.quantization import build_quantization_config
+    monkeypatch.delenv("QDRANT_QUANTIZATION", raising=False)
+    assert build_quantization_config() is None
+
+
+@pytest.mark.parametrize("kind,expected_bits", [
+    ("tq4",   "bits4"),
+    ("tq2",   "bits2"),
+    ("tq1.5", "bits1_5"),
+    ("tq1",   "bits1"),
+])
+def test_build_turboquant_config(monkeypatch, kind, expected_bits):
+    from cognee_community_vector_adapter_qdrant.quantization import build_quantization_config
+    from qdrant_client import models
+
+    monkeypatch.setenv("QDRANT_QUANTIZATION", kind)
+    cfg = build_quantization_config()
+    assert isinstance(cfg, models.TurboQuantization)
+    assert cfg.turbo.bits == expected_bits
+    assert cfg.turbo.always_ram is True
+
+
+def test_build_quantization_config_unknown(monkeypatch):
+    from cognee_community_vector_adapter_qdrant.quantization import build_quantization_config
+
+    monkeypatch.setenv("QDRANT_QUANTIZATION", "garbage")
+    with pytest.raises(ValueError):
+        build_quantization_config()
+
+
+def test_build_search_params_disabled(monkeypatch):
+    from cognee_community_vector_adapter_qdrant.quantization import build_search_params
+
+    monkeypatch.delenv("QDRANT_QUANTIZATION", raising=False)
+    assert build_search_params() is None
+
+
+def test_build_search_params_enabled(monkeypatch):
+    from cognee_community_vector_adapter_qdrant.quantization import build_search_params
+
+    monkeypatch.setenv("QDRANT_QUANTIZATION", "tq4")
+    monkeypatch.setenv("QDRANT_QUANTIZATION_OVERSAMPLING", "3.0")
+    params = build_search_params()
+    assert params is not None
+    assert params.quantization.rescore is True
+    assert params.quantization.oversampling == 3.0
+    assert params.quantization.ignore is False
 
 
 if __name__ == "__main__":
