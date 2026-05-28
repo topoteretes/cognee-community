@@ -113,6 +113,7 @@ class ValkeyAdapter(VectorDBInterface):
 
         cfg = GlideClientConfiguration(
             [NodeAddress(self._host, self._port)],
+            client_name="cognee_vector_store_client",
             use_tls=False,
             request_timeout=5000,
             reconnect_strategy=BackoffStrategy(num_of_retries=3, factor=1000, exponent_base=2),
