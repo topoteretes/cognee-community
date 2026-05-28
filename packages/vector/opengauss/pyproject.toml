@@ -1,0 +1,42 @@
+[project]
+name = "cognee-community-vector-adapter-opengauss"
+version = "0.1.0"
+description = "openGauss DataVec vector database adapter for cognee"
+readme = "README.md"
+requires-python = ">=3.11,<=3.13"
+dependencies = [
+    "psycopg2-binary>=2.9.9",
+    "cognee",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[dependency-groups]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=1.4.0",
+    "mypy>=1.20.2",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[tool.mypy]
+python_version = "3.12"
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_return_any = true
+no_implicit_optional = true
+check_untyped_defs = true
+disallow_any_generics = true
+strict_equality = true
+exclude = ["^\\.venv/"]
+
+[[tool.mypy.overrides]]
+module = [
+  "psycopg2.*",
+  "cognee.*",
+]
+ignore_missing_imports = true
