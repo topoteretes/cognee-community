@@ -99,6 +99,7 @@ poetry run python ./examples/example.py
 | `cognee-community-graph-adapter-networkx`    | Graph    | Networkx graph database adapter for cognee         |
 | `cognee-community-graph-adapter-spanner`    | Graph    | Google Cloud Spanner (Spanner Graph) adapter for cognee |
 | `cognee-community-graph-adapter-turingdb`   | Graph    | TuringDB graph database adapter for cognee         |
+| `cognee-community-graph-adapter-pggraph`    | Graph    | pgGraph adapter for cognee (Postgres + graph extension, experimental) |
 | `cognee-community-hybrid-adapter-duckdb`     | Hybrid   | DuckDB hybrid database adapter for cognee          |
 | `cognee-community-hybrid-adapter-falkor`     | Hybrid   | FalkorDB hybrid database adapter for cognee        |
 
