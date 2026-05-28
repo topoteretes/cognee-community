@@ -1,0 +1,6 @@
+.claude/
+.venv/
+__pycache__/
+*.py[co]
+.pytest_cache/
+.cognee_system/

@@ -1,0 +1,16 @@
+# Postgres for pgGraph adapter demos (port 5433 avoids local Postgres on 5432).
+services:
+  postgres:
+    image: postgres:16
+    container_name: cognee-community-pggraph-postgres
+    environment:
+      POSTGRES_USER: cognee
+      POSTGRES_PASSWORD: cognee
+      POSTGRES_DB: cognee
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cognee -d cognee"]
+      interval: 3s
+      timeout: 5s
+      retries: 15
