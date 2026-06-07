@@ -25,6 +25,7 @@ All TurboPuffer SDK calls are synchronous; they are wrapped in
 
 import asyncio
 import json
+import uuid
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 import turbopuffer
@@ -42,6 +43,12 @@ logger = get_logger("TurbopufferGraphAdapter")
 
 # TurboPuffer caps a single query at 10,000 returned rows; we page/chunk below it.
 _MAX_QUERY_ROWS = 10000
+
+# Fixed namespace for deterministic edge ids. TurboPuffer caps string ids at 64
+# bytes; "{source}__{rel}__{target}" with UUID endpoints (83+ bytes) overflows it,
+# so the composite key is hashed into a uuid5 (36 bytes). source_id, target_id and
+# relationship_name are stored as attributes, so nothing ever parses the edge id.
+_EDGE_ID_NAMESPACE = uuid.UUID("8f6e0a1c-7b2d-5e44-9a3f-1c2d3e4f5a6b")
 
 # Core node attributes stored as first-class TurboPuffer columns. Everything else
 # is folded into the JSON ``properties`` attribute.
@@ -91,7 +98,8 @@ class TurbopufferGraphAdapter(GraphDBInterface):
 
     @staticmethod
     def _edge_id(source_id: str, relationship_name: str, target_id: str) -> str:
-        return f"{source_id}__{relationship_name}__{target_id}"
+        # Deterministic, fixed-length (<=64 byte) id; see _EDGE_ID_NAMESPACE.
+        return str(uuid.uuid5(_EDGE_ID_NAMESPACE, f"{source_id}__{relationship_name}__{target_id}"))
 
     @staticmethod
     def _serialize_properties(props: Optional[Dict[str, Any]]) -> str:

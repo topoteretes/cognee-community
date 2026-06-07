@@ -101,6 +101,26 @@ async def test_add_and_has_edge(adapter):
     assert await adapter.has_edge("Alice", "WhiteRabbit", "loathes") is False
 
 
+async def test_add_edges_with_uuid_ids(adapter):
+    """Real cognee node ids are UUIDs; the synthetic edge id must stay within
+    TurboPuffer's 64-byte id limit (regression: "{src}__{rel}__{tgt}" with two
+    UUIDs is 83 bytes and 400s)."""
+    import uuid
+
+    s, t = str(uuid.uuid4()), str(uuid.uuid4())
+    await adapter.add_nodes(
+        [
+            (s, {"name": "Alice", "type": "Entity"}),
+            (t, {"name": "White Rabbit", "type": "Entity"}),
+        ]
+    )
+    await adapter.add_edge(s, t, "follows", {})
+
+    assert await adapter.has_edge(s, t, "follows") is True
+    edges = await adapter.get_edges(s)
+    assert any(e[0] == s and e[1] == t and e[2] == "follows" for e in edges)
+
+
 async def test_add_edges_batch_and_has_edges(adapter):
     await adapter.add_nodes(demo_node_tuples())
     edges = demo_edge_tuples()
