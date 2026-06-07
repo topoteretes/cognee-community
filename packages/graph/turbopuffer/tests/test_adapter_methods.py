@@ -101,6 +101,20 @@ async def test_add_and_has_edge(adapter):
     assert await adapter.has_edge("Alice", "WhiteRabbit", "loathes") is False
 
 
+async def test_large_node_property_not_truncated(adapter):
+    """A node property bigger than TurboPuffer's 4096-byte filterable-attribute
+    limit (e.g. a DocumentChunk's text) must round-trip intact — it lives in the
+    non-filterable `properties` blob and must not be clamped/corrupted."""
+    big_text = "wonderland " * 1200  # ~13KB, well over 4096 bytes
+
+    await adapter.add_nodes(
+        [("chunk1", {"name": "", "type": "DocumentChunk", "text": big_text})]
+    )
+    node = await adapter.get_node("chunk1")
+    assert node is not None
+    assert node["text"] == big_text  # full content preserved, not truncated
+
+
 async def test_add_edges_with_uuid_ids(adapter):
     """Real cognee node ids are UUIDs; the synthetic edge id must stay within
     TurboPuffer's 64-byte id limit (regression: "{src}__{rel}__{tgt}" with two

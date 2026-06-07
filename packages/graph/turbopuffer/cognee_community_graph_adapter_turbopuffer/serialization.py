@@ -32,11 +32,21 @@ def _serialize_value(value):
     return value
 
 
-def _truncate_large_values(payload: dict) -> dict:
-    """Truncate string values exceeding turbopuffer's filterable attribute limit."""
+def _truncate_large_values(payload: dict, skip_keys=()) -> dict:
+    """Truncate string values exceeding turbopuffer's filterable attribute limit.
+
+    Keys in ``skip_keys`` are left intact — used for non-filterable blob columns
+    (e.g. the JSON ``properties`` payload) which must not be clamped to 4096 bytes
+    or their content (e.g. a DocumentChunk's text) would be corrupted.
+    """
+    skip = set(skip_keys)
     result = {}
     for key, value in payload.items():
-        if isinstance(value, str) and len(value.encode("utf-8")) > _MAX_ATTR_BYTES:
+        if (
+            key not in skip
+            and isinstance(value, str)
+            and len(value.encode("utf-8")) > _MAX_ATTR_BYTES
+        ):
             encoded = value.encode("utf-8")[: _MAX_ATTR_BYTES - 3]
             result[key] = encoded.decode("utf-8", errors="ignore") + "..."
         else:
@@ -127,17 +137,26 @@ def _merge_turbopuffer_types(existing_type: str, new_type: str) -> str:
     return existing_type
 
 
-def _build_row_schema(rows: list[dict]) -> dict:
+def _build_row_schema(rows: list[dict], non_filterable=()) -> dict:
     """Infer a TurboPuffer write schema from row values alone.
 
     The graph adapter writes plain dict rows (not DataPoint instances), so the
     schema is inferred from the actual values, widening numeric types when a
     field appears with mixed int/float values across rows.
+
+    Keys in ``non_filterable`` are declared as non-filterable string columns so
+    they are exempt from the 4096-byte filterable-attribute limit and can hold
+    large blobs (e.g. the JSON ``properties`` payload) without truncation.
     """
+    non_filterable = set(non_filterable)
     schema: dict = {}
     for row in rows:
         for key, value in row.items():
             if key in ("id", "vector"):
+                continue
+            if key in non_filterable:
+                # Non-filterable string blob: no 4096-byte limit, never filtered.
+                schema[key] = {"type": "string", "filterable": False}
                 continue
             if value is None:
                 continue

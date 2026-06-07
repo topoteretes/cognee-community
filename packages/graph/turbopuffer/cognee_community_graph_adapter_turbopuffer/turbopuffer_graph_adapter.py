@@ -280,7 +280,8 @@ class TurbopufferGraphAdapter(GraphDBInterface):
             "belongs_to_set": belongs_to_set,
             "properties": self._serialize_properties(extra),
         }
-        return _truncate_large_values(row)
+        # Never truncate the properties blob (non-filterable; holds e.g. chunk text).
+        return _truncate_large_values(row, skip_keys={"properties"})
 
     async def add_nodes(self, nodes: Union[List[Tuple[str, Dict]], List[DataPoint]]) -> None:
         if not nodes:
@@ -290,7 +291,7 @@ class TurbopufferGraphAdapter(GraphDBInterface):
         # Deduplicate by id (last wins) so a single write batch never conflicts.
         rows = list({r["id"]: r for r in rows}.values())
 
-        schema = _build_row_schema(rows)
+        schema = _build_row_schema(rows, non_filterable={"properties"})
         await asyncio.to_thread(
             self._node_namespace().write,
             upsert_rows=rows,
@@ -347,12 +348,12 @@ class TurbopufferGraphAdapter(GraphDBInterface):
                 "target_type": tgt_type or "",
                 "properties": self._serialize_properties(raw_props),
             }
-            rows.append(_truncate_large_values(row))
+            rows.append(_truncate_large_values(row, skip_keys={"properties"}))
 
         # Deduplicate by edge id (last wins) within the batch.
         rows = list({r["id"]: r for r in rows}.values())
 
-        schema = _build_row_schema(rows)
+        schema = _build_row_schema(rows, non_filterable={"properties"})
         await asyncio.to_thread(
             self._edge_namespace().write,
             upsert_rows=rows,
