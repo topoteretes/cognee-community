@@ -23,10 +23,10 @@ from qdrant_client import models
 
 
 _TQ_BITS = {
-    "tq4":   models.TurboQuantBitSize.BITS4,
-    "tq2":   models.TurboQuantBitSize.BITS2,
+    "tq4": models.TurboQuantBitSize.BITS4,
+    "tq2": models.TurboQuantBitSize.BITS2,
     "tq1.5": models.TurboQuantBitSize.BITS1_5,
-    "tq1":   models.TurboQuantBitSize.BITS1,
+    "tq1": models.TurboQuantBitSize.BITS1,
 }
 
 

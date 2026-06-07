@@ -146,9 +146,7 @@ class PgGraphAdapter(PostgresAdapter):
         self._pggraph_ready = False
         try:
             async with self._session() as session:
-                available = (
-                    await session.execute(text(queries.EXTENSION_AVAILABLE))
-                ).scalar()
+                available = (await session.execute(text(queries.EXTENSION_AVAILABLE))).scalar()
                 if not available:
                     logger.info(
                         "pgGraph extension not installed on this Postgres server; "
@@ -180,8 +178,7 @@ class PgGraphAdapter(PostgresAdapter):
                 await session.execute(text(queries.REGISTER_NODE_TABLE))
 
             edges = {
-                row[0]
-                for row in (await session.execute(text(queries.REGISTERED_EDGES))).fetchall()
+                row[0] for row in (await session.execute(text(queries.REGISTERED_EDGES))).fetchall()
             }
             if "cognee_edge" not in edges:
                 await session.execute(text(queries.REGISTER_EDGE_TABLE))

@@ -172,7 +172,9 @@ class SingleStoreAdapter(VectorDBInterface):
             ],
         )
 
-    async def retrieve(self, collection_name: str, data_point_ids: list[str]) -> list[dict[str, Any]]:
+    async def retrieve(
+        self, collection_name: str, data_point_ids: list[str]
+    ) -> list[dict[str, Any]]:
         if not data_point_ids or not await self.has_collection(collection_name):
             return []
 
@@ -221,9 +223,7 @@ class SingleStoreAdapter(VectorDBInterface):
             return []
 
         table_name = self._table_name(collection_name)
-        query_vector_json = json.dumps(
-            self._normalize_vector(query_vector), separators=(",", ":")
-        )
+        query_vector_json = json.dumps(self._normalize_vector(query_vector), separators=(",", ":"))
         select_payload = ", payload" if include_payload else ""
         select_vector = ", vector" if with_vector else ""
         filter_sql, filter_params = self._build_filter(node_name, node_name_filter_operator)

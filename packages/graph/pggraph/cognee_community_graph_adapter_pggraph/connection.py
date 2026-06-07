@@ -19,9 +19,9 @@ def _normalize_scheme(url: str) -> str:
         # clear error if the chosen driver isn't async-capable.
         return url
     if url.startswith("postgresql://"):
-        return f"{_ASYNC_DRIVER}://" + url[len("postgresql://"):]
+        return f"{_ASYNC_DRIVER}://" + url[len("postgresql://") :]
     if url.startswith("postgres://"):
-        return f"{_ASYNC_DRIVER}://" + url[len("postgres://"):]
+        return f"{_ASYNC_DRIVER}://" + url[len("postgres://") :]
     return url
 
 
@@ -65,7 +65,4 @@ def resolve_connection_string(
             "Missing Postgres credentials. Set GRAPH_DATABASE_* or DB_* environment variables."
         )
 
-    return (
-        f"{_ASYNC_DRIVER}://{db_username}:{db_password}"
-        f"@{db_host}:{db_port}/{db_name}"
-    )
+    return f"{_ASYNC_DRIVER}://{db_username}:{db_password}@{db_host}:{db_port}/{db_name}"

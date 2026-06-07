@@ -130,7 +130,9 @@ class QDrantAdapter(VectorDBInterface):
         collection without recreating it. Qdrant re-indexes in the
         background; queries during rebuild may transparently fall back
         to full vectors."""
-        config = quantization_config if quantization_config is not None else build_quantization_config()
+        config = (
+            quantization_config if quantization_config is not None else build_quantization_config()
+        )
         client = self.get_qdrant_client()
         try:
             await client.update_collection(

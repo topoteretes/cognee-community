@@ -111,17 +111,11 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
                 )
                 logger.info("Bolt driver initialized at %s", bolt_url)
             except ImportError:
-                logger.info(
-                    "neo4j package not installed, using HTTP for Cypher"
-                )
+                logger.info("neo4j package not installed, using HTTP for Cypher")
             except Exception as e:
-                logger.info(
-                    "Could not initialize Bolt driver: %s, using HTTP", e
-                )
+                logger.info("Could not initialize Bolt driver: %s, using HTTP", e)
 
-        self.embedding_engine = (
-            get_embedding_engine() if not embedding_engine else embedding_engine
-        )
+        self.embedding_engine = get_embedding_engine() if not embedding_engine else embedding_engine
 
         # Track which vector indexes have been created this session
         self._vector_indexes: set[str] = set()
@@ -217,9 +211,7 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
         if not values_to_embed:
             return
 
-        vectors = await self.embed_data(
-            [prop_value for _, prop_value in values_to_embed]
-        )
+        vectors = await self.embed_data([prop_value for _, prop_value in values_to_embed])
         escaped_node_id = self._escape_sql_literal(node_id)
         escaped_node_type = self._escape_sql_literal(node_type)
 
@@ -240,9 +232,7 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
 
     def _get_auth(self) -> Optional[aiohttp.BasicAuth]:
         if self.graph_database_username and self.graph_database_password:
-            return aiohttp.BasicAuth(
-                self.graph_database_username, self.graph_database_password
-            )
+            return aiohttp.BasicAuth(self.graph_database_username, self.graph_database_password)
         return None
 
     async def _ensure_database(self) -> None:
@@ -263,9 +253,7 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
 
         async with aiohttp.ClientSession(auth=self._get_auth()) as session:
             # Step 1: check if the database already exists
-            exists_url = (
-                f"{self.http_base_url}/api/v1/exists/{self.database_name}"
-            )
+            exists_url = f"{self.http_base_url}/api/v1/exists/{self.database_name}"
             async with session.get(exists_url) as resp:
                 exists_body = await resp.text()
                 if resp.status == 200:
@@ -288,9 +276,7 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
             async with session.post(create_url, json=payload) as resp:
                 body = await resp.text()
                 if resp.status == 200:
-                    logger.info(
-                        "Created ArcadeDB database '%s'", self.database_name
-                    )
+                    logger.info("Created ArcadeDB database '%s'", self.database_name)
                     self._database_ensured = True
                 elif "already exists" in body.lower():
                     self._database_ensured = True
@@ -303,10 +289,7 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
                         f"manually or supply root credentials."
                     )
                 else:
-                    raise RuntimeError(
-                        f"ArcadeDB create database failed "
-                        f"({resp.status}): {body}"
-                    )
+                    raise RuntimeError(f"ArcadeDB create database failed ({resp.status}): {body}")
 
     async def _http_request(
         self,
@@ -336,24 +319,18 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
                         await _asyncio.sleep(0.3 * (attempt + 1))
                         continue
                     if resp.status != 200:
-                        raise RuntimeError(
-                            f"ArcadeDB HTTP error ({resp.status}): {body}"
-                        )
+                        raise RuntimeError(f"ArcadeDB HTTP error ({resp.status}): {body}")
                     return json.loads(body)
         # Should not reach here, but just in case
         raise RuntimeError(f"ArcadeDB HTTP error (503): {body}")
 
     async def _sql(self, sql: str) -> dict:
         """Execute an SQL command via HTTP."""
-        return await self._http_request(
-            "command", {"language": "sql", "command": sql}
-        )
+        return await self._http_request("command", {"language": "sql", "command": sql})
 
     async def _sql_query(self, sql: str) -> dict:
         """Execute an SQL read query via HTTP."""
-        return await self._http_request(
-            "query", {"language": "sql", "command": sql}
-        )
+        return await self._http_request("query", {"language": "sql", "command": sql})
 
     async def _cypher_via_http(
         self,
@@ -376,9 +353,7 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
         from neo4j.exceptions import ServiceUnavailable
 
         try:
-            async with self._bolt_driver.session(
-                database=self.database_name
-            ) as session:
+            async with self._bolt_driver.session(database=self.database_name) as session:
                 result = await session.run(cypher, params)
                 records = await result.data()
 
@@ -420,20 +395,14 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
             if not self._bolt_verified:
                 # First call: verify Bolt connectivity
                 try:
-                    result = await self._cypher_via_bolt(
-                        "RETURN true AS ok"
-                    )
+                    result = await self._cypher_via_bolt("RETURN true AS ok")
                     if result and result[0].get("ok"):
                         self._bolt_verified = True
-                        logger.info(
-                            "Bolt protocol verified, using Bolt for Cypher"
-                        )
+                        logger.info("Bolt protocol verified, using Bolt for Cypher")
                     else:
                         raise RuntimeError("Bolt verification returned no data")
                 except Exception as e:
-                    logger.info(
-                        "Bolt verification failed: %s, using HTTP", e
-                    )
+                    logger.info("Bolt verification failed: %s, using HTTP", e)
                     self._bolt_driver = None
 
             if self._bolt_driver is not None:
@@ -597,9 +566,7 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
             },
         )
 
-    async def add_edges(
-        self, edges: list[tuple[str, str, str, dict[str, Any]]]
-    ) -> None:
+    async def add_edges(self, edges: list[tuple[str, str, str, dict[str, Any]]]) -> None:
         if not edges:
             return []
 
@@ -610,9 +577,7 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
                 "source_node_id": str(src),
                 "target_node_id": str(dst),
             }
-            results.append(
-                await self.add_edge(src, dst, rel_type, edge_properties)
-            )
+            results.append(await self.add_edge(src, dst, rel_type, edge_properties))
 
         return results
 
@@ -623,19 +588,14 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
             {"node_id": node_id},
         )
         return [
-            (r["source_id"], r["target_id"], {"relationship_name": r["rel_type"]})
-            for r in results
+            (r["source_id"], r["target_id"], {"relationship_name": r["rel_type"]}) for r in results
         ]
 
     async def get_disconnected_nodes(self) -> list[str]:
-        results = await self._cypher(
-            "MATCH (n) WHERE NOT (n)--() RETURN collect(n.id) AS ids"
-        )
+        results = await self._cypher("MATCH (n) WHERE NOT (n)--() RETURN collect(n.id) AS ids")
         return results[0]["ids"] if results else []
 
-    async def get_predecessors(
-        self, node_id: str, edge_label: Optional[str] = None
-    ) -> list[str]:
+    async def get_predecessors(self, node_id: str, edge_label: Optional[str] = None) -> list[str]:
         if edge_label is not None:
             results = await self._cypher(
                 "MATCH (node)<-[r]-(predecessor) "
@@ -645,15 +605,12 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
             )
         else:
             results = await self._cypher(
-                "MATCH (node)<-[r]-(predecessor) "
-                "WHERE node.id = $node_id RETURN predecessor",
+                "MATCH (node)<-[r]-(predecessor) WHERE node.id = $node_id RETURN predecessor",
                 {"node_id": node_id},
             )
         return results
 
-    async def get_successors(
-        self, node_id: str, edge_label: Optional[str] = None
-    ) -> list[str]:
+    async def get_successors(self, node_id: str, edge_label: Optional[str] = None) -> list[str]:
         if edge_label is not None:
             results = await self._cypher(
                 "MATCH (node)-[r]->(successor) "
@@ -663,8 +620,7 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
             )
         else:
             results = await self._cypher(
-                "MATCH (node)-[r]->(successor) "
-                "WHERE node.id = $node_id RETURN successor",
+                "MATCH (node)-[r]->(successor) WHERE node.id = $node_id RETURN successor",
                 {"node_id": node_id},
             )
         return results
@@ -706,13 +662,9 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
 
         connections = []
         for r in predecessors:
-            connections.append(
-                (r["src"], {"relationship_name": r["rel"]}, r["dst"])
-            )
+            connections.append((r["src"], {"relationship_name": r["rel"]}, r["dst"]))
         for r in successors:
-            connections.append(
-                (r["src"], {"relationship_name": r["rel"]}, r["dst"])
-            )
+            connections.append((r["src"], {"relationship_name": r["rel"]}, r["dst"]))
         return connections
 
     async def remove_connection_to_predecessors_of(
@@ -763,8 +715,7 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
 
     async def get_graph_data(self):
         result = await self._cypher_projection(
-            "MATCH (n) RETURN n.id AS id, labels(n) AS labels, "
-            "properties(n) AS properties"
+            "MATCH (n) RETURN n.id AS id, labels(n) AS labels, properties(n) AS properties"
         )
         nodes = [(r["id"], r["properties"]) for r in result]
 
@@ -772,15 +723,10 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
             "MATCH (n)-[r]->(m) RETURN n.id AS source, m.id AS target, "
             "TYPE(r) AS type, properties(r) AS properties"
         )
-        edges = [
-            (r["source"], r["target"], r["type"], r["properties"])
-            for r in result
-        ]
+        edges = [(r["source"], r["target"], r["type"], r["properties"]) for r in result]
         return (nodes, edges)
 
-    async def get_triplets_batch(
-        self, offset: int = 0, limit: int = 100
-    ) -> list[dict[str, Any]]:
+    async def get_triplets_batch(self, offset: int = 0, limit: int = 100) -> list[dict[str, Any]]:
         """
         Return graph triplets in the structure expected by cognee memify.
 
@@ -874,8 +820,7 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
         all_ids = list(set(primary_ids + neighbor_ids))
 
         nodes_result = await self._cypher_projection(
-            "MATCH (n) WHERE n.id IN $ids "
-            "RETURN n.id AS id, properties(n) AS properties",
+            "MATCH (n) WHERE n.id IN $ids RETURN n.id AS id, properties(n) AS properties",
             {"ids": all_ids},
         )
         nodes = [(r["id"], r["properties"]) for r in nodes_result]
@@ -886,10 +831,7 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
             "type(r) AS type, properties(r) AS properties",
             {"ids": all_ids},
         )
-        edges = [
-            (r["source"], r["target"], r["type"], r["properties"])
-            for r in edges_result
-        ]
+        edges = [(r["source"], r["target"], r["type"], r["properties"]) for r in edges_result]
         return nodes, edges
 
     async def get_filtered_graph_data(self, attribute_filters):
@@ -905,9 +847,7 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
                 if not values:
                     continue
                 param_name = f"values_{i}_{attr}"
-                normalized = [
-                    str(v) if isinstance(v, UUID) else v for v in values
-                ]
+                normalized = [str(v) if isinstance(v, UUID) else v for v in values]
                 where_clauses_n.append(f"n.{attr} IN ${param_name}")
                 where_clauses_m.append(f"m.{attr} IN ${param_name}")
                 params[param_name] = normalized
@@ -916,14 +856,10 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
             return await self.get_graph_data()
 
         node_where = " AND ".join(where_clauses_n)
-        edge_where = (
-            f"{' AND '.join(where_clauses_n)} AND "
-            f"{' AND '.join(where_clauses_m)}"
-        )
+        edge_where = f"{' AND '.join(where_clauses_n)} AND {' AND '.join(where_clauses_m)}"
 
         result_nodes = await self._cypher_projection(
-            f"MATCH (n) WHERE {node_where} "
-            "RETURN n.id AS id, properties(n) AS properties",
+            f"MATCH (n) WHERE {node_where} RETURN n.id AS id, properties(n) AS properties",
             params,
         )
         nodes = [(r["id"], r["properties"]) for r in result_nodes]
@@ -934,49 +870,30 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
             "TYPE(r) AS type, properties(r) AS properties",
             params,
         )
-        edges = [
-            (r["source"], r["target"], r["type"], r["properties"])
-            for r in result_edges
-        ]
+        edges = [(r["source"], r["target"], r["type"], r["properties"]) for r in result_edges]
         return (nodes, edges)
 
     async def get_graph_metrics(self, include_optional=False):
         try:
-            node_count = await self._cypher(
-                "MATCH (n) RETURN count(n) AS cnt"
-            )
-            edge_count = await self._cypher(
-                "MATCH ()-[r]->() RETURN count(r) AS cnt"
-            )
+            node_count = await self._cypher("MATCH (n) RETURN count(n) AS cnt")
+            edge_count = await self._cypher("MATCH ()-[r]->() RETURN count(r) AS cnt")
             num_nodes = node_count[0]["cnt"] if node_count else 0
             num_edges = edge_count[0]["cnt"] if edge_count else 0
 
             metrics = {
                 "num_nodes": num_nodes,
                 "num_edges": num_edges,
-                "mean_degree": (
-                    (2 * num_edges) / num_nodes if num_nodes > 0 else 0
-                ),
-                "edge_density": (
-                    num_edges / (num_nodes * (num_nodes - 1))
-                    if num_nodes > 1
-                    else 0
-                ),
+                "mean_degree": ((2 * num_edges) / num_nodes if num_nodes > 0 else 0),
+                "edge_density": (num_edges / (num_nodes * (num_nodes - 1)) if num_nodes > 1 else 0),
                 "num_connected_components": 1 if num_nodes > 0 else 0,
-                "sizes_of_connected_components": (
-                    [num_nodes] if num_nodes > 0 else []
-                ),
+                "sizes_of_connected_components": ([num_nodes] if num_nodes > 0 else []),
             }
 
             if include_optional:
-                self_loops = await self._cypher(
-                    "MATCH (n)-[r]->(n) RETURN COUNT(r) AS cnt"
-                )
+                self_loops = await self._cypher("MATCH (n)-[r]->(n) RETURN COUNT(r) AS cnt")
                 metrics.update(
                     {
-                        "num_selfloops": (
-                            self_loops[0]["cnt"] if self_loops else 0
-                        ),
+                        "num_selfloops": (self_loops[0]["cnt"] if self_loops else 0),
                         "diameter": -1,
                         "avg_shortest_path_length": -1,
                         "avg_clustering": -1,
@@ -1056,8 +973,7 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
 
         # Step 2: Fetch all nodes
         nodes_result = await self._cypher_projection(
-            "MATCH (n) WHERE n.id IN $ids "
-            "RETURN n.id AS id, properties(n) AS properties",
+            "MATCH (n) WHERE n.id IN $ids RETURN n.id AS id, properties(n) AS properties",
             {"ids": all_ids},
         )
         nodes = []
@@ -1081,12 +997,14 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
             props = record.get("properties", {})
             if not isinstance(props, dict):
                 props = dict(props)
-            edges.append((
-                record["source"],
-                record["target"],
-                record["type"],
-                props,
-            ))
+            edges.append(
+                (
+                    record["source"],
+                    record["target"],
+                    record["type"],
+                    props,
+                )
+            )
 
         return (nodes, edges)
 
@@ -1113,38 +1031,22 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
 
     async def has_collection(self, collection_name: str) -> bool:
         """Check if a vertex type (collection) exists in ArcadeDB."""
-        type_name = (
-            collection_name.split("_")[0]
-            if "_" in collection_name
-            else collection_name
-        )
+        type_name = collection_name.split("_")[0] if "_" in collection_name else collection_name
         try:
-            await self._sql(
-                f"SELECT count(*) AS cnt FROM `{type_name}` LIMIT 0"
-            )
+            await self._sql(f"SELECT count(*) AS cnt FROM `{type_name}` LIMIT 0")
             return True
         except RuntimeError:
             return False
 
-    async def create_collection(
-        self, collection_name: str, payload_schema: Optional[Any] = None
-    ):
+    async def create_collection(self, collection_name: str, payload_schema: Optional[Any] = None):
         """Create a vertex type in ArcadeDB if it does not exist."""
-        type_name = (
-            collection_name.split("_")[0]
-            if "_" in collection_name
-            else collection_name
-        )
+        type_name = collection_name.split("_")[0] if "_" in collection_name else collection_name
         try:
-            await self._sql(
-                f"CREATE VERTEX TYPE `{type_name}` IF NOT EXISTS"
-            )
+            await self._sql(f"CREATE VERTEX TYPE `{type_name}` IF NOT EXISTS")
         except RuntimeError:
             pass
 
-    async def create_vector_index(
-        self, index_name: str, index_property_name: str
-    ) -> None:
+    async def create_vector_index(self, index_name: str, index_property_name: str) -> None:
         """Create an LSM_VECTOR (HNSW) index on the shared Vertex storage."""
         vector_prop = f"{index_property_name}_vector"
         storage_type = await self._vector_storage_type()
@@ -1162,8 +1064,7 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
 
         try:
             await self._sql(
-                f"CREATE PROPERTY `{storage_type}`.`{vector_prop}` "
-                "IF NOT EXISTS ARRAY_OF_FLOATS"
+                f"CREATE PROPERTY `{storage_type}`.`{vector_prop}` IF NOT EXISTS ARRAY_OF_FLOATS"
             )
         except RuntimeError:
             pass
@@ -1187,9 +1088,7 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
             else:
                 raise
 
-    async def create_data_points(
-        self, collection_name: str, data_points: list[DataPoint]
-    ):
+    async def create_data_points(self, collection_name: str, data_points: list[DataPoint]):
         """Embed and store data points as vertices with vector properties."""
         if not data_points:
             return
@@ -1213,11 +1112,7 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
                     vector_map[key][prop_name] = None
 
         # Batch embed all values at once
-        vectorized_values = (
-            await self.embed_data(embeddable_values)
-            if embeddable_values
-            else []
-        )
+        vectorized_values = await self.embed_data(embeddable_values) if embeddable_values else []
 
         for dp in data_points:
             node_label = type(dp).__name__
@@ -1286,9 +1181,7 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
     ) -> list:
         """Perform vector similarity search using ArcadeDB's vectorNeighbors()."""
         if query_text is None and query_vector is None:
-            raise ValueError(
-                "Either query_text or query_vector must be provided"
-            )
+            raise ValueError("Either query_text or query_vector must be provided")
 
         if query_text and not query_vector:
             query_vector = (await self.embed_data([query_text]))[0]
@@ -1355,9 +1248,7 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
                 payload_data = {
                     k: v
                     for k, v in record.items()
-                    if k
-                    not in ("@rid", "@cat", "@type", "distance")
-                    and not k.endswith("_vector")
+                    if k not in ("@rid", "@cat", "@type", "distance") and not k.endswith("_vector")
                 }
                 if "name" in payload_data:
                     payload_data["text"] = payload_data["name"]
@@ -1401,9 +1292,7 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
         )
         return results
 
-    async def delete_data_points(
-        self, collection_name: str, data_point_ids: list[UUID]
-    ):
+    async def delete_data_points(self, collection_name: str, data_point_ids: list[UUID]):
         """Delete data points by their IDs."""
         return await self._cypher(
             "MATCH (node) WHERE node.id IN $node_ids DETACH DELETE node",
@@ -1440,26 +1329,14 @@ class ArcadeDBVectorAdapter(ArcadeDBAdapter):
 
         if isinstance(graph_config, dict):
             graph_database_url = graph_config.get("graph_database_url") or url
-            graph_database_username = graph_config.get(
-                "graph_database_username"
-            )
-            graph_database_password = graph_config.get(
-                "graph_database_password"
-            )
+            graph_database_username = graph_config.get("graph_database_username")
+            graph_database_password = graph_config.get("graph_database_password")
             graph_database_name = graph_config.get("graph_database_name")
         else:
-            graph_database_url = (
-                getattr(graph_config, "graph_database_url", None) or url
-            )
-            graph_database_username = getattr(
-                graph_config, "graph_database_username", None
-            )
-            graph_database_password = getattr(
-                graph_config, "graph_database_password", None
-            )
-            graph_database_name = getattr(
-                graph_config, "graph_database_name", None
-            )
+            graph_database_url = getattr(graph_config, "graph_database_url", None) or url
+            graph_database_username = getattr(graph_config, "graph_database_username", None)
+            graph_database_password = getattr(graph_config, "graph_database_password", None)
+            graph_database_name = getattr(graph_config, "graph_database_name", None)
 
         super().__init__(
             graph_database_url=graph_database_url,

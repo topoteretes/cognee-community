@@ -5,11 +5,13 @@ from os import path
 
 import cognee
 from cognee import config
+
 # NOTE: Importing the register module we let cognee know it can use the Qdrant vector adapter
 # NOTE: The "noqa: F401" mark is to make sure the linter doesn't flag this as an unused import
 from cognee_community_vector_adapter_qdrant import register  # noqa: F401
 
 from dotenv import load_dotenv
+
 load_dotenv()
 
 MY_PREFERENCE = """
@@ -18,6 +20,7 @@ MY_PREFERENCE = """
 - I prefer Vegetarian meals. Use this when I ask for restaurants recommendation
 - My hobbies that might also help in planning Itineraries: I love Anime, F1 and Cricket.
 """
+
 
 async def main():
     system_path = pathlib.Path(__file__).parent
@@ -30,13 +33,15 @@ async def main():
             "vector_db_provider": "qdrant",
             "vector_db_url": os.getenv("QDRANT_API_URL", "http://localhost:6333"),
             "vector_db_key": os.getenv("QDRANT_API_KEY", ""),
-            "vector_dataset_database_handler":"qdrant"
+            "vector_dataset_database_handler": "qdrant",
         }
     )
-    config.set_graph_db_config({
-        "graph_database_provider": "kuzu",
-        "graph_dataset_database_handler": "kuzu",
-    })
+    config.set_graph_db_config(
+        {
+            "graph_database_provider": "kuzu",
+            "graph_dataset_database_handler": "kuzu",
+        }
+    )
     await cognee.remember(MY_PREFERENCE)
 
     query_text = "plan a 3 days Itinerary for Berlin along with restaurants to try food."
@@ -44,6 +49,7 @@ async def main():
 
     for result_text in search_results:
         print(result_text)
+
 
 if __name__ == "__main__":
     asyncio.run(main())

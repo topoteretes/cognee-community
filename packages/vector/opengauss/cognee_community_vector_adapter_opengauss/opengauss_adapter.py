@@ -40,9 +40,17 @@ class OpenGaussAdapter(VectorDBInterface):
         self.schema_name = schema_name or os.getenv("OPENGAUSS_SCHEMA_NAME", "cognee")
         self.embedding_engine = embedding_engine
         self.index_type = (index_type or os.getenv("OPENGAUSS_INDEX_TYPE", "HNSW")).upper()
-        self.distance_strategy = (distance_strategy or os.getenv("OPENGAUSS_DISTANCE_STRATEGY", "COSINE")).upper()
-        self.embedding_dimension = embedding_dimension or int(os.getenv("EMBEDDING_DIMENSIONS", "1536"))
-        self.create_index = os.getenv("OPENGAUSS_CREATE_INDEX", "false").lower() in ("true", "1", "yes")
+        self.distance_strategy = (
+            distance_strategy or os.getenv("OPENGAUSS_DISTANCE_STRATEGY", "COSINE")
+        ).upper()
+        self.embedding_dimension = embedding_dimension or int(
+            os.getenv("EMBEDDING_DIMENSIONS", "1536")
+        )
+        self.create_index = os.getenv("OPENGAUSS_CREATE_INDEX", "false").lower() in (
+            "true",
+            "1",
+            "yes",
+        )
 
         self._validate_config()
 
@@ -191,8 +199,7 @@ class OpenGaussAdapter(VectorDBInterface):
             )
             conn.commit()
             logger.info(
-                f"Created table {collection_name} "
-                f"(dim={vector_dim}, index={self.index_type})"
+                f"Created table {collection_name} (dim={vector_dim}, index={self.index_type})"
             )
 
         except Exception as e:
@@ -232,12 +239,14 @@ class OpenGaussAdapter(VectorDBInterface):
             try:
                 insert_data = []
                 for data_point, vector in zip(data_points, vectors):
-                    insert_data.append((
-                        str(data_point.id),
-                        str(vector).replace(" ", ""),
-                        self._get_text_content(data_point),
-                        json.dumps(getattr(data_point, "metadata", {})),
-                    ))
+                    insert_data.append(
+                        (
+                            str(data_point.id),
+                            str(vector).replace(" ", ""),
+                            self._get_text_content(data_point),
+                            json.dumps(getattr(data_point, "metadata", {})),
+                        )
+                    )
 
                 ids = [row[0] for row in insert_data]
                 cursor.execute(
@@ -252,9 +261,7 @@ class OpenGaussAdapter(VectorDBInterface):
                 )
                 conn.commit()
 
-                logger.info(
-                    f"Inserted {len(data_points)} rows into table: {collection_name}"
-                )
+                logger.info(f"Inserted {len(data_points)} rows into table: {collection_name}")
 
             except Exception as e:
                 conn.rollback()
@@ -333,9 +340,7 @@ class OpenGaussAdapter(VectorDBInterface):
         cursor = self._get_cursor()
         try:
             cursor.execute(
-                f"SELECT id, text, metadata, vector "
-                f"FROM {collection_name} "
-                f"WHERE id = ANY(%s);",
+                f"SELECT id, text, metadata, vector FROM {collection_name} WHERE id = ANY(%s);",
                 (data_point_ids,),
             )
             return [dict(row) for row in cursor.fetchall()]
@@ -409,17 +414,17 @@ class OpenGaussAdapter(VectorDBInterface):
             scored_results = []
             for row in cursor:
                 row_dict = dict(row)
-                scored_results.append(ScoredResult(
-                    id=row_dict["id"],
-                    score=row_dict.get("score", 0.0),
-                    payload={"text": row_dict.get("text")},
-                    metadata=row_dict.get("metadata", {}),
-                    vector=row_dict.get("vector") if with_vector else None,
-                ))
+                scored_results.append(
+                    ScoredResult(
+                        id=row_dict["id"],
+                        score=row_dict.get("score", 0.0),
+                        payload={"text": row_dict.get("text")},
+                        metadata=row_dict.get("metadata", {}),
+                        vector=row_dict.get("vector") if with_vector else None,
+                    )
+                )
 
-            logger.info(
-                f"Search in {collection_name} returned {len(scored_results)} results"
-            )
+            logger.info(f"Search in {collection_name} returned {len(scored_results)} results")
             return scored_results
 
         except Exception as e:
@@ -471,9 +476,7 @@ class OpenGaussAdapter(VectorDBInterface):
                 )
                 deleted_count = cursor.rowcount
                 conn.commit()
-                logger.info(
-                    f"Deleted {deleted_count} rows from table: {collection_name}"
-                )
+                logger.info(f"Deleted {deleted_count} rows from table: {collection_name}")
                 return {"deleted_count": deleted_count}
             except Exception as e:
                 conn.rollback()
@@ -515,8 +518,7 @@ class OpenGaussAdapter(VectorDBInterface):
         cursor = self._get_cursor()
         try:
             cursor.execute(
-                "SELECT table_name FROM information_schema.tables "
-                "WHERE table_schema = %s;",
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = %s;",
                 (self.schema_name,),
             )
             return [row["table_name"] for row in cursor.fetchall()]

@@ -119,6 +119,7 @@ async def test_collection_has_turboquant_config():
         return  # only run when explicitly opted in via env
 
     from cognee.infrastructure.databases.vector import get_vector_engine
+
     adapter = get_vector_engine()
     client = adapter.get_qdrant_client()
     try:
@@ -392,16 +393,20 @@ async def main():
 
 def test_build_quantization_config_default(monkeypatch):
     from cognee_community_vector_adapter_qdrant.quantization import build_quantization_config
+
     monkeypatch.delenv("QDRANT_QUANTIZATION", raising=False)
     assert build_quantization_config() is None
 
 
-@pytest.mark.parametrize("kind,expected_bits", [
-    ("tq4",   "bits4"),
-    ("tq2",   "bits2"),
-    ("tq1.5", "bits1_5"),
-    ("tq1",   "bits1"),
-])
+@pytest.mark.parametrize(
+    "kind,expected_bits",
+    [
+        ("tq4", "bits4"),
+        ("tq2", "bits2"),
+        ("tq1.5", "bits1_5"),
+        ("tq1", "bits1"),
+    ],
+)
 def test_build_turboquant_config(monkeypatch, kind, expected_bits):
     from cognee_community_vector_adapter_qdrant.quantization import build_quantization_config
     from qdrant_client import models
