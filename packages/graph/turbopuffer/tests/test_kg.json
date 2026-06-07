@@ -1,0 +1,17 @@
+{
+  "_comment": "Deterministic Wonderland demo graph for unit/integration tests. Mirrors the structure of cognee/tests/integration/infrastructure/graph/test_kg.json (id/name/type/description nodes; source_node_id/target_node_id/relationship_name edges). Two node types (Person, Animal) so get_filtered_graph_data can be exercised. Alice is a hub node (multiple in/out edges) for get_neighbors/get_connections.",
+  "nodes": [
+    { "id": "Alice", "name": "Alice", "type": "Person", "description": "The curious girl who falls down the rabbit hole." },
+    { "id": "WhiteRabbit", "name": "White Rabbit", "type": "Person", "description": "The anxious rabbit Alice follows." },
+    { "id": "QueenOfHearts", "name": "Queen of Hearts", "type": "Person", "description": "The tyrannical ruler of Wonderland." },
+    { "id": "MadHatter", "name": "Mad Hatter", "type": "Person", "description": "Host of the perpetual tea party." },
+    { "id": "CheshireCat", "name": "Cheshire Cat", "type": "Animal", "description": "The grinning cat who can vanish." }
+  ],
+  "edges": [
+    { "source_node_id": "Alice", "target_node_id": "WhiteRabbit", "relationship_name": "follows" },
+    { "source_node_id": "Alice", "target_node_id": "MadHatter", "relationship_name": "meets" },
+    { "source_node_id": "WhiteRabbit", "target_node_id": "QueenOfHearts", "relationship_name": "serves" },
+    { "source_node_id": "MadHatter", "target_node_id": "CheshireCat", "relationship_name": "knows" },
+    { "source_node_id": "QueenOfHearts", "target_node_id": "Alice", "relationship_name": "summons" }
+  ]
+}
