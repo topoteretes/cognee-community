@@ -16,5 +16,8 @@ class TurbopufferGraphDatasetDatabaseHandler:
 
     async def delete_dataset(self, dataset_id: Any, **kwargs: Any) -> None:
         # Drop both namespaces for this dataset by delegating to the adapter's
-        # delete_graph(); implemented alongside the adapter.
-        raise NotImplementedError
+        # delete_graph(), bound to the dataset's namespace prefix.
+        from .turbopuffer_graph_adapter import TurbopufferGraphAdapter
+
+        adapter = TurbopufferGraphAdapter(database_name=str(dataset_id), **kwargs)
+        await adapter.delete_graph()
