@@ -197,30 +197,39 @@ async def test_get_filtered_graph_data_by_type(adapter):
 # --- nodeset subgraph ------------------------------------------------------
 
 
-async def test_get_nodeset_subgraph_or(adapter):
-    from cognee.modules.engine.models import NodeSet  # type used by the retriever
+# get_nodeset_subgraph matches nodes whose `type` == node_type.__name__ (the
+# Postgres/Neo4j contract). The demo nodes are type "Person", so the probe type
+# must be named "Person".
+class Person:
+    pass
 
+
+async def test_get_nodeset_subgraph_or(adapter):
     await adapter.add_nodes(demo_node_tuples())
     await adapter.add_edges(demo_edge_tuples())
 
+    # node_name matches the node NAME (not id); demo names have spaces.
     nodes, edges = await adapter.get_nodeset_subgraph(
-        node_type=NodeSet, node_name=["Alice", "MadHatter"], node_name_filter_operator="OR"
+        node_type=Person, node_name=["Alice", "Mad Hatter"], node_name_filter_operator="OR"
     )
     node_ids = {n[0] for n in nodes}
+    # Both named primaries are returned (by id), plus their 1-hop neighbors.
     assert {"Alice", "MadHatter"} <= node_ids
 
 
 async def test_get_nodeset_subgraph_and(adapter):
-    from cognee.modules.engine.models import NodeSet
-
     await adapter.add_nodes(demo_node_tuples())
     await adapter.add_edges(demo_edge_tuples())
 
-    # AND mode: only neighbors connected to ALL named primaries (client-side intersection).
+    # AND mode: keep only neighbors connected to ALL named primaries.
+    # QueenOfHearts is the sole node linked to both Alice (summons->Alice) and
+    # WhiteRabbit (serves->QueenOfHearts); MadHatter links to Alice only.
     nodes, edges = await adapter.get_nodeset_subgraph(
-        node_type=NodeSet, node_name=["Alice"], node_name_filter_operator="AND"
+        node_type=Person, node_name=["Alice", "White Rabbit"], node_name_filter_operator="AND"
     )
-    assert isinstance(nodes, list)
+    node_ids = {n[0] for n in nodes}
+    assert {"Alice", "WhiteRabbit", "QueenOfHearts"} <= node_ids
+    assert "MadHatter" not in node_ids
 
 
 # --- metrics: counts real, traversal-dependent ones are -1 -----------------

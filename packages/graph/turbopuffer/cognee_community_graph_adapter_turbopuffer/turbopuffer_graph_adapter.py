@@ -126,6 +126,22 @@ class TurbopufferGraphAdapter(GraphDBInterface):
         """Build a node dict from denormalized endpoint identity on an edge row."""
         return {"id": str(node_id), "name": name or "", "type": type_ or ""}
 
+    @staticmethod
+    def _is_namespace_missing(error: Exception) -> bool:
+        """TurboPuffer creates namespaces lazily on first write, so reads/deletes
+        against a not-yet-written namespace return 404. We treat that as empty."""
+        msg = str(error).lower()
+        return "404" in msg or "not found" in msg or "not_found" in msg
+
+    async def _safe_query(self, namespace, **kwargs):
+        """Run namespace.query, returning None if the namespace doesn't exist yet."""
+        try:
+            return await asyncio.to_thread(namespace.query, **kwargs)
+        except Exception as error:
+            if self._is_namespace_missing(error):
+                return None
+            raise
+
     async def _query_all(self, namespace, filters=None) -> List[Any]:
         """Cursor-scan a namespace deterministically (rank_by id asc), returning rows."""
         rows: List[Any] = []
@@ -147,7 +163,9 @@ class TurbopufferGraphAdapter(GraphDBInterface):
             if effective is not None:
                 kwargs["filters"] = effective
 
-            response = await asyncio.to_thread(namespace.query, **kwargs)
+            response = await self._safe_query(namespace, **kwargs)
+            if response is None:  # namespace not created yet -> empty
+                break
             page = response.rows or []
             rows.extend(page)
             if len(page) < _MAX_QUERY_ROWS:
@@ -163,12 +181,14 @@ class TurbopufferGraphAdapter(GraphDBInterface):
             chunk = unique_ids[start : start + _MAX_QUERY_ROWS]
             if not chunk:
                 continue
-            response = await asyncio.to_thread(
-                namespace.query,
+            response = await self._safe_query(
+                namespace,
                 filters=("id", "In", chunk),
                 top_k=len(chunk),
                 include_attributes=True,
             )
+            if response is None:  # namespace not created yet -> no matches
+                continue
             rows.extend(response.rows or [])
         return rows
 
@@ -352,8 +372,14 @@ class TurbopufferGraphAdapter(GraphDBInterface):
     async def _delete_ids(self, namespace, ids: List[str]) -> None:
         for start in range(0, len(ids), _MAX_QUERY_ROWS):
             chunk = ids[start : start + _MAX_QUERY_ROWS]
-            if chunk:
+            if not chunk:
+                continue
+            try:
                 await asyncio.to_thread(namespace.write, deletes=chunk)
+            except Exception as error:
+                # Deleting from a namespace that was never written is a no-op.
+                if not self._is_namespace_missing(error):
+                    raise
 
     # --- point reads -------------------------------------------------------
 
