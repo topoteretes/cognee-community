@@ -9,8 +9,7 @@ These run against a real TurboPuffer namespace (integration tier).
 """
 
 import pytest
-
-from conftest import demo_node_tuples, demo_edge_tuples, requires_turbopuffer
+from conftest import demo_edge_tuples, demo_node_tuples, requires_turbopuffer
 
 pytestmark = [pytest.mark.asyncio, requires_turbopuffer]
 
@@ -107,9 +106,7 @@ async def test_large_node_property_not_truncated(adapter):
     non-filterable `properties` blob and must not be clamped/corrupted."""
     big_text = "wonderland " * 1200  # ~13KB, well over 4096 bytes
 
-    await adapter.add_nodes(
-        [("chunk1", {"name": "", "type": "DocumentChunk", "text": big_text})]
-    )
+    await adapter.add_nodes([("chunk1", {"name": "", "type": "DocumentChunk", "text": big_text})])
     node = await adapter.get_node("chunk1")
     assert node is not None
     assert node["text"] == big_text  # full content preserved, not truncated
@@ -165,6 +162,18 @@ async def test_get_neighbors(adapter):
     neighbor_ids = {n["id"] for n in neighbors}
     assert "WhiteRabbit" in neighbor_ids
     assert "MadHatter" in neighbor_ids
+
+
+async def test_get_neighbors_returns_full_node_payload(adapter):
+    """Neighbors must carry their full node payload (e.g. `description`), not just
+    id/name/type derived from denormalized edge fields."""
+    await adapter.add_nodes(demo_node_tuples())
+    await adapter.add_edges(demo_edge_tuples())
+
+    neighbors = await adapter.get_neighbors("Alice")
+    rabbit = next(n for n in neighbors if n["id"] == "WhiteRabbit")
+    assert rabbit["name"] == "White Rabbit"
+    assert "description" in rabbit and rabbit["description"]  # hydrated from node row
 
 
 async def test_get_connections_returns_triples(adapter):
@@ -288,8 +297,12 @@ async def test_get_graph_metrics_traversal_fields_are_sentinel(adapter):
     await adapter.add_edges(demo_edge_tuples())
 
     metrics = await adapter.get_graph_metrics(include_optional=True)
-    for field in ("num_connected_components", "diameter", "avg_shortest_path_length",
-                  "avg_clustering"):
+    for field in (
+        "num_connected_components",
+        "diameter",
+        "avg_shortest_path_length",
+        "avg_clustering",
+    ):
         if field in metrics:
             assert metrics[field] == -1
 
@@ -310,14 +323,69 @@ async def test_get_triplets_batch_sequential(adapter):
         assert "end_node" in t
 
 
-async def test_get_triplets_batch_arbitrary_offset_raises(adapter):
-    """TurboPuffer is cursor-paginated, not offset-paginated. A nonzero offset
-    cannot be served efficiently, so v1 rejects it rather than scanning O(offset)."""
+async def test_get_triplets_batch_offset_pagination(adapter):
+    """Offset pagination must be deterministic and non-overlapping (cognee's
+    triplet-embedding memify paginates by increasing offset)."""
     await adapter.add_nodes(demo_node_tuples())
-    await adapter.add_edges(demo_edge_tuples())
+    edges = demo_edge_tuples()
+    await adapter.add_edges(edges)
 
-    with pytest.raises(NotImplementedError):
-        await adapter.get_triplets_batch(offset=5, limit=10)
+    page1 = await adapter.get_triplets_batch(offset=0, limit=2)
+    page2 = await adapter.get_triplets_batch(offset=2, limit=2)
+    rest = await adapter.get_triplets_batch(offset=4, limit=100)
+
+    assert len(page1) == 2
+    assert len(page2) == 2
+
+    def key(t):
+        return (
+            t["start_node"]["id"],
+            t["relationship_properties"]["relationship_name"],
+            t["end_node"]["id"],
+        )
+
+    seen = [key(t) for t in page1 + page2 + rest]
+    assert len(seen) == len(edges)  # full coverage
+    assert len(set(seen)) == len(edges)  # no overlap across pages
+
+    # Past the end -> empty.
+    assert await adapter.get_triplets_batch(offset=len(edges) + 10, limit=10) == []
+
+
+# --- belongs_to_set reconciliation -----------------------------------------
+
+
+async def test_remove_belongs_to_set_tags(adapter):
+    """Stripping a tag must remove it from node belongs_to_set AND delete the
+    stale belongs_to_set edge to the matching NodeSet node."""
+    await adapter.add_nodes(
+        [
+            ("Alice", {"name": "Alice", "type": "Entity", "belongs_to_set": ["ds1", "ds2"]}),
+            ("ns_ds1", {"name": "ds1", "type": "NodeSet"}),
+        ]
+    )
+    await adapter.add_edge("Alice", "ns_ds1", "belongs_to_set", {})
+
+    await adapter.remove_belongs_to_set_tags(["ds1"])
+
+    node = await adapter.get_node("Alice")
+    assert node["belongs_to_set"] == ["ds2"]  # ds1 stripped, ds2 kept
+    # stale membership edge removed
+    assert await adapter.has_edge("Alice", "ns_ds1", "belongs_to_set") is False
+
+
+async def test_remove_belongs_to_set_tags_scoped_to_node_ids(adapter):
+    """With node_ids given, only those nodes are detagged."""
+    await adapter.add_nodes(
+        [
+            ("A", {"name": "A", "type": "Entity", "belongs_to_set": ["ds1"]}),
+            ("B", {"name": "B", "type": "Entity", "belongs_to_set": ["ds1"]}),
+        ]
+    )
+    await adapter.remove_belongs_to_set_tags(["ds1"], node_ids=["A"])
+
+    assert (await adapter.get_node("A"))["belongs_to_set"] == []
+    assert (await adapter.get_node("B"))["belongs_to_set"] == ["ds1"]  # untouched
 
 
 # --- unsupported surface ---------------------------------------------------

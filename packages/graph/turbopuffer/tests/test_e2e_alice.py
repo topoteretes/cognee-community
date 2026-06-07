@@ -17,11 +17,10 @@ Requires TURBOPUFFER_API_KEY, LLM_API_KEY and COGNEE_TURBOPUFFER_GRAPH_E2E=1.
 
 import asyncio
 import os
-import shutil
 import pathlib
+import shutil
 
 import pytest
-
 from conftest import requires_e2e
 
 # Candidate locations for the Alice corpus (package-local first, then repo copies).
@@ -29,7 +28,11 @@ _ALICE_CANDIDATES = [
     pathlib.Path(__file__).parent / "data" / "alice_in_wonderland.txt",
     pathlib.Path(__file__).parents[5] / "notebooks" / "data" / "alice_in_wonderland.txt",
     pathlib.Path(__file__).parents[5]
-    / "examples" / "demos" / "simple_document_qa" / "data" / "alice_in_wonderland.txt",
+    / "examples"
+    / "demos"
+    / "simple_document_qa"
+    / "data"
+    / "alice_in_wonderland.txt",
 ]
 
 
@@ -48,15 +51,15 @@ def _resolve_alice_path() -> str:
 async def run_alice_pipeline(provider: str = "turbopuffer"):
     """Full add -> cognify -> search pipeline against the given graph provider."""
     import cognee
-    from cognee_community_graph_adapter_turbopuffer import register
+    from cognee.base_config import get_base_config
+    from cognee.infrastructure.databases.graph.config import get_graph_config
     from cognee.infrastructure.files.storage import get_storage_config
     from cognee.modules.engine.models import NodeSet
     from cognee.modules.retrieval.graph_completion_retriever import GraphCompletionRetriever
-    from cognee.modules.search.types import SearchType
     from cognee.modules.search.operations import get_history
+    from cognee.modules.search.types import SearchType
     from cognee.modules.users.methods import get_default_user
-    from cognee.infrastructure.databases.graph.config import get_graph_config
-    from cognee.base_config import get_base_config
+    from cognee_community_graph_adapter_turbopuffer import register
 
     register()  # make "turbopuffer" graph provider resolvable
 
@@ -101,9 +104,7 @@ async def run_alice_pipeline(provider: str = "turbopuffer"):
         from cognee.infrastructure.databases.vector import get_vector_engine
 
         vector_engine = get_vector_engine()
-        random_node = (
-            await vector_engine.search("Entity_name", "Alice", include_payload=True)
-        )[0]
+        random_node = (await vector_engine.search("Entity_name", "Alice", include_payload=True))[0]
         random_node_name = random_node.payload["text"]
 
         # GRAPH_COMPLETION exercises the graph adapter's traversal/connection path.

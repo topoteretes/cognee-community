@@ -41,7 +41,7 @@ class TurbopufferGraphDatasetDatabaseHandler(DatasetDatabaseHandlerInterface):
             "graph_database_url": graph_config.graph_database_url,
             "graph_database_name": graph_db_name,
             "graph_database_key": graph_config.graph_database_key,
-            "graph_dataset_database_handler": "turbopuffer",
+            "graph_dataset_database_handler": "turbopuffer_graph",
         }
 
     @classmethod

@@ -27,7 +27,11 @@ ALICE_CANDIDATES = [
     pathlib.Path(__file__).parents[1] / "tests" / "data" / "alice_in_wonderland.txt",
     pathlib.Path(__file__).parents[5] / "notebooks" / "data" / "alice_in_wonderland.txt",
     pathlib.Path(__file__).parents[5]
-    / "examples" / "demos" / "simple_document_qa" / "data" / "alice_in_wonderland.txt",
+    / "examples"
+    / "demos"
+    / "simple_document_qa"
+    / "data"
+    / "alice_in_wonderland.txt",
 ]
 
 

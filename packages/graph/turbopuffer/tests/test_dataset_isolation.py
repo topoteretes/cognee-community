@@ -7,9 +7,7 @@ graph analog of the vector adapter's dataset handler guarantee.
 import uuid
 
 import pytest
-
-from conftest import demo_node_tuples, demo_edge_tuples, requires_turbopuffer
-from conftest import _make_adapter
+from conftest import _make_adapter, demo_edge_tuples, demo_node_tuples, requires_turbopuffer
 
 pytestmark = [pytest.mark.asyncio, requires_turbopuffer]
 

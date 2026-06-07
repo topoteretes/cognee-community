@@ -6,8 +6,6 @@ factory uses (``database_name=...``, no ``connection_string``). These are pure
 unit tests — no network, always run.
 """
 
-import pytest
-
 from cognee_community_graph_adapter_turbopuffer import TurbopufferGraphAdapter, register
 
 
@@ -16,6 +14,24 @@ def test_register_adds_turbopuffer_provider():
     from cognee.infrastructure.databases.graph.supported_databases import supported_databases
 
     assert supported_databases["turbopuffer"] is TurbopufferGraphAdapter
+
+
+def test_register_adds_graph_dataset_handler_under_graph_specific_key():
+    """The dataset handler must register under "turbopuffer_graph" (not the bare
+    "turbopuffer" key the vector adapter uses) so the two don't overwrite each
+    other in cognee's shared registry."""
+    from cognee_community_graph_adapter_turbopuffer.TurbopufferGraphDatasetDatabaseHandler import (
+        TurbopufferGraphDatasetDatabaseHandler,
+    )
+
+    register()
+    from cognee.infrastructure.databases.dataset_database_handler import (
+        supported_dataset_database_handlers,
+    )
+
+    entry = supported_dataset_database_handlers["turbopuffer_graph"]
+    assert entry["handler_instance"] is TurbopufferGraphDatasetDatabaseHandler
+    assert entry["handler_provider"] == "turbopuffer"
 
 
 def test_factory_shaped_construction_accepts_database_name():

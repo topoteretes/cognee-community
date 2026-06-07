@@ -125,6 +125,7 @@ class TurbopufferGraphAdapter(GraphDBInterface):
             "id": str(row.id),
             "name": extra.get("name", ""),
             "type": extra.get("type", ""),
+            "belongs_to_set": list(extra.get("belongs_to_set") or []),
         }
         node.update(cls._parse_properties(extra.get("properties")))
         return node
@@ -390,6 +391,85 @@ class TurbopufferGraphAdapter(GraphDBInterface):
                 if not self._is_namespace_missing(error):
                     raise
 
+    async def remove_belongs_to_set_tags(
+        self,
+        tags: List[str],
+        node_ids: Optional[List[str]] = None,
+    ) -> None:
+        """Strip the given tags from node `belongs_to_set` arrays AND delete the
+        stale `belongs_to_set` edges to surviving NodeSet nodes named in `tags`.
+
+        Mirrors the Neo4j adapter so a deleted NodeSet/dataset leaves no stale
+        membership behind. Scoped to `node_ids` when provided."""
+        if not tags:
+            return None
+        if node_ids is not None and not node_ids:
+            return None
+        tagset = {str(t) for t in tags}
+
+        # 1) Candidate nodes carrying any of the tags (scoped to node_ids if given).
+        if node_ids is not None:
+            candidates = await self._query_by_ids(
+                self._node_namespace(), [str(n) for n in node_ids]
+            )
+        else:
+            candidates = await self._query_all(
+                self._node_namespace(),
+                filters=("belongs_to_set", "ContainsAny", list(tagset)),
+            )
+
+        # 2) Strip tags from belongs_to_set and re-upsert only the changed nodes.
+        updated_rows = []
+        for row in candidates:
+            extra = row.model_extra or {}
+            current = extra.get("belongs_to_set") or []
+            if not isinstance(current, list):
+                current = [current]
+            remaining = [str(t) for t in current if str(t) not in tagset]
+            if len(remaining) == len(current):
+                continue  # this node didn't carry any of the tags
+            updated_rows.append(
+                {
+                    "id": str(row.id),
+                    "name": extra.get("name", "") or "",
+                    "type": extra.get("type", "") or "",
+                    "belongs_to_set": remaining,
+                    "properties": extra.get("properties", "") or "{}",
+                }
+            )
+        if updated_rows:
+            schema = _build_row_schema(updated_rows, non_filterable={"properties"})
+            await asyncio.to_thread(
+                self._node_namespace().write, upsert_rows=updated_rows, schema=schema
+            )
+
+        # 3) Delete stale belongs_to_set edges to surviving NodeSet nodes named in tags.
+        nodeset_rows = await self._query_all(
+            self._node_namespace(),
+            filters=("And", (("type", "Eq", "NodeSet"), ("name", "In", list(tagset)))),
+        )
+        nodeset_ids = [str(r.id) for r in nodeset_rows]
+        if not nodeset_ids:
+            return None
+        edge_rows = await self._query_all(
+            self._edge_namespace(),
+            filters=(
+                "And",
+                (
+                    ("relationship_name", "Eq", "belongs_to_set"),
+                    ("target_id", "In", nodeset_ids),
+                ),
+            ),
+        )
+        scope = {str(n) for n in node_ids} if node_ids is not None else None
+        edge_ids = [
+            str(r.id)
+            for r in edge_rows
+            if scope is None or str((r.model_extra or {}).get("source_id")) in scope
+        ]
+        await self._delete_ids(self._edge_namespace(), edge_ids)
+        return None
+
     # --- point reads -------------------------------------------------------
 
     async def get_node(self, node_id: str) -> Optional[Dict[str, Any]]:
@@ -435,36 +515,65 @@ class TurbopufferGraphAdapter(GraphDBInterface):
             )
         return edges
 
+    async def _hydrate_node_map(self, ids) -> Dict[str, Dict[str, Any]]:
+        """Fetch full node payloads for the given ids -> {id: merged node dict}."""
+        unique = [str(i) for i in dict.fromkeys(str(i) for i in ids)]
+        if not unique:
+            return {}
+        node_rows = await self._query_by_ids(self._node_namespace(), unique)
+        return {str(row.id): self._node_dict_from_row(row) for row in node_rows}
+
     async def get_neighbors(self, node_id: str) -> List[Dict[str, Any]]:
         nid = str(node_id)
         rows = await self._edges_touching([nid])
-        neighbors: Dict[str, Dict[str, Any]] = {}
+
+        # Collect each neighbor id (dedup, preserve order) + a denormalized fallback.
+        ordered: List[str] = []
+        seen = set()
+        fallback: Dict[str, Tuple[Any, Any]] = {}
         for row in rows:
             extra = row.model_extra or {}
             source_id = str(extra.get("source_id"))
             target_id = str(extra.get("target_id"))
             if source_id == nid:
-                neighbors[target_id] = self._node_dict_from_endpoint(
-                    target_id, extra.get("target_name"), extra.get("target_type")
-                )
+                other, name, type_ = target_id, extra.get("target_name"), extra.get("target_type")
             else:
-                neighbors[source_id] = self._node_dict_from_endpoint(
-                    source_id, extra.get("source_name"), extra.get("source_type")
-                )
-        return list(neighbors.values())
+                other, name, type_ = source_id, extra.get("source_name"), extra.get("source_type")
+            fallback.setdefault(other, (name, type_))
+            if other not in seen:
+                seen.add(other)
+                ordered.append(other)
+
+        # Hydrate full node payloads; fall back to denormalized edge fields if a
+        # node row is missing.
+        full = await self._hydrate_node_map(ordered)
+        return [
+            full.get(i) or self._node_dict_from_endpoint(i, *fallback.get(i, ("", "")))
+            for i in ordered
+        ]
 
     async def get_connections(
         self, node_id: Union[str, Any]
     ) -> List[Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]]:
         rows = await self._edges_touching([str(node_id)])
+
+        endpoint_ids = set()
+        for row in rows:
+            extra = row.model_extra or {}
+            endpoint_ids.add(str(extra.get("source_id")))
+            endpoint_ids.add(str(extra.get("target_id")))
+        full = await self._hydrate_node_map(endpoint_ids)
+
         connections = []
         for row in rows:
             extra = row.model_extra or {}
-            src = self._node_dict_from_endpoint(
-                extra.get("source_id"), extra.get("source_name"), extra.get("source_type")
+            source_id = str(extra.get("source_id"))
+            target_id = str(extra.get("target_id"))
+            src = full.get(source_id) or self._node_dict_from_endpoint(
+                source_id, extra.get("source_name"), extra.get("source_type")
             )
-            tgt = self._node_dict_from_endpoint(
-                extra.get("target_id"), extra.get("target_name"), extra.get("target_type")
+            tgt = full.get(target_id) or self._node_dict_from_endpoint(
+                target_id, extra.get("target_name"), extra.get("target_type")
             )
             edge = {"relationship_name": extra.get("relationship_name")}
             edge.update(self._parse_properties(extra.get("properties")))
@@ -704,14 +813,12 @@ class TurbopufferGraphAdapter(GraphDBInterface):
         raise NotImplementedError("TurboPuffer has no query language; Cypher is unsupported.")
 
     async def get_triplets_batch(self, offset: int, limit: int) -> List[Dict[str, Any]]:
-        if offset != 0:
-            raise NotImplementedError(
-                "TurboPuffer is cursor-paginated, not offset-paginated; nonzero offset "
-                "is unsupported in v1."
-            )
-
+        # Edges are cursor-scanned in deterministic id order, so offset/limit
+        # slicing is stable across paginated calls (cognee's triplet-embedding
+        # memify paginates by increasing offset). Cost is O(offset + limit).
+        offset = max(offset, 0)
         edge_rows = await self._query_all(self._edge_namespace())
-        edge_rows = edge_rows[: max(limit, 0)]
+        edge_rows = edge_rows[offset : offset + max(limit, 0)] if limit >= 0 else edge_rows[offset:]
         if not edge_rows:
             return []
 

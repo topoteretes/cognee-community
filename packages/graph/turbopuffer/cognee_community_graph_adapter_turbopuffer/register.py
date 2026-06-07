@@ -15,6 +15,10 @@ from .TurbopufferGraphDatasetDatabaseHandler import TurbopufferGraphDatasetDatab
 
 def register() -> None:
     use_graph_adapter("turbopuffer", TurbopufferGraphAdapter)
+    # Register under a graph-specific handler key so it does not collide with the
+    # TurboPuffer *vector* adapter, which registers its own handler under
+    # "turbopuffer". The third argument is the graph_database_provider this
+    # handler serves. Select it with GRAPH_DATASET_DATABASE_HANDLER=turbopuffer_graph.
     use_dataset_database_handler(
-        "turbopuffer", TurbopufferGraphDatasetDatabaseHandler, "turbopuffer"
+        "turbopuffer_graph", TurbopufferGraphDatasetDatabaseHandler, "turbopuffer"
     )

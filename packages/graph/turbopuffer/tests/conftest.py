@@ -65,8 +65,7 @@ def demo_edge_tuples() -> list[tuple[str, str, str, dict]]:
     """Edges in the (source, target, relationship_name, properties) form."""
     kg = load_demo_kg()
     return [
-        (e["source_node_id"], e["target_node_id"], e["relationship_name"], {})
-        for e in kg["edges"]
+        (e["source_node_id"], e["target_node_id"], e["relationship_name"], {}) for e in kg["edges"]
     ]
 
 
