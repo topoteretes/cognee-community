@@ -25,8 +25,8 @@ from cognee.modules.search.types import SearchType
 
 ALICE_CANDIDATES = [
     pathlib.Path(__file__).parents[1] / "tests" / "data" / "alice_in_wonderland.txt",
-    pathlib.Path(__file__).parents[6] / "notebooks" / "data" / "alice_in_wonderland.txt",
-    pathlib.Path(__file__).parents[6]
+    pathlib.Path(__file__).parents[5] / "notebooks" / "data" / "alice_in_wonderland.txt",
+    pathlib.Path(__file__).parents[5]
     / "examples" / "demos" / "simple_document_qa" / "data" / "alice_in_wonderland.txt",
 ]
 
