@@ -37,8 +37,8 @@ async def main():
     )
     config.set_graph_db_config(
         {
-            "graph_database_provider": "kuzu",
-            "graph_dataset_database_handler": "kuzu",
+            "graph_database_provider": "ladybug",
+            "graph_dataset_database_handler": "ladybug",
         }
     )
     await cognee.remember(MY_PREFERENCE)

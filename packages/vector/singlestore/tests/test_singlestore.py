@@ -221,7 +221,7 @@ async def test_cognee_recall_flow():
             "vector_db_key": singlestore_key(),
         }
     )
-    cognee.config.set_graph_db_config({"graph_database_provider": "kuzu"})
+    cognee.config.set_graph_db_config({"graph_database_provider": "ladybug"})
 
     data_directory_path = str(
         pathlib.Path(

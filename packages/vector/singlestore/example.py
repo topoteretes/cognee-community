@@ -25,7 +25,7 @@ async def main():
             "vector_db_key": os.getenv("SINGLESTORE_KEY", ""),
         }
     )
-    config.set_graph_db_config({"graph_database_provider": "kuzu"})
+    config.set_graph_db_config({"graph_database_provider": "ladybug"})
 
     await prune.prune_data()
     await prune.prune_system(metadata=True)
