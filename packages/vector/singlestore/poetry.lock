@@ -814,14 +814,14 @@ colorama = {version = "*", markers = "platform_system == \"Windows\""}
 
 [[package]]
 name = "cognee"
-version = "0.5.6"
+version = "1.1.2"
 description = "Cognee - is a library for enriching LLM context with a semantic layer for better understanding and reasoning."
 optional = false
-python-versions = "<3.14,>=3.10"
+python-versions = "<3.15,>=3.10"
 groups = ["main"]
 files = [
-    {file = "cognee-0.5.6-py3-none-any.whl", hash = "sha256:12c22f7ca0f3e2ccaf8c81a06bce1c9217ac028eb7db9af6a4ab0206975faeb8"},
-    {file = "cognee-0.5.6.tar.gz", hash = "sha256:b9bcd2a72d5168ef4a8a61ff4e46ae1f85def7b14e1ad0bde9833156915a7666"},
+    {file = "cognee-1.1.2-py3-none-any.whl", hash = "sha256:0d092f84c4df2c2a418ca1ddfaab64e28878ee620b6728c95d1b080a93f48f97"},
+    {file = "cognee-1.1.2.tar.gz", hash = "sha256:ef80b8da94ad148b32deb6a9ba1315bc7105508d741a47eff70c6645b30485bf"},
 ]
 
 [package.dependencies]
@@ -840,11 +840,11 @@ filetype = ">=1.2.0,<2.0.0"
 gunicorn = ">=20.1.0,<24"
 instructor = ">=1.9.1,<2.0.0"
 jinja2 = ">=3.1.3,<4"
-kuzu = "0.11.3"
+ladybug = "0.16.0"
 lancedb = ">=0.24.0,<1.0.0"
 langdetect = ">=1.0.9"
 limits = ">=4.4.1,<5"
-litellm = ">=1.76.0"
+litellm = ">=1.83.7"
 nbformat = ">=5.7.0,<6.0.0"
 networkx = ">=3.4.2,<4"
 numpy = ">=1.26.4,<=4.0.0"
@@ -859,6 +859,7 @@ python-magic-bin = {version = "<0.5", markers = "platform_system == \"Windows\""
 python-multipart = ">=0.0.22,<1.0.0"
 rdflib = ">=7.1.4,<7.2.0"
 sqlalchemy = ">=2.0.39,<3.0.0"
+starlette = ">=0.48"
 structlog = ">=25.2.0,<26"
 tenacity = ">=9.0.0"
 tiktoken = ">=0.8.0,<1.0.0"
@@ -872,23 +873,23 @@ anthropic = ["anthropic (>=0.27)"]
 aws = ["s3fs[boto3] (==2025.3.2)"]
 azure = ["azure-identity (>=1.15.0,<2)"]
 baml = ["baml-py (==0.206.0)"]
-chromadb = ["chromadb (>=0.6,<0.7)", "pypika (==0.48.9)"]
-codegraph = ["fastembed (<=0.6.0) ; python_version < \"3.13\"", "transformers (>=4.46.3,<5)", "tree-sitter (>=0.24.0,<0.25)", "tree-sitter-python (>=0.23.6,<0.24)"]
+chromadb = ["chromadb (>=0.6,<0.7)", "pypika (==0.48.9) ; python_version < \"3.14\"", "pypika (>=0.50.0) ; python_version >= \"3.14\""]
+codegraph = ["fastembed (<=0.8.0) ; python_version < \"3.14\"", "transformers (>=4.46.3,<5)", "tree-sitter (>=0.24.0,<0.25)", "tree-sitter-python (>=0.23.6,<0.24)"]
 debug = ["debugpy (>=1.8.9,<2.0.0)"]
 deepeval = ["deepeval (>=3.0.1,<4)"]
-dev = ["coverage (>=7.3.2,<8)", "deptry (>=0.20.0,<0.21)", "gitpython (>=3.1.43,<4)", "mkdocs-material (>=9.5.42,<10)", "mkdocs-minify-plugin (>=0.8.0,<0.9)", "mkdocstrings[python] (>=0.26.2,<0.27)", "mypy (>=1.7.1,<2)", "notebook (>=7.1.0,<8)", "pre-commit (>=4.0.1,<5)", "pylint (>=3.0.3,<4)", "pytest (>=7.4.0,<8)", "pytest-asyncio (>=0.21.1,<0.22)", "pytest-cov (>=6.1.1,<7.0.0)", "ruff (>=0.9.2,<=0.13.1)", "tweepy (>=4.14.0,<5.0.0)"]
+dev = ["coverage (>=7.3.2,<8)", "deptry (>=0.20.0,<0.21)", "gitpython (>=3.1.43,<4)", "mkdocs-material (>=9.5.42,<10)", "mkdocs-minify-plugin (>=0.8.0,<0.9)", "mkdocstrings[python] (>=0.26.2,<0.27)", "notebook (>=7.1.0,<8)", "pre-commit (>=4.0.1,<5)", "pytest (>=7.4.0,<8)", "pytest-asyncio (>=0.21.1,<0.22)", "pytest-cov (>=6.1.1,<7.0.0)", "ruff (>=0.9.2,<=0.16.0)", "tweepy (>=4.14.0,<5.0.0)", "ty (>=0.0.31,<0.1.0)"]
 distributed = ["modal (>=1.0.5,<2.0.0)"]
 dlt = ["dlt[sqlalchemy] (>=1.9.0,<2)"]
 docling = ["docling (>=2.54)", "transformers (>=4.55)"]
-docs = ["lxml (>=4.9.3,<5) ; python_version < \"3.13\"", "lxml (>=5,<6) ; python_version >= \"3.13\"", "unstructured[csv,doc,docx,epub,md,odt,org,pdf,ppt,pptx,rst,rtf,tsv,xlsx] (>=0.18.1,<19)"]
-evals = ["gdown (>=5.2.0,<6)", "matplotlib (>=3.8.3,<4)", "pandas (>=2.2.2,<3.0.0)", "plotly (>=6.0.0,<7)", "scikit-learn (>=1.6.1,<2)"]
-fastembed = ["fastembed (<=0.6.0)", "onnxruntime (<=1.22.1)"]
-graphiti = ["graphiti-core (>=0.7.0,<0.8)"]
+docs = ["lxml (>=4.9.3,<5) ; python_version < \"3.13\"", "lxml (>=5,<6) ; python_version == \"3.13\"", "lxml (>=6.0.1,<7) ; python_version >= \"3.14\"", "nltk (>=3.9.3,<4)", "unstructured[csv,doc,docx,epub,md,odt,org,pdf,ppt,pptx,rst,rtf,tsv,xlsx] (>=0.18.1,<19)"]
+evals = ["gdown (>=5.2.0,<6)", "locust (>=2.0.0,<3)", "matplotlib (>=3.8.3,<4)", "pandas (>=2.2.2,<3.0.0)", "plotly (>=6.0.0,<7)", "scikit-learn (>=1.6.1,<2)"]
+fastembed = ["fastembed (<=0.8.0)", "onnxruntime (<=1.23.2) ; python_version < \"3.14\"", "onnxruntime (>=1.24.1) ; python_version >= \"3.14\""]
+graphiti = ["graphiti-core (>=0.28.0)"]
 groq = ["groq (>=0.8.0,<1.0.0)"]
 huggingface = ["transformers (>=4.46.3,<5)"]
 langchain = ["langchain-core (>=1.2.5)", "langchain-text-splitters (>=0.3.2,<1.0.0)", "langsmith (>=0.2.3,<1.0.0)"]
 llama-cpp = ["llama-cpp-python[server] (>=0.3.0,<1.0.0)"]
-llama-index = ["llama-index-core (>=0.13.0,<0.14)"]
+llama-index = ["llama-index-core (>=0.14.20,<0.15)"]
 mistral = ["mistral-common (>=1.5.2,<2)", "mistralai (>=1.9.10,<2)"]
 monitoring = ["langfuse (>=2.32.0,<3)", "opentelemetry-api (>=1.20.0,<2)", "opentelemetry-exporter-otlp-proto-grpc (>=1.20.0,<2)", "opentelemetry-exporter-otlp-proto-http (>=1.20.0,<2)", "opentelemetry-sdk (>=1.20.0,<2)", "sentry-sdk[fastapi] (>=2.9.0,<3)"]
 neo4j = ["neo4j (>=5.28.0,<6)"]
@@ -899,7 +900,7 @@ postgres = ["asyncpg (>=0.30.0,<1.0.0)", "pgvector (>=0.3.5,<0.4)", "psycopg2 (>
 postgres-binary = ["asyncpg (>=0.30.0,<1.0.0)", "pgvector (>=0.3.5,<0.4)", "psycopg2-binary (>=2.9.10,<3.0.0)"]
 posthog = ["posthog (>=3.5.0,<4)"]
 redis = ["redis (>=5.0.3,<6.0.0)"]
-scraping = ["apscheduler (>=3.10.0,<=3.11.0)", "beautifulsoup4 (>=4.13.1)", "lxml (>=4.9.3,<5) ; python_version < \"3.13\"", "lxml (>=5,<6) ; python_version >= \"3.13\"", "playwright (>=1.9.0)", "protego (>=0.1)", "tavily-python (>=0.7.12)"]
+scraping = ["apscheduler (>=3.10.0,<=3.11.0)", "beautifulsoup4 (>=4.13.1)", "lxml (>=4.9.3,<5) ; python_version < \"3.13\"", "lxml (>=5,<6) ; python_version == \"3.13\"", "lxml (>=6.0.1,<7) ; python_version >= \"3.14\"", "playwright (>=1.9.0)", "protego (>=0.1)", "tavily-python (>=0.7.12)"]
 tracing = ["opentelemetry-api (>=1.20.0,<2)", "opentelemetry-exporter-otlp-proto-grpc (>=1.20.0,<2)", "opentelemetry-exporter-otlp-proto-http (>=1.20.0,<2)", "opentelemetry-sdk (>=1.20.0,<2)"]
 
 [[package]]
@@ -1782,14 +1783,14 @@ all = ["mypy (>=1.11.2)", "pytest (>=8.3.2)", "ruff (>=0.6.2)"]
 
 [[package]]
 name = "importlib-metadata"
-version = "9.0.0"
+version = "8.9.0"
 description = "Read metadata from Python packages"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "importlib_metadata-9.0.0-py3-none-any.whl", hash = "sha256:2d21d1cc5a017bd0559e36150c21c830ab1dc304dedd1b7ea85d20f45ef3edd7"},
-    {file = "importlib_metadata-9.0.0.tar.gz", hash = "sha256:a4f57ab599e6a2e3016d7595cfd72eb4661a5106e787a95bcc90c7105b831efc"},
+    {file = "importlib_metadata-8.9.0-py3-none-any.whl", hash = "sha256:e0f761b6ea91ced3b0844c14c9d955224d538105921f8e6754c00f6ca79fba7f"},
+    {file = "importlib_metadata-8.9.0.tar.gz", hash = "sha256:58850626cef4bd2df100378b0f2aea9724a7b92f10770d547725b047078f99ee"},
 ]
 
 [package.dependencies]
@@ -2081,52 +2082,52 @@ docs = ["intersphinx-registry", "myst-parser", "pydata-sphinx-theme", "sphinx-au
 test = ["ipykernel", "pre-commit", "pytest (<9)", "pytest-cov", "pytest-timeout"]
 
 [[package]]
-name = "kuzu"
-version = "0.11.3"
+name = "ladybug"
+version = "0.16.0"
 description = "Highly scalable, extremely fast, easy-to-use embeddable graph database"
 optional = false
-python-versions = "*"
+python-versions = "<3.15,>=3.10"
 groups = ["main"]
 files = [
-    {file = "kuzu-0.11.3-cp310-cp310-macosx_11_0_arm64.whl", hash = "sha256:3d93131f3dc7b647da7a5124c975dc2cc207afc38a9fbb83badc23d2e25dbfec"},
-    {file = "kuzu-0.11.3-cp310-cp310-macosx_11_0_x86_64.whl", hash = "sha256:4f021a6b4e31867a0b49e369431c8f05ef4244cea1cb337c76114649975f56e3"},
-    {file = "kuzu-0.11.3-cp310-cp310-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:4ac7d2a81d7370dc12400431a3331c45954340b96439fcf2b730794cf670684a"},
-    {file = "kuzu-0.11.3-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:8621bb470390f95810c7e79e36a670e9a2f27e189ef429f3df892626de63a652"},
-    {file = "kuzu-0.11.3-cp310-cp310-win_amd64.whl", hash = "sha256:126efba7f8a504614f5b307bcb94ac0e6d9f87f7e34b4334ca769ad6cfe2215e"},
-    {file = "kuzu-0.11.3-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:836739dced9f61912a80bb7ad1df2159cef456c5b5cfe92f15394b9c51a785cb"},
-    {file = "kuzu-0.11.3-cp311-cp311-macosx_11_0_x86_64.whl", hash = "sha256:8d4f0e4085d3a85b0e7a8e337082bec6a3cf8c92c9a35209ffe53b2ed212ab08"},
-    {file = "kuzu-0.11.3-cp311-cp311-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:1419ada227d15107c2b2536c66ae715c59876585d434b1918c17598956dcd5f7"},
-    {file = "kuzu-0.11.3-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:ef094001d319804fcc8eb72775a184f1119d84af1bace29581a003bd806c36cd"},
-    {file = "kuzu-0.11.3-cp311-cp311-win_amd64.whl", hash = "sha256:eb0858ec8084b10badeae37e730fbe0c3b2846dfe3508001d123087de262efbb"},
-    {file = "kuzu-0.11.3-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:d865ca31506867cf1ccf50c094c44de96de94bc77ffb350bfcaca0e4c5e469da"},
-    {file = "kuzu-0.11.3-cp312-cp312-macosx_11_0_x86_64.whl", hash = "sha256:109372bc16ce6724f88e0312bc686e34145e330d69b163b22ba92f4d3d96b48f"},
-    {file = "kuzu-0.11.3-cp312-cp312-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:d6274da6c470c001b7d332ec78a076395b009c2f267914640884fd6fa78bf47d"},
-    {file = "kuzu-0.11.3-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:1bb3b833ca2d1d919423cb3e0150592c2587562ab85259277f622e6f06e0b487"},
-    {file = "kuzu-0.11.3-cp312-cp312-win_amd64.whl", hash = "sha256:605909f744763775b8647014a03526d7f928a7b5a62a8b8c1d1e7bbdaf9dbb6c"},
-    {file = "kuzu-0.11.3-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:e20ab3e3b20ccf75219872feb86582f959e313eeb59f51131adf4c91ebfabe30"},
-    {file = "kuzu-0.11.3-cp313-cp313-macosx_11_0_x86_64.whl", hash = "sha256:054479d3ce71410b8af2f5fa6aa37883db7fea5b25606af8d3bd7cf717aa5395"},
-    {file = "kuzu-0.11.3-cp313-cp313-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:143a37f1ae38b6b4337ccfcf42fa4f779a897223fff9c6c29f1a5a5a86911300"},
-    {file = "kuzu-0.11.3-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:548bfb3045d89bce1fbe89f4a890d636789671abfa80cbde2054c671e6069133"},
-    {file = "kuzu-0.11.3-cp313-cp313-win_amd64.whl", hash = "sha256:87bf6c369f182a59e5b8a38b3ca288b90fab2827577d9b0d2170a202c42bc8f5"},
-    {file = "kuzu-0.11.3-cp313-cp313t-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:eb5c165bc5838059e498e8325939fc6bac075e1941157e8df6ebdd710135d43b"},
-    {file = "kuzu-0.11.3-cp313-cp313t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:88c73dfd3d6a1fb374031050b725236fa9dd9a95424b09b20086a3d274bed51f"},
-    {file = "kuzu-0.11.3-cp314-cp314-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:9d2752a9e37adda6aef3bf041932ae3a1cf74ca7e893bbbacdd5e62b3ac6f8c2"},
-    {file = "kuzu-0.11.3-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:86be7d113e4e2c6761b1701079af8aeffc04c6981517f2d6aa393e883cc46036"},
-    {file = "kuzu-0.11.3-cp314-cp314t-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:d72ebd88e231b562e7a60ff88d200825d53e78a681bddd7f8d77b78126a5060c"},
-    {file = "kuzu-0.11.3-cp314-cp314t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:64c7ec822906bdee154eb38d93e64f184d8f94b30bbeaceaa252725f2b9efab3"},
-    {file = "kuzu-0.11.3-cp37-cp37m-macosx_11_0_x86_64.whl", hash = "sha256:af061b98f7b80058bcc6780edb1675f3d937a76cac02b8838365a07db06a8f41"},
-    {file = "kuzu-0.11.3-cp38-cp38-macosx_11_0_arm64.whl", hash = "sha256:d1fd7047c9a2c6a2f410e0e6fc5e499ff23c9a3e1683f101b3e7466c009de6f8"},
-    {file = "kuzu-0.11.3-cp38-cp38-macosx_11_0_x86_64.whl", hash = "sha256:be76326e0845a18a436def173332ebc2a9b63528959713115bb26298e3bf4f4f"},
-    {file = "kuzu-0.11.3-cp38-cp38-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:3517ea4b265ac373458fb41419c8cd5080282f7f3e18ba44f673031118aef72b"},
-    {file = "kuzu-0.11.3-cp38-cp38-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:5b60b9975ad6e0b65b20412759cceee0b2d1f28edac84fa4eed11f0800ceafac"},
-    {file = "kuzu-0.11.3-cp38-cp38-win_amd64.whl", hash = "sha256:c9c361d7977167b2fa320d9e477b8d3215c88f136844c5c3a3b4142887e54fb5"},
-    {file = "kuzu-0.11.3-cp39-cp39-macosx_11_0_arm64.whl", hash = "sha256:d71d6ec478178ce2d9303133eb5a444cd30268e512eb8d1b54fbf528b1b4f983"},
-    {file = "kuzu-0.11.3-cp39-cp39-macosx_11_0_x86_64.whl", hash = "sha256:549588499430a8df2f51ef8b5742a6f197776d52d34862812ef2de3ae0539c2a"},
-    {file = "kuzu-0.11.3-cp39-cp39-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:ae837f265a4b1865fe45fffba3fbd9d39698cc1a88bcbdb06e366b0b7829a7ff"},
-    {file = "kuzu-0.11.3-cp39-cp39-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:ffff1f2fdf4fc570ddfefbe1d5918d3f53239eb38dd5c26358baa7d07e29a0d2"},
-    {file = "kuzu-0.11.3-cp39-cp39-win_amd64.whl", hash = "sha256:df7bf00f8921e4e41169ab2d9e5b439f42c602d33612f620c8c0f09bace2adb5"},
-    {file = "kuzu-0.11.3.tar.gz", hash = "sha256:e7bea3ca30c4bb462792eedcaa7f2125c800b243bb4a872e1eedc16917c1967a"},
+    {file = "ladybug-0.16.0-cp310-cp310-macosx_13_0_arm64.whl", hash = "sha256:ab084a9e36629d9cd944a46bfe04180bc045e09f6a0337d29f8de2eb61f75277"},
+    {file = "ladybug-0.16.0-cp310-cp310-macosx_13_0_x86_64.whl", hash = "sha256:8f447edfdfb01bfffa18447feff816eff4b8ea2790e8b9fb5c5219decca4da29"},
+    {file = "ladybug-0.16.0-cp310-cp310-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:29e80383a0757a01ed39f5f05aed5a3aec4a05b706ffe6400409794d79090a76"},
+    {file = "ladybug-0.16.0-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:bb74ba509ad97eefdccf2ae6fb6a13e302fedf54422213dff985ef8e63c9d425"},
+    {file = "ladybug-0.16.0-cp310-cp310-musllinux_1_2_aarch64.whl", hash = "sha256:d4641bd358e9c2e134dd24665dcb3d13f03f1b4e16ad5b1a632c103034112604"},
+    {file = "ladybug-0.16.0-cp310-cp310-musllinux_1_2_x86_64.whl", hash = "sha256:e990c5452cc162004fcc2152a1e436d5405c213a8bc014d1370511f3a4364b07"},
+    {file = "ladybug-0.16.0-cp310-cp310-win_amd64.whl", hash = "sha256:5883d55aed9c5ad59f40cfe17ab5e7dca090b6ef956c363035c171adb61a6730"},
+    {file = "ladybug-0.16.0-cp311-cp311-macosx_13_0_arm64.whl", hash = "sha256:504b3f71cab827cc111f4fa95a6d71bf2fc4247ae93bfbbf4d7b9e2cd998a54f"},
+    {file = "ladybug-0.16.0-cp311-cp311-macosx_13_0_x86_64.whl", hash = "sha256:52a68b6deaab8593a25224ed62d3be8acac1efc30527d54c1711fce691d91cad"},
+    {file = "ladybug-0.16.0-cp311-cp311-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:1256abdb7f3c21cd3ced5e65380e6706309611facf700cec851ae1d396e6ce7c"},
+    {file = "ladybug-0.16.0-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:ba0347cdca9f6e0d98decf428d21dae6a73969de1928732ff5da00d153e80d67"},
+    {file = "ladybug-0.16.0-cp311-cp311-musllinux_1_2_aarch64.whl", hash = "sha256:c4673936e2c8d5402fe6a86d92eee0e79650c70e66d74a936a64a716bd9e6f89"},
+    {file = "ladybug-0.16.0-cp311-cp311-musllinux_1_2_x86_64.whl", hash = "sha256:3dbb6a11b341d0e4944380900b37bea674e5bd6c99d288866bedc5da9e4fa6ff"},
+    {file = "ladybug-0.16.0-cp311-cp311-win_amd64.whl", hash = "sha256:7fee95e546082b7e565e360f9f3f3c36f1fff1209acaec731dec4773ccf8331e"},
+    {file = "ladybug-0.16.0-cp312-cp312-macosx_13_0_arm64.whl", hash = "sha256:d49ba0f5a9b1774dfa225294cad16882467b4e6c694c3cde4c28714c77ea2fe5"},
+    {file = "ladybug-0.16.0-cp312-cp312-macosx_13_0_x86_64.whl", hash = "sha256:c01671e7990a7b685c211e8cfd12098c4fb35d1f3ca398ff1d17e719bf733d88"},
+    {file = "ladybug-0.16.0-cp312-cp312-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:0741586f9a33cb97e29b469f85f40a812d7ac36c03d9e8bf42edff0e5ce7e923"},
+    {file = "ladybug-0.16.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:e33f0fcadcc5a9ce23d4b08a9dbef7204b8194efb3cda49ec292d8c278f1ee97"},
+    {file = "ladybug-0.16.0-cp312-cp312-musllinux_1_2_aarch64.whl", hash = "sha256:056cdc2c6d77bab72fb876538bc629511738966b067c08b2d75cc40f72adae8f"},
+    {file = "ladybug-0.16.0-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:4f20103e00d44351d036de98ecd4532f9c0e0c33a0885649b2762869449de277"},
+    {file = "ladybug-0.16.0-cp312-cp312-win_amd64.whl", hash = "sha256:ab657600fdec982c24dcd6828cc24900aded83256ba6bbc2df198b11fccc55fe"},
+    {file = "ladybug-0.16.0-cp313-cp313-macosx_13_0_arm64.whl", hash = "sha256:397eb053e8d380bcf3f0d15b036dd39e531bbd1f34c9b0d210a61ede7311b12e"},
+    {file = "ladybug-0.16.0-cp313-cp313-macosx_13_0_x86_64.whl", hash = "sha256:85b16d32ff061d829fda1bfd9923bc0cbf74cb304f0102b33da3f74867a0ce45"},
+    {file = "ladybug-0.16.0-cp313-cp313-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:5f29fd2c8f1de623586afe0d42d56840dcd4318b9c9da1c69c81e25155ae74c5"},
+    {file = "ladybug-0.16.0-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:ba2398cb365626f1010f97eefdd7b3fd548069cc919196ea873fa53df134c4af"},
+    {file = "ladybug-0.16.0-cp313-cp313-musllinux_1_2_aarch64.whl", hash = "sha256:6e56ff315cc09075a207884e326ab475c16097e70f8da62c2ea9d5c4b66fad4b"},
+    {file = "ladybug-0.16.0-cp313-cp313-musllinux_1_2_x86_64.whl", hash = "sha256:691f90fad0769f8ea2b6e59296506f6446eccb18122d926f47077e05ede1eaca"},
+    {file = "ladybug-0.16.0-cp313-cp313-win_amd64.whl", hash = "sha256:812be3edbce7f9201fff8fdf8761c88200170c31a9cc0daffd76729f7723f265"},
+    {file = "ladybug-0.16.0-cp314-cp314-macosx_13_0_arm64.whl", hash = "sha256:be5027893f326c76a3419aeeead220de5363d331001c5a9d3c928f8e4b6b87c4"},
+    {file = "ladybug-0.16.0-cp314-cp314-macosx_13_0_x86_64.whl", hash = "sha256:9c6f09c39990d7b9f3d0f3f815ca88ddbbe49b76bfb639681737e3c599a32d56"},
+    {file = "ladybug-0.16.0-cp314-cp314-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:b8bf6d74bfd9158ee86a3f3c6121110138a3317ba8dacac67f39f5d8346ed33d"},
+    {file = "ladybug-0.16.0-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:8b29ab0d3dbbc1e5ca31c95b0af5dbfd1878c2c301e3667f50d200a59106e04a"},
+    {file = "ladybug-0.16.0-cp314-cp314-musllinux_1_2_aarch64.whl", hash = "sha256:f3d5c16ccd28bd09e37f77aa7691182caebd739242f664a915034f5c9d7d70b1"},
+    {file = "ladybug-0.16.0-cp314-cp314-musllinux_1_2_x86_64.whl", hash = "sha256:2944bc1c259628b24b865310bd5d233e63ed827b035cf2c11893dea8a71ddb6f"},
+    {file = "ladybug-0.16.0-cp314-cp314-win_amd64.whl", hash = "sha256:ed7e33bfd52361e1c63074fa6e2b16bdac1dcb7d04aac66fdbc928f74469b20f"},
 ]
+
+[package.extras]
+dev = ["mypy (==1.16.0)", "networkx (>=3.0,<4.0)", "numpy (>=2.0,<3.0)", "pandas (>=2.2,<3.0)", "polars (>=1.30,<2.0)", "pyarrow (>=21,<23)", "pybind11 (>=2.13,<3.0)", "pytest", "pytest-asyncio (>=1.0,<2.0)", "ruff (==0.11.12)", "setuptools (>=80.9,<81.0)", "torch (>=2.5.0)", "torch-geometric (>=2.5.0)"]
 
 [[package]]
 name = "lance-namespace"
@@ -2245,39 +2246,41 @@ valkey = ["valkey (>=6)"]
 
 [[package]]
 name = "litellm"
-version = "1.83.0"
+version = "1.88.0"
 description = "Library to easily interface with LLM API providers"
 optional = false
-python-versions = "<4.0,>=3.9"
+python-versions = "<3.14,>=3.10"
 groups = ["main"]
 files = [
-    {file = "litellm-1.83.0-py3-none-any.whl", hash = "sha256:88c536d339248f3987571493015784671ba3f193a328e1ea6780dbebaa2094a8"},
-    {file = "litellm-1.83.0.tar.gz", hash = "sha256:860bebc76c4bb27b4cf90b4a77acd66dba25aced37e3db98750de8a1766bfb7a"},
+    {file = "litellm-1.88.0-py3-none-any.whl", hash = "sha256:abd3037e0bf5703f833f5565c87bdfd93578d3de46cbcb36dfa108c3ef58021c"},
+    {file = "litellm-1.88.0.tar.gz", hash = "sha256:4ff794493e40bd86c6f13e91dcb3e1aad697403fd46a96902196d93356ba48f4"},
 ]
 
 [package.dependencies]
-aiohttp = ">=3.10"
-click = "*"
-fastuuid = ">=0.13.0"
-httpx = ">=0.23.0"
-importlib-metadata = ">=6.8.0"
-jinja2 = ">=3.1.2,<4.0.0"
-jsonschema = ">=4.23.0,<5.0.0"
-openai = ">=2.8.0"
-pydantic = ">=2.5.0,<3.0.0"
-python-dotenv = ">=0.2.0"
-tiktoken = ">=0.7.0"
-tokenizers = "*"
+aiohttp = ">=3.10,<4.0"
+click = ">=8.0.0,<9.0"
+fastuuid = ">=0.14.0,<1.0"
+httpx = ">=0.28.0,<1.0"
+importlib-metadata = ">=8.0.0,<9.0"
+jinja2 = ">=3.1.6,<4.0"
+jsonschema = ">=4.0.0,<5.0"
+openai = ">=2.20.0,<3.0.0"
+pydantic = ">=2.10.0,<3.0.0"
+python-dotenv = ">=1.0.0,<2.0"
+tiktoken = ">=0.8.0,<1.0"
+tokenizers = ">=0.21.0,<1.0"
 
 [package.extras]
-caching = ["diskcache (>=5.6.1,<6.0.0)"]
-extra-proxy = ["a2a-sdk (>=0.3.22,<0.4.0) ; python_version >= \"3.10\"", "azure-identity (>=1.15.0,<2.0.0) ; python_version >= \"3.9\"", "azure-keyvault-secrets (>=4.8.0,<5.0.0)", "google-cloud-iam (>=2.19.1,<3.0.0)", "google-cloud-kms (>=2.21.3,<3.0.0)", "prisma (>=0.11.0,<0.12.0)", "redisvl (>=0.4.1,<0.5.0) ; python_version >= \"3.9\" and python_version < \"3.14\"", "resend (>=0.8.0)"]
-google = ["google-cloud-aiplatform (>=1.38.0)"]
-grpc = ["grpcio (>=1.62.3,<1.68.dev0 || >1.71.0,!=1.71.1,!=1.72.0,!=1.72.1,!=1.73.0) ; python_version < \"3.14\"", "grpcio (>=1.75.0) ; python_version >= \"3.14\""]
-mlflow = ["mlflow (>3.1.4) ; python_version >= \"3.10\""]
-proxy = ["PyJWT (>=2.12.0,<3.0.0) ; python_version >= \"3.9\"", "apscheduler (>=3.10.4,<4.0.0)", "azure-identity (>=1.15.0,<2.0.0) ; python_version >= \"3.9\"", "azure-storage-blob (>=12.25.1,<13.0.0)", "backoff", "boto3 (>=1.40.76,<2.0.0)", "cryptography", "fastapi (>=0.120.1)", "fastapi-sso (>=0.16.0,<0.17.0)", "gunicorn (>=23.0.0,<24.0.0)", "litellm-enterprise (==0.1.35)", "litellm-proxy-extras (>=0.4.62,<0.5.0)", "mcp (>=1.25.0,<2.0.0) ; python_version >= \"3.10\"", "orjson (>=3.9.7,<4.0.0)", "polars (>=1.31.0,<2.0.0) ; python_version >= \"3.10\"", "pynacl (>=1.5.0,<2.0.0)", "pyroscope-io (>=0.8,<0.9) ; sys_platform != \"win32\"", "python-multipart (>=0.0.20)", "pyyaml (>=6.0.1,<7.0.0)", "rich (>=13.7.1,<14.0.0)", "rq", "soundfile (>=0.12.1,<0.13.0)", "uvicorn (>=0.32.1,<1.0.0)", "uvloop (>=0.21.0,<0.22.0) ; sys_platform != \"win32\"", "websockets (>=15.0.1,<16.0.0)"]
-semantic-router = ["semantic-router (>=0.1.12) ; python_version >= \"3.9\" and python_version < \"3.14\""]
-utils = ["numpydoc"]
+caching = ["diskcache (>=5.6.3,<6.0)"]
+extra-proxy = ["a2a-sdk (>=0.3.24,<1.0)", "azure-identity (>=1.25.2,<2.0)", "azure-keyvault-secrets (>=4.10.0,<5.0)", "google-cloud-iam (>=2.19.1,<3.0)", "google-cloud-kms (>=2.24.2,<3.0)", "prisma (>=0.11.0,<1.0)", "redisvl (>=0.4.1,<1.0) ; python_full_version < \"3.14.0\"", "resend (>=2.23.0,<3.0)"]
+google = ["google-cloud-aiplatform (>=1.133.0,<2.0)"]
+grpc = ["grpcio (==1.78.0)"]
+mlflow = ["mlflow (>=3.11.1,<4.0)"]
+proxy = ["apscheduler (>=3.11.2,<4.0)", "azure-identity (>=1.25.2,<2.0)", "azure-storage-blob (>=12.28.0,<13.0)", "backoff (>=2.2.1,<3.0)", "boto3 (>=1.43.1,<2.0)", "cryptography (>=46.0.7,<47.0)", "fastapi (>=0.136.3,<1.0)", "fastapi-sso (>=0.19.0,<1.0)", "granian (>=2.7.4,<3.0)", "gunicorn (>=23.0.0,<24.0)", "litellm-enterprise (==0.1.42)", "litellm-proxy-extras (==0.4.73)", "mcp (>=1.26.0,<2.0)", "orjson (>=3.11.6,<4.0)", "polars (>=1.38.1,<2.0)", "pydantic-settings (>=2.14.1,<3.0)", "pyjwt (>=2.12.0,<3.0)", "pynacl (>=1.6.2,<2.0)", "pyroscope-io (>=0.8.16,<1.0) ; sys_platform != \"win32\"", "python-multipart (>=0.0.27,<1.0)", "pyyaml (>=6.0.3,<7.0)", "restrictedpython (>=8.1,<9.0)", "rich (>=13.9.4,<14.0)", "rq (>=2.7.0,<3.0)", "soundfile (>=0.12.1,<1.0)", "starlette (>=1.0.1,<2.0)", "uvicorn (>=0.33.0,<1.0)", "uvloop (>=0.21.0,<1.0) ; sys_platform != \"win32\"", "websockets (>=15.0.1,<16.0)"]
+proxy-runtime = ["anthropic[vertex] (>=0.84.0,<1.0)", "azure-ai-contentsafety (>=1.0.0,<2.0)", "azure-storage-file-datalake (>=12.20.0,<13.0)", "ddtrace (>=2.19.0,<3.0)", "detect-secrets (>=1.5.0,<2.0)", "google-cloud-aiplatform (>=1.133.0,<2.0)", "google-genai (>=1.37.0,<2.0)", "grpcio (==1.78.0)", "langfuse (>=2.59.7,<3.0)", "llm-sandbox (>=0.3.39,<1.0)", "mangum (>=0.17.0,<1.0)", "opentelemetry-api (==1.28.0)", "opentelemetry-exporter-otlp (==1.28.0)", "opentelemetry-instrumentation-fastapi (==0.49b0)", "opentelemetry-sdk (==1.28.0)", "prometheus-client (>=0.20.0,<1.0)", "pypdf (>=6.10.2,<7.0) ; python_full_version < \"3.14.0\"", "sentry-sdk (>=2.21.0,<3.0)"]
+semantic-router = ["aurelio-sdk (>=0.0.19,<1.0) ; python_full_version < \"3.14.0\"", "semantic-router (>=0.1.15,<1.0) ; python_full_version < \"3.14.0\""]
+stt-nvidia-riva = ["audioread (>=3.0.1)", "numpy (>=1.26.0)", "nvidia-riva-client (>=2.15.0)", "soundfile (>=0.12.1)"]
+utils = ["numpydoc (>=1.8.0,<2.0)"]
 
 [[package]]
 name = "lupa"
@@ -4865,4 +4868,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.11,<=3.13"
-content-hash = "a6ffede62c8e538d89809eef2e8211e08a82d8565de4cf41bcac51ec52b4c351"
+content-hash = "39bcd334077b44b3602fc785afcbc6e94bff4fdd698a30c37de1963e546bee9a"
