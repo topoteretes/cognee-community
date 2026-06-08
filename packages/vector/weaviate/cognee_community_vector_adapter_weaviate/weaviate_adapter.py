@@ -58,6 +58,7 @@ class IndexSchema(DataPoint):
     text: str
 
     metadata: dict = {"index_fields": ["text"]}
+    belongs_to_set: list[str] = []
 
 
 class WeaviateAdapter(VectorDBInterface):
@@ -360,6 +361,7 @@ class WeaviateAdapter(VectorDBInterface):
                 IndexSchema(
                     id=data_point.id,
                     text=DataPoint.get_embeddable_data(data_point),
+                    belongs_to_set=(data_point.belongs_to_set or []),
                 )
                 for data_point in data_points
             ],

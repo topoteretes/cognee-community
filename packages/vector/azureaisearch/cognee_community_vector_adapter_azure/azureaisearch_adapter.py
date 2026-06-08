@@ -37,6 +37,7 @@ class IndexSchema(DataPoint):
     id: str
     text: str
     metadata: dict = {"index_fields": ["text"]}
+    belongs_to_set: list[str] = []
 
 
 class AzureAISearchAdapter(VectorDBInterface):
@@ -491,6 +492,7 @@ class AzureAISearchAdapter(VectorDBInterface):
                 IndexSchema(
                     id=str(data_point.id),
                     text=getattr(data_point, data_point.metadata["index_fields"][0]),
+                    belongs_to_set=(data_point.belongs_to_set or []),
                 )
                 for data_point in data_points
             ],
