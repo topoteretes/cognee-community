@@ -1,8 +1,7 @@
 import asyncio
 import base64
 import json
-from typing import Any, List, Optional
-from uuid import UUID
+from typing import List, Optional
 
 from cognee.infrastructure.databases.exceptions import MissingQueryParameterError
 from cognee.infrastructure.databases.vector.embeddings.EmbeddingEngine import (
@@ -16,19 +15,6 @@ from cognee.infrastructure.engine.utils import parse_id
 from opensearchpy import AsyncOpenSearch, NotFoundError
 
 
-def serialize_for_json(obj: Any) -> Any:
-    """Recursively convert UUIDs (and containers of them) to JSON-serializable
-    values so returned payloads can be json.dumps()'d by cognee core (e.g. when
-    logging search history)."""
-    if isinstance(obj, UUID):
-        return str(obj)
-    if isinstance(obj, dict):
-        return {key: serialize_for_json(value) for key, value in obj.items()}
-    if isinstance(obj, list):
-        return [serialize_for_json(item) for item in obj]
-    return obj
-
-
 class IndexSchema(DataPoint):
     """
     Define a schema for indexing data points with a text field.
@@ -40,6 +26,7 @@ class IndexSchema(DataPoint):
 
     text: str
     metadata: dict = {"index_fields": ["text"]}
+    belongs_to_set: list[str] = []
 
 
 class OpenSearchAdapter(VectorDBInterface):
@@ -242,6 +229,7 @@ class OpenSearchAdapter(VectorDBInterface):
                 IndexSchema(
                     id=data_point.id,
                     text=DataPoint.get_embeddable_data(data_point),
+                    belongs_to_set=(data_point.belongs_to_set or []),
                 )
                 for data_point in data_points
             ],
@@ -288,11 +276,7 @@ class OpenSearchAdapter(VectorDBInterface):
                 res = await self.client.get(index=index, id=id_)
                 source = res["_source"]
                 docs.append(
-                    ScoredResult(
-                        id=parse_id(source["id"]),
-                        payload=serialize_for_json(source["payload"]),
-                        score=0,
-                    )
+                    ScoredResult(id=parse_id(source["id"]), payload=source["payload"], score=0)
                 )
             except NotFoundError:
                 continue
@@ -378,7 +362,7 @@ class OpenSearchAdapter(VectorDBInterface):
                 results.append(
                     ScoredResult(
                         id=parse_id(source["id"]),
-                        payload=serialize_for_json(source["payload"]),
+                        payload=source["payload"],
                         score=score,
                     )
                 )

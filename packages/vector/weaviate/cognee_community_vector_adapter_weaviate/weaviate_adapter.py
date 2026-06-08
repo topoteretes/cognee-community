@@ -1,5 +1,6 @@
 import asyncio
-from typing import List, Optional
+from typing import Any, List, Optional
+from uuid import UUID
 
 from cognee.infrastructure.databases.exceptions import MissingQueryParameterError
 from cognee.infrastructure.databases.vector.embeddings.EmbeddingEngine import (
@@ -14,6 +15,19 @@ from cognee.shared.logging_utils import get_logger
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
 logger = get_logger("WeaviateAdapter")
+
+
+def serialize_for_json(obj: Any) -> Any:
+    """Recursively convert UUIDs (and containers of them) to JSON-serializable
+    values so returned payloads can be json.dumps()'d by cognee core (e.g. when
+    logging search history)."""
+    if isinstance(obj, UUID):
+        return str(obj)
+    if isinstance(obj, dict):
+        return {key: serialize_for_json(value) for key, value in obj.items()}
+    if isinstance(obj, list):
+        return [serialize_for_json(item) for item in obj]
+    return obj
 
 
 def is_retryable_request(error):
@@ -469,7 +483,7 @@ class WeaviateAdapter(VectorDBInterface):
                 return [
                     ScoredResult(
                         id=parse_id(str(result.uuid)),
-                        payload=result.properties,
+                        payload=serialize_for_json(result.properties),
                         score=1 - float(result.metadata.score),
                     )
                     for result in search_result.objects
