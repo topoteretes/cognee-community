@@ -5,9 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
-
 from cognee.infrastructure.databases.graph.postgres.adapter import PostgresAdapter
-
 from cognee_community_graph_adapter_pggraph import PgGraphAdapter, register
 from cognee_community_graph_adapter_pggraph.connection import (
     _normalize_scheme,
@@ -91,15 +89,11 @@ class TestConnectionString:
         assert _normalize_scheme(url) == url
 
     def test_resolver_passes_through_normalized_url(self):
-        out = resolve_connection_string(
-            graph_database_url="postgresql://user:pass@host:5432/db"
-        )
+        out = resolve_connection_string(graph_database_url="postgresql://user:pass@host:5432/db")
         assert out == "postgresql+asyncpg://user:pass@host:5432/db"
 
     def test_resolver_passes_through_legacy_url(self):
-        out = resolve_connection_string(
-            graph_database_url="postgres://user:pass@host:5432/db"
-        )
+        out = resolve_connection_string(graph_database_url="postgres://user:pass@host:5432/db")
         assert out == "postgresql+asyncpg://user:pass@host:5432/db"
 
     def test_resolver_builds_url_from_parts_with_async_driver(self):
@@ -267,9 +261,7 @@ async def test_factory_shaped_construction_connects_to_real_postgres():
             "GRAPH_DATABASE_PASSWORD", os.getenv("DB_PASSWORD", "cognee")
         ),
         graph_database_port=os.getenv("GRAPH_DATABASE_PORT", os.getenv("DB_PORT", "5433")),
-        graph_database_host=os.getenv(
-            "GRAPH_DATABASE_HOST", os.getenv("DB_HOST", "localhost")
-        ),
+        graph_database_host=os.getenv("GRAPH_DATABASE_HOST", os.getenv("DB_HOST", "localhost")),
         # cognee's factory passes the database name under this key.
         database_name=os.getenv("GRAPH_DATABASE_NAME", os.getenv("DB_NAME", "cognee")),
         graph_database_key="",

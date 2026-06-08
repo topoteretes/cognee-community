@@ -10,12 +10,9 @@ import json
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from textwrap import dedent
-from typing import Any, Optional
+from typing import Any, Optional, Union
 from uuid import UUID
 
-from cognee.infrastructure.databases.exceptions.exceptions import (
-    NodesetFilterNotSupportedError,
-)
 from cognee.infrastructure.databases.graph.graph_db_interface import GraphDBInterface
 from cognee.infrastructure.engine import DataPoint
 from cognee.modules.storage.utils import JSONEncoder
@@ -82,8 +79,17 @@ class ArcadeDBAdapter(GraphDBInterface):
         )
         return results[0]["node_exists"] if len(results) > 0 else False
 
-    async def add_node(self, node: DataPoint):
-        serialized_properties = self.serialize_properties(node.model_dump())
+    async def add_node(
+        self,
+        node: Union[DataPoint, str],
+        properties: Optional[dict[str, Any]] = None,
+    ):
+        if isinstance(node, DataPoint):
+            node_id = str(node.id)
+            serialized_properties = self.serialize_properties(node.model_dump())
+        else:
+            node_id = str(node)
+            serialized_properties = self.serialize_properties(properties or {})
 
         query = """
         MERGE (node {id: $node_id})
@@ -93,7 +99,7 @@ class ArcadeDBAdapter(GraphDBInterface):
         """
 
         params = {
-            "node_id": str(node.id),
+            "node_id": node_id,
             "properties": serialized_properties,
         }
         return await self.query(query, params)
@@ -146,7 +152,7 @@ class ArcadeDBAdapter(GraphDBInterface):
         params = {"node_ids": node_ids}
         return await self.query(query, params)
 
-    async def has_edge(self, from_node: UUID, to_node: UUID, edge_label: str) -> bool:
+    async def has_edge(self, source_id: str, target_id: str, relationship_name: str) -> bool:
         query = """
             MATCH (from_node)-[relationship]->(to_node)
             WHERE from_node.id = $from_node_id AND to_node.id = $to_node_id
@@ -155,9 +161,9 @@ class ArcadeDBAdapter(GraphDBInterface):
         """
 
         params = {
-            "from_node_id": str(from_node),
-            "to_node_id": str(to_node),
-            "edge_label": edge_label,
+            "from_node_id": str(source_id),
+            "to_node_id": str(target_id),
+            "edge_label": relationship_name,
         }
 
         records = await self.query(query, params)
@@ -194,12 +200,12 @@ class ArcadeDBAdapter(GraphDBInterface):
 
     async def add_edge(
         self,
-        from_node: UUID,
-        to_node: UUID,
+        source_id: str,
+        target_id: str,
         relationship_name: str,
-        edge_properties: Optional[dict[str, Any]] = None,
+        properties: Optional[dict[str, Any]] = None,
     ):
-        serialized_properties = self.serialize_properties(edge_properties or {})
+        serialized_properties = self.serialize_properties(properties or {})
 
         query = dedent(
             f"""\
@@ -213,8 +219,8 @@ class ArcadeDBAdapter(GraphDBInterface):
         )
 
         params = {
-            "from_node": str(from_node),
-            "to_node": str(to_node),
+            "from_node": str(source_id),
+            "to_node": str(target_id),
             "relationship_name": relationship_name,
             "properties": serialized_properties,
         }
@@ -446,10 +452,169 @@ class ArcadeDBAdapter(GraphDBInterface):
 
         return (nodes, edges)
 
+    async def get_neighborhood(
+        self,
+        node_ids: list[str],
+        depth: int = 1,
+        edge_types: Optional[list[str]] = None,
+    ) -> tuple[list[tuple[str, dict[str, Any]]], list[tuple[str, str, str, dict[str, Any]]]]:
+        """
+        Get the k-hop neighborhood subgraph around a set of seed nodes.
+
+        Returns all nodes and edges within `depth` hops of any seed node,
+        in the same format as get_graph_data(). If `edge_types` is provided,
+        only those relationship types are traversed.
+        """
+        if not node_ids:
+            logger.warning("No node IDs provided for neighborhood retrieval.")
+            return [], []
+
+        node_ids = [str(node_id) for node_id in node_ids]
+
+        # Step 1: collect all node IDs within `depth` hops of any seed node.
+        if edge_types:
+            path_query = f"""
+            MATCH path = (seed)-[*1..{depth}]-(neighbor)
+            WHERE seed.id IN $node_ids
+              AND ALL(r IN relationships(path) WHERE TYPE(r) IN $edge_types)
+            RETURN DISTINCT neighbor.id AS nid
+            """
+        else:
+            path_query = f"""
+            MATCH (seed)-[*1..{depth}]-(neighbor)
+            WHERE seed.id IN $node_ids
+            RETURN DISTINCT neighbor.id AS nid
+            """
+
+        params = {"node_ids": node_ids}
+        if edge_types:
+            params["edge_types"] = edge_types
+
+        result = await self.query(path_query, params)
+        neighbor_ids = [record["nid"] for record in result if record.get("nid")]
+
+        all_ids = list(set(node_ids) | set(neighbor_ids))
+
+        # Step 2: fetch all nodes in the collected set.
+        nodes_query = """
+        MATCH (n)
+        WHERE n.id IN $ids
+        RETURN n.id AS id, properties(n) AS properties
+        """
+        nodes_result = await self.query(nodes_query, {"ids": all_ids})
+        nodes = [(record["properties"]["id"], record["properties"]) for record in nodes_result]
+
+        # Step 3: fetch all edges between collected nodes (honoring edge_types).
+        if edge_types:
+            edges_query = """
+            MATCH (n)-[r]->(m)
+            WHERE n.id IN $ids AND m.id IN $ids AND TYPE(r) IN $edge_types
+            RETURN properties(r) AS properties, TYPE(r) AS type
+            """
+            edges_params = {"ids": all_ids, "edge_types": edge_types}
+        else:
+            edges_query = """
+            MATCH (n)-[r]->(m)
+            WHERE n.id IN $ids AND m.id IN $ids
+            RETURN properties(r) AS properties, TYPE(r) AS type
+            """
+            edges_params = {"ids": all_ids}
+
+        edges_result = await self.query(edges_query, edges_params)
+        edges = [
+            (
+                record["properties"]["source_node_id"],
+                record["properties"]["target_node_id"],
+                record["type"],
+                record["properties"],
+            )
+            for record in edges_result
+        ]
+
+        return (nodes, edges)
+
     async def get_nodeset_subgraph(
-        self, node_type: type[Any], node_name: list[str]
+        self,
+        node_type: type[Any],
+        node_name: list[str],
+        node_name_filter_operator: str = "OR",
     ) -> tuple[list[tuple[int, dict]], list[tuple[int, int, str, dict]]]:
-        raise NodesetFilterNotSupportedError
+        """
+        Retrieve a subgraph based on specified node names and type, including their
+        relationships.
+
+        When `node_name_filter_operator` is "OR" the subgraph includes the neighborhood
+        of any matched node; when "AND" only neighbors shared by all matched nodes are
+        included.
+        """
+        label = node_type.__name__
+
+        if node_name_filter_operator == "OR":
+            query = f"""
+            UNWIND $names AS wantedName
+            MATCH (n:`{label}`)
+            WHERE n.name = wantedName
+            WITH collect(DISTINCT n) AS primary
+            UNWIND primary AS p
+            OPTIONAL MATCH (p)--(nbr)
+            WITH primary, collect(DISTINCT nbr) AS nbrs
+            WITH primary + nbrs AS nodelist
+            UNWIND nodelist AS node
+            WITH collect(DISTINCT node) AS nodes
+            MATCH (a)-[r]-(b)
+            WHERE a IN nodes AND b IN nodes
+            WITH nodes, collect(DISTINCT r) AS rels
+            RETURN
+              [n IN nodes |
+                 {{ id: n.id,
+                    properties: properties(n) }}] AS rawNodes,
+              [r IN rels  |
+                 {{ type: type(r),
+                    properties: properties(r) }}] AS rawRels
+            """
+        else:
+            query = f"""
+            UNWIND $names AS wantedName
+            MATCH (n:`{label}`)
+            WHERE n.name = wantedName
+            WITH collect(DISTINCT n) AS primary
+            UNWIND primary AS p
+            MATCH (p)--(nbr)
+            WITH primary, nbr, COUNT(DISTINCT p) AS matched_count
+            WHERE matched_count = size(primary)
+            WITH primary, collect(DISTINCT nbr) AS nbrs
+            WITH primary + nbrs AS nodelist
+            UNWIND nodelist AS node
+            WITH collect(DISTINCT node) AS nodes
+            MATCH (a)-[r]-(b)
+            WHERE a IN nodes AND b IN nodes
+            WITH nodes, collect(DISTINCT r) AS rels
+            RETURN
+              [n IN nodes | {{ id: n.id, properties: properties(n) }}] AS rawNodes,
+              [r IN rels  | {{ type: type(r), properties: properties(r) }}] AS rawRels
+            """
+
+        result = await self.query(query, {"names": node_name})
+
+        if not result:
+            return [], []
+
+        raw_nodes = result[0]["rawNodes"]
+        raw_rels = result[0]["rawRels"]
+
+        nodes = [(n["properties"]["id"], n["properties"]) for n in raw_nodes]
+
+        edges = [
+            (
+                r["properties"]["source_node_id"],
+                r["properties"]["target_node_id"],
+                r["type"],
+                r["properties"],
+            )
+            for r in raw_rels
+        ]
+
+        return nodes, edges
 
     async def get_filtered_graph_data(self, attribute_filters):
         where_clauses = []

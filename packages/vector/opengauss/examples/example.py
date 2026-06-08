@@ -4,10 +4,9 @@ import asyncio
 import os
 import pathlib
 
-from dotenv import load_dotenv
-
 from cognee import SearchType, add, cognify, config, prune, search
 from cognee_community_vector_adapter_opengauss import register  # noqa: F401 — registers adapter
+from dotenv import load_dotenv
 
 load_dotenv()
 
@@ -23,10 +22,12 @@ async def main() -> None:
         "OPENGAUSS_URL",
         "postgresql://gaussdb:OpenGauss%40123@localhost:5432/postgres",
     )
-    config.set_vector_db_config({
-        "vector_db_provider": "opengauss",
-        "vector_db_url": opengauss_url,
-    })
+    config.set_vector_db_config(
+        {
+            "vector_db_provider": "opengauss",
+            "vector_db_url": opengauss_url,
+        }
+    )
 
     host = opengauss_url.rsplit("@", 1)[-1].split("/", 1)[0]
     print(f"openGauss DataVec Demo — {host}")

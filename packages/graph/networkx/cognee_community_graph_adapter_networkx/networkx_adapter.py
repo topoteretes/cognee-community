@@ -9,9 +9,6 @@ import aiofiles
 import aiofiles.os as aiofiles_os
 import networkx as nx
 import numpy as np
-from cognee.infrastructure.databases.exceptions.exceptions import (
-    NodesetFilterNotSupportedError,
-)
 from cognee.infrastructure.databases.graph.graph_db_interface import (
     GraphDBInterface,
 )
@@ -95,7 +92,7 @@ class NetworkXAdapter(GraphDBInterface):
         """
         pass
 
-    async def has_node(self, node_id: UUID) -> bool:
+    async def has_node(self, node_id: str | UUID) -> bool:
         """
         Determine if a specific node exists in the graph.
 
@@ -277,7 +274,7 @@ class NetworkXAdapter(GraphDBInterface):
             logger.error(f"Failed to add edges: {e}")
             raise
 
-    async def get_edges(self, node_id: UUID):
+    async def get_edges(self, node_id: str | UUID):
         """
         Retrieve edges connected to a specific node.
 
@@ -295,7 +292,7 @@ class NetworkXAdapter(GraphDBInterface):
             self.graph.out_edges(node_id, data=True)
         )
 
-    async def delete_node(self, node_id: UUID) -> None:
+    async def delete_node(self, node_id: str | UUID) -> None:
         """
         Remove a node and its associated edges from the graph, then persist the changes.
 
@@ -319,7 +316,7 @@ class NetworkXAdapter(GraphDBInterface):
         else:
             logger.error(f"Node {node_id} not found in graph")
 
-    async def delete_nodes(self, node_ids: list[UUID]) -> None:
+    async def delete_nodes(self, node_ids: list[str | UUID]) -> None:
         """
         Bulk delete nodes from the graph and persist the changes.
 
@@ -351,7 +348,7 @@ class NetworkXAdapter(GraphDBInterface):
 
         return disconnected_nodes
 
-    async def extract_node(self, node_id: UUID) -> dict:
+    async def extract_node(self, node_id: str | UUID) -> dict:
         """
         Retrieve data for a specific node based on its identifier.
 
@@ -370,7 +367,7 @@ class NetworkXAdapter(GraphDBInterface):
 
         return None
 
-    async def extract_nodes(self, node_ids: list[UUID]) -> list[dict]:
+    async def extract_nodes(self, node_ids: list[str | UUID]) -> list[dict]:
         """
         Retrieve data for multiple nodes based on their identifiers.
 
@@ -386,7 +383,7 @@ class NetworkXAdapter(GraphDBInterface):
         """
         return [self.graph.nodes[node_id] for node_id in node_ids if self.graph.has_node(node_id)]
 
-    async def get_predecessors(self, node_id: UUID, edge_label: str = None) -> list:
+    async def get_predecessors(self, node_id: str | UUID, edge_label: str = None) -> list:
         """
         Retrieve the predecessor nodes of a specified node according to a specific edge label.
 
@@ -417,7 +414,7 @@ class NetworkXAdapter(GraphDBInterface):
 
             return nodes
 
-    async def get_successors(self, node_id: UUID, edge_label: str = None) -> list:
+    async def get_successors(self, node_id: str | UUID, edge_label: str = None) -> list:
         """
         Retrieve the successor nodes of a specified node according to a specific edge label.
 
@@ -448,7 +445,7 @@ class NetworkXAdapter(GraphDBInterface):
 
             return nodes
 
-    async def get_neighbors(self, node_id: UUID) -> list:
+    async def get_neighbors(self, node_id: str | UUID) -> list:
         """
         Get the neighboring nodes of a specified node, including both predecessors and
         successors.
@@ -475,14 +472,14 @@ class NetworkXAdapter(GraphDBInterface):
 
         return neighbors
 
-    async def get_connections(self, node_id: UUID) -> list:
+    async def get_connections(self, node_id: str | UUID) -> list:
         """
         Get the connections of a specified node to its neighbors.
 
         Parameters:
         -----------
 
-            - node_id (UUID): The identifier of the node for which to get connections.
+            - node_id (Union[str, UUID]): The identifier of the node for which to get connections.
 
         Returns:
         --------
@@ -524,7 +521,7 @@ class NetworkXAdapter(GraphDBInterface):
         return connections
 
     async def remove_connection_to_predecessors_of(
-        self, node_ids: list[UUID], edge_label: str
+        self, node_ids: list[str | UUID], edge_label: str
     ) -> None:
         """
         Remove connections to predecessors of specified nodes based on an edge label and persist
@@ -533,8 +530,8 @@ class NetworkXAdapter(GraphDBInterface):
         Parameters:
         -----------
 
-            - node_ids (list[UUID]): A list of node identifiers whose predecessor connections
-              need to be removed.
+            - node_ids (list[Union[str, UUID]]): A list of node identifiers whose
+              predecessor connections need to be removed.
             - edge_label (str): The label of the edges to remove.
         """
         for node_id in node_ids:
@@ -546,7 +543,7 @@ class NetworkXAdapter(GraphDBInterface):
         await self.save_graph_to_file(self.filename)
 
     async def remove_connection_to_successors_of(
-        self, node_ids: list[UUID], edge_label: str
+        self, node_ids: list[str | UUID], edge_label: str
     ) -> None:
         """
         Remove connections to successors of specified nodes based on an edge label and persist
@@ -555,8 +552,8 @@ class NetworkXAdapter(GraphDBInterface):
         Parameters:
         -----------
 
-            - node_ids (list[UUID]): A list of node identifiers whose successor connections need
-              to be removed.
+            - node_ids (list[Union[str, UUID]]): A list of node identifiers whose
+              successor connections need to be removed.
             - edge_label (str): The label of the edges to remove.
         """
         for node_id in node_ids:
@@ -710,23 +707,161 @@ class NetworkXAdapter(GraphDBInterface):
             logger.error("Failed to delete graph: %s", error)
             raise error
 
+    async def get_neighborhood(
+        self,
+        node_ids: list[str],
+        depth: int = 1,
+        edge_types: list[str] | None = None,
+    ) -> tuple[list[tuple[str, dict]], list[tuple[str, str, str, dict]]]:
+        """
+        Get the k-hop neighborhood subgraph around a set of seed nodes.
+
+        Starting from each seed in ``node_ids``, traverse up to ``depth`` hops following
+        both incoming and outgoing edges. If ``edge_types`` is provided, only edges whose
+        relationship type (the MultiDiGraph edge key) is in that list are traversed.
+
+        Returns all nodes and edges within ``depth`` hops of any seed node, in the SAME
+        format as ``get_graph_data()``: nodes as ``(node_id, data)`` tuples and edges as
+        ``(source, target, key, data)`` tuples.
+
+        Parameters:
+        -----------
+
+            - node_ids (List[str]): Seed node identifiers to start traversal from.
+            - depth (int): Number of hops to traverse from each seed node. (default 1)
+            - edge_types (Optional[List[str]]): If provided, only traverse edges of these
+              relationship types. (default None)
+        """
+        await self.load_graph_from_file()
+
+        if not node_ids:
+            logger.warning("No node IDs provided for neighborhood retrieval.")
+            return [], []
+
+        edge_type_set = set(edge_types) if edge_types else None
+
+        # BFS over both in and out edges, collecting visited nodes within `depth` hops.
+        visited = set()
+        frontier = set()
+        for seed in node_ids:
+            if self.graph.has_node(seed):
+                visited.add(seed)
+                frontier.add(seed)
+
+        for _ in range(max(depth, 0)):
+            next_frontier = set()
+            for current in frontier:
+                # Outgoing edges: current -> successor
+                for _src, target, key in self.graph.out_edges(current, keys=True):
+                    if edge_type_set is not None and key not in edge_type_set:
+                        continue
+                    if target not in visited:
+                        visited.add(target)
+                        next_frontier.add(target)
+                # Incoming edges: predecessor -> current
+                for source, _tgt, key in self.graph.in_edges(current, keys=True):
+                    if edge_type_set is not None and key not in edge_type_set:
+                        continue
+                    if source not in visited:
+                        visited.add(source)
+                        next_frontier.add(source)
+            if not next_frontier:
+                break
+            frontier = next_frontier
+
+        nodes = [
+            (node_id, data) for node_id, data in self.graph.nodes(data=True) if node_id in visited
+        ]
+
+        # Edges where both endpoints are in the visited set, honoring edge_types filter.
+        edges = [
+            (source, target, key, data)
+            for source, target, key, data in self.graph.edges(data=True, keys=True)
+            if source in visited
+            and target in visited
+            and (edge_type_set is None or key in edge_type_set)
+        ]
+
+        logger.info(
+            "Neighborhood retrieval (%d-hop): %d nodes and %d edges",
+            depth,
+            len(nodes),
+            len(edges),
+        )
+
+        return nodes, edges
+
     async def get_nodeset_subgraph(
         self,
         node_type: type[Any],
         node_name: list[str],
-        node_name_filter_operator: str = "OR",  # TODO: Add functionality for this parameter
+        node_name_filter_operator: str = "OR",
     ) -> tuple[list[tuple[int, dict]], list[tuple[int, int, str, dict]]]:
         """
-        Obtain a subgraph based on specific node types and names. Not supported in this
-        implementation.
+        Obtain a subgraph based on specific node types and names, together with their
+        immediate neighbors and the edges among the selected nodes.
+
+        Primary nodes are those whose ``type`` attribute equals ``node_type.__name__`` and
+        which match ``node_name`` according to ``node_name_filter_operator``:
+
+            - "OR": the node's ``name`` is one of ``node_name`` OR the node's
+              ``belongs_to_set`` list contains ANY of the requested names.
+            - "AND": the node's ``belongs_to_set`` list contains ALL of the requested
+              names (a single ``name`` cannot satisfy more than one requested value).
+
+        Returns nodes as ``(node_id, data)`` tuples and edges as
+        ``(source, target, type, data)`` tuples, matching the interface format.
 
         Parameters:
         -----------
 
             - node_type (Type[Any]): The type of nodes to include in the subgraph.
             - node_name (List[str]): A list of node names to filter by.
+            - node_name_filter_operator (str): "OR" (any) or "AND" (all). (default "OR")
         """
-        raise NodesetFilterNotSupportedError
+        await self.load_graph_from_file()
+
+        type_name = node_type.__name__
+        wanted = list(node_name) if node_name else []
+        wanted_set = set(wanted)
+
+        def _matches(data: dict) -> bool:
+            if data.get("type") != type_name:
+                return False
+            if not wanted:
+                return False
+            belongs_to_set = data.get("belongs_to_set") or []
+            if not isinstance(belongs_to_set, (list, tuple, set)):
+                belongs_to_set = [belongs_to_set]
+            belongs_set = set(belongs_to_set)
+            if node_name_filter_operator == "AND":
+                return wanted_set.issubset(belongs_set)
+            # OR: match by node name or any membership in belongs_to_set
+            return data.get("name") in wanted_set or bool(wanted_set & belongs_set)
+
+        # Collect primary matching nodes plus their immediate neighbors.
+        primary = {node_id for node_id, data in self.graph.nodes(data=True) if _matches(data)}
+
+        subgraph_nodes = set(primary)
+        for node_id in primary:
+            for _src, target in self.graph.out_edges(node_id):
+                subgraph_nodes.add(target)
+            for source, _tgt in self.graph.in_edges(node_id):
+                subgraph_nodes.add(source)
+
+        nodes = [
+            (node_id, data)
+            for node_id, data in self.graph.nodes(data=True)
+            if node_id in subgraph_nodes
+        ]
+
+        edges = [
+            (source, target, key, data)
+            for source, target, key, data in self.graph.edges(data=True, keys=True)
+            if source in subgraph_nodes and target in subgraph_nodes
+        ]
+
+        return nodes, edges
 
     async def get_filtered_graph_data(self, attribute_filters: list[dict[str, list[str | int]]]):
         """
@@ -1008,7 +1143,7 @@ class NetworkXAdapter(GraphDBInterface):
                     nodes.append(node_data)
         return nodes
 
-    async def get_node(self, node_id: UUID) -> dict:
+    async def get_node(self, node_id: str | UUID) -> dict:
         """
         Retrieve the details of a specific node identified by its identifier.
 
@@ -1026,7 +1161,7 @@ class NetworkXAdapter(GraphDBInterface):
             return self.graph.nodes[node_id]
         return None
 
-    async def get_nodes(self, node_ids: list[UUID] = None) -> list[dict]:
+    async def get_nodes(self, node_ids: list[str | UUID] = None) -> list[dict]:
         """
         Retrieve data for multiple nodes by their identifiers, or all nodes if no identifiers
         are provided.

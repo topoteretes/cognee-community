@@ -288,8 +288,8 @@ class OpenSearchAdapter(VectorDBInterface):
         limit: int | None = 15,
         with_vector: bool = False,
         include_payload: bool = False,
-        node_name: Optional[List[str]] = None,  # TODO: Add functionality for this parameter
-        node_name_filter_operator: str = "OR",  # TODO: Add functionality for this parameter
+        node_name: Optional[List[str]] = None,
+        node_name_filter_operator: str = "OR",
     ) -> list[ScoredResult]:
         """
         Search for similar data points in a collection using a query text or vector.
@@ -321,10 +321,35 @@ class OpenSearchAdapter(VectorDBInterface):
         await self._acquire()
 
         index = self._get_index_name(collection_name)
-        query = {
-            "size": limit,
-            "query": {"knn": {"vector": {"vector": query_vector, "k": limit}}},
-        }
+        knn_query = {"knn": {"vector": {"vector": query_vector, "k": limit}}}
+
+        # Optionally filter results to data points whose payload field
+        # "belongs_to_set" contains ANY (operator "OR") or ALL (operator "AND")
+        # of the names in node_name.
+        # Match against the unanalyzed ".keyword" sub-field so exact term matching
+        # works (the analyzed text field would lowercase/tokenize the set names).
+        if node_name:
+            if node_name_filter_operator == "AND":
+                set_filter = [
+                    {"term": {"payload.belongs_to_set.keyword": name}} for name in node_name
+                ]
+            else:
+                set_filter = [{"terms": {"payload.belongs_to_set.keyword": list(node_name)}}]
+
+            query = {
+                "size": limit,
+                "query": {
+                    "bool": {
+                        "must": [knn_query],
+                        "filter": set_filter,
+                    }
+                },
+            }
+        else:
+            query = {
+                "size": limit,
+                "query": knn_query,
+            }
         try:
             res = await self.client.search(index=index, body=query)
             hits = res["hits"]["hits"]
@@ -353,7 +378,6 @@ class OpenSearchAdapter(VectorDBInterface):
         with_vectors: bool = False,
         include_payload: bool = False,
         node_name: Optional[List[str]] = None,
-        node_name_filter_operator: str = "OR",
     ):
         """
         Perform a batch search for multiple query texts.
@@ -379,7 +403,6 @@ class OpenSearchAdapter(VectorDBInterface):
                 with_vector=with_vectors,
                 include_payload=include_payload,
                 node_name=node_name,
-                node_name_filter_operator=node_name_filter_operator,
             )
             for vector in vectors
         ]

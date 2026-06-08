@@ -6,14 +6,13 @@ from uuid import uuid4
 
 import cognee
 from cognee.modules.search.types import SearchType
-
 from cognee_community_vector_adapter_singlestore import register  # noqa: F401
-from cognee_community_vector_adapter_singlestore.SingleStoreDatasetDatabaseHandler import (
-    SingleStoreDatasetDatabaseHandler,
-)
 from cognee_community_vector_adapter_singlestore.singlestore_adapter import (
     SingleStoreAdapter,
     SingleStoreDataPoint,
+)
+from cognee_community_vector_adapter_singlestore.SingleStoreDatasetDatabaseHandler import (
+    SingleStoreDatasetDatabaseHandler,
 )
 
 

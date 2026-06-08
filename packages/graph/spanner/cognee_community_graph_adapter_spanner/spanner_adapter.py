@@ -619,13 +619,129 @@ class SpannerGraphAdapter(GraphDBInterface):
             return []
         return await self.get_nodes(list(neighbor_ids))
 
+    async def get_neighborhood(
+        self,
+        node_ids: list[str],
+        depth: int = 1,
+        edge_types: list[str] | None = None,
+    ) -> tuple[
+        list[tuple[str, dict[str, Any]]],
+        list[tuple[str, str, str, dict[str, Any]]],
+    ]:
+        """Get the k-hop neighborhood subgraph around seed nodes.
+
+        Performs an iterative BFS using the adapter's existing get_edges
+        primitive, collecting all node IDs within `depth` hops of any seed
+        node. If edge_types is provided, only edges of those relationship
+        types are traversed. Returns (nodes, edges) in the same format as
+        get_graph_data().
+        """
+        if not node_ids:
+            return [], []
+
+        edge_type_set: set[str] | None = set(edge_types) if edge_types else None
+
+        # Iterative BFS over the graph using get_edges as the traversal primitive.
+        reachable_ids: set[str] = {str(nid) for nid in node_ids}
+        frontier: set[str] = set(reachable_ids)
+        for _ in range(max(0, depth)):
+            if not frontier:
+                break
+            next_frontier: set[str] = set()
+            for current in frontier:
+                for src, tgt, rel, _props in await self.get_edges(current):
+                    if edge_type_set is not None and str(rel) not in edge_type_set:
+                        continue
+                    other = str(tgt) if str(src) == current else str(src)
+                    if other not in reachable_ids:
+                        next_frontier.add(other)
+            reachable_ids.update(next_frontier)
+            frontier = next_frontier
+
+        # Collect nodes for all reachable ids.
+        nodes: list[tuple[str, dict[str, Any]]] = []
+        for nid in reachable_ids:
+            node = await self.get_node(nid)
+            if node is not None:
+                nodes.append((str(nid), node))
+
+        # Collect edges whose both endpoints are within the neighborhood,
+        # honoring the edge_types filter.
+        seen_edges: set[tuple[str, str, str]] = set()
+        edges: list[tuple[str, str, str, dict[str, Any]]] = []
+        for nid in reachable_ids:
+            for src, tgt, rel, props in await self.get_edges(nid):
+                s, t, r = str(src), str(tgt), str(rel)
+                if s not in reachable_ids or t not in reachable_ids:
+                    continue
+                if edge_type_set is not None and r not in edge_type_set:
+                    continue
+                key = (s, t, r)
+                if key in seen_edges:
+                    continue
+                seen_edges.add(key)
+                edges.append((s, t, r, props))
+
+        return nodes, edges
+
     async def get_nodeset_subgraph(
-        self, node_type: type[Any], node_name: list[str]
+        self,
+        node_type: type[Any],
+        node_name: list[str],
+        node_name_filter_operator: str = "OR",
     ) -> tuple[
         list[tuple[int, dict[str, Any]]],
         list[tuple[int, int, str, dict[str, Any]]],
     ]:
-        raise NodesetFilterNotSupportedError
+        """Fetch a subgraph of matching primary nodes, their direct neighbors,
+        and all edges interconnecting that node set.
+
+        Primary nodes are those whose properties match the given node_type
+        (DataPoint subclass name, stored in the "type" property) and whose
+        "name" property is in node_name. With operator "OR" a neighbor of any
+        primary node qualifies; with "AND" a neighbor must be connected to
+        every primary node. Returns (nodes, edges) in get_graph_data() format.
+        """
+        if node_name_filter_operator not in ("OR", "AND"):
+            raise NodesetFilterNotSupportedError
+
+        label = node_type.__name__
+        wanted_names = set(node_name)
+
+        all_nodes, all_edges = await self.get_graph_data()
+
+        # Identify primary nodes by type label and name.
+        primary_ids: set[str] = set()
+        for nid, props in all_nodes:
+            if str(props.get("type")) == label and props.get("name") in wanted_names:
+                primary_ids.add(str(nid))
+
+        if not primary_ids:
+            return [], []
+
+        # Count, per neighbor, how many distinct primary nodes it connects to.
+        neighbor_primary_links: dict[str, set[str]] = {}
+        for src, tgt, _rel, _props in all_edges:
+            s, t = str(src), str(tgt)
+            if s in primary_ids and t not in primary_ids:
+                neighbor_primary_links.setdefault(t, set()).add(s)
+            elif t in primary_ids and s not in primary_ids:
+                neighbor_primary_links.setdefault(s, set()).add(t)
+
+        if node_name_filter_operator == "OR":
+            neighbor_ids = set(neighbor_primary_links.keys())
+        else:
+            neighbor_ids = {
+                nbr for nbr, primaries in neighbor_primary_links.items() if primaries == primary_ids
+            }
+
+        all_ids = primary_ids | neighbor_ids
+
+        nodes = [(nid, props) for nid, props in all_nodes if str(nid) in all_ids]
+        edges = [
+            (s, t, r, p) for s, t, r, p in all_edges if str(s) in all_ids and str(t) in all_ids
+        ]
+        return nodes, edges
 
     async def get_connections(
         self, node_id: str | UUID

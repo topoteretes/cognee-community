@@ -169,6 +169,15 @@ class MilvusAdapter:
             schema.add_field("vector", DataType.FLOAT_VECTOR, dim=vector_dim)
             schema.add_field("text", DataType.VARCHAR, max_length=65535)
             schema.add_field("metadata", DataType.JSON)
+            # Store the data point's belongs_to_set names so that search() can
+            # filter by node_name using Milvus array-membership expressions.
+            schema.add_field(
+                "belongs_to_set",
+                DataType.ARRAY,
+                element_type=DataType.VARCHAR,
+                max_capacity=4096,
+                max_length=65535,
+            )
 
             try:
                 client.create_collection(collection_name=collection_name, schema=schema)
@@ -202,6 +211,14 @@ class MilvusAdapter:
 
         try:
             for data_point, embedding in zip(data_points, data_vectors, strict=False):
+                # belongs_to_set may be a list of DataPoints, a list of strings,
+                # or None. Normalize to a list of string names for filtering.
+                belongs_to_set = getattr(data_point, "belongs_to_set", None) or []
+                belongs_to_set_names = [
+                    item if isinstance(item, str) else str(getattr(item, "name", item))
+                    for item in belongs_to_set
+                ]
+
                 doc_data = {
                     "id": str(data_point.id),
                     "text": getattr(
@@ -211,6 +228,7 @@ class MilvusAdapter:
                     ),
                     "vector": embedding,
                     "metadata": data_point.metadata,
+                    "belongs_to_set": belongs_to_set_names,
                 }
 
                 client.insert(
@@ -328,8 +346,8 @@ class MilvusAdapter:
         limit: int | None = 10,
         with_vector: bool = False,
         include_payload: bool = False,
-        node_name: Optional[List[str]] = None,  # TODO: Add functionality for this parameter
-        node_name_filter_operator: str = "OR",  # TODO: Add functionality for this parameter
+        node_name: Optional[List[str]] = None,
+        node_name_filter_operator: str = "OR",
         **kwargs: object,
     ) -> list[dict[str, object]]:
         """
@@ -385,14 +403,41 @@ class MilvusAdapter:
             if with_vector:
                 output_fields.append("vector")
 
-            results = client.search(
-                collection_name=collection_name,
-                data=[search_vector],
-                anns_field="vector",
-                search_params=search_params,
-                limit=limit,
-                output_fields=output_fields,
-            )
+            # Build a boolean filter expression over the belongs_to_set field so
+            # that only data points whose belongs_to_set contains ANY (OR) or ALL
+            # (AND) of the requested node names are returned.
+            filter_expr = kwargs.get("expr", "")
+            if node_name:
+                escaped_node_names = [name.replace('"', '\\"') for name in node_name]
+                literal_node_names = (
+                    "[" + ", ".join(f'"{name}"' for name in escaped_node_names) + "]"
+                )
+                if node_name_filter_operator == "AND":
+                    node_name_filter_string = (
+                        f"ARRAY_CONTAINS_ALL(belongs_to_set, {literal_node_names})"
+                    )
+                else:
+                    node_name_filter_string = (
+                        f"ARRAY_CONTAINS_ANY(belongs_to_set, {literal_node_names})"
+                    )
+
+                if filter_expr:
+                    filter_expr = f"({filter_expr}) and {node_name_filter_string}"
+                else:
+                    filter_expr = node_name_filter_string
+
+            search_kwargs: dict[str, object] = {
+                "collection_name": collection_name,
+                "data": [search_vector],
+                "anns_field": "vector",
+                "search_params": search_params,
+                "limit": limit,
+                "output_fields": output_fields,
+            }
+            if filter_expr:
+                search_kwargs["filter"] = filter_expr
+
+            results = client.search(**search_kwargs)
 
             scored_results = []
             for result in results[0]:  # results is a list of lists
@@ -423,8 +468,7 @@ class MilvusAdapter:
         limit: int | None = 10,
         with_vectors: bool = False,
         include_payload: bool = False,
-        node_name: Optional[List[str]] = None,  # TODO: Add functionality for this parameter
-        node_name_filter_operator: str = "OR",  # TODO: Add functionality for this parameter
+        node_name: Optional[List[str]] = None,
         **kwargs: object,
     ) -> list[list[dict[str, object]]]:
         """
@@ -435,67 +479,32 @@ class MilvusAdapter:
             collection_name (str): Name of the collection to search.
             query_texts (List[str]): List of texts to search for.
             limit (int): Maximum number of results per query.
+            node_name (Optional[List[str]]): If provided, only data points whose
+                belongs_to_set contains the given names are returned. The
+                adapter's default node_name_filter_operator ("OR") is used.
             **kwargs: object: Additional search parameters.
 
         Returns:
         --------
             List[List[Dict]]: List of search results for each query.
         """
-        # Embed all query texts
+        # Embed all query texts, then forward each query to search() so that
+        # node_name filtering is applied per-query using the default operator.
         query_vectors = await self.embed_data(query_texts)
 
-        client = self.get_milvus_client()
-
-        try:
-            # Load the collection for search
-            client.load_collection(collection_name)
-
-            if limit is None:
-                stats = client.get_collection_stats(collection_name)
-                limit = stats["row_count"]
-            if limit == 0:
-                return []
-
-            # Perform the batch search
-            search_params = {"metric_type": "COSINE", "params": {"nprobe": 10}}
-
-            output_fields = ["id", "text", "metadata"] if include_payload else ["id"]
-            if with_vectors:
-                output_fields.append("vector")
-
-            results = client.search(
-                collection_name=collection_name,
-                data=query_vectors,
-                anns_field="vector",
-                search_params=search_params,
-                limit=limit,
-                output_fields=output_fields,
-            )
-
-            batch_results = []
-            for query_results in results:
-                query_search_results = []
-                for result in query_results:
-                    payload = (
-                        {
-                            "text": result["text"],
-                            "metadata": result["metadata"],
-                        }
-                        if include_payload
-                        else {}
-                    )
-                    if with_vectors:
-                        payload["vectors"] = result["vectors"]
-
-                    query_search_results.append(
-                        ScoredResult(id=result["id"], payload=payload, score=result.score),
-                    )
-                batch_results.append(query_search_results)
-
-            return batch_results
-        except Exception as e:
-            logger.error(f"Error performing batch search in collection {collection_name}: {e}")
-            raise
+        return await asyncio.gather(
+            *[
+                self.search(
+                    collection_name=collection_name,
+                    query_vector=query_vector,
+                    limit=limit,
+                    with_vector=with_vectors,
+                    include_payload=include_payload,
+                    node_name=node_name,
+                )
+                for query_vector in query_vectors
+            ]
+        )
 
     async def delete_data_points(self, collection_name: str, data_point_ids: list[str]) -> None:
         """

@@ -164,6 +164,12 @@ class AzureAISearchAdapter(VectorDBInterface):
                     type=SearchFieldDataType.String,
                     searchable=False,
                 ),
+                # Filterable nodeset membership, used by node_name filtering in search()
+                SimpleField(
+                    name="belongs_to_set",
+                    type=SearchFieldDataType.Collection(SearchFieldDataType.String),
+                    filterable=True,
+                ),
             ]
 
             # Configure vector search
@@ -216,11 +222,17 @@ class AzureAISearchAdapter(VectorDBInterface):
             # Convert payload to proper JSON string
             import json
 
+            # Normalize nodeset membership to a list of string names so the filterable
+            # belongs_to_set field can back node_name filtering in search().
+            raw_belongs_to_set = getattr(data_point, "belongs_to_set", None) or []
+            belongs_to_set = [str(getattr(item, "name", item)) for item in raw_belongs_to_set]
+
             document = {
                 "id": str(data_point.id),
                 "text": DataPoint.get_embeddable_data(data_point),
                 "vector": data_vectors[i],
                 "payload": json.dumps(properties),  # Store as proper JSON string
+                "belongs_to_set": belongs_to_set,
             }
             documents.append(document)
 
@@ -281,6 +293,28 @@ class AzureAISearchAdapter(VectorDBInterface):
 
             return results
 
+    def _build_node_name_filter(self, node_name: list[str], node_name_filter_operator: str) -> str:
+        """Build an OData ``$filter`` expression restricting results to data
+        points whose ``belongs_to_set`` collection field contains ANY (operator
+        ``OR``) or ALL (operator ``AND``) of ``node_name``.
+
+        For OR, a single ``belongs_to_set/any(t: search.in(t, 'a,b,c'))`` clause
+        matches when at least one of the names is present.  For AND, the clauses
+        are chained per-name so that every requested name must be present.
+        """
+
+        def _escape(name: str) -> str:
+            # Escape single quotes for OData string literals.
+            return name.replace("'", "''")
+
+        if node_name_filter_operator == "AND":
+            clauses = [f"belongs_to_set/any(t: t eq '{_escape(name)}')" for name in node_name]
+            return " and ".join(clauses)
+
+        # OR (default): any of the requested names present.
+        joined = ",".join(_escape(name) for name in node_name)
+        return f"belongs_to_set/any(t: search.in(t, '{joined}', ','))"
+
     async def search(
         self,
         collection_name: str,
@@ -288,10 +322,18 @@ class AzureAISearchAdapter(VectorDBInterface):
         query_vector: list[float] | None = None,
         limit: int = 15,
         with_vector: bool = False,
+        include_payload: bool = False,
+        node_name: list[str] | None = None,
+        node_name_filter_operator: str = "OR",
         normalized: bool = True,
     ) -> list[ScoredResult]:
         """Perform vector or hybrid search.
         Args:
+            node_name: When provided, results are filtered to data points whose
+                ``belongs_to_set`` collection field contains ANY (operator
+                ``OR``) or ALL (operator ``AND``) of these names.
+            node_name_filter_operator: ``"OR"`` (default) or ``"AND"``,
+                controlling how ``node_name`` entries are combined.
             normalized: When True (default), returns ``1 - similarity``
                 so that lower scores indicate better matches, consistent
                 with cognee's ``ScoredResult`` contract.  When False,
@@ -318,6 +360,11 @@ class AzureAISearchAdapter(VectorDBInterface):
         else:
             limit = 10000
 
+        # Build an OData $filter over the belongs_to_set collection field.
+        filter_expression = None
+        if node_name:
+            filter_expression = self._build_node_name_filter(node_name, node_name_filter_operator)
+
         async with self.get_async_search_client(sanitized_name) as client:
             # Create vector query
             vector_query = VectorizedQuery(
@@ -333,6 +380,7 @@ class AzureAISearchAdapter(VectorDBInterface):
                     search_text=query_text,
                     vector_queries=[vector_query],
                     top=limit,
+                    filter=filter_expression,
                 )
             else:
                 # Pure vector search
@@ -340,6 +388,7 @@ class AzureAISearchAdapter(VectorDBInterface):
                     search_text="*",  # Match all for pure vector search
                     vector_queries=[vector_query],
                     top=limit,
+                    filter=filter_expression,
                 )
 
             scored_results = []
@@ -381,6 +430,8 @@ class AzureAISearchAdapter(VectorDBInterface):
         query_texts: list[str],
         limit: int = None,
         with_vectors: bool = False,
+        include_payload: bool = False,
+        node_name: list[str] | None = None,
     ) -> list[list[ScoredResult]]:
         """Perform batch vector search."""
         query_vectors = await self.embed_data(query_texts)
@@ -397,6 +448,8 @@ class AzureAISearchAdapter(VectorDBInterface):
                     query_vector=query_vector,
                     limit=limit,
                     with_vector=with_vectors,
+                    include_payload=include_payload,
+                    node_name=node_name,
                 )
                 for query_vector in query_vectors
             ]

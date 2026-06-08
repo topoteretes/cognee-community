@@ -7,7 +7,7 @@ requires-python = ">=3.11,<=3.13"
 dependencies = [
     "pymilvus>=2.5.0,<3",
     "milvus-lite>=2.4.0; sys_platform != 'win32'",
-    "cognee==0.5.5",
+    "cognee>=1.1.0,<2.0.0",
     "starlette>=0.48.0",
     "instructor>=1.11"
 ]

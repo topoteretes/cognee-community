@@ -110,7 +110,7 @@ class WeaviateAdapter(VectorDBInterface):
 
         return self.client
 
-    async def embed_data(self, data: list[str]) -> list[float]:
+    async def embed_data(self, data: list[str]) -> List[List[float]]:
         """
         Embed the given text data into vector representations.
 
@@ -393,8 +393,8 @@ class WeaviateAdapter(VectorDBInterface):
         limit: int | None = 15,
         with_vector: bool = False,
         include_payload: bool = False,
-        node_name: Optional[List[str]] = None,  # TODO: Add functionality for this parameter
-        node_name_filter_operator: str = "OR",  # TODO: Add functionality for this parameter
+        node_name: Optional[List[str]] = None,
+        node_name_filter_operator: str = "OR",
     ):
         """
         Perform a search on a collection using either a text query or a vector query.
@@ -421,6 +421,7 @@ class WeaviateAdapter(VectorDBInterface):
         """
         import weaviate.classes as wvc
         import weaviate.exceptions
+        from weaviate.classes.query import Filter
 
         if query_text is None and query_vector is None:
             raise MissingQueryParameterError()
@@ -446,6 +447,14 @@ class WeaviateAdapter(VectorDBInterface):
             if limit == 0:
                 return []
 
+            search_filters = None
+            if node_name:
+                property_filter = Filter.by_property("belongs_to_set")
+                if node_name_filter_operator == "AND":
+                    search_filters = property_filter.contains_all(node_name)
+                else:
+                    search_filters = property_filter.contains_any(node_name)
+
             try:
                 search_result = await collection.query.hybrid(
                     query=None,
@@ -454,6 +463,7 @@ class WeaviateAdapter(VectorDBInterface):
                     include_vector=with_vector,
                     return_metadata=wvc.query.MetadataQuery(score=True),
                     return_properties=include_payload,
+                    filters=search_filters,
                 )
 
                 return [
@@ -476,7 +486,6 @@ class WeaviateAdapter(VectorDBInterface):
         with_vectors: bool = False,
         include_payload: bool = False,
         node_name: Optional[List[str]] = None,
-        node_name_filter_operator: str = "OR",
     ):
         """
         Execute a batch search for multiple query texts in the specified collection.
@@ -523,7 +532,6 @@ class WeaviateAdapter(VectorDBInterface):
                 with_vector=with_vectors,
                 include_payload=include_payload,
                 node_name=node_name,
-                node_name_filter_operator=node_name_filter_operator,
             )
 
         return [

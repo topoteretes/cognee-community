@@ -4,11 +4,10 @@ import json
 import os
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from sqlalchemy import text
-
 from cognee.infrastructure.databases.graph.postgres.adapter import PostgresAdapter
 from cognee.infrastructure.engine import DataPoint
 from cognee.shared.logging_utils import get_logger
+from sqlalchemy import text
 
 from . import queries
 from .connection import resolve_connection_string
@@ -146,9 +145,7 @@ class PgGraphAdapter(PostgresAdapter):
         self._pggraph_ready = False
         try:
             async with self._session() as session:
-                available = (
-                    await session.execute(text(queries.EXTENSION_AVAILABLE))
-                ).scalar()
+                available = (await session.execute(text(queries.EXTENSION_AVAILABLE))).scalar()
                 if not available:
                     logger.info(
                         "pgGraph extension not installed on this Postgres server; "
@@ -180,8 +177,7 @@ class PgGraphAdapter(PostgresAdapter):
                 await session.execute(text(queries.REGISTER_NODE_TABLE))
 
             edges = {
-                row[0]
-                for row in (await session.execute(text(queries.REGISTERED_EDGES))).fetchall()
+                row[0] for row in (await session.execute(text(queries.REGISTERED_EDGES))).fetchall()
             }
             if "cognee_edge" not in edges:
                 await session.execute(text(queries.REGISTER_EDGE_TABLE))

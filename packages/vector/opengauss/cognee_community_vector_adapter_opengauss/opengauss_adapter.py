@@ -4,16 +4,15 @@ import os
 from typing import Any
 
 import psycopg2
-from psycopg2.extras import RealDictCursor
-
-from cognee.infrastructure.databases.vector import VectorDBInterface
 from cognee.infrastructure.databases.exceptions import MissingQueryParameterError
+from cognee.infrastructure.databases.vector import VectorDBInterface
 from cognee.infrastructure.databases.vector.embeddings.EmbeddingEngine import (
     EmbeddingEngine,
 )
 from cognee.infrastructure.databases.vector.models.ScoredResult import ScoredResult
 from cognee.infrastructure.engine import DataPoint
 from cognee.shared.logging_utils import get_logger
+from psycopg2.extras import RealDictCursor
 
 logger = get_logger("OpenGaussAdapter")
 
@@ -40,9 +39,17 @@ class OpenGaussAdapter(VectorDBInterface):
         self.schema_name = schema_name or os.getenv("OPENGAUSS_SCHEMA_NAME", "cognee")
         self.embedding_engine = embedding_engine
         self.index_type = (index_type or os.getenv("OPENGAUSS_INDEX_TYPE", "HNSW")).upper()
-        self.distance_strategy = (distance_strategy or os.getenv("OPENGAUSS_DISTANCE_STRATEGY", "COSINE")).upper()
-        self.embedding_dimension = embedding_dimension or int(os.getenv("EMBEDDING_DIMENSIONS", "1536"))
-        self.create_index = os.getenv("OPENGAUSS_CREATE_INDEX", "false").lower() in ("true", "1", "yes")
+        self.distance_strategy = (
+            distance_strategy or os.getenv("OPENGAUSS_DISTANCE_STRATEGY", "COSINE")
+        ).upper()
+        self.embedding_dimension = embedding_dimension or int(
+            os.getenv("EMBEDDING_DIMENSIONS", "1536")
+        )
+        self.create_index = os.getenv("OPENGAUSS_CREATE_INDEX", "false").lower() in (
+            "true",
+            "1",
+            "yes",
+        )
 
         self._validate_config()
 
@@ -191,8 +198,7 @@ class OpenGaussAdapter(VectorDBInterface):
             )
             conn.commit()
             logger.info(
-                f"Created table {collection_name} "
-                f"(dim={vector_dim}, index={self.index_type})"
+                f"Created table {collection_name} (dim={vector_dim}, index={self.index_type})"
             )
 
         except Exception as e:
@@ -231,13 +237,15 @@ class OpenGaussAdapter(VectorDBInterface):
 
             try:
                 insert_data = []
-                for data_point, vector in zip(data_points, vectors):
-                    insert_data.append((
-                        str(data_point.id),
-                        str(vector).replace(" ", ""),
-                        self._get_text_content(data_point),
-                        json.dumps(getattr(data_point, "metadata", {})),
-                    ))
+                for data_point, vector in zip(data_points, vectors, strict=False):
+                    insert_data.append(
+                        (
+                            str(data_point.id),
+                            str(vector).replace(" ", ""),
+                            self._get_text_content(data_point),
+                            json.dumps(getattr(data_point, "metadata", {})),
+                        )
+                    )
 
                 ids = [row[0] for row in insert_data]
                 cursor.execute(
@@ -252,9 +260,7 @@ class OpenGaussAdapter(VectorDBInterface):
                 )
                 conn.commit()
 
-                logger.info(
-                    f"Inserted {len(data_points)} rows into table: {collection_name}"
-                )
+                logger.info(f"Inserted {len(data_points)} rows into table: {collection_name}")
 
             except Exception as e:
                 conn.rollback()
@@ -290,13 +296,27 @@ class OpenGaussAdapter(VectorDBInterface):
                 op_class = distance_ops[self.distance_strategy]
 
                 if self.index_type == "HNSW":
-                    sql = f"CREATE INDEX IF NOT EXISTS {vector_index_name} ON {collection_name} USING hnsw (vector {op_class}) WITH (m=16, ef_construction=200);"
+                    sql = (
+                        f"CREATE INDEX IF NOT EXISTS {vector_index_name} ON {collection_name} "
+                        f"USING hnsw (vector {op_class}) WITH (m=16, ef_construction=200);"
+                    )
                 elif self.index_type == "IVFFLAT":
-                    sql = f"CREATE INDEX IF NOT EXISTS {vector_index_name} ON {collection_name} USING ivfflat (vector {op_class}) WITH (lists=100);"
+                    sql = (
+                        f"CREATE INDEX IF NOT EXISTS {vector_index_name} ON {collection_name} "
+                        f"USING ivfflat (vector {op_class}) WITH (lists=100);"
+                    )
                 elif self.index_type == "IVFPQ":
-                    sql = f"CREATE INDEX IF NOT EXISTS {vector_index_name} ON {collection_name} USING ivfflat (vector {op_class}) WITH (lists=100, enable_pq=on, pq_m=2000);"
+                    sql = (
+                        f"CREATE INDEX IF NOT EXISTS {vector_index_name} ON {collection_name} "
+                        f"USING ivfflat (vector {op_class}) "
+                        f"WITH (lists=100, enable_pq=on, pq_m=2000);"
+                    )
                 elif self.index_type == "HNSW-PQ":
-                    sql = f"CREATE INDEX IF NOT EXISTS {vector_index_name} ON {collection_name} USING hnsw (vector {op_class}) WITH (m=16, ef_construction=200, enable_pq=on, pq_m=2000);"
+                    sql = (
+                        f"CREATE INDEX IF NOT EXISTS {vector_index_name} ON {collection_name} "
+                        f"USING hnsw (vector {op_class}) "
+                        f"WITH (m=16, ef_construction=200, enable_pq=on, pq_m=2000);"
+                    )
                 else:
                     raise ValueError(f"Unsupported index type: {self.index_type}")
 
@@ -333,9 +353,7 @@ class OpenGaussAdapter(VectorDBInterface):
         cursor = self._get_cursor()
         try:
             cursor.execute(
-                f"SELECT id, text, metadata, vector "
-                f"FROM {collection_name} "
-                f"WHERE id = ANY(%s);",
+                f"SELECT id, text, metadata, vector FROM {collection_name} WHERE id = ANY(%s);",
                 (data_point_ids,),
             )
             return [dict(row) for row in cursor.fetchall()]
@@ -409,17 +427,17 @@ class OpenGaussAdapter(VectorDBInterface):
             scored_results = []
             for row in cursor:
                 row_dict = dict(row)
-                scored_results.append(ScoredResult(
-                    id=row_dict["id"],
-                    score=row_dict.get("score", 0.0),
-                    payload={"text": row_dict.get("text")},
-                    metadata=row_dict.get("metadata", {}),
-                    vector=row_dict.get("vector") if with_vector else None,
-                ))
+                scored_results.append(
+                    ScoredResult(
+                        id=row_dict["id"],
+                        score=row_dict.get("score", 0.0),
+                        payload={"text": row_dict.get("text")},
+                        metadata=row_dict.get("metadata", {}),
+                        vector=row_dict.get("vector") if with_vector else None,
+                    )
+                )
 
-            logger.info(
-                f"Search in {collection_name} returned {len(scored_results)} results"
-            )
+            logger.info(f"Search in {collection_name} returned {len(scored_results)} results")
             return scored_results
 
         except Exception as e:
@@ -434,6 +452,8 @@ class OpenGaussAdapter(VectorDBInterface):
         query_texts: list[str],
         limit: int = 15,
         with_vectors: bool = False,
+        include_payload: bool = False,
+        node_name: list[str] | None = None,
     ) -> list[list[ScoredResult]]:
         """Search with multiple query texts, returning results per query."""
         if not query_texts:
@@ -447,6 +467,8 @@ class OpenGaussAdapter(VectorDBInterface):
                 query_vector=query_vector,
                 limit=limit,
                 with_vector=with_vectors,
+                include_payload=include_payload,
+                node_name=node_name,
             )
             batch_results.append(results)
 
@@ -471,9 +493,7 @@ class OpenGaussAdapter(VectorDBInterface):
                 )
                 deleted_count = cursor.rowcount
                 conn.commit()
-                logger.info(
-                    f"Deleted {deleted_count} rows from table: {collection_name}"
-                )
+                logger.info(f"Deleted {deleted_count} rows from table: {collection_name}")
                 return {"deleted_count": deleted_count}
             except Exception as e:
                 conn.rollback()
@@ -515,8 +535,7 @@ class OpenGaussAdapter(VectorDBInterface):
         cursor = self._get_cursor()
         try:
             cursor.execute(
-                "SELECT table_name FROM information_schema.tables "
-                "WHERE table_schema = %s;",
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = %s;",
                 (self.schema_name,),
             )
             return [row["table_name"] for row in cursor.fetchall()]
