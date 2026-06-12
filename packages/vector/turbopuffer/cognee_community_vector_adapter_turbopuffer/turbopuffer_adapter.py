@@ -25,8 +25,23 @@ _MAX_ATTR_BYTES = 4096
 class IndexSchema(DataPoint):
     text: str
 
+    # Reference scalars carried into the indexed payload, mirroring the
+    # pgvector/lancedb index schema. source_chunk_id is required by hybrid
+    # search to pair a TextSummary vector hit back to its source chunk;
+    # without it the hybrid summary leg is silently dropped.
+    source_chunk_id: Optional[str] = None
+    document_id: Optional[str] = None
+    document_name: Optional[str] = None
+    chunk_index: Optional[int] = None
+    importance_weight: Optional[float] = None
+
     metadata: dict = {"index_fields": ["text"]}
     belongs_to_set: List[str] = []
+
+
+def _str_or_none(value):
+    """Coerce ids (UUID/str) to str for the index payload, preserving None."""
+    return None if value is None else str(value)
 
 
 def _serialize_value(value):
@@ -271,6 +286,7 @@ class TurbopufferAdapter(VectorDBInterface):
 
         write_schema = _build_write_schema(data_points, rows)
 
+
         try:
             await asyncio.to_thread(
                 ns.write,
@@ -299,6 +315,13 @@ class TurbopufferAdapter(VectorDBInterface):
                 IndexSchema(
                     id=data_point.id,
                     text=getattr(data_point, data_point.metadata["index_fields"][0]),
+                    # Pulled via getattr so non-summary/non-chunk data points
+                    # (which lack these fields) fall back to None.
+                    source_chunk_id=_str_or_none(getattr(data_point, "source_chunk_id", None)),
+                    document_id=_str_or_none(getattr(data_point, "document_id", None)),
+                    document_name=getattr(data_point, "document_name", None),
+                    chunk_index=getattr(data_point, "chunk_index", None),
+                    importance_weight=getattr(data_point, "importance_weight", None),
                     belongs_to_set=(data_point.belongs_to_set or []),
                 )
                 for data_point in data_points
