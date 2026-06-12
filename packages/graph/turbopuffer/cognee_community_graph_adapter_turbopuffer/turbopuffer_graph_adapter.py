@@ -293,11 +293,7 @@ class TurbopufferGraphAdapter(GraphDBInterface):
         rows = list({r["id"]: r for r in rows}.values())
 
         schema = _build_row_schema(rows, non_filterable={"properties"})
-        await asyncio.to_thread(
-            self._node_namespace().write,
-            upsert_rows=rows,
-            schema=schema,
-        )
+        await self._upsert_rows(self._node_namespace(), rows, schema)
 
     async def add_edge(
         self,
@@ -355,10 +351,22 @@ class TurbopufferGraphAdapter(GraphDBInterface):
         rows = list({r["id"]: r for r in rows}.values())
 
         schema = _build_row_schema(rows, non_filterable={"properties"})
-        await asyncio.to_thread(
-            self._edge_namespace().write,
-            upsert_rows=rows,
-            schema=schema,
+        await self._upsert_rows(self._edge_namespace(), rows, schema)
+
+    async def _upsert_rows(self, namespace, rows: List[Dict[str, Any]], schema) -> None:
+        """Upsert in concurrent chunks: a single write of 100k+ docs exceeds
+        the HTTP write timeout (httpx.WriteTimeout). Chunks are disjoint by id,
+        so concurrent upserts are safe; 429 backpressure is absorbed by the
+        SDK's retry/backoff."""
+        await asyncio.gather(
+            *(
+                asyncio.to_thread(
+                    namespace.write,
+                    upsert_rows=rows[start : start + _MAX_QUERY_ROWS],
+                    schema=schema,
+                )
+                for start in range(0, len(rows), _MAX_QUERY_ROWS)
+            )
         )
 
     # --- deletes -----------------------------------------------------------
