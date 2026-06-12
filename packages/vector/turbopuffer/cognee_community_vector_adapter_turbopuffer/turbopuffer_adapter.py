@@ -21,6 +21,12 @@ logger = get_logger("TurbopufferAdapter")
 # Fields larger than this should not be stored as attributes or should be truncated.
 _MAX_ATTR_BYTES = 4096
 
+# Content fields holding the embeddable text (chunk/summary bodies). These are
+# never used in filters, so they are stored as non-filterable columns: exempt
+# from the 4096-byte filterable-attribute limit and therefore never silently
+# truncated. Mirrors the graph adapter's non-filterable ``properties`` blob.
+_NON_FILTERABLE_FIELDS = frozenset({"text"})
+
 
 class IndexSchema(DataPoint):
     text: str
@@ -33,7 +39,7 @@ class IndexSchema(DataPoint):
     document_id: Optional[str] = None
     document_name: Optional[str] = None
     chunk_index: Optional[int] = None
-    importance_weight: Optional[float] = None
+    importance_weight: Optional[float] = 0.5
 
     metadata: dict = {"index_fields": ["text"]}
     belongs_to_set: List[str] = []
@@ -77,10 +83,20 @@ def _coerce_vector(value):
 
 
 def _truncate_large_values(payload: dict) -> dict:
-    """Truncate string values exceeding turbopuffer's filterable attribute limit."""
+    """Truncate filterable string values exceeding turbopuffer's 4096-byte limit.
+
+    Non-filterable content fields (see ``_NON_FILTERABLE_FIELDS``) are left
+    intact — they are declared non-filterable in the write schema and so are
+    not subject to the filterable-attribute limit. Truncating them here would
+    silently corrupt retrieved chunk/summary text.
+    """
     result = {}
     for key, value in payload.items():
-        if isinstance(value, str) and len(value.encode("utf-8")) > _MAX_ATTR_BYTES:
+        if (
+            key not in _NON_FILTERABLE_FIELDS
+            and isinstance(value, str)
+            and len(value.encode("utf-8")) > _MAX_ATTR_BYTES
+        ):
             # Truncate to fit within limit
             encoded = value.encode("utf-8")[: _MAX_ATTR_BYTES - 3]
             result[key] = encoded.decode("utf-8", errors="ignore") + "..."
@@ -178,6 +194,9 @@ def _build_write_schema(data_points: list[DataPoint], rows: list[dict]) -> dict:
     # First use model annotations so schema is stable and future fields are auto-covered.
     for data_point in data_points:
         for key, field in data_point.model_fields.items():
+            if key in _NON_FILTERABLE_FIELDS:
+                schema[key] = {"type": "string", "filterable": False}
+                continue
             inferred_type = _annotation_to_turbopuffer_type(field.annotation)
             if inferred_type is None:
                 continue
@@ -190,6 +209,9 @@ def _build_write_schema(data_points: list[DataPoint], rows: list[dict]) -> dict:
     for row in rows:
         for key, value in row.items():
             if key in ("id", "vector"):
+                continue
+            if key in _NON_FILTERABLE_FIELDS:
+                schema[key] = {"type": "string", "filterable": False}
                 continue
             if value is None:
                 continue
