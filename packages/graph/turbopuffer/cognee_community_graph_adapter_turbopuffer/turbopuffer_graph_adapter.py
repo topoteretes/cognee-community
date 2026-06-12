@@ -670,6 +670,45 @@ class TurbopufferGraphAdapter(GraphDBInterface):
             )
         return nodes, edges
 
+    async def get_id_filtered_graph_data(self, target_ids: List[str]) -> Tuple[List, List]:
+        """Subgraph touching target_ids: edges with either endpoint in the set,
+        plus all endpoint nodes of those edges (edge-driven, matching the
+        Ladybug/Neo4j contract). Same return format as get_graph_data. Lets
+        CogneeGraph project only the vector-search neighborhood instead of
+        scanning the full graph."""
+        if not target_ids:
+            return [], []
+
+        edge_rows = await self._edges_touching([str(i) for i in target_ids])
+
+        edges = []
+        endpoint_ids: set = set()
+        for row in edge_rows:
+            extra = row.model_extra or {}
+            source_id = str(extra.get("source_id"))
+            target_id = str(extra.get("target_id"))
+            endpoint_ids.update((source_id, target_id))
+            edges.append(
+                (
+                    source_id,
+                    target_id,
+                    extra.get("relationship_name"),
+                    self._parse_properties(extra.get("properties")),
+                )
+            )
+
+        if not endpoint_ids:
+            return [], []
+
+        node_rows = await self._query_by_ids(self._node_namespace(), list(endpoint_ids))
+        nodes = []
+        for row in node_rows:
+            extra = row.model_extra or {}
+            data = {"name": extra.get("name", ""), "type": extra.get("type", "")}
+            data.update(self._parse_properties(extra.get("properties")))
+            nodes.append((str(row.id), data))
+        return nodes, edges
+
     async def get_filtered_graph_data(
         self, attribute_filters: List[Dict[str, List[Union[str, int]]]]
     ) -> Tuple[List, List]:
