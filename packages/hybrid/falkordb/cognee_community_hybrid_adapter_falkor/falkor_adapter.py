@@ -107,31 +107,60 @@ class FalkorDBAdapter(VectorDBInterface, GraphDBInterface):
         self.api_key = api_key
 
     @staticmethod
-    def _sanitize_cypher_params(params: dict) -> dict:
-        """Recursively convert Enum values to their underlying value.
+    def _coerce_param_value(value: Any) -> Any:
+        """Coerce a single query-param value to a FalkorDB-acceptable type.
 
-        FalkorDB serializes unknown types via ``str()``, which turns
-        ``MyEnum.member`` into ``"MyEnum.member"`` – an invalid Cypher
-        literal.  This helper ensures every Enum is replaced by its
-        ``.value`` before the params reach the driver.
+        FalkorDB query parameters accept only primitives (``str``/``int``/
+        ``float``/``bool``/``None``) and arrays of those primitives. Any other
+        value makes FalkorDB reject the *entire* query — and since node writes
+        bind every node property as the ``$properties`` map, one stray value
+        aborts the whole pipeline run. The two failure modes are:
+
+        - ``bytes`` -> ``ResponseError: Failed to parse query parameter
+          'properties' value``; and
+        - nested mappings / arrays containing non-primitives -> ``ResponseError:
+          Property values can only be of primitive types or arrays of primitive
+          types``.
+
+        Coerce such values to a JSON/text representation so they survive the
+        write instead of failing it. ``Enum`` is unwrapped to its ``.value``.
+        """
+        if value is None or isinstance(value, (bool, int, float, str)):
+            return value
+        if isinstance(value, Enum):
+            return value.value
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace")
+        if isinstance(value, (list, tuple)):
+            coerced = [FalkorDBAdapter._coerce_param_value(item) for item in value]
+            # FalkorDB arrays must hold primitives (and reject null elements);
+            # if any element isn't one, store the whole array as a JSON string.
+            if all(
+                item is not None and isinstance(item, (bool, int, float, str))
+                for item in coerced
+            ):
+                return coerced
+            return json.dumps(value, default=str)
+        if isinstance(value, dict):
+            return json.dumps(value, default=str)
+        return str(value)
+
+    @staticmethod
+    def _sanitize_cypher_params(params: dict) -> dict:
+        """Make a params dict safe for FalkorDB.
+
+        Recurses into nested mappings (so the bound property map keeps its
+        structure and nested ``Enum``s are unwrapped) and routes every other
+        value through :meth:`_coerce_param_value`, which converts ``bytes`` and
+        other non-primitive types FalkorDB can't bind (they would otherwise
+        reject the whole query and abort the pipeline run).
         """
         sanitized = {}
         for key, value in params.items():
             if isinstance(value, dict):
                 sanitized[key] = FalkorDBAdapter._sanitize_cypher_params(value)
-            elif isinstance(value, Enum):
-                sanitized[key] = value.value
-            elif isinstance(value, list):
-                sanitized[key] = [
-                    item.value
-                    if isinstance(item, Enum)
-                    else FalkorDBAdapter._sanitize_cypher_params(item)
-                    if isinstance(item, dict)
-                    else item
-                    for item in value
-                ]
             else:
-                sanitized[key] = value
+                sanitized[key] = FalkorDBAdapter._coerce_param_value(value)
         return sanitized
 
     # TODO: This should return a list of results, not a single result
