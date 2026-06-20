@@ -4,13 +4,13 @@ import asyncio
 import json
 from contextlib import asynccontextmanager
 from textwrap import dedent
-from typing import Any, Optional
+from typing import Any, Optional, Union
 from uuid import UUID
 
-from cognee.infrastructure.databases.exceptions.exceptions import (
-    NodesetFilterNotSupportedError,
+from cognee.infrastructure.databases.graph.graph_db_interface import (
+    GraphDBInterface,
+    NodeData,
 )
-from cognee.infrastructure.databases.graph.graph_db_interface import GraphDBInterface
 from cognee.infrastructure.engine import DataPoint
 from cognee.modules.storage.utils import JSONEncoder
 from cognee.shared.logging_utils import ERROR, get_logger
@@ -138,21 +138,32 @@ class MemgraphAdapter(GraphDBInterface):
         )
         return results[0]["node_exists"] if len(results) > 0 else False
 
-    async def add_node(self, node: DataPoint):
+    async def add_node(
+        self, node: Union[DataPoint, str], properties: Optional[dict[str, Any]] = None
+    ):
         """
         Add a new node to the database with specified properties.
 
         Parameters:
         -----------
 
-            - node (DataPoint): The DataPoint object representing the node to add.
+            - node (Union[DataPoint, str]): Either a DataPoint object or a string identifier
+              for the node being added.
+            - properties (Optional[Dict[str, Any]]): A dictionary of properties associated
+              with the node. Required when node is a string, ignored when node is a DataPoint.
+              (default None)
 
         Returns:
         --------
 
             The result of the node addition, including its internal ID and node ID.
         """
-        serialized_properties = self.serialize_properties(node.model_dump())
+        if isinstance(node, DataPoint):
+            node_id = str(node.id)
+            serialized_properties = self.serialize_properties(node.model_dump())
+        else:
+            node_id = str(node)
+            serialized_properties = self.serialize_properties(properties or {})
 
         query = """
         MERGE (node {id: $node_id})
@@ -162,7 +173,7 @@ class MemgraphAdapter(GraphDBInterface):
         """
 
         params = {
-            "node_id": str(node.id),
+            "node_id": node_id,
             "properties": serialized_properties,
         }
         return await self.query(query, params)
@@ -288,16 +299,18 @@ class MemgraphAdapter(GraphDBInterface):
 
         return await self.query(query, params)
 
-    async def has_edge(self, from_node: UUID, to_node: UUID, edge_label: str) -> bool:
+    async def has_edge(
+        self, source_id: Union[str, UUID], target_id: Union[str, UUID], relationship_name: str
+    ) -> bool:
         """
         Check if a directed edge exists between two nodes identified by their IDs.
 
         Parameters:
         -----------
 
-            - from_node (UUID): The ID of the source node.
-            - to_node (UUID): The ID of the target node.
-            - edge_label (str): The label of the edge to check.
+            - source_id (Union[str, UUID]): The ID of the source node.
+            - target_id (Union[str, UUID]): The ID of the target node.
+            - relationship_name (str): The name of the relationship to check.
 
         Returns:
         --------
@@ -307,14 +320,14 @@ class MemgraphAdapter(GraphDBInterface):
         query = """
             MATCH (from_node)-[relationship]->(to_node)
             WHERE from_node.id = $from_node_id AND to_node.id = $to_node_id
-            AND type(relationship) = $edge_label
+            AND type(relationship) = $relationship_name
             RETURN COUNT(relationship) > 0 AS edge_exists
         """
 
         params = {
-            "from_node_id": str(from_node),
-            "to_node_id": str(to_node),
-            "edge_label": edge_label,
+            "from_node_id": str(source_id),
+            "to_node_id": str(target_id),
+            "relationship_name": relationship_name,
         }
 
         records = await self.query(query, params)
@@ -363,10 +376,10 @@ class MemgraphAdapter(GraphDBInterface):
 
     async def add_edge(
         self,
-        from_node: UUID,
-        to_node: UUID,
+        source_id: Union[str, UUID],
+        target_id: Union[str, UUID],
         relationship_name: str,
-        edge_properties: Optional[dict[str, Any]] = None,
+        properties: Optional[dict[str, Any]] = None,
     ):
         """
         Add a directed edge between two nodes with optional properties.
@@ -374,10 +387,10 @@ class MemgraphAdapter(GraphDBInterface):
         Parameters:
         -----------
 
-            - from_node (UUID): The ID of the source node.
-            - to_node (UUID): The ID of the target node.
+            - source_id (Union[str, UUID]): The ID of the source node.
+            - target_id (Union[str, UUID]): The ID of the target node.
             - relationship_name (str): The type/label of the relationship to create.
-            - edge_properties (Optional[Dict[str, Any]]): Optional properties associated with
+            - properties (Optional[Dict[str, Any]]): Optional properties associated with
               the edge. (default None)
 
         Returns:
@@ -385,7 +398,7 @@ class MemgraphAdapter(GraphDBInterface):
 
             The result of the edge addition operation, including relationship details.
         """
-        serialized_properties = self.serialize_properties(edge_properties or {})
+        serialized_properties = self.serialize_properties(properties or {})
 
         query = dedent(
             f"""\
@@ -399,8 +412,8 @@ class MemgraphAdapter(GraphDBInterface):
         )
 
         params = {
-            "from_node": str(from_node),
-            "to_node": str(to_node),
+            "from_node": str(source_id),
+            "to_node": str(target_id),
             "relationship_name": relationship_name,
             "properties": serialized_properties,
         }
@@ -649,6 +662,76 @@ class MemgraphAdapter(GraphDBInterface):
 
         return predecessors + successors
 
+    async def get_neighborhood(
+        self,
+        node_ids: list[str],
+        depth: int = 1,
+        edge_types: Optional[list[str]] = None,
+    ) -> tuple[list[tuple[str, dict]], list[tuple[str, str, str, dict]]]:
+        """
+        Get the k-hop neighborhood subgraph around a set of seed nodes.
+
+        Returns all nodes and edges within ``depth`` hops of any seed node, in the same
+        format as ``get_nodeset_subgraph()`` / the neo4j adapter: nodes are keyed by the
+        cognee ``id`` property (a UUID), and edges use the source/target ``id`` properties.
+        When ``edge_types`` is provided, only edges of those relationship types are
+        traversed and returned.
+
+        Parameters:
+        -----------
+
+            - node_ids (List[str]): Seed node identifiers (the ``id`` property) to start from.
+            - depth (int): Number of hops to traverse from each seed node. (default 1)
+            - edge_types (Optional[List[str]]): If given, only traverse/return edges of these
+              relationship types. (default None)
+        """
+        if not node_ids:
+            return ([], [])
+
+        # Memgraph requires a literal upper bound in a variable-length pattern, so depth is
+        # validated to an int and interpolated; user-supplied ids stay parameterised.
+        depth = max(0, int(depth))
+        seed_ids = [str(node_id) for node_id in node_ids]
+
+        params: dict[str, Any] = {"node_ids": seed_ids}
+        path_edge_clause = ""
+        if edge_types:
+            path_edge_clause = " WHERE ALL(r IN relationships(path) WHERE TYPE(r) IN $edge_types)"
+            params["edge_types"] = list(edge_types)
+
+        nodes_query = (
+            "MATCH (seed) WHERE seed.id IN $node_ids "
+            f"MATCH path = (seed)-[*0..{depth}]-(n)"
+            f"{path_edge_clause} "
+            "RETURN DISTINCT n.id AS id, properties(n) AS properties"
+        )
+        node_records = await self.query(nodes_query, params)
+        nodes = [(record["id"], record["properties"]) for record in node_records]
+
+        node_uuids = [record["id"] for record in node_records]
+        if not node_uuids:
+            return (nodes, [])
+
+        edge_params: dict[str, Any] = {"ids": node_uuids}
+        edge_type_filter = ""
+        if edge_types:
+            edge_type_filter = " AND TYPE(r) IN $edge_types"
+            edge_params["edge_types"] = list(edge_types)
+
+        edges_query = (
+            "MATCH (n)-[r]->(m) "
+            f"WHERE n.id IN $ids AND m.id IN $ids{edge_type_filter} "
+            "RETURN n.id AS source, m.id AS target, TYPE(r) AS type, "
+            "properties(r) AS properties"
+        )
+        edge_records = await self.query(edges_query, edge_params)
+        edges = [
+            (record["source"], record["target"], record["type"], record["properties"])
+            for record in edge_records
+        ]
+
+        return (nodes, edges)
+
     async def get_node(self, node_id: str) -> Optional[dict[str, Any]]:
         """Get a single node by ID."""
         query = """
@@ -668,19 +751,22 @@ class MemgraphAdapter(GraphDBInterface):
         results = await self.query(query, {"node_ids": node_ids})
         return [result["node"] for result in results]
 
-    async def get_connections(self, node_id: UUID) -> list:
+    async def get_connections(
+        self, node_id: Union[str, UUID]
+    ) -> list[tuple[NodeData, dict[str, Any], NodeData]]:
         """
         Retrieve connections for a given node, including both predecessors and successors.
 
         Parameters:
         -----------
 
-            - node_id (UUID): The ID of the node for which to retrieve connections.
+            - node_id (Union[str, UUID]): The ID of the node for which to retrieve connections.
 
         Returns:
         --------
 
-            - list: A list of connections associated with the node.
+            - List[Tuple[NodeData, Dict[str, Any], NodeData]]: A list of connections associated
+              with the node.
         """
         predecessors_query = """
         MATCH (node)<-[relation]-(neighbour)
@@ -871,18 +957,101 @@ class MemgraphAdapter(GraphDBInterface):
         self,
         node_type: type[Any],
         node_name: list[str],
-        node_name_filter_operator: str = "OR",  # TODO: Add functionality for this parameter
+        node_name_filter_operator: str = "OR",
     ) -> tuple[list[tuple[int, dict]], list[tuple[int, int, str, dict]]]:
         """
-        Throw an error indicating that node set filtering is not supported.
+        Retrieve a subgraph based on specified node names and type, including their
+        relationships.
+
+        The seed nodes are those of label ``node_type.__name__`` whose ``name`` matches one of
+        the provided ``node_name`` values. With operator "OR" any neighbour of a seed node is
+        included; with operator "AND" only neighbours connected to every seed node are included.
 
         Parameters:
         -----------
 
             - node_type (Type[Any]): The type of nodes to filter.
             - node_name (List[str]): A list of node names to filter.
+            - node_name_filter_operator (str): How to combine the node names, either "OR"
+              (default) or "AND".
+
+        Returns:
+        --------
+
+            - Tuple[List[Tuple[int, dict]], List[Tuple[int, int, str, dict]]]: A tuple
+              containing nodes and edges in the requested subgraph.
         """
-        raise NodesetFilterNotSupportedError
+        label = node_type.__name__
+
+        if node_name_filter_operator == "OR":
+            query = """
+            UNWIND $names AS wantedName
+            MATCH (n)
+            WHERE n.type = $label AND n.name = wantedName
+            WITH collect(DISTINCT n) AS primary
+            UNWIND primary AS p
+            OPTIONAL MATCH (p)--(nbr)
+            WITH primary, collect(DISTINCT nbr) AS nbrs
+            WITH primary + nbrs AS nodelist
+            UNWIND nodelist AS node
+            WITH collect(DISTINCT node) AS nodes
+            MATCH (a)-[r]-(b)
+            WHERE a IN nodes AND b IN nodes
+            WITH nodes, collect(DISTINCT r) AS rels
+            RETURN
+              [n IN nodes |
+                 { id: n.id,
+                    properties: properties(n) }] AS rawNodes,
+              [r IN rels  |
+                 { type: type(r),
+                    properties: properties(r) }] AS rawRels
+            """
+        else:
+            query = """
+            UNWIND $names AS wantedName
+            MATCH (n)
+            WHERE n.type = $label AND n.name = wantedName
+            WITH collect(DISTINCT n) AS primary
+            UNWIND primary AS p
+            MATCH (p)--(nbr)
+            WITH primary, nbr, COUNT(DISTINCT p) AS matched_count
+            WHERE matched_count = size(primary)
+            WITH primary, collect(DISTINCT nbr) AS nbrs
+            WITH primary + nbrs AS nodelist
+            UNWIND nodelist AS node
+            WITH collect(DISTINCT node) AS nodes
+            MATCH (a)-[r]-(b)
+            WHERE a IN nodes AND b IN nodes
+            WITH nodes, collect(DISTINCT r) AS rels
+            RETURN
+              [n IN nodes | { id: n.id, properties: properties(n) }] AS rawNodes,
+              [r IN rels  | { type: type(r), properties: properties(r) }] AS rawRels
+            """
+
+        result = await self.query(query, {"names": node_name, "label": label})
+
+        if not result:
+            return [], []
+
+        raw_nodes = result[0]["rawNodes"]
+        raw_rels = result[0]["rawRels"]
+
+        nodes = []
+        for n in raw_nodes:
+            nodes.append((n["properties"]["id"], n["properties"]))
+
+        edges = []
+        for r in raw_rels:
+            edges.append(
+                (
+                    r["properties"]["source_node_id"],
+                    r["properties"]["target_node_id"],
+                    r["type"],
+                    r["properties"],
+                )
+            )
+
+        return nodes, edges
 
     async def get_filtered_graph_data(self, attribute_filters):
         """

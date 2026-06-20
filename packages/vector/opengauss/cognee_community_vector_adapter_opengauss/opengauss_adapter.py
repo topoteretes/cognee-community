@@ -4,16 +4,15 @@ import os
 from typing import Any
 
 import psycopg2
-from psycopg2.extras import RealDictCursor
-
-from cognee.infrastructure.databases.vector import VectorDBInterface
 from cognee.infrastructure.databases.exceptions import MissingQueryParameterError
+from cognee.infrastructure.databases.vector import VectorDBInterface
 from cognee.infrastructure.databases.vector.embeddings.EmbeddingEngine import (
     EmbeddingEngine,
 )
 from cognee.infrastructure.databases.vector.models.ScoredResult import ScoredResult
 from cognee.infrastructure.engine import DataPoint
 from cognee.shared.logging_utils import get_logger
+from psycopg2.extras import RealDictCursor
 
 logger = get_logger("OpenGaussAdapter")
 
@@ -238,7 +237,7 @@ class OpenGaussAdapter(VectorDBInterface):
 
             try:
                 insert_data = []
-                for data_point, vector in zip(data_points, vectors):
+                for data_point, vector in zip(data_points, vectors, strict=False):
                     insert_data.append(
                         (
                             str(data_point.id),
@@ -297,13 +296,27 @@ class OpenGaussAdapter(VectorDBInterface):
                 op_class = distance_ops[self.distance_strategy]
 
                 if self.index_type == "HNSW":
-                    sql = f"CREATE INDEX IF NOT EXISTS {vector_index_name} ON {collection_name} USING hnsw (vector {op_class}) WITH (m=16, ef_construction=200);"
+                    sql = (
+                        f"CREATE INDEX IF NOT EXISTS {vector_index_name} ON {collection_name} "
+                        f"USING hnsw (vector {op_class}) WITH (m=16, ef_construction=200);"
+                    )
                 elif self.index_type == "IVFFLAT":
-                    sql = f"CREATE INDEX IF NOT EXISTS {vector_index_name} ON {collection_name} USING ivfflat (vector {op_class}) WITH (lists=100);"
+                    sql = (
+                        f"CREATE INDEX IF NOT EXISTS {vector_index_name} ON {collection_name} "
+                        f"USING ivfflat (vector {op_class}) WITH (lists=100);"
+                    )
                 elif self.index_type == "IVFPQ":
-                    sql = f"CREATE INDEX IF NOT EXISTS {vector_index_name} ON {collection_name} USING ivfflat (vector {op_class}) WITH (lists=100, enable_pq=on, pq_m=2000);"
+                    sql = (
+                        f"CREATE INDEX IF NOT EXISTS {vector_index_name} ON {collection_name} "
+                        f"USING ivfflat (vector {op_class}) "
+                        f"WITH (lists=100, enable_pq=on, pq_m=2000);"
+                    )
                 elif self.index_type == "HNSW-PQ":
-                    sql = f"CREATE INDEX IF NOT EXISTS {vector_index_name} ON {collection_name} USING hnsw (vector {op_class}) WITH (m=16, ef_construction=200, enable_pq=on, pq_m=2000);"
+                    sql = (
+                        f"CREATE INDEX IF NOT EXISTS {vector_index_name} ON {collection_name} "
+                        f"USING hnsw (vector {op_class}) "
+                        f"WITH (m=16, ef_construction=200, enable_pq=on, pq_m=2000);"
+                    )
                 else:
                     raise ValueError(f"Unsupported index type: {self.index_type}")
 
@@ -439,6 +452,8 @@ class OpenGaussAdapter(VectorDBInterface):
         query_texts: list[str],
         limit: int = 15,
         with_vectors: bool = False,
+        include_payload: bool = False,
+        node_name: list[str] | None = None,
     ) -> list[list[ScoredResult]]:
         """Search with multiple query texts, returning results per query."""
         if not query_texts:
@@ -452,6 +467,8 @@ class OpenGaussAdapter(VectorDBInterface):
                 query_vector=query_vector,
                 limit=limit,
                 with_vector=with_vectors,
+                include_payload=include_payload,
+                node_name=node_name,
             )
             batch_results.append(results)
 

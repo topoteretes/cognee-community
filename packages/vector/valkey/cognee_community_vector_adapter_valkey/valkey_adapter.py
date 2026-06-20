@@ -217,6 +217,12 @@ class ValkeyAdapter(VectorDBInterface):
 
                 fields = [
                     TagField("id"),
+                    # Index belongs_to_set as a comma-separated tag scalar. valkey-search does
+                    # not reliably index multi-element JSON arrays via "$.belongs_to_set[*]"
+                    # (single-element works, multi-element does not), so create_data_points
+                    # stores the set names as a single comma-joined string and we declare the
+                    # separator here so each name becomes its own tag.
+                    TagField("$.belongs_to_set", alias="belongs_to_set", separator=","),
                     VectorField(
                         name="vector",
                         algorithm=VectorAlgorithm.HNSW,
@@ -274,6 +280,13 @@ class ValkeyAdapter(VectorDBInterface):
                 doc_data = {
                     "id": str(data_point.id),
                     "vector": embedding,
+                    # Store belongs_to_set as a comma-separated string so the TAG field
+                    # (declared with separator=",") indexes each set name individually.
+                    # Commas inside a name would corrupt the split, but node-set names do
+                    # not contain commas in practice.
+                    "belongs_to_set": ",".join(
+                        str(x) for x in (getattr(data_point, "belongs_to_set", None) or [])
+                    ),
                     "payload_data": json.dumps(payload),  # Store as JSON string
                 }
 
@@ -354,8 +367,8 @@ class ValkeyAdapter(VectorDBInterface):
         limit: int | None = 15,
         with_vector: bool = False,
         include_payload: bool = False,
-        node_name: Optional[List[str]] = None,  # TODO: Add functionality for this parameter
-        node_name_filter_operator: str = "OR",  # TODO: Add functionality for this parameter
+        node_name: Optional[List[str]] = None,
+        node_name_filter_operator: str = "OR",
     ) -> list[ScoredResult]:
         """Search for similar vectors in the collection.
 
@@ -411,8 +424,34 @@ class ValkeyAdapter(VectorDBInterface):
             if with_vector:
                 return_fields.append(ReturnField("$.vector", alias="vector"))
 
+            # Build an optional pre-filter on the belongs_to_set tag field so that only
+            # data points whose belongs_to_set contains ANY ("OR") or ALL ("AND") of the
+            # provided node_name values are considered. When node_name is falsy, match all ("*").
+            prefilter = "*"
+            if node_name:
+
+                def _escape_tag(value: str) -> str:
+                    # Escape RediSearch/Valkey tag query special characters.
+                    escaped = []
+                    for ch in str(value):
+                        if ch in {"|", "{", "}", "(", ")", " ", "\\", "-", "@", ":"}:
+                            escaped.append("\\" + ch)
+                        else:
+                            escaped.append(ch)
+                    return "".join(escaped)
+
+                names = [_escape_tag(name) for name in node_name]
+                if node_name_filter_operator == "AND":
+                    # AND: every name must be present (space-separated clauses are intersected).
+                    prefilter = " ".join(f"@belongs_to_set:{{{name}}}" for name in names)
+                else:
+                    # OR: any name may match. valkey-search does not honor an in-brace
+                    # "{a|b}" union, so use query-level union of separate tag clauses.
+                    prefilter = " | ".join(f"@belongs_to_set:{{{name}}}" for name in names)
+                prefilter = f"({prefilter})"
+
             vector_param_name = "query_vector"
-            query = f"*=>[KNN {limit} @vector ${vector_param_name}]"
+            query = f"{prefilter}=>[KNN {limit} @vector ${vector_param_name}]"
             query_options = FtSearchOptions(
                 params={vector_param_name: vec_bytes}, return_fields=return_fields
             )
@@ -442,7 +481,6 @@ class ValkeyAdapter(VectorDBInterface):
         max_concurrency: int = 10,
         include_payload: bool = False,
         node_name: Optional[List[str]] = None,
-        node_name_filter_operator: str = "OR",
     ) -> list[list[ScoredResult]]:
         """Perform batch search for multiple queries.
 
@@ -479,7 +517,6 @@ class ValkeyAdapter(VectorDBInterface):
                     with_vector=with_vectors,
                     include_payload=include_payload,
                     node_name=node_name,
-                    node_name_filter_operator=node_name_filter_operator,
                 )
 
         tasks = [limited_search(vector) for vector in vectors]

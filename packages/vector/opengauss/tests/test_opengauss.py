@@ -1,7 +1,7 @@
-import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
 import asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from cognee_community_vector_adapter_opengauss import OpenGaussAdapter
 
 
@@ -73,7 +73,7 @@ class TestOpenGaussAdapter:
 
     def test_validate_config_valid(self, mock_embedding_engine):
         """Test configuration validation with valid parameters"""
-        adapter = OpenGaussAdapter(
+        OpenGaussAdapter(
             url="postgresql://test@localhost:5432/test",
             api_key="test",
             embedding_engine=mock_embedding_engine,
@@ -192,9 +192,7 @@ class TestOpenGaussAdapter:
             mock_cursor = adapter._get_cursor.return_value
             mock_cursor.fetchall.return_value = []
 
-            results = await adapter.search(
-                collection_name="test_table", query_vector=query_vector, limit=10
-            )
+            await adapter.search(collection_name="test_table", query_vector=query_vector, limit=10)
 
             # Should NOT call embed_data when vector is provided directly
             adapter.embedding_engine.embed_text.assert_not_called()
@@ -281,7 +279,7 @@ class TestOpenGaussAdapter:
         """create_vector_index creates table but skips index when flag is off."""
         with patch.object(adapter, "has_collection", return_value=False):
             mock_cursor = adapter._get_cursor.return_value
-            mock_conn = adapter._get_connection()
+            adapter._get_connection()
 
             await adapter.create_vector_index("test_table", "vector")
 
@@ -298,7 +296,7 @@ class TestOpenGaussAdapter:
         adapter.create_index = True
         with patch.object(adapter, "has_collection", return_value=False):
             mock_cursor = adapter._get_cursor.return_value
-            mock_conn = adapter._get_connection()
+            adapter._get_connection()
 
             await adapter.create_vector_index("test_table", "vector")
 
@@ -388,8 +386,9 @@ class TestOpenGaussAdapterEdgeCases:
     @pytest.mark.asyncio
     async def test_large_batch_insert(self, adapter):
         """Test performance with large batch insert"""
-        from cognee.infrastructure.engine import DataPoint
         from uuid import uuid4
+
+        from cognee.infrastructure.engine import DataPoint
 
         large_batch = [
             DataPoint(

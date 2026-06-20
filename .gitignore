@@ -21,4 +21,5 @@ wheels/
 .cognee_data
 .cognee_system
 .data_storage
-*.log
+*.log.DS_Store
+.DS_Store

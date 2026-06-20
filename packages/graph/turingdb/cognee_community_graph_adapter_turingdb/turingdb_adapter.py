@@ -643,6 +643,78 @@ class TuringDBAdapter(GraphDBInterface):
                 neighbors.append({})
         return neighbors
 
+    async def get_neighborhood(
+        self,
+        node_ids: List[str],
+        depth: int = 1,
+        edge_types: Optional[List[str]] = None,
+    ) -> Tuple[List[Node], List[EdgeData]]:
+        """
+        Get the k-hop neighborhood subgraph around a set of seed nodes.
+
+        Returns all nodes and edges within `depth` hops of any seed node,
+        in the same format as get_graph_data(). If `edge_types` is given,
+        only edges whose relationship_name is in `edge_types` are traversed.
+        """
+        if not node_ids or await self.is_empty():
+            return [], []
+
+        edge_type_set = set(edge_types) if edge_types else None
+
+        # Iterative BFS up to `depth` hops, expanding via incident edges.
+        visited_ids = {str(node_id) for node_id in node_ids}
+        frontier = {str(node_id) for node_id in node_ids}
+
+        for _ in range(max(depth, 0)):
+            if not frontier:
+                break
+            next_frontier: set = set()
+            for current_id in frontier:
+                incident_edges = await self.get_edges(current_id)
+                for source_id, target_id, relationship_name, _props in incident_edges:
+                    if edge_type_set is not None and relationship_name not in edge_type_set:
+                        continue
+                    for endpoint in (source_id, target_id):
+                        if endpoint is None:
+                            continue
+                        endpoint = str(endpoint)
+                        if endpoint not in visited_ids:
+                            visited_ids.add(endpoint)
+                            next_frontier.add(endpoint)
+            frontier = next_frontier
+
+        if not visited_ids:
+            return [], []
+
+        all_ids = list(visited_ids)
+
+        # Fetch all nodes within the neighborhood.
+        node_props = await self.get_nodes(all_ids)
+        nodes: List[Node] = []
+        for props in node_props:
+            node_id = props.get("id") if isinstance(props, dict) else None
+            nodes.append((node_id, props))
+
+        # Fetch all edges between collected nodes, in get_graph_data() format.
+        id_set = set(all_ids)
+        edges: List[EdgeData] = []
+        seen_edges: set = set()
+        for current_id in all_ids:
+            for source_id, target_id, relationship_name, props in await self.get_edges(current_id):
+                if source_id is None or target_id is None:
+                    continue
+                if str(source_id) not in id_set or str(target_id) not in id_set:
+                    continue
+                if edge_type_set is not None and relationship_name not in edge_type_set:
+                    continue
+                edge_key = (str(source_id), str(target_id), relationship_name)
+                if edge_key in seen_edges:
+                    continue
+                seen_edges.add(edge_key)
+                edges.append((source_id, target_id, relationship_name, props))
+
+        return nodes, edges
+
     async def get_nodeset_subgraph(
         self,
         node_type: Type[Any],

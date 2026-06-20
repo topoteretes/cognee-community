@@ -5,9 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
-
 from cognee.infrastructure.databases.graph.postgres.adapter import PostgresAdapter
-
 from cognee_community_graph_adapter_pggraph import PgGraphAdapter, register
 from cognee_community_graph_adapter_pggraph.connection import (
     _normalize_scheme,

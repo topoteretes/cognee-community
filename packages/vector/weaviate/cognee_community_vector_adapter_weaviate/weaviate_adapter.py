@@ -1,5 +1,6 @@
 import asyncio
-from typing import List, Optional
+from typing import Any, List, Optional
+from uuid import UUID
 
 from cognee.infrastructure.databases.exceptions import MissingQueryParameterError
 from cognee.infrastructure.databases.vector.embeddings.EmbeddingEngine import (
@@ -14,6 +15,19 @@ from cognee.shared.logging_utils import get_logger
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
 logger = get_logger("WeaviateAdapter")
+
+
+def serialize_for_json(obj: Any) -> Any:
+    """Recursively convert UUIDs (and containers of them) to JSON-serializable
+    values so returned payloads can be json.dumps()'d by cognee core (e.g. when
+    logging search history)."""
+    if isinstance(obj, UUID):
+        return str(obj)
+    if isinstance(obj, dict):
+        return {key: serialize_for_json(value) for key, value in obj.items()}
+    if isinstance(obj, list):
+        return [serialize_for_json(item) for item in obj]
+    return obj
 
 
 def is_retryable_request(error):
@@ -44,6 +58,7 @@ class IndexSchema(DataPoint):
     text: str
 
     metadata: dict = {"index_fields": ["text"]}
+    belongs_to_set: list[str] = []
 
 
 class WeaviateAdapter(VectorDBInterface):
@@ -110,7 +125,7 @@ class WeaviateAdapter(VectorDBInterface):
 
         return self.client
 
-    async def embed_data(self, data: list[str]) -> list[float]:
+    async def embed_data(self, data: list[str]) -> List[List[float]]:
         """
         Embed the given text data into vector representations.
 
@@ -346,6 +361,7 @@ class WeaviateAdapter(VectorDBInterface):
                 IndexSchema(
                     id=data_point.id,
                     text=DataPoint.get_embeddable_data(data_point),
+                    belongs_to_set=(data_point.belongs_to_set or []),
                 )
                 for data_point in data_points
             ],
@@ -393,8 +409,8 @@ class WeaviateAdapter(VectorDBInterface):
         limit: int | None = 15,
         with_vector: bool = False,
         include_payload: bool = False,
-        node_name: Optional[List[str]] = None,  # TODO: Add functionality for this parameter
-        node_name_filter_operator: str = "OR",  # TODO: Add functionality for this parameter
+        node_name: Optional[List[str]] = None,
+        node_name_filter_operator: str = "OR",
     ):
         """
         Perform a search on a collection using either a text query or a vector query.
@@ -421,6 +437,7 @@ class WeaviateAdapter(VectorDBInterface):
         """
         import weaviate.classes as wvc
         import weaviate.exceptions
+        from weaviate.classes.query import Filter
 
         if query_text is None and query_vector is None:
             raise MissingQueryParameterError()
@@ -446,6 +463,14 @@ class WeaviateAdapter(VectorDBInterface):
             if limit == 0:
                 return []
 
+            search_filters = None
+            if node_name:
+                property_filter = Filter.by_property("belongs_to_set")
+                if node_name_filter_operator == "AND":
+                    search_filters = property_filter.contains_all(node_name)
+                else:
+                    search_filters = property_filter.contains_any(node_name)
+
             try:
                 search_result = await collection.query.hybrid(
                     query=None,
@@ -454,12 +479,13 @@ class WeaviateAdapter(VectorDBInterface):
                     include_vector=with_vector,
                     return_metadata=wvc.query.MetadataQuery(score=True),
                     return_properties=include_payload,
+                    filters=search_filters,
                 )
 
                 return [
                     ScoredResult(
                         id=parse_id(str(result.uuid)),
-                        payload=result.properties,
+                        payload=serialize_for_json(result.properties),
                         score=1 - float(result.metadata.score),
                     )
                     for result in search_result.objects
@@ -476,7 +502,6 @@ class WeaviateAdapter(VectorDBInterface):
         with_vectors: bool = False,
         include_payload: bool = False,
         node_name: Optional[List[str]] = None,
-        node_name_filter_operator: str = "OR",
     ):
         """
         Execute a batch search for multiple query texts in the specified collection.
@@ -523,7 +548,6 @@ class WeaviateAdapter(VectorDBInterface):
                 with_vector=with_vectors,
                 include_payload=include_payload,
                 node_name=node_name,
-                node_name_filter_operator=node_name_filter_operator,
             )
 
         return [

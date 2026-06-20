@@ -11,7 +11,7 @@ import os
 import pathlib
 from os import path
 
-from cognee import config, prune, add, cognify, search, SearchType
+from cognee import SearchType, add, cognify, config, prune, search
 
 # Importing the register module lets Cognee know about the ArcadeDB adapter
 from cognee_community_hybrid_adapter_arcadedb import register  # noqa: F401

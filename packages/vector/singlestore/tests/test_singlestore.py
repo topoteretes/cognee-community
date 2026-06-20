@@ -6,14 +6,13 @@ from uuid import uuid4
 
 import cognee
 from cognee.modules.search.types import SearchType
-
 from cognee_community_vector_adapter_singlestore import register  # noqa: F401
-from cognee_community_vector_adapter_singlestore.SingleStoreDatasetDatabaseHandler import (
-    SingleStoreDatasetDatabaseHandler,
-)
 from cognee_community_vector_adapter_singlestore.singlestore_adapter import (
     SingleStoreAdapter,
     SingleStoreDataPoint,
+)
+from cognee_community_vector_adapter_singlestore.SingleStoreDatasetDatabaseHandler import (
+    SingleStoreDatasetDatabaseHandler,
 )
 
 
@@ -222,7 +221,7 @@ async def test_cognee_recall_flow():
             "vector_db_key": singlestore_key(),
         }
     )
-    cognee.config.set_graph_db_config({"graph_database_provider": "kuzu"})
+    cognee.config.set_graph_db_config({"graph_database_provider": "ladybug"})
 
     data_directory_path = str(
         pathlib.Path(

@@ -48,6 +48,7 @@ class IndexSchema(DataPoint):
     text: str
 
     metadata: dict = {"index_fields": ["text"]}
+    belongs_to_set: list[str] = []
 
 
 class PineconeAdapter(VectorDBInterface):
@@ -170,6 +171,7 @@ class PineconeAdapter(VectorDBInterface):
                 IndexSchema(
                     id=data_point.id,
                     text=getattr(data_point, data_point.metadata["index_fields"][0]),
+                    belongs_to_set=(data_point.belongs_to_set or []),
                 )
                 for data_point in data_points
             ],

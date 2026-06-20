@@ -4,11 +4,10 @@ import json
 import os
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from sqlalchemy import text
-
 from cognee.infrastructure.databases.graph.postgres.adapter import PostgresAdapter
 from cognee.infrastructure.engine import DataPoint
 from cognee.shared.logging_utils import get_logger
+from sqlalchemy import text
 
 from . import queries
 from .connection import resolve_connection_string

@@ -1,9 +1,8 @@
 import os
 import pathlib
 
-import pytest
-
 import cognee
+import pytest
 from cognee.infrastructure.files.storage import get_storage_config
 from cognee.modules.data.models import Data
 from cognee.modules.search.operations import get_history
@@ -284,7 +283,7 @@ async def main():
     )
     cognee.config.set_graph_db_config(
         {
-            "graph_database_provider": "kuzu",
+            "graph_database_provider": "ladybug",
         }
     )
 

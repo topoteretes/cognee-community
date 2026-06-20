@@ -9,13 +9,12 @@ from cognee import config
 # NOTE: Importing the register module we let cognee know it can use the Qdrant vector adapter
 # NOTE: The "noqa: F401" mark is to make sure the linter doesn't flag this as an unused import
 from cognee_community_vector_adapter_qdrant import register  # noqa: F401
-
 from dotenv import load_dotenv
 
 load_dotenv()
 
 MY_PREFERENCE = """
-- I like to visit places near the beach where I can find the best spots. 
+- I like to visit places near the beach where I can find the best spots.
 - I need locations that are rare to find on blogs but are goldmine places for your eyes
 - I prefer Vegetarian meals. Use this when I ask for restaurants recommendation
 - My hobbies that might also help in planning Itineraries: I love Anime, F1 and Cricket.
@@ -38,8 +37,8 @@ async def main():
     )
     config.set_graph_db_config(
         {
-            "graph_database_provider": "kuzu",
-            "graph_dataset_database_handler": "kuzu",
+            "graph_database_provider": "ladybug",
+            "graph_dataset_database_handler": "ladybug",
         }
     )
     await cognee.remember(MY_PREFERENCE)

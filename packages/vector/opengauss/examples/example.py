@@ -4,10 +4,9 @@ import asyncio
 import os
 import pathlib
 
-from dotenv import load_dotenv
-
 from cognee import SearchType, add, cognify, config, prune, search
 from cognee_community_vector_adapter_opengauss import register  # noqa: F401 — registers adapter
+from dotenv import load_dotenv
 
 load_dotenv()
 

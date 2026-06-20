@@ -18,16 +18,13 @@ import time
 from datetime import datetime
 from enum import Enum
 from textwrap import dedent
-from typing import Any, Optional
+from typing import Any
 from uuid import UUID
 
 import aiohttp
 from cognee.infrastructure.databases.graph.config import get_graph_context_config
 from cognee.infrastructure.databases.graph.graph_db_interface import (
-    EdgeData,
     GraphDBInterface,
-    Node,
-    NodeData,
 )
 from cognee.infrastructure.databases.vector.embeddings import get_embedding_engine
 from cognee.infrastructure.databases.vector.embeddings.EmbeddingEngine import (
@@ -66,13 +63,13 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
     def __init__(
         self,
         graph_database_url: str,
-        graph_database_username: Optional[str] = None,
-        graph_database_password: Optional[str] = None,
-        embedding_engine: Optional[EmbeddingEngine] = None,
-        driver: Optional[Any] = None,
-        url: Optional[str] = None,
-        api_key: Optional[str] = None,
-        database_name: Optional[str] = "cognee",
+        graph_database_username: str | None = None,
+        graph_database_password: str | None = None,
+        embedding_engine: EmbeddingEngine | None = None,
+        driver: Any | None = None,
+        url: str | None = None,
+        api_key: str | None = None,
+        database_name: str | None = "cognee",
         **kwargs,
     ):
         raw_url = url if url else graph_database_url
@@ -144,7 +141,7 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
 
         return logical_type, attr_name
 
-    _vector_storage_type_cache: Optional[str] = None
+    _vector_storage_type_cache: str | None = None
 
     async def _vector_storage_type(self) -> str:
         """
@@ -215,7 +212,7 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
         escaped_node_id = self._escape_sql_literal(node_id)
         escaped_node_type = self._escape_sql_literal(node_type)
 
-        for (prop_name, _), vector in zip(values_to_embed, vectors):
+        for (prop_name, _), vector in zip(values_to_embed, vectors, strict=False):
             if not vector:
                 continue
 
@@ -230,7 +227,7 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
                 f"AND type = '{escaped_node_type}'"
             )
 
-    def _get_auth(self) -> Optional[aiohttp.BasicAuth]:
+    def _get_auth(self) -> aiohttp.BasicAuth | None:
         if self.graph_database_username and self.graph_database_password:
             return aiohttp.BasicAuth(self.graph_database_username, self.graph_database_password)
         return None
@@ -335,7 +332,7 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
     async def _cypher_via_http(
         self,
         cypher: str,
-        params: Optional[dict[str, Any]] = None,
+        params: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """Execute Cypher via HTTP API. Returns flat dicts."""
         payload = {"language": "cypher", "command": cypher}
@@ -347,7 +344,7 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
     async def _cypher_via_bolt(
         self,
         cypher: str,
-        params: Optional[dict[str, Any]] = None,
+        params: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """Execute Cypher via Bolt protocol. Normalizes response to flat dicts."""
         from neo4j.exceptions import ServiceUnavailable
@@ -384,7 +381,7 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
     async def _cypher(
         self,
         cypher: str,
-        params: Optional[dict[str, Any]] = None,
+        params: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """Execute Cypher query using Bolt if available, otherwise HTTP.
 
@@ -413,7 +410,7 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
     async def _cypher_projection(
         self,
         cypher: str,
-        params: Optional[dict[str, Any]] = None,
+        params: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """
         Execute graph projection queries via HTTP so aliased nested maps stay
@@ -435,7 +432,7 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
     async def query(
         self,
         query: str,
-        params: Optional[dict[str, Any]] = None,
+        params: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         return await self._cypher(query, params)
 
@@ -547,7 +544,7 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
         from_node: UUID,
         to_node: UUID,
         relationship_name: str,
-        edge_properties: Optional[dict[str, Any]] = None,
+        edge_properties: dict[str, Any] | None = None,
     ):
         serialized = self.serialize_properties(edge_properties or {})
         return await self._cypher(
@@ -595,7 +592,7 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
         results = await self._cypher("MATCH (n) WHERE NOT (n)--() RETURN collect(n.id) AS ids")
         return results[0]["ids"] if results else []
 
-    async def get_predecessors(self, node_id: str, edge_label: Optional[str] = None) -> list[str]:
+    async def get_predecessors(self, node_id: str, edge_label: str | None = None) -> list[str]:
         if edge_label is not None:
             results = await self._cypher(
                 "MATCH (node)<-[r]-(predecessor) "
@@ -610,7 +607,7 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
             )
         return results
 
-    async def get_successors(self, node_id: str, edge_label: Optional[str] = None) -> list[str]:
+    async def get_successors(self, node_id: str, edge_label: str | None = None) -> list[str]:
         if edge_label is not None:
             results = await self._cypher(
                 "MATCH (node)-[r]->(successor) "
@@ -631,7 +628,7 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
         )
         return predecessors + successors
 
-    async def get_node(self, node_id: str) -> Optional[dict[str, Any]]:
+    async def get_node(self, node_id: str) -> dict[str, Any] | None:
         results = await self._cypher(
             "MATCH (node {id: $node_id}) RETURN node",
             {"node_id": node_id},
@@ -933,7 +930,7 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
         self,
         node_ids: list[str],
         depth: int = 1,
-        edge_types: Optional[list[str]] = None,
+        edge_types: list[str] | None = None,
     ) -> tuple[list[tuple[str, dict[str, Any]]], list[tuple[str, str, str, dict[str, Any]]]]:
         """
         Get the k-hop neighborhood subgraph around a set of seed nodes.
@@ -1038,7 +1035,7 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
         except RuntimeError:
             return False
 
-    async def create_collection(self, collection_name: str, payload_schema: Optional[Any] = None):
+    async def create_collection(self, collection_name: str, payload_schema: Any | None = None):
         """Create a vertex type in ArcadeDB if it does not exist."""
         type_name = collection_name.split("_")[0] if "_" in collection_name else collection_name
         try:
@@ -1095,7 +1092,7 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
 
         # Collect all embeddable values for batch embedding
         embeddable_values: list[str] = []
-        vector_map: dict[str, dict[str, Optional[int]]] = {}
+        vector_map: dict[str, dict[str, int | None]] = {}
         created_types: set[str] = set()
 
         for dp in data_points:
@@ -1171,12 +1168,12 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
     async def search(
         self,
         collection_name: str,
-        query_text: Optional[str] = None,
-        query_vector: Optional[list[float]] = None,
-        limit: Optional[int] = None,
+        query_text: str | None = None,
+        query_vector: list[float] | None = None,
+        limit: int | None = None,
         with_vector: bool = False,
         include_payload: bool = False,
-        node_name: Optional[list[str]] = None,
+        node_name: list[str] | None = None,
         node_name_filter_operator: str = "OR",
     ) -> list:
         """Perform vector similarity search using ArcadeDB's vectorNeighbors()."""
@@ -1214,7 +1211,7 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
             if "not found" in str(e).lower() or "index" in str(e).lower():
                 raise CollectionNotFoundError(
                     f"No vector index found for collection {collection_name}"
-                )
+                ) from e
             raise
 
         records = result.get("result", [])
@@ -1267,10 +1264,10 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
         self,
         collection_name: str,
         query_texts: list[str],
-        limit: Optional[int] = None,
+        limit: int | None = None,
         with_vectors: bool = False,
         include_payload: bool = False,
-        node_name: Optional[list[str]] = None,
+        node_name: list[str] | None = None,
         node_name_filter_operator: str = "OR",
     ) -> list:
         """Perform batch vector search across multiple queries."""
@@ -1320,9 +1317,9 @@ class ArcadeDBVectorAdapter(ArcadeDBAdapter):
     def __init__(
         self,
         url: str,
-        api_key: Optional[str] = None,
-        embedding_engine: Optional[EmbeddingEngine] = None,
-        database_name: Optional[str] = "cognee",
+        api_key: str | None = None,
+        embedding_engine: EmbeddingEngine | None = None,
+        database_name: str | None = "cognee",
         **kwargs,
     ):
         graph_config = get_graph_context_config()

@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11,<=3.13"
 dependencies = [
     "weaviate-client>=4.9.6,<5.0.0",
-    "cognee==0.5.5",
+    "cognee>=1.1.0,<2.0.0",
     "starlette>=0.48.0",
     "instructor>=1.11"
 ] 

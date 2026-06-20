@@ -21,7 +21,6 @@ import os
 
 from qdrant_client import models
 
-
 _TQ_BITS = {
     "tq4": models.TurboQuantBitSize.BITS4,
     "tq2": models.TurboQuantBitSize.BITS2,

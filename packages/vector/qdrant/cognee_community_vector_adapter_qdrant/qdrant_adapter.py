@@ -1,6 +1,7 @@
 import asyncio
 import os
-from typing import List, Optional
+from typing import Any, List, Optional
+from uuid import UUID
 
 from cognee.infrastructure.databases.exceptions import MissingQueryParameterError
 from cognee.infrastructure.databases.vector import VectorDBInterface
@@ -20,6 +21,19 @@ from .quantization import (
 )
 
 logger = get_logger("QDrantAdapter")
+
+
+def serialize_for_json(obj: Any) -> Any:
+    """Recursively convert UUIDs (and containers of them) to JSON-serializable
+    values so returned payloads can be json.dumps()'d by cognee core (e.g. when
+    logging search history)."""
+    if isinstance(obj, UUID):
+        return str(obj)
+    if isinstance(obj, dict):
+        return {key: serialize_for_json(value) for key, value in obj.items()}
+    if isinstance(obj, list):
+        return [serialize_for_json(item) for item in obj]
+    return obj
 
 
 class IndexSchema(DataPoint):
@@ -280,10 +294,7 @@ class QDrantAdapter(VectorDBInterface):
                     id=parse_id(str(result.id)),
                     payload=None
                     if not result.payload
-                    else {
-                        **result.payload,
-                        "id": parse_id(str(result.id)),
-                    },
+                    else serialize_for_json({**result.payload, "id": str(result.id)}),
                     score=1 - result.score if hasattr(result, "score") else 1.0,
                 )
                 for result in results

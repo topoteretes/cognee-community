@@ -261,6 +261,7 @@ class DuckDBAdapter(VectorDBInterface, GraphDBInterface):
         with_vector: bool = True,
         include_payload: bool = False,
         node_name: Optional[List[str]] = None,
+        node_name_filter_operator: str = "OR",
     ) -> list[ScoredResult]:
         """[VECTOR] Search for similar vectors."""
         from cognee.infrastructure.databases.exceptions import (
@@ -325,13 +326,30 @@ class DuckDBAdapter(VectorDBInterface, GraphDBInterface):
             if include_payload:
                 select_fields.append("payload")
 
+            # Optionally filter on the "belongs_to_set" payload field by node_name.
+            # belongs_to_set is stored inside the JSON payload as a list of names.
+            where_clause = ""
+            query_params: list[Any] = []
+            if node_name:
+                # Extract belongs_to_set from the JSON payload as a list of strings.
+                belongs_expr = "CAST(json_extract_string(payload, '$.belongs_to_set') AS VARCHAR[])"
+                if node_name_filter_operator == "AND":
+                    list_fn = "list_has_all"
+                else:
+                    list_fn = "list_has_any"
+                where_clause = f"WHERE {list_fn}({belongs_expr}, $1)"
+                query_params.append(node_name)
+
             search_query = f"""
             SELECT {", ".join(select_fields)}
             FROM {collection_name}
+            {where_clause}
             LIMIT {limit}
             """
 
-            search_results = await self._execute_query(search_query)
+            search_results = await self._execute_query(
+                search_query, query_params if query_params else None
+            )
 
             if not search_results:
                 return []
@@ -384,6 +402,7 @@ class DuckDBAdapter(VectorDBInterface, GraphDBInterface):
                 limit=limit,
                 with_vector=with_vectors,
                 include_payload=include_payload,
+                node_name=node_name,
             )
             for vector in vectors
         ]
@@ -553,6 +572,15 @@ class DuckDBAdapter(VectorDBInterface, GraphDBInterface):
 
     async def get_neighbors(self, node_id: str) -> list[dict[str, Any]]:
         """[GRAPH] Get neighboring nodes."""
+        raise NotImplementedError("Graph operations are not implemented for DuckDB adapter")
+
+    async def get_neighborhood(
+        self,
+        node_ids: List[str],
+        depth: int = 1,
+        edge_types: Optional[List[str]] = None,
+    ) -> Tuple[List[Any], List[Any]]:
+        """[GRAPH] Get the k-hop neighborhood of the given seed nodes."""
         raise NotImplementedError("Graph operations are not implemented for DuckDB adapter")
 
     async def get_nodeset_subgraph(

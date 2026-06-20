@@ -5,7 +5,6 @@ import os
 
 import cognee
 from cognee.infrastructure.databases.graph import get_graph_engine
-
 from cognee_community_graph_adapter_pggraph import register
 
 
