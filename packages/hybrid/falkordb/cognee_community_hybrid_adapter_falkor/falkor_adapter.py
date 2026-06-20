@@ -107,23 +107,22 @@ class FalkorDBAdapter(VectorDBInterface, GraphDBInterface):
         self.api_key = api_key
 
     @staticmethod
-    def _coerce_param_value(value: Any) -> Any:
-        """Coerce a single query-param value to a FalkorDB-acceptable type.
+    def _coerce_stored_value(value: Any) -> Any:
+        """Coerce a value that will be STORED as a node/edge property.
 
-        FalkorDB query parameters accept only primitives (``str``/``int``/
-        ``float``/``bool``/``None``) and arrays of those primitives. Any other
-        value makes FalkorDB reject the *entire* query — and since node writes
-        bind every node property as the ``$properties`` map, one stray value
-        aborts the whole pipeline run. The two failure modes are:
+        FalkorDB property values must be primitives or arrays of primitives. A
+        map, a non-primitive array, or a ``bytes`` value makes FalkorDB reject the
+        *entire* query — and since writes bind the property bag as ``$properties``
+        / each ``UNWIND``-ed ``$items`` element, one stray value aborts the whole
+        pipeline run. The failure modes are:
 
         - ``bytes`` -> ``ResponseError: Failed to parse query parameter
           'properties' value``; and
-        - nested mappings / arrays containing non-primitives -> ``ResponseError:
-          Property values can only be of primitive types or arrays of primitive
-          types``.
+        - maps / arrays containing non-primitives -> ``ResponseError: Property
+          values can only be of primitive types or arrays of primitive types``.
 
-        Coerce such values to a JSON/text representation so they survive the
-        write instead of failing it. ``Enum`` is unwrapped to its ``.value``.
+        JSON-encode maps and non-primitive arrays, decode ``bytes``, and unwrap
+        ``Enum`` to its ``.value`` so the value survives the write.
         """
         if value is None or isinstance(value, (bool, int, float, str)):
             return value
@@ -132,7 +131,7 @@ class FalkorDBAdapter(VectorDBInterface, GraphDBInterface):
         if isinstance(value, bytes):
             return value.decode("utf-8", errors="replace")
         if isinstance(value, (list, tuple)):
-            coerced = [FalkorDBAdapter._coerce_param_value(item) for item in value]
+            coerced = [FalkorDBAdapter._coerce_stored_value(item) for item in value]
             # FalkorDB arrays must hold primitives (and reject null elements);
             # if any element isn't one, store the whole array as a JSON string.
             if all(
@@ -146,22 +145,46 @@ class FalkorDBAdapter(VectorDBInterface, GraphDBInterface):
         return str(value)
 
     @staticmethod
-    def _sanitize_cypher_params(params: dict) -> dict:
-        """Make a params dict safe for FalkorDB.
+    def _coerce_param_value(value: Any) -> Any:
+        """Coerce a bound query-param value, PRESERVING the structure FalkorDB
+        needs.
 
-        Recurses into nested mappings (so the bound property map keeps its
-        structure and nested ``Enum``s are unwrapped) and routes every other
-        value through :meth:`_coerce_param_value`, which converts ``bytes`` and
-        other non-primitive types FalkorDB can't bind (they would otherwise
-        reject the whole query and abort the pipeline run).
+        Maps and arrays-of-maps are valid *bound params* — e.g. an
+        ``UNWIND $items AS item ... SET edge += item`` edge batch binds a list of
+        maps — so this keeps that shape. A record map keeps its keys, but its
+        values are primitivized via :meth:`_coerce_stored_value` (they get stored
+        as properties). Flattening a list of maps to JSON strings (as a blanket
+        coercion would) makes the ``UNWIND`` fail with ``Type mismatch: expected
+        Map ... but was String``. ``bytes`` / ``Enum`` outside a record map are
+        still coerced.
         """
-        sanitized = {}
-        for key, value in params.items():
-            if isinstance(value, dict):
-                sanitized[key] = FalkorDBAdapter._sanitize_cypher_params(value)
-            else:
-                sanitized[key] = FalkorDBAdapter._coerce_param_value(value)
-        return sanitized
+        if isinstance(value, dict):
+            return {
+                key: FalkorDBAdapter._coerce_stored_value(val)
+                for key, val in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [FalkorDBAdapter._coerce_param_value(item) for item in value]
+        if isinstance(value, Enum):
+            return value.value
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace")
+        return value
+
+    @staticmethod
+    def _sanitize_cypher_params(params: dict) -> dict:
+        """Make a bound-params dict safe for FalkorDB.
+
+        Routes every value through :meth:`_coerce_param_value` (structure-
+        preserving), which primitivizes the values that get stored as properties
+        via :meth:`_coerce_stored_value`. Without this a ``bytes`` value or a
+        nested map/array in a model-extracted entity rejects the whole query and
+        aborts the pipeline run.
+        """
+        return {
+            key: FalkorDBAdapter._coerce_param_value(value)
+            for key, value in params.items()
+        }
 
     # TODO: This should return a list of results, not a single result
     async def query(self, query: str, params: dict = None) -> list:
