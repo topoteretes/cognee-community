@@ -51,7 +51,7 @@ class MilvusAdapter:
         url: str,
         api_key: str | None,
         embedding_engine: EmbeddingEngine,
-        database_name: str = "cognee",
+        database_name: str = "",
     ):
         self.url = url
         self.api_key = api_key
@@ -91,9 +91,9 @@ class MilvusAdapter:
 
         if not self.client:
             if self.api_key:
-                self.client = MilvusClient(uri=self.url, token=self.api_key)
+                self.client = MilvusClient(uri=self.url, token=self.api_key, db_name=self.database_name)
             else:
-                self.client = MilvusClient(uri=self.url)
+                self.client = MilvusClient(uri=self.url, db_name=self.database_name)
 
         return self.client
 
