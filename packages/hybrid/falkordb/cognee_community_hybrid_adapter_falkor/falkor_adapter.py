@@ -658,7 +658,13 @@ class FalkorDBAdapter(VectorDBInterface, GraphDBInterface):
             SET node += $properties, node.updated_at = timestamp()
             """).strip()
 
-        index_fields = (properties.get("metadata") or {}).get("index_fields", [])
+        node_metadata = properties.get("metadata")
+        if isinstance(node_metadata, str):
+            try:
+                node_metadata = json.loads(node_metadata)
+            except (ValueError, TypeError):
+                node_metadata = None
+        index_fields = (node_metadata or {}).get("index_fields", [])
         for field in index_fields:
             vector_key = f"{field}_vector"
             if vector_key in properties and properties[vector_key] is not None:
@@ -1172,6 +1178,32 @@ class FalkorDBAdapter(VectorDBInterface, GraphDBInterface):
         )
         return results
 
+    @staticmethod
+    def _deserialize_node_properties(properties: Dict[str, Any]) -> Dict[str, Any]:
+        """Restore dict-valued node properties that the write path JSON-encoded.
+
+        FalkorDB stores only primitive property values, so ``add_node`` and
+        ``_coerce_stored_value`` ``json.dumps`` any dict-valued property (notably
+        ``metadata``) before persisting it. cognee core, however, treats
+        ``metadata`` as a dict — e.g. ``DataPoint.get_embeddable_property_names``
+        does ``metadata["index_fields"]``. Any code that reads a node back and
+        feeds it to core therefore needs ``metadata`` as a dict again; the cognee
+        1.2.0 ``namespace_entity_type_node_ids`` graph migration is the first such
+        path (it round-trips ``get_graph_data`` output through ``add_nodes``) and
+        otherwise raises ``TypeError: string indices must be integers``.
+
+        Scoped to ``metadata`` to avoid mangling legitimate string properties
+        (e.g. ``name``/``text``) that may happen to look like JSON. Non-string or
+        malformed values are left untouched, so this is safe and idempotent.
+        """
+        metadata = properties.get("metadata")
+        if isinstance(metadata, str):
+            try:
+                properties["metadata"] = json.loads(metadata)
+            except (ValueError, TypeError):
+                pass
+        return properties
+
     async def get_graph_data(
         self,
     ) -> Tuple[List[Tuple[str, Dict[str, Any]]], List[Tuple[str, str, str, Dict[str, Any]]]]:
@@ -1190,7 +1222,7 @@ class FalkorDBAdapter(VectorDBInterface, GraphDBInterface):
         nodes = [
             (
                 record[2]["id"],
-                record[2],
+                self._deserialize_node_properties(record[2]),
             )
             for record in result.result_set
         ]
