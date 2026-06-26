@@ -77,6 +77,13 @@ async def main():
     print("\nDirect graph data:")
     pprint.pprint(graph_data)
 
+    # Descriptive graph metrics computed from the live graph. These previously
+    # collapsed to an all-zeros fallback for Memgraph; they now report real counts,
+    # connected-component sizes and self-loops.
+    print("\nGraph metrics:")
+    graph_metrics = await graph_engine.get_graph_metrics(include_optional=True)
+    pprint.pprint(graph_metrics)
+
     # Or visualize it in HTML
     print("\nVisualizing the graph...")
     await cognee.visualize_graph(system_path / "graph.html")
