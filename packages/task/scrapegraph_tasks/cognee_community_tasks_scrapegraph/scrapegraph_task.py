@@ -3,7 +3,10 @@ from typing import Any
 
 import cognee
 from cognee.shared.logging_utils import get_logger
-from scrapegraph_py import Client
+# from scrapegraph_py import Client
+# -------
+from scrapegraph_py import ScrapeGraphAI
+# --------
 
 logger = get_logger("ScrapegraphTask")
 
@@ -38,29 +41,41 @@ async def scrape_urls(
             "ScrapeGraphAI API key is required. Set the SGAI_API_KEY environment variable."
         )
 
-    client = Client(api_key=api_key)
+
+    sgai = ScrapeGraphAI(api_key=api_key)
+
+    # client = Client(api_key=api_key)
     results = []
 
-    try:
-        for url in urls:
-            logger.info(f"Scraping URL: {url}")
-            try:
-                response = client.smartscraper(
-                    website_url=url,
-                    user_prompt=user_prompt,
-                )
+    for url in urls:
+        logger.info(f"Scraping URL: {url}")
+        try:
+            response = sgai.extract(
+                url=url,
+                prompt=user_prompt,
+            )
+
+            if response.status == "success": 
                 results.append(
                     {
                         "url": url,
-                        "content": response.get("result", ""),
+                        "content": response.data.json_data
                     }
                 )
                 logger.info(f"Successfully scraped: {url}")
-            except Exception as e:
-                logger.error(f"Failed to scrape {url}: {e!s}")
-                results.append({"url": url, "content": "", "error": str(e)})
-    finally:
-        client.close()
+            else: 
+                results.append(
+                    {
+                        "url": url,
+                        "content": "",
+                        "error": response.error,
+                    }
+                )
+                logger.error(f"Failed to scrape {url}: {response.error}")
+
+        except Exception as e:
+            logger.error(f"Failed to scrape {url}: {e!s}")
+            results.append({"url": url, "content": "", "error": str(e)})
 
     return results
 
