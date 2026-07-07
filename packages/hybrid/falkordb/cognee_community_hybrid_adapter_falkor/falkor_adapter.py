@@ -135,8 +135,7 @@ class FalkorDBAdapter(VectorDBInterface, GraphDBInterface):
             # FalkorDB arrays must hold primitives (and reject null elements);
             # if any element isn't one, store the whole array as a JSON string.
             if all(
-                item is not None and isinstance(item, (bool, int, float, str))
-                for item in coerced
+                item is not None and isinstance(item, (bool, int, float, str)) for item in coerced
             ):
                 return coerced
             return json.dumps(value, default=str)
@@ -159,10 +158,7 @@ class FalkorDBAdapter(VectorDBInterface, GraphDBInterface):
         still coerced.
         """
         if isinstance(value, dict):
-            return {
-                key: FalkorDBAdapter._coerce_stored_value(val)
-                for key, val in value.items()
-            }
+            return {key: FalkorDBAdapter._coerce_stored_value(val) for key, val in value.items()}
         if isinstance(value, (list, tuple)):
             return [FalkorDBAdapter._coerce_param_value(item) for item in value]
         if isinstance(value, Enum):
@@ -181,10 +177,7 @@ class FalkorDBAdapter(VectorDBInterface, GraphDBInterface):
         nested map/array in a model-extracted entity rejects the whole query and
         aborts the pipeline run.
         """
-        return {
-            key: FalkorDBAdapter._coerce_param_value(value)
-            for key, value in params.items()
-        }
+        return {key: FalkorDBAdapter._coerce_param_value(value) for key, value in params.items()}
 
     # TODO: This should return a list of results, not a single result
     async def query(self, query: str, params: dict = None) -> list:

@@ -53,9 +53,7 @@ def test_projects_nodes_and_directed_edges():
         "s1": {"id": "s1", "name": "seed"},
         "n1": {"id": "n1", "name": "neighbor"},
     }
-    assert edges == [
-        ("s1", "n1", "RELATES_TO", {"source_node_id": "s1", "target_node_id": "n1"})
-    ]
+    assert edges == [("s1", "n1", "RELATES_TO", {"source_node_id": "s1", "target_node_id": "n1"})]
 
 
 def test_direction_from_rel_props_not_match_order():
@@ -71,9 +69,7 @@ def test_direction_from_rel_props_not_match_order():
     ]
     adapter, _ = _make_adapter_with_mock_query(rows)
     _, edges = asyncio.run(adapter.get_id_filtered_graph_data(["s1"]))
-    assert edges == [
-        ("s1", "n1", "RELATES_TO", {"source_node_id": "s1", "target_node_id": "n1"})
-    ]
+    assert edges == [("s1", "n1", "RELATES_TO", {"source_node_id": "s1", "target_node_id": "n1"})]
 
 
 def test_seed_to_seed_edge_deduped():
