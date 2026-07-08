@@ -6,9 +6,8 @@ readme = "README.md"
 requires-python = ">=3.11,<=3.13"
 dependencies = [
     # The adapter implementation ships in the lodedb package
-    # (lodedb.local.integrations.cognee). Requires the LodeDB release that first
-    # includes it; bump this floor to that version when it is published.
-    "lodedb>=1.4.0",
+    # (lodedb.local.integrations.cognee), added in lodedb 1.3.1.
+    "lodedb>=1.3.1",
     "cognee>=1.1.0,<2.0.0",
 ]
 

@@ -25,8 +25,7 @@ poetry install   # run in the directory containing pyproject.toml
 
 The adapter itself ships in the `lodedb` package
 (`lodedb.local.integrations.cognee.CogneeLodeDBAdapter`); this package registers it with
-cognee. It needs the LodeDB release that includes the cognee adapter (`pip install
-"lodedb[cognee]"`).
+cognee. It needs LodeDB >= 1.3.1 (the release that added the cognee adapter).
 
 ## Usage
 
