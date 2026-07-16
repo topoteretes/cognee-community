@@ -4,7 +4,7 @@ pipeline, with the Drive API mocked (no live credentials).
 Verifies the behaviors the issue asks for at the add()/Data-record layer
 (no cognify(), so no LLM calls are needed):
   - initial sync creates one Data record per in-scope file
-  - content-bearing rows are routed through document mode (dlt_mode="document"),
+  - content-bearing rows are routed through document mode (source="google_drive"),
     so cognify would chunk + LLM-extract them rather than schema-wrap them
   - an incremental re-sync only re-processes new/changed files — an unchanged
     file's data_id is stable, so it isn't recreated
@@ -143,18 +143,18 @@ async def _dlt_sourced_data(dataset_name: str):
     return [
         d
         for d in all_data
-        if isinstance(d.external_metadata, dict) and d.external_metadata.get("source") == "dlt"
+        if isinstance(d.external_metadata, dict) and d.external_metadata.get("source") == "google_drive"
     ]
 
 
 async def _remember_drive(**overrides):
     source = google_drive_source(folder_id="root", auth_mode="service_account")
-    # No dlt_content_column here on purpose: the connector advertises its
-    # content column on the resource, so document-mode routing must work from a
-    # plain add()/remember() call (asserted via dlt_mode below).
+    # The connector declares its document nature on the source (DOCUMENT_SOURCE_ATTR),
+    # so document-mode routing must work from a plain add()/remember() call
+    # (asserted below via is_dlt_sourced).
     kwargs = dict(
         dataset_name=DATASET_NAME,
-        primary_key="file_id",
+        primary_key="id",
         write_disposition="merge",
         max_rows_per_table=0,
     )
@@ -186,14 +186,16 @@ async def test_incremental_resync_and_deletion_propagate(clean_environment, monk
 
     initial_data = await _dlt_sourced_data(DATASET_NAME)
     assert len(initial_data) == 3
-    initial_ids_by_file = {d.external_metadata["primary_key_value"]: d.id for d in initial_data}
+    initial_ids_by_file = {d.external_metadata["external_id"]: d.id for d in initial_data}
     assert set(initial_ids_by_file) == {"fileA", "fileB", "fileC"}
 
-    # Content-bearing rows are routed through document mode: dlt_mode="document"
-    # is what makes classify_documents pick TextDocument (chunk + LLM extract)
-    # over the schema-wrapped DltRowDocument. If this regressed, the files would
-    # still ingest but contribute nothing to the graph.
-    assert all(d.external_metadata.get("dlt_mode") == "document" for d in initial_data)
+    # Document rows are tagged source="google_drive" (not "dlt"), so is_dlt_sourced()
+    # is False and classify_documents picks TextDocument (chunk + LLM extract) over
+    # the schema-wrapped DltRowDocument. If this regressed, the files would still
+    # ingest but contribute nothing to the graph.
+    from cognee.tasks.ingestion.dlt_utils import is_dlt_sourced
+
+    assert all(not is_dlt_sourced(d.external_metadata) for d in initial_data)
 
     # --- Incremental run: fileA content changes, fileB is deleted from Drive,
     # and fileC is left untouched (not in the change feed).
@@ -216,7 +218,7 @@ async def test_incremental_resync_and_deletion_propagate(clean_environment, monk
     await _remember_drive()
 
     final_data = await _dlt_sourced_data(DATASET_NAME)
-    final_by_file = {d.external_metadata["primary_key_value"]: d for d in final_data}
+    final_by_file = {d.external_metadata["external_id"]: d for d in final_data}
 
     # fileB was removed from Drive -> forgotten via orphan_cleanup.
     assert "fileB" not in final_by_file

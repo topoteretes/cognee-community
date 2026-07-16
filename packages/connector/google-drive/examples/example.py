@@ -53,7 +53,7 @@ async def main():
     result = await cognee.remember(
         drive_source,
         dataset_name="google_drive_demo",
-        primary_key="file_id",
+        primary_key="id",
         # "merge" is required: it's what makes re-runs incremental and what
         # makes deletions propagate via orphan cleanup. The default
         # ("replace") would re-extract every file on every run instead.
@@ -71,7 +71,7 @@ async def main():
     result = await cognee.remember(
         google_drive_source(),
         dataset_name="google_drive_demo",
-        primary_key="file_id",
+        primary_key="id",
         write_disposition="merge",
         max_rows_per_table=0,
     )

@@ -171,7 +171,7 @@ async def _sync(drive):
     await cognee.add(
         google_drive_source(folder_id="root", service=drive),
         dataset_name=DATASET,
-        primary_key="file_id",
+        primary_key="id",
         write_disposition="merge",
         max_rows_per_table=0,
     )

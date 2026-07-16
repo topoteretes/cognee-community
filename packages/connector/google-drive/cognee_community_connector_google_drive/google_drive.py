@@ -56,7 +56,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional, Set, Tuple
 
 from cognee.shared.logging_utils import get_logger
-from cognee.tasks.ingestion.dlt_utils import CONTENT_COLUMN_HINT_ATTR
+from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
 
 logger = get_logger("google_drive_connector")
 
@@ -264,7 +264,7 @@ def _iter_rows(service, config: _DriveConfig, state: dict):
     tombstoned = 0
     for file_id in deleted_ids:
         tombstoned += 1
-        yield {"file_id": file_id, "_deleted": True}
+        yield {"id": file_id, "_deleted": True}
 
     # The scope set is only needed to check whether changed files are still in
     # the folder, so skip the subfolder walk entirely when nothing changed.
@@ -276,7 +276,7 @@ def _iter_rows(service, config: _DriveConfig, state: dict):
             except Exception as e:
                 if _is_not_found(e):
                     tombstoned += 1
-                    yield {"file_id": file_id, "_deleted": True}
+                    yield {"id": file_id, "_deleted": True}
                     continue
                 raise RuntimeError(
                     f"Google Drive: failed to fetch metadata for file '{file_id}': {e}"
@@ -284,7 +284,7 @@ def _iter_rows(service, config: _DriveConfig, state: dict):
 
             if file_meta.get("trashed") or not _is_in_scope(file_meta, scope_folder_ids):
                 tombstoned += 1
-                yield {"file_id": file_id, "_deleted": True}
+                yield {"id": file_id, "_deleted": True}
                 continue
 
             row = _file_to_row(service, file_meta, config)
@@ -454,14 +454,15 @@ def _file_to_row(service, file_meta: Dict[str, Any], config: _DriveConfig) -> Op
         # Unparseable/skipped, or an empty document — nothing to add to memory.
         return None
 
+    # Document-mode row contract: {id, title, content, url}. resolve_dlt_sources
+    # tags these rows external_metadata["source"]="google_drive" (see the
+    # DOCUMENT_SOURCE_ATTR marker below), so each file flows through normal
+    # cognify (LLM graph extraction) rather than the relational schema path.
     return {
-        "file_id": file_id,
-        "name": name,
-        "mime_type": mime_type,
-        "web_view_link": file_meta.get("webViewLink"),
-        "modified_time": file_meta.get("modifiedTime"),
-        "parent_folder_id": (file_meta.get("parents") or [None])[0],
+        "id": file_id,
+        "title": name,
         "content": content,
+        "url": file_meta.get("webViewLink"),
         "_deleted": False,
     }
 
@@ -535,7 +536,7 @@ def google_drive_source(
     @dlt.resource(
         name="google_drive_files",
         write_disposition="merge",
-        primary_key="file_id",
+        primary_key="id",
         # `_deleted` is a boolean hard-delete marker (matching gmail.py): rows
         # where it is True are removed from the dlt destination on merge, which
         # propagates the deletion through cognee's orphan_cleanup.
@@ -550,8 +551,10 @@ def google_drive_source(
         yield from _iter_rows(client, config, dlt.current.resource_state())
 
     resource = google_drive_files()
-    # Self-describing: declare the column carrying file content so
-    # resolve_dlt_sources routes rows through normal chunking + LLM graph
-    # extraction (document mode) without the caller passing dlt_content_column.
-    setattr(resource, CONTENT_COLUMN_HINT_ATTR, "content")
+    # Opt into the document ingestion path: each file row (id/title/content/url)
+    # becomes a text document that flows through normal cognify (LLM graph
+    # extraction). resolve_dlt_sources reads this marker; it never imports this
+    # connector. Sync stays incremental — hand this to remember() with
+    # write_disposition="merge" (the Changes-API delta + _deleted hard-delete).
+    setattr(resource, DOCUMENT_SOURCE_ATTR, "google_drive")
     return resource
