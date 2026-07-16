@@ -1,0 +1,37 @@
+[project]
+name = "cognee-community-connector-notion"
+version = "0.1.0"
+description = "Notion data-source connector for cognee — sync your Notion workspace into memory (full snapshot + forget-on-delete)"
+readme = "README.md"
+requires-python = ">=3.11,<=3.13"
+dependencies = [
+    # RELEASE-BLOCKED: the Notion connector uses cognee "document-mode"
+    # (cognee.tasks.ingestion.dlt_utils.DOCUMENT_SOURCE_ATTR + resolve_dlt_sources
+    # routing pages through cognify instead of the dlt-schema path). That is NOT in
+    # cognee 1.3.0. Set this pin to the first cognee release that ships document-mode
+    # before publishing — the version below is a placeholder for that release.
+    "cognee==1.4.0",
+    "dlt[sqlalchemy]>=1.9.0,<2",
+    "notion-client>=2.2.1,<3",
+]
+
+[project.urls]
+Homepage = "https://github.com/topoteretes/cognee"
+Repository = "https://github.com/topoteretes/cognee-community"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cognee_community_connector_notion"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "N", "B", "UP", "C4", "PGH", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
