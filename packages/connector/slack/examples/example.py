@@ -24,6 +24,7 @@ import asyncio
 import os
 
 import cognee
+
 from cognee_community_connector_slack import slack_export_source
 
 DATASET = "team-slack-export"

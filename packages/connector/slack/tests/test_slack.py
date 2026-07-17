@@ -5,7 +5,6 @@ and do not depend on any checked-in fixtures.
 """
 
 import json
-import uuid
 
 import pytest
 
@@ -166,13 +165,13 @@ def test_large_export_parses_all_rows(tmp_path):
 
 
 def test_missing_channels_json_raises(tmp_path):
-    with pytest.raises(FileNotFoundError, match="channels.json"):
+    with pytest.raises(FileNotFoundError, match=r"channels\.json"):
         list(iter_slack_export_messages(tmp_path))
 
 
 def test_malformed_channels_json_raises(tmp_path):
     (tmp_path / "channels.json").write_text(json.dumps({"not": "a list"}))
-    with pytest.raises(ValueError, match="channels.json"):
+    with pytest.raises(ValueError, match=r"channels\.json"):
         list(iter_slack_export_messages(tmp_path))
 
 

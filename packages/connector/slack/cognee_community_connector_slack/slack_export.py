@@ -53,8 +53,9 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any
 
 from cognee.shared.logging_utils import get_logger
 
@@ -90,8 +91,8 @@ def _load_json(path: Path) -> Any:
         return json.load(handle)
 
 
-def _build_user_lookup(users: List[dict]) -> Dict[str, str]:
-    lookup: Dict[str, str] = {}
+def _build_user_lookup(users: list[dict]) -> dict[str, str]:
+    lookup: dict[str, str] = {}
     for user in users:
         user_id = user.get("id")
         if not user_id:
@@ -106,9 +107,9 @@ def _build_user_lookup(users: List[dict]) -> Dict[str, str]:
     return lookup
 
 
-def _build_channel_lookup(channels: List[dict]) -> Dict[str, dict]:
+def _build_channel_lookup(channels: list[dict]) -> dict[str, dict]:
     """Map channel folder name (``name`` field) → channel metadata."""
-    lookup: Dict[str, dict] = {}
+    lookup: dict[str, dict] = {}
     for channel in channels:
         name = channel.get("name")
         if name:
@@ -116,10 +117,10 @@ def _build_channel_lookup(channels: List[dict]) -> Dict[str, dict]:
     return lookup
 
 
-def _message_text(message: dict, user_name: Optional[str], channel_name: str) -> str:
+def _message_text(message: dict, user_name: str | None, channel_name: str) -> str:
     """Build searchable text, folding thread context when present."""
     raw_text = message.get("text") or ""
-    parts: List[str] = []
+    parts: list[str] = []
 
     thread_ts = message.get("thread_ts")
     msg_ts = message.get("ts")
