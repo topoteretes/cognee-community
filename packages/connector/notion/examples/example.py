@@ -40,6 +40,7 @@ import asyncio
 import os
 
 import cognee
+
 from cognee_community_connector_notion import notion_source
 
 # Keep Notion in its own dataset so it is easy to inspect and forget.

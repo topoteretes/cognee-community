@@ -23,10 +23,9 @@ approach cannot see deletions — hence the Slack-style full-snapshot model.)
 
 import os
 import time
-from typing import Any, Optional
+from typing import Any
 
 from cognee.shared.logging_utils import get_logger
-
 from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
 
 logger = get_logger("notion_connector")
@@ -49,9 +48,9 @@ _HEADING_PREFIX = {"heading_1": "# ", "heading_2": "## ", "heading_3": "### "}
 
 
 def notion_source(
-    token: Optional[str] = None,
-    page_ids: Optional[list[str]] = None,
-    database_ids: Optional[list[str]] = None,
+    token: str | None = None,
+    page_ids: list[str] | None = None,
+    database_ids: list[str] | None = None,
     client: Any = None,
 ):
     """Create a dlt source that yields Notion pages as markdown documents.
@@ -208,8 +207,7 @@ def _paginate(method, **kwargs):
             if cursor
             else _request(method, **kwargs)
         )
-        for item in response.get("results", []):
-            yield item
+        yield from response.get("results", [])
         cursor = response.get("next_cursor")
         # Stop on the last page, or if Notion signals "more" without a cursor
         # (contract violation) so we can't loop forever.
@@ -241,7 +239,7 @@ def _page_title(page: dict) -> str:
     return ""
 
 
-def _render_blocks(client, block_id: Optional[str], depth: int = 0) -> str:
+def _render_blocks(client, block_id: str | None, depth: int = 0) -> str:
     """Render a block's children to markdown, recursing into nested blocks."""
     # Guard against pathological nesting / cycles.
     if not block_id or depth > 10:

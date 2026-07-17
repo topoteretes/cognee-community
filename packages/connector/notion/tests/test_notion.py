@@ -15,20 +15,19 @@ from uuid import NAMESPACE_OID, uuid5
 
 import pytest
 
-from cognee_community_connector_notion.notion import (
-    NOTION_SOURCE_NAME,
-    _paginate,
-    _page_title,
-    _page_to_row,
-    _render_block,
-    _render_blocks,
-    _rich_text,
-)
-
 # The row → document-DataItem mapping is generic and owned by the ingestion
 # layer (any document source uses it), not the connector.
 from cognee.tasks.ingestion.resolve_dlt_sources import _build_document_data_item
 
+from cognee_community_connector_notion.notion import (
+    NOTION_SOURCE_NAME,
+    _page_title,
+    _page_to_row,
+    _paginate,
+    _render_block,
+    _render_blocks,
+    _rich_text,
+)
 
 # ---------------------------------------------------------------------------
 # Fixtures / fakes
@@ -223,8 +222,9 @@ def test_build_document_data_item_tags_source():
 def test_notion_source_declares_document_marker():
     # resolve_dlt_sources routes on the document-source marker (not on this name),
     # but the tag it carries is the source name; keep it stable.
-    from cognee_community_connector_notion.notion import notion_source
     from cognee.tasks.ingestion.dlt_utils import document_source_tag
+
+    from cognee_community_connector_notion.notion import notion_source
 
     source = notion_source(token="test-token")
     assert NOTION_SOURCE_NAME == "notion"
@@ -257,9 +257,11 @@ def _read_pages(pipeline):
     Reads positionally (the SELECT fixes the column order) since dlt's
     sqlalchemy cursor exposes a SQLAlchemy Result without DB-API ``description``.
     """
-    with pipeline.sql_client() as client:
-        with client.execute_query("SELECT id, title, content FROM notion_pages") as cursor:
-            rows = cursor.fetchall()
+    with (
+        pipeline.sql_client() as client,
+        client.execute_query("SELECT id, title, content FROM notion_pages") as cursor,
+    ):
+        rows = cursor.fetchall()
     return {row[0]: {"id": row[0], "title": row[1], "content": row[2]} for row in rows}
 
 
@@ -412,5 +414,5 @@ def test_render_error_aborts_sync(dlt_mod, tmp_path):
         dataset_name="notion_ds",
         pipelines_dir=str(tmp_path / "state"),
     )
-    with pytest.raises(Exception):
+    with pytest.raises(Exception):  # noqa: B017 - dlt wraps the source error in PipelineStepFailed
         pipeline.run(notion_source(client=fake))
