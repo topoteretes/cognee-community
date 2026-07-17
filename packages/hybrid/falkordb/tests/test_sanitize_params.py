@@ -96,9 +96,7 @@ def test_bound_list_of_maps_preserved_for_unwind():
     result = FalkorDBAdapter._sanitize_cypher_params(
         {"items": [{"edge_index": 0, "props": {"w": 1}}, {"edge_index": 1}]}
     )
-    assert result == {
-        "items": [{"edge_index": 0, "props": '{"w": 1}'}, {"edge_index": 1}]
-    }
+    assert result == {"items": [{"edge_index": 0, "props": '{"w": 1}'}, {"edge_index": 1}]}
 
 
 def test_stored_map_value_json_encoded():
@@ -113,9 +111,7 @@ def test_stored_map_value_json_encoded():
 def test_stored_array_of_maps_json_encoded():
     # An array of maps as a stored property value becomes an array of JSON strings
     # (a valid array-of-primitives).
-    result = FalkorDBAdapter._sanitize_cypher_params(
-        {"properties": {"objs": [{"k": 1}, {"k": 2}]}}
-    )
+    result = FalkorDBAdapter._sanitize_cypher_params({"properties": {"objs": [{"k": 1}, {"k": 2}]}})
     assert result == {"properties": {"objs": ['{"k": 1}', '{"k": 2}']}}
 
 
