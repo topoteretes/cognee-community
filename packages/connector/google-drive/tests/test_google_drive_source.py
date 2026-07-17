@@ -96,14 +96,14 @@ class FakeDriveService:
 
 
 def _config(**overrides):
-    defaults = dict(
-        folder_id="root",
-        auth_mode="service_account",
-        credentials_path="unused.json",
-        token_path=None,
-        include_subfolders=True,
-        max_file_size_mb=25,
-    )
+    defaults = {
+        "folder_id": "root",
+        "auth_mode": "service_account",
+        "credentials_path": "unused.json",
+        "token_path": None,
+        "include_subfolders": True,
+        "max_file_size_mb": 25,
+    }
     defaults.update(overrides)
     return _DriveConfig(**defaults)
 

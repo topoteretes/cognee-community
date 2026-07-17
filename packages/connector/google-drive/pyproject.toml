@@ -36,3 +36,6 @@ select = ["E", "W", "F", "I", "N", "B", "UP", "C4", "PGH", "SIM", "RUF"]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
+# Test doubles mirror the Google Drive API surface (camelCase methods and
+# kwargs like getStartPageToken / fileId), so tolerate non-snake_case names.
+"tests/**" = ["N802", "N803"]

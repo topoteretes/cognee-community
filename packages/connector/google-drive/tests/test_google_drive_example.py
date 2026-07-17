@@ -10,14 +10,14 @@ credentials are used or required.
 import importlib.util
 import pathlib
 
+import cognee
 import pytest
 import pytest_asyncio
-
-import cognee
-from cognee.infrastructure.llm import LLMGateway
 from cognee.infrastructure.databases.vector.embeddings.LiteLLMEmbeddingEngine import (
     LiteLLMEmbeddingEngine,
 )
+from cognee.infrastructure.llm import LLMGateway
+
 from cognee_community_connector_google_drive import google_drive as gd_source
 
 add_data_points_module = importlib.import_module("cognee.tasks.storage.add_data_points")
@@ -105,7 +105,8 @@ def _file_meta(file_id):
 async def _mock_structured_output(
     text_input=None, system_prompt=None, response_model=str, **_kwargs
 ):
-    from cognee.shared.data_models import KnowledgeGraph, Node as KGNode, SummarizedContent
+    from cognee.shared.data_models import KnowledgeGraph, SummarizedContent
+    from cognee.shared.data_models import Node as KGNode
 
     if response_model is str:
         return "Mocked answer."

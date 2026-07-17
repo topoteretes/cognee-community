@@ -11,15 +11,15 @@ Verifies the behaviors the issue asks for at the add()/Data-record layer
   - a file removed from Drive is forgotten (foreground orphan_cleanup fires)
 """
 
+import cognee
 import pytest
 import pytest_asyncio
-
-import cognee
-from cognee_community_connector_google_drive import google_drive as gd_source
-from cognee_community_connector_google_drive import google_drive_source
-from cognee.modules.users.methods import get_default_user
 from cognee.modules.data.methods import get_authorized_existing_datasets
 from cognee.modules.data.methods.get_dataset_data import get_dataset_data
+from cognee.modules.users.methods import get_default_user
+
+from cognee_community_connector_google_drive import google_drive as gd_source
+from cognee_community_connector_google_drive import google_drive_source
 
 DATASET_NAME = "gdrive_integration_test"
 DOC_MIME = "application/vnd.google-apps.document"
@@ -143,7 +143,8 @@ async def _dlt_sourced_data(dataset_name: str):
     return [
         d
         for d in all_data
-        if isinstance(d.external_metadata, dict) and d.external_metadata.get("source") == "google_drive"
+        if isinstance(d.external_metadata, dict)
+        and d.external_metadata.get("source") == "google_drive"
     ]
 
 
@@ -152,12 +153,12 @@ async def _remember_drive(**overrides):
     # The connector declares its document nature on the source (DOCUMENT_SOURCE_ATTR),
     # so document-mode routing must work from a plain add()/remember() call
     # (asserted below via is_dlt_sourced).
-    kwargs = dict(
-        dataset_name=DATASET_NAME,
-        primary_key="id",
-        write_disposition="merge",
-        max_rows_per_table=0,
-    )
+    kwargs = {
+        "dataset_name": DATASET_NAME,
+        "primary_key": "id",
+        "write_disposition": "merge",
+        "max_rows_per_table": 0,
+    }
     kwargs.update(overrides)
     await cognee.add(source, **kwargs)
 

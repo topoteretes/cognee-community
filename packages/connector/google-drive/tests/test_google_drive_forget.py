@@ -10,15 +10,15 @@ checks the relational ledger), leaving a forgotten file still retrievable.
 
 import importlib
 
+import cognee
 import pytest
 import pytest_asyncio
-
-import cognee
-from cognee.infrastructure.llm import LLMGateway
+from cognee.infrastructure.databases.graph import get_graph_engine
 from cognee.infrastructure.databases.vector.embeddings.LiteLLMEmbeddingEngine import (
     LiteLLMEmbeddingEngine,
 )
-from cognee.infrastructure.databases.graph import get_graph_engine
+from cognee.infrastructure.llm import LLMGateway
+
 from cognee_community_connector_google_drive import google_drive_source
 
 add_data_points_module = importlib.import_module("cognee.tasks.storage.add_data_points")
@@ -112,7 +112,8 @@ async def _mock_structured_output(
     text_input=None, system_prompt=None, response_model=str, **_kwargs
 ):
     """Extract one entity named after whichever token appears in the chunk text."""
-    from cognee.shared.data_models import KnowledgeGraph, Node as KGNode, SummarizedContent
+    from cognee.shared.data_models import KnowledgeGraph, SummarizedContent
+    from cognee.shared.data_models import Node as KGNode
 
     if response_model is str:
         return "Mocked answer."

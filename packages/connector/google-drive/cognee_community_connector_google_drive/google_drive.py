@@ -53,7 +53,7 @@ Limitations
 import io
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Set, Tuple
+from typing import Any
 
 from cognee.shared.logging_utils import get_logger
 from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
@@ -86,8 +86,8 @@ FILE_FIELDS = "id, name, mimeType, modifiedTime, webViewLink, parents, trashed, 
 class _DriveConfig:
     folder_id: str
     auth_mode: str
-    credentials_path: Optional[str]
-    token_path: Optional[str]
+    credentials_path: str | None
+    token_path: str | None
     include_subfolders: bool
     max_file_size_mb: int
 
@@ -98,8 +98,8 @@ class _DriveConfig:
 def build_drive_service(
     *,
     auth_mode: str = "service_account",
-    credentials_path: Optional[str] = None,
-    token_path: Optional[str] = None,
+    credentials_path: str | None = None,
+    token_path: str | None = None,
 ) -> Any:
     """Build an authenticated Drive v3 API client.
 
@@ -107,9 +107,9 @@ def build_drive_service(
     dependency (``pip install "cognee[google-drive]"``).
     """
     try:
+        from google.auth.transport.requests import Request
         from google.oauth2 import service_account
         from google.oauth2.credentials import Credentials as UserCredentials
-        from google.auth.transport.requests import Request
         from google_auth_oauthlib.flow import InstalledAppFlow
         from googleapiclient.discovery import build
     except ImportError as exc:  # pragma: no cover - depends on optional extra
@@ -140,16 +140,18 @@ def build_drive_service(
     return build("drive", "v3", credentials=credentials, cache_discovery=False)
 
 
+# The first three parameters are injected google-auth classes (dependency
+# injection for testability); classmethods are called on them below.
 def _load_oauth_credentials(
-    UserCredentials, InstalledAppFlow, Request, client_secret_path, token_path
+    user_credentials, installed_app_flow, request, client_secret_path, token_path
 ):
     creds = None
     if token_path and os.path.exists(token_path):
-        creds = UserCredentials.from_authorized_user_file(token_path, DRIVE_READONLY_SCOPES)
+        creds = user_credentials.from_authorized_user_file(token_path, DRIVE_READONLY_SCOPES)
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
+            creds.refresh(request())
         else:
             if not client_secret_path or not os.path.exists(client_secret_path):
                 raise FileNotFoundError(
@@ -159,7 +161,7 @@ def _load_oauth_credentials(
                 )
             # Interactive: opens a browser on first run. For headless / CI use,
             # pre-authorize a token file and point token_path at it.
-            flow = InstalledAppFlow.from_client_secrets_file(
+            flow = installed_app_flow.from_client_secrets_file(
                 client_secret_path, DRIVE_READONLY_SCOPES
             )
             creds = flow.run_local_server(port=0)
@@ -182,7 +184,7 @@ def is_supported_mime_type(mime_type: str) -> bool:
     )
 
 
-def extract_file_content(service: Any, file_id: str, mime_type: str, name: str) -> Optional[str]:
+def extract_file_content(service: Any, file_id: str, mime_type: str, name: str) -> str | None:
     """Return extracted text for a Drive file, or None to skip it.
 
     A file that can't be parsed (corrupt PDF, export error, transient per-file
@@ -300,7 +302,7 @@ def _iter_rows(service, config: _DriveConfig, state: dict):
     )
 
 
-def _get_scope_folder_ids(service, config: _DriveConfig) -> Set[str]:
+def _get_scope_folder_ids(service, config: _DriveConfig) -> set[str]:
     root = config.folder_id
     if not config.include_subfolders:
         return {root}
@@ -383,9 +385,9 @@ def _get_start_page_token(service) -> str:
     return response["startPageToken"]
 
 
-def _list_changed_file_ids(service, page_token: str) -> Tuple[Set[str], Set[str], str]:
-    changed_ids: Set[str] = set()
-    deleted_ids: Set[str] = set()
+def _list_changed_file_ids(service, page_token: str) -> tuple[set[str], set[str], str]:
+    changed_ids: set[str] = set()
+    deleted_ids: set[str] = set()
     current_token = page_token
     new_start_token = page_token
 
@@ -420,7 +422,7 @@ def _list_changed_file_ids(service, page_token: str) -> Tuple[Set[str], Set[str]
     return changed_ids - deleted_ids, deleted_ids, new_start_token
 
 
-def _is_in_scope(file_meta: Dict[str, Any], scope_folder_ids: Set[str]) -> bool:
+def _is_in_scope(file_meta: dict[str, Any], scope_folder_ids: set[str]) -> bool:
     return bool(set(file_meta.get("parents", [])) & scope_folder_ids)
 
 
@@ -428,7 +430,7 @@ def _is_not_found(e: Exception) -> bool:
     return getattr(getattr(e, "resp", None), "status", None) == 404
 
 
-def _file_to_row(service, file_meta: Dict[str, Any], config: _DriveConfig) -> Optional[dict]:
+def _file_to_row(service, file_meta: dict[str, Any], config: _DriveConfig) -> dict | None:
     mime_type = file_meta.get("mimeType", "")
     name = file_meta.get("name", "")
     file_id = file_meta["id"]
@@ -471,13 +473,13 @@ def _file_to_row(service, file_meta: Dict[str, Any], config: _DriveConfig) -> Op
 # Public factory
 # ---------------------------------------------------------------------------
 def google_drive_source(
-    folder_id: Optional[str] = None,
+    folder_id: str | None = None,
     *,
-    auth_mode: Optional[str] = None,
-    credentials_path: Optional[str] = None,
-    token_path: Optional[str] = None,
-    include_subfolders: Optional[bool] = None,
-    max_file_size_mb: Optional[int] = None,
+    auth_mode: str | None = None,
+    credentials_path: str | None = None,
+    token_path: str | None = None,
+    include_subfolders: bool | None = None,
+    max_file_size_mb: int | None = None,
     service: Any = None,
 ):
     """Return a ``dlt`` resource yielding one row per in-scope Google Drive file.

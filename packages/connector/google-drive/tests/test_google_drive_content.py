@@ -5,11 +5,11 @@ import io
 from pypdf import PdfWriter
 
 from cognee_community_connector_google_drive.google_drive import (
-    extract_file_content,
-    is_supported_mime_type,
     GOOGLE_DOC_MIME_TYPE,
     GOOGLE_SHEET_MIME_TYPE,
     PDF_MIME_TYPE,
+    extract_file_content,
+    is_supported_mime_type,
 )
 
 
