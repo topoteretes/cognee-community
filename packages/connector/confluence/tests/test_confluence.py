@@ -235,14 +235,14 @@ def test_comments_are_folded_into_page_body_when_requested():
             )
         ]
     )
-    rows_with = list(sync_pages(session, BASE_URL, dict(), include_comments=True))
+    rows_with = list(sync_pages(session, BASE_URL, {}, include_comments=True))
     assert rows_with[0]["body"] == "page\n\nComments:\nfirst\n\nsecond"
 
     rows_without = list(
         sync_pages(
             _make_session([_page("1", when="x", body="<p>page</p>", comments=["<p>c</p>"])]),
             BASE_URL,
-            dict(),
+            {},
             include_comments=False,
         )
     )
@@ -261,7 +261,7 @@ def test_space_keys_are_pushed_down_as_a_repeated_array_param():
     # Multi-space filter must resolve BOTH requested spaces (comma-joining would
     # match neither and silently sync nothing / mass-delete on re-run).
     rows = list(
-        sync_pages(session, BASE_URL, dict(), space_keys=["ENG", "DOCS"], include_comments=False)
+        sync_pages(session, BASE_URL, {}, space_keys=["ENG", "DOCS"], include_comments=False)
     )
 
     assert sorted(r["id"] for r in rows) == ["1", "2"]  # OPS excluded, ENG+DOCS included

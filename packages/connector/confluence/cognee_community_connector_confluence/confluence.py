@@ -58,7 +58,8 @@ from __future__ import annotations
 
 import html
 import re
-from typing import Any, Dict, Iterator, List, Optional, Set
+from collections.abc import Iterator
+from typing import Any
 
 from cognee.shared.logging_utils import get_logger
 
@@ -94,7 +95,7 @@ def _make_session(email: str, api_token: str) -> Any:
     return session
 
 
-def _api_get(session: Any, base_url: str, path_or_url: str, params: Optional[dict] = None) -> dict:
+def _api_get(session: Any, base_url: str, path_or_url: str, params: dict | None = None) -> dict:
     """GET a Confluence API path (or a ready-made pagination URL) and return JSON."""
     url = path_or_url if path_or_url.startswith("http") else f"{base_url}{path_or_url}"
     response = session.get(url, params=params or {})
@@ -108,12 +109,11 @@ def _paginate(session: Any, base_url: str, path: str, params: dict) -> Iterator[
     The v2 ``next`` link is a site-relative path that already carries the
     cursor, so subsequent requests drop the initial query params.
     """
-    next_path: Optional[str] = path
+    next_path: str | None = path
     next_params = dict(params)
     while next_path:
         data = _api_get(session, base_url, next_path, next_params)
-        for item in data.get("results", []) or []:
-            yield item
+        yield from data.get("results", []) or []
         next_path = (data.get("_links") or {}).get("next")
         next_params = {}
 
@@ -121,7 +121,7 @@ def _paginate(session: Any, base_url: str, path: str, params: dict) -> Iterator[
 # ---------------------------------------------------------------------------
 # Parsing
 # ---------------------------------------------------------------------------
-def _clean_html(raw: Optional[str]) -> str:
+def _clean_html(raw: str | None) -> str:
     """Strip Confluence storage-format markup down to plain text.
 
     Storage format is XHTML with macros; feeding raw tags into entity
@@ -143,7 +143,7 @@ def _version_when(page: dict) -> str:
     return version.get("createdAt") or version.get("when") or ""
 
 
-def _page_to_row(page: dict, body: str, base_url: str) -> Dict[str, Any]:
+def _page_to_row(page: dict, body: str, base_url: str) -> dict[str, Any]:
     """Flatten a Confluence page (+ its resolved body text) into a dlt row."""
     webui = (page.get("_links") or {}).get("webui") or ""
     if webui and not webui.startswith("http"):
@@ -162,7 +162,7 @@ def _page_to_row(page: dict, body: str, base_url: str) -> Dict[str, Any]:
     }
 
 
-def _deleted_row(page_id: str) -> Dict[str, Any]:
+def _deleted_row(page_id: str) -> dict[str, Any]:
     """Build a minimal row that instructs dlt to hard-delete a page by id."""
     return {"id": str(page_id), "_deleted": True}
 
@@ -170,9 +170,9 @@ def _deleted_row(page_id: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Confluence API reads
 # ---------------------------------------------------------------------------
-def _resolve_space_ids(session: Any, base_url: str, space_keys: Optional[List[str]]) -> List[str]:
+def _resolve_space_ids(session: Any, base_url: str, space_keys: list[str] | None) -> list[str]:
     """Resolve space keys to numeric v2 space ids (all accessible spaces if None)."""
-    params: Dict[str, Any] = {"limit": 250}
+    params: dict[str, Any] = {"limit": 250}
     if space_keys:
         # v2 `keys` is an array query param — requests repeats a list value
         # (keys=ENG&keys=DOCS). A comma-joined string is read as one literal
@@ -190,9 +190,9 @@ def _page_body(session: Any, base_url: str, page_id: str) -> str:
     return _clean_html(storage.get("value"))
 
 
-def _page_comments(session: Any, base_url: str, page_id: str) -> List[str]:
+def _page_comments(session: Any, base_url: str, page_id: str) -> list[str]:
     """Fetch a page's footer comments as plain text."""
-    texts: List[str] = []
+    texts: list[str] = []
     for comment in _paginate(
         session,
         base_url,
@@ -214,9 +214,9 @@ def sync_pages(
     base_url: str,
     state: dict,
     *,
-    space_keys: Optional[List[str]] = None,
+    space_keys: list[str] | None = None,
     include_comments: bool = True,
-) -> Iterator[Dict[str, Any]]:
+) -> Iterator[dict[str, Any]]:
     """Yield changed pages since the last run, plus hard-delete markers.
 
     One listing pass per space enumerates the *current* pages (cheap, no
@@ -225,10 +225,10 @@ def sync_pages(
     cursor (``last_when``) and the id set (``known_ids``) are advanced in
     ``state`` so the next run is a no-op when nothing changed.
     """
-    known_ids: Set[str] = set(state.get("known_ids", []))
+    known_ids: set[str] = set(state.get("known_ids", []))
     last_when: str = state.get("last_when", "")
     newest_when = last_when
-    current_ids: Set[str] = set()
+    current_ids: set[str] = set()
     changed = 0
 
     for space_id in _resolve_space_ids(session, base_url, space_keys):
@@ -287,9 +287,9 @@ def sync_pages(
 def confluence_source(
     *,
     base_url: str,
-    email: Optional[str] = None,
-    api_token: Optional[str] = None,
-    space_keys: Optional[List[str]] = None,
+    email: str | None = None,
+    api_token: str | None = None,
+    space_keys: list[str] | None = None,
     include_comments: bool = True,
     session: Any = None,
 ):
