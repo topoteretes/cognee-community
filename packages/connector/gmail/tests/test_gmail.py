@@ -76,7 +76,7 @@ class _Messages:
     def list(self, **kwargs):
         return _Request({"messages": [{"id": mid} for mid in self._svc.message_ids]})
 
-    def get(self, *, userId, id, format):  # noqa: A002 - mirror Gmail API kwarg name
+    def get(self, *, userId, id, format):  # noqa: N803 - mirror Gmail API kwarg names
         if id in self._svc.get_errors:
             return _Request(_HttpError(self._svc.get_errors[id]))
         if id not in self._svc.messages:

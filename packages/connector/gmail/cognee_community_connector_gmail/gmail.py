@@ -59,7 +59,8 @@ from __future__ import annotations
 
 import base64
 import os
-from typing import Any, Dict, Iterator, List, Optional
+from collections.abc import Iterator
+from typing import Any
 
 from cognee.shared.logging_utils import get_logger
 
@@ -130,7 +131,7 @@ def build_gmail_service(
 # ---------------------------------------------------------------------------
 # Message parsing
 # ---------------------------------------------------------------------------
-def _decode_body(data: Optional[str]) -> str:
+def _decode_body(data: str | None) -> str:
     """Decode a base64url-encoded Gmail body part into text."""
     if not data:
         return ""
@@ -140,7 +141,7 @@ def _decode_body(data: Optional[str]) -> str:
         return ""
 
 
-def _extract_plaintext(payload: Optional[dict]) -> str:
+def _extract_plaintext(payload: dict | None) -> str:
     """Walk a Gmail message payload and return its ``text/plain`` body.
 
     Depth-first search for the first ``text/plain`` part anywhere in the MIME
@@ -165,7 +166,7 @@ def _extract_plaintext(payload: Optional[dict]) -> str:
     return ""
 
 
-def _headers_to_dict(payload: Optional[dict]) -> Dict[str, str]:
+def _headers_to_dict(payload: dict | None) -> dict[str, str]:
     """Index a message's headers case-insensitively by name."""
     headers = {}
     for header in (payload or {}).get("headers", []) or []:
@@ -175,7 +176,7 @@ def _headers_to_dict(payload: Optional[dict]) -> Dict[str, str]:
     return headers
 
 
-def parse_message(message: dict) -> Dict[str, Any]:
+def parse_message(message: dict) -> dict[str, Any]:
     """Flatten a Gmail ``users.messages.get`` resource into a dlt row.
 
     Lists (label ids) are flattened to a comma-separated string so dlt does not
@@ -210,7 +211,7 @@ def parse_message(message: dict) -> Dict[str, Any]:
     }
 
 
-def _deleted_row(message_id: str) -> Dict[str, Any]:
+def _deleted_row(message_id: str) -> dict[str, Any]:
     """Build a minimal row that instructs dlt to hard-delete a message by id."""
     return {"id": message_id, "_deleted": True}
 
@@ -220,8 +221,8 @@ def _deleted_row(message_id: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 def _list_message_ids(
     service: Any,
-    label_ids: Optional[List[str]],
-    max_results: Optional[int],
+    label_ids: list[str] | None,
+    max_results: int | None,
 ) -> Iterator[str]:
     """Yield message ids matching the given labels, following pagination."""
     page_token = None
@@ -247,7 +248,7 @@ def _list_message_ids(
             return
 
 
-def _get_message(service: Any, message_id: str) -> Optional[dict]:
+def _get_message(service: Any, message_id: str) -> dict | None:
     """Fetch a full message; return None only if it is genuinely gone (404/410).
 
     A transient failure (5xx / rate-limit / network) is re-raised rather than
@@ -266,7 +267,7 @@ def _get_message(service: Any, message_id: str) -> Optional[dict]:
         raise
 
 
-def _mailbox_history_id(service: Any) -> Optional[str]:
+def _mailbox_history_id(service: Any) -> str | None:
     """Return the mailbox-wide ``historyId`` used as the incremental baseline."""
     try:
         profile = service.users().getProfile(userId="me").execute()
@@ -284,9 +285,9 @@ def full_backfill(
     service: Any,
     state: dict,
     *,
-    label_ids: Optional[List[str]] = None,
-    max_results: Optional[int] = None,
-) -> Iterator[Dict[str, Any]]:
+    label_ids: list[str] | None = None,
+    max_results: int | None = None,
+) -> Iterator[dict[str, Any]]:
     """Yield every matching message and record the incremental baseline.
 
     The mailbox ``historyId`` is captured *before* listing so no change is
@@ -312,8 +313,8 @@ def incremental_fetch(
     service: Any,
     state: dict,
     *,
-    label_ids: Optional[List[str]] = None,
-) -> Iterator[Dict[str, Any]]:
+    label_ids: list[str] | None = None,
+) -> Iterator[dict[str, Any]]:
     """Yield only changes since ``state['last_history_id']`` via the History API.
 
     Added / changed messages are fetched and emitted normally; deleted (or
@@ -436,8 +437,8 @@ def gmail_source(
     *,
     credentials_path: str = "credentials.json",
     token_path: str = "token.json",
-    label_ids: Optional[List[str]] = None,
-    max_results: Optional[int] = None,
+    label_ids: list[str] | None = None,
+    max_results: int | None = None,
     service: Any = None,
 ):
     """Return a ``dlt`` resource that yields Gmail messages for ``remember``.
