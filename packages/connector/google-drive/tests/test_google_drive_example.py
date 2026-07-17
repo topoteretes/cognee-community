@@ -1,4 +1,4 @@
-"""CI-safe smoke test for examples/demos/google_drive_ingestion_example.py.
+"""CI-safe smoke test for the packaged ``examples/example.py``.
 
 Runs the example's ``main()`` end-to-end with the Drive API mocked and the
 LLM mocked (reusing the ``LLMGateway.acreate_structured_output`` monkeypatch
@@ -23,13 +23,11 @@ from cognee_community_connector_google_drive import google_drive as gd_source
 add_data_points_module = importlib.import_module("cognee.tasks.storage.add_data_points")
 
 DOC_MIME = "application/vnd.google-apps.document"
-EXAMPLE_PATH = (
-    pathlib.Path(__file__).parents[4] / "examples" / "demos" / "google_drive_ingestion_example.py"
-)
+EXAMPLE_PATH = pathlib.Path(__file__).parents[1] / "examples" / "example.py"
 
 
 def _load_example_module():
-    spec = importlib.util.spec_from_file_location("google_drive_ingestion_example", EXAMPLE_PATH)
+    spec = importlib.util.spec_from_file_location("google_drive_example", EXAMPLE_PATH)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
