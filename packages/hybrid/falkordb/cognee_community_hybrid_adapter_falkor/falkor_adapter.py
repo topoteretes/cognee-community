@@ -704,9 +704,20 @@ class FalkorDBAdapter(VectorDBInterface, GraphDBInterface):
         """
         await self.create_data_points("", nodes)
 
-    async def add_nodes(self, nodes: list[Node] | list[DataPoint]) -> None:
+    async def add_nodes(
+        self,
+        nodes: list[Node] | list[DataPoint],
+        source_ref_key: Optional[str] = None,
+        pipeline_run_id: Optional[str] = None,
+    ) -> None:
         """
         Add multiple nodes to the graph in a single operation.
+
+        ``source_ref_key`` / ``pipeline_run_id`` are the graph-provenance parameters cognee
+        passes for run-scoped rollback. FalkorDB does not implement provenance folding, so they
+        are accepted and ignored — the GraphDBInterface contract explicitly allows backends that
+        do not support it to ignore them. Accepting them keeps the adapter callable from cognee
+        1.x's write path (add_data_points), which otherwise raises "unexpected keyword argument".
 
         Collects all embeddable property values across all DataPoint nodes and
         makes a single ``embed_data()`` call instead of one per node.  Individual
@@ -793,9 +804,18 @@ class FalkorDBAdapter(VectorDBInterface, GraphDBInterface):
         query = await self.create_edge_query(edge_tuple)
         await self.query(query)
 
-    async def add_edges(self, edges: list[EdgeData]) -> None:
+    async def add_edges(
+        self,
+        edges: list[EdgeData],
+        source_ref_key: Optional[str] = None,
+        pipeline_run_id: Optional[str] = None,
+    ) -> None:
         """
         Add multiple edges to the graph in a single operation.
+
+        ``source_ref_key`` / ``pipeline_run_id`` are the graph-provenance parameters cognee
+        passes for run-scoped rollback. FalkorDB does not implement provenance folding, so they
+        are accepted and ignored (the GraphDBInterface contract allows this).
 
         Groups edges by sanitised relationship type and issues one UNWIND MERGE
         query per type instead of one query per edge.  FalkorDB requires a

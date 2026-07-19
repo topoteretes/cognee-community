@@ -66,3 +66,22 @@ def test_explicit_graph_params_win_over_config():
 def test_port_defaults_to_6379_when_unset_everywhere():
     conn = _construct(url="h", api_key="k", config={"graph_database_port": 0})
     assert conn["port"] == 6379
+
+
+def test_add_nodes_accepts_provenance_kwargs():
+    # cognee 1.x's write path (add_data_points) calls add_nodes/add_edges with
+    # source_ref_key + pipeline_run_id; the adapter must accept them or it raises
+    # "unexpected keyword argument" mid-cognify.
+    import inspect
+
+    params = inspect.signature(FalkorDBAdapter.add_nodes).parameters
+    assert "source_ref_key" in params
+    assert "pipeline_run_id" in params
+
+
+def test_add_edges_accepts_provenance_kwargs():
+    import inspect
+
+    params = inspect.signature(FalkorDBAdapter.add_edges).parameters
+    assert "source_ref_key" in params
+    assert "pipeline_run_id" in params
