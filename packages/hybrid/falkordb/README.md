@@ -105,7 +105,7 @@ export VECTOR_DATASET_DATABASE_HANDLER="falkor_vector_local"
 
 - Python >= 3.11, <= 3.13
 - falkordb >= 1.0.9, < 2.0.0
-- cognee >= 0.2.0.dev0
+- cognee >= 1.0.3, < 2.0.0
 
 ## Features
 
