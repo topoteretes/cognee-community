@@ -278,7 +278,7 @@ class DuckDBAdapter(VectorDBInterface, GraphDBInterface):
             with_vector: Whether to include vectors in the results.
 
         Returns:
-            List of scored results ordered by similarity (highest similarity first).
+            List of scored results ordered by ascending cosine distance (nearest match first).
         """
 
         from cognee.infrastructure.engine.utils import parse_id
@@ -344,6 +344,7 @@ class DuckDBAdapter(VectorDBInterface, GraphDBInterface):
             SELECT {", ".join(select_fields)}
             FROM {collection_name}
             {where_clause}
+            ORDER BY distance ASC
             LIMIT {limit}
             """
 
@@ -359,7 +360,9 @@ class DuckDBAdapter(VectorDBInterface, GraphDBInterface):
             for row in search_results:
                 distance = row[1]  # distance is the 2nd column (index 1)
 
-                score = 1.0 - distance
+                # ScoredResult.score is the raw backend distance (lower is better), matching the
+                # built-in cognee adapters (LanceDB, PGVector). Do not invert it into a similarity.
+                score = distance
                 # Parse the payload JSON
                 payload = {}
                 if include_payload:
