@@ -3,10 +3,11 @@ name = "cognee-community-tasks-scrapegraph"
 version = "0.1.1"
 description = "Package containing custom cognee tasks for scraping web content using ScrapeGraphAI"
 readme = "README.md"
-requires-python = ">=3.11,<=3.13"
+# requires-python = ">=3.11,<=3.13"
+requires-python = ">=3.12"
 dependencies = [
     "cognee==0.5.3",
-    "scrapegraph-py>=1.7.0",
+    "scrapegraph-py>=2.1.0",
 ]
 
 [project.urls]
@@ -26,3 +27,6 @@ select = ["E", "W", "F", "I", "N", "B", "UP", "C4", "PGH", "SIM", "RUF"]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
+
+[dependency-groups]
+dev = []
