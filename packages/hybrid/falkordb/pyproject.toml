@@ -1,6 +1,6 @@
 [project]
 name = "cognee-community-hybrid-adapter-falkor"
-version = "0.3.0"
+version = "0.3.2"
 description = "Falkor hybrid database adapter for cognee"
 readme = "README.md"
 requires-python = ">=3.11,<=3.13"

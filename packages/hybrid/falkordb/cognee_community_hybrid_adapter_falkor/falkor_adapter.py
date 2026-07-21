@@ -96,15 +96,41 @@ class FalkorDBAdapter(VectorDBInterface, GraphDBInterface):
         database_name: str | None = "cognee_graph",
         **kwargs,
     ):
+        # ``create_vector_engine`` builds this adapter on the vector path as
+        # ``adapter(url=..., api_key=..., embedding_engine=..., database_name=...)``
+        # with no port kwarg, so a non-default FalkorDB port only reaches us
+        # embedded in the URL (e.g. ``VECTOR_DB_URL="myhost:6380"``). Parse a
+        # trailing ``:port`` out of the host so those deployments are reachable
+        # instead of always dialing ``:6379``.
+        resolved_host = url if url else graph_database_url
+        default_port = graph_database_port if graph_database_port else 6379
+        host, port = self._split_host_port(resolved_host, default_port)
         self.driver = FalkorDB(
-            host=url if url else graph_database_url,
-            port=graph_database_port if graph_database_port else 6379,
+            host=host,
+            port=port,
             username=graph_database_username,
             password=graph_database_password,
         )
         self.embedding_engine = get_embedding_engine() if not embedding_engine else embedding_engine
         self.graph_name = database_name if database_name else "cognee_graph"
         self.api_key = api_key
+
+    @staticmethod
+    def _split_host_port(raw_host: Any, default_port: int) -> Tuple[Any, int]:
+        """Split a bare ``host:port`` string into ``(host, port)``.
+
+        Only a plain ``host:port`` (single colon, all-digit port) is parsed; a
+        scheme-qualified URL (``redis://...``) or an IPv6 literal (multiple
+        colons) is left untouched with ``default_port``, so this is safe and
+        backward compatible — a bare host keeps the default port.
+        """
+        if not isinstance(raw_host, str):
+            return raw_host, default_port
+        if "://" not in raw_host and raw_host.count(":") == 1:
+            candidate_host, _, candidate_port = raw_host.partition(":")
+            if candidate_port.isdigit():
+                return candidate_host, int(candidate_port)
+        return raw_host, default_port
 
     @staticmethod
     def _coerce_stored_value(value: Any) -> Any:
@@ -690,7 +716,12 @@ class FalkorDBAdapter(VectorDBInterface, GraphDBInterface):
         """
         await self.create_data_points("", nodes)
 
-    async def add_nodes(self, nodes: list[Node] | list[DataPoint]) -> None:
+    async def add_nodes(
+        self,
+        nodes: list[Node] | list[DataPoint],
+        source_ref_key: Optional[str] = None,
+        pipeline_run_id: Optional[str] = None,
+    ) -> None:
         """
         Add multiple nodes to the graph in a single operation.
 
@@ -705,6 +736,17 @@ class FalkorDBAdapter(VectorDBInterface, GraphDBInterface):
 
             - nodes (Union[List[Node], List[DataPoint]]): A list of Node tuples
                                 or DataPoint objects to be added to the graph.
+            - source_ref_key (Optional[str]): Graph-provenance key passed by
+                cognee 1.3.0's ``add_data_points`` write path.
+            - pipeline_run_id (Optional[str]): Graph-provenance run id passed by
+                the same path.
+
+        The two provenance kwargs are part of the ``GraphDBInterface`` contract
+        in cognee 1.3.0; accepting them avoids the ``TypeError`` cognify raised
+        against the previous ``add_nodes(self, nodes)`` signature. They are
+        intentionally accepted-and-ignored: on FalkorDB the values are always
+        ``None`` today (``mark_graph_provenance_if_empty`` is unsupported), so
+        ignoring them is lossless. Stamping provenance is left for a follow-up.
         """
         if not nodes:
             return
@@ -779,7 +821,12 @@ class FalkorDBAdapter(VectorDBInterface, GraphDBInterface):
         query = await self.create_edge_query(edge_tuple)
         await self.query(query)
 
-    async def add_edges(self, edges: list[EdgeData]) -> None:
+    async def add_edges(
+        self,
+        edges: list[EdgeData],
+        source_ref_key: Optional[str] = None,
+        pipeline_run_id: Optional[str] = None,
+    ) -> None:
         """
         Add multiple edges to the graph in a single operation.
 
@@ -792,6 +839,14 @@ class FalkorDBAdapter(VectorDBInterface, GraphDBInterface):
         -----------
 
             - edges (List[EdgeData]): A list of EdgeData objects representing edges to be added.
+            - source_ref_key (Optional[str]): Graph-provenance key passed by
+                cognee 1.3.0's ``add_data_points`` write path.
+            - pipeline_run_id (Optional[str]): Graph-provenance run id passed by
+                the same path.
+
+        As with :meth:`add_nodes`, the provenance kwargs are part of the
+        cognee 1.3.0 ``GraphDBInterface`` contract and are accepted-and-ignored
+        (always ``None`` on FalkorDB today) to avoid a ``TypeError`` on cognify.
         """
         if not edges:
             return
@@ -1261,6 +1316,54 @@ class FalkorDBAdapter(VectorDBInterface, GraphDBInterface):
             {
                 "node_ids": [str(data_point) for data_point in data_point_ids],
             },
+        )
+
+    async def remove_belongs_to_set_tags(
+        self,
+        tags: List[str],
+        node_ids: Optional[List[str]] = None,
+    ) -> None:
+        """
+        Strip the given scope tags from every node's ``belongs_to_set`` array and
+        delete nodes whose ``belongs_to_set`` becomes empty as a result.
+
+        Implements the ``VectorDBInterface`` contract that cognee's
+        ``delete_session_qa_vectors`` relies on. Without this override the adapter
+        inherited the base-class no-op, so session QA vectors on FalkorDB were
+        never cleaned up and accumulated indefinitely.
+
+        Parameters:
+        -----------
+
+            - tags (List[str]): Scope tags to remove from ``belongs_to_set``.
+            - node_ids (Optional[List[str]]): When provided, scope the detag to
+              rows whose id is in the list (reconciles shared rows that lose one
+              tag); otherwise every matching node is considered.
+        """
+        if not tags:
+            return
+
+        id_filter = ""
+        params: dict[str, Any] = {"tags": tags}
+        if node_ids is not None:
+            id_filter = " AND n.id IN $node_ids"
+            params["node_ids"] = node_ids
+
+        # Match only nodes actually carrying one of the tags (so pre-existing
+        # empty sets are untouched), strip the tags, then delete the ones left
+        # empty by this operation — in a single pass so the delete stays scoped
+        # to affected nodes.
+        await self.query(
+            f"""
+            MATCH (n)
+            WHERE any(t IN $tags WHERE t IN coalesce(n.belongs_to_set, [])){id_filter}
+            SET n.belongs_to_set =
+                [x IN coalesce(n.belongs_to_set, []) WHERE NOT x IN $tags]
+            WITH n
+            WHERE size(coalesce(n.belongs_to_set, [])) = 0
+            DETACH DELETE n
+            """,
+            params,
         )
 
     async def delete_node(self, node_id: str) -> None:
