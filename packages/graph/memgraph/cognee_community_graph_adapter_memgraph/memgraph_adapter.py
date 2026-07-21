@@ -1161,6 +1161,67 @@ class MemgraphAdapter(GraphDBInterface):
         )
         return relationship_types_undirected_str
 
+    async def _connected_component_sizes(self) -> list[int]:
+        """
+        Return the sizes of the graph's weakly connected components.
+
+        Uses MAGE's weakly_connected_components when available, falling back to a
+        client-side union-find for deployments running Memgraph without MAGE.
+
+        Returns:
+        --------
+
+            - list[int]: One entry per component, holding that component's node count.
+        """
+        try:
+            rows = await self.query(
+                """
+                CALL weakly_connected_components.get()
+                YIELD node, component_id
+                RETURN component_id, count(node) AS size
+                """
+            )
+            return [int(row["size"]) for row in rows]
+        except Neo4jError:
+            logger.debug("MAGE unavailable; computing connected components client-side.")
+            return await self._connected_component_sizes_without_mage()
+
+    async def _connected_component_sizes_without_mage(self) -> list[int]:
+        """
+        Compute weakly connected component sizes client-side via union-find.
+
+        Transfers the node ids and edge endpoints, so cost grows with graph size; it
+        exists so metrics still work without the MAGE query modules installed.
+
+        Returns:
+        --------
+
+            - list[int]: One entry per component, holding that component's node count.
+        """
+        nodes = await self.query("MATCH (n) RETURN n.id AS id")
+        edges = await self.query("MATCH (a)-[]->(b) RETURN a.id AS source, b.id AS target")
+
+        parent = {row["id"]: row["id"] for row in nodes}
+
+        def find(node_id):
+            while parent[node_id] != node_id:
+                parent[node_id] = parent[parent[node_id]]
+                node_id = parent[node_id]
+            return node_id
+
+        for edge in edges:
+            source, target = edge["source"], edge["target"]
+            if source in parent and target in parent:
+                source_root, target_root = find(source), find(target)
+                if source_root != target_root:
+                    parent[target_root] = source_root
+
+        sizes: dict[Any, int] = {}
+        for node_id in parent:
+            root = find(node_id)
+            sizes[root] = sizes.get(root, 0) + 1
+        return list(sizes.values())
+
     async def get_graph_metrics(self, include_optional=False):
         """
         Calculate and return various metrics of the graph, including mandatory and optional
@@ -1179,11 +1240,12 @@ class MemgraphAdapter(GraphDBInterface):
         """
 
         try:
-            # Basic metrics
-            node_count = await self.query("MATCH (n) RETURN count(n)")
-            edge_count = await self.query("MATCH ()-[r]->() RETURN count(r)")
-            num_nodes = node_count[0][0] if node_count else 0
-            num_edges = edge_count[0][0] if edge_count else 0
+            # Basic metrics. query() returns a list of dicts keyed by the RETURN
+            # names, so every result is aliased and read by key.
+            node_count = await self.query("MATCH (n) RETURN count(n) AS cnt")
+            edge_count = await self.query("MATCH ()-[r]->() RETURN count(r) AS cnt")
+            num_nodes = node_count[0]["cnt"] if node_count else 0
+            num_edges = edge_count[0]["cnt"] if edge_count else 0
 
             # Calculate mandatory metrics
             mandatory_metrics = {
@@ -1193,18 +1255,7 @@ class MemgraphAdapter(GraphDBInterface):
                 "edge_density": (num_edges) / (num_nodes * (num_nodes - 1)) if num_nodes > 1 else 0,
             }
 
-            # Calculate connected components
-            components_query = """
-            MATCH (n:Node)
-            WITH n.id AS node_id
-            MATCH path = (n)-[:EDGE*0..]-()
-            WITH COLLECT(DISTINCT node_id) AS component
-            RETURN COLLECT(component) AS components
-            """
-            components_result = await self.query(components_query)
-            component_sizes = (
-                [len(comp) for comp in components_result[0][0]] if components_result else []
-            )
+            component_sizes = await self._connected_component_sizes()
 
             mandatory_metrics.update(
                 {
@@ -1214,58 +1265,17 @@ class MemgraphAdapter(GraphDBInterface):
             )
 
             if include_optional:
-                # Self-loops
-                self_loops_query = """
-                MATCH (n:Node)-[r:EDGE]->(n)
-                RETURN COUNT(r)
-                """
-                self_loops = await self.query(self_loops_query)
-                num_selfloops = self_loops[0][0] if self_loops else 0
+                self_loops = await self.query("MATCH (n)-[r]->(n) RETURN COUNT(r) AS cnt")
+                num_selfloops = self_loops[0]["cnt"] if self_loops else 0
 
-                # Shortest paths (simplified for Kuzu)
-                paths_query = """
-                MATCH (n:Node), (m:Node)
-                WHERE n.id < m.id
-                MATCH path = (n)-[:EDGE*]-(m)
-                RETURN MIN(LENGTH(path)) AS length
-                """
-                paths = await self.query(paths_query)
-                path_lengths = [p[0] for p in paths if p[0] is not None]
-
-                # Local clustering coefficient
-                clustering_query = """
-                /// Step 1: Get each node with its neighbors and degree
-                MATCH (n:Node)-[:EDGE]-(neighbor)
-                WITH n, COLLECT(DISTINCT neighbor) AS neighbors, COUNT(DISTINCT neighbor) AS degree
-
-                // Step 2: Pair up neighbors and check if they are connected
-                UNWIND neighbors AS n1
-                UNWIND neighbors AS n2
-                WITH n, degree, n1, n2
-                WHERE id(n1) < id(n2)  // avoid duplicate pairs
-
-                // Step 3: Use OPTIONAL MATCH to see if n1 and n2 are connected
-                OPTIONAL MATCH (n1)-[:EDGE]-(n2)
-                WITH n, degree, COUNT(n2) AS triangle_count
-
-                // Step 4: Compute local clustering coefficient
-                WITH n, degree,
-                    CASE WHEN degree <= 1 THEN 0.0
-                        ELSE (1.0 * triangle_count) / (degree * (degree - 1) / 2.0)
-                    END AS local_cc
-
-                // Step 5: Compute average
-                RETURN AVG(local_cc) AS avg_clustering_coefficient
-                """
-                clustering = await self.query(clustering_query)
-
+                # The all-pairs metrics below need every shortest path in the graph,
+                # which is prohibitive on a general graph. They are reported as
+                # unsupported (-1), consistent with the other community adapters.
                 optional_metrics = {
                     "num_selfloops": num_selfloops,
-                    "diameter": max(path_lengths) if path_lengths else -1,
-                    "avg_shortest_path_length": sum(path_lengths) / len(path_lengths)
-                    if path_lengths
-                    else -1,
-                    "avg_clustering": clustering[0][0] if clustering and clustering[0][0] else -1,
+                    "diameter": -1,
+                    "avg_shortest_path_length": -1,
+                    "avg_clustering": -1,
                 }
             else:
                 optional_metrics = {
