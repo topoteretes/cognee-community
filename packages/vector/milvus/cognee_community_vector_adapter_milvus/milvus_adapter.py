@@ -14,7 +14,6 @@ from cognee.infrastructure.databases.vector.embeddings.EmbeddingEngine import (
 )
 from cognee.infrastructure.databases.vector.models.ScoredResult import ScoredResult
 from cognee.infrastructure.engine import DataPoint
-from cognee.infrastructure.files.storage import get_file_storage
 from cognee.shared.logging_utils import get_logger
 from pymilvus.orm.types import DataType
 
@@ -71,23 +70,16 @@ class MilvusAdapter:
             A MilvusClient instance.
         """
 
-        # Ensure the parent directory exists for local file-based Milvus databases
+        # Ensure the parent directory exists for local file-based (milvus-lite) databases.
+        # This method is sync but is called from within cognee's running event loop, so we
+        # must not drive the async file-storage helper here — doing so raised RuntimeError
+        # (run_until_complete on a running loop, and the asyncio.run fallback likewise). A
+        # local milvus-lite URI is always a real filesystem path, so os.makedirs is the
+        # loop-safe equivalent.
         if not self.url.startswith("http"):
-            # Local file path
             db_dir = os.path.dirname(self.url)
             if db_dir:
-                file_storage = get_file_storage(db_dir)
-                # This is a sync operation, but we'll handle it appropriately
-                try:
-                    import asyncio
-
-                    loop = asyncio.get_event_loop()
-                    loop.run_until_complete(file_storage.ensure_directory_exists())
-                except RuntimeError:
-                    # If no event loop is running, create a temporary one
-                    import asyncio
-
-                    asyncio.run(file_storage.ensure_directory_exists())
+                os.makedirs(db_dir, exist_ok=True)
 
         if not self.client:
             if self.api_key:
