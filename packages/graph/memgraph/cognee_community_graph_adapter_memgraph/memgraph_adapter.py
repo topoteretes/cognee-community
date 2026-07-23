@@ -178,7 +178,12 @@ class MemgraphAdapter(GraphDBInterface):
         }
         return await self.query(query, params)
 
-    async def add_nodes(self, nodes: list[DataPoint]) -> None:
+    async def add_nodes(
+        self,
+        nodes: list[DataPoint],
+        source_ref_key: Optional[str] = None,
+        pipeline_run_id: Optional[str] = None,
+    ) -> None:
         """
         Add multiple nodes to the database in a single operation.
 
@@ -187,6 +192,11 @@ class MemgraphAdapter(GraphDBInterface):
 
             - nodes (list[DataPoint]): A list of DataPoint objects representing the nodes to
               add.
+            - source_ref_key (Optional[str]): Graph-provenance source ref (cognee 1.3.0). Accepted
+              for interface compatibility and ignored — Memgraph does not fold provenance today.
+              (default None)
+            - pipeline_run_id (Optional[str]): Run id paired with the provenance stamp. Accepted
+              and ignored by this backend. (default None)
 
         Returns:
         --------
@@ -420,7 +430,12 @@ class MemgraphAdapter(GraphDBInterface):
 
         return await self.query(query, params)
 
-    async def add_edges(self, edges: list[tuple[str, str, str, dict[str, Any]]]) -> None:
+    async def add_edges(
+        self,
+        edges: list[tuple[str, str, str, dict[str, Any]]],
+        source_ref_key: Optional[str] = None,
+        pipeline_run_id: Optional[str] = None,
+    ) -> None:
         """
         Batch add multiple edges between nodes, enforcing specified relationships.
 
@@ -429,6 +444,11 @@ class MemgraphAdapter(GraphDBInterface):
 
             - edges (list[tuple[str, str, str, dict[str, Any]]): A list of tuples containing
               specifications for each edge to add.
+            - source_ref_key (Optional[str]): Graph-provenance source ref (cognee 1.3.0). Accepted
+              for interface compatibility and ignored — Memgraph does not fold provenance today.
+              (default None)
+            - pipeline_run_id (Optional[str]): Run id paired with the provenance stamp. Accepted
+              and ignored by this backend. (default None)
 
         Returns:
         --------

@@ -3,9 +3,11 @@ from typing import Any
 
 import cognee
 from cognee.shared.logging_utils import get_logger
+
 # from scrapegraph_py import Client
 # -------
 from scrapegraph_py import ScrapeGraphAI
+
 # --------
 
 logger = get_logger("ScrapegraphTask")
@@ -41,7 +43,6 @@ async def scrape_urls(
             "ScrapeGraphAI API key is required. Set the SGAI_API_KEY environment variable."
         )
 
-
     sgai = ScrapeGraphAI(api_key=api_key)
 
     # client = Client(api_key=api_key)
@@ -55,15 +56,10 @@ async def scrape_urls(
                 prompt=user_prompt,
             )
 
-            if response.status == "success": 
-                results.append(
-                    {
-                        "url": url,
-                        "content": response.data.json_data
-                    }
-                )
+            if response.status == "success":
+                results.append({"url": url, "content": response.data.json_data})
                 logger.info(f"Successfully scraped: {url}")
-            else: 
+            else:
                 results.append(
                     {
                         "url": url,
