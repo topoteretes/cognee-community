@@ -1,6 +1,6 @@
 [project]
 name = "cognee-community-graph-adapter-memgraph"
-version = "0.1.4"
+version = "0.2.0"
 description = "Memgraph graph database adapter for cognee"
 authors = [
     {name = "Cognee Team", email = "hello@cognee.ai"},
