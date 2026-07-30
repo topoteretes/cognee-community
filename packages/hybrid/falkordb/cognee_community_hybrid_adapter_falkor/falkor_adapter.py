@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 from uuid import UUID
 
 from cognee.infrastructure.databases.exceptions import MissingQueryParameterError
+from cognee.infrastructure.databases.graph import get_graph_config
 from cognee.infrastructure.databases.graph.graph_db_interface import (
     EdgeData,
     GraphDBInterface,
@@ -87,7 +88,7 @@ class FalkorDBAdapter(VectorDBInterface, GraphDBInterface):
     def __init__(
         self,
         graph_database_url: str | None = None,
-        graph_database_port: int | None = 6379,
+        graph_database_port: int | None = None,
         graph_database_username: str | None = None,
         graph_database_password: str | None = None,
         embedding_engine: EmbeddingEngine | None = None,
@@ -96,11 +97,24 @@ class FalkorDBAdapter(VectorDBInterface, GraphDBInterface):
         database_name: str | None = "cognee_graph",
         **kwargs,
     ):
+        # FalkorDB is a hybrid store, so this adapter is instantiated for both the graph and
+        # the vector engine. cognee's vector engine constructs it with only ``url`` + ``api_key``
+        # and never forwards the port/credentials, so without a fallback the vector path would
+        # connect to the default 6379 with no auth — unreachable for a FalkorDB on a non-default
+        # port or with ``requirepass``. Fall back to the graph config (the single source of truth
+        # for the FalkorDB connection, same as the graph handler) for any connection field the
+        # caller did not pass. Explicitly-passed values always win, so the graph path is unchanged.
+        graph_config = get_graph_config()
+        resolved_host = url or graph_database_url or graph_config.graph_database_url or "localhost"
+        resolved_port = graph_database_port or graph_config.graph_database_port or 6379
+        resolved_username = graph_database_username or graph_config.graph_database_username or None
+        resolved_password = graph_database_password or graph_config.graph_database_password or None
+
         self.driver = FalkorDB(
-            host=url if url else graph_database_url,
-            port=graph_database_port if graph_database_port else 6379,
-            username=graph_database_username,
-            password=graph_database_password,
+            host=resolved_host,
+            port=int(resolved_port),
+            username=resolved_username,
+            password=resolved_password,
         )
         self.embedding_engine = get_embedding_engine() if not embedding_engine else embedding_engine
         self.graph_name = database_name if database_name else "cognee_graph"
@@ -690,9 +704,20 @@ class FalkorDBAdapter(VectorDBInterface, GraphDBInterface):
         """
         await self.create_data_points("", nodes)
 
-    async def add_nodes(self, nodes: list[Node] | list[DataPoint]) -> None:
+    async def add_nodes(
+        self,
+        nodes: list[Node] | list[DataPoint],
+        source_ref_key: Optional[str] = None,
+        pipeline_run_id: Optional[str] = None,
+    ) -> None:
         """
         Add multiple nodes to the graph in a single operation.
+
+        ``source_ref_key`` / ``pipeline_run_id`` are the graph-provenance parameters cognee
+        passes for run-scoped rollback. FalkorDB does not implement provenance folding, so they
+        are accepted and ignored — the GraphDBInterface contract explicitly allows backends that
+        do not support it to ignore them. Accepting them keeps the adapter callable from cognee
+        1.x's write path (add_data_points), which otherwise raises "unexpected keyword argument".
 
         Collects all embeddable property values across all DataPoint nodes and
         makes a single ``embed_data()`` call instead of one per node.  Individual
@@ -779,9 +804,18 @@ class FalkorDBAdapter(VectorDBInterface, GraphDBInterface):
         query = await self.create_edge_query(edge_tuple)
         await self.query(query)
 
-    async def add_edges(self, edges: list[EdgeData]) -> None:
+    async def add_edges(
+        self,
+        edges: list[EdgeData],
+        source_ref_key: Optional[str] = None,
+        pipeline_run_id: Optional[str] = None,
+    ) -> None:
         """
         Add multiple edges to the graph in a single operation.
+
+        ``source_ref_key`` / ``pipeline_run_id`` are the graph-provenance parameters cognee
+        passes for run-scoped rollback. FalkorDB does not implement provenance folding, so they
+        are accepted and ignored (the GraphDBInterface contract allows this).
 
         Groups edges by sanitised relationship type and issues one UNWIND MERGE
         query per type instead of one query per edge.  FalkorDB requires a
