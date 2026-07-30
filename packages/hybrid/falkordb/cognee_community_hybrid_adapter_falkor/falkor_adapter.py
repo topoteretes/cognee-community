@@ -1545,6 +1545,71 @@ class FalkorDBAdapter(VectorDBInterface, GraphDBInterface):
         # FalkorDB returns node objects as first element in each record
         return [record[0] for record in result.result_set] if result.result_set else []
 
+    async def get_id_filtered_graph_data(
+        self, target_ids: list[str]
+    ) -> tuple[list[tuple[str, dict]], list[tuple[str, str, str, dict]]]:
+        """
+        Fetch a subgraph scoped to ``target_ids`` and their incident edges.
+
+        cognee's ``GraphCompletionRetriever`` vector-searches the top
+        ``wide_search_top_k`` relevant node ids, then projects a graph scoped to
+        them via ``CogneeGraph._get_full_or_id_filtered_graph`` — but only if the
+        adapter implements this method. Without it the retriever silently falls
+        back to ``get_graph_data()`` and loads the whole graph, so the vector
+        search results are ignored and every query projects the same (full)
+        subgraph regardless of query content (the Neo4j, Postgres and Ladybug
+        adapters all implement it; this brings FalkorDB in line).
+
+        The traversal is anchored on the bound id set (``WHERE a.id IN $ids`` — a
+        NodeByIdSeek via the :Node(id) index) and expands undirected, mirroring
+        ``get_nodeset_subgraph``, NOT an untyped full-graph ``MATCH ()-[r]-()``:
+        cognee mints ~one relationship TYPE per relationship name (easily tens of
+        thousands on a real graph) and FalkorDB keeps one adjacency matrix per
+        type, so an unanchored untyped match probes every per-type matrix for
+        every node. Edge direction is taken from ``properties(r).source_node_id``
+        / ``target_node_id`` so it survives the undirected match; a seed<->seed
+        edge returned twice (once per anchor) is de-duped.
+
+        Returns the same tuple shape as ``get_graph_data``::
+
+            (
+                [(node_id, properties), ...],
+                [(source_id, target_id, relationship_type, properties), ...],
+            )
+        """
+        if not target_ids:
+            return [], []
+
+        query = """
+        MATCH (a)-[r]-(b)
+        WHERE a.id IN $ids
+        RETURN properties(a) AS a_props, properties(b) AS b_props,
+               type(r) AS rel_type, properties(r) AS rel_props
+        """
+        result = await self.query(query, {"ids": list(target_ids)})
+
+        nodes: dict = {}
+        edges: dict = {}
+        if result.result_set:
+            for record in result.result_set:
+                # FalkorDB returns values by index: a_props, b_props, type, rel_props
+                a_props = self._deserialize_node_properties(record[0])
+                b_props = self._deserialize_node_properties(record[1])
+                rel_type = record[2]
+                rel_props = record[3] or {}
+                nodes[a_props["id"]] = (a_props["id"], a_props)
+                nodes[b_props["id"]] = (b_props["id"], b_props)
+                source_id = rel_props.get("source_node_id", a_props["id"])
+                target_id = rel_props.get("target_node_id", b_props["id"])
+                edges[(source_id, target_id, rel_type)] = (
+                    source_id,
+                    target_id,
+                    rel_type,
+                    rel_props,
+                )
+
+        return list(nodes.values()), list(edges.values())
+
     async def get_nodeset_subgraph(
         self, node_type: type[Any], node_name: list[str], node_name_filter_operator: str = "OR"
     ) -> tuple[list[tuple[int, dict]], list[tuple[int, int, str, dict]]]:
