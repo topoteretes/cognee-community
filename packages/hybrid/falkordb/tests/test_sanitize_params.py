@@ -96,7 +96,8 @@ def test_bound_list_of_maps_preserved_for_unwind():
     result = FalkorDBAdapter._sanitize_cypher_params(
         {"items": [{"edge_index": 0, "props": {"w": 1}}, {"edge_index": 1}]}
     )
-    assert result == {"items": [{"edge_index": 0, "props": '{"w": 1}'}, {"edge_index": 1}]}
+    # props stays a map so `SET r += item.props` works (issue #3324)
+    assert result == {"items": [{"edge_index": 0, "props": {"w": 1}}, {"edge_index": 1}]}
 
 
 def test_stored_map_value_json_encoded():
@@ -105,14 +106,18 @@ def test_stored_map_value_json_encoded():
     result = FalkorDBAdapter._sanitize_cypher_params(
         {"properties": {"meta": {"a": 1}, "name": "ok"}}
     )
-    assert result == {"properties": {"meta": '{"a": 1}', "name": "ok"}}
+    # With the fix, nested maps preserve their shape (issue #3324).
+    # add_node pre-flattens stored property values before binding, so the
+    # sanitizer no longer needs to stringify nested maps.
+    assert result == {"properties": {"meta": {"a": 1}, "name": "ok"}}
 
 
 def test_stored_array_of_maps_json_encoded():
     # An array of maps as a stored property value becomes an array of JSON strings
     # (a valid array-of-primitives).
     result = FalkorDBAdapter._sanitize_cypher_params({"properties": {"objs": [{"k": 1}, {"k": 2}]}})
-    assert result == {"properties": {"objs": ['{"k": 1}', '{"k": 2}']}}
+    # Nested maps in arrays also preserve their shape (issue #3324)
+    assert result == {"properties": {"objs": [{"k": 1}, {"k": 2}]}}
 
 
 def test_stored_array_with_null_json_encoded():
@@ -130,8 +135,30 @@ def test_coerce_param_value_helper():
     assert coerce(None) is None
     assert coerce([1, 2]) == [1, 2]
     assert coerce(Color.RED) == "red"
-    # a bound map keeps its structure; its values are primitivized for storage
-    assert coerce({"a": 1, "b": {"c": 2}}) == {"a": 1, "b": '{"c": 2}'}
+    # a bound map keeps its structure; nested maps also preserve shape (issue #3324)
+    assert coerce({"a": 1, "b": {"c": 2}}) == {"a": 1, "b": {"c": 2}}
+
+
+def test_edge_props_preserved_as_map_for_unwind_set():
+    """Regression for cognee issue #3324: edge ``props`` must stay a map so
+    ``SET r += item.props`` works in FalkorDB.  Previously ``_coerce_param_value``
+    routed dict values through ``_coerce_stored_value`` which ``json.dumps``'d
+    them, turning ``props`` into a string and causing
+    ``Property values can only be of primitive types``.
+    """
+    params = {
+        "items": [
+            {
+                "source_id": "node_a",
+                "target_id": "node_b",
+                "props": {"relationship_name": "CONNECTS", "weight": 1},
+            }
+        ]
+    }
+    result = FalkorDBAdapter._sanitize_cypher_params(params)
+    props = result["items"][0]["props"]
+    assert isinstance(props, dict), f"props should be a dict, got {type(props)}: {props!r}"
+    assert props == {"relationship_name": "CONNECTS", "weight": 1}
 
 
 def test_coerce_stored_value_helper():
