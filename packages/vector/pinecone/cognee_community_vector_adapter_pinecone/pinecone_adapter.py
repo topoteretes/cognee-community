@@ -114,15 +114,22 @@ class PineconeAdapter(VectorDBInterface):
                     logger.error("Error creating collection: %s", str(e))
                     raise e
 
-    async def create_data_points(self, collection_name: str, data_points: list[DataPoint]):
+    async def create_data_points(
+        self, collection_name: str, data_points: list[DataPoint]
+    ):
         try:
             if not await self.has_collection(collection_name):
-                raise CollectionNotFoundError(message=f"Collection {collection_name} not found!")
+                raise CollectionNotFoundError(
+                    message=f"Collection {collection_name} not found!"
+                )
 
             index = self.get_pinecone_index(collection_name)
 
             data_vectors = await self.embed_data(
-                [DataPoint.get_embeddable_data(data_point) for data_point in data_points]
+                [
+                    DataPoint.get_embeddable_data(data_point)
+                    for data_point in data_points
+                ]
             )
 
             def convert_to_pinecone_vector(data_point: DataPoint):
@@ -131,7 +138,9 @@ class PineconeAdapter(VectorDBInterface):
                 data_dump = data_point.model_dump()
 
                 for key, value in data_dump.items():
-                    if key != "metadata":  # Skip the nested metadata field that causes issues
+                    if (
+                        key != "metadata"
+                    ):  # Skip the nested metadata field that causes issues
                         if isinstance(value, (str, int, float, bool)):
                             clean_metadata[key] = value
                         elif isinstance(value, list) and all(
@@ -180,7 +189,9 @@ class PineconeAdapter(VectorDBInterface):
     async def retrieve(self, collection_name: str, data_point_ids: list[str]):
         try:
             if not await self.has_collection(collection_name):
-                raise CollectionNotFoundError(message=f"Collection {collection_name} not found!")
+                raise CollectionNotFoundError(
+                    message=f"Collection {collection_name} not found!"
+                )
 
             index = self.get_pinecone_index(collection_name)
             results = index.fetch(ids=data_point_ids)
@@ -197,8 +208,9 @@ class PineconeAdapter(VectorDBInterface):
         limit: int = 15,
         with_vector: bool = False,
         include_payload: bool = False,
-        node_name: Optional[List[str]] = None,  # TODO: Add functionality for this parameter
-        node_name_filter_operator: str = "OR",  # TODO: Add functionality for this parameter
+        node_name: Optional[List[str]] = None,
+        node_name_filter_operator: str = "OR",
+        **kwargs: object,
     ) -> list[ScoredResult]:
         """Search for similar vectors in the collection.
 
@@ -239,22 +251,37 @@ class PineconeAdapter(VectorDBInterface):
             if limit == 0:
                 return []
 
-            results = index.query(
-                vector=query_vector,
-                top_k=limit,
-                include_metadata=include_payload,
-                include_values=with_vector,
-            )
+            filter_params = kwargs.get("filter", {})
+            if node_name:
+                if node_name_filter_operator == "AND":
+                    filter_params["$and"] = [
+                        {"belongs_to_set": {"$in": [name]}} for name in node_name
+                    ]
+                else:
+                    filter_params["belongs_to_set"] = {"$in": node_name}
+
+            query_kwargs = {
+                "vector": query_vector,
+                "top_k": limit,
+                "include_metadata": include_payload,
+                "include_values": with_vector,
+            }
+            if filter_params:
+                query_kwargs["filter"] = filter_params
+
+            results = index.query(**query_kwargs)
 
             return [
                 ScoredResult(
                     id=parse_id(match.id),
-                    payload={
-                        **match.metadata,
-                        "id": parse_id(match.id),
-                    }
-                    if include_payload
-                    else {},
+                    payload=(
+                        {
+                            **match.metadata,
+                            "id": parse_id(match.id),
+                        }
+                        if include_payload
+                        else {}
+                    ),
                     # Pinecone returns similarity score (0-1, higher = more similar)
                     score=match.score,
                 )
@@ -274,6 +301,7 @@ class PineconeAdapter(VectorDBInterface):
         include_payload: bool = False,
         node_name: Optional[List[str]] = None,
         node_name_filter_operator: str = "OR",
+        **kwargs: object,
     ) -> list[list[ScoredResult]]:
         """Perform batch search for multiple queries.
 
@@ -307,25 +335,39 @@ class PineconeAdapter(VectorDBInterface):
             results = []
             for i, vector in enumerate(vectors):
                 try:
-                    result = index.query(
-                        vector=vector,
-                        top_k=limit,
-                        include_metadata=include_payload,
-                        include_values=with_vectors,
-                        node_name=node_name,
-                        node_name_filter_operator=node_name_filter_operator,
-                    )
+                    filter_params = kwargs.get("filter", {})
+                    if node_name:
+                        if node_name_filter_operator == "AND":
+                            filter_params["$and"] = [
+                                {"belongs_to_set": {"$in": [name]}}
+                                for name in node_name
+                            ]
+                        else:
+                            filter_params["belongs_to_set"] = {"$in": node_name}
+
+                    query_kwargs = {
+                        "vector": vector,
+                        "top_k": limit,
+                        "include_metadata": include_payload,
+                        "include_values": with_vectors,
+                    }
+                    if filter_params:
+                        query_kwargs["filter"] = filter_params
+
+                    result = index.query(**query_kwargs)
 
                     # Convert to ScoredResult objects (no filtering to match other adapters)
                     scored_results = [
                         ScoredResult(
                             id=parse_id(match.id),
-                            payload={
-                                **match.metadata,
-                                "id": parse_id(match.id),
-                            }
-                            if include_payload
-                            else {},
+                            payload=(
+                                {
+                                    **match.metadata,
+                                    "id": parse_id(match.id),
+                                }
+                                if include_payload
+                                else {}
+                            ),
                             score=match.score,
                         )
                         for match in result.matches
@@ -345,11 +387,15 @@ class PineconeAdapter(VectorDBInterface):
     async def delete_data_points(self, collection_name: str, data_point_ids: list[str]):
         try:
             if not await self.has_collection(collection_name):
-                raise CollectionNotFoundError(message=f"Collection {collection_name} not found!")
+                raise CollectionNotFoundError(
+                    message=f"Collection {collection_name} not found!"
+                )
 
             index = self.get_pinecone_index(collection_name)
             results = index.delete(ids=data_point_ids)
-            logger.info("Deleted %d data points from %s", len(data_point_ids), collection_name)
+            logger.info(
+                "Deleted %d data points from %s", len(data_point_ids), collection_name
+            )
             return results
         except Exception as e:
             logger.error("Error deleting data points: %s", str(e))
