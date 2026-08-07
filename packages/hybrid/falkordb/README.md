@@ -20,55 +20,60 @@ from cognee import config, prune, add, cognify, search, SearchType
 # Import the register module to enable FalkorDB support
 from cognee_community_hybrid_adapter_falkor import register
 
+
 async def main():
     # Set up local directories
     system_path = pathlib.Path(__file__).parent
     config.system_root_directory(path.join(system_path, ".cognee_system"))
     config.data_root_directory(path.join(system_path, ".cognee_data"))
-    
+
     # Configure databases
-    config.set_relational_db_config({
-        "db_provider": "sqlite",
-    })
-    
+    config.set_relational_db_config(
+        {
+            "db_provider": "sqlite",
+        }
+    )
+
     # Configure FalkorDB as both vector and graph database
-    config.set_vector_db_config({
-        "vector_db_provider": "falkor",
-        "vector_db_url": os.getenv("GRAPH_DB_URL", "localhost"),
-        "vector_db_port": int(os.getenv("GRAPH_DB_PORT", "6379")),
-    })
-    config.set_graph_db_config({
-        "graph_database_provider": "falkor",
-        "graph_database_url": os.getenv("GRAPH_DB_URL", "localhost"),
-        "graph_database_port": int(os.getenv("GRAPH_DB_PORT", "6379")),
-    })
-    
+    config.set_vector_db_config(
+        {
+            "vector_db_provider": "falkor",
+            "vector_db_url": os.getenv("GRAPH_DB_URL", "localhost"),
+            "vector_db_port": int(os.getenv("GRAPH_DB_PORT", "6379")),
+        }
+    )
+    config.set_graph_db_config(
+        {
+            "graph_database_provider": "falkor",
+            "graph_database_url": os.getenv("GRAPH_DB_URL", "localhost"),
+            "graph_database_port": int(os.getenv("GRAPH_DB_PORT", "6379")),
+        }
+    )
+
     # Optional: Clean previous data
     await prune.prune_data()
     await prune.prune_system(metadata=True)
-    
+
     # Add and process your content
     await add("""
     Natural language processing (NLP) is an interdisciplinary
     subfield of computer science and information retrieval.
     """)
-    
+
     await add("""
     Sandwiches are best served toasted with cheese, ham, mayo,
     lettuce, mustard, and salt & pepper.          
     """)
-    
+
     await cognify()
-    
+
     # Search using graph completion
     query_text = "Tell me about NLP"
-    search_results = await search(
-        query_type=SearchType.GRAPH_COMPLETION,
-        query_text=query_text
-    )
-    
+    search_results = await search(query_type=SearchType.GRAPH_COMPLETION, query_text=query_text)
+
     for result in search_results:
         print("\nSearch result: \n" + result)
+
 
 if __name__ == "__main__":
     asyncio.run(main())

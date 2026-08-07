@@ -33,6 +33,10 @@ exclude = ["^\\.venv/"]
 module = [
   "pymilvus.*",
   "cognee.*",
+  # Shared test helpers imported via a sys.path shim in tests/conftest.py
+  # (packages/shared/contract_suite) — invisible to mypy's import resolution.
+  "contract_suite.*",
+  "contract_suite",
 ]
 ignore_missing_imports = true
 [build-system]

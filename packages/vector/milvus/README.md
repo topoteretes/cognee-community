@@ -52,11 +52,13 @@ import cognee
 from cognee_community_vector_adapter_milvus import register  # noqa: F401
 
 # Configure Milvus
-cognee.config.set_vector_db_config({
-    "vector_db_provider": "milvus",
-    "vector_db_url": "./milvus.db",
-    "vector_db_key": "",
-})
+cognee.config.set_vector_db_config(
+    {
+        "vector_db_provider": "milvus",
+        "vector_db_url": "./milvus.db",
+        "vector_db_key": "",
+    }
+)
 
 # Use Cognee normally
 await cognee.add("Your data here")

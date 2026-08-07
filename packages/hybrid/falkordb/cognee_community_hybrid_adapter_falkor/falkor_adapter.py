@@ -144,15 +144,32 @@ class FalkorDBAdapter(VectorDBInterface, GraphDBInterface):
         return str(value)
 
     @staticmethod
+    def _coerce_record_value(value: Any) -> Any:
+        """Coerce a value inside an UNWIND record map.
+
+        A sub-map here (e.g. ``props`` in the ``add_edges`` batch, spread via
+        ``SET r += e.props``) must STAY a map: FalkorDB accepts nested maps as
+        bound params but rejects a JSON string on ``+=`` with ``Property values
+        can only be of primitive types or arrays of primitive types``. The
+        sub-map's own values get stored as properties, so they are primitivized
+        via :meth:`_coerce_stored_value`.
+        """
+        if isinstance(value, dict):
+            return {key: FalkorDBAdapter._coerce_stored_value(val) for key, val in value.items()}
+        return FalkorDBAdapter._coerce_stored_value(value)
+
+    @staticmethod
     def _coerce_param_value(value: Any) -> Any:
         """Coerce a bound query-param value, PRESERVING the structure FalkorDB
         needs.
 
         Maps and arrays-of-maps are valid *bound params* — e.g. an
         ``UNWIND $items AS item ... SET edge += item`` edge batch binds a list of
-        maps — so this keeps that shape. A record map keeps its keys, but its
-        values are primitivized via :meth:`_coerce_stored_value` (they get stored
-        as properties). Flattening a list of maps to JSON strings (as a blanket
+        maps — so this keeps that shape. A record map (an element of a bound
+        list) keeps its keys, and a dict-valued field of a record (``e.props``)
+        also stays a map (see :meth:`_coerce_record_value`); deeper values are
+        primitivized via :meth:`_coerce_stored_value` since they get stored as
+        properties. Flattening a list of maps to JSON strings (as a blanket
         coercion would) makes the ``UNWIND`` fail with ``Type mismatch: expected
         Map ... but was String``. ``bytes`` / ``Enum`` outside a record map are
         still coerced.
@@ -160,7 +177,12 @@ class FalkorDBAdapter(VectorDBInterface, GraphDBInterface):
         if isinstance(value, dict):
             return {key: FalkorDBAdapter._coerce_stored_value(val) for key, val in value.items()}
         if isinstance(value, (list, tuple)):
-            return [FalkorDBAdapter._coerce_param_value(item) for item in value]
+            return [
+                {key: FalkorDBAdapter._coerce_record_value(val) for key, val in item.items()}
+                if isinstance(item, dict)
+                else FalkorDBAdapter._coerce_param_value(item)
+                for item in value
+            ]
         if isinstance(value, Enum):
             return value.value
         if isinstance(value, bytes):

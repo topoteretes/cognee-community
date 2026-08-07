@@ -8,7 +8,12 @@ from contract_suite.vector_contract import assert_registered
 
 
 def test_conforms_to_cognee_vector_contract():
-    assert_vector_contract(AzureAISearchAdapter)
+    # Azure's SDK refuses key credentials on non-https endpoints, so the dummy
+    # construction URL must be https.
+    assert_vector_contract(
+        AzureAISearchAdapter,
+        constructor_kwargs={"url": "https://contract-test.search.windows.net"},
+    )
 
 
 def test_register_adds_azureaisearch_provider():

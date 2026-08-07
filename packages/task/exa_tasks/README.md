@@ -115,9 +115,9 @@ Returns a list of dicts with keys:
     "url": "https://example.com/post",
     "title": "Example post",
     "content": "Best available text/summary/highlights...",
-    "text": "...",             # full text, if requested
-    "highlights": [...],        # list, if requested
-    "summary": "...",          # LLM summary, if requested
+    "text": "...",  # full text, if requested
+    "highlights": [...],  # list, if requested
+    "summary": "...",  # LLM summary, if requested
     "score": 0.92,
     "published_date": "2026-01-12",
     "author": "Alice",

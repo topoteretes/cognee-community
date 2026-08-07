@@ -92,11 +92,23 @@ def test_bound_list_of_maps_preserved_for_unwind():
     # A list of maps bound as a param (e.g. the `UNWIND $items AS item ... SET
     # edge += item` edge batch) MUST stay a list of maps — JSON-stringifying the
     # elements makes FalkorDB fail with "Type mismatch: expected Map ... but was
-    # String". The element maps' values are still primitivized (they get stored).
+    # String". A dict-valued record field like `props` (spread via
+    # `SET r += e.props`) must ALSO stay a map: FalkorDB rejects a JSON string
+    # there with "Property values can only be of primitive types or arrays of
+    # primitive types". Only the props map's own values are primitivized.
     result = FalkorDBAdapter._sanitize_cypher_params(
         {"items": [{"edge_index": 0, "props": {"w": 1}}, {"edge_index": 1}]}
     )
-    assert result == {"items": [{"edge_index": 0, "props": '{"w": 1}'}, {"edge_index": 1}]}
+    assert result == {"items": [{"edge_index": 0, "props": {"w": 1}}, {"edge_index": 1}]}
+
+
+def test_bound_record_props_values_primitivized():
+    # Values inside a record's props sub-map get stored as edge properties, so
+    # they are primitivized (a nested dict there becomes a JSON string).
+    result = FalkorDBAdapter._sanitize_cypher_params(
+        {"items": [{"props": {"meta": {"a": 1}, "raw": b"x", "kind": Color.RED}}]}
+    )
+    assert result == {"items": [{"props": {"meta": '{"a": 1}', "raw": "x", "kind": "red"}}]}
 
 
 def test_stored_map_value_json_encoded():

@@ -35,6 +35,7 @@ from glide_shared.commands.server_modules.ft_options.ft_search_options import (
     ReturnField,
 )
 from glide_shared.exceptions import RequestError
+from glide_shared.exceptions import TimeoutError as GlideTimeoutError
 
 from .exceptions import CollectionNotFoundError, ValkeyVectorEngineInitializationError
 from .utils import (
@@ -124,7 +125,10 @@ class ValkeyAdapter(VectorDBInterface):
             [NodeAddress(self._host, self._port)],
             client_name="cognee_vector_store_client",
             use_tls=False,
-            request_timeout=5000,
+            # Documents carry full embedding vectors (tens of KB each); a slow
+            # CI runner needs headroom or bulk writes hit "TimeoutError: timed
+            # out" mid-pipeline.
+            request_timeout=30000,
             reconnect_strategy=BackoffStrategy(num_of_retries=3, factor=1000, exponent_base=2),
         )
         self._client = await GlideClient.create(cfg)
@@ -282,8 +286,12 @@ class ValkeyAdapter(VectorDBInterface):
             ]
             data_vectors = await self.embed_data(data_to_embed)
 
-            documents = []
-            for data_point, embedding in zip(data_points, data_vectors, strict=False):
+            # Bound write concurrency: firing every JSON.SET at once over a
+            # single connection makes bulk indexing (e.g. cognee's
+            # index_graph_edges) exceed the request timeout on slow runners.
+            write_semaphore = asyncio.Semaphore(32)
+
+            async def _write_document(data_point, embedding):
                 payload = _serialize_for_json(data_point.model_dump())
 
                 doc_data = {
@@ -299,16 +307,32 @@ class ValkeyAdapter(VectorDBInterface):
                     "payload_data": json.dumps(payload),  # Store as JSON string
                 }
 
-                documents.append(
-                    glide_json.set(
-                        client,
-                        self._key(collection_name, str(data_point.id)),
-                        "$",
-                        json.dumps(doc_data),
-                    )
-                )
+                # Retry on glide timeouts: when another pipeline task blocks
+                # the event loop with long synchronous work (e.g. an embedded
+                # graph engine), in-flight glide requests can hit their
+                # client-side timer even though the server is healthy. The
+                # write is an idempotent JSON.SET, so retrying is safe.
+                for attempt in range(4):
+                    try:
+                        async with write_semaphore:
+                            await glide_json.set(
+                                client,
+                                self._key(collection_name, str(data_point.id)),
+                                "$",
+                                json.dumps(doc_data),
+                            )
+                        break
+                    except GlideTimeoutError:
+                        if attempt == 3:
+                            raise
+                        await asyncio.sleep(0.5 * (attempt + 1))
 
-            await asyncio.gather(*documents)
+            await asyncio.gather(
+                *[
+                    _write_document(data_point, embedding)
+                    for data_point, embedding in zip(data_points, data_vectors, strict=False)
+                ]
+            )
 
         except RequestError as e:
             # Helpful guidance if JSON vector arrays aren't supported by the deployed module

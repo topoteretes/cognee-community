@@ -25,8 +25,8 @@ from cognee_community_connector_slack import slack_export_source
 
 await cognee.remember(
     slack_export_source("/path/to/slack-export"),
-    dataset_name="team-slack-export",   # use a DEDICATED dataset (see below)
-    max_rows_per_table=0,               # ingest the whole export
+    dataset_name="team-slack-export",  # use a DEDICATED dataset (see below)
+    max_rows_per_table=0,  # ingest the whole export
 )
 
 answer = await cognee.search(

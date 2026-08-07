@@ -61,16 +61,14 @@ export VECTOR_DB_URL="valkey://localhost:6379"
 
 ```python
 # Local Valkey
-config.set_vector_db_config({
-    "vector_db_provider": "valkey",
-    "vector_db_url": "valkey://localhost:6379"
-})
+config.set_vector_db_config(
+    {"vector_db_provider": "valkey", "vector_db_url": "valkey://localhost:6379"}
+)
 
 # Valkey with authentication
-config.set_vector_db_config({
-    "vector_db_provider": "valkey", 
-    "vector_db_url": "valkey://user:password@localhost:6379"
-})
+config.set_vector_db_config(
+    {"vector_db_provider": "valkey", "vector_db_url": "valkey://user:password@localhost:6379"}
+)
 ```
 
 ## Requirements
@@ -90,10 +88,7 @@ from cognee.infrastructure.engine import DataPoint
 
 # Initialize embedding engine and adapter
 embedding_engine = EmbeddingEngine(model="your-model")
-valkey_adapter = ValkeyAdapter(
-    url="valkey://localhost:6379",
-    embedding_engine=embedding_engine
-)
+valkey_adapter = ValkeyAdapter(url="valkey://localhost:6379", embedding_engine=embedding_engine)
 
 # Direct adapter operations
 await valkey_adapter.create_collection("my_collection")
@@ -127,6 +122,7 @@ The adapter uses Cognee's logging system. Enable debug logging to see detailed o
 
 ```python
 import logging
+
 logging.getLogger("ValkeyAdapter").setLevel(logging.DEBUG)
 ```
 
