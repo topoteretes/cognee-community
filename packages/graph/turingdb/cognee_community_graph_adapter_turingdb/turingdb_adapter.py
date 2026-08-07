@@ -205,9 +205,16 @@ class TuringDBAdapter(GraphDBInterface):
 
     @staticmethod
     def _is_unknown_property_error(error: Exception) -> bool:
-        """True when TuringDB's analyzer rejected a projection of a property
-        that no node/edge in the graph carries ("Property type 'x' not found")."""
+        """True when TuringDB's analyzer rejected a read referencing a property
+        that no node/edge in the graph currently carries.
+
+        TuringDB reports this two ways: "Property type 'x' not found" for
+        projections (RETURN n.x) and "Unknown property: x" for match patterns
+        (MATCH (n {x: ...})).
+        """
         message = str(error)
+        if "Unknown property" in message:
+            return True
         return "Property type" in message and "not found" in message
 
     async def is_empty(self) -> bool:
@@ -224,7 +231,26 @@ class TuringDBAdapter(GraphDBInterface):
         if self._is_write_query(query):
             return self._run_in_change([query])
 
-        result = self.driver.query(query=query)
+        try:
+            result = self.driver.query(query=query)
+        except Exception as error:
+            if self._is_unknown_property_error(error):
+                # TuringDB's analyzer rejects reads referencing a property no
+                # node/edge currently carries — e.g. `MATCH (n {id: ...})`
+                # right after DETACH DELETE removed every node, which drops
+                # the property from the graph schema, or reads against a
+                # foreign/legacy graph. Semantically that is just "no
+                # matches", so return an empty result instead of aborting the
+                # caller (cognee's migrations and pipeline writes both trip
+                # over this otherwise).
+                logger.debug(
+                    "TuringDB read referenced a property unknown to graph %s; "
+                    "treating as no matches. Query: %s",
+                    self.database_name,
+                    query,
+                )
+                return []
+            raise
         return self._df_to_records(result)
 
     async def add_node(
@@ -445,25 +471,9 @@ class TuringDBAdapter(GraphDBInterface):
         nodes_query = (
             f"MATCH (n) RETURN n.id AS id, n.{self.PROPERTIES_JSON_KEY} AS properties_json"
         )
-        try:
-            nodes_result = await self.query(nodes_query)
-        except Exception as error:
-            if self._is_unknown_property_error(error):
-                # The graph holds nodes, but none written by this adapter
-                # (TuringDB's query analyzer rejects projections of properties
-                # absent from the graph schema — e.g. a graph seeded by an
-                # older adapter version, or a foreign/sample graph). Treat it
-                # as containing no cognee data instead of failing callers like
-                # cognee's startup migrations, which would otherwise block all
-                # writes to the database.
-                logger.warning(
-                    "TuringDB graph %s has no cognee-written nodes "
-                    "(missing %s property); returning an empty graph.",
-                    self.database_name,
-                    self.PROPERTIES_JSON_KEY,
-                )
-                return [], []
-            raise
+        # query() maps unknown-property ANALYZE errors (foreign/legacy graphs
+        # with no cognee-written nodes) to an empty result set.
+        nodes_result = await self.query(nodes_query)
         nodes: List[Node] = []
         for row in nodes_result:
             raw_props = row.get("properties_json")
@@ -484,14 +494,7 @@ class TuringDBAdapter(GraphDBInterface):
             f"RETURN n.id AS source_id, m.id AS target_id, "
             f"r.{self.PROPERTIES_JSON_KEY} as properties_json"
         )
-        try:
-            edges_result = await self.query(edges_query)
-        except Exception as error:
-            if self._is_unknown_property_error(error):
-                # Edges exist but none carry adapter-written properties (see
-                # the nodes_query guard above); report the nodes only.
-                return nodes, []
-            raise
+        edges_result = await self.query(edges_query)
         edges: List[EdgeData] = []
         for row in edges_result:
             raw_props = row.get("properties_json")
