@@ -89,3 +89,11 @@ jobs:
       event-type: ${{ inputs.event-type }}
     uses: ./.github/workflows/test_turingdb.yml
     secrets: inherit
+
+  test-pggraph:
+    name: "PgGraph Community Adapter Test"
+    if: ${{ inputs.databases == 'all' || contains(inputs.databases, 'pggraph') }}
+    with:
+      event-type: ${{ inputs.event-type }}
+    uses: ./.github/workflows/test_pggraph.yml
+    secrets: inherit

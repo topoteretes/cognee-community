@@ -1,0 +1,76 @@
+name: Adapter Contract Tests
+
+# Offline conformance tests for every graph/vector/hybrid adapter package.
+# No services, no secrets: each package's tests/unit tier asserts the adapter
+# satisfies the call surface of the pinned cognee version (see
+# packages/shared/contract_suite/). This is the always-on PR signal, including
+# for adapters whose backing service is cloud-only.
+
+on:
+  workflow_dispatch:
+  workflow_call:
+  pull_request:
+    branches: [main, dev]
+    paths:
+      - "packages/graph/**"
+      - "packages/vector/**"
+      - "packages/hybrid/**"
+      - "packages/shared/**"
+      - ".github/workflows/adapter_contract_tests.yml"
+      - ".github/actions/community_setup/**"
+  push:
+    branches: [main, dev]
+    paths:
+      - "packages/graph/**"
+      - "packages/vector/**"
+      - "packages/hybrid/**"
+      - "packages/shared/**"
+
+concurrency:
+  group: contract-tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  contract-tests:
+    name: contract (${{ matrix.package }})
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        package:
+          - packages/graph/arcadedb
+          - packages/graph/memgraph
+          - packages/graph/networkx
+          - packages/graph/pggraph
+          - packages/graph/spanner
+          - packages/graph/turbopuffer
+          - packages/graph/turingdb
+          - packages/vector/azureaisearch
+          - packages/vector/milvus
+          - packages/vector/moss
+          - packages/vector/opengauss
+          - packages/vector/opensearch
+          - packages/vector/pinecone
+          - packages/vector/qdrant
+          - packages/vector/redis
+          - packages/vector/singlestore
+          - packages/vector/turbopuffer
+          - packages/vector/valkey
+          - packages/vector/weaviate
+          - packages/hybrid/arcadedb
+          - packages/hybrid/duckdb
+          - packages/hybrid/falkordb
+          - packages/hybrid/helixdb
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Community setup
+        uses: ./.github/actions/community_setup
+        with:
+          package-path: ${{ matrix.package }}
+          python-version: "3.11.x"
+
+      - name: Run unit tier
+        working-directory: ${{ matrix.package }}
+        run: poetry run pytest tests/unit -q

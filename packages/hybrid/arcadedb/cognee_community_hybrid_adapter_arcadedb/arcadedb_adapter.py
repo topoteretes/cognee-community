@@ -459,7 +459,12 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
 
         return result
 
-    async def add_nodes(self, nodes: list[DataPoint]) -> None:
+    async def add_nodes(
+        self,
+        nodes: list[DataPoint],
+        source_ref_key: str | None = None,
+        pipeline_run_id: str | None = None,
+    ) -> None:
         if not nodes:
             return []
 
@@ -563,7 +568,12 @@ class ArcadeDBAdapter(VectorDBInterface, GraphDBInterface):
             },
         )
 
-    async def add_edges(self, edges: list[tuple[str, str, str, dict[str, Any]]]) -> None:
+    async def add_edges(
+        self,
+        edges: list[tuple[str, str, str, dict[str, Any]]],
+        source_ref_key: str | None = None,
+        pipeline_run_id: str | None = None,
+    ) -> None:
         if not edges:
             return []
 

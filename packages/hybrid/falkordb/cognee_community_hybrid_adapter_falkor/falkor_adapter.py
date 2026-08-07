@@ -690,7 +690,12 @@ class FalkorDBAdapter(VectorDBInterface, GraphDBInterface):
         """
         await self.create_data_points("", nodes)
 
-    async def add_nodes(self, nodes: list[Node] | list[DataPoint]) -> None:
+    async def add_nodes(
+        self,
+        nodes: list[Node] | list[DataPoint],
+        source_ref_key: str | None = None,
+        pipeline_run_id: str | None = None,
+    ) -> None:
         """
         Add multiple nodes to the graph in a single operation.
 
@@ -779,7 +784,12 @@ class FalkorDBAdapter(VectorDBInterface, GraphDBInterface):
         query = await self.create_edge_query(edge_tuple)
         await self.query(query)
 
-    async def add_edges(self, edges: list[EdgeData]) -> None:
+    async def add_edges(
+        self,
+        edges: list[EdgeData],
+        source_ref_key: str | None = None,
+        pipeline_run_id: str | None = None,
+    ) -> None:
         """
         Add multiple edges to the graph in a single operation.
 

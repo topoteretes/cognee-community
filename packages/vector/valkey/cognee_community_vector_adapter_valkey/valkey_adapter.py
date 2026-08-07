@@ -47,6 +47,15 @@ from .utils import (
 logger = get_logger("ValkeyAdapter")
 
 
+class IndexSchema(DataPoint):
+    """Minimal data point written by index_data_points: one indexed text field."""
+
+    text: str
+
+    metadata: dict = {"index_fields": ["text"]}
+    belongs_to_set: List[str] = []
+
+
 class ValkeyAdapter(VectorDBInterface):
     """Valkey vector database adapter using ValkeyGlide for vector similarity search.
 
@@ -310,16 +319,28 @@ class ValkeyAdapter(VectorDBInterface):
             logger.error(f"Error creating data points: {str(e)}")
             raise e
 
-    # TODO: Add this and fix issues
-    # async def create_vector_index(self, index_name: str, index_property_name: str):
-    #     await self.create_collection(f"{index_name}_{index_property_name}")
-    #
-    # async def index_data_points(
-    #     self, index_name: str, index_property_name: str, data_points: List[DataPoint]
-    # ):
-    #     """Index data points in the collection."""
-    #
-    #     await self.create_data_points(f"{index_name}_{index_property_name}", data_points)
+    async def create_vector_index(self, index_name: str, index_property_name: str):
+        await self.create_collection(f"{index_name}_{index_property_name}")
+
+    async def index_data_points(
+        self, index_name: str, index_property_name: str, data_points: List[DataPoint]
+    ):
+        """Index data points into the per-field collection created by create_vector_index.
+
+        Without this override the interface default is a no-op and cognify
+        would silently store nothing searchable.
+        """
+        await self.create_data_points(
+            f"{index_name}_{index_property_name}",
+            [
+                IndexSchema(
+                    id=data_point.id,
+                    text=getattr(data_point, data_point.metadata["index_fields"][0]),
+                    belongs_to_set=(data_point.belongs_to_set or []),
+                )
+                for data_point in data_points
+            ],
+        )
 
     async def retrieve(
         self,

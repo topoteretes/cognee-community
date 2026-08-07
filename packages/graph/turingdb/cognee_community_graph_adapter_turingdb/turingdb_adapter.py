@@ -237,7 +237,12 @@ class TuringDBAdapter(GraphDBInterface):
         create_query = f"CREATE (:{label} {{{property_fragments}}})"
         self._run_in_change([create_query])
 
-    async def add_nodes(self, nodes: Union[List[Node], List[DataPoint]]) -> None:
+    async def add_nodes(
+        self,
+        nodes: Union[List[Node], List[DataPoint]],
+        source_ref_key: Optional[str] = None,
+        pipeline_run_id: Optional[str] = None,
+    ) -> None:
         if not nodes:
             return
 
@@ -368,6 +373,8 @@ class TuringDBAdapter(GraphDBInterface):
             List[EdgeData],
             List[Tuple[str, str, str, Optional[Dict[str, Any]]]],
         ],
+        source_ref_key: Optional[str] = None,
+        pipeline_run_id: Optional[str] = None,
     ) -> None:
         if not edges:
             return

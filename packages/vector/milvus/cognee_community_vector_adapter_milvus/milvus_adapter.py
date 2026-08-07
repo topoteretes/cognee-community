@@ -1,27 +1,25 @@
 import asyncio
 import os
-from typing import TYPE_CHECKING, Any, List, Optional, cast
+from typing import Any, List, Optional, cast
 
-from pymilvus import MilvusClient
-
-if TYPE_CHECKING:
-    from cognee.infrastructure.databases.vector.vector_db_interface import (
-        VectorDBInterface,
-    )
 from cognee.infrastructure.databases.exceptions import MissingQueryParameterError
 from cognee.infrastructure.databases.vector.embeddings.EmbeddingEngine import (
     EmbeddingEngine,
 )
 from cognee.infrastructure.databases.vector.models.ScoredResult import ScoredResult
+from cognee.infrastructure.databases.vector.vector_db_interface import (
+    VectorDBInterface,
+)
 from cognee.infrastructure.engine import DataPoint
 from cognee.infrastructure.files.storage import get_file_storage
 from cognee.shared.logging_utils import get_logger
+from pymilvus import MilvusClient
 from pymilvus.orm.types import DataType
 
 logger = get_logger("MilvusAdapter")
 
 
-class MilvusAdapter:
+class MilvusAdapter(VectorDBInterface):
     """
     Interface for interacting with a Milvus vector database.
 
@@ -571,7 +569,3 @@ class MilvusAdapter:
         """
         client = self.get_milvus_client()
         return client.list_collections()
-
-
-if TYPE_CHECKING:
-    _: VectorDBInterface = MilvusAdapter("", None, None)

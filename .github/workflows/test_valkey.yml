@@ -102,4 +102,6 @@ jobs:
           VECTOR_DB_PROVIDER: 'valkey'
           VECTOR_DB_URL: 'valkey://localhost:6379'
         working-directory: ./packages/vector/valkey
-        run: poetry run python tests/test_valkey.py
+        # tests/test_valkey.py is a pytest suite: running it as a script
+        # executed nothing. Run it through pytest so the tests actually run.
+        run: poetry run pytest tests/test_valkey.py -v

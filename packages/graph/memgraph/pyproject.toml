@@ -6,7 +6,7 @@ authors = [
     {name = "Cognee Team", email = "hello@cognee.ai"},
 ]
 dependencies = [
-    "cognee[neo4j]>=1.1.0,<2.0.0",
+    "cognee[neo4j]==1.4.1",
     "starlette>=0.48.0",
     "instructor>=1.11"
 ]

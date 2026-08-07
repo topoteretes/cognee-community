@@ -23,6 +23,10 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  contract-tests:
+    name: Adapter Contract Tests
+    uses: ./.github/workflows/adapter_contract_tests.yml
+
   test-vector-databases:
     name: Test Vector Databases
     uses: ./.github/workflows/vector_db_community_tests.yml
@@ -113,7 +117,7 @@ jobs:
   summary:
     name: Test Summary
     runs-on: ubuntu-22.04
-    needs: [test-vector-databases, test-graph-databases, test-community-pipelines, test-community-retrievers]
+    needs: [contract-tests, test-vector-databases, test-graph-databases, test-community-pipelines, test-community-retrievers]
     if: always()
     steps:
       - name: Test Results Summary
@@ -121,12 +125,14 @@ jobs:
           echo "## Community Database Tests Summary" >> $GITHUB_STEP_SUMMARY
           echo "| Test Suite | Status |" >> $GITHUB_STEP_SUMMARY
           echo "|------------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Adapter Contract Tests | ${{ needs.contract-tests.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Vector Databases | ${{ needs.test-vector-databases.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Graph Databases | ${{ needs.test-graph-databases.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Pipelines | ${{ needs.test-community-pipelines.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Retrievers | ${{ needs.test-community-retrievers.result }} |" >> $GITHUB_STEP_SUMMARY
-          
-          if [[ 
+
+          if [[
+            "${{ needs.contract-tests.result }}" == "success" &&
             "${{ needs.test-vector-databases.result }}" == "success" &&
             "${{ needs.test-graph-databases.result }}" == "success" &&
             "${{ needs.test-community-pipelines.result }}" == "success" &&

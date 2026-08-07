@@ -5,7 +5,7 @@ This package provides a Memgraph graph database adapter for the Cognee framework
 
 from .memgraph_adapter import MemgraphAdapter
 
-__version__ = "0.1.0"
+__version__ = "0.1.4"
 __all__ = ["MemgraphAdapter", "register"]
 
 

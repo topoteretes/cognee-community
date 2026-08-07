@@ -28,8 +28,8 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
-    "cognee>=1.1.0,<2.0.0",
-    "duckdb>=1.3.2",
+    "cognee==1.4.1",
+    "duckdb>=1.3.2,<1.5.5",  # duckpgq community extension is not yet published for 1.5.5
     "starlette>=0.48.0",
     "instructor>=1.11"
 ]

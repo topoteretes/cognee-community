@@ -29,6 +29,9 @@ PACKAGE_ROOT = TESTS_DIR.parent
 if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
 
+# Make packages/shared (contract_suite) importable.
+sys.path.insert(0, str((TESTS_DIR.parents[2] / "shared").resolve()))
+
 # --- env gates -------------------------------------------------------------
 
 INTEGRATION = os.getenv("COGNEE_TURBOPUFFER_GRAPH_TESTS", "").lower() in ("1", "true", "yes")

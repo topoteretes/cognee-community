@@ -116,7 +116,7 @@ export VECTOR_DB_KEY="your-api-key"
 
 - Python >= 3.11, <= 3.13
 - weaviate-client >= 4.9.6, < 5.0.0
-- cognee >= 0.2.1
+- cognee == 1.4.1
 
 ## Features
 

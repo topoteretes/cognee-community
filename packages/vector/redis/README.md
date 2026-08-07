@@ -155,7 +155,7 @@ config.set_vector_db_config({
 
 - Python >= 3.11, <= 3.13
 - redisvl >= 0.6.0, <= 1.0.0
-- cognee >= 0.2.0.dev0
+- cognee == 1.4.1
 
 ## Advanced Usage
 

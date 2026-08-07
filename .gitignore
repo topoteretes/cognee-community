@@ -9,6 +9,10 @@ wheels/
 # Virtual environments
 .venv
 .idea
+# Local install logs from per-package test env setup
+install.log
+# NetworkX adapter graph snapshots written during local runs
+cognee_graph.pkl
 # Env config
 .env
 

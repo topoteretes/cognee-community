@@ -121,7 +121,12 @@ class NetworkXAdapter(GraphDBInterface):
 
         await self.save_graph_to_file(self.filename)
 
-    async def add_nodes(self, nodes: list[DataPoint]) -> None:
+    async def add_nodes(
+        self,
+        nodes: list[DataPoint],
+        source_ref_key: str | None = None,
+        pipeline_run_id: str | None = None,
+    ) -> None:
         """
         Bulk add multiple nodes to the graph and persist the graph state to the file.
 
@@ -130,6 +135,8 @@ class NetworkXAdapter(GraphDBInterface):
 
             - nodes (list[DataPoint]): A list of DataPoint objects defining the nodes to be
               added.
+            - source_ref_key / pipeline_run_id: provenance markers passed by cognee's
+              add_data_points task; this adapter does not store provenance in-graph.
         """
         nodes = [(node.id, node.model_dump()) for node in nodes]
         self.graph.add_nodes_from(nodes)
@@ -218,7 +225,12 @@ class NetworkXAdapter(GraphDBInterface):
 
         await self.save_graph_to_file(self.filename)
 
-    async def add_edges(self, edges: list[tuple[str, str, str, dict]]) -> None:
+    async def add_edges(
+        self,
+        edges: list[tuple[str, str, str, dict]],
+        source_ref_key: str | None = None,
+        pipeline_run_id: str | None = None,
+    ) -> None:
         """
         Bulk add multiple edges to the graph and persist the graph state to the file.
 
@@ -227,6 +239,8 @@ class NetworkXAdapter(GraphDBInterface):
 
             - edges (list[tuple[str, str, str, dict]]): A list of edges defined as tuples
               containing (from_node, to_node, relationship_name, edge_properties).
+            - source_ref_key / pipeline_run_id: provenance markers passed by cognee's
+              add_data_points task; this adapter does not store provenance in-graph.
         """
         if not edges:
             logger.debug("No edges to add")
