@@ -158,7 +158,12 @@ class FalkorDBAdapter(VectorDBInterface, GraphDBInterface):
         still coerced.
         """
         if isinstance(value, dict):
-            return {key: FalkorDBAdapter._coerce_stored_value(val) for key, val in value.items()}
+            # Recurse so nested maps (e.g. edge ``props`` spread via
+            # ``SET r += item.props``) keep their map shape.  Routing dict
+            # values through ``_coerce_stored_value`` would ``json.dumps``
+            # them into strings, which FalkorDB rejects with
+            # ``Property values can only be of primitive types`` (issue #3324).
+            return {key: FalkorDBAdapter._coerce_param_value(val) for key, val in value.items()}
         if isinstance(value, (list, tuple)):
             return [FalkorDBAdapter._coerce_param_value(item) for item in value]
         if isinstance(value, Enum):
