@@ -144,45 +144,26 @@ class FalkorDBAdapter(VectorDBInterface, GraphDBInterface):
         return str(value)
 
     @staticmethod
-    def _coerce_record_value(value: Any) -> Any:
-        """Coerce a value inside an UNWIND record map.
-
-        A sub-map here (e.g. ``props`` in the ``add_edges`` batch, spread via
-        ``SET r += e.props``) must STAY a map: FalkorDB accepts nested maps as
-        bound params but rejects a JSON string on ``+=`` with ``Property values
-        can only be of primitive types or arrays of primitive types``. The
-        sub-map's own values get stored as properties, so they are primitivized
-        via :meth:`_coerce_stored_value`.
-        """
-        if isinstance(value, dict):
-            return {key: FalkorDBAdapter._coerce_stored_value(val) for key, val in value.items()}
-        return FalkorDBAdapter._coerce_stored_value(value)
-
-    @staticmethod
     def _coerce_param_value(value: Any) -> Any:
         """Coerce a bound query-param value, PRESERVING the structure FalkorDB
         needs.
 
         Maps and arrays-of-maps are valid *bound params* — e.g. an
-        ``UNWIND $items AS item ... SET edge += item`` edge batch binds a list of
-        maps — so this keeps that shape. A record map (an element of a bound
-        list) keeps its keys, and a dict-valued field of a record (``e.props``)
-        also stays a map (see :meth:`_coerce_record_value`); deeper values are
-        primitivized via :meth:`_coerce_stored_value` since they get stored as
-        properties. Flattening a list of maps to JSON strings (as a blanket
-        coercion would) makes the ``UNWIND`` fail with ``Type mismatch: expected
-        Map ... but was String``. ``bytes`` / ``Enum`` outside a record map are
-        still coerced.
+        ``UNWIND $items AS item ... SET edge += item`` edge batch binds a list
+        of maps, and a dict-valued record field (``e.props``, spread via
+        ``SET r += e.props``) must ALSO stay a map: FalkorDB rejects a JSON
+        string there with ``Property values can only be of primitive types or
+        arrays of primitive types`` (issue #3324). So coercion is fully
+        structure-preserving: dicts and lists keep their shape at every depth
+        and only leaf values are coerced (``Enum`` -> ``.value``, ``bytes`` ->
+        text). Values destined for storage are primitivized by the write paths
+        themselves (``create_data_point_query`` / ``add_edges``'s
+        ``_flatten_value``) before they reach the sanitizer.
         """
         if isinstance(value, dict):
-            return {key: FalkorDBAdapter._coerce_stored_value(val) for key, val in value.items()}
+            return {key: FalkorDBAdapter._coerce_param_value(val) for key, val in value.items()}
         if isinstance(value, (list, tuple)):
-            return [
-                {key: FalkorDBAdapter._coerce_record_value(val) for key, val in item.items()}
-                if isinstance(item, dict)
-                else FalkorDBAdapter._coerce_param_value(item)
-                for item in value
-            ]
+            return [FalkorDBAdapter._coerce_param_value(item) for item in value]
         if isinstance(value, Enum):
             return value.value
         if isinstance(value, bytes):
@@ -194,10 +175,9 @@ class FalkorDBAdapter(VectorDBInterface, GraphDBInterface):
         """Make a bound-params dict safe for FalkorDB.
 
         Routes every value through :meth:`_coerce_param_value` (structure-
-        preserving), which primitivizes the values that get stored as properties
-        via :meth:`_coerce_stored_value`. Without this a ``bytes`` value or a
-        nested map/array in a model-extracted entity rejects the whole query and
-        aborts the pipeline run.
+        preserving, leaf-coercing). Without this a ``bytes`` or ``Enum`` value
+        in a model-extracted entity rejects the whole query and aborts the
+        pipeline run.
         """
         return {key: FalkorDBAdapter._coerce_param_value(value) for key, value in params.items()}
 
