@@ -8,8 +8,6 @@ from cognee.modules.search.types import SearchType
 from cognee.modules.users.methods import get_default_user
 from cognee.shared.logging_utils import get_logger
 
-# NOTE: Importing the register module we let cognee know it can use the TopK vector adapter
-# NOTE: The "noqa: F401" mark is to make sure the linter doesn't flag this as an unused import
 from cognee_community_vector_adapter_topk import register  # noqa: F401
 
 logger = get_logger()
