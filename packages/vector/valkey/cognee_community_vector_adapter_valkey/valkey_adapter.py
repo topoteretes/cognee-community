@@ -280,6 +280,11 @@ class ValkeyAdapter(VectorDBInterface):
             if not await self.has_collection(collection_name):
                 raise CollectionNotFoundError(f"Collection {collection_name} not found!")
 
+            if not data_points:
+                # Nothing to write; embedding an empty batch would error
+                # (providers reject empty input arrays).
+                return
+
             # Embed the data points
             data_to_embed = [
                 DataPoint.get_embeddable_data(data_point) for data_point in data_points
@@ -522,8 +527,8 @@ class ValkeyAdapter(VectorDBInterface):
         query_texts: list[str],
         limit: int | None,
         with_vectors: bool = False,
-        score_threshold: float | None = 0.1,
-        max_concurrency: int = 10,
+        score_threshold: float | None = None,
+        max_concurrency: int = 1,
         include_payload: bool = False,
         node_name: Optional[List[str]] = None,
     ) -> list[list[ScoredResult]]:
@@ -534,13 +539,25 @@ class ValkeyAdapter(VectorDBInterface):
             query_texts: List of text queries to search for.
             limit: Maximum number of results per query.
             with_vectors: Whether to include vectors in results.
-            score_threshold: threshold for filtering scores.
-            max_concurrency: maximum number of concurrent searches.
+            score_threshold: optional distance cutoff (lower = more similar);
+                None (default) returns unfiltered results. cognee core calls
+                batch_search without this argument and expects unfiltered
+                distance lists — absolute distances depend on the embedding
+                model, so any fixed default would silently drop valid results.
+            max_concurrency: maximum number of concurrent searches. Defaults
+                to 1: concurrent commands on a single Glide client have been
+                observed to stall until the request timeout, while sequential
+                per-query searches complete in milliseconds.
             include_payload: Whether to include payloads in results.
 
         Returns:
-            List of search results for each query, filtered by score threshold.
+            List of search results for each query.
         """
+        if not query_texts:
+            # Embedding an empty batch would error (providers reject empty
+            # input arrays); an empty query list has no results by definition.
+            return []
+
         if not await self.has_collection(collection_name):
             logger.warning(
                 f"Collection '{collection_name}' not found in ValkeyAdapter.search; returning []."
@@ -567,7 +584,10 @@ class ValkeyAdapter(VectorDBInterface):
         tasks = [limited_search(vector) for vector in vectors]
         results = await asyncio.gather(*tasks)
 
-        # Filter results by a score threshold
+        if score_threshold is None:
+            return list(results)
+
+        # Filter results by the requested score threshold
         return [
             [result for result in result_group if result.score < score_threshold]
             for result_group in results
