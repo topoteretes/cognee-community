@@ -8,6 +8,8 @@ from uuid import NAMESPACE_OID, uuid5
 from cognee.infrastructure.engine import DataPoint
 from cognee.shared.CodeGraphEntities import CodeFile, Repository
 
+from .embedding_limits import enforce_embedding_limits
+
 # constant, declared only once
 EXCLUDED_DIRS: set[str] = {
     ".venv",
@@ -238,4 +240,9 @@ async def get_repo_file_dependencies(
                 source_code_file, "language", None
             ) is None and source_code_file.file_path.endswith(".py"):
                 source_code_file.language = "python"
+            # Large files/classes exceed the embedding model's per-input token
+            # cap (8192 for Azure/OpenAI text-embedding), which aborts the
+            # whole add_data_points batch; trim embeddable source before
+            # handing data points to the pipeline.
+            enforce_embedding_limits(source_code_file)
             yield source_code_file
