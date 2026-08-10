@@ -93,6 +93,7 @@ poetry run python ./examples/example.py
 | `cognee-community-vector-adapter-pinecone`   | Vector   | Pinecone vector database adapter for cognee        |
 | `cognee-community-vector-adapter-qdrant`     | Vector   | Qdrant vector database adapter for cognee          |
 | `cognee-community-vector-adapter-redis`      | Vector   | Redis vector database adapter for cognee           |
+| `cognee-community-vector-adapter-topk`       | Vector   | TopK vector database adapter for cognee            |
 | `cognee-community-vector-adapter-valkey`     | Vector   | Valkey vector database adapter for cognee          |
 | `cognee-community-vector-adapter-weaviate`   | Vector   | Weaviate vector database adapter for cognee        |
 | `cognee-community-graph-adapter-memgraph`    | Graph    | Memgraph graph database adapter for cognee         |

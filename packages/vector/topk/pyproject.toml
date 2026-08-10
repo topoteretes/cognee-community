@@ -1,0 +1,24 @@
+[project]
+name = "cognee-community-vector-adapter-topk"
+version = "0.1.0"
+description = "TopK vector database adapter for cognee"
+readme = "README.md"
+requires-python = ">=3.11,<=3.13"
+dependencies = [
+    "topk-sdk>=0.12.0",
+    "cognee>=1.1.0,<2.0.0",
+    "python-dotenv>=1.0.0",
+    "starlette>=0.48.0",
+    "instructor>=1.11",
+]
+
+[project.urls]
+Homepage = "https://www.topk.io"
+Repository = "https://github.com/topoteretes/cognee-community"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build]
+exclude = ["/dist", "/.venv"]
