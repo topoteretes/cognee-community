@@ -397,7 +397,12 @@ class MilvusAdapter(VectorDBInterface):
             # Perform the search
             search_params = {"metric_type": "COSINE", "params": {"nprobe": 10}}
 
-            output_fields = ["id", "text", "metadata"] if include_payload else ["id"]
+            # belongs_to_set is part of the payload contract: cognee's
+            # nodeset-filtered retrieval inspects payload["belongs_to_set"]
+            # on search results.
+            output_fields = (
+                ["id", "text", "metadata", "belongs_to_set"] if include_payload else ["id"]
+            )
             if with_vector:
                 output_fields.append("vector")
 
@@ -439,14 +444,20 @@ class MilvusAdapter(VectorDBInterface):
 
             scored_results = []
             for result in results[0]:  # results is a list of lists
-                payload = (
-                    {
+                if include_payload:
+                    # Collections created before the belongs_to_set field was
+                    # added won't return it; default to no set memberships.
+                    try:
+                        belongs_to_set = result["belongs_to_set"] or []
+                    except (KeyError, TypeError):
+                        belongs_to_set = []
+                    payload = {
                         "text": result["text"],
                         "metadata": result["metadata"],
+                        "belongs_to_set": belongs_to_set,
                     }
-                    if include_payload
-                    else {}
-                )
+                else:
+                    payload = {}
                 if with_vector:
                     payload["vector"] = result["vector"]
 
