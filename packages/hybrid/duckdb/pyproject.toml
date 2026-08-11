@@ -29,6 +29,9 @@ classifiers = [
 ]
 dependencies = [
     "cognee==1.4.1",
+    # Transitive via cognee; pinned to the version cognee 1.4.1 locks (litellm
+    # 1.96.x published cp310-only wheels, uninstallable on the CI's Python 3.11).
+    "litellm==1.89.2",
     "duckdb>=1.3.2,<1.5.5",  # duckpgq community extension is not yet published for 1.5.5
     "starlette>=0.48.0",
     "instructor>=1.11"
