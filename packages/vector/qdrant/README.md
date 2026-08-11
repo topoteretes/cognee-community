@@ -72,6 +72,7 @@ Setting `QDRANT_QUANTIZATION` only affects newly created collections. To enable 
 
 ```python
 from cognee.infrastructure.databases.vector import get_vector_engine
+
 adapter = get_vector_engine()
 await adapter.update_quantization("Entity_name")
 await adapter.update_quantization("DocumentChunk_text")

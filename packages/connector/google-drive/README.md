@@ -34,8 +34,8 @@ await cognee.remember(
     google_drive_source(folder_id="<folder id from the Drive URL>"),
     dataset_name="my_drive_folder",
     primary_key="file_id",
-    write_disposition="merge",   # incremental upsert by file id
-    max_rows_per_table=0,        # folders often exceed the default 50-row cap
+    write_disposition="merge",  # incremental upsert by file id
+    max_rows_per_table=0,  # folders often exceed the default 50-row cap
 )
 
 answer = await cognee.search(

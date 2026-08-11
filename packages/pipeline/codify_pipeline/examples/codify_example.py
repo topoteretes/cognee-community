@@ -12,7 +12,11 @@ from cognee_community_retriever_code.code_retriever import CodeSearchType
 async def main():
     # Disable permissions feature for this example
     os.environ["ENABLE_BACKEND_ACCESS_CONTROL"] = "false"
-    repo_path = str(pathlib.Path(__file__).parent.parent.parent.parent.resolve())
+    # Codify a small, stable package instead of the whole packages/ tree: the
+    # full tree keeps growing (some adapter files exceed the embedding model's
+    # per-input token cap) and makes this example slow and non-deterministic.
+    packages_root = pathlib.Path(__file__).parent.parent.parent.parent.resolve()
+    repo_path = str(packages_root / "task" / "codify_tasks")
     include_docs = False
 
     await cognee.prune.prune_data()

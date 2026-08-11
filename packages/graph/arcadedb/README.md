@@ -31,11 +31,13 @@ cognee.config.set_graph_database_provider("arcadedb")
 register()
 
 # Configure connection
-cognee.config.set_graph_db_config({
-    "graph_database_url": "bolt://localhost:7687",
-    "graph_database_username": "root",
-    "graph_database_password": "arcadedb",
-})
+cognee.config.set_graph_db_config(
+    {
+        "graph_database_url": "bolt://localhost:7687",
+        "graph_database_username": "root",
+        "graph_database_password": "arcadedb",
+    }
+)
 
 # Use cognee as usual
 await cognee.add(["Your text data here"], "dataset_name")

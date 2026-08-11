@@ -4,7 +4,7 @@ version = "0.1.1"
 description = "Package containing custom cognee tasks for scraping web content using ScrapeGraphAI"
 readme = "README.md"
 # requires-python = ">=3.11,<=3.13"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.14"
 dependencies = [
     "cognee==0.5.3",
     "scrapegraph-py>=2.1.0",

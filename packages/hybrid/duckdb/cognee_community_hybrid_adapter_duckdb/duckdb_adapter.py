@@ -8,14 +8,22 @@ from cognee.infrastructure.databases.graph.graph_db_interface import GraphDBInte
 from cognee.infrastructure.databases.vector.embeddings.EmbeddingEngine import (
     EmbeddingEngine,
 )
+from cognee.infrastructure.databases.vector.exceptions import (
+    CollectionNotFoundError as CogneeCollectionNotFoundError,
+)
 from cognee.infrastructure.databases.vector.models.ScoredResult import ScoredResult
 from cognee.infrastructure.databases.vector.vector_db_interface import VectorDBInterface
 from cognee.infrastructure.engine import DataPoint
 from cognee.shared.logging_utils import get_logger
 
 
-class CollectionNotFoundError(Exception):
-    """Exception raised when a collection is not found."""
+class CollectionNotFoundError(CogneeCollectionNotFoundError):
+    """Collection-not-found error.
+
+    Subclasses cognee's CollectionNotFoundError so core retrieval code
+    (which catches the cognee exception to treat missing collections as
+    empty results) handles it correctly.
+    """
 
     pass
 
@@ -502,7 +510,12 @@ class DuckDBAdapter(VectorDBInterface, GraphDBInterface):
         """[GRAPH] Add a node to the graph."""
         raise NotImplementedError("Graph operations are not implemented for DuckDB adapter")
 
-    async def add_nodes(self, nodes: list[tuple[str, dict[str, Any]]] | list[DataPoint]) -> None:
+    async def add_nodes(
+        self,
+        nodes: list[tuple[str, dict[str, Any]]] | list[DataPoint],
+        source_ref_key: str | None = None,
+        pipeline_run_id: str | None = None,
+    ) -> None:
         """[GRAPH] Add multiple nodes to the graph."""
         raise NotImplementedError("Graph operations are not implemented for DuckDB adapter")
 
@@ -536,6 +549,8 @@ class DuckDBAdapter(VectorDBInterface, GraphDBInterface):
         self,
         edges: list[tuple[str, str, str, dict[str, Any]]]
         | list[tuple[str, str, str, dict[str, Any] | None]],
+        source_ref_key: str | None = None,
+        pipeline_run_id: str | None = None,
     ) -> None:
         """[GRAPH] Add multiple edges to the graph."""
         raise NotImplementedError("Graph operations are not implemented for DuckDB adapter")
@@ -587,7 +602,7 @@ class DuckDBAdapter(VectorDBInterface, GraphDBInterface):
         raise NotImplementedError("Graph operations are not implemented for DuckDB adapter")
 
     async def get_nodeset_subgraph(
-        self, node_type: type[Any], node_name: list[str]
+        self, node_type: type[Any], node_name: list[str], node_name_filter_operator: str = "OR"
     ) -> tuple[list[tuple[int, dict[str, Any]]], list[tuple[int, int, str, dict[str, Any]]]]:
         """[GRAPH] Get a subgraph for specific node types and names."""
         raise NotImplementedError("Graph operations are not implemented for DuckDB adapter")

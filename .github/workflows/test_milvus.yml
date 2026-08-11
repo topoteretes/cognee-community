@@ -38,6 +38,8 @@ jobs:
   test-milvus:
     name: "Milvus Community Adapter Test"
     runs-on: ubuntu-22.04
+    # A hung Milvus bootstrap once idled for hours; fail fast instead.
+    timeout-minutes: 30
     steps:
       - name: Check out
         uses: actions/checkout@v4
@@ -52,9 +54,13 @@ jobs:
           event-type: ${{ inputs.event-type }}
 
       - name: Start Milvus using official script
+        # Pin the script to the release matching the pymilvus client (see
+        # packages/vector/milvus lockfile) — fetching it from `master` made
+        # this job hang for hours whenever upstream changed the script.
+        timeout-minutes: 10
         run: |
-          curl -sfL https://raw.githubusercontent.com/milvus-io/milvus/master/scripts/standalone_embed.sh -o standalone_embed.sh
-          bash standalone_embed.sh start
+          curl -sfL https://raw.githubusercontent.com/milvus-io/milvus/v2.6.2/scripts/standalone_embed.sh -o standalone_embed.sh
+          timeout 480 bash standalone_embed.sh start
           echo "Milvus started with official script"
 
       - name: Wait for Milvus to be ready

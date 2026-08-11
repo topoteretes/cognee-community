@@ -28,8 +28,8 @@ await cognee.remember(
     gmail_source(label_ids=["INBOX"]),
     dataset_name="gmail_inbox",
     primary_key="id",
-    write_disposition="merge",   # REQUIRED — see note below
-    max_rows_per_table=0,        # unlimited: orphan-cleanup sees the whole corpus
+    write_disposition="merge",  # REQUIRED — see note below
+    max_rows_per_table=0,  # unlimited: orphan-cleanup sees the whole corpus
 )
 
 answer = await cognee.search(

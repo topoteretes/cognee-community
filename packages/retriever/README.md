@@ -22,6 +22,8 @@ When adding a new retriever, one should follow these steps:
     the SearchType value in the following manner:
 ```python
 from aenum import extend_enum
+
+
 # We define the search type as a class here to avoid hardcoding it in
 # other modules and files. This will also help in reducing warnings from the compiler.
 class CodeSearchType:

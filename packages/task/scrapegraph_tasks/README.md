@@ -99,8 +99,8 @@ Returns a list of dicts:
 
 ```python
 [
-    {"url": "https://example.com", "content": {...}},           # success
-    {"url": "https://bad.invalid", "content": "", "error": "..."}, # failure
+    {"url": "https://example.com", "content": {...}},  # success
+    {"url": "https://bad.invalid", "content": "", "error": "..."},  # failure
 ]
 ```
 

@@ -78,35 +78,38 @@ from cognee import config, prune, add, cognify, search, SearchType
 # Import the register module to enable Redis support
 from cognee_community_vector_adapter_redis import register
 
+
 async def main():
     # Configure Redis as vector database
-    config.set_vector_db_config({
-        "vector_db_provider": "redis",
-        "vector_db_url": os.getenv("VECTOR_DB_URL", "redis://localhost:6379"),
-        "vector_db_key": os.getenv("VECTOR_DB_KEY", "your-api-key"),  # Optional
-    })
-    
+    config.set_vector_db_config(
+        {
+            "vector_db_provider": "redis",
+            "vector_db_url": os.getenv("VECTOR_DB_URL", "redis://localhost:6379"),
+            "vector_db_key": os.getenv("VECTOR_DB_KEY", "your-api-key"),  # Optional
+        }
+    )
+
     # Optional: Clean previous data
     await prune.prune_data()
     await prune.prune_system()
-    
+
     # Add your content
     await add("""
     Natural language processing (NLP) is an interdisciplinary
     subfield of computer science and information retrieval.
     """)
-    
+
     # Process with cognee
     await cognify()
-    
+
     # Search
     search_results = await search(
-        query_type=SearchType.GRAPH_COMPLETION, 
-        query_text="Tell me about NLP"
+        query_type=SearchType.GRAPH_COMPLETION, query_text="Tell me about NLP"
     )
-    
+
     for result in search_results:
         print("Search result:", result)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
@@ -133,29 +136,26 @@ export VECTOR_DB_KEY="optional-key"  # Not used by Redis
 
 ```python
 # Local Redis
-config.set_vector_db_config({
-    "vector_db_provider": "redis",
-    "vector_db_url": "redis://localhost:6379"
-})
+config.set_vector_db_config(
+    {"vector_db_provider": "redis", "vector_db_url": "redis://localhost:6379"}
+)
 
 # Redis with authentication
-config.set_vector_db_config({
-    "vector_db_provider": "redis", 
-    "vector_db_url": "redis://user:password@localhost:6379"
-})
+config.set_vector_db_config(
+    {"vector_db_provider": "redis", "vector_db_url": "redis://user:password@localhost:6379"}
+)
 
 # Redis with SSL
-config.set_vector_db_config({
-    "vector_db_provider": "redis",
-    "vector_db_url": "rediss://localhost:6380"
-})
+config.set_vector_db_config(
+    {"vector_db_provider": "redis", "vector_db_url": "rediss://localhost:6380"}
+)
 ```
 
 ## Requirements
 
 - Python >= 3.11, <= 3.13
 - redisvl >= 0.6.0, <= 1.0.0
-- cognee >= 0.2.0.dev0
+- cognee == 1.4.1
 
 ## Advanced Usage
 
@@ -168,10 +168,7 @@ from cognee.infrastructure.engine import DataPoint
 
 # Initialize embedding engine and adapter
 embedding_engine = EmbeddingEngine(model="your-model")
-redis_adapter = RedisAdapter(
-    url="redis://localhost:6379",
-    embedding_engine=embedding_engine
-)
+redis_adapter = RedisAdapter(url="redis://localhost:6379", embedding_engine=embedding_engine)
 
 # Direct adapter operations
 await redis_adapter.create_collection("my_collection")
@@ -205,6 +202,7 @@ The adapter uses Cognee's logging system. Enable debug logging to see detailed o
 
 ```python
 import logging
+
 logging.getLogger("RedisAdapter").setLevel(logging.DEBUG)
 ```
 

@@ -32,8 +32,8 @@ await cognee.remember(
     ),
     dataset_name="my_wiki",
     primary_key="id",
-    write_disposition="merge",   # incremental upsert by page id
-    max_rows_per_table=0,        # unlimited: orphan-cleanup sees the whole corpus
+    write_disposition="merge",  # incremental upsert by page id
+    max_rows_per_table=0,  # unlimited: orphan-cleanup sees the whole corpus
 )
 
 answer = await cognee.search(

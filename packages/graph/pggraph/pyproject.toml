@@ -8,7 +8,10 @@ authors = [
 readme = "README.md"
 requires-python = ">=3.10,<=3.13"
 dependencies = [
-    "cognee>=0.5.5",
+    "cognee==1.4.1",
+    # Transitive via cognee; pinned to the version cognee 1.4.1 locks (litellm
+    # 1.96.x published cp310-only wheels, uninstallable on the CI's Python 3.11).
+    "litellm==1.89.2",
     "asyncpg>=0.29.0",
     "starlette>=0.48.0",
     "instructor>=1.11",

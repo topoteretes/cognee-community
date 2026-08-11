@@ -6,25 +6,13 @@ readme = "README.md"
 requires-python = ">=3.11,<=3.13"
 dependencies = [
     "singlestoredb>=1.16.0",
-    "cognee>=1.1.0,<2.0.0",
+    "cognee==1.4.1",
+    # Transitive via cognee; pinned to the version cognee 1.4.1 locks (litellm
+    # 1.96.x published cp310-only wheels, uninstallable on the CI's Python 3.11).
+    "litellm==1.89.2",
     "starlette>=0.48.0",
     "instructor>=1.11"
 ]
-
-[tool.poetry]
-name = "cognee-community-vector-adapter-singlestore"
-version = "0.1.0"
-description = "SingleStore vector database adapter for cognee"
-authors = ["Cognee Community <support@cognee.ai>"]
-readme = "README.md"
-packages = [{ include = "cognee_community_vector_adapter_singlestore" }]
-
-[tool.poetry.dependencies]
-python = ">=3.11,<=3.13"
-singlestoredb = ">=1.16.0"
-cognee = ">=1.1.0,<2.0.0"
-starlette = ">=0.48.0"
-instructor = ">=1.11"
 
 [build-system]
 requires = ["hatchling"]

@@ -6,12 +6,15 @@ authors = [
     {name = "Luca Garulli", email = "l.garulli@arcadedata.com"},
 ]
 dependencies = [
-    "cognee[neo4j]>=1.1.0,<2.0.0",
+    "cognee[neo4j]==1.4.1",
+    # Transitive via cognee; pinned to the version cognee 1.4.1 locks (litellm
+    # 1.96.x published cp310-only wheels, uninstallable on the CI's Python 3.11).
+    "litellm==1.89.2",
     "starlette>=0.48.0",
     "instructor>=1.11"
 ]
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.14"
 
 [project.urls]
 Homepage = "https://github.com/topoteretes/cognee"

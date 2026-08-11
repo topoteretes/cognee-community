@@ -31,7 +31,7 @@ import cognee
 from cognee_community_connector_notion import notion_source
 
 await cognee.remember(
-    notion_source(),               # NOTION_API_KEY from env, or pass token=...
+    notion_source(),  # NOTION_API_KEY from env, or pass token=...
     dataset_name="notion",
 )
 

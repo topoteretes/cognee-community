@@ -81,14 +81,26 @@ class PgGraphAdapter(PostgresAdapter):
             rows = result.fetchall()
             return [dict(row._mapping) for row in rows]
 
-    async def add_nodes(self, nodes: Union[List[Tuple[str, Dict]], List[DataPoint]]) -> None:
-        await super().add_nodes(nodes)
+    async def add_nodes(
+        self,
+        nodes: Union[List[Tuple[str, Dict]], List[DataPoint]],
+        source_ref_key: Optional[str] = None,
+        pipeline_run_id: Optional[str] = None,
+    ) -> None:
+        await super().add_nodes(
+            nodes, source_ref_key=source_ref_key, pipeline_run_id=pipeline_run_id
+        )
         await self._maybe_rebuild_on_write()
 
     async def add_edges(
-        self, edges: Union[List[Tuple[str, str, str, Optional[Dict[str, Any]]]], List]
+        self,
+        edges: Union[List[Tuple[str, str, str, Optional[Dict[str, Any]]]], List],
+        source_ref_key: Optional[str] = None,
+        pipeline_run_id: Optional[str] = None,
     ) -> None:
-        await super().add_edges(edges)
+        await super().add_edges(
+            edges, source_ref_key=source_ref_key, pipeline_run_id=pipeline_run_id
+        )
         await self._maybe_rebuild_on_write()
 
     async def delete_graph(self) -> None:

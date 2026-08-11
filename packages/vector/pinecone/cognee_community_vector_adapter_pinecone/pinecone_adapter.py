@@ -194,11 +194,11 @@ class PineconeAdapter(VectorDBInterface):
         collection_name: str,
         query_text: str | None = None,
         query_vector: list[float] | None = None,
-        limit: int = 15,
+        limit: int | None = 15,
         with_vector: bool = False,
         include_payload: bool = False,
-        node_name: Optional[List[str]] = None,  # TODO: Add functionality for this parameter
-        node_name_filter_operator: str = "OR",  # TODO: Add functionality for this parameter
+        node_name: Optional[List[str]] = None,
+        node_name_filter_operator: str = "OR",
     ) -> list[ScoredResult]:
         """Search for similar vectors in the collection.
 
@@ -206,9 +206,12 @@ class PineconeAdapter(VectorDBInterface):
             collection_name: Name of the collection to search.
             query_text: Text query to search for (will be embedded).
             query_vector: Pre-computed query vector.
-            limit: Maximum number of results to return.
+            limit: Maximum number of results to return (None/0 = all).
             with_vector: Whether to include vectors in results.
             include_payload: Whether to include payload in results.
+            node_name: When provided, only data points whose belongs_to_set
+                metadata contains ANY ("OR") or ALL ("AND") of these names.
+            node_name_filter_operator: "OR" (default) or "AND".
 
         Returns:
             List of ScoredResult objects sorted by similarity.
@@ -231,19 +234,28 @@ class PineconeAdapter(VectorDBInterface):
         try:
             index = self.get_pinecone_index(collection_name)
 
-            if limit == 0:
+            if not limit:
                 # Get actual index stats instead of hardcoded limit
                 stats = index.describe_index_stats()
                 limit = stats.total_vector_count
 
-            if limit == 0:
+            if not limit:
                 return []
+
+            metadata_filter = None
+            if node_name:
+                if node_name_filter_operator.upper() == "AND":
+                    # Equality against a list-valued metadata field means "contains".
+                    metadata_filter = {"$and": [{"belongs_to_set": name} for name in node_name]}
+                else:
+                    metadata_filter = {"belongs_to_set": {"$in": list(node_name)}}
 
             results = index.query(
                 vector=query_vector,
                 top_k=limit,
                 include_metadata=include_payload,
                 include_values=with_vector,
+                filter=metadata_filter,
             )
 
             return [
@@ -304,6 +316,13 @@ class PineconeAdapter(VectorDBInterface):
             vectors = await self.embed_data(query_texts)
             index = self.get_pinecone_index(collection_name)
 
+            metadata_filter = None
+            if node_name:
+                if node_name_filter_operator.upper() == "AND":
+                    metadata_filter = {"$and": [{"belongs_to_set": name} for name in node_name]}
+                else:
+                    metadata_filter = {"belongs_to_set": {"$in": list(node_name)}}
+
             results = []
             for i, vector in enumerate(vectors):
                 try:
@@ -312,8 +331,7 @@ class PineconeAdapter(VectorDBInterface):
                         top_k=limit,
                         include_metadata=include_payload,
                         include_values=with_vectors,
-                        node_name=node_name,
-                        node_name_filter_operator=node_name_filter_operator,
+                        filter=metadata_filter,
                     )
 
                     # Convert to ScoredResult objects (no filtering to match other adapters)

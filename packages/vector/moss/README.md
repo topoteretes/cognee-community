@@ -43,13 +43,16 @@ import os
 from cognee_community_vector_adapter_moss import register  # noqa: F401
 from cognee import add, cognify, config, search
 
+
 async def main():
-    config.set_vector_db_config({
-        "vector_db_provider": "moss",
-        "vector_db_key": os.getenv("MOSS_PROJECT_KEY"),
-        "vector_db_name": os.getenv("MOSS_PROJECT_ID"),
-        "vector_dataset_database_handler": "moss",
-    })
+    config.set_vector_db_config(
+        {
+            "vector_db_provider": "moss",
+            "vector_db_key": os.getenv("MOSS_PROJECT_KEY"),
+            "vector_db_name": os.getenv("MOSS_PROJECT_ID"),
+            "vector_dataset_database_handler": "moss",
+        }
+    )
 
     await add("Natural language processing is a subfield of computer science.")
     await cognify()
@@ -57,6 +60,7 @@ async def main():
     results = await search(query_text="Tell me about NLP")
     for r in results:
         print(r)
+
 
 asyncio.run(main())
 ```

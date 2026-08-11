@@ -6,7 +6,10 @@ readme = "README.md"
 requires-python = ">=3.11,<=3.13"
 dependencies = [
     "valkey-glide>=2.1.0",
-    "cognee>=1.1.0,<2.0.0",
+    "cognee==1.4.1",
+    # Transitive via cognee; pinned to the version cognee 1.4.1 locks (litellm
+    # 1.96.x published cp310-only wheels, uninstallable on the CI's Python 3.11).
+    "litellm==1.89.2",
     "numpy>=1.24.0"
 ]
 

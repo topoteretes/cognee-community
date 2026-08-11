@@ -32,7 +32,6 @@ def serialize_for_json(obj: Any) -> Any:
 
 def is_retryable_request(error):
     from requests.exceptions import RequestException
-
     from weaviate.exceptions import UnexpectedStatusCodeException
 
     if isinstance(error, UnexpectedStatusCodeException):

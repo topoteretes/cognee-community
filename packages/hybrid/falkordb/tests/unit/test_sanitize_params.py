@@ -92,12 +92,26 @@ def test_bound_list_of_maps_preserved_for_unwind():
     # A list of maps bound as a param (e.g. the `UNWIND $items AS item ... SET
     # edge += item` edge batch) MUST stay a list of maps — JSON-stringifying the
     # elements makes FalkorDB fail with "Type mismatch: expected Map ... but was
-    # String". The element maps' values are still primitivized (they get stored).
+    # String". A dict-valued record field like `props` (spread via
+    # `SET r += e.props`) must ALSO stay a map: FalkorDB rejects a JSON string
+    # there with "Property values can only be of primitive types or arrays of
+    # primitive types". Only the props map's own values are primitivized.
     result = FalkorDBAdapter._sanitize_cypher_params(
         {"items": [{"edge_index": 0, "props": {"w": 1}}, {"edge_index": 1}]}
     )
     # props stays a map so `SET r += item.props` works (issue #3324)
     assert result == {"items": [{"edge_index": 0, "props": {"w": 1}}, {"edge_index": 1}]}
+
+
+def test_bound_record_props_leaf_values_coerced():
+    # Coercion is structure-preserving at every depth: a record's props sub-map
+    # stays a map (nested maps included) while leaf values are coerced
+    # (bytes -> text, Enum -> value). Storage-bound values are primitivized by
+    # the write paths (_flatten_value / create_data_point_query), not here.
+    result = FalkorDBAdapter._sanitize_cypher_params(
+        {"items": [{"props": {"meta": {"a": 1}, "raw": b"x", "kind": Color.RED}}]}
+    )
+    assert result == {"items": [{"props": {"meta": {"a": 1}, "raw": "x", "kind": "red"}}]}
 
 
 def test_stored_map_value_json_encoded():
@@ -113,18 +127,18 @@ def test_stored_map_value_json_encoded():
 
 
 def test_stored_array_of_maps_json_encoded():
-    # An array of maps as a stored property value becomes an array of JSON strings
-    # (a valid array-of-primitives).
-    result = FalkorDBAdapter._sanitize_cypher_params({"properties": {"objs": [{"k": 1}, {"k": 2}]}})
     # Nested maps in arrays also preserve their shape (issue #3324)
+    result = FalkorDBAdapter._sanitize_cypher_params({"properties": {"objs": [{"k": 1}, {"k": 2}]}})
     assert result == {"properties": {"objs": [{"k": 1}, {"k": 2}]}}
 
 
-def test_stored_array_with_null_json_encoded():
-    # FalkorDB rejects null elements inside a stored array; it can't be made
-    # all-primitive, so the whole array becomes a JSON string.
+def test_stored_array_with_null_passthrough():
+    # The sanitizer is structure-preserving; null-containing arrays pass
+    # through unchanged. Write paths that store arrays as property values
+    # (add_edges' _flatten_value) JSON-encode them before binding, which is
+    # where FalkorDB's "no null array elements" rule is satisfied.
     result = FalkorDBAdapter._sanitize_cypher_params({"properties": {"tags": ["a", None]}})
-    assert result == {"properties": {"tags": '["a", null]'}}
+    assert result == {"properties": {"tags": ["a", None]}}
 
 
 def test_coerce_param_value_helper():

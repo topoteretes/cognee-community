@@ -70,34 +70,35 @@ from cognee import config, prune, add, cognify, search, SearchType
 # Import the register module to enable DuckDB support
 from cognee_community_hybrid_adapter_duckdb import register
 
+
 async def main():
     # Configure DuckDB as vector database
-    config.set_vector_db_config({
-        "vector_db_provider": "duckdb",
-        "vector_db_url": "my_database.db",  # File path or None for in-memory
-    })
-    
+    config.set_vector_db_config(
+        {
+            "vector_db_provider": "duckdb",
+            "vector_db_url": "my_database.db",  # File path or None for in-memory
+        }
+    )
+
     # Optional: Clean previous data
     await prune.prune_data()
     await prune.prune_system()
-    
+
     # Add your content
     await add("""
     Natural language processing (NLP) is an interdisciplinary
     subfield of computer science and information retrieval.
     """)
-    
+
     # Process with cognee
     await cognify()
-    
+
     # Search (use vector-based search types)
-    search_results = await search(
-        query_type=SearchType.CHUNKS, 
-        query_text="Tell me about NLP"
-    )
-    
+    search_results = await search(query_type=SearchType.CHUNKS, query_text="Tell me about NLP")
+
     for result in search_results:
         print("Search result:", result)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
@@ -114,28 +115,28 @@ Configure DuckDB as your vector database in cognee:
 
 ```python
 # Persistent file-based database
-config.set_vector_db_config({
-    "vector_db_provider": "duckdb",
-    "vector_db_url": "cognee_vectors.db"
-})
+config.set_vector_db_config({"vector_db_provider": "duckdb", "vector_db_url": "cognee_vectors.db"})
 
 # In-memory database (fastest, but data is lost on restart)
-config.set_vector_db_config({
-    "vector_db_provider": "duckdb",
-    "vector_db_url": None  # or ":memory:"
-})
+config.set_vector_db_config(
+    {
+        "vector_db_provider": "duckdb",
+        "vector_db_url": None,  # or ":memory:"
+    }
+)
 
 # Absolute path to database file
-config.set_vector_db_config({
-    "vector_db_provider": "duckdb", 
-    "vector_db_url": "/path/to/my/database.db"
-})
+config.set_vector_db_config(
+    {"vector_db_provider": "duckdb", "vector_db_url": "/path/to/my/database.db"}
+)
 
 # MotherDuck cloud database
-config.set_vector_db_config({
-    "vector_db_provider": "duckdb",
-    "vector_db_url": "md:my_database"  # Replace with your MotherDuck database
-})
+config.set_vector_db_config(
+    {
+        "vector_db_provider": "duckdb",
+        "vector_db_url": "md:my_database",  # Replace with your MotherDuck database
+    }
+)
 ```
 
 ## Requirements
@@ -188,6 +189,7 @@ The adapter uses Cognee's logging system. Enable debug logging to see detailed o
 
 ```python
 import logging
+
 logging.getLogger("DuckDBAdapter").setLevel(logging.DEBUG)
 ```
 

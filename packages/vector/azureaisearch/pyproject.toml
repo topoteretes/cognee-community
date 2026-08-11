@@ -7,7 +7,10 @@ requires-python = "<=3.13,>=3.10"
 dependencies = [
     "azure-search-documents>=11.4.0",
     "azure-core>=1.29.0",
-    "cognee>=1.1.0,<2.0.0"
+    "cognee==1.4.1",
+    # Transitive via cognee; pinned to the version cognee 1.4.1 locks (litellm
+    # 1.96.x published cp310-only wheels, uninstallable on the CI's Python 3.11).
+    "litellm==1.89.2",
 ]
 
 [project.urls]

@@ -55,10 +55,13 @@ async def valkey_client_and_engine():
 
     yield client, vector_engine
 
+    # The adapter's glide client lives on its private I/O loop; raw glide
+    # commands must be routed through _run_glide — awaiting them on the test's
+    # loop never completes (cross-loop futures).
     # Drop all indexes before each test
-    all_indexes = await ft.list(client)
+    all_indexes = await vector_engine._run_glide(ft.list(client))
     for index in all_indexes:
-        await ft.dropindex(client, index)
+        await vector_engine._run_glide(ft.dropindex(client, index))
     await vector_engine.close()
 
 
@@ -72,7 +75,7 @@ async def test_happy_path(valkey_client_and_engine):
     await vector_engine.create_collection(collection)
 
     # Verify collection created
-    info = await ft.info(client, vector_engine._index_name(collection))
+    info = await vector_engine._run_glide(ft.info(client, vector_engine._index_name(collection)))
     assert info is not None
 
     # Insert a couple of points
@@ -90,7 +93,10 @@ async def test_happy_path(valkey_client_and_engine):
     assert len(results) == 2
     assert [r.id for r in results] == [id_1, id_2]
 
-    assert await ft.dropindex(client, vector_engine._index_name(collection)) == OK
+    assert (
+        await vector_engine._run_glide(ft.dropindex(client, vector_engine._index_name(collection)))
+        == OK
+    )
 
 
 async def test_create_data_points_collection_not_found(valkey_client_and_engine):
@@ -128,7 +134,10 @@ async def test_empty_collection_search_returns_no_results(valkey_client_and_engi
     )
 
     assert results == []
-    assert await ft.dropindex(client, vector_engine._index_name(collection)) == OK
+    assert (
+        await vector_engine._run_glide(ft.dropindex(client, vector_engine._index_name(collection)))
+        == OK
+    )
 
 
 async def test_search_invalid_collection_returns_no_results(valkey_client_and_engine):
@@ -149,7 +158,10 @@ async def test_search_empty_query_text(valkey_client_and_engine):
     with pytest.raises(MissingQueryParameterError):
         await vector_engine.search(collection_name=collection, query_text=None, limit=10)
 
-    assert await ft.dropindex(client, vector_engine._index_name(collection)) == OK
+    assert (
+        await vector_engine._run_glide(ft.dropindex(client, vector_engine._index_name(collection)))
+        == OK
+    )
 
 
 async def test_delete_data_points(valkey_client_and_engine):
@@ -186,7 +198,10 @@ async def test_delete_data_points(valkey_client_and_engine):
     assert len(results) == 1
     assert [r.id for r in results] == [id_2]
 
-    assert await ft.dropindex(client, vector_engine._index_name(collection)) == OK
+    assert (
+        await vector_engine._run_glide(ft.dropindex(client, vector_engine._index_name(collection)))
+        == OK
+    )
 
 
 async def test_delete_non_existing_ids(valkey_client_and_engine):
@@ -240,7 +255,9 @@ async def test_prune_removes_all_collections(valkey_client_and_engine):
     await vector_engine.create_collection(collection_name=col2)
 
     # Verify collections exist
-    indexes_before = [idx.decode("utf-8") for idx in await ft.list(client)]
+    indexes_before = [
+        idx.decode("utf-8") for idx in await vector_engine._run_glide(ft.list(client))
+    ]
     assert vector_engine._index_name(col1) in indexes_before
     assert vector_engine._index_name(col2) in indexes_before
 
@@ -248,7 +265,7 @@ async def test_prune_removes_all_collections(valkey_client_and_engine):
     await vector_engine.prune()
 
     # Verify all collections are removed
-    indexes_after = [idx.decode("utf-8") for idx in await ft.list(client)]
+    indexes_after = [idx.decode("utf-8") for idx in await vector_engine._run_glide(ft.list(client))]
     assert vector_engine._index_name(col1) not in indexes_after
     assert vector_engine._index_name(col2) not in indexes_after
     assert len(indexes_after) == 0 or all(idx.startswith("system") for idx in indexes_after)
@@ -280,10 +297,13 @@ async def test_batch_search_returns_results(valkey_client_and_engine):
     ]
     await vector_engine.create_data_points(collection_name=collection, data_points=data_points)
 
-    # Perform batch search
+    # Perform batch search. No score_threshold: absolute distances depend on
+    # the embedding model in use (e.g. OpenAI cosine distances for these
+    # sentences exceed 0.5), so the assertions below rely on membership and
+    # ranking rather than a model-specific cutoff.
     queries = ["Hello", "embeddings"]
     results = await vector_engine.batch_search(
-        collection_name=collection, query_texts=queries, limit=10, score_threshold=0.5
+        collection_name=collection, query_texts=queries, limit=10
     )
 
     # Validate structure
@@ -318,4 +338,4 @@ async def test_valkey_connection(valkey_client_and_engine):
     client, vector_engine = valkey_client_and_engine
 
     assert client is not None
-    assert (await client.ping()) in (b"PONG", "PONG")
+    assert (await vector_engine._run_glide(client.ping())) in (b"PONG", "PONG")

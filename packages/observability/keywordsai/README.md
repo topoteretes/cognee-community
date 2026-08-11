@@ -27,21 +27,26 @@ from cognee.pipelines import run_tasks, Task
 from cognee.tasks.storage import add_data_points as _add_data_points
 
 from cognee.modules.observability.get_observe import get_observe
-observe = get_observe()          # returns Keywords AI decorator
+
+observe = get_observe()  # returns Keywords AI decorator
+
 
 # ---------------- DataPoint models ---------------- #
 class Person(DataPoint):
     name: str
     metadata = {"index_fields": ["name"]}
 
+
 class Department(DataPoint):
     name: str
     employees: list[Person]
     metadata = {"index_fields": ["name"]}
 
+
 class CompanyType(DataPoint):
     name: str = "Company"
     metadata = {"index_fields": ["name"]}
+
 
 class Company(DataPoint):
     name: str
@@ -49,8 +54,9 @@ class Company(DataPoint):
     is_type: CompanyType
     metadata = {"index_fields": ["name"]}
 
+
 # ---------------- Tasks ---------------- #
-@observe                    # task span “ingest_files”
+@observe  # task span “ingest_files”
 def ingest_files(data: List[Any]):
     people_dp, dept_dp, companies_dp = {}, {}, {}
     for item in data:
@@ -67,17 +73,18 @@ def ingest_files(data: List[Any]):
                 name=c["name"], departments=[], is_type=company_type
             )
             for d in c["departments"]:
-                comp.departments.append(
-                    dept_dp.setdefault(d, Department(name=d, employees=[]))
-                )
+                comp.departments.append(dept_dp.setdefault(d, Department(name=d, employees=[])))
     return companies_dp.values()
+
 
 add_data_points = observe(_add_data_points)  # task span “add_data_points”
 
+
 # ---------------- Workflow ---------------- #
-@observe(workflow=True)     # workflow span “main”
+@observe(workflow=True)  # workflow span “main”
 async def main():
-    await prune.prune_data(); await prune.prune_system(metadata=True)
+    await prune.prune_data()
+    await prune.prune_system(metadata=True)
     await setup()
 
     user = await get_default_user()
@@ -85,7 +92,7 @@ async def main():
 
     base = os.path.dirname(__file__)
     companies = json.load(open(os.path.join(base, "companies.json")))
-    people    = json.load(open(os.path.join(base, "people.json")))
+    people = json.load(open(os.path.join(base, "people.json")))
     data = [{"companies": companies, "people": people}]
 
     pipeline = run_tasks(
@@ -94,15 +101,16 @@ async def main():
         data=data,
         incremental_loading=False,
     )
-    async for s in pipeline: print(s)
+    async for s in pipeline:
+        print(s)
 
     out = os.path.join(base, ".artifacts/graph_visualization.html")
     await visualize_graph(out)
     return out
 
+
 if __name__ == "__main__":
     asyncio.run(main())
-
 ```
 
 ![Example output](example_output.png)

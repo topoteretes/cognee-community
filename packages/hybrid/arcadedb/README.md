@@ -25,6 +25,7 @@ from cognee import config, prune, add, cognify, search, SearchType
 # Import the register module to enable ArcadeDB support
 from cognee_community_hybrid_adapter_arcadedb import register
 
+
 async def main():
     # Set up local directories
     system_path = pathlib.Path(__file__).parent
@@ -32,25 +33,31 @@ async def main():
     config.data_root_directory(path.join(system_path, ".cognee_data"))
 
     # Configure databases
-    config.set_relational_db_config({
-        "db_provider": "sqlite",
-    })
+    config.set_relational_db_config(
+        {
+            "db_provider": "sqlite",
+        }
+    )
 
     # Configure ArcadeDB as both vector and graph database
-    config.set_vector_db_config({
-        "vector_db_provider": "arcadedb",
-        "vector_db_url": os.getenv("ARCADEDB_URL", "localhost"),
-        "vector_db_port": int(os.getenv("ARCADEDB_HTTP_PORT", "2480")),
-        "vector_db_username": os.getenv("ARCADEDB_USERNAME", "root"),
-        "vector_db_password": os.getenv("ARCADEDB_PASSWORD", ""),
-    })
-    config.set_graph_db_config({
-        "graph_database_provider": "arcadedb",
-        "graph_database_url": os.getenv("ARCADEDB_URL", "localhost"),
-        "graph_database_port": int(os.getenv("ARCADEDB_HTTP_PORT", "2480")),
-        "graph_database_username": os.getenv("ARCADEDB_USERNAME", "root"),
-        "graph_database_password": os.getenv("ARCADEDB_PASSWORD", ""),
-    })
+    config.set_vector_db_config(
+        {
+            "vector_db_provider": "arcadedb",
+            "vector_db_url": os.getenv("ARCADEDB_URL", "localhost"),
+            "vector_db_port": int(os.getenv("ARCADEDB_HTTP_PORT", "2480")),
+            "vector_db_username": os.getenv("ARCADEDB_USERNAME", "root"),
+            "vector_db_password": os.getenv("ARCADEDB_PASSWORD", ""),
+        }
+    )
+    config.set_graph_db_config(
+        {
+            "graph_database_provider": "arcadedb",
+            "graph_database_url": os.getenv("ARCADEDB_URL", "localhost"),
+            "graph_database_port": int(os.getenv("ARCADEDB_HTTP_PORT", "2480")),
+            "graph_database_username": os.getenv("ARCADEDB_USERNAME", "root"),
+            "graph_database_password": os.getenv("ARCADEDB_PASSWORD", ""),
+        }
+    )
 
     # Optional: Clean previous data
     await prune.prune_data()
@@ -72,6 +79,7 @@ async def main():
 
     for result in search_results:
         print("\nSearch result:\n" + result)
+
 
 if __name__ == "__main__":
     asyncio.run(main())

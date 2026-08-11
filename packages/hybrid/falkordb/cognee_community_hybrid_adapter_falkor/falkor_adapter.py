@@ -149,20 +149,18 @@ class FalkorDBAdapter(VectorDBInterface, GraphDBInterface):
         needs.
 
         Maps and arrays-of-maps are valid *bound params* — e.g. an
-        ``UNWIND $items AS item ... SET edge += item`` edge batch binds a list of
-        maps — so this keeps that shape. A record map keeps its keys, but its
-        values are primitivized via :meth:`_coerce_stored_value` (they get stored
-        as properties). Flattening a list of maps to JSON strings (as a blanket
-        coercion would) makes the ``UNWIND`` fail with ``Type mismatch: expected
-        Map ... but was String``. ``bytes`` / ``Enum`` outside a record map are
-        still coerced.
+        ``UNWIND $items AS item ... SET edge += item`` edge batch binds a list
+        of maps, and a dict-valued record field (``e.props``, spread via
+        ``SET r += e.props``) must ALSO stay a map: FalkorDB rejects a JSON
+        string there with ``Property values can only be of primitive types or
+        arrays of primitive types`` (issue #3324). So coercion is fully
+        structure-preserving: dicts and lists keep their shape at every depth
+        and only leaf values are coerced (``Enum`` -> ``.value``, ``bytes`` ->
+        text). Values destined for storage are primitivized by the write paths
+        themselves (``create_data_point_query`` / ``add_edges``'s
+        ``_flatten_value``) before they reach the sanitizer.
         """
         if isinstance(value, dict):
-            # Recurse so nested maps (e.g. edge ``props`` spread via
-            # ``SET r += item.props``) keep their map shape.  Routing dict
-            # values through ``_coerce_stored_value`` would ``json.dumps``
-            # them into strings, which FalkorDB rejects with
-            # ``Property values can only be of primitive types`` (issue #3324).
             return {key: FalkorDBAdapter._coerce_param_value(val) for key, val in value.items()}
         if isinstance(value, (list, tuple)):
             return [FalkorDBAdapter._coerce_param_value(item) for item in value]
@@ -177,10 +175,9 @@ class FalkorDBAdapter(VectorDBInterface, GraphDBInterface):
         """Make a bound-params dict safe for FalkorDB.
 
         Routes every value through :meth:`_coerce_param_value` (structure-
-        preserving), which primitivizes the values that get stored as properties
-        via :meth:`_coerce_stored_value`. Without this a ``bytes`` value or a
-        nested map/array in a model-extracted entity rejects the whole query and
-        aborts the pipeline run.
+        preserving, leaf-coercing). Without this a ``bytes`` or ``Enum`` value
+        in a model-extracted entity rejects the whole query and aborts the
+        pipeline run.
         """
         return {key: FalkorDBAdapter._coerce_param_value(value) for key, value in params.items()}
 
@@ -695,7 +692,12 @@ class FalkorDBAdapter(VectorDBInterface, GraphDBInterface):
         """
         await self.create_data_points("", nodes)
 
-    async def add_nodes(self, nodes: list[Node] | list[DataPoint]) -> None:
+    async def add_nodes(
+        self,
+        nodes: list[Node] | list[DataPoint],
+        source_ref_key: str | None = None,
+        pipeline_run_id: str | None = None,
+    ) -> None:
         """
         Add multiple nodes to the graph in a single operation.
 
@@ -784,7 +786,12 @@ class FalkorDBAdapter(VectorDBInterface, GraphDBInterface):
         query = await self.create_edge_query(edge_tuple)
         await self.query(query)
 
-    async def add_edges(self, edges: list[EdgeData]) -> None:
+    async def add_edges(
+        self,
+        edges: list[EdgeData],
+        source_ref_key: str | None = None,
+        pipeline_run_id: str | None = None,
+    ) -> None:
         """
         Add multiple edges to the graph in a single operation.
 

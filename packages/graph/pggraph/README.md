@@ -53,13 +53,15 @@ from cognee_community_graph_adapter_pggraph import register
 async def main():
     register()
     cognee.config.set_graph_database_provider("pggraph")
-    cognee.config.set_graph_db_config({
-        "graph_database_host": os.getenv("GRAPH_DATABASE_HOST", "localhost"),
-        "graph_database_port": int(os.getenv("GRAPH_DATABASE_PORT", "5433")),
-        "graph_database_name": os.getenv("GRAPH_DATABASE_NAME", "cognee"),
-        "graph_database_username": os.getenv("GRAPH_DATABASE_USERNAME", "cognee"),
-        "graph_database_password": os.getenv("GRAPH_DATABASE_PASSWORD", "cognee"),
-    })
+    cognee.config.set_graph_db_config(
+        {
+            "graph_database_host": os.getenv("GRAPH_DATABASE_HOST", "localhost"),
+            "graph_database_port": int(os.getenv("GRAPH_DATABASE_PORT", "5433")),
+            "graph_database_name": os.getenv("GRAPH_DATABASE_NAME", "cognee"),
+            "graph_database_username": os.getenv("GRAPH_DATABASE_USERNAME", "cognee"),
+            "graph_database_password": os.getenv("GRAPH_DATABASE_PASSWORD", "cognee"),
+        }
+    )
 
     graph = await get_graph_engine()
     await graph.initialize()

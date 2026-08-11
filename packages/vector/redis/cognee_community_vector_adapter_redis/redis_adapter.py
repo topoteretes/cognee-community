@@ -8,6 +8,9 @@ from cognee.infrastructure.databases.vector import VectorDBInterface
 from cognee.infrastructure.databases.vector.embeddings.EmbeddingEngine import (
     EmbeddingEngine,
 )
+from cognee.infrastructure.databases.vector.exceptions import (
+    CollectionNotFoundError as CogneeCollectionNotFoundError,
+)
 from cognee.infrastructure.databases.vector.models.ScoredResult import ScoredResult
 from cognee.infrastructure.engine import DataPoint
 from cognee.infrastructure.engine.utils import parse_id
@@ -27,8 +30,13 @@ class VectorEngineInitializationError(Exception):
     pass
 
 
-class CollectionNotFoundError(Exception):
-    """Exception raised when a collection is not found."""
+class CollectionNotFoundError(CogneeCollectionNotFoundError):
+    """Collection-not-found error.
+
+    Subclasses cognee's CollectionNotFoundError so core retrieval code
+    (which catches the cognee exception to treat missing collections as
+    empty results) handles it correctly.
+    """
 
     pass
 
@@ -441,9 +449,9 @@ class RedisAdapter(VectorDBInterface):
         self,
         collection_name: str,
         query_texts: list[str],
-        limit: int | None,
+        limit: int | None = None,
         with_vectors: bool = False,
-        include_payload: bool = True,
+        include_payload: bool = False,
         node_name: Optional[List[str]] = None,
         node_name_filter_operator: str = "OR",
     ) -> list[list[ScoredResult]]:

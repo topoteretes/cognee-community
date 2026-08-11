@@ -57,37 +57,44 @@ from cognee import config, prune, add, cognify, search, SearchType
 # Import the register module to enable Weaviate support
 import cognee_community_vector_adapter_weaviate.register
 
+
 async def main():
     # Configure databases
-    config.set_relational_db_config({
-        "db_provider": "sqlite",
-    })
-    config.set_vector_db_config({
-        "vector_db_provider": "weaviate",
-        "vector_db_url": os.getenv("VECTOR_DB_URL"),  # or your Weaviate URL
-        "vector_db_key": os.getenv("VECTOR_DB_KEY"),  # or your API key
-    })
-    config.set_graph_db_config({
-        "graph_database_provider": "networkx",
-    })
-    
+    config.set_relational_db_config(
+        {
+            "db_provider": "sqlite",
+        }
+    )
+    config.set_vector_db_config(
+        {
+            "vector_db_provider": "weaviate",
+            "vector_db_url": os.getenv("VECTOR_DB_URL"),  # or your Weaviate URL
+            "vector_db_key": os.getenv("VECTOR_DB_KEY"),  # or your API key
+        }
+    )
+    config.set_graph_db_config(
+        {
+            "graph_database_provider": "networkx",
+        }
+    )
+
     # Optional: Clean previous data
     await prune.prune_data()
     await prune.prune_system()
-    
+
     # Add and process your content
     text = "Your text content here"
     await add(text)
     await cognify()
-    
+
     # Search
     search_results = await search(
-        query_type=SearchType.GRAPH_COMPLETION,
-        query_text="Your search query"
+        query_type=SearchType.GRAPH_COMPLETION, query_text="Your search query"
     )
-    
+
     for result in search_results:
         print(result)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
@@ -116,7 +123,7 @@ export VECTOR_DB_KEY="your-api-key"
 
 - Python >= 3.11, <= 3.13
 - weaviate-client >= 4.9.6, < 5.0.0
-- cognee >= 0.2.1
+- cognee == 1.4.1
 
 ## Features
 

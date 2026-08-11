@@ -11,7 +11,10 @@ from cognee.infrastructure.databases.graph.graph_db_interface import (
 )
 from cognee.infrastructure.engine import DataPoint
 from cognee.modules.storage.utils import JSONEncoder
+from cognee.shared.logging_utils import get_logger
 from turingdb import TuringDB
+
+logger = get_logger()
 
 
 class TuringDBAdapter(GraphDBInterface):
@@ -37,14 +40,28 @@ class TuringDBAdapter(GraphDBInterface):
             self.driver = TuringDB()
 
         existing_graphs = self.driver.list_available_graphs()
-        if self.database_name not in existing_graphs:
-            self.driver.create_graph(self.database_name)
+        needs_seed = self.database_name not in existing_graphs
+        if needs_seed:
+            try:
+                self.driver.create_graph(self.database_name)
+            except Exception:
+                # The graph appeared between the listing and the create (race,
+                # or a stale listing) — reuse it instead of failing the init.
+                needs_seed = False
         self.driver.set_graph(self.database_name)
-        change = self.driver.new_change()
-        self.driver.checkout(change=change)
-        self.driver.query("CREATE (:Node {id: 'seed'})")
-        self.driver.query("COMMIT")
-        self.driver.query("CHANGE SUBMIT")
+        if needs_seed:
+            # Seed only freshly created graphs (re-seeding on every reconnect
+            # would accumulate duplicate seed nodes). The seed carries
+            # properties_json so the property is known to TuringDB's query
+            # analyzer from the start: without it, any read that projects
+            # n.properties_json (e.g. get_graph_data during cognee's startup
+            # migrations) fails ANALYZE with "Property type not found" and
+            # cognee blocks writes to the database.
+            change = self.driver.new_change()
+            self.driver.checkout(change=change)
+            self.driver.query("CREATE (:Node {id: 'seed', properties_json: '{}'})")
+            self.driver.query("COMMIT")
+            self.driver.query("CHANGE SUBMIT")
         self.driver.checkout()
 
     def _coerce_json_value(self, value: Any) -> Any:
@@ -186,6 +203,20 @@ class TuringDBAdapter(GraphDBInterface):
         finally:
             self.driver.checkout()
 
+    @staticmethod
+    def _is_unknown_property_error(error: Exception) -> bool:
+        """True when TuringDB's analyzer rejected a read referencing a property
+        that no node/edge in the graph currently carries.
+
+        TuringDB reports this two ways: "Property type 'x' not found" for
+        projections (RETURN n.x) and "Unknown property: x" for match patterns
+        (MATCH (n {x: ...})).
+        """
+        message = str(error)
+        if "Unknown property" in message:
+            return True
+        return "Property type" in message and "not found" in message
+
     async def is_empty(self) -> bool:
         query = """
                 MATCH (n)
@@ -200,7 +231,26 @@ class TuringDBAdapter(GraphDBInterface):
         if self._is_write_query(query):
             return self._run_in_change([query])
 
-        result = self.driver.query(query=query)
+        try:
+            result = self.driver.query(query=query)
+        except Exception as error:
+            if self._is_unknown_property_error(error):
+                # TuringDB's analyzer rejects reads referencing a property no
+                # node/edge currently carries — e.g. `MATCH (n {id: ...})`
+                # right after DETACH DELETE removed every node, which drops
+                # the property from the graph schema, or reads against a
+                # foreign/legacy graph. Semantically that is just "no
+                # matches", so return an empty result instead of aborting the
+                # caller (cognee's migrations and pipeline writes both trip
+                # over this otherwise).
+                logger.debug(
+                    "TuringDB read referenced a property unknown to graph %s; "
+                    "treating as no matches. Query: %s",
+                    self.database_name,
+                    query,
+                )
+                return []
+            raise
         return self._df_to_records(result)
 
     async def add_node(
@@ -237,7 +287,12 @@ class TuringDBAdapter(GraphDBInterface):
         create_query = f"CREATE (:{label} {{{property_fragments}}})"
         self._run_in_change([create_query])
 
-    async def add_nodes(self, nodes: Union[List[Node], List[DataPoint]]) -> None:
+    async def add_nodes(
+        self,
+        nodes: Union[List[Node], List[DataPoint]],
+        source_ref_key: Optional[str] = None,
+        pipeline_run_id: Optional[str] = None,
+    ) -> None:
         if not nodes:
             return
 
@@ -368,6 +423,8 @@ class TuringDBAdapter(GraphDBInterface):
             List[EdgeData],
             List[Tuple[str, str, str, Optional[Dict[str, Any]]]],
         ],
+        source_ref_key: Optional[str] = None,
+        pipeline_run_id: Optional[str] = None,
     ) -> None:
         if not edges:
             return
@@ -414,6 +471,8 @@ class TuringDBAdapter(GraphDBInterface):
         nodes_query = (
             f"MATCH (n) RETURN n.id AS id, n.{self.PROPERTIES_JSON_KEY} AS properties_json"
         )
+        # query() maps unknown-property ANALYZE errors (foreign/legacy graphs
+        # with no cognee-written nodes) to an empty result set.
         nodes_result = await self.query(nodes_query)
         nodes: List[Node] = []
         for row in nodes_result:

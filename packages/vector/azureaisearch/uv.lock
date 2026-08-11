@@ -579,7 +579,7 @@ wheels = [
 
 [[package]]
 name = "cognee"
-version = "1.1.2"
+version = "1.4.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiofiles" },
@@ -588,11 +588,13 @@ dependencies = [
     { name = "aiosqlite" },
     { name = "alembic" },
     { name = "cbor2" },
+    { name = "cryptography" },
     { name = "datamodel-code-generator" },
     { name = "diskcache" },
     { name = "fakeredis", extra = ["lua"] },
     { name = "fastapi" },
     { name = "fastapi-users", extra = ["sqlalchemy"] },
+    { name = "filelock" },
     { name = "filetype" },
     { name = "gunicorn" },
     { name = "instructor" },
@@ -626,9 +628,9 @@ dependencies = [
     { name = "uvicorn" },
     { name = "websockets" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/23/b1/1f2ad87bc25a64a62781f23f299d58f9502804b705ee87d364d3efbb0564/cognee-1.1.2.tar.gz", hash = "sha256:ef80b8da94ad148b32deb6a9ba1315bc7105508d741a47eff70c6645b30485bf", size = 18954198, upload-time = "2026-05-30T18:14:03.861Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/d8/93/1277ebad661581e4eee8182e80cb898d26ae8f60f8aae2cf33329281c4db/cognee-1.4.1.tar.gz", hash = "sha256:9206075539935ef0adfab82cf410af6799e83c42969ba7c8fae5065de9aba7c9", size = 26990336, upload-time = "2026-07-31T21:28:41.496Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a1/fa/a74f83a7dc19b52056c18afaf60b6c3ee4f56a5521a6b6cbdace1e9164d1/cognee-1.1.2-py3-none-any.whl", hash = "sha256:0d092f84c4df2c2a418ca1ddfaab64e28878ee620b6728c95d1b080a93f48f97", size = 2473205, upload-time = "2026-05-30T18:14:00.306Z" },
+    { url = "https://files.pythonhosted.org/packages/34/8f/509d4fa55140129ae3f93a013f44f82e0842ef60e2f58168c2a38ae3e0a1/cognee-1.4.1-py3-none-any.whl", hash = "sha256:4c94285589db5a585365bf4bf9cfc8481494d7a8dec2e38d50f14484f69f48dc", size = 7448815, upload-time = "2026-07-31T21:28:38.213Z" },
 ]
 
 [[package]]
@@ -639,13 +641,15 @@ dependencies = [
     { name = "azure-core" },
     { name = "azure-search-documents" },
     { name = "cognee" },
+    { name = "litellm" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "azure-core", specifier = ">=1.29.0" },
     { name = "azure-search-documents", specifier = ">=11.4.0" },
-    { name = "cognee", specifier = ">=1.1.0,<2.0.0" },
+    { name = "cognee", specifier = "==1.4.1" },
+    { name = "litellm", specifier = "==1.89.2" },
 ]
 
 [[package]]
@@ -1512,7 +1516,7 @@ wheels = [
 
 [[package]]
 name = "litellm"
-version = "1.88.0"
+version = "1.89.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohttp" },
@@ -1528,9 +1532,9 @@ dependencies = [
     { name = "tiktoken" },
     { name = "tokenizers" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/9b/8c/6cfce5d15554e076b8438a955436e9e6e2a2bd39c76539656c1c3861c369/litellm-1.88.0.tar.gz", hash = "sha256:4ff794493e40bd86c6f13e91dcb3e1aad697403fd46a96902196d93356ba48f4", size = 13886026, upload-time = "2026-06-06T23:25:17.93Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/c1/29/865d38325f9c424daf0bcc7ab61908cf51a87862b3a0dfebd059b60dac97/litellm-1.89.2.tar.gz", hash = "sha256:b2534d69568eed026310f4e006407db2d46494eb629bd1e71eb9603ec146540d", size = 14079449, upload-time = "2026-06-18T02:26:03.64Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/da/71/deb6637475253b83eb4577c058863eec4b4ddaef2d08dcd93981b1aa4209/litellm-1.88.0-py3-none-any.whl", hash = "sha256:abd3037e0bf5703f833f5565c87bdfd93578d3de46cbcb36dfa108c3ef58021c", size = 15276203, upload-time = "2026-06-06T23:25:07.257Z" },
+    { url = "https://files.pythonhosted.org/packages/32/c8/51c93e8d017e7af02600171b5b6cc3805b07507acb2b94de7235ce764015/litellm-1.89.2-py3-none-any.whl", hash = "sha256:07e8e43b1a70fe919021376742897d18ffe7577ccfbb84632c949670f9abdc03", size = 15492797, upload-time = "2026-06-18T02:25:59.863Z" },
 ]
 
 [[package]]

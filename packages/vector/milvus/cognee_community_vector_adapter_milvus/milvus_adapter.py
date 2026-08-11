@@ -1,27 +1,25 @@
 import asyncio
 import os
-from typing import TYPE_CHECKING, Any, List, Optional, cast
+from typing import Any, List, Optional, cast
 
-from pymilvus import MilvusClient
-
-if TYPE_CHECKING:
-    from cognee.infrastructure.databases.vector.vector_db_interface import (
-        VectorDBInterface,
-    )
 from cognee.infrastructure.databases.exceptions import MissingQueryParameterError
 from cognee.infrastructure.databases.vector.embeddings.EmbeddingEngine import (
     EmbeddingEngine,
 )
 from cognee.infrastructure.databases.vector.models.ScoredResult import ScoredResult
+from cognee.infrastructure.databases.vector.vector_db_interface import (
+    VectorDBInterface,
+)
 from cognee.infrastructure.engine import DataPoint
 from cognee.infrastructure.files.storage import get_file_storage
 from cognee.shared.logging_utils import get_logger
+from pymilvus import MilvusClient
 from pymilvus.orm.types import DataType
 
 logger = get_logger("MilvusAdapter")
 
 
-class MilvusAdapter:
+class MilvusAdapter(VectorDBInterface):
     """
     Interface for interacting with a Milvus vector database.
 
@@ -399,7 +397,12 @@ class MilvusAdapter:
             # Perform the search
             search_params = {"metric_type": "COSINE", "params": {"nprobe": 10}}
 
-            output_fields = ["id", "text", "metadata"] if include_payload else ["id"]
+            # belongs_to_set is part of the payload contract: cognee's
+            # nodeset-filtered retrieval inspects payload["belongs_to_set"]
+            # on search results.
+            output_fields = (
+                ["id", "text", "metadata", "belongs_to_set"] if include_payload else ["id"]
+            )
             if with_vector:
                 output_fields.append("vector")
 
@@ -441,14 +444,20 @@ class MilvusAdapter:
 
             scored_results = []
             for result in results[0]:  # results is a list of lists
-                payload = (
-                    {
+                if include_payload:
+                    # Collections created before the belongs_to_set field was
+                    # added won't return it; default to no set memberships.
+                    try:
+                        belongs_to_set = result["belongs_to_set"] or []
+                    except (KeyError, TypeError):
+                        belongs_to_set = []
+                    payload = {
                         "text": result["text"],
                         "metadata": result["metadata"],
+                        "belongs_to_set": belongs_to_set,
                     }
-                    if include_payload
-                    else {}
-                )
+                else:
+                    payload = {}
                 if with_vector:
                     payload["vector"] = result["vector"]
 
@@ -571,7 +580,3 @@ class MilvusAdapter:
         """
         client = self.get_milvus_client()
         return client.list_collections()
-
-
-if TYPE_CHECKING:
-    _: VectorDBInterface = MilvusAdapter("", None, None)
