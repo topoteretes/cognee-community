@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from typing import Any, List, Optional
 
 from cognee.infrastructure.databases.exceptions import MissingQueryParameterError
@@ -100,6 +101,50 @@ class ValkeyAdapter(VectorDBInterface):
         self._client: GlideClient | None = None
         self._connected = False
         self.VECTOR_DB_LOCK = asyncio.Lock()
+        self._glide_loop: asyncio.AbstractEventLoop | None = None
+        self._glide_thread: threading.Thread | None = None
+        self._glide_gate: asyncio.Lock | None = None
+
+    # -------------------- glide I/O loop --------------------
+    #
+    # All glide commands run on a dedicated event loop in a background
+    # thread. cognee's pipeline interleaves vector writes with long
+    # SYNCHRONOUS work (e.g. embedded graph engines) on the caller's loop;
+    # while that loop is blocked, glide's per-request timer still fires, so
+    # in-flight commands come back as "TimeoutError: timed out" even though
+    # the server answered instantly. On a private loop that runs nothing but
+    # glide I/O, requests complete on time regardless of what the pipeline
+    # loop is doing — callers merely observe the result a little later.
+
+    def _ensure_glide_loop(self) -> asyncio.AbstractEventLoop:
+        if self._glide_loop is not None and self._glide_loop.is_running():
+            return self._glide_loop
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=loop.run_forever, name="valkey-glide-io", daemon=True)
+        thread.start()
+        self._glide_loop = loop
+        self._glide_thread = thread
+        # Serialize commands on the I/O loop: multiple concurrent in-flight
+        # commands on one Glide client have been observed to stall client-side
+        # until the request timer fires (requests only reach the server at the
+        # timeout moment), while sequential commands complete in milliseconds.
+        # The gate is awaited exclusively on this loop.
+        self._glide_gate = asyncio.Lock()
+        return loop
+
+    async def _run_glide(self, coro):
+        """Run a glide coroutine on the adapter's dedicated I/O loop.
+
+        Commands are serialized via the loop's gate; see _ensure_glide_loop.
+        """
+        loop = self._ensure_glide_loop()
+        gate = self._glide_gate
+
+        async def _serialized():
+            async with gate:
+                return await coro
+
+        return await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(_serialized(), loop))
 
     # -------------------- lifecycle --------------------
 
@@ -131,7 +176,9 @@ class ValkeyAdapter(VectorDBInterface):
             request_timeout=30000,
             reconnect_strategy=BackoffStrategy(num_of_retries=3, factor=1000, exponent_base=2),
         )
-        self._client = await GlideClient.create(cfg)
+        # Create the client on the dedicated I/O loop so its internal
+        # reader/writer tasks (and request timers) live there too.
+        self._client = await self._run_glide(GlideClient.create(cfg))
         self._connected = True
 
         return self._client
@@ -153,12 +200,17 @@ class ValkeyAdapter(VectorDBInterface):
 
         if self._client is not None:
             try:
-                await self._client.close()
+                await self._run_glide(self._client.close())
             except Exception as e:
                 logger.error("Failed to close Valkey client: %e", e)
                 pass
         self._client = None
         self._connected = False
+        # Deliberately keep the glide I/O loop thread alive: cognee's engine
+        # cache closes idle engines while other coroutines may still have
+        # commands submitted to this loop — stopping it would strand their
+        # futures and hang those callers forever. The daemon thread is reused
+        # on reconnect and exits with the process.
 
     # -------------------- helpers --------------------
 
@@ -202,7 +254,7 @@ class ValkeyAdapter(VectorDBInterface):
         """
         client = await self.get_connection()
         try:
-            await ft.info(client, self._index_name(collection_name))
+            await self._run_glide(ft.info(client, self._index_name(collection_name)))
             return True
         except Exception as e:
             logger.warning("Valkey index check failed for '%s': %s", collection_name, e)
@@ -250,7 +302,7 @@ class ValkeyAdapter(VectorDBInterface):
                 options = FtCreateOptions(DataType.JSON, prefixes)
                 index = self._index_name(collection_name)
 
-                ok = await ft.create(self._client, index, fields, options)
+                ok = await self._run_glide(ft.create(self._client, index, fields, options))
                 if ok not in (b"OK", "OK"):
                     raise Exception(f"FT.CREATE failed for index '{index}': {ok!r}")
 
@@ -291,10 +343,13 @@ class ValkeyAdapter(VectorDBInterface):
             ]
             data_vectors = await self.embed_data(data_to_embed)
 
-            # Bound write concurrency: firing every JSON.SET at once over a
-            # single connection makes bulk indexing (e.g. cognee's
-            # index_graph_edges) exceed the request timeout on slow runners.
-            write_semaphore = asyncio.Semaphore(32)
+            # Serialize writes: concurrent in-flight commands on a single
+            # Glide client have been observed (locally and in CI) to stall
+            # until the request timer fires — requests only reach the server
+            # at the timeout moment — while sequential commands complete in
+            # milliseconds. One in-flight JSON.SET at a time is fast enough
+            # (local: 500 documents in <1s) and never trips the stall.
+            write_semaphore = asyncio.Semaphore(1)
 
             async def _write_document(data_point, embedding):
                 payload = _serialize_for_json(data_point.model_dump())
@@ -320,11 +375,13 @@ class ValkeyAdapter(VectorDBInterface):
                 for attempt in range(4):
                     try:
                         async with write_semaphore:
-                            await glide_json.set(
-                                client,
-                                self._key(collection_name, str(data_point.id)),
-                                "$",
-                                json.dumps(doc_data),
+                            await self._run_glide(
+                                glide_json.set(
+                                    client,
+                                    self._key(collection_name, str(data_point.id)),
+                                    "$",
+                                    json.dumps(doc_data),
+                                )
                             )
                         break
                     except GlideTimeoutError:
@@ -392,7 +449,7 @@ class ValkeyAdapter(VectorDBInterface):
             results = []
             for data_id in data_point_ids:
                 key = self._key(collection_name, data_id)
-                raw_doc = await glide_json.get(client, key, "$")
+                raw_doc = await self._run_glide(glide_json.get(client, key, "$"))
                 if raw_doc:
                     doc = json.loads(raw_doc)
                     payload_str = doc[0]["payload_data"]
@@ -450,7 +507,7 @@ class ValkeyAdapter(VectorDBInterface):
             return []
 
         if limit is None:
-            info = await ft.info(client, self._index_name(collection_name))
+            info = await self._run_glide(ft.info(client, self._index_name(collection_name)))
             limit = info["num_docs"]
 
         if limit <= 0:
@@ -507,11 +564,13 @@ class ValkeyAdapter(VectorDBInterface):
             )
 
             # Execute the search
-            raw_results = await ft.search(
-                client=client,
-                index_name=self._index_name(collection_name),
-                query=query,
-                options=query_options,
+            raw_results = await self._run_glide(
+                ft.search(
+                    client=client,
+                    index_name=self._index_name(collection_name),
+                    query=query,
+                    options=query_options,
+                )
             )
 
             scored_results = _build_scored_results_from_ft(raw_results)
@@ -616,7 +675,7 @@ class ValkeyAdapter(VectorDBInterface):
         ids = [self._key(collection_name, id) for id in data_point_ids]
 
         try:
-            deleted_count = await client.delete(ids)
+            deleted_count = await self._run_glide(client.delete(ids))
             logger.info(f"Deleted {deleted_count} data points from collection {collection_name}")
             return {"deleted": deleted_count}
         except Exception as e:
@@ -634,9 +693,9 @@ class ValkeyAdapter(VectorDBInterface):
         client = await self.get_connection()
         assert self._client is not None
         try:
-            all_indexes = await ft.list(client)
+            all_indexes = await self._run_glide(ft.list(client))
             for index in all_indexes:
-                await ft.dropindex(client, index)
+                await self._run_glide(ft.dropindex(client, index))
                 logger.info(f"Dropped index {index}")
 
         except Exception as e:
