@@ -6,7 +6,7 @@ using Spanner Graph (GQL) for knowledge graphs and GraphRAG pipelines.
 
 from .spanner_adapter import SpannerGraphAdapter
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __all__ = ["SpannerGraphAdapter", "register"]
 
 

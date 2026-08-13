@@ -579,7 +579,7 @@ wheels = [
 
 [[package]]
 name = "cognee"
-version = "1.4.1"
+version = "1.4.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiofiles" },
@@ -628,14 +628,14 @@ dependencies = [
     { name = "uvicorn" },
     { name = "websockets" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/d8/93/1277ebad661581e4eee8182e80cb898d26ae8f60f8aae2cf33329281c4db/cognee-1.4.1.tar.gz", hash = "sha256:9206075539935ef0adfab82cf410af6799e83c42969ba7c8fae5065de9aba7c9", size = 26990336, upload-time = "2026-07-31T21:28:41.496Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/47/06/cf0da41e9dbe28f4d1c8f1f8c3d0e4fbc224fe9f1a281e9a189fdfac5ba4/cognee-1.4.2.tar.gz", hash = "sha256:ca94b26d674c66ad11bdf4bde24881f7b6a6044bdc029cf673c79a6f07f2631f", size = 27031477, upload-time = "2026-08-08T18:02:32.632Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/34/8f/509d4fa55140129ae3f93a013f44f82e0842ef60e2f58168c2a38ae3e0a1/cognee-1.4.1-py3-none-any.whl", hash = "sha256:4c94285589db5a585365bf4bf9cfc8481494d7a8dec2e38d50f14484f69f48dc", size = 7448815, upload-time = "2026-07-31T21:28:38.213Z" },
+    { url = "https://files.pythonhosted.org/packages/a6/c7/f3c62c5c872314bb24fa6a81a0e8987ac313655e0e4c41b1ba8f703092eb/cognee-1.4.2-py3-none-any.whl", hash = "sha256:8fd91bed9ec87155970d5c3d79996701076bfedb87bf1a1f056a18e857a1f57d", size = 7496972, upload-time = "2026-08-08T18:02:29.899Z" },
 ]
 
 [[package]]
 name = "cognee-community-vector-adapter-azure"
-version = "0.0.2"
+version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "azure-core" },
@@ -648,7 +648,7 @@ dependencies = [
 requires-dist = [
     { name = "azure-core", specifier = ">=1.29.0" },
     { name = "azure-search-documents", specifier = ">=11.4.0" },
-    { name = "cognee", specifier = "==1.4.1" },
+    { name = "cognee", specifier = "==1.4.2" },
     { name = "litellm", specifier = "==1.89.2" },
 ]
 

@@ -2,7 +2,7 @@
 
 This directory contains GitHub Actions workflows for testing community adapters
 against the pinned cognee version (see each package's `pyproject.toml`,
-currently `cognee==1.4.1`).
+currently `cognee==1.4.2`).
 
 ## Test tiers
 

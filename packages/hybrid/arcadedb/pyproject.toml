@@ -1,13 +1,13 @@
 [project]
 name = "cognee-community-hybrid-adapter-arcadedb"
-version = "0.4.0"
+version = "0.5.0"
 description = "ArcadeDB hybrid database adapter for Cognee (graph + vector)"
 readme = "README.md"
 requires-python = ">=3.11,<=3.13"
 dependencies = [
     "aiohttp>=3.9.0",
-    "cognee==1.4.1",
-    # Transitive via cognee; pinned to the version cognee 1.4.1 locks (litellm
+    "cognee==1.4.2",
+    # Transitive via cognee; pinned to the version cognee 1.4.2 locks (litellm
     # 1.96.x published cp310-only wheels, uninstallable on the CI's Python 3.11).
     "litellm==1.89.2",
     "starlette>=0.48.0",

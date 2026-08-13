@@ -799,14 +799,14 @@ colorama = {version = "*", markers = "platform_system == \"Windows\""}
 
 [[package]]
 name = "cognee"
-version = "1.4.1"
+version = "1.4.2"
 description = "Cognee - is a library for enriching LLM context with a semantic layer for better understanding and reasoning."
 optional = false
 python-versions = "<3.15,>=3.10"
 groups = ["main"]
 files = [
-    {file = "cognee-1.4.1-py3-none-any.whl", hash = "sha256:4c94285589db5a585365bf4bf9cfc8481494d7a8dec2e38d50f14484f69f48dc"},
-    {file = "cognee-1.4.1.tar.gz", hash = "sha256:9206075539935ef0adfab82cf410af6799e83c42969ba7c8fae5065de9aba7c9"},
+    {file = "cognee-1.4.2-py3-none-any.whl", hash = "sha256:8fd91bed9ec87155970d5c3d79996701076bfedb87bf1a1f056a18e857a1f57d"},
+    {file = "cognee-1.4.2.tar.gz", hash = "sha256:ca94b26d674c66ad11bdf4bde24881f7b6a6044bdc029cf673c79a6f07f2631f"},
 ]
 
 [package.dependencies]
@@ -4985,4 +4985,4 @@ dev = ["build", "mypy", "twine"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<=3.13"
-content-hash = "de8997d0a59cd474ba0913530134789d13de18aa86b5a2edf96c61402626c9c6"
+content-hash = "bab6eb2c1c7fd8896211d2c68f1f1644cf55f3a64cddfc093b668e29efa9baae"

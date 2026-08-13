@@ -1,13 +1,13 @@
 [project]
 name = "cognee-community-graph-adapter-arcadedb"
-version = "0.1.0"
+version = "0.2.0"
 description = "ArcadeDB graph database adapter for cognee"
 authors = [
     {name = "Luca Garulli", email = "l.garulli@arcadedata.com"},
 ]
 dependencies = [
-    "cognee[neo4j]==1.4.1",
-    # Transitive via cognee; pinned to the version cognee 1.4.1 locks (litellm
+    "cognee[neo4j]==1.4.2",
+    # Transitive via cognee; pinned to the version cognee 1.4.2 locks (litellm
     # 1.96.x published cp310-only wheels, uninstallable on the CI's Python 3.11).
     "litellm==1.89.2",
     "starlette>=0.48.0",

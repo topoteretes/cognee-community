@@ -2,7 +2,7 @@
 
 A community [cognee](https://github.com/topoteretes/cognee) adapter that uses
 [HelixDB](https://www.helix-db.com/) as both the **graph** and the **vector**
-store (hybrid adapter). Requires **cognee 1.4.1**.
+store (hybrid adapter). Requires **cognee 1.4.2**.
 
 HelixDB uses pre-compiled HQL queries; the adapter deploys a generic schema
 (`CogneeNode` / `CogneeEdge` / `CogneeVector`) and a fixed set of query

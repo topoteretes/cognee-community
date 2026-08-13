@@ -1,6 +1,6 @@
 [project]
 name = "cognee-community-graph-adapter-pggraph"
-version = "0.1.0"
+version = "0.2.0"
 description = "Experimental pgGraph graph database adapter for cognee"
 authors = [
     {name = "Cognee Community"},
@@ -8,8 +8,8 @@ authors = [
 readme = "README.md"
 requires-python = ">=3.10,<=3.13"
 dependencies = [
-    "cognee==1.4.1",
-    # Transitive via cognee; pinned to the version cognee 1.4.1 locks (litellm
+    "cognee==1.4.2",
+    # Transitive via cognee; pinned to the version cognee 1.4.2 locks (litellm
     # 1.96.x published cp310-only wheels, uninstallable on the CI's Python 3.11).
     "litellm==1.89.2",
     "asyncpg>=0.29.0",
