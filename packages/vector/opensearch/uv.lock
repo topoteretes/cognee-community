@@ -595,7 +595,7 @@ wheels = [
 
 [[package]]
 name = "cognee-community-vector-adapter-opensearch"
-version = "0.1.2"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "cognee" },

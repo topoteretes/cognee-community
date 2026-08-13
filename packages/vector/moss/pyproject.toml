@@ -1,6 +1,6 @@
 [project]
 name = "cognee-community-vector-adapter-moss"
-version = "0.1.1"
+version = "0.2.0"
 description = "Moss vector database adapter for cognee"
 readme = "README.md"
 requires-python = ">=3.10,<3.14"

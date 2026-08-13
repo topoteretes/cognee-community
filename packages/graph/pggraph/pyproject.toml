@@ -1,6 +1,6 @@
 [project]
 name = "cognee-community-graph-adapter-pggraph"
-version = "0.1.0"
+version = "0.2.0"
 description = "Experimental pgGraph graph database adapter for cognee"
 authors = [
     {name = "Cognee Community"},

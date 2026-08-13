@@ -1,6 +1,6 @@
 [project]
 name = "cognee-community-graph-adapter-arcadedb"
-version = "0.1.0"
+version = "0.2.0"
 description = "ArcadeDB graph database adapter for cognee"
 authors = [
     {name = "Luca Garulli", email = "l.garulli@arcadedata.com"},
