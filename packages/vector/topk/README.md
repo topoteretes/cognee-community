@@ -8,31 +8,28 @@ If published, the package can be simply installed via pip:
 pip install cognee-community-vector-adapter-topk
 ```
 
-In case it is not published yet, you can install it locally:
+## Setup
 
-```bash
-pip install -e . # run this command in the directory containing the pyproject.toml file
-```
-
-## Connection Setup
-
-1. Create an account at [topk.io](https://www.topk.io)
-2. Create a project and an API key in the [console](https://console.topk.io)
-3. Set the `TOPK_API_KEY` environment variable
-4. Optionally set `TOPK_REGION` (defaults to `aws-us-east-1-elastica`). See [available regions](https://docs.topk.io/regions).
-5. For non-default deployments only, `TOPK_HOST` and `TOPK_HTTPS` override the API host (default `topk.io`) and TLS (`false` to disable).
+1. Create a TopK account [console.topk.io](https://console.topk.io).
+2. Create a project or select the default project.
+3. Create an API Key for your project (Project -> API Keys -> Create API Key).
+4. Set the `TOPK_API_KEY` environment variable.
+5. (Optional) Set `TOPK_REGION` environment variable to specify a region (defaults to `aws-us-east-1-elastica`). See [available regions](https://docs.topk.io/regions).
 
 ## Usage
 
 Import and register the adapter in your code:
+
 ```python
 from cognee_community_vector_adapter_topk import register
 ```
 
 Also, specify the dataset handler in the .env file:
+
 ```dotenv
 VECTOR_DATASET_DATABASE_HANDLER="topk"
 ```
 
 ## Example
-See example in `example.py` file.
+
+See `[example.py](./example.py)`
