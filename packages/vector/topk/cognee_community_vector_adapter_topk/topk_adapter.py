@@ -32,16 +32,6 @@ class IndexSchema(DataPoint):
     belongs_to_set: List[str] = []
 
 
-def _ensure_f32_vector(vector):
-    if type(vector).__module__ == "numpy":
-        return vector.astype("float32")
-    return vector
-
-
-def _database_prefix(database_name: str) -> str:
-    return f"{database_name}__"
-
-
 class TopKAdapter(VectorDBInterface):
     name = "TopK"
 
@@ -55,7 +45,7 @@ class TopKAdapter(VectorDBInterface):
         self.embedding_engine = embedding_engine
         self.database_name = database_name
         self.api_key = api_key
-        self._prefix = _database_prefix(database_name)
+        self._prefix = f"{database_name}__"
         self._client = None
         self._lsns: dict[str, str] = {}
 
@@ -113,7 +103,7 @@ class TopKAdapter(VectorDBInterface):
             documents.append(
                 {
                     "_id": str(data_point.id),
-                    "vector": _ensure_f32_vector(vector),
+                    "vector": vector,
                     "payload": json.dumps(payload),
                     "belongs_to_set": payload.get("belongs_to_set") or [],
                 }
@@ -171,6 +161,24 @@ class TopKAdapter(VectorDBInterface):
             results.append(ScoredResult(id=parse_id(document_id), payload=payload, score=0))
         return results
 
+    def _to_scored_results(self, documents, include_payload: bool) -> List[ScoredResult]:
+        results = []
+        for document in documents:
+            payload = None
+            if include_payload:
+                payload = json.loads(document.get("payload", "{}"))
+                payload["id"] = document["_id"]
+            results.append(
+                ScoredResult(
+                    id=parse_id(document["_id"]),
+                    payload=payload,
+                    # TopK cosine returns similarity (higher = closer);
+                    # ScoredResult.score is lower-is-better.
+                    score=1 - document["similarity"],
+                )
+            )
+        return results
+
     async def search(
         self,
         collection_name: str,
@@ -193,7 +201,6 @@ class TopKAdapter(VectorDBInterface):
 
         if query_vector is None:
             query_vector = (await self.embed_data([query_text]))[0]
-        query_vector = _ensure_f32_vector(query_vector)
 
         try:
             lsn = self._lsns.get(prefixed_name)
@@ -207,33 +214,18 @@ class TopKAdapter(VectorDBInterface):
             query = select(*fields, similarity=fn.vector_distance("vector", query_vector))
 
             if node_name:
-                clauses = [field("belongs_to_set").contains(name) for name in node_name]
-                combine = operator.and_ if node_name_filter_operator == "AND" else operator.or_
-                query = query.filter(functools.reduce(combine, clauses))
+                exprs = [field("belongs_to_set").contains(name) for name in node_name]
+                operator = operator.and_ if node_name_filter_operator == "AND" else operator.or_
+                query = query.filter(functools.reduce(operator, exprs))
 
             documents = await collection.query(
                 query.sort(field("similarity"), asc=False).limit(limit),
                 lsn=lsn,
             )
-
-            results = []
-            for document in documents:
-                payload = None
-                if include_payload:
-                    payload = json.loads(document.get("payload", "{}"))
-                    payload["id"] = document["_id"]
-                results.append(
-                    ScoredResult(
-                        id=parse_id(document["_id"]),
-                        payload=payload,
-                        # TopK cosine returns similarity (higher = closer);
-                        # ScoredResult.score is lower-is-better.
-                        score=1 - document["similarity"],
-                    )
-                )
-            return results
         except TopKCollectionNotFoundError as error:
             raise CollectionNotFoundError(f"Collection '{collection_name}' not found!") from error
+
+        return self._to_scored_results(documents, include_payload)
 
     async def batch_search(
         self,
