@@ -54,8 +54,8 @@ class _Session:
         return self.response
 
 
-def _database(tmp_path):
-    engine = create_engine(f"sqlite:///{tmp_path / 'source.db'}")
+def _database(tmp_path, filename="source.db"):
+    engine = create_engine(f"sqlite:///{tmp_path / filename}")
     metadata = MetaData()
     Table(
         "customers",
@@ -341,3 +341,74 @@ def test_dlt_incremental_update_delete_and_empty_anchor(tmp_path):
     rows = staged_rows()
     assert len(rows) == 1
     assert rows[0]["id"] == 'supabase:project:main:customers:{"id":3}'
+
+
+def test_dlt_incremental_cursor_is_isolated_by_project_ref(tmp_path):
+    """A new project must not inherit another project's incremental cursor."""
+    import dlt
+
+    newer_project = _database(tmp_path, "newer-project.db")
+    older_project = _database(tmp_path, "older-project.db")
+    newer_table = Table("customers", MetaData(), autoload_with=newer_project)
+    older_table = Table("customers", MetaData(), autoload_with=older_project)
+
+    with newer_project.begin() as db:
+        db.execute(
+            insert(newer_table).values(
+                id=1,
+                name="Newer project row",
+                private_note="x",
+                updated_at=datetime(2026, 1, 2, tzinfo=UTC),
+            )
+        )
+    with older_project.begin() as db:
+        db.execute(
+            insert(older_table).values(
+                id=1,
+                name="Older project row",
+                private_note="y",
+                updated_at=datetime(2026, 1, 1, tzinfo=UTC),
+            )
+        )
+
+    pipeline = dlt.pipeline(
+        pipeline_name="supabase_project_isolation_test",
+        pipelines_dir=str(tmp_path / "project-isolation-pipelines"),
+        destination=dlt.destinations.sqlalchemy(
+            credentials=f"sqlite:///{tmp_path / 'project-isolation-destination.db'}"
+        ),
+        dataset_name="supabase_project_isolation",
+    )
+
+    def run_sync(engine, project_ref):
+        return pipeline.run(
+            supabase_source(
+                engine,
+                project_ref=project_ref,
+                schema="main",
+                tables=["customers"],
+                columns={"customers": ["id", "name", "updated_at"]},
+                cursor_columns={"customers": "updated_at"},
+                enforce_read_only=False,
+            ),
+            write_disposition="merge",
+        )
+
+    run_sync(newer_project, "newer-project")
+    run_sync(older_project, "older-project")
+
+    destination_engine = create_engine(
+        f"sqlite:///{tmp_path / 'project-isolation-destination__supabase_project_isolation.db'}"
+    )
+    target_name = next(
+        name
+        for name in inspect(destination_engine).get_table_names()
+        if name.endswith("supabase_rows")
+    )
+    target = Table(target_name, MetaData(), autoload_with=destination_engine)
+    with destination_engine.connect() as db:
+        staged_ids = {row.id for row in db.execute(select(target.c.id))}
+
+    assert 'supabase:older-project:main:customers:{"id":1}' in staged_ids, (
+        "The first sync for a different project reused the previous project's cursor"
+    )

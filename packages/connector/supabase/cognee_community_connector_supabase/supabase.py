@@ -248,7 +248,9 @@ def supabase_source(
         key_columns = table_config["primary_key"]
         cursor_column = table_config["cursor"]
         reflected_columns = list(dict.fromkeys([*selected_columns, *key_columns, cursor_column]))
-        fingerprint = _fingerprint(schema, table_name, selected_columns, key_columns, cursor_column)
+        fingerprint = _fingerprint(
+            project_ref, schema, table_name, selected_columns, key_columns, cursor_column
+        )
         parent = sql_table(
             credentials=engine,
             table=table_name,
