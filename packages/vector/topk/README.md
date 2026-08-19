@@ -2,8 +2,6 @@
 
 ## Installation
 
-If published, the package can be simply installed via pip:
-
 ```bash
 pip install cognee-community-vector-adapter-topk
 ```
