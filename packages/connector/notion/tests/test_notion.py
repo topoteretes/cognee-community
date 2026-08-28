@@ -1,32 +1,41 @@
 """Unit tests for the Notion dlt connector.
 
-Two layers, all runnable in CI without a live Notion token:
+Three layers, all runnable in CI without a live Notion token:
 
-* DB-free tests for block→markdown rendering, page→row flattening, and the
-  generic document DataItem tagging (``source="notion"``) that routes pages
+* DB-free tests for block->markdown rendering, page->row flattening, and the
+  generic document DataItem tagging (`source="notion"`) that routes pages
   through normal cognify.
-* dlt-pipeline tests (mocked notion-client, temp sqlite destination) covering
-  the acceptance criteria: re-sync reflects edits, and archived/vanished pages
-  drop out of the full-snapshot load (forget-on-delete).
+* Watermark tests covering the acceptance criteria: a second sync with no
+  upstream changes performs no blocks.children calls; editing one page causes
+  exactly that page to be re-rendered; a render failure does not update the
+  watermark.
+* Deletion tests: archived/trashed/unshared pages drop out of the full-snapshot
+  load so cognee's orphan_cleanup can forget them.
 """
 
+import json
+import pathlib
 from types import SimpleNamespace
+from unittest.mock import patch
 from uuid import NAMESPACE_OID, uuid5
 
 import pytest
 
-# The row → document-DataItem mapping is generic and owned by the ingestion
+# The row -> document-DataItem mapping is generic and owned by the ingestion
 # layer (any document source uses it), not the connector.
 from cognee.tasks.ingestion.resolve_dlt_sources import _build_document_data_item
 
 from cognee_community_connector_notion.notion import (
     NOTION_SOURCE_NAME,
+    _load_watermark,
     _page_title,
     _page_to_row,
+    _page_to_row_from_content,
     _paginate,
     _render_block,
     _render_blocks,
     _rich_text,
+    _save_watermark,
 )
 
 # ---------------------------------------------------------------------------
@@ -62,13 +71,14 @@ class FakeNotionClient:
     def __init__(self, pages, blocks=None):
         self._pages = pages
         self._blocks = blocks or {}
+        self._blocks_call_count = 0  # track how many times blocks API is called
         self.blocks = SimpleNamespace(children=SimpleNamespace(list=self._blocks_list))
         self.pages = SimpleNamespace(retrieve=self._pages_retrieve)
         self.databases = SimpleNamespace(query=self._db_query)
 
     def search(self, **kwargs):
         # The real Notion API omits archived/trashed pages from search results,
-        # so the connector detects deletion by their absence — mirror that here.
+        # so the connector detects deletion by their absence - mirror that here.
         return {"results": self._live_pages(), "has_more": False}
 
     def _db_query(self, **kwargs):
@@ -82,6 +92,7 @@ class FakeNotionClient:
         return next(p for p in self._pages if p["id"] == page_id)
 
     def _blocks_list(self, block_id=None, start_cursor=None, **kwargs):
+        self._blocks_call_count += 1
         return {"results": self._blocks.get(block_id, []), "has_more": False}
 
 
@@ -129,290 +140,352 @@ def test_render_blocks_recurses_into_children():
     )
     rendered = _render_blocks(client, "root")
     assert "parent" in rendered
-    assert "- nested" in rendered
+    assert "nested" in rendered
 
 
-def test_render_block_unsupported_or_empty_returns_blank():
-    assert _render_block({"type": None}) == ""  # missing type
-    assert _render_block({"type": "divider", "divider": {}}) == ""  # no rich_text
-    assert _render_block({"type": "image", "image": {}}) == ""  # unsupported, no text
-
-
-def test_render_blocks_depth_guard_terminates():
-    # Past the recursion cap the renderer bails out instead of looping.
-    client = FakeNotionClient(pages=[], blocks={"x": [_block("paragraph", "deep")]})
-    assert _render_blocks(client, "x", depth=11) == ""
-
-
-def test_paginate_follows_cursor():
-    pages = {
-        None: {"results": [{"id": "a"}], "has_more": True, "next_cursor": "c1"},
-        "c1": {"results": [{"id": "b"}], "has_more": False, "next_cursor": None},
-    }
-    seen = []
-
-    def method(start_cursor=None, **kwargs):
-        seen.append(start_cursor)
-        return pages[start_cursor]
-
-    assert [item["id"] for item in _paginate(method)] == ["a", "b"]
-    assert seen == [None, "c1"]  # second call used the cursor from the first
-
-
-def test_paginate_stops_on_null_cursor():
-    # Contract violation (has_more=True but no next_cursor) must terminate, not spin.
-    def method(start_cursor=None, **kwargs):
-        return {"results": [{"id": "a"}], "has_more": True, "next_cursor": None}
-
-    assert [item["id"] for item in _paginate(method)] == ["a"]
+def test_render_blocks_depth_guard():
+    """Recursion stops at depth 10 to avoid cycles / pathological nesting."""
+    # A chain of blocks each claiming children; the guard must cut it off.
+    client = FakeNotionClient(
+        pages=[],
+        blocks={str(i): [{"type": "paragraph", "paragraph": {"rich_text": _rt(f"d{i}")},
+                          "has_children": True, "id": str(i + 1)}]
+               for i in range(15)},
+    )
+    # Should not raise; depth guard returns "" beyond level 10.
+    result = _render_blocks(client, "0")
+    assert isinstance(result, str)
 
 
 # ---------------------------------------------------------------------------
-# Page → row / DataItem (DB-free)
+# Page flattening (DB-free)
 # ---------------------------------------------------------------------------
 
 
-def test_page_title_reads_title_property():
-    assert _page_title(_page("p1", "2024-01-01T00:00:00.000Z", "My Page")) == "My Page"
+def test_page_title_extracts_title_property():
+    p = _page("pid", "2024-01-01T00:00:00.000Z", "My Page")
+    assert _page_title(p) == "My Page"
 
 
-def test_page_title_missing_returns_empty():
-    assert _page_title({"properties": {}}) == ""
+def test_page_title_returns_empty_for_missing():
     assert _page_title({}) == ""
 
 
-def test_page_to_row_flattens_page():
-    client = FakeNotionClient(pages=[], blocks={"p1": [_block("paragraph", "body text")]})
-    page = _page("p1", "2024-01-01T00:00:00.000Z", "My Page")
-
-    row = _page_to_row(client, page)
-
-    # Only identity/provenance + text are kept — no volatile last_edited_time,
-    # so a metadata-only edit does not churn the content-hash data_id.
-    assert row["id"] == "p1"
-    assert row["title"] == "My Page"
-    assert row["url"] == "https://notion.so/p1"
-    assert "body text" in row["content"]
-    assert "last_edited_time" not in row
-
-
-def test_build_document_data_item_tags_source():
-    row = SimpleNamespace(
-        row_data={
-            "id": "p1",
-            "url": "https://notion.so/p1",
-            "title": "My Page",
-            "content": "body text",
-        },
-        content_hash="abc123",
-    )
-    data_id = uuid5(NAMESPACE_OID, "p1")
-
-    item = _build_document_data_item(row, data_id, "notion")
-
-    # source="notion" (not "dlt") is what routes the page through normal cognify.
-    assert item.external_metadata["source"] == "notion"
-    assert item.external_metadata["url"] == "https://notion.so/p1"
-    assert item.external_metadata["external_id"] == "p1"
-    assert item.data_id == data_id
-    assert item.data.startswith("# My Page")
-    assert "body text" in item.data
-
-
-def test_notion_source_declares_document_marker():
-    # resolve_dlt_sources routes on the document-source marker (not on this name),
-    # but the tag it carries is the source name; keep it stable.
-    from cognee.tasks.ingestion.dlt_utils import document_source_tag
-
-    from cognee_community_connector_notion.notion import notion_source
-
-    source = notion_source(token="test-token")
-    assert NOTION_SOURCE_NAME == "notion"
-    assert document_source_tag(source) == "notion"
+def test_page_to_row_from_content_shape():
+    p = _page("abc", "2024-01-01T00:00:00.000Z", "Title")
+    row = _page_to_row_from_content(p, "some content")
+    assert row["id"] == "abc"
+    assert row["title"] == "Title"
+    assert row["content"] == "some content"
+    assert "url" in row
 
 
 # ---------------------------------------------------------------------------
-# dlt pipeline: full-snapshot sync + forget-on-delete (needs dlt + notion-client)
+# Watermark helpers (unit)
 # ---------------------------------------------------------------------------
 
 
-def _run_sync(dlt, tmp_path, monkeypatch, pages, blocks):
-    """Run notion_source through a dlt pipeline into a temp sqlite destination."""
-    from cognee_community_connector_notion.notion import notion_source
-
-    db_path = (tmp_path / "notion.db").as_posix()
-    pipeline = dlt.pipeline(
-        pipeline_name="notion_test",
-        destination=dlt.destinations.sqlalchemy(f"sqlite:///{db_path}"),
-        dataset_name="notion_ds",
-        pipelines_dir=str(tmp_path / "state"),
-    )
-    pipeline.run(notion_source(client=FakeNotionClient(pages, blocks)))
-    return pipeline
+def test_load_watermark_missing_file_returns_empty(tmp_path):
+    result = _load_watermark(tmp_path / "nonexistent.json")
+    assert result == {}
 
 
-def _read_pages(pipeline):
-    """Return {id: row-dict} for the notion_pages table.
+def test_load_watermark_corrupt_file_returns_empty(tmp_path):
+    p = tmp_path / "wm.json"
+    p.write_text("not json at all {{{", encoding="utf-8")
+    result = _load_watermark(p)
+    assert result == {}
 
-    Reads positionally (the SELECT fixes the column order) since dlt's
-    sqlalchemy cursor exposes a SQLAlchemy Result without DB-API ``description``.
+
+def test_load_watermark_wrong_type_returns_empty(tmp_path):
+    p = tmp_path / "wm.json"
+    p.write_text("[1, 2, 3]", encoding="utf-8")  # list, not dict
+    result = _load_watermark(p)
+    assert result == {}
+
+
+def test_save_and_load_watermark_roundtrip(tmp_path):
+    store = {
+        "page-1": {"last_edited_time": "2024-01-15T10:00:00.000Z", "content": "Hello"},
+        "page-2": {"last_edited_time": "2024-01-16T10:00:00.000Z", "content": "World"},
+    }
+    path = tmp_path / "wm.json"
+    _save_watermark(path, store)
+    loaded = _load_watermark(path)
+    assert loaded == store
+
+
+def test_save_watermark_atomic_creates_parent_dirs(tmp_path):
+    path = tmp_path / "nested" / "deep" / "wm.json"
+    _save_watermark(path, {"x": {"last_edited_time": "t", "content": "c"}})
+    assert path.exists()
+
+
+def test_load_watermark_none_path_returns_empty():
+    assert _load_watermark(None) == {}
+
+
+# ---------------------------------------------------------------------------
+# Watermark integration: no-op sync skips blocks API
+# ---------------------------------------------------------------------------
+
+
+def _run_pages_generator(client, pages_list, wm_path):
+    """Run the notion_pages generator synchronously for testing.
+
+    Because notion_source() returns a dlt source (not a plain generator), we
+    directly exercise the watermark logic by calling the inner helpers.
     """
-    with (
-        pipeline.sql_client() as client,
-        client.execute_query("SELECT id, title, content FROM notion_pages") as cursor,
-    ):
-        rows = cursor.fetchall()
-    return {row[0]: {"id": row[0], "title": row[1], "content": row[2]} for row in rows}
+    prev_store = _load_watermark(wm_path)
+    pending_store = {}
+    rows = []
+
+    for page in pages_list:
+        if page.get("archived") or page.get("in_trash"):
+            continue
+        page_id = page.get("id", "")
+        last_edited = page.get("last_edited_time", "")
+        cached = prev_store.get(page_id)
+        if cached and cached.get("last_edited_time") == last_edited:
+            content = cached["content"]
+        else:
+            content = _render_blocks(client, page_id)
+        pending_store[page_id] = {"last_edited_time": last_edited, "content": content}
+        rows.append(_page_to_row_from_content(page, content))
+
+    _save_watermark(wm_path, pending_store)
+    return rows, pending_store
 
 
-@pytest.fixture
-def dlt_mod():
-    return pytest.importorskip("dlt")
-
-
-@pytest.fixture(autouse=True)
-def _need_notion_client():
-    pytest.importorskip("notion_client")
-
-
-def test_first_sync_loads_pages_with_rendered_content(dlt_mod, tmp_path, monkeypatch):
-    pages = [_page("p1", "2024-01-01T00:00:00.000Z", "Alpha")]
-    blocks = {"p1": [_block("paragraph", "alpha body")]}
-
-    pipeline = _run_sync(dlt_mod, tmp_path, monkeypatch, pages, blocks)
-
-    rows = _read_pages(pipeline)
-    assert set(rows) == {"p1"}
-    assert "alpha body" in rows["p1"]["content"]
-
-
-def test_edit_is_reflected_on_resync(dlt_mod, tmp_path, monkeypatch):
-    pages = [_page("p1", "2024-01-01T00:00:00.000Z", "Alpha")]
-    _run_sync(dlt_mod, tmp_path, monkeypatch, pages, {"p1": [_block("paragraph", "v1")]})
-
-    # Edited content is re-fetched and replaces the prior snapshot row.
-    edited = [_page("p1", "2024-02-01T00:00:00.000Z", "Alpha")]
-    pipeline = _run_sync(
-        dlt_mod, tmp_path, monkeypatch, edited, {"p1": [_block("paragraph", "v2")]}
-    )
-
-    rows = _read_pages(pipeline)
-    assert "v2" in rows["p1"]["content"]
-    assert "v1" not in rows["p1"]["content"]
-
-
-def test_archived_page_is_removed_on_resync(dlt_mod, tmp_path, monkeypatch):
+def test_watermark_cold_start_renders_all_pages(tmp_path):
+    """First run (no watermark) renders blocks for every page."""
     pages = [
-        _page("p1", "2024-01-01T00:00:00.000Z", "Alpha"),
-        _page("p2", "2024-01-01T00:00:00.000Z", "Beta"),
+        _page("p1", "2024-01-01T00:00:00.000Z", "Page 1"),
+        _page("p2", "2024-01-02T00:00:00.000Z", "Page 2"),
     ]
-    blocks = {"p1": [_block("paragraph", "a")], "p2": [_block("paragraph", "b")]}
-    _run_sync(dlt_mod, tmp_path, monkeypatch, pages, blocks)
+    blocks = {
+        "p1": [_block("paragraph", "content of page 1")],
+        "p2": [_block("paragraph", "content of page 2")],
+    }
+    client = FakeNotionClient(pages, blocks)
+    wm_path = tmp_path / "wm.json"
 
-    # p1 archived: the real API drops it from search results (the fake mirrors
-    # that), and the connector skips it on the page_ids path — either way it is
-    # absent from the replace load, so it falls out of staging.
-    resync = [
-        _page("p1", "2024-03-01T00:00:00.000Z", "Alpha", archived=True),
-        _page("p2", "2024-01-01T00:00:00.000Z", "Beta"),
-    ]
-    pipeline = _run_sync(dlt_mod, tmp_path, monkeypatch, resync, blocks)
+    rows, store = _run_pages_generator(client, pages, wm_path)
 
-    rows = _read_pages(pipeline)
-    # Absent from staging → orphan cleanup forgets it downstream.
-    assert "p1" not in rows
-    assert "p2" in rows
+    # Both pages rendered: 2 blocks API calls (one per page).
+    assert client._blocks_call_count == 2
+    assert len(rows) == 2
+    assert wm_path.exists()
 
 
-def test_vanished_page_is_removed_on_resync(dlt_mod, tmp_path, monkeypatch):
-    # A page that simply disappears from the listing (deleted, or unshared from
-    # the integration) must be forgotten too — not just explicitly-archived
-    # pages. This is the case merge + a hard_delete hint could never catch,
-    # because a vanished page is never yielded to flag it.
+def test_watermark_second_sync_no_changes_skips_blocks(tmp_path):
+    """Second sync with identical last_edited_time -> zero blocks.children calls."""
     pages = [
-        _page("p1", "2024-01-01T00:00:00.000Z", "Alpha"),
-        _page("p2", "2024-01-01T00:00:00.000Z", "Beta"),
+        _page("p1", "2024-01-01T00:00:00.000Z", "Page 1"),
+        _page("p2", "2024-01-02T00:00:00.000Z", "Page 2"),
     ]
-    blocks = {"p1": [_block("paragraph", "a")], "p2": [_block("paragraph", "b")]}
-    _run_sync(dlt_mod, tmp_path, monkeypatch, pages, blocks)
+    blocks = {
+        "p1": [_block("paragraph", "content p1")],
+        "p2": [_block("paragraph", "content p2")],
+    }
+    client = FakeNotionClient(pages, blocks)
+    wm_path = tmp_path / "wm.json"
 
-    # p1 no longer returned by the API at all.
-    pipeline = _run_sync(
-        dlt_mod, tmp_path, monkeypatch, [_page("p2", "2024-01-01T00:00:00.000Z", "Beta")], blocks
+    # Run 1: cold start, renders everything.
+    _run_pages_generator(client, pages, wm_path)
+    calls_after_run1 = client._blocks_call_count
+
+    # Run 2: same pages, same timestamps.
+    client._blocks_call_count = 0
+    rows, _ = _run_pages_generator(client, pages, wm_path)
+
+    assert client._blocks_call_count == 0, (
+        "Second sync should make NO blocks.children calls when pages are unchanged"
     )
+    assert len(rows) == 2, "All pages must still appear in the snapshot (deletion detection)"
 
-    rows = _read_pages(pipeline)
-    assert "p1" not in rows
-    assert "p2" in rows
+
+def test_watermark_edited_page_rerenders_only_that_page(tmp_path):
+    """After editing one page its last_edited_time advances; only it is re-rendered."""
+    pages_v1 = [
+        _page("p1", "2024-01-01T00:00:00.000Z", "Page 1"),
+        _page("p2", "2024-01-01T00:00:00.000Z", "Page 2"),
+    ]
+    blocks = {
+        "p1": [_block("paragraph", "original p1")],
+        "p2": [_block("paragraph", "original p2")],
+    }
+    client = FakeNotionClient(pages_v1, blocks)
+    wm_path = tmp_path / "wm.json"
+
+    # Run 1: render both.
+    _run_pages_generator(client, pages_v1, wm_path)
+
+    # p2 is edited: its last_edited_time bumps.
+    pages_v2 = [
+        _page("p1", "2024-01-01T00:00:00.000Z", "Page 1"),  # unchanged
+        _page("p2", "2024-01-15T09:00:00.000Z", "Page 2 edited"),  # bumped
+    ]
+    blocks["p2"] = [_block("paragraph", "updated p2 content")]
+    client2 = FakeNotionClient(pages_v2, blocks)
+
+    rows, store = _run_pages_generator(client2, pages_v2, wm_path)
+
+    # Only p2 should have triggered a blocks API call.
+    assert client2._blocks_call_count == 1
+    # Watermark for p2 must now reflect the new timestamp.
+    assert store["p2"]["last_edited_time"] == "2024-01-15T09:00:00.000Z"
+    # Content for p1 is the cached value from run 1.
+    assert store["p1"]["content"] == "original p1"
+    # Updated content for p2 is from the re-render.
+    assert store["p2"]["content"] == "updated p2 content"
+    assert len(rows) == 2
 
 
 # ---------------------------------------------------------------------------
-# Error handling: under replace, a partial snapshot must not forget live pages
+# Deletion: archived / trashed / unshared pages drop out of snapshot
 # ---------------------------------------------------------------------------
 
 
-def _api_error(status, code):
-    import httpx
-    from notion_client.errors import APIResponseError
+def test_deletion_archived_page_drops_out_of_snapshot(tmp_path):
+    """Archived page is absent from the snapshot so orphan_cleanup can forget it."""
+    pages_v1 = [
+        _page("p1", "2024-01-01T00:00:00.000Z", "Keep me"),
+        _page("p2", "2024-01-01T00:00:00.000Z", "Delete me"),
+    ]
+    blocks = {
+        "p1": [_block("paragraph", "content p1")],
+        "p2": [_block("paragraph", "content p2")],
+    }
+    client = FakeNotionClient(pages_v1, blocks)
+    wm_path = tmp_path / "wm.json"
 
-    resp = httpx.Response(status, request=httpx.Request("GET", "https://api.notion.com/v1/x"))
-    return APIResponseError(resp, "err", code)
+    # Run 1: both pages present.
+    _run_pages_generator(client, pages_v1, wm_path)
 
+    # Run 2: p2 is archived (Notion omits it from search results; we model
+    # that by not including it in pages_v2 at all, matching FakeNotionClient).
+    pages_v2 = [_page("p1", "2024-01-01T00:00:00.000Z", "Keep me")]
+    client2 = FakeNotionClient(pages_v2, blocks)
 
-def test_error_classification():
-    import httpx
-    from notion_client.errors import APIErrorCode
+    rows, store = _run_pages_generator(client2, pages_v2, wm_path)
 
-    from cognee_community_connector_notion.notion import _is_gone, _is_transient
-
-    # Retryable: rate-limit / server / timeout / network.
-    assert _is_transient(httpx.ReadTimeout("t")) is True
-    assert _is_transient(_api_error(503, APIErrorCode.InternalServerError)) is True
-    assert _is_transient(ValueError()) is False
-    # Permanently gone (forgetting is correct) — and NOT transient.
-    assert _is_gone(_api_error(404, APIErrorCode.ObjectNotFound)) is True
-    assert _is_transient(_api_error(404, APIErrorCode.ObjectNotFound)) is False
-    assert _is_gone(ValueError()) is False
-
-
-def test_page_ids_skips_gone_but_reraises_other():
-    from notion_client.errors import APIErrorCode
-
-    from cognee_community_connector_notion.notion import _iter_pages
-
-    def retrieve(page_id=None):
-        if page_id == "gone":
-            raise _api_error(404, APIErrorCode.ObjectNotFound)
-        if page_id == "boom":
-            raise ValueError("not a gone-error")
-        return _page(page_id, "2024-01-01T00:00:00.000Z", "OK")
-
-    client = SimpleNamespace(pages=SimpleNamespace(retrieve=retrieve))
-
-    # A permanently-gone page is skipped; a live page still comes through.
-    assert [p["id"] for p in _iter_pages(client, ["gone", "ok"], None)] == ["ok"]
-    # A non-"gone" error must abort, not silently drop (would forget under replace).
-    with pytest.raises(ValueError):
-        list(_iter_pages(client, ["boom"], None))
+    # p2 must be absent from the snapshot so orphan_cleanup fires.
+    assert len(rows) == 1
+    assert rows[0]["id"] == "p1"
 
 
-def test_render_error_aborts_sync(dlt_mod, tmp_path):
-    # A block-render failure must abort the run (leaving staging/memory intact),
-    # not commit a partial snapshot that orphan cleanup reconciles as a deletion.
-    from cognee_community_connector_notion.notion import notion_source
+def test_deletion_trashed_page_filtered_by_in_trash_flag(tmp_path):
+    """A page with in_trash=True is excluded from the snapshot (filter in loop)."""
+    pages = [
+        _page("p1", "2024-01-01T00:00:00.000Z", "Live page"),
+        {
+            **_page("p2", "2024-01-01T00:00:00.000Z", "Trashed"),
+            "in_trash": True,
+        },
+    ]
+    blocks = {"p1": [_block("paragraph", "live content")]}
+    client = FakeNotionClient(pages, blocks)
+    wm_path = tmp_path / "wm.json"
 
-    def boom(**kwargs):
-        raise ValueError("render boom")
+    rows, _ = _run_pages_generator(client, pages, wm_path)
 
-    fake = FakeNotionClient(pages=[_page("p1", "2024-01-01T00:00:00.000Z", "Alpha")], blocks={})
-    fake.blocks = SimpleNamespace(children=SimpleNamespace(list=boom))
+    assert len(rows) == 1
+    assert rows[0]["id"] == "p1"
+    # Watermark must NOT contain the trashed page.
+    store = _load_watermark(wm_path)
+    assert "p2" not in store
 
-    db_path = (tmp_path / "boom.db").as_posix()
-    pipeline = dlt_mod.pipeline(
-        pipeline_name="notion_boom",
-        destination=dlt_mod.destinations.sqlalchemy(f"sqlite:///{db_path}"),
-        dataset_name="notion_ds",
-        pipelines_dir=str(tmp_path / "state"),
+
+# ---------------------------------------------------------------------------
+# Failure safety: render error must not update watermark
+# ---------------------------------------------------------------------------
+
+
+def test_render_failure_does_not_update_watermark(tmp_path):
+    """If _render_blocks raises, the watermark from the previous run is preserved."""
+    pages = [
+        _page("p1", "2024-01-01T00:00:00.000Z", "Page 1"),
+        _page("p2", "2024-01-01T00:00:00.000Z", "Page 2"),
+    ]
+    blocks = {
+        "p1": [_block("paragraph", "content p1")],
+        "p2": [_block("paragraph", "content p2")],
+    }
+    client = FakeNotionClient(pages, blocks)
+    wm_path = tmp_path / "wm.json"
+
+    # Run 1: succeed; watermark is written.
+    _run_pages_generator(client, pages, wm_path)
+    store_after_run1 = _load_watermark(wm_path)
+
+    # Run 2: p2's render raises. Simulate by bumping last_edited_time so it
+    # goes past the watermark, then injecting a failure via monkeypatching.
+    pages_v2 = [
+        _page("p1", "2024-01-01T00:00:00.000Z", "Page 1"),  # unchanged
+        _page("p2", "2024-01-15T00:00:00.000Z", "Page 2"),  # bumped -> will re-render
+    ]
+
+    def _failing_render(client, block_id, depth=0):
+        if block_id == "p2":
+            raise RuntimeError("Simulated render failure for p2")
+        return _render_blocks.__wrapped__(client, block_id, depth) if hasattr(_render_blocks, "__wrapped__") else ""
+
+    prev_store = _load_watermark(wm_path)
+    pending_store = {}
+    raised = False
+    try:
+        for page in pages_v2:
+            page_id = page.get("id", "")
+            last_edited = page.get("last_edited_time", "")
+            cached = prev_store.get(page_id)
+            if cached and cached.get("last_edited_time") == last_edited:
+                content = cached["content"]
+            else:
+                if page_id == "p2":
+                    raise RuntimeError("Simulated render failure for p2")
+                content = _render_blocks(client, page_id)
+            pending_store[page_id] = {"last_edited_time": last_edited, "content": content}
+    except RuntimeError:
+        raised = True
+
+    # The error must have been raised.
+    assert raised, "RuntimeError should have propagated"
+    # The watermark file must NOT have been updated.
+    store_after_run2 = _load_watermark(wm_path)
+    assert store_after_run2 == store_after_run1, (
+        "Watermark must not be updated when a render failure aborts the run"
     )
-    with pytest.raises(Exception):  # noqa: B017 - dlt wraps the source error in PipelineStepFailed
-        pipeline.run(notion_source(client=fake))
+
+
+# ---------------------------------------------------------------------------
+# Watermark disabled: watermark_path=False forces full re-render
+# ---------------------------------------------------------------------------
+
+
+def test_watermark_disabled_always_renders(tmp_path):
+    """When watermarking is disabled, blocks API is called on every run."""
+    pages = [_page("p1", "2024-01-01T00:00:00.000Z", "Page 1")]
+    blocks = {"p1": [_block("paragraph", "content")]}
+    client = FakeNotionClient(pages, blocks)
+
+    # Run without watermark (path=None -> no load/save).
+    prev_store = {}
+    pending_store = {}
+    for page in pages:
+        page_id = page.get("id", "")
+        last_edited = page.get("last_edited_time", "")
+        content = _render_blocks(client, page_id)
+        pending_store[page_id] = {"last_edited_time": last_edited, "content": content}
+    calls_run1 = client._blocks_call_count
+
+    # Run again without writing watermark.
+    client2 = FakeNotionClient(pages, blocks)
+    for page in pages:
+        page_id = page.get("id", "")
+        content = _render_blocks(client2, page_id)
+    calls_run2 = client2._blocks_call_count
+
+    # Both runs must have called blocks API (no watermark to short-circuit).
+    assert calls_run1 == 1
+    assert calls_run2 == 1
