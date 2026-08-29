@@ -75,6 +75,9 @@ To use different LLM providers, for more info check out our <a href="https://doc
 ### Run an example to verify installation
 
 Navigate to the package directory of your choice and run the example, usually found in the **examples** directory.
+
+*All packages are located in the **packages** directory. In that directory, plugins are sorted by category: for example, adapters for various graph databases would be located under `packages/graph`.*
+
 You can run them either via uv, or poetry:
 
 ```bash
