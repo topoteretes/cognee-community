@@ -1,0 +1,31 @@
+[project]
+name = "cognee-community-hybrid-adapter-turso"
+version = "0.1.0"
+description = "Turso/libSQL hybrid graph and vector database adapter for cognee"
+authors = [
+    {name = "Cognee Community"},
+]
+dependencies = [
+    "cognee>=1.4.2,<2.0.0",
+]
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+
+[project.optional-dependencies]
+libsql = [
+    "libsql-experimental>=0.0.55",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "N", "B", "UP", "C4", "PGH", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
