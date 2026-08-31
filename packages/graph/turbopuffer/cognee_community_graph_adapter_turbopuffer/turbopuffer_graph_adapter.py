@@ -298,11 +298,7 @@ class TurbopufferGraphAdapter(GraphDBInterface):
         rows = list({r["id"]: r for r in rows}.values())
 
         schema = _build_row_schema(rows, non_filterable={"properties"})
-        await asyncio.to_thread(
-            self._node_namespace().write,
-            upsert_rows=rows,
-            schema=schema,
-        )
+        await self._upsert_rows(self._node_namespace(), rows, schema)
 
     async def add_edge(
         self,
@@ -363,10 +359,22 @@ class TurbopufferGraphAdapter(GraphDBInterface):
         rows = list({r["id"]: r for r in rows}.values())
 
         schema = _build_row_schema(rows, non_filterable={"properties"})
-        await asyncio.to_thread(
-            self._edge_namespace().write,
-            upsert_rows=rows,
-            schema=schema,
+        await self._upsert_rows(self._edge_namespace(), rows, schema)
+
+    async def _upsert_rows(self, namespace, rows: List[Dict[str, Any]], schema) -> None:
+        """Upsert in concurrent chunks: a single write of 100k+ docs exceeds
+        the HTTP write timeout (httpx.WriteTimeout). Chunks are disjoint by id,
+        so concurrent upserts are safe; 429 backpressure is absorbed by the
+        SDK's retry/backoff."""
+        await asyncio.gather(
+            *(
+                asyncio.to_thread(
+                    namespace.write,
+                    upsert_rows=rows[start : start + _MAX_QUERY_ROWS],
+                    schema=schema,
+                )
+                for start in range(0, len(rows), _MAX_QUERY_ROWS)
+            )
         )
 
     # --- deletes -----------------------------------------------------------
@@ -668,6 +676,45 @@ class TurbopufferGraphAdapter(GraphDBInterface):
                     self._parse_properties(extra.get("properties")),
                 )
             )
+        return nodes, edges
+
+    async def get_id_filtered_graph_data(self, target_ids: List[str]) -> Tuple[List, List]:
+        """Subgraph touching target_ids: edges with either endpoint in the set,
+        plus all endpoint nodes of those edges (edge-driven, matching the
+        Ladybug/Neo4j contract). Same return format as get_graph_data. Lets
+        CogneeGraph project only the vector-search neighborhood instead of
+        scanning the full graph."""
+        if not target_ids:
+            return [], []
+
+        edge_rows = await self._edges_touching([str(i) for i in target_ids])
+
+        edges = []
+        endpoint_ids: set = set()
+        for row in edge_rows:
+            extra = row.model_extra or {}
+            source_id = str(extra.get("source_id"))
+            target_id = str(extra.get("target_id"))
+            endpoint_ids.update((source_id, target_id))
+            edges.append(
+                (
+                    source_id,
+                    target_id,
+                    extra.get("relationship_name"),
+                    self._parse_properties(extra.get("properties")),
+                )
+            )
+
+        if not endpoint_ids:
+            return [], []
+
+        node_rows = await self._query_by_ids(self._node_namespace(), list(endpoint_ids))
+        nodes = []
+        for row in node_rows:
+            extra = row.model_extra or {}
+            data = {"name": extra.get("name", ""), "type": extra.get("type", "")}
+            data.update(self._parse_properties(extra.get("properties")))
+            nodes.append((str(row.id), data))
         return nodes, edges
 
     async def get_filtered_graph_data(
