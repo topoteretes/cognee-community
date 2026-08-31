@@ -25,10 +25,14 @@ To use the Pinecone adapter, you need to:
 
 ## Usage
 
-Import and register the adapter in your code:
+Register the adapter with cognee before configuring `vector_db_provider="pinecone"`.
+Importing `register` already registers the adapter as a side effect, and `register()`
+is also callable directly (both are idempotent):
 
 ```python
 from cognee_community_vector_adapter_pinecone import register
+
+register()
 ```
 
 ## Example
