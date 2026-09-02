@@ -1,9 +1,8 @@
-"""A full-snapshot PubMed source for cognee.
+"""An incremental PubMed source for cognee.
 
-The connector queries NCBI E-utilities, fetches article metadata and abstracts,
-and yields normal cognee documents.  A run replaces its staging snapshot: an
-article that no longer appears in the selected PubMed query is therefore
-eligible for cognee's downstream orphan cleanup.
+Each run performs a lightweight PMID sweep for the configured query. It fetches
+only articles changed in PubMed's ``edat`` window (plus newly discovered PMIDs)
+and emits hard-delete markers for PMIDs that disappeared from the sweep.
 """
 
 import os
@@ -12,6 +11,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from collections.abc import Callable, Iterator
+from datetime import UTC, datetime
 from typing import Any
 
 from cognee.shared.logging_utils import get_logger
@@ -34,8 +34,6 @@ def pubmed_source(
     query: str,
     email: str | None = None,
     api_key: str | None = None,
-    date_from: str | None = None,
-    date_to: str | None = None,
     client: "PubMedClient | None" = None,
 ):
     """Create a dlt source for PubMed articles matching ``query``.
@@ -44,13 +42,7 @@ def pubmed_source(
         query: PubMed query, for example ``"traditional Chinese medicine"``.
         email: Contact address required by NCBI. Falls back to ``PUBMED_EMAIL``.
         api_key: Optional NCBI API key. Falls back to ``NCBI_API_KEY``.
-        date_from: Optional inclusive ``YYYY/MM/DD`` E-utilities ``edat`` start.
-        date_to: Optional inclusive end date; defaults to today at NCBI.
         client: Injectable client used by tests; normally constructed internally.
-
-    The date range is useful for an incremental *discovery* run. Do not use a
-    date-limited query to reconcile deletion: a full selection snapshot is what
-    makes forget-on-delete safe.
     """
     try:
         import dlt
@@ -66,15 +58,19 @@ def pubmed_source(
     resolved_client = client or PubMedClient(
         email=resolved_email, api_key=api_key or os.environ.get("NCBI_API_KEY")
     )
-    search_term = _with_edat_range(query, date_from, date_to)
 
-    @dlt.resource(name=PUBMED_TABLE_NAME, primary_key="id", write_disposition="replace")
+    @dlt.resource(
+        name=PUBMED_TABLE_NAME,
+        primary_key="id",
+        write_disposition="merge",
+        columns={"_deleted": {"data_type": "bool", "hard_delete": True}},
+    )
     def pubmed_articles():
-        count = 0
-        for article in resolved_client.iter_articles(search_term):
-            count += 1
-            yield article
-        logger.info("PubMed: synced %d article(s).", count)
+        yield from sync_articles(
+            resolved_client,
+            query,
+            dlt.current.resource_state(),
+        )
 
     @dlt.source(name=PUBMED_SOURCE_NAME)
     def _pubmed():
@@ -103,13 +99,22 @@ class PubMedClient:
 
     def iter_articles(self, term: str) -> Iterator[dict[str, str]]:
         """Search all matching PMIDs, then fetch them in batches."""
-        ids = self._search_ids(term)
+        yield from self.iter_articles_by_ids(self.search_ids(term))
+
+    def search_ids(self, term: str) -> list[str]:
+        """Return all PMIDs matching an E-utilities search term."""
+        root = ET.fromstring(
+            self._get(
+                "esearch.fcgi",
+                {"db": "pubmed", "term": term, "retmax": "100000"},
+            )
+        )
+        return [node.text for node in root.findall(".//IdList/Id") if node.text]
+
+    def iter_articles_by_ids(self, ids: list[str]) -> Iterator[dict[str, Any]]:
+        """Fetch and normalize the supplied PMIDs in bounded batches."""
         for start in range(0, len(ids), _DEFAULT_BATCH_SIZE):
             yield from _parse_articles(self._fetch(ids[start : start + _DEFAULT_BATCH_SIZE]))
-
-    def _search_ids(self, term: str) -> list[str]:
-        root = ET.fromstring(self._get("esearch.fcgi", {"db": "pubmed", "term": term, "retmax": "100000"}))
-        return [node.text for node in root.findall(".//IdList/Id") if node.text]
 
     def _fetch(self, ids: list[str]) -> bytes:
         return self._get(
@@ -134,7 +139,8 @@ class PubMedClient:
 def _http_get(url: str, params: dict[str, str]) -> bytes:
     """Issue one GET request without adding a third-party HTTP dependency."""
     request = urllib.request.Request(f"{url}?{urllib.parse.urlencode(params)}")
-    with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310 - fixed NCBI base URL
+    # S310 is safe here because callers cannot override the fixed NCBI base URL.
+    with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310
         return response.read()
 
 
@@ -145,11 +151,62 @@ def _with_edat_range(query: str, date_from: str | None, date_to: str | None) -> 
     return f"({query}) AND {date_from}:{date_to or '3000/12/31'}[edat]"
 
 
+def _deleted_row(pmid: str) -> dict[str, Any]:
+    """Build a dlt hard-delete marker for one vanished PubMed record."""
+    return {"id": pmid, "_deleted": True}
+
+
+def sync_articles(
+    client: PubMedClient,
+    query: str,
+    state: dict[str, Any],
+    *,
+    today: str | None = None,
+) -> Iterator[dict[str, Any]]:
+    """Yield changed articles and deletions, then advance the persisted cursor.
+
+    PubMed exposes edit dates at day precision. The inclusive cursor therefore
+    deliberately overlaps the boundary day so edits made later on that day are
+    not missed; stable document hashes keep those occasional repeats harmless.
+    """
+    sync_date = today or datetime.now(UTC).strftime("%Y/%m/%d")
+    known_ids = set(state.get("known_ids", []))
+    current_order = client.search_ids(query)
+    current_ids = set(current_order)
+
+    if known_ids and state.get("last_edat"):
+        changed_ids = set(
+            client.search_ids(_with_edat_range(query, state["last_edat"], sync_date))
+        )
+        # A newly matching article can carry an older edit date (for example
+        # after a query/scope change), so never rely on the cursor alone.
+        changed_ids.update(current_ids - known_ids)
+    else:
+        changed_ids = current_ids
+
+    changed_order = [pmid for pmid in current_order if pmid in changed_ids]
+    changed = 0
+    for article in client.iter_articles_by_ids(changed_order):
+        article["_deleted"] = False
+        changed += 1
+        yield article
+
+    deleted_ids = known_ids - current_ids
+    for pmid in sorted(deleted_ids):
+        yield _deleted_row(pmid)
+
+    # State advances only after the generator completes successfully. A search,
+    # fetch, or parse failure leaves the old cursor available for a safe retry.
+    state["known_ids"] = sorted(current_ids)
+    state["last_edat"] = sync_date
+    logger.info("PubMed: %d changed article(s), %d deletion(s).", changed, len(deleted_ids))
+
+
 def _text(element: ET.Element | None) -> str:
     return "".join(element.itertext()).strip() if element is not None else ""
 
 
-def _parse_articles(payload: bytes) -> Iterator[dict[str, str]]:
+def _parse_articles(payload: bytes) -> Iterator[dict[str, Any]]:
     """Turn PubMed XML into stable document rows with provenance."""
     root = ET.fromstring(payload)
     for article in root.findall(".//PubmedArticle"):
@@ -158,7 +215,15 @@ def _parse_articles(payload: bytes) -> Iterator[dict[str, str]]:
             continue
         title = _text(article.find("./MedlineCitation/Article/ArticleTitle"))
         abstract = "\n".join(
-            filter(None, (_text(item) for item in article.findall("./MedlineCitation/Article/Abstract/AbstractText")))
+            filter(
+                None,
+                (
+                    _text(item)
+                    for item in article.findall(
+                        "./MedlineCitation/Article/Abstract/AbstractText"
+                    )
+                ),
+            )
         )
         journal = _text(article.find("./MedlineCitation/Article/Journal/Title"))
         publication_date = _publication_date(article)
@@ -179,4 +244,5 @@ def _publication_date(article: ET.Element) -> str:
     date = article.find("./MedlineCitation/Article/Journal/JournalIssue/PubDate")
     if date is None:
         return ""
-    return "-".join(filter(None, (_text(date.find("Year")), _text(date.find("Month")), _text(date.find("Day")))))
+    parts = (_text(date.find("Year")), _text(date.find("Month")), _text(date.find("Day")))
+    return "-".join(filter(None, parts))
