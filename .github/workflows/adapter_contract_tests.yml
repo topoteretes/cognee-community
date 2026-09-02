@@ -53,6 +53,7 @@ jobs:
           - packages/vector/pinecone
           - packages/vector/qdrant
           - packages/vector/redis
+          - packages/vector/s3vectors
           - packages/vector/singlestore
           - packages/vector/turbopuffer
           - packages/vector/valkey

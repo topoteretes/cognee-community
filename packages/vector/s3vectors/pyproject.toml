@@ -1,0 +1,27 @@
+[project]
+name = "cognee-community-vector-adapter-s3vectors"
+version = "0.1.0"
+description = "Amazon S3 Vectors adapter for cognee"
+readme = "README.md"
+requires-python = "<=3.13,>=3.10"
+dependencies = [
+    "boto3>=1.40.0",
+    "cognee==1.4.2",
+    # Transitive via cognee; pinned to the version cognee 1.4.2 locks (litellm
+    # 1.96.x published cp310-only wheels, uninstallable on the CI's Python 3.11).
+    "litellm==1.89.2",
+]
+
+[project.urls]
+Homepage = "https://www.cognee.ai"
+Repository = "https://github.com/topoteretes/cognee-community"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build]
+exclude = [
+  "/dist",
+  "/.venv",
+]
