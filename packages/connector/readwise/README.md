@@ -62,4 +62,4 @@ uv run pytest tests/
 ```
 
 The test suite is offline: it uses a fake HTTP session to cover pagination, filtering,
-rendering, deletions, cursor safety, and the dlt merge/hard-delete schema.
+rendering, deletion rows, and incremental cursor safety.
