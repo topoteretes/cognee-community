@@ -2,12 +2,12 @@ import os
 import pathlib
 
 import cognee
-from cognee.shared.logging_utils import get_logger
 from cognee.infrastructure.files.storage import get_storage_config
 from cognee.modules.data.models import Data
-from cognee.modules.users.methods import get_default_user
-from cognee.modules.search.types import SearchType
 from cognee.modules.search.operations import get_history
+from cognee.modules.search.types import SearchType
+from cognee.modules.users.methods import get_default_user
+from cognee.shared.logging_utils import get_logger
 
 # NOTE: Importing the register module lets cognee know it can use the ChromaDB vector adapter.
 # NOTE: The "noqa: F401" mark keeps the linter from flagging this as an unused import.
@@ -20,9 +20,10 @@ TEST_DATA_DIR = pathlib.Path(__file__).parent.parent.parent.parent / "test_data"
 
 
 async def test_local_file_deletion(data_text, file_location):
-    from sqlalchemy import select
     import hashlib
+
     from cognee.infrastructure.databases.relational import get_relational_engine
+    from sqlalchemy import select
 
     engine = get_relational_engine()
 

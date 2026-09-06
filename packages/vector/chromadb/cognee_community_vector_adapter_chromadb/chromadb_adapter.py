@@ -1,20 +1,19 @@
-import json
 import asyncio
-from uuid import UUID
+import json
 from typing import List, Literal, Optional
-from chromadb import AsyncHttpClient, Settings
-from pydantic import BaseModel
+from uuid import UUID
 
-from cognee.shared.logging_utils import get_logger
-from cognee.modules.storage.utils import get_own_properties
-from cognee.infrastructure.engine import DataPoint
-from cognee.infrastructure.engine.utils import parse_id
+from chromadb import AsyncHttpClient, Settings
+from chromadb.config import DEFAULT_DATABASE
+from cognee.infrastructure.databases.exceptions import MissingQueryParameterError
+from cognee.infrastructure.databases.vector.embeddings.EmbeddingEngine import EmbeddingEngine
 from cognee.infrastructure.databases.vector.exceptions import CollectionNotFoundError
 from cognee.infrastructure.databases.vector.models.ScoredResult import ScoredResult
-from cognee.infrastructure.databases.exceptions import MissingQueryParameterError
-
-from cognee.infrastructure.databases.vector.embeddings.EmbeddingEngine import EmbeddingEngine
 from cognee.infrastructure.databases.vector.vector_db_interface import VectorDBInterface
+from cognee.infrastructure.engine import DataPoint
+from cognee.infrastructure.engine.utils import parse_id
+from cognee.modules.storage.utils import get_own_properties
+from cognee.shared.logging_utils import get_logger
 
 logger = get_logger("ChromaDBAdapter")
 
@@ -157,11 +156,17 @@ class ChromaDBAdapter(VectorDBInterface):
     connection: AsyncHttpClient = None
 
     def __init__(
-        self, url: Optional[str], api_key: Optional[str], embedding_engine: EmbeddingEngine
+        self,
+        url: Optional[str],
+        api_key: Optional[str],
+        embedding_engine: EmbeddingEngine,
+        database_name: Optional[str] = None,
+        **kwargs,
     ):
         self.embedding_engine = embedding_engine
         self.url = url
         self.api_key = api_key
+        self.database_name = database_name or DEFAULT_DATABASE
         self.VECTOR_DB_LOCK = asyncio.Lock()
 
     async def get_connection(self) -> AsyncHttpClient:
@@ -176,9 +181,14 @@ class ChromaDBAdapter(VectorDBInterface):
         """
         if self.connection is None:
             settings = Settings(
-                chroma_client_auth_provider="token", chroma_client_auth_credentials=self.api_key
+                chroma_client_auth_provider="chromadb.auth.token_authn.TokenAuthClientProvider",
+                chroma_client_auth_credentials=self.api_key,
             )
-            self.connection = await AsyncHttpClient(host=self.url, settings=settings)
+            # Chroma 0.6's async HTTP client does not apply client auth providers.
+            headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else None
+            self.connection = await AsyncHttpClient(
+                host=self.url, settings=settings, database=self.database_name, headers=headers
+            )
 
         return self.connection
 
@@ -349,7 +359,7 @@ class ChromaDBAdapter(VectorDBInterface):
                 payload=restore_data_from_chroma(metadata),
                 score=0,
             )
-            for id, metadata in zip(results["ids"], results["metadatas"])
+            for id, metadata in zip(results["ids"], results["metadatas"], strict=True)
         ]
 
     @staticmethod
@@ -451,7 +461,9 @@ class ChromaDBAdapter(VectorDBInterface):
 
             vector_list = []
             metadatas = results.get("metadatas")
-            for i, (id, distance) in enumerate(zip(results["ids"][0], results["distances"][0])):
+            for i, (id, distance) in enumerate(
+                zip(results["ids"][0], results["distances"][0], strict=True)
+            ):
                 item = {
                     "id": parse_id(id),
                     "payload": restore_data_from_chroma(metadatas[0][i])
@@ -487,7 +499,7 @@ class ChromaDBAdapter(VectorDBInterface):
         self,
         collection_name: str,
         query_texts: List[str],
-        limit: int = 5,
+        limit: Optional[int] = 5,
         with_vectors: bool = False,
         include_payload: bool = False,
         node_name: Optional[List[str]] = None,
@@ -503,8 +515,8 @@ class ChromaDBAdapter(VectorDBInterface):
             - collection_name (str): The name of the collection in which to perform the
               searches.
             - query_texts (List[str]): A list of text queries to be searched.
-            - limit (int): The maximum number of results to return for each query; defaults to
-              5. (default 5)
+            - limit (Optional[int]): Maximum results per query; defaults to 5.
+              None searches the entire collection.
             - with_vectors (bool): Whether to include vectors in the results for each query.
               (default False)
             - include_payload (bool): Whether to include payload metadata in results.
@@ -519,9 +531,16 @@ class ChromaDBAdapter(VectorDBInterface):
 
             Returns a list of lists of ScoredResult instances for each query's results.
         """
-        query_vectors = await self.embed_data(query_texts)
+        if not query_texts:
+            return []
 
         collection = await self.get_collection(collection_name)
+        if limit is None:
+            limit = await collection.count()
+        if limit <= 0:
+            return [[] for _ in query_texts]
+
+        query_vectors = await self.embed_data(query_texts)
 
         where_filter = self._build_where_filter(node_name, node_name_filter_operator)
         include_list = self._build_include_list(include_payload, with_vectors)
@@ -541,7 +560,9 @@ class ChromaDBAdapter(VectorDBInterface):
         for i in range(len(query_texts)):
             vector_list = []
 
-            for j, (id, distance) in enumerate(zip(results["ids"][i], results["distances"][i])):
+            for j, (id, distance) in enumerate(
+                zip(results["ids"][i], results["distances"][i], strict=True)
+            ):
                 item = {
                     "id": parse_id(id),
                     "payload": restore_data_from_chroma(metadatas[i][j])

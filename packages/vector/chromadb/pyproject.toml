@@ -11,7 +11,8 @@ dependencies = [
     # newer pypika on 3.14.
     "pypika==0.48.9 ; python_version < '3.14'",
     "pypika>=0.50.0 ; python_version >= '3.14'",
-    "cognee>=0.5.0",
+    "cognee==1.5.4",
+    "litellm==1.89.2",
     "starlette>=0.48.0",
     "instructor>=1.11",
 ]
@@ -38,3 +39,10 @@ module = [
   "cognee.*",
 ]
 ignore_missing_imports = true
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cognee_community_vector_adapter_chromadb"]
