@@ -5318,37 +5318,47 @@ test = ["argcomplete (>=3.0.3)", "mypy (>=1.7.0)", "pre-commit", "pytest (>=7.0,
 
 [[package]]
 name = "turingdb"
-version = "1.22.0"
+version = "1.37"
 description = ""
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "turingdb-1.22.0-cp310-cp310-macosx_14_0_arm64.whl", hash = "sha256:67c42d3381dce199564e9e9e18fac4340c59763a2fe0f74009168d5b24966293"},
-    {file = "turingdb-1.22.0-cp310-cp310-macosx_15_0_arm64.whl", hash = "sha256:736d42c332342a4c93f9784bc2f053280329d241645d8191e39532ddd637ede4"},
-    {file = "turingdb-1.22.0-cp310-cp310-macosx_26_0_arm64.whl", hash = "sha256:02d652a86a1735b7a9ebefe9d13dd093146d6dfd30c1ee7ac67153be29f560ca"},
-    {file = "turingdb-1.22.0-cp310-cp310-manylinux_2_35_x86_64.whl", hash = "sha256:4bf1746e7a86eafd72f4a2d93af3ba8fa41a4b3e1f1c5fd56d314052a0c9a267"},
-    {file = "turingdb-1.22.0-cp310-cp310-manylinux_2_39_x86_64.whl", hash = "sha256:85b4eecbe01cb4e111a0413d55253da2b1110d04d1f25a6a828a7565877d60fa"},
-    {file = "turingdb-1.22.0-cp311-cp311-macosx_14_0_arm64.whl", hash = "sha256:91002312967cce3bd70bfc4c6b3d726c2c3708049c9fa3d19cc4be2a33320d12"},
-    {file = "turingdb-1.22.0-cp311-cp311-macosx_15_0_arm64.whl", hash = "sha256:a96e77d977a0172f7517bab9ee835a02c876d41ecb9345373fed3e765ce3b96c"},
-    {file = "turingdb-1.22.0-cp311-cp311-macosx_26_0_arm64.whl", hash = "sha256:c87c59fd09f47ff7743b0f2d67e75609671b533531f75c2baf2377681e11a03d"},
-    {file = "turingdb-1.22.0-cp311-cp311-manylinux_2_35_x86_64.whl", hash = "sha256:4b783343770689c1075832fe90c2c0e7a7f773e3dab9ff33b124fbfeff5087f1"},
-    {file = "turingdb-1.22.0-cp311-cp311-manylinux_2_39_x86_64.whl", hash = "sha256:7b40cd433cf424be8114b15a8c4bbc963d7f366d5e67dfbc09c74d4b08e70d5a"},
-    {file = "turingdb-1.22.0-cp312-cp312-macosx_14_0_arm64.whl", hash = "sha256:964544676e686a89fba4466c438afc74a1b1d4742366cabfa3d86b314749ef5c"},
-    {file = "turingdb-1.22.0-cp312-cp312-macosx_15_0_arm64.whl", hash = "sha256:723fd3ddbcf066dd2e822daa0cfc9e60eeebcf81277e0525475be5995e020b32"},
-    {file = "turingdb-1.22.0-cp312-cp312-macosx_26_0_arm64.whl", hash = "sha256:f003c225856345c0a61da799f0e91faee233aa1353326de95f521f31fb339d2e"},
-    {file = "turingdb-1.22.0-cp312-cp312-manylinux_2_35_x86_64.whl", hash = "sha256:c2fe8c905db7057c03e37c97ee0e48b3638e12344c99b9c8b5160202e1d0f7a9"},
-    {file = "turingdb-1.22.0-cp312-cp312-manylinux_2_39_x86_64.whl", hash = "sha256:e5bea1e7244801c46ec4306a1108f0a4faca74790e53a5a2137b2f0e9d3c25f1"},
-    {file = "turingdb-1.22.0-cp313-cp313-macosx_14_0_arm64.whl", hash = "sha256:1baf9c119905d6377084ed92838d5d009bfb22f6667bf2692e996e212de51b9d"},
-    {file = "turingdb-1.22.0-cp313-cp313-macosx_15_0_arm64.whl", hash = "sha256:a26f03e73d30e32bff4a6321fbf019937d001d346b4683f22c0354d9f81484f5"},
-    {file = "turingdb-1.22.0-cp313-cp313-macosx_26_0_arm64.whl", hash = "sha256:9545d4f1cafb8251cebcf020d128810863103fc560df3881dc3645ecb69383e9"},
-    {file = "turingdb-1.22.0-cp313-cp313-manylinux_2_35_x86_64.whl", hash = "sha256:fbd4b33fdb9776b7fcd7daabeda77a44b5d245a9ef0a352f68657a6a0fcf1e8c"},
-    {file = "turingdb-1.22.0-cp313-cp313-manylinux_2_39_x86_64.whl", hash = "sha256:9c17a2eded7322d8bd8b6c496ec5e2731f5fc042c76efdde02da3a5d364b8183"},
-    {file = "turingdb-1.22.0-cp314-cp314-macosx_14_0_arm64.whl", hash = "sha256:ff2b93410995942d0a839dd70acffdba2ea1e6794a2ac386000e97074eca978d"},
-    {file = "turingdb-1.22.0-cp314-cp314-macosx_15_0_arm64.whl", hash = "sha256:0ba61a2802f632cdae52ad0315724002b0fdebef44d309d7605075b19e570977"},
-    {file = "turingdb-1.22.0-cp314-cp314-macosx_26_0_arm64.whl", hash = "sha256:23be7194b969b4e08d58f41a89b859303e38a0abb955c462503faa7d5007238c"},
-    {file = "turingdb-1.22.0-cp314-cp314-manylinux_2_35_x86_64.whl", hash = "sha256:c7907f97e4e3c52068b00007ecfad70e68967d91764c778456530757c0b11ad7"},
-    {file = "turingdb-1.22.0-cp314-cp314-manylinux_2_39_x86_64.whl", hash = "sha256:3583d99cf04f03ba2bbd7579304e377f628ffbec55374a5d532ebfabe0cd42ba"},
+    {file = "turingdb-1.37-cp310-cp310-macosx_14_0_arm64.whl", hash = "sha256:3e9708a620539dfa1300d9677f57e6f0f8cb5d1babacc3c403ea59b5412716e8"},
+    {file = "turingdb-1.37-cp310-cp310-macosx_15_0_arm64.whl", hash = "sha256:c12f965ed32258742ce44be994f5ecae0cefed85c9e9a24882f18ff11a09aa77"},
+    {file = "turingdb-1.37-cp310-cp310-macosx_26_0_arm64.whl", hash = "sha256:bfb4fc991e3767f1a87829d560efa9b3049edb8ddc655de8dd2b7c335467f145"},
+    {file = "turingdb-1.37-cp310-cp310-manylinux_2_35_aarch64.whl", hash = "sha256:e8cdfc0f205c6078ebad6090bdeb4e526c8e5ae8ffb6d4d84f6ad96c2a0b7a1e"},
+    {file = "turingdb-1.37-cp310-cp310-manylinux_2_35_x86_64.whl", hash = "sha256:52460d24f46f73158407aac51700088275d6e2ce63657ec674debccb93ba422d"},
+    {file = "turingdb-1.37-cp310-cp310-manylinux_2_39_aarch64.whl", hash = "sha256:2e6872150b8c347969838d274ef4247a9534a6845583cab5a512089dc1d7b789"},
+    {file = "turingdb-1.37-cp310-cp310-manylinux_2_39_x86_64.whl", hash = "sha256:deab553b139a28f6e0f044137ba0546fbb8f69114b5d7958143bf44f498c83f0"},
+    {file = "turingdb-1.37-cp311-cp311-macosx_14_0_arm64.whl", hash = "sha256:a1a233ca5f1a59e2d2cfaec6aeb2868b7aa84c7400d0c4ebe2ff21bc431d183b"},
+    {file = "turingdb-1.37-cp311-cp311-macosx_15_0_arm64.whl", hash = "sha256:185503fc6fc01b36d03545259a75e3067892b1646e9627bf0a378a10cfb2dca8"},
+    {file = "turingdb-1.37-cp311-cp311-macosx_26_0_arm64.whl", hash = "sha256:985f041586fa7defc5028136d82526e1d426ed946e9be72f9f9777a5e3eaa380"},
+    {file = "turingdb-1.37-cp311-cp311-manylinux_2_35_aarch64.whl", hash = "sha256:94c6a940c5d442860ad2a0b01df069b6be3fcc654ed8347a298cdae514031278"},
+    {file = "turingdb-1.37-cp311-cp311-manylinux_2_35_x86_64.whl", hash = "sha256:b53d5ca5a2b09663aa7b78ba685d88be26b9b7ced672aa31613d359b2e12f385"},
+    {file = "turingdb-1.37-cp311-cp311-manylinux_2_39_aarch64.whl", hash = "sha256:c66f908fa93faa54cc27b2b0ccf4b51bb4ced04dc95f928e7bf66c33bbc31982"},
+    {file = "turingdb-1.37-cp311-cp311-manylinux_2_39_x86_64.whl", hash = "sha256:bf9b24054a315de189beeee1856653f1e6af36067074928050c152dd91b4c073"},
+    {file = "turingdb-1.37-cp312-cp312-macosx_14_0_arm64.whl", hash = "sha256:16ed1b14d47842d2c7a1a6df9a83d4bce8077586732d8c71f11f0019e21d01c8"},
+    {file = "turingdb-1.37-cp312-cp312-macosx_15_0_arm64.whl", hash = "sha256:21a16ce063501e309bfbe175f7e050534711d54d83232ef9ecf3c260012c6359"},
+    {file = "turingdb-1.37-cp312-cp312-macosx_26_0_arm64.whl", hash = "sha256:91dc41df7bc19463b19d3f10a753361c732510e62df65d1b0de71b97c9ed9d3c"},
+    {file = "turingdb-1.37-cp312-cp312-manylinux_2_35_aarch64.whl", hash = "sha256:755e8a19ebae7610cf5713dc0c786c4efeef58ab089dde4e9b0987e963474c96"},
+    {file = "turingdb-1.37-cp312-cp312-manylinux_2_35_x86_64.whl", hash = "sha256:4caee4de7a9ae258853db9b67abd950d7cd67a5bc7989fc62d0f770815ec89b5"},
+    {file = "turingdb-1.37-cp312-cp312-manylinux_2_39_aarch64.whl", hash = "sha256:b6697e0093e1ef8fccafc148d8787df172b28e62d3f301c3f5d1acb215b3de8a"},
+    {file = "turingdb-1.37-cp312-cp312-manylinux_2_39_x86_64.whl", hash = "sha256:717c89b2b9223d5a9c09065deaf48aeced4e08ecf95ffdff5add76e616196d69"},
+    {file = "turingdb-1.37-cp313-cp313-macosx_14_0_arm64.whl", hash = "sha256:0c8e8785646f8d1eb9cb51796635e3b30d9d3ff2bd648197d2bec8e008124e70"},
+    {file = "turingdb-1.37-cp313-cp313-macosx_15_0_arm64.whl", hash = "sha256:5a3e8f9c754b2a0056986691113fa826b225e249784d8b270d90c198853eb2bd"},
+    {file = "turingdb-1.37-cp313-cp313-macosx_26_0_arm64.whl", hash = "sha256:421e48707d773930a7b2497b454d16cff9fdced5192c1f1ea41c24a950ca5c8c"},
+    {file = "turingdb-1.37-cp313-cp313-manylinux_2_35_aarch64.whl", hash = "sha256:21bb3b040fad402db0251a99ea4f7a91799e99a71083bb71096d0fc5725a861b"},
+    {file = "turingdb-1.37-cp313-cp313-manylinux_2_35_x86_64.whl", hash = "sha256:23e6dde4e3abfb45b314ab5faefd5b0ef734eda11e1b80f503b8894917fd6109"},
+    {file = "turingdb-1.37-cp313-cp313-manylinux_2_39_aarch64.whl", hash = "sha256:e7c593dff6d78d418576af253e2009543e3845efd0d2dedeecfbae2dad6e0f23"},
+    {file = "turingdb-1.37-cp313-cp313-manylinux_2_39_x86_64.whl", hash = "sha256:75ab3a034881a5dccdd0b70cf46665e40ef224fc4cd847732ae55fcd00cc6aab"},
+    {file = "turingdb-1.37-cp314-cp314-macosx_14_0_arm64.whl", hash = "sha256:118dd88bb9c047dac26532607369a34a4309c4b3237d77c59f28e3a12b548320"},
+    {file = "turingdb-1.37-cp314-cp314-macosx_15_0_arm64.whl", hash = "sha256:e9997661f34bb80966574e95908b8d2178dda7686811ca5549dcf992820b378b"},
+    {file = "turingdb-1.37-cp314-cp314-macosx_26_0_arm64.whl", hash = "sha256:3db3536c7861b1226c0cfd505413f8f5a5a0b633f5edfffdf12088b4ff13acef"},
+    {file = "turingdb-1.37-cp314-cp314-manylinux_2_35_aarch64.whl", hash = "sha256:fa714e5b461d966516f85b207377c72910523c07d482227bce27a2768cf11c64"},
+    {file = "turingdb-1.37-cp314-cp314-manylinux_2_35_x86_64.whl", hash = "sha256:909f3a9664ebb4e67fe8d162d2dcca5fa4f83fe1a11bf4280cd9bdc37eb45e00"},
+    {file = "turingdb-1.37-cp314-cp314-manylinux_2_39_aarch64.whl", hash = "sha256:c88c7c2572225bb63caaa468a65544cf3d38a870d1d3f7c6ff4ab040d3cb831d"},
+    {file = "turingdb-1.37-cp314-cp314-manylinux_2_39_x86_64.whl", hash = "sha256:a2443ede6b68a64a2092e80f4b8491d4244d1d8f7a01bc5ece586a17a0e3cfa4"},
 ]
 
 [package.dependencies]
@@ -5844,4 +5854,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.11,<=3.13"
-content-hash = "18b03b1ae7ea2a5aab5fe6c2c0484bd5bf983ea8cdf29ef69e9d713324849d3f"
+content-hash = "85aca358a381e41f62501f6ef0a88acc34817055ea6d7e8caa400349657f6412"

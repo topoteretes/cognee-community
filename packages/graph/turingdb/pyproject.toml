@@ -5,7 +5,10 @@ description = "Turingdb graph database adapter for cognee"
 readme = "README.md"
 requires-python =  ">=3.11,<=3.13"
 dependencies = [
-    "turingdb>=1.22.0",
+    # 1.30.0 is the oldest release still on PyPI: the publisher deleted every
+    # earlier one, including the 1.22.0 this floor used to name, which left
+    # the lock pointing at files no installer could fetch.
+    "turingdb>=1.30.0",
     "cognee==1.5.4",
     # Transitive via cognee; pinned to the version cognee 1.5.4 locks, so CI
     # resolves the litellm the upstream release was tested against. cognee 1.5.x

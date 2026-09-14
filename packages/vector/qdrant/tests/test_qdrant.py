@@ -369,8 +369,14 @@ async def main():
         print(f"{result}\n")
 
     user = await get_default_user()
-    history = await get_history(user.id)
-    assert len(history) == 8, "Search history is not correct."
+    # cognee >= 1.5.0 records search history per dataset searched: one query row
+    # and one result row for every dataset a search fans out over. The four
+    # searches above cover 2 + 1 + 1 + 2 = 6 dataset searches, so 12 rows.
+    # get_history's default limit of 10 would truncate that; limit=0 lifts it.
+    history = await get_history(user.id, limit=0)
+    assert len(history) == 12, (
+        f"Search history is not correct: expected 12 entries, got {len(history)}"
+    )
 
     await test_vector_engine_search_none_limit()
 

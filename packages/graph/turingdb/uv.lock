@@ -639,7 +639,7 @@ requires-dist = [
     { name = "instructor", specifier = ">=1.11" },
     { name = "litellm", specifier = "==1.96.2" },
     { name = "starlette", specifier = ">=0.48.0" },
-    { name = "turingdb", specifier = ">=1.22.0" },
+    { name = "turingdb", specifier = ">=1.30.0" },
 ]
 
 [[package]]
