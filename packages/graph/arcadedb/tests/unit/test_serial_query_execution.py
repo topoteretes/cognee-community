@@ -14,9 +14,7 @@ class RecordingAdapter(ArcadeDBAdapter):
     async def query(self, query, params=None):
         self.calls.append((query, params))
         self.active_queries += 1
-        self.max_active_queries = max(
-            self.max_active_queries, self.active_queries
-        )
+        self.max_active_queries = max(self.max_active_queries, self.active_queries)
 
         await asyncio.sleep(0)
 
@@ -45,9 +43,7 @@ async def test_get_connections_executes_queries_sequentially():
 class NeighborAdapter(RecordingAdapter):
     async def get_predecessors(self, node_id):
         self.active_queries += 1
-        self.max_active_queries = max(
-            self.max_active_queries, self.active_queries
-        )
+        self.max_active_queries = max(self.max_active_queries, self.active_queries)
 
         await asyncio.sleep(0)
 
@@ -56,9 +52,7 @@ class NeighborAdapter(RecordingAdapter):
 
     async def get_successors(self, node_id):
         self.active_queries += 1
-        self.max_active_queries = max(
-            self.max_active_queries, self.active_queries
-        )
+        self.max_active_queries = max(self.max_active_queries, self.active_queries)
 
         await asyncio.sleep(0)
 

@@ -375,12 +375,8 @@ class ArcadeDBAdapter(GraphDBInterface):
         """
 
         # Execute reads sequentially to avoid concurrent database requests.
-        predecessors = await self.query(
-            predecessors_query, {"node_id": str(node_id)}
-        )
-        successors = await self.query(
-            successors_query, {"node_id": str(node_id)}
-        )
+        predecessors = await self.query(predecessors_query, {"node_id": str(node_id)})
+        successors = await self.query(successors_query, {"node_id": str(node_id)})
 
         connections = []
 
