@@ -1,10 +1,12 @@
-"""Offline conformance checks for community graph adapters against cognee 1.4.1.
+"""Offline conformance checks for community graph adapters against cognee 1.5.4.
 
-Call-shape sources (cognee v1.4.1):
+Call-shape sources (cognee v1.5.4):
 - construction: cognee/infrastructure/databases/graph/get_graph_engine.py
   -> adapter(graph_database_url=..., graph_database_username=...,
              graph_database_password=..., graph_database_port=...,
              graph_database_key=..., database_name=...)
+  Unchanged in 1.5.x: unlike the vector factory, the graph factory did NOT gain
+  new connection keywords.
 - writes: cognee/tasks/storage/add_data_points.py ALWAYS calls
   add_nodes(nodes, source_ref_key=..., pipeline_run_id=...) and
   add_edges(edges, source_ref_key=..., pipeline_run_id=...) — values may be
@@ -30,12 +32,12 @@ def _bind(adapter_cls, method_name: str, *args, **kwargs):
     except TypeError as error:
         raise AssertionError(
             f"{adapter_cls.__name__}.{method_name}{signature} cannot be called as "
-            f"cognee 1.4.1 calls it (args={args}, kwargs={kwargs}): {error}"
+            f"cognee 1.5.4 calls it (args={args}, kwargs={kwargs}): {error}"
         ) from error
 
 
 def assert_graph_contract(adapter_cls, *, check_constructor=True):
-    """Assert that *adapter_cls* satisfies the cognee 1.4.1 graph adapter contract.
+    """Assert that *adapter_cls* satisfies the cognee 1.5.4 graph adapter contract.
 
     Parameters:
         adapter_cls: the adapter class registered via use_graph_adapter (or the
@@ -54,7 +56,9 @@ def assert_graph_contract(adapter_cls, *, check_constructor=True):
         f"be instantiated: {sorted(remaining_abstract)}"
     )
 
-    # The hard 1.4.1 break: add_data_points always passes these kwargs.
+    # The hard 1.4.1 break, still in force: add_data_points always passes these
+    # kwargs. 1.5.x may pass a per-row MAPPING instead of a scalar key, but only
+    # to adapters that opt in with supports_per_row_source_refs = True.
     _bind(adapter_cls, "add_nodes", [], source_ref_key=None, pipeline_run_id=None)
     _bind(adapter_cls, "add_edges", [], source_ref_key=None, pipeline_run_id=None)
     _bind(adapter_cls, "add_nodes", [], source_ref_key="dataset:data", pipeline_run_id="run-1")

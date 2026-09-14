@@ -92,7 +92,12 @@ class WeaviateAdapter(VectorDBInterface):
         api_key: str,
         embedding_engine: EmbeddingEngine,
         database_name: str = "cognee",
+        **kwargs,
     ):
+        # cognee >= 1.5.0 always passes vector_db_host / vector_db_port /
+        # vector_db_username / vector_db_password to registered adapters. This
+        # adapter connects to Weaviate Cloud, which takes a cluster URL and an
+        # API key, so they are absorbed by **kwargs and ignored.
         import weaviate
         import weaviate.classes as wvc
 

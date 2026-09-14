@@ -1,4 +1,4 @@
-"""Offline cognee-1.4.1 conformance tests. No OpenSearch server, no secrets."""
+"""Offline cognee-1.5.4 conformance tests. No OpenSearch server, no secrets."""
 
 from cognee_community_vector_adapter_opensearch.opensearch_adapter import (
     OpenSearchAdapter,

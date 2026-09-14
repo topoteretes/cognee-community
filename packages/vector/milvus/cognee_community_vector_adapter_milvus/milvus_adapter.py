@@ -18,6 +18,8 @@ from pymilvus.orm.types import DataType
 
 logger = get_logger("MilvusAdapter")
 
+DEFAULT_MILVUS_PORT = 19530
+
 
 class MilvusAdapter(VectorDBInterface):
     """
@@ -50,7 +52,22 @@ class MilvusAdapter(VectorDBInterface):
         api_key: str | None,
         embedding_engine: EmbeddingEngine,
         database_name: str = "cognee",
+        vector_db_host: str = "",
+        vector_db_port: str = "",
+        vector_db_username: str = "",
+        vector_db_password: str = "",
+        **kwargs,
     ):
+        # cognee >= 1.5.0 always passes the four connection keywords below to
+        # registered adapters. They are a fallback for deployments configured
+        # without a VECTOR_DB_URL: host/port build the Milvus URI, and a
+        # username/password pair becomes the "user:password" token Milvus
+        # expects when no API key is given.
+        if not url and vector_db_host:
+            url = f"http://{vector_db_host}:{vector_db_port or DEFAULT_MILVUS_PORT}"
+        if not api_key and vector_db_username and vector_db_password:
+            api_key = f"{vector_db_username}:{vector_db_password}"
+
         self.url = url
         self.api_key = api_key
         self.database_name = database_name

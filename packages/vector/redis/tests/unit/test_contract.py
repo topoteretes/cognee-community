@@ -1,4 +1,4 @@
-"""Offline cognee-1.4.1 conformance tests. No Redis server, no secrets."""
+"""Offline cognee-1.5.4 conformance tests. No Redis server, no secrets."""
 
 from cognee.infrastructure.databases.vector.exceptions import (
     CollectionNotFoundError as CogneeCollectionNotFoundError,

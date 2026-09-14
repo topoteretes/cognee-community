@@ -67,7 +67,12 @@ class PineconeAdapter(VectorDBInterface):
         environment: str = None,
         cloud: str = None,
         region: str = None,
+        **kwargs,
     ):
+        # cognee >= 1.5.0 always passes vector_db_host / vector_db_port /
+        # vector_db_username / vector_db_password to registered adapters.
+        # Pinecone is a hosted service addressed by API key plus cloud/region,
+        # so they are absorbed by **kwargs and ignored.
         self.url = url  # Not used by Pinecone, but required by Cognee interface
         self.api_key = api_key
         self.environment = environment

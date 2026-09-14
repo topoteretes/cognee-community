@@ -1,4 +1,4 @@
-"""Offline cognee-1.4.1 conformance tests. No Moss account, no secrets."""
+"""Offline cognee-1.5.4 conformance tests. No Moss account, no secrets."""
 
 from cognee_community_vector_adapter_moss.moss_adapter import MossAdapter
 from contract_suite import assert_vector_contract

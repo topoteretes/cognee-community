@@ -805,14 +805,14 @@ colorama = {version = "*", markers = "platform_system == \"Windows\""}
 
 [[package]]
 name = "cognee"
-version = "1.4.2"
+version = "1.5.4"
 description = "Cognee - is a library for enriching LLM context with a semantic layer for better understanding and reasoning."
 optional = false
 python-versions = "<3.15,>=3.10"
 groups = ["main"]
 files = [
-    {file = "cognee-1.4.2-py3-none-any.whl", hash = "sha256:8fd91bed9ec87155970d5c3d79996701076bfedb87bf1a1f056a18e857a1f57d"},
-    {file = "cognee-1.4.2.tar.gz", hash = "sha256:ca94b26d674c66ad11bdf4bde24881f7b6a6044bdc029cf673c79a6f07f2631f"},
+    {file = "cognee-1.5.4-py3-none-any.whl", hash = "sha256:b12522572b5f8e9cd40a31501b94610ffeeb8fb66c8d08a82a34301357c06ac2"},
+    {file = "cognee-1.5.4.tar.gz", hash = "sha256:f1be8b050599721eb64e3b97c6f5270f7d24ca576a54837b6887262aa361b272"},
 ]
 
 [package.dependencies]
@@ -822,7 +822,7 @@ aiolimiter = ">=1.2.1"
 aiosqlite = ">=0.20.0,<1.0.0"
 alembic = ">=1.13.3,<2"
 cbor2 = ">=5.8.0"
-cryptography = ">=43.0.0,<50"
+cryptography = ">=43.0.0,<51"
 datamodel-code-generator = ">=0.54.0"
 diskcache = ">=5.6.3"
 fakeredis = {version = ">=2.32.0", extras = ["lua"]}
@@ -833,11 +833,14 @@ filetype = ">=1.2.0,<2.0.0"
 gunicorn = ">=20.1.0,<24"
 instructor = ">=1.9.1,<1.15.3"
 jinja2 = ">=3.1.3,<4"
-ladybug = ">=0.16.0,<=0.18.2"
+ladybug = [
+    {version = "0.19.0", markers = "sys_platform != \"darwin\" or \"Darwin Kernel Version 22.\" not in platform_version and \"Darwin Kernel Version 23.\" not in platform_version"},
+    {version = ">=0.17.0,<0.18", markers = "sys_platform == \"darwin\" and (\"Darwin Kernel Version 22.\" in platform_version or \"Darwin Kernel Version 23.\" in platform_version)"},
+]
 lancedb = ">=0.24.3,<1.0.0"
 langdetect = ">=1.0.9"
-limits = ">=4.4.1,<5"
-litellm = ">=1.83.7"
+limits = ">=4.4.1,<6"
+litellm = ">=1.83.7,<1.97.0"
 nbformat = ">=5.7.0,<6.0.0"
 neo4j = {version = ">=5.28.0,<6", optional = true, markers = "extra == \"neo4j\""}
 networkx = ">=3.4.2,<4"
@@ -867,16 +870,17 @@ anthropic = ["anthropic (>=0.27)"]
 aws = ["s3fs[boto3] (==2025.3.2)"]
 azure = ["azure-identity (>=1.15.0,<2)"]
 baml = ["baml-py (==0.206.0)"]
-codegraph = ["fastembed (<=0.8.0) ; python_version < \"3.14\"", "transformers (>=4.46.3,<5)", "tree-sitter (>=0.24.0,<0.25)", "tree-sitter-python (>=0.23.6,<0.24)"]
+codegraph = ["fastembed (<=0.8.0) ; python_version < \"3.14\"", "transformers (>=4.46.3,<5)"]
 debug = ["debugpy (>=1.8.9,<2.0.0)"]
 deepeval = ["deepeval (>=3.0.1,<4)"]
 dev = ["coverage (>=7.3.2,<8)", "deptry (>=0.20.0,<0.21)", "gitpython (>=3.1.43,<4)", "mkdocs-material (>=9.5.42,<10)", "mkdocs-minify-plugin (>=0.8.0,<0.9)", "mkdocstrings[python] (>=0.26.2,<0.27)", "notebook (>=7.1.0,<8)", "pre-commit (>=4.0.1,<5)", "pytest (>=7.4.0,<8)", "pytest-asyncio (>=0.21.1,<0.22)", "pytest-cov (>=6.1.1,<7.0.0)", "pytest-split (>=0.11.0,<0.12)", "pytest-timeout (>=2.3.1,<3)", "ruff (>=0.9.2,<=0.16.0)", "tweepy (>=4.14.0,<5.0.0)", "ty (>=0.0.31,<0.1.0)"]
-distributed = ["modal (>=1.0.5,<2.0.0)"]
-dlt = ["dlt[sqlalchemy] (>=1.9.0,<2)"]
-docling = ["docling (>=2.54)", "transformers (>=4.55)"]
+dlt = ["dlt[sqlalchemy] (>=1.9.0,<2)", "pandas (>=2.2.2,<3.0.0)"]
+docling = ["docling-slim[convert-core,format-email,format-html,format-latex,format-markdown,format-office,format-pdf] (>=2.115,<3)"]
+docling-full = ["docling (>=2.115,<3)", "transformers (>=4.55)"]
 docs = ["lxml (>=4.9.3,<5) ; python_version < \"3.13\"", "lxml (>=5,<6) ; python_version == \"3.13\"", "lxml (>=6.0.1,<7) ; python_version >= \"3.14\"", "nltk (>=3.9.3,<4)", "unstructured[csv,doc,docx,epub,md,odt,org,pdf,ppt,pptx,rst,rtf,tsv,xlsx] (>=0.18.1,<19)"]
 evals = ["gdown (>=5.2.0,<6)", "locust (>=2.0.0,<3)", "matplotlib (>=3.8.3,<4)", "pandas (>=2.2.2,<3.0.0)", "plotly (>=6.0.0,<7)", "scikit-learn (>=1.6.1,<2)"]
 fastembed = ["fastembed (<=0.8.0)", "onnxruntime (<=1.23.2) ; python_version < \"3.14\"", "onnxruntime (>=1.24.1) ; python_version >= \"3.14\""]
+gmail = ["dlt[sqlalchemy] (>=1.9.0,<2)", "google-api-python-client (>=2.100.0,<3)", "google-auth (>=2.23.0,<3)", "google-auth-oauthlib (>=1.1.0,<2)", "pandas (>=2.2.2,<3.0.0)"]
 graphiti = ["graphiti-core (>=0.28.0)"]
 groq = ["groq (>=0.8.0,<1.0.0)"]
 huggingface = ["transformers (>=4.46.3,<5)"]
@@ -891,6 +895,7 @@ ollama = ["transformers (>=4.46.3,<5)"]
 postgres = ["asyncpg (>=0.30.0,<1.0.0)", "pgvector (>=0.3.5,<0.4)", "psycopg2 (>=2.9.10,<3)"]
 postgres-binary = ["asyncpg (>=0.30.0,<1.0.0)", "pgvector (>=0.3.5,<0.4)", "psycopg2-binary (>=2.9.10,<3.0.0)"]
 posthog = ["posthog (>=3.5.0,<4)"]
+rapidocr = ["rapidocr-onnxruntime (>=1.3.0,<2)"]
 redis = ["redis (>=5.0.3,<6.0.0)"]
 scraping = ["apscheduler (>=3.10.0,<=3.11.0)", "beautifulsoup4 (>=4.13.1)", "lxml (>=4.9.3,<5) ; python_version < \"3.13\"", "lxml (>=5,<6) ; python_version == \"3.13\"", "lxml (>=6.0.1,<7) ; python_version >= \"3.14\"", "playwright (>=1.9.0)", "protego (>=0.1)", "tavily-python (>=0.7.12)"]
 tracing = ["opentelemetry-api (>=1.20.0,<2)", "opentelemetry-exporter-otlp-proto-grpc (>=1.20.0,<2)", "opentelemetry-exporter-otlp-proto-http (>=1.20.0,<2)", "opentelemetry-sdk (>=1.20.0,<2)"]
@@ -2123,53 +2128,109 @@ test = ["ipykernel", "pre-commit", "pytest (<9)", "pytest-cov", "pytest-timeout"
 
 [[package]]
 name = "ladybug"
-version = "0.18.2"
+version = "0.17.1"
 description = "Highly scalable, extremely fast, easy-to-use embeddable graph database"
 optional = false
 python-versions = "<3.15,>=3.10"
 groups = ["main"]
+markers = "sys_platform == \"darwin\" and (\"Darwin Kernel Version 22.\" in platform_version or \"Darwin Kernel Version 23.\" in platform_version)"
 files = [
-    {file = "ladybug-0.18.2-cp310-cp310-macosx_15_0_arm64.whl", hash = "sha256:eca376fad7e4f9ba79d0643f37247fe49ba38f91a273bbc71af3e00f84c1d994"},
-    {file = "ladybug-0.18.2-cp310-cp310-macosx_15_0_x86_64.whl", hash = "sha256:02b81c7a16dff58d2244a60cd7e04a09b677452ba68bfa3474fab65b662dcc82"},
-    {file = "ladybug-0.18.2-cp310-cp310-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:1a32aff8be2b77d9c6ec398a156822ed25d4eee0a7693bfa977966dc782ea8ed"},
-    {file = "ladybug-0.18.2-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:eedee7fac99e0d3290fa8f7cc820ce4812712d8181a6847c2d91a4a9fd8538c9"},
-    {file = "ladybug-0.18.2-cp310-cp310-musllinux_1_2_aarch64.whl", hash = "sha256:7d8233140775b55ca3f329aa39f4c7cba9a684d11f966bb5deeaf84224150f2a"},
-    {file = "ladybug-0.18.2-cp310-cp310-musllinux_1_2_x86_64.whl", hash = "sha256:81fc210454258d111a17f935454da72611fdfebddefdc6b7983d9dad58e9bc6e"},
-    {file = "ladybug-0.18.2-cp310-cp310-win_amd64.whl", hash = "sha256:d4d63be0c9cb415e21fd9c2e2122a60e9bc1e5c52ceba6f73ce782437b684867"},
-    {file = "ladybug-0.18.2-cp310-cp310-win_arm64.whl", hash = "sha256:bc3cf6a1fee71c9f6c8fba4e6054b2f8cd01f57c74b43b5db3d55ea787cf059e"},
-    {file = "ladybug-0.18.2-cp311-cp311-macosx_15_0_arm64.whl", hash = "sha256:986d3394f372178e55a960bbdf69090fdf1e979dab350a7020f626f382bbfe4d"},
-    {file = "ladybug-0.18.2-cp311-cp311-macosx_15_0_x86_64.whl", hash = "sha256:2fc5d5470d53071de0ac8ac1930fa9ed36222df1c9a7620059f16ec1b11b559b"},
-    {file = "ladybug-0.18.2-cp311-cp311-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:8589f92131aaecb1342d65dace115032abf3492b79d3a46563fa0f439c28d143"},
-    {file = "ladybug-0.18.2-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:6e1bb854f5a1e3ce39723c73d4294658d56f82c74c282b42f187880ed0814973"},
-    {file = "ladybug-0.18.2-cp311-cp311-musllinux_1_2_aarch64.whl", hash = "sha256:47246b4e4c12211fc93fcf3211c27705954ea4b5e3ab2c2e8080f637c65dd444"},
-    {file = "ladybug-0.18.2-cp311-cp311-musllinux_1_2_x86_64.whl", hash = "sha256:b56454d03409d5daae78fc39ea78f2d96694c838a2baa9397e37eb24dd4c7f82"},
-    {file = "ladybug-0.18.2-cp311-cp311-win_amd64.whl", hash = "sha256:97380a9cce9982e01085c5abbf1ab7b177be8ce4fb5aa55e20c2892b92da0029"},
-    {file = "ladybug-0.18.2-cp311-cp311-win_arm64.whl", hash = "sha256:dfdd9b49f5d44dae0eddec9262db46c85686839f21f0e80dba1a78a1b9e935d2"},
-    {file = "ladybug-0.18.2-cp312-cp312-macosx_15_0_arm64.whl", hash = "sha256:fbabddb8e1156486c1e2822ece85ff06fa82df2dbad5113275b83f5a7740a72f"},
-    {file = "ladybug-0.18.2-cp312-cp312-macosx_15_0_x86_64.whl", hash = "sha256:fb64c893b8195e5134de9d79a7a2588de9f555739c88e474a0bd1d13753ea208"},
-    {file = "ladybug-0.18.2-cp312-cp312-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:91d3e23aed822568c539f4a79c88d4558e554c1419d20b7590df5562680f7176"},
-    {file = "ladybug-0.18.2-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:a257bdf8e48cd7cf21a5dbc94ac3fef1132838f04a47198d74527f04fe7963e8"},
-    {file = "ladybug-0.18.2-cp312-cp312-musllinux_1_2_aarch64.whl", hash = "sha256:4a955bbddfc679f29caa3079c9cf835031f56cfe777bf356d3c872dd5aef82ce"},
-    {file = "ladybug-0.18.2-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:3c66654a39b37983f3a8e3578d009370205af1a5bd05c4ae385411c805863dc7"},
-    {file = "ladybug-0.18.2-cp312-cp312-win_amd64.whl", hash = "sha256:6f82e94b683311af74609e57b42af23e185bfbc2dc335f8a7c8b1b0028538891"},
-    {file = "ladybug-0.18.2-cp312-cp312-win_arm64.whl", hash = "sha256:f468a6c45515e6c76137b9686e5a31a03c65c236b2f1d3eacd63cb6c456beaef"},
-    {file = "ladybug-0.18.2-cp313-cp313-macosx_15_0_arm64.whl", hash = "sha256:dba91c939b9ec0b058214841e5e7c0e3a67da4c1114912788ec6a1a23ca032e6"},
-    {file = "ladybug-0.18.2-cp313-cp313-macosx_15_0_x86_64.whl", hash = "sha256:e47931e90570ff8a72f04faa4200aa85a662bebaf4f4cf4dac3f91dae7cd55c7"},
-    {file = "ladybug-0.18.2-cp313-cp313-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:2db15bf2a9e5166cc365c377e9e6b20b7e002e752cb0a8aed964db40a37fbff9"},
-    {file = "ladybug-0.18.2-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:a58587123ad7e05df05dcf540b88cc114b1d044db49921827bb4803e66d86b7c"},
-    {file = "ladybug-0.18.2-cp313-cp313-musllinux_1_2_aarch64.whl", hash = "sha256:e8e2484764b3467407381e37f2d37c2131e8a6487a7c0704e5d1cf7fc2d5fb67"},
-    {file = "ladybug-0.18.2-cp313-cp313-musllinux_1_2_x86_64.whl", hash = "sha256:d436b11cfb3373f56b7527506409799ec3a57ce6fe8fd818aba518e72c4e473f"},
-    {file = "ladybug-0.18.2-cp313-cp313-win_amd64.whl", hash = "sha256:54239e02f7fe740642c72e18bf9e4e80220ee7bacef544c79fe500d46cc6ed23"},
-    {file = "ladybug-0.18.2-cp313-cp313-win_arm64.whl", hash = "sha256:35a237845086bdcbf7a5f8c20701dcd6703faefe200bb7c9e859416e21a48096"},
-    {file = "ladybug-0.18.2-cp314-cp314-macosx_15_0_arm64.whl", hash = "sha256:17af43a997d4faad7605038f0ba9787f23239333d11d43995662d1ce5550d3f7"},
-    {file = "ladybug-0.18.2-cp314-cp314-macosx_15_0_x86_64.whl", hash = "sha256:64e73149976d2e353993d330471cb34cb988212e21f321f552e0bbf304bd7f0e"},
-    {file = "ladybug-0.18.2-cp314-cp314-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:f846e2d4438a6b17fcdec7dd90cb7b96b32c36687990864ec95f7cb70f314b67"},
-    {file = "ladybug-0.18.2-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:07e796a947adb357debf3c250b2fa0a33fa02f7bd6d88ac4b88bf5cf99134944"},
-    {file = "ladybug-0.18.2-cp314-cp314-musllinux_1_2_aarch64.whl", hash = "sha256:a07482bb5596e5fcc57efe561d573392cfca8f93b049a5e27a339de1a55ecdce"},
-    {file = "ladybug-0.18.2-cp314-cp314-musllinux_1_2_x86_64.whl", hash = "sha256:2dc29ccce8f41c24f3dc4589b0e3c869bbf7a26624aa8d01024686a86d6281da"},
-    {file = "ladybug-0.18.2-cp314-cp314-win_amd64.whl", hash = "sha256:d0e8e895ac1dbe6658784d71388fa64c1a010f4c3bfbd5ee3445927b7cc38546"},
-    {file = "ladybug-0.18.2-cp314-cp314-win_arm64.whl", hash = "sha256:1f626b4d0708979e4f75e8b9ef92fe6671eeab4a27408b82e528e9a71103cab5"},
-    {file = "ladybug-0.18.2.tar.gz", hash = "sha256:0ff83e699b54cdb5c684f8d679bced7c51ca40f136b8e01fe11ce23d60acfd31"},
+    {file = "ladybug-0.17.1-cp310-cp310-macosx_13_0_arm64.whl", hash = "sha256:faf616d55f8a1269346c66913cabb32a88f9459878adadd7befb5e7adb206ea2"},
+    {file = "ladybug-0.17.1-cp310-cp310-macosx_13_0_x86_64.whl", hash = "sha256:6b93d3dc7eb3827bfec82368d1196f78aa529dcddab848a06015a51d05ec622d"},
+    {file = "ladybug-0.17.1-cp310-cp310-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:e0624025078a120b4e397d0e84a4de2a931a8a40434fa0594c49da5beee093ce"},
+    {file = "ladybug-0.17.1-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:3b69c79fafd7fbd2eaa2fa5ee7b891aa5ddf91f913b1d252a983175c1b8c4563"},
+    {file = "ladybug-0.17.1-cp310-cp310-musllinux_1_2_aarch64.whl", hash = "sha256:0ed7445e6bf200cc585f7e71e0d3a79b4a78718c1bf3fdcdee99dfadc0ce73c1"},
+    {file = "ladybug-0.17.1-cp310-cp310-musllinux_1_2_x86_64.whl", hash = "sha256:99a76128828245e39996c44ba693a754132b785c5db5e70f0e469e73ec24d103"},
+    {file = "ladybug-0.17.1-cp310-cp310-win_amd64.whl", hash = "sha256:2748b1bb9e13c6af465f8089eb20e72fb4f1871603b1031eeb3390ab5b9f9baa"},
+    {file = "ladybug-0.17.1-cp310-cp310-win_arm64.whl", hash = "sha256:0a7cea07905e7bdfb8a45bd80f3491ff6624ec34d0395d1887be0e4e0e2259d3"},
+    {file = "ladybug-0.17.1-cp311-cp311-macosx_13_0_arm64.whl", hash = "sha256:b21e9101855a852c8f810e591d078adc0d28639c45bfaae4f20c20ad07164162"},
+    {file = "ladybug-0.17.1-cp311-cp311-macosx_13_0_x86_64.whl", hash = "sha256:d6ed21cc33d636d9e69c9126a0e55142000faa3f402cc8f30a79f03f9c9c997b"},
+    {file = "ladybug-0.17.1-cp311-cp311-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:afbf3096d18ab6300a29df15c2a77c936434d11bf9ef2b370076e13450592907"},
+    {file = "ladybug-0.17.1-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:3cffc7023414c890f8be7841df8f41a9b3d489715ada9ab7426f943701e64eb6"},
+    {file = "ladybug-0.17.1-cp311-cp311-musllinux_1_2_aarch64.whl", hash = "sha256:7eb77583aee8618bcb8d174ec834950b821f44feb21655d502fda415d51e1194"},
+    {file = "ladybug-0.17.1-cp311-cp311-musllinux_1_2_x86_64.whl", hash = "sha256:8eb26cb7508541facc38e4d4282583469ef3927fbb99900eb4ae66632a55e215"},
+    {file = "ladybug-0.17.1-cp311-cp311-win_amd64.whl", hash = "sha256:b2fd0e4e8948e15e567e8dcdfa38709906f6f1a66552cd44eea873a8ff664df9"},
+    {file = "ladybug-0.17.1-cp311-cp311-win_arm64.whl", hash = "sha256:e1b881433e6623daa5c84eb80a9c1d6d5b4a16618c022fa028aa16b9de7a7dd8"},
+    {file = "ladybug-0.17.1-cp312-cp312-macosx_13_0_arm64.whl", hash = "sha256:1a5fd5f324df8c5659a8cd6a0c08c58b2f6efbf0319cde6ec7cdcc3480343129"},
+    {file = "ladybug-0.17.1-cp312-cp312-macosx_13_0_x86_64.whl", hash = "sha256:17e540cedd30816fad248e4d3cc6444bbc139a4b79e43af5f471acbe790a707a"},
+    {file = "ladybug-0.17.1-cp312-cp312-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:067e183bd3fb2094a040cc4e69269fdcc5a770579a89f2d9f5dd8c93da6c08bc"},
+    {file = "ladybug-0.17.1-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:c11887032a14ca49941cbb5e9ac94adcba804c17fc7f823f598c8cceb5438612"},
+    {file = "ladybug-0.17.1-cp312-cp312-musllinux_1_2_aarch64.whl", hash = "sha256:5a3e906981abb4a92f3c2add315ae44419b1c5487bbedfa50eb03a0e2040dc38"},
+    {file = "ladybug-0.17.1-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:bc0d0276b6181c26434f33eb675a304d33ce183fe6f90d04c91e7c001468b407"},
+    {file = "ladybug-0.17.1-cp312-cp312-win_amd64.whl", hash = "sha256:4efc3f1117c16d7e9728afe9a0a87b89d4d3fb98c480d16d7f22c64be963a43b"},
+    {file = "ladybug-0.17.1-cp312-cp312-win_arm64.whl", hash = "sha256:4c50a9e3e288cb57ede865b16e84bb4fd0471c572a641481e548cd70c4e82973"},
+    {file = "ladybug-0.17.1-cp313-cp313-macosx_13_0_arm64.whl", hash = "sha256:785c95d595754be8d16b2e35defc44a906ccbef329c180e97e47ac7df17776bf"},
+    {file = "ladybug-0.17.1-cp313-cp313-macosx_13_0_x86_64.whl", hash = "sha256:a168cdeea1f239b698ca222d680faa9b9b01b5ff96a1087b6235be23533d05e0"},
+    {file = "ladybug-0.17.1-cp313-cp313-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:fb2d88b4852689d73437c7c31057345fc95540e242c25e71999d541ad104f390"},
+    {file = "ladybug-0.17.1-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:bf0ec0e0c0cb06be60ef83e3d95a3f5c02e3df6fe0270fee576b5688d0e70d28"},
+    {file = "ladybug-0.17.1-cp313-cp313-musllinux_1_2_aarch64.whl", hash = "sha256:8fd79f020c5b2db9d2b2b689ac2616f86d43ebc5d36063a001ee1ce158f50bf8"},
+    {file = "ladybug-0.17.1-cp313-cp313-musllinux_1_2_x86_64.whl", hash = "sha256:a9706c6a65365955ac3b18688a582c82ac3388362fdccab13a18e66b2c864e6b"},
+    {file = "ladybug-0.17.1-cp313-cp313-win_amd64.whl", hash = "sha256:616d5017ee21ac99c4e1251f75c569053b709f73e207bd2d97f7742169680286"},
+    {file = "ladybug-0.17.1-cp313-cp313-win_arm64.whl", hash = "sha256:5e84e5329f74e833828eeddd468ac881323fbfdb54a8610ae9f2bbe7bc02f952"},
+    {file = "ladybug-0.17.1-cp314-cp314-macosx_13_0_arm64.whl", hash = "sha256:c8a71f90f2fe16396c98380aadd5519ed72346aed4d7872b06e2450e9470ac77"},
+    {file = "ladybug-0.17.1-cp314-cp314-macosx_13_0_x86_64.whl", hash = "sha256:08934e417214ca03836934ed7bd1f6ebedf6959db3b4405541aa4389f60800a6"},
+    {file = "ladybug-0.17.1-cp314-cp314-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:2dbca5d77c309b6c992f5ab9f5d18b2a8002d4766f09ab7fa6ff9510df304b74"},
+    {file = "ladybug-0.17.1-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:1f206b635840a26dd76e0b2f74e00e25e33fad1eb4e913bcce98cd5e5cf0146d"},
+    {file = "ladybug-0.17.1-cp314-cp314-musllinux_1_2_aarch64.whl", hash = "sha256:a4c6701f0abce984e7820f8242754682b7e6ed82787b1316b614c192458bac99"},
+    {file = "ladybug-0.17.1-cp314-cp314-musllinux_1_2_x86_64.whl", hash = "sha256:6c53cf98ae5b414af6f6f2025ccbb06dcd368eb1142e9a675ab24ccc4b936ed5"},
+    {file = "ladybug-0.17.1-cp314-cp314-win_amd64.whl", hash = "sha256:48efb95673096a7524a1f16943a1885ad016944ea8a5a000746d9939cf2a039b"},
+    {file = "ladybug-0.17.1-cp314-cp314-win_arm64.whl", hash = "sha256:2ad869f14b0307c7eb2f91639da7ab887c666c2f93260c46a055c7969e082a09"},
+    {file = "ladybug-0.17.1.tar.gz", hash = "sha256:82efea498713c7da7f6f94f80252574599252d26ee10fb11e62ae932b5d8f2ba"},
+]
+
+[package.extras]
+dev = ["mypy (==1.16.0)", "networkx (>=3.0,<4.0)", "numpy (>=2.0,<3.0)", "pandas (>=2.2,<3.0)", "polars (>=1.30,<2.0)", "pyarrow (>=21,<23)", "pybind11 (>=2.13,<3.0)", "pytest", "pytest-asyncio (>=1.0,<2.0)", "ruff (==0.11.12)", "setuptools (>=80.9,<81.0)", "torch (>=2.5.0)", "torch-geometric (>=2.5.0)"]
+
+[[package]]
+name = "ladybug"
+version = "0.19.0"
+description = "Highly scalable, extremely fast, easy-to-use embeddable graph database"
+optional = false
+python-versions = "<3.15,>=3.10"
+groups = ["main"]
+markers = "sys_platform != \"darwin\" or \"Darwin Kernel Version 22.\" not in platform_version and \"Darwin Kernel Version 23.\" not in platform_version"
+files = [
+    {file = "ladybug-0.19.0-cp310-cp310-macosx_15_0_arm64.whl", hash = "sha256:5adf17c61155d8687f8b0a999a227549edf4473ae1ced897e0d6ac9937550b0a"},
+    {file = "ladybug-0.19.0-cp310-cp310-macosx_15_0_x86_64.whl", hash = "sha256:8aca1fdf33f02508f0679ed49c90a154051c01640be1f44d5d93fb9e32635d36"},
+    {file = "ladybug-0.19.0-cp310-cp310-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:85647a6359186c39936c905f5f78714ab4be020ae734c4ac834fcfbf78f9caa6"},
+    {file = "ladybug-0.19.0-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:71d8cfdb2200295d294f10cbda5554fd86299b751ec997cfec74d0c1eef24556"},
+    {file = "ladybug-0.19.0-cp310-cp310-musllinux_1_2_aarch64.whl", hash = "sha256:507fd8a2da1970b2bfdf84f85bba3f62482864416e7f8178661331938a98d1a5"},
+    {file = "ladybug-0.19.0-cp310-cp310-musllinux_1_2_x86_64.whl", hash = "sha256:290ef1a03e88debb5039f218e7d842f7ea15861be8e716d015dbc472da4187cc"},
+    {file = "ladybug-0.19.0-cp310-cp310-win_amd64.whl", hash = "sha256:4791f27194fdda740a0debaa9e1ad7f1294ec7e3080a57eaccd6278b2aa893fd"},
+    {file = "ladybug-0.19.0-cp310-cp310-win_arm64.whl", hash = "sha256:1c26b9aae154a3dd7e9222c5e4f57e9a8309627657d143f82ff1b0edb7613c36"},
+    {file = "ladybug-0.19.0-cp311-cp311-macosx_15_0_arm64.whl", hash = "sha256:d1a434f02723072a6ea4407b928f458d3e3ada28eb1f5406f0f18b1d261c9457"},
+    {file = "ladybug-0.19.0-cp311-cp311-macosx_15_0_x86_64.whl", hash = "sha256:f64b1de331d21e24240eee4c62c18a45f51903c75cfe6db7dd660deddab0dfda"},
+    {file = "ladybug-0.19.0-cp311-cp311-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:7f04b1557052e62802007fb40d5216c0548bb02863ba1295bbbf28b796fd8978"},
+    {file = "ladybug-0.19.0-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:54867877c723f3be76a32e060e948ccec95187ad2e4086563c42ef34c35a03b7"},
+    {file = "ladybug-0.19.0-cp311-cp311-musllinux_1_2_aarch64.whl", hash = "sha256:09f6052dd8b0f9e8985457e7d40287726e199234934678db28d0b27e98104da2"},
+    {file = "ladybug-0.19.0-cp311-cp311-musllinux_1_2_x86_64.whl", hash = "sha256:38d798d62001ceb976d9b7107e5e3d916305deb5d131f92789ccbfcda51f0fdc"},
+    {file = "ladybug-0.19.0-cp311-cp311-win_amd64.whl", hash = "sha256:a8367c2bd473e4361f80e50d24186542f12af4004eb548cb1854736fdd352b3c"},
+    {file = "ladybug-0.19.0-cp311-cp311-win_arm64.whl", hash = "sha256:66fe4fcd4113f2adfa15ae9b195e43e450fc52de71b612d65c64ada65d597157"},
+    {file = "ladybug-0.19.0-cp312-cp312-macosx_15_0_arm64.whl", hash = "sha256:2189d4baccd8518bd37cb86212105f06b1033b8b711f0328fecb306159c0acca"},
+    {file = "ladybug-0.19.0-cp312-cp312-macosx_15_0_x86_64.whl", hash = "sha256:a232e0eb484647f6573be2eec71a862d9a1c953353a954e0774b6d83e075b488"},
+    {file = "ladybug-0.19.0-cp312-cp312-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:9f5333857dbfd871b6fc611ff9e08b98c9b2f09d6ddcf1ae53061de85837bd65"},
+    {file = "ladybug-0.19.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:8c4d00d5cc55e13524eff56e3295732a3c1b8d272d001b30748c2cc348581827"},
+    {file = "ladybug-0.19.0-cp312-cp312-musllinux_1_2_aarch64.whl", hash = "sha256:1dfb149912cc960e24a19f83688df5857d0679cc688f8553a896d10f4e8dd8f3"},
+    {file = "ladybug-0.19.0-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:aacd9f3c8f50b0ee1cbcb6a8ef8cb522b288784482ef13eda2ef1ead6e645cea"},
+    {file = "ladybug-0.19.0-cp312-cp312-win_amd64.whl", hash = "sha256:42d15b5e090f3600a47efd4697b1809547fbb0a637f593024e906aa960e7c92b"},
+    {file = "ladybug-0.19.0-cp312-cp312-win_arm64.whl", hash = "sha256:e07c17db7834f95bb7f0003a8b0476390908549c91d93865465da60700565425"},
+    {file = "ladybug-0.19.0-cp313-cp313-macosx_15_0_arm64.whl", hash = "sha256:5470bbc0e3b3b544e16d91d33784aeba64e39a7e0f0ae3a04cc2d28e53b8f965"},
+    {file = "ladybug-0.19.0-cp313-cp313-macosx_15_0_x86_64.whl", hash = "sha256:e98bfbf891fb8cbcc345760124dae86d236621ef945d0993fed1fce6ef50ff7e"},
+    {file = "ladybug-0.19.0-cp313-cp313-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:6116f000eaf7346ca242cf5ae9ee51b2536165a88d43d760e2e746cc8b67be58"},
+    {file = "ladybug-0.19.0-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:86c352593983e399ad4b43b1e7d7fe04591f763167ec7acf40e6c57f39005c7f"},
+    {file = "ladybug-0.19.0-cp313-cp313-musllinux_1_2_aarch64.whl", hash = "sha256:a329b267bcad79cc9ea56bcd982d5d0c5ed91934219116ecb85910475f82d3f9"},
+    {file = "ladybug-0.19.0-cp313-cp313-musllinux_1_2_x86_64.whl", hash = "sha256:c035c4f00d97c6e1c89f166c43547a753e6a6e22ec3188a762770cecfb21c7e7"},
+    {file = "ladybug-0.19.0-cp313-cp313-win_amd64.whl", hash = "sha256:c32273d33360dcc89798ee6a4ae711614c95f18d65b0fc1082653ec55f2530f5"},
+    {file = "ladybug-0.19.0-cp313-cp313-win_arm64.whl", hash = "sha256:0b0e88b49ed63f6a19a143d688b9e4c052ac09e1d11b92583d862d0512ee6bb2"},
+    {file = "ladybug-0.19.0-cp314-cp314-macosx_15_0_arm64.whl", hash = "sha256:4c2cdf36b2f904709b22518938e7828eec9718795b8b562512e3592af4b8466d"},
+    {file = "ladybug-0.19.0-cp314-cp314-macosx_15_0_x86_64.whl", hash = "sha256:088c5f79bd843ac15aee0bb44c417d70dce833a5295252569dcd139d348700dc"},
+    {file = "ladybug-0.19.0-cp314-cp314-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:ea03d4388dd024c5fa4629d607765c9c2c6f4fa4350aceabecee8d37b54289bb"},
+    {file = "ladybug-0.19.0-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:f880a6d5329461088d25854a8cd77aec17ffbf00b2f3642ed32f94b5d001f452"},
+    {file = "ladybug-0.19.0-cp314-cp314-musllinux_1_2_aarch64.whl", hash = "sha256:be3035c3e9232d5c50f399a85fd39713f6b31574d2b198d696117e2f21f96d1b"},
+    {file = "ladybug-0.19.0-cp314-cp314-musllinux_1_2_x86_64.whl", hash = "sha256:b3b2227e10d2004691b3fca755ec050da317eb9a7e1411f5358a395c2eaf19bb"},
+    {file = "ladybug-0.19.0-cp314-cp314-win_amd64.whl", hash = "sha256:1051bf29963eb73d35910f60256fb0649057cd1d0993237bdaf193654071507c"},
+    {file = "ladybug-0.19.0-cp314-cp314-win_arm64.whl", hash = "sha256:69b8a3d05f04dbadde0f111e03a82e387675032232d3f8ccc91921b749fa8306"},
+    {file = "ladybug-0.19.0.tar.gz", hash = "sha256:02a0725d29b36fd0de469dab14928c3bc8c5dfee4019acfd60ca504caffc4cd7"},
 ]
 
 [package.extras]
@@ -2291,18 +2352,24 @@ valkey = ["valkey (>=6)"]
 
 [[package]]
 name = "litellm"
-version = "1.89.2"
+version = "1.96.2"
 description = "Library to easily interface with LLM API providers"
 optional = false
-python-versions = "<3.14,>=3.10"
+python-versions = "<3.15,>=3.10"
 groups = ["main"]
 files = [
-    {file = "litellm-1.89.2-py3-none-any.whl", hash = "sha256:07e8e43b1a70fe919021376742897d18ffe7577ccfbb84632c949670f9abdc03"},
-    {file = "litellm-1.89.2.tar.gz", hash = "sha256:b2534d69568eed026310f4e006407db2d46494eb629bd1e71eb9603ec146540d"},
+    {file = "litellm-1.96.2-cp310-abi3-macosx_10_12_x86_64.whl", hash = "sha256:0aa667c6fc58b20ff04fe5efaac5cf48b1e224bac32dbf22ced2e5ee695bc4ba"},
+    {file = "litellm-1.96.2-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:e5d96d16b37a043e482a134a71b0c1df4e700603fc14df22e4bd27dc9e38f5c4"},
+    {file = "litellm-1.96.2-cp310-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:1a42d68b903f6b605bd7744e9700b16a725f897c5edcc448e491cec14cd5a9db"},
+    {file = "litellm-1.96.2-cp310-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:76e9c72cb6757bb7c35cd23e3e4fc028910795910ae92491076bd50f7b61f205"},
+    {file = "litellm-1.96.2-cp310-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:1f304b8854e385946469d2dcf8ef88e24357120671caeaddea11b085b0302308"},
+    {file = "litellm-1.96.2-cp310-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:8c21a57a0f3507176492a4f65361a4302af1a0723c97e96961c7ed0e96934832"},
+    {file = "litellm-1.96.2-cp310-abi3-win_amd64.whl", hash = "sha256:0168e49cffecb0b45a0d044ecb7e5f7f6fc9e14d974b50f54edfa9d8e0db9c1d"},
+    {file = "litellm-1.96.2.tar.gz", hash = "sha256:80d477ae092b05ce023b5084542cb3cb75999b52b1dd2e4d834fb348effc9399"},
 ]
 
 [package.dependencies]
-aiohttp = ">=3.10,<4.0"
+aiohttp = ">=3.14.2,<4.0"
 click = ">=8.0.0,<9.0"
 fastuuid = ">=0.14.0,<1.0"
 httpx = ">=0.28.0,<1.0"
@@ -2311,18 +2378,22 @@ jinja2 = ">=3.1.6,<4.0"
 jsonschema = ">=4.0.0,<5.0"
 openai = ">=2.20.0,<3.0.0"
 pydantic = ">=2.10.0,<3.0.0"
+pydantic-settings = ">=2.14.1,<3.0"
 python-dotenv = ">=1.0.0,<2.0"
 tiktoken = ">=0.8.0,<1.0"
 tokenizers = ">=0.21.0,<1.0"
 
 [package.extras]
+bedrock-realtime = ["aws-sdk-bedrock-runtime (>=0.7.0,<0.8.0) ; python_full_version >= \"3.12.0\""]
 caching = ["diskcache (>=5.6.3,<6.0)"]
-extra-proxy = ["a2a-sdk (>=0.3.24,<1.0)", "azure-identity (>=1.25.2,<2.0)", "azure-keyvault-secrets (>=4.10.0,<5.0)", "google-cloud-iam (>=2.19.1,<3.0)", "google-cloud-kms (>=2.24.2,<3.0)", "prisma (>=0.11.0,<1.0)", "redisvl (>=0.4.1,<1.0) ; python_full_version < \"3.14.0\"", "resend (>=2.23.0,<3.0)"]
+cli = ["inquirerpy (>=0.3.4,<1.0)", "pyyaml (>=6.0.3,<7.0)", "requests (>=2.32.0,<3.0)", "rich (>=13.9.4,<14.0)"]
+extra-proxy = ["a2a-sdk (>=1.1.0,<2.0)", "azure-identity (>=1.25.2,<2.0)", "azure-keyvault-secrets (>=4.10.0,<5.0)", "google-cloud-iam (>=2.19.1,<3.0)", "google-cloud-kms (>=2.24.2,<3.0)", "prisma (>=0.11.0,<1.0)", "redisvl (>=0.4.1,<1.0)", "resend (>=2.23.0,<3.0)"]
 google = ["google-cloud-aiplatform (>=1.133.0,<2.0)"]
 grpc = ["grpcio (==1.78.0)"]
 mlflow = ["mlflow (>=3.11.1,<4.0)"]
-proxy = ["apscheduler (>=3.11.2,<4.0)", "azure-identity (>=1.25.2,<2.0)", "azure-storage-blob (>=12.28.0,<13.0)", "backoff (>=2.2.1,<3.0)", "boto3 (>=1.43.1,<2.0)", "cryptography (>=46.0.7,<47.0)", "fastapi (>=0.136.3,<1.0)", "fastapi-sso (>=0.19.0,<1.0)", "granian (>=2.7.4,<3.0)", "gunicorn (>=23.0.0,<24.0)", "litellm-enterprise (==0.1.42)", "litellm-proxy-extras (==0.4.74)", "mcp (>=1.26.0,<2.0)", "orjson (>=3.11.6,<4.0)", "polars (>=1.38.1,<2.0)", "pydantic-settings (>=2.14.1,<3.0)", "pyjwt (>=2.12.0,<3.0)", "pynacl (>=1.6.2,<2.0)", "pyroscope-io (>=0.8.16,<1.0) ; sys_platform != \"win32\"", "python-multipart (>=0.0.27,<1.0)", "pyyaml (>=6.0.3,<7.0)", "restrictedpython (>=8.1,<9.0)", "rich (>=13.9.4,<14.0)", "rq (>=2.7.0,<3.0)", "soundfile (>=0.12.1,<1.0)", "starlette (>=1.0.1,<2.0)", "uvicorn (>=0.33.0,<1.0)", "uvloop (>=0.21.0,<1.0) ; sys_platform != \"win32\"", "websockets (>=15.0.1,<16.0)"]
-proxy-runtime = ["anthropic[vertex] (>=0.84.0,<1.0)", "azure-ai-contentsafety (>=1.0.0,<2.0)", "azure-storage-file-datalake (>=12.20.0,<13.0)", "ddtrace (>=2.19.0,<3.0)", "detect-secrets (>=1.5.0,<2.0)", "google-cloud-aiplatform (>=1.133.0,<2.0)", "google-genai (>=1.37.0,<2.0)", "grpcio (==1.78.0)", "langfuse (>=2.59.7,<3.0)", "llm-sandbox (>=0.3.39,<1.0)", "mangum (>=0.17.0,<1.0)", "opentelemetry-api (==1.28.0)", "opentelemetry-exporter-otlp (==1.28.0)", "opentelemetry-instrumentation-fastapi (==0.49b0)", "opentelemetry-sdk (==1.28.0)", "prometheus-client (>=0.20.0,<1.0)", "pypdf (>=6.12.0,<7.0) ; python_full_version < \"3.14.0\"", "sentry-sdk (>=2.21.0,<3.0)"]
+proxy = ["apscheduler (>=3.11.2,<4.0)", "azure-identity (>=1.25.2,<2.0)", "azure-storage-blob (>=12.28.0,<13.0)", "backoff (>=2.2.1,<3.0)", "boto3 (>=1.43.1,<2.0)", "cryptography (>=49.0.0,<51.0)", "expression (>=5.6.0,<6.0)", "fastapi (>=0.136.3,<1.0)", "fastapi-sso (>=0.19.0,<1.0)", "granian (>=2.7.4,<3.0)", "gunicorn (>=23.0.0,<24.0)", "inquirerpy (>=0.3.4,<1.0)", "litellm-enterprise (==0.1.53)", "litellm-proxy-extras (==0.4.81)", "mcp (>=1.28.1,<2.0)", "orjson (>=3.11.6,<4.0)", "polars (>=1.38.1,<2.0)", "pyjwt (>=2.13.0,<3.0)", "pynacl (>=1.6.2,<2.0)", "pyroscope-io (>=0.8.16,<1.0) ; sys_platform != \"win32\"", "python-multipart (>=0.0.27,<1.0)", "pyyaml (>=6.0.3,<7.0)", "restrictedpython (>=8.1,<9.0)", "rich (>=13.9.4,<14.0)", "rq (>=2.7.0,<3.0)", "soundfile (>=0.12.1,<1.0)", "starlette (>=1.0.1,<2.0)", "uvicorn (>=0.33.0,<1.0)", "uvloop (>=0.21.0,<1.0) ; sys_platform != \"win32\"", "websockets (>=15.0.1,<16.0)"]
+proxy-runtime = ["anthropic[vertex] (>=0.84.0,<1.0)", "azure-ai-contentsafety (>=1.0.0,<2.0)", "azure-storage-file-datalake (>=12.20.0,<13.0)", "ddtrace (>=4.8.2,<5.0)", "detect-secrets (>=1.5.0,<2.0)", "google-cloud-aiplatform (>=1.133.0,<2.0)", "google-genai (>=1.37.0,<2.0)", "grpcio (==1.78.0)", "langfuse (>=2.59.7,<3.0)", "llm-sandbox (>=0.3.39,<1.0)", "mangum (>=0.17.0,<1.0)", "opentelemetry-api (==1.28.0)", "opentelemetry-exporter-otlp (==1.28.0)", "opentelemetry-instrumentation-fastapi (==0.49b0)", "opentelemetry-sdk (==1.28.0)", "prometheus-client (>=0.20.0,<1.0)", "pypdf (>=6.12.0,<7.0)", "sentry-sdk (>=2.21.0,<3.0)"]
+saml = ["python3-saml (>=1.16.0,<2.0)"]
 semantic-router = ["aurelio-sdk (>=0.0.19,<1.0) ; python_full_version < \"3.14.0\"", "semantic-router (>=0.1.15,<1.0) ; python_full_version < \"3.14.0\""]
 stt-nvidia-riva = ["audioread (>=3.0.1)", "numpy (>=1.26.0)", "nvidia-riva-client (>=2.15.0)", "soundfile (>=0.12.1)"]
 utils = ["numpydoc (>=1.8.0,<2.0)"]
@@ -4892,4 +4963,4 @@ type = ["pytest-mypy (>=1.0.1) ; platform_python_implementation != \"PyPy\""]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.14"
-content-hash = "ee6ab09f9423eb562c9a8060ddee4239453eb4af47d8cbb17ccd9992a88366ac"
+content-hash = "68dfdbb7d1993daa382b7b6af895879ad7ec46439b18ab3287bec914e42674e4"

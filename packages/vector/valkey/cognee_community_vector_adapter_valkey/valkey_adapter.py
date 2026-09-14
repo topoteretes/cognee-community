@@ -77,6 +77,9 @@ class ValkeyAdapter(VectorDBInterface):
         api_key: str | None = None,
         database_name: str = "cognee",
         embedding_engine: EmbeddingEngine | None = None,
+        vector_db_host: str = "",
+        vector_db_port: str = "",
+        **kwargs,
     ) -> None:
         """Initialize the Valkey adapter.
 
@@ -84,6 +87,10 @@ class ValkeyAdapter(VectorDBInterface):
             url (str): Connection string for your Valkey instance like valkey://localhost:6379.
             embedding_engine: Engine for generating embeddings.
             api_key: Optional API key. Ignored for Valkey.
+            vector_db_host/vector_db_port: passed by cognee >= 1.5.0 to every
+                registered adapter; used when no VECTOR_DB_URL is configured.
+                cognee also passes vector_db_username/vector_db_password, which
+                land in **kwargs — this adapter connects without auth.
 
         Raises:
             ValkeyVectorEngineInitializationError: If required parameters are missing.
@@ -95,7 +102,16 @@ class ValkeyAdapter(VectorDBInterface):
             )
 
         self.url = url
-        self._host, self._port = _parse_host_port(url)
+        if url:
+            self._host, self._port = _parse_host_port(url)
+        else:
+            # _parse_host_port("") silently yields localhost:6379; prefer the
+            # host/port cognee actually configured before falling back to it.
+            self._host, self._port = _parse_host_port("")
+            if vector_db_host:
+                self._host = vector_db_host
+            if vector_db_port:
+                self._port = int(vector_db_port)
         self.database_name = database_name
         self.embedding_engine = embedding_engine
         self._client: GlideClient | None = None

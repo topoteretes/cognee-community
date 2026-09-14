@@ -1,4 +1,4 @@
-"""Offline cognee-1.4.1 conformance tests. No Weaviate cluster, no secrets."""
+"""Offline cognee-1.5.4 conformance tests. No Weaviate cluster, no secrets."""
 
 from cognee_community_vector_adapter_weaviate.weaviate_adapter import WeaviateAdapter
 from contract_suite import assert_vector_contract

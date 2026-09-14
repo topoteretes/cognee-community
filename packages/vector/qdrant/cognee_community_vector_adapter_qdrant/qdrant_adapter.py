@@ -22,6 +22,8 @@ from .quantization import (
 
 logger = get_logger("QDrantAdapter")
 
+DEFAULT_QDRANT_PORT = 6333
+
 
 def serialize_for_json(obj: Any) -> Any:
     """Recursively convert UUIDs (and containers of them) to JSON-serializable
@@ -57,7 +59,15 @@ class QDrantAdapter(VectorDBInterface):
         qdrant_path=None,
         database_name: str = "cognee_db",
         timeout: int = 120,
+        vector_db_host: str = "",
+        vector_db_port: str = "",
+        **kwargs,
     ):
+        # cognee >= 1.5.0 always passes vector_db_host / vector_db_port /
+        # vector_db_username / vector_db_password to registered adapters. Host
+        # and port are honored as a fallback when no VECTOR_DB_URL is set;
+        # Qdrant authenticates with an API key, so the username/password pair
+        # lands in **kwargs and is ignored.
         self.embedding_engine = embedding_engine
         self.database_name = database_name
         self.timeout = timeout
@@ -65,6 +75,8 @@ class QDrantAdapter(VectorDBInterface):
         if qdrant_path is not None:
             self.qdrant_path = qdrant_path
         else:
+            if not url and vector_db_host:
+                url = f"http://{vector_db_host}:{vector_db_port or DEFAULT_QDRANT_PORT}"
             self.url = url
             self.api_key = api_key
         self.VECTOR_DB_LOCK = asyncio.Lock()

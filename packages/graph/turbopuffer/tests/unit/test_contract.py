@@ -1,7 +1,7 @@
-"""Offline cognee-1.4.1 conformance tests. No TurboPuffer account, no secrets.
+"""Offline cognee-1.5.4 conformance tests. No TurboPuffer account, no secrets.
 
 Complements tests/unit/test_registration.py (registration + handler specifics)
-with the shared 1.4.1 call-shape contract.
+with the shared 1.5.4 call-shape contract.
 """
 
 from cognee_community_graph_adapter_turbopuffer import TurbopufferGraphAdapter, register

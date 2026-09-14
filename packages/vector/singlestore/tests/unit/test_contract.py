@@ -1,4 +1,4 @@
-"""Offline cognee-1.4.1 conformance tests. No SingleStore server, no secrets."""
+"""Offline cognee-1.5.4 conformance tests. No SingleStore server, no secrets."""
 
 from cognee_community_vector_adapter_singlestore.singlestore_adapter import (
     SingleStoreAdapter,

@@ -1,6 +1,7 @@
 import asyncio
 import json
 from typing import Any, List, Optional
+from urllib.parse import quote
 from uuid import UUID
 
 from cognee.infrastructure.databases.exceptions import MissingQueryParameterError
@@ -22,6 +23,24 @@ from redisvl.query import VectorQuery
 from redisvl.schema import IndexSchema
 
 logger = get_logger("RedisAdapter")
+
+DEFAULT_REDIS_PORT = 6379
+
+
+def _url_from_parts(host: str, port: str, username: str, password: str) -> str:
+    """Build a redis:// URL from cognee's discrete connection settings.
+
+    Returns "" when no host is configured, so the caller keeps raising the same
+    initialization error it always did.
+    """
+    if not host:
+        return ""
+    credentials = ""
+    if password:
+        credentials = f"{quote(username or '', safe='')}:{quote(password, safe='')}@"
+    elif username:
+        credentials = f"{quote(username, safe='')}@"
+    return f"redis://{credentials}{host}:{port or DEFAULT_REDIS_PORT}"
 
 
 class VectorEngineInitializationError(Exception):
@@ -91,6 +110,11 @@ class RedisAdapter(VectorDBInterface):
         database_name: str = "cognee",
         api_key: str | None = None,
         embedding_engine: EmbeddingEngine | None = None,
+        vector_db_host: str = "",
+        vector_db_port: str = "",
+        vector_db_username: str = "",
+        vector_db_password: str = "",
+        **kwargs,
     ) -> None:
         """Initialize the Redis adapter.
 
@@ -98,10 +122,16 @@ class RedisAdapter(VectorDBInterface):
             url (str): Connection string for your Redis instance like redis://localhost:6379.
             embedding_engine: Engine for generating embeddings.
             api_key: Optional API key. Ignored for Redis.
+            vector_db_host/vector_db_port/vector_db_username/vector_db_password:
+                passed by cognee >= 1.5.0 to every registered adapter. Used to
+                build the connection URL when no VECTOR_DB_URL is configured.
 
         Raises:
             VectorEngineInitializationError: If required parameters are missing.
         """
+        url = url or _url_from_parts(
+            vector_db_host, vector_db_port, vector_db_username, vector_db_password
+        )
         if not url:
             raise VectorEngineInitializationError("Redis connnection URL!")
         if not embedding_engine:

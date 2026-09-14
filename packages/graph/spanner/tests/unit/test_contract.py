@@ -1,4 +1,4 @@
-"""Offline cognee-1.4.1 conformance tests. No Spanner instance, no secrets."""
+"""Offline cognee-1.5.4 conformance tests. No Spanner instance, no secrets."""
 
 from contract_suite import assert_graph_contract
 from contract_suite.graph_contract import assert_registered

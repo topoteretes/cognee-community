@@ -1,4 +1,4 @@
-"""Offline cognee-1.4.1 conformance tests. No TurboPuffer account, no secrets."""
+"""Offline cognee-1.5.4 conformance tests. No TurboPuffer account, no secrets."""
 
 from cognee_community_vector_adapter_turbopuffer.turbopuffer_adapter import (
     TurbopufferAdapter,

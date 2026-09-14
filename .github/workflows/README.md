@@ -2,7 +2,12 @@
 
 This directory contains GitHub Actions workflows for testing community adapters
 against the pinned cognee version (see each package's `pyproject.toml`,
-currently `cognee==1.4.2`).
+currently `cognee==1.5.4`).
+
+Exception: `packages/graph/pggraph` is still pinned to `cognee==1.4.2`. It
+subclasses cognee's built-in Postgres graph adapter, which moved to
+`postgres_demo` and was rewritten in 1.5.x, so it needs a rework before it can
+follow the rest.
 
 ## Test tiers
 

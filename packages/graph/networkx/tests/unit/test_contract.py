@@ -1,4 +1,4 @@
-"""Offline cognee-1.4.1 conformance tests. No services, no secrets."""
+"""Offline cognee-1.5.4 conformance tests. No services, no secrets."""
 
 from cognee_community_graph_adapter_networkx import NetworkXAdapter
 from contract_suite import assert_graph_contract
