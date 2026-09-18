@@ -158,6 +158,19 @@ class TuringDBAdapter(GraphDBInterface):
             value = str(value)
         return f"'{value}'"
 
+    @staticmethod
+    def _quote_identifier(name: Any) -> str:
+        """Backtick-quote a property name so the Cypher parser takes it literally.
+
+        TuringDB reserves words that are also ordinary cognee property names —
+        ``type`` (carried by every DataPoint) and ``index`` among them — and
+        rejects them as bare identifiers with "syntax error, unexpected TYPE".
+        Quoting is accepted for non-reserved names too, so every dynamic
+        property name goes through here rather than a keyword list that would
+        drift as the parser gains words. Embedded backticks are doubled.
+        """
+        return "`" + str(name).replace("`", "``") + "`"
+
     def _apply_params(self, query: str, params: Optional[dict]) -> str:
         if not params:
             return query
@@ -276,7 +289,8 @@ class TuringDBAdapter(GraphDBInterface):
 
         label = node_label if node_label else self.DEFAULT_NODE_LABEL
         property_fragments = ", ".join(
-            f"{key}: {self._format_value(value)}" for key, value in serialized_properties.items()
+            f"{self._quote_identifier(key)}: {self._format_value(value)}"
+            for key, value in serialized_properties.items()
         )
 
         exists_query = f"MATCH (n {{id: {self._format_value(node_id)}}}) RETURN n"
@@ -318,7 +332,7 @@ class TuringDBAdapter(GraphDBInterface):
 
             label = node_label if node_label else self.DEFAULT_NODE_LABEL
             property_fragments = ", ".join(
-                f"{key}: {self._format_value(value)}"
+                f"{self._quote_identifier(key)}: {self._format_value(value)}"
                 for key, value in serialized_properties.items()
             )
 
@@ -407,7 +421,8 @@ class TuringDBAdapter(GraphDBInterface):
         serialized_properties[self.PROPERTIES_JSON_KEY] = properties_json
 
         property_fragments = ", ".join(
-            f"{key}: {self._format_value(value)}" for key, value in serialized_properties.items()
+            f"{self._quote_identifier(key)}: {self._format_value(value)}"
+            for key, value in serialized_properties.items()
         )
 
         query = (
@@ -445,7 +460,7 @@ class TuringDBAdapter(GraphDBInterface):
             serialized_properties[self.PROPERTIES_JSON_KEY] = properties_json
 
             property_fragments = ", ".join(
-                f"{key}: {self._format_value(value)}"
+                f"{self._quote_identifier(key)}: {self._format_value(value)}"
                 for key, value in serialized_properties.items()
             )
 
@@ -789,7 +804,8 @@ class TuringDBAdapter(GraphDBInterface):
         # Phase 1: collect seed nodes + neighbors (IDs only)
         phase1_query = (
             f"MATCH (n)-[r]-(m) "
-            f"WHERE n.type = {self._format_value(label)} AND ({name_conditions}) "
+            f"WHERE n.{self._quote_identifier('type')} = {self._format_value(label)} "
+            f"AND ({name_conditions}) "
             f"RETURN n.id AS nid, m.id AS mid"
         )
         phase1_rows = await self.query(phase1_query)
@@ -907,7 +923,8 @@ class TuringDBAdapter(GraphDBInterface):
         where_clauses = []
         for attribute, values in attribute_filters[0].items():
             value_conditions = " OR ".join(
-                f"n.{attribute} = {self._format_value(value)}" for value in values
+                f"n.{self._quote_identifier(attribute)} = {self._format_value(value)}"
+                for value in values
             )
             where_clauses.append(f"({value_conditions})")
 

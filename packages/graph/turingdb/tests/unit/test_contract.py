@@ -1,4 +1,4 @@
-"""Offline cognee-1.4.1 conformance tests. No TuringDB server, no secrets."""
+"""Offline cognee-1.5.4 conformance tests. No TuringDB server, no secrets."""
 
 from cognee_community_graph_adapter_turingdb.turingdb_adapter import TuringDBAdapter
 from contract_suite import assert_graph_contract

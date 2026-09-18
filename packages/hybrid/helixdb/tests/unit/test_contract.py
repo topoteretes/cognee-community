@@ -1,4 +1,4 @@
-"""Offline cognee-1.4.1 conformance tests. No HelixDB server, no secrets."""
+"""Offline cognee-1.5.4 conformance tests. No HelixDB server, no secrets."""
 
 from cognee_community_hybrid_adapter_helixdb.helixdb_adapter import HelixDBAdapter
 from contract_suite import assert_graph_contract, assert_vector_contract

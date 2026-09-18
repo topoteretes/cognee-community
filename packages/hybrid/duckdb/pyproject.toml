@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cognee-community-hybrid-adapter-duckdb"
-version = "0.2.0"
+version = "0.2.1"
 description = "DuckDB vector adapter for Cognee with planned graph support"
 readme = "README.md"
 requires-python = ">=3.10,<=3.13"
@@ -28,10 +28,12 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
-    "cognee==1.4.2",
-    # Transitive via cognee; pinned to the version cognee 1.4.2 locks (litellm
-    # 1.96.x published cp310-only wheels, uninstallable on the CI's Python 3.11).
-    "litellm==1.89.2",
+    "cognee==1.5.4",
+    # Transitive via cognee; pinned to the version cognee 1.5.4 locks, so CI
+    # resolves the litellm the upstream release was tested against. cognee 1.5.x
+    # caps the range itself (>=1.83.7,<1.97.0); 1.96.2 ships abi3 wheels that
+    # install on every Python this package supports.
+    "litellm==1.96.2",
     "duckdb>=1.3.2,<1.5.5",  # duckpgq community extension is not yet published for 1.5.5
     "starlette>=0.48.0",
     "instructor>=1.11"

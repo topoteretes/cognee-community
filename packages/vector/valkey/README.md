@@ -75,7 +75,7 @@ config.set_vector_db_config(
 
 - Python >= 3.11, <= 3.13
 - valkey-glide >= 2.1.0
-- cognee == 1.4.2
+- cognee == 1.5.4
 
 ## Advanced Usage
 
