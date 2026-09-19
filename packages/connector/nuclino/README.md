@@ -153,13 +153,10 @@ When an item or collection is deleted or unshared in Nuclino:
 4. Cognee's fresh-ID reconciliation identifies the dropped document.
 5. Cognee's `orphan_cleanup` purges the document from vector, graph, and relational stores.
 
-### Empty-Sweep Safeguard
+### Empty-Corpus Deletion & Failure Safety
 
-If a connector run that previously tracked objects suddenly encounters an empty metadata listing (0 objects returned across all target workspaces), the connector enters an intentional safeguard state:
-
-- It preserves the previous sync state untouched.
-- It yields no tombstones and exits safely.
-- It prevents accidental mass-deletion of the Cognee dataset caused by transient API issues or network misconfigurations.
+- **Authoritative Empty Corpus**: If all items and collections in the selected workspace(s) are deleted upstream, a successful metadata sweep returning zero objects will emit hard-delete tombstones for all previously tracked objects and reset the persisted sync state to empty, removing them from Cognee via orphan cleanup.
+- **Fail-Closed Safety**: Any transient HTTP errors, network timeouts, malformed API payloads, or mid-sync failures abort execution immediately. In failure cases, the previously persisted sync state remains completely untouched and no false deletion tombstones are emitted.
 
 ## Testing
 

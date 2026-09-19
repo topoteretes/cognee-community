@@ -395,8 +395,8 @@ def sync_items(
     Deletion reconciliation:
       - Sweeps lightweight metadata across all targeted workspaces.
       - Fails closed on malformed metadata, missing ``lastUpdatedAt``, or duplicate conflicts.
-      - Empty-sweep safety: if previous state is non-empty and 0 objects are discovered,
-        preserves state completely unchanged and yields no deletion tombstones.
+      - Authoritative empty sweep: if a successful metadata sweep returns 0 objects,
+        all previously known IDs are emitted as deletion tombstones and state becomes empty.
       - Changed/new items are fetched individually via ``_fetch_item``.
       - Vanished items (HTTP 404 on detail fetch) are omitted if brand-new, or emitted
         as deletion tombstones if previously known.
@@ -447,16 +447,7 @@ def sync_items(
                 )
         current_metadata[obj_id] = obj
 
-    # C. Empty-sweep safety
-    if previous_versions and not current_metadata:
-        logger.warning(
-            "Nuclino metadata sweep returned 0 objects, but previous state contained "
-            "%d item versions. Preserving state and skipping deletion reconciliation.",
-            len(previous_versions),
-        )
-        return
-
-    # D & E & F. Determine changed/new objects and fetch details
+    # C. Determine changed/new objects and fetch details
     effective_current_versions: dict[str, str] = {}
     rows_to_yield: list[dict[str, Any]] = []
 

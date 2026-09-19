@@ -1150,8 +1150,11 @@ def test_sync_items_brand_new_item_404_produces_no_unnecessary_tombstone():
     assert state["item_versions"] == {}
 
 
-def test_sync_items_empty_sweep_with_previous_state_yields_no_tombstones_and_preserves_state():
-    """Empty-sweep safety guard: 0 discovered items when previous state existed preserves state."""
+def test_sync_items_single_item_empty_sweep_emits_tombstone_and_clears_state():
+    """When a single known item is deleted upstream, empty sweep emits tombstone and empties.
+
+    State should become empty.
+    """
     session = FakeNuclinoSession(
         routes={
             f"{NUCLINO_API_BASE}/items": FakeNuclinoResponse(
@@ -1160,11 +1163,50 @@ def test_sync_items_empty_sweep_with_previous_state_yields_no_tombstones_and_pre
         }
     )
 
-    state = {"item_versions": {"i1": "ts1", "i2": "ts2"}}
+    state = {"item_versions": {"item-1": "ts1"}}
     rows = list(sync_items(session, state, workspace_ids=["ws-1"]))
 
-    assert rows == []
-    assert state["item_versions"] == {"i1": "ts1", "i2": "ts2"}
+    assert rows == [{"id": "item-1", "_deleted": True}]
+    assert state["item_versions"] == {}
+
+
+def test_sync_items_multiple_items_empty_sweep_emits_ordered_tombstones_and_clears_state():
+    """When multiple known items are deleted upstream, empty sweep emits tombstones.
+
+    Tombstones are emitted in deterministic order and state becomes empty.
+    """
+    session = FakeNuclinoSession(
+        routes={
+            f"{NUCLINO_API_BASE}/items": FakeNuclinoResponse(
+                {"status": "success", "data": {"results": []}}
+            ),
+        }
+    )
+
+    state = {"item_versions": {"item-b": "ts_b", "item-a": "ts_a", "col-1": "ts_c"}}
+    rows = list(sync_items(session, state, workspace_ids=["ws-1"]))
+
+    assert rows == [
+        {"id": "col-1", "_deleted": True},
+        {"id": "item-a", "_deleted": True},
+        {"id": "item-b", "_deleted": True},
+    ]
+    assert state["item_versions"] == {}
+
+
+def test_sync_items_metadata_sweep_api_failure_preserves_previous_state():
+    """API failure during metadata sweep propagates exception and preserves previous state."""
+    session = FakeNuclinoSession(
+        routes={
+            f"{NUCLINO_API_BASE}/items": FakeNuclinoResponse(status_code=500),
+        }
+    )
+
+    state = {"item_versions": {"item-1": "ts1", "item-2": "ts2"}}
+    with pytest.raises(requests.exceptions.HTTPError):
+        list(sync_items(session, state, workspace_ids=["ws-1"]))
+
+    assert state["item_versions"] == {"item-1": "ts1", "item-2": "ts2"}
 
 
 def test_sync_items_malformed_missing_last_updated_at_raises_and_preserves_state():
