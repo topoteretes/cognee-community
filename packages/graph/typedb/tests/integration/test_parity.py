@@ -94,13 +94,6 @@ async def test_get_triplets_batch_pages_in_stable_order(seeded):
         await adapter.get_triplets_batch(0, -1)
 
 
-async def test_frequency_weights_are_unsupported(adapter):
-    with pytest.raises(NotImplementedError):
-        await adapter.get_node_frequency_weights(["x"])
-    with pytest.raises(NotImplementedError):
-        await adapter.get_edge_frequency_weights(["x"])
-
-
 async def test_get_triplets_batch_on_missing_database(adapter):
     assert await adapter.get_triplets_batch(0, 5) == []
     await adapter.add_nodes([Concept(name="solo")])

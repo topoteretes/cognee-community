@@ -1,12 +1,18 @@
-"""Offline conformance checks for community vector adapters against cognee 1.4.1.
+"""Offline conformance checks for community vector adapters against cognee 1.6.1.
 
 These assertions encode the exact call shapes cognee core uses when talking to
-a vector adapter, so a package's unit tier can prove 1.4.1 compatibility with
+a vector adapter, so a package's unit tier can prove 1.6.1 compatibility with
 no database, no network, and no API keys.
 
-Call-shape sources (cognee v1.4.1):
+Call-shape sources (cognee v1.6.1):
 - construction: cognee/infrastructure/databases/vector/create_vector_engine.py
-  -> adapter(url=..., api_key=..., embedding_engine=..., database_name=...)
+  -> adapter(url=..., api_key=..., embedding_engine=..., database_name=...,
+             vector_db_host=..., vector_db_port=..., vector_db_username=...,
+             vector_db_password=...)
+  The four connection keywords were added in 1.5.0 so registered adapters can
+  reach a store on a non-default host or one needing credentials. cognee passes
+  them UNCONDITIONALLY, so an adapter that neither declares nor absorbs them
+  (**kwargs) raises TypeError the moment the engine is built.
 - search: cognee/modules/retrieval/chunks_retriever.py
   -> search(collection, query, limit=..., include_payload=True,
             node_name=..., node_name_filter_operator=...)
@@ -16,6 +22,11 @@ Call-shape sources (cognee v1.4.1):
   -> create_vector_index(type_name, field_name);
      index_data_points(type_name, field_name, batch);
      vector_engine.embedding_engine.get_batch_size()
+- neighborhood re-scoring (1.6.0, optional):
+  cognee/modules/retrieval/utils/brute_force_triplet_search.py
+  -> score_by_ids(collection_name=..., data_point_ids=..., query_vector=...)
+  VectorDBInterface's default raises NotImplementedError, which cognee catches,
+  so an adapter only needs this shape when it overrides it.
 """
 
 import inspect
@@ -25,6 +36,19 @@ from cognee.infrastructure.databases.vector.vector_db_interface import VectorDBI
 from .fakes import FakeEmbeddingEngine
 
 _SELF = object()
+
+# Exactly what create_vector_engine passes to a registered community adapter.
+# Keep this in lockstep with cognee/infrastructure/databases/vector/
+# create_vector_engine.py -- it is the whole point of the construction check.
+FACTORY_KWARGS = {
+    "url": "http://localhost:1",
+    "api_key": "key",
+    "database_name": "contract_db",
+    "vector_db_host": "localhost",
+    "vector_db_port": "1",
+    "vector_db_username": "user",
+    "vector_db_password": "password",
+}
 
 REQUIRED_METHODS = [
     "has_collection",
@@ -50,12 +74,12 @@ def _bind(adapter_cls, method_name: str, *args, **kwargs):
     except TypeError as error:
         raise AssertionError(
             f"{adapter_cls.__name__}.{method_name}{signature} cannot be called as "
-            f"cognee 1.4.1 calls it (args={args}, kwargs={kwargs}): {error}"
+            f"cognee 1.6.1 calls it (args={args}, kwargs={kwargs}): {error}"
         ) from error
 
 
 def assert_vector_contract(adapter_cls, *, instantiate=True, constructor_kwargs=None):
-    """Assert that *adapter_cls* satisfies the cognee 1.4.1 vector adapter contract.
+    """Assert that *adapter_cls* satisfies the cognee 1.6.1 vector adapter contract.
 
     Parameters:
         adapter_cls: the adapter class registered via use_vector_adapter.
@@ -81,10 +105,8 @@ def assert_vector_contract(adapter_cls, *, instantiate=True, constructor_kwargs=
     try:
         init_signature.bind(
             _SELF,
-            url="http://localhost:1",
-            api_key="key",
             embedding_engine=FakeEmbeddingEngine(),
-            database_name="contract_db",
+            **FACTORY_KWARGS,
         )
     except TypeError as error:
         raise AssertionError(
@@ -130,12 +152,20 @@ def assert_vector_contract(adapter_cls, *, instantiate=True, constructor_kwargs=
     _bind(adapter_cls, "has_collection", "DocumentChunk_text")
     _bind(adapter_cls, "prune")
 
+    # Optional re-scoring hook: only an override needs checking.
+    if adapter_cls.score_by_ids is not VectorDBInterface.score_by_ids:
+        _bind(
+            adapter_cls,
+            "score_by_ids",
+            collection_name="EntityName_text",
+            data_point_ids=["id-1"],
+            query_vector=[0.0, 0.1],
+        )
+
     if instantiate:
         kwargs = {
-            "url": "http://localhost:1",
-            "api_key": "key",
             "embedding_engine": FakeEmbeddingEngine(),
-            "database_name": "contract_db",
+            **FACTORY_KWARGS,
         }
         if constructor_kwargs:
             kwargs.update(constructor_kwargs)

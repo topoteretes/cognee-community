@@ -7,7 +7,7 @@ driver is used under the hood.
 
 from .arcadedb_adapter import ArcadeDBAdapter
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 __all__ = ["ArcadeDBAdapter", "register"]
 
 

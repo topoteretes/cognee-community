@@ -199,7 +199,12 @@ class TurbopufferAdapter(VectorDBInterface):
         api_key=None,
         embedding_engine: EmbeddingEngine = None,
         database_name: str = "cognee_db",
+        **kwargs,
     ):
+        # cognee >= 1.5.0 always passes vector_db_host / vector_db_port /
+        # vector_db_username / vector_db_password to registered adapters.
+        # Turbopuffer is a hosted service addressed by API key plus region (the
+        # url field), so they are absorbed by **kwargs and ignored.
         self.embedding_engine = embedding_engine
         self.database_name = database_name
         self.url = url

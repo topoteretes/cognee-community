@@ -1,4 +1,4 @@
-"""Offline cognee-1.4.1 conformance tests. No ArcadeDB server, no secrets."""
+"""Offline cognee-1.6.1 conformance tests. No ArcadeDB server, no secrets."""
 
 from cognee_community_hybrid_adapter_arcadedb.arcadedb_adapter import (
     ArcadeDBAdapter,

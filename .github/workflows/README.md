@@ -2,14 +2,14 @@
 
 This directory contains GitHub Actions workflows for testing community adapters
 against the pinned cognee version (see each package's `pyproject.toml`,
-currently `cognee==1.4.2`).
+currently `cognee==1.6.1`).
 
 ## Test tiers
 
 Every graph/vector/hybrid adapter package structures its tests as:
 
 - **unit** (`tests/unit/`) — offline contract tests plus any mocked/pure-logic
-  suites. No services, no secrets. Runs for **all 23 adapter packages** on
+  suites. No services, no secrets. Runs for **all 24 adapter packages** on
   every PR via `adapter_contract_tests.yml` (see
   `packages/shared/contract_suite/README.md`). This is the always-on signal,
   including for adapters whose backing service is cloud-only (Pinecone, Moss,

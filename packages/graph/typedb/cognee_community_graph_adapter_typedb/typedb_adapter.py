@@ -664,7 +664,7 @@ class TypeDBAdapter(ProvenanceMixin, GraphDBInterface):
         return (query, [row])
 
     # ------------------------------------------------------------------
-    # GraphDBInterface — cognee 1.4.2 call surface
+    # GraphDBInterface — cognee 1.6.1 call surface
     # ------------------------------------------------------------------
 
     async def query(
