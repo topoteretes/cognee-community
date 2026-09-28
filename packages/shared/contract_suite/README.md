@@ -11,7 +11,7 @@ It is not published to PyPI and has no dependencies beyond `cognee` itself
   cognee's `EmbeddingEngine` protocol. Use it in unit and integration tests so
   no LLM or embedding API keys are ever needed.
 - `assert_vector_contract(AdapterCls)` — asserts a vector adapter satisfies the
-  cognee 1.5.4 call surface: real `VectorDBInterface` subclassing, the factory
+  cognee 1.6.1 call surface: real `VectorDBInterface` subclassing, the factory
   construction shape (`url=`, `api_key=`, `embedding_engine=`,
   `database_name=`, plus the `vector_db_host=` / `vector_db_port=` /
   `vector_db_username=` / `vector_db_password=` keywords added in 1.5.0), and
@@ -21,7 +21,12 @@ It is not published to PyPI and has no dependencies beyond `cognee` itself
   1.4.1 hard requirement that `add_nodes` / `add_edges` accept
   `source_ref_key=` and `pipeline_run_id=` keywords, and that
   `get_nodeset_subgraph` accepts `node_name_filter_operator=`. The graph
-  factory's call shape did not change in 1.5.x.
+  factory's call shape did not change in 1.5.x or 1.6.x.
+- Optional hooks added in 1.6.0 (`get_top_degree_node_ids`,
+  `iter_bounded_neighborhood`, `get_entity_type_names` on graph adapters,
+  `score_by_ids` on vector adapters) have working defaults in cognee's
+  interfaces; the suite checks their call shape only when an adapter overrides
+  one.
 
 ## How adapter packages use it
 
@@ -42,7 +47,7 @@ from contract_suite import assert_vector_contract
 from cognee_community_vector_adapter_example.example_adapter import ExampleAdapter
 
 
-def test_conforms_to_cognee_154_vector_contract():
+def test_conforms_to_cognee_161_vector_contract():
     assert_vector_contract(ExampleAdapter)
 ```
 

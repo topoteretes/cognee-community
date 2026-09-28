@@ -1,12 +1,12 @@
-"""Offline conformance checks for community graph adapters against cognee 1.5.4.
+"""Offline conformance checks for community graph adapters against cognee 1.6.1.
 
-Call-shape sources (cognee v1.5.4):
+Call-shape sources (cognee v1.6.1):
 - construction: cognee/infrastructure/databases/graph/get_graph_engine.py
   -> adapter(graph_database_url=..., graph_database_username=...,
              graph_database_password=..., graph_database_port=...,
              graph_database_key=..., database_name=...)
-  Unchanged in 1.5.x: unlike the vector factory, the graph factory did NOT gain
-  new connection keywords.
+  Unchanged in 1.5.x and 1.6.x: unlike the vector factory, the graph factory
+  did NOT gain new connection keywords.
 - writes: cognee/tasks/storage/add_data_points.py ALWAYS calls
   add_nodes(nodes, source_ref_key=..., pipeline_run_id=...) and
   add_edges(edges, source_ref_key=..., pipeline_run_id=...) — values may be
@@ -14,6 +14,11 @@ Call-shape sources (cognee v1.5.4):
 - nodeset search: cognee/modules/graph/cognee_graph/CogneeGraph.py calls
   get_nodeset_subgraph(node_type=..., node_name=...,
                        node_name_filter_operator=...).
+- graph view (1.6.0): cognee/modules/visualization/subgraph_data.py calls the
+  optional get_top_degree_node_ids(top_k), get_entity_type_names(entity_ids)
+  and iter_bounded_neighborhood(seeds, depth, max_nodes, chunk_size=...,
+  property_keys=...). GraphDBInterface ships working defaults, so an adapter
+  only needs these shapes when it overrides one.
 """
 
 import inspect
@@ -32,12 +37,16 @@ def _bind(adapter_cls, method_name: str, *args, **kwargs):
     except TypeError as error:
         raise AssertionError(
             f"{adapter_cls.__name__}.{method_name}{signature} cannot be called as "
-            f"cognee 1.5.4 calls it (args={args}, kwargs={kwargs}): {error}"
+            f"cognee 1.6.1 calls it (args={args}, kwargs={kwargs}): {error}"
         ) from error
 
 
+def _overrides(adapter_cls, method_name: str) -> bool:
+    return getattr(adapter_cls, method_name) is not getattr(GraphDBInterface, method_name)
+
+
 def assert_graph_contract(adapter_cls, *, check_constructor=True):
-    """Assert that *adapter_cls* satisfies the cognee 1.5.4 graph adapter contract.
+    """Assert that *adapter_cls* satisfies the cognee 1.6.1 graph adapter contract.
 
     Parameters:
         adapter_cls: the adapter class registered via use_graph_adapter (or the
@@ -57,7 +66,7 @@ def assert_graph_contract(adapter_cls, *, check_constructor=True):
     )
 
     # The hard 1.4.1 break, still in force: add_data_points always passes these
-    # kwargs. 1.5.x may pass a per-row MAPPING instead of a scalar key, but only
+    # kwargs. Since 1.5.x it may pass a per-row MAPPING instead of a scalar key, but only
     # to adapters that opt in with supports_per_row_source_refs = True.
     _bind(adapter_cls, "add_nodes", [], source_ref_key=None, pipeline_run_id=None)
     _bind(adapter_cls, "add_edges", [], source_ref_key=None, pipeline_run_id=None)
@@ -79,6 +88,24 @@ def assert_graph_contract(adapter_cls, *, check_constructor=True):
     _bind(adapter_cls, "get_graph_metrics", include_optional=True)
     _bind(adapter_cls, "is_empty")
     _bind(adapter_cls, "delete_graph")
+
+    # Optional graph-view hooks: only overrides need checking, the inherited
+    # defaults match by construction.
+    if _overrides(adapter_cls, "get_top_degree_node_ids"):
+        _bind(adapter_cls, "get_top_degree_node_ids", 10)
+    if _overrides(adapter_cls, "get_entity_type_names"):
+        _bind(adapter_cls, "get_entity_type_names", ["entity-1"])
+    if _overrides(adapter_cls, "iter_bounded_neighborhood"):
+        _bind(adapter_cls, "iter_bounded_neighborhood", ["seed-1"], 2, 100, chunk_size=50)
+        _bind(
+            adapter_cls,
+            "iter_bounded_neighborhood",
+            ["seed-1"],
+            2,
+            100,
+            chunk_size=50,
+            property_keys=["name"],
+        )
 
     if check_constructor:
         init_signature = inspect.signature(adapter_cls.__init__)

@@ -258,9 +258,6 @@ database: the relational provenance model does not read the old attributes.
   `get_document_subgraph` / `get_degree_one_nodes` are not implemented; that
   path is only reachable for data ingested before cognee 1.4.x's relational
   provenance ledger.
-- Frequency weights (`get_node_frequency_weights` /
-  `get_edge_frequency_weights`) raise `NotImplementedError`, as on every
-  cognee adapter.
 
 ## Example
 

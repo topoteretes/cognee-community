@@ -6,9 +6,9 @@ authors = [
     {name = "Cognee Team", email = "hello@cognee.ai"},
 ]
 dependencies = [
-    "cognee[neo4j]==1.5.4",
-    # Transitive via cognee; pinned to the version cognee 1.5.4 locks, so CI
-    # resolves the litellm the upstream release was tested against. cognee 1.5.x
+    "cognee[neo4j]==1.6.1",
+    # Transitive via cognee; pinned to the version cognee 1.6.1 locks, so CI
+    # resolves the litellm the upstream release was tested against. cognee 1.6.x
     # caps the range itself (>=1.83.7,<1.97.0); 1.96.2 ships abi3 wheels that
     # install on every Python this package supports.
     "litellm==1.96.2",
