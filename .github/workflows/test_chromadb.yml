@@ -1,0 +1,43 @@
+name: ChromaDB Adapter Tests
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "packages/vector/chromadb/**"
+      - "packages/shared/contract_suite/**"
+      - ".github/workflows/test_chromadb.yml"
+  push:
+    branches: [main]
+    paths:
+      - "packages/vector/chromadb/**"
+      - "packages/shared/contract_suite/**"
+      - ".github/workflows/test_chromadb.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: ChromaDB unit and integration (${{ matrix.python-version }})
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.13"]
+    env:
+      TELEMETRY_DISABLED: "1"
+      ANONYMIZED_TELEMETRY: "False"
+      COGNEE_LOG_FILE: "false"
+      LITELLM_LOCAL_MODEL_COST_MAP: "True"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install package and test dependencies
+        run: python -m pip install -e packages/vector/chromadb pytest pytest-asyncio
+      - name: Run unit and in-process integration tests
+        run: >-
+          python -m pytest packages/vector/chromadb/tests/unit
+          packages/vector/chromadb/tests/integration -q
