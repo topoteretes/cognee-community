@@ -55,6 +55,23 @@ each package's README for manual runs.
 - `test_all_with_cognee_dev.yml` — manual: matrix over packages against an
   arbitrary cognee ref
 
+### Cognee version bump
+- `bump_cognee.yml` — daily and manual (optional `version` input). When a new
+  stable cognee is on PyPI, opens one PR on `automation/bump-cognee` that bumps
+  every adapter under `packages/{graph,vector,hybrid}`:
+  - pins, adapter package versions, version strings and lock files, done by
+    `.github/scripts/bump_cognee.py`
+  - new optional adapter methods, done by an agent step following
+    `.github/prompts/bump_cognee_agent.md`
+
+  A person reviews the PR, fixes breaking changes on its branch, merges and
+  publishes to PyPI. The workflow does nothing when the adapters are up to date
+  or a PR for that version is open, and never force-pushes over a reviewer's
+  commits. Needs the `COGNEE_BUMP_PR_TOKEN` secret (a PAT or app token, since
+  PRs opened with `GITHUB_TOKEN` don't run CI) and `ANTHROPIC_API_KEY` for the
+  agent step. Run the mechanical part locally with
+  `python .github/scripts/bump_cognee.py apply --version X --skip-locks`.
+
 ## Usage
 
 Tests run automatically on push/PR to `main` or `dev`. To manually trigger all
