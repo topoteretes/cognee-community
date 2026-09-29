@@ -185,6 +185,7 @@ class ValkeyAdapter(VectorDBInterface):
         cfg = GlideClientConfiguration(
             [NodeAddress(self._host, self._port)],
             client_name="cognee_vector_store_client",
+            client_info_tag="cognee-community",
             use_tls=False,
             # Documents carry full embedding vectors (tens of KB each); a slow
             # CI runner needs headroom or bulk writes hit "TimeoutError: timed
