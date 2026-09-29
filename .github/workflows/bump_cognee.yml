@@ -80,8 +80,20 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.COGNEE_BUMP_PR_TOKEN }}
           VERSION: ${{ steps.resolve.outputs.version }}
+          EVENT: ${{ github.event_name }}
         run: |
           set -euo pipefail
+          # A closed bump PR for this version means a maintainer skipped it. Only
+          # a manual run reopens it.
+          if [ "$EVENT" = schedule ]; then
+            closed=$(gh pr list --head "$BRANCH" --base "$BASE" --state closed --json number,title \
+                       --jq '[.[] | select(.title | endswith("cognee " + env.VERSION))][0].number // empty')
+            if [ -n "$closed" ]; then
+              echo "PR #$closed for cognee $VERSION was closed; skipping. Run the workflow manually to bump anyway."
+              echo "action=skip" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
           pr=$(gh pr list --head "$BRANCH" --base "$BASE" --state open --json number,title \
                  --jq '.[0] // empty | "\(.number)\t\(.title)"')
           number=""
