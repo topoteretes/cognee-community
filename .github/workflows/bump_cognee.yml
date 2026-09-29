@@ -1,0 +1,308 @@
+name: automation | Bump cognee in the database adapters
+
+# Opens (or updates) one pull request that moves every adapter under
+# packages/{graph,vector,hybrid} to the latest stable cognee on PyPI. The
+# mechanical part is .github/scripts/bump_cognee.py; an agent step then reads
+# cognee's interface diff and implements new optional adapter methods. A person
+# reviews the PR, fixes breaking changes on its branch, merges and publishes.
+#
+# Required secrets:
+#   COGNEE_BUMP_PR_TOKEN  PAT or GitHub App token with contents + pull-requests
+#                         write. Pushes and PRs made with the default
+#                         GITHUB_TOKEN do not trigger CI, so it can't be used.
+#   ANTHROPIC_API_KEY     For the agent step. Without it the PR still opens,
+#                         with the mechanical bump only.
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "cognee version to bump to (default: latest stable on PyPI)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bump-cognee
+  cancel-in-progress: false
+
+env:
+  # One branch per base, so a run from another branch never touches main's PR.
+  BRANCH: automation/bump-cognee-${{ github.ref_name }}
+  BASE: ${{ github.ref_name }}
+  BOT_NAME: github-actions[bot]
+  BOT_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+  BUMP: uv run --no-project --python 3.11 --with packaging python .github/scripts/bump_cognee.py
+
+jobs:
+  bump:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    env:
+      HAS_PR_TOKEN: ${{ secrets.COGNEE_BUMP_PR_TOKEN != '' }}
+      HAS_ANTHROPIC_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+    steps:
+      - name: Check the PR token is configured
+        if: ${{ env.HAS_PR_TOKEN != 'true' }}
+        run: |
+          echo "::error::Set the COGNEE_BUMP_PR_TOKEN secret (see the header of this workflow)."
+          exit 1
+
+      - name: Check out ${{ env.BASE }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BASE }}
+          fetch-depth: 0
+          # The agent step can read the working tree; keep the token out of .git/config.
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Resolve the target version
+        id: resolve
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: ${{ env.BUMP }} resolve --version "$INPUT_VERSION"
+
+      - name: Check for an open bump PR
+        id: pr
+        if: ${{ steps.resolve.outputs.needed == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.COGNEE_BUMP_PR_TOKEN }}
+          VERSION: ${{ steps.resolve.outputs.version }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          # A closed bump PR for this version means a maintainer skipped it. Only
+          # a manual run reopens it.
+          if [ "$EVENT" = schedule ]; then
+            closed=$(gh pr list --head "$BRANCH" --base "$BASE" --state closed --json number,title \
+                       --jq '[.[] | select(.title | endswith("cognee " + env.VERSION))][0].number // empty')
+            if [ -n "$closed" ]; then
+              echo "PR #$closed for cognee $VERSION was closed; skipping. Run the workflow manually to bump anyway."
+              echo "action=skip" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          pr=$(gh pr list --head "$BRANCH" --base "$BASE" --state open --json number,title \
+                 --jq '.[0] // empty | "\(.number)\t\(.title)"')
+          number=""
+          if [ -n "$pr" ]; then
+            number=${pr%%$'\t'*}; title=${pr#*$'\t'}
+            echo "number=$number" >> "$GITHUB_OUTPUT"
+            if [[ "$title" == *"cognee $VERSION" ]]; then
+              echo "PR #$number already bumps to cognee $VERSION; nothing to do."
+              echo "action=skip" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          # Rebuilding the branch force-pushes it. Never do that over anyone
+          # else's commits, with or without an open PR.
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null; then
+            git fetch --quiet origin "$BRANCH"
+            others=$(git log --format='%ae' "origin/$BASE..origin/$BRANCH" | grep -vxF "$BOT_EMAIL" || true)
+            if [ -n "$others" ]; then
+              if [ -n "$number" ]; then
+                # Leave a note on the PR instead (once).
+                marker="<!-- bump-cognee:$VERSION -->"
+                if ! gh pr view "$number" --json comments --jq '.comments[].body' | grep -qF "$marker"; then
+                  gh pr comment "$number" --body "cognee $VERSION is out. This PR has reviewer commits, so the automation won't rebuild it: merge it first, and the next run opens a PR for $VERSION. $marker"
+                fi
+              else
+                echo "::warning::$BRANCH has commits by others and no open PR; not overwriting it. Delete the branch to let the automation recreate it."
+              fi
+              echo "action=skip" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          if [ -n "$number" ]; then
+            echo "action=update" >> "$GITHUB_OUTPUT"
+          else
+            echo "action=create" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Bump pins, versions and lock files
+        id: apply
+        if: ${{ steps.pr.outputs.action == 'create' || steps.pr.outputs.action == 'update' }}
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          echo ".bump/" >> .git/info/exclude
+          git config user.name "$BOT_NAME"
+          git config user.email "$BOT_EMAIL"
+          # Always rebuilt from the base branch; the PR check above refuses to
+          # get here when the existing branch carries anyone else's commits.
+          git checkout -B "$BRANCH"
+          ${{ env.BUMP }} apply --version "$VERSION"
+          git add -A
+          git commit --quiet -m "chore: bump database adapters to cognee $VERSION"
+
+      - name: Prepare cognee's interface diff
+        if: ${{ steps.apply.outcome == 'success' }}
+        env:
+          OLD: ${{ steps.resolve.outputs.old_version }}
+          NEW: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          git clone --quiet --filter=blob:none https://github.com/topoteretes/cognee .bump/cognee
+          git -C .bump/cognee diff "v$OLD" "v$NEW" -- \
+            cognee/infrastructure/databases/graph/graph_db_interface.py \
+            cognee/infrastructure/databases/graph/get_graph_engine.py \
+            cognee/infrastructure/databases/vector/vector_db_interface.py \
+            cognee/infrastructure/databases/vector/create_vector_engine.py \
+            cognee/infrastructure/databases/vector/models \
+            cognee/infrastructure/databases/provenance \
+            cognee/tasks/storage \
+            cognee/tests/integration/infrastructure/graph \
+            > .bump/interface_diff.patch
+          wc -l .bump/interface_diff.patch
+          # The action rewrites .git/config (bot identity, a token in the origin
+          # URL) and the agent could plant core.fsmonitor there, so the next step
+          # restores this copy before running git. A planted hook fails the run.
+          cp .git/config "$RUNNER_TEMP/git.config"
+          find .git/hooks -type f | sort | xargs -r sha256sum > "$RUNNER_TEMP/hooks.sha256"
+
+      - name: Implement new adapter methods with Claude
+        id: claude
+        if: ${{ steps.apply.outcome == 'success' && env.HAS_ANTHROPIC_KEY == 'true' }}
+        continue-on-error: true
+        uses: anthropics/claude-code-action@c81e3bc69d1b18badbb63ba39581218f02421678  # v1.0.201
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          prompt: |
+            Read and follow `.github/prompts/bump_cognee_agent.md`.
+
+            - Old cognee version: ${{ steps.resolve.outputs.old_version }}
+            - New cognee version: ${{ steps.resolve.outputs.version }}
+            - Interface diff: `.bump/interface_diff.patch`
+            - cognee clone: `.bump/cognee`
+            - Report: `.bump/agent_summary.md`
+          claude_args: >-
+            --allowed-tools Read,Edit,Write,Glob,Grep,Bash(git -C .bump/cognee diff:*),Bash(git -C .bump/cognee show:*),Bash(git -C .bump/cognee log:*)
+            --max-turns 80
+
+      - name: Keep only in-scope agent changes
+        id: scope
+        if: ${{ steps.apply.outcome == 'success' }}
+        env:
+          CLAUDE_OUTCOME: ${{ steps.claude.outcome }}
+          CLAUDE_CONCLUSION: ${{ steps.claude.outputs.conclusion }}
+          EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
+        run: |
+          set -euo pipefail
+          # Before any git command: drop the action's token, identity and any
+          # config the agent added.
+          cp "$RUNNER_TEMP/git.config" .git/config
+          if ! find .git/hooks -type f | sort | xargs -r sha256sum \
+               | diff -q "$RUNNER_TEMP/hooks.sha256" - >/dev/null; then
+            echo "::error::The agent step changed .git/hooks; stopping."
+            exit 1
+          fi
+          # The action can fail on the turn count after finishing cleanly; judge
+          # from the agent's own result, as cognee's docs workflows do.
+          status=skipped
+          if [ "${CLAUDE_OUTCOME:-skipped}" != "skipped" ]; then
+            status=finished
+            if [ "${CLAUDE_CONCLUSION:-}" != "success" ] && { [ -z "${EXECUTION_FILE:-}" ] || \
+                 ! jq -e '[.. | objects | select(has("is_error"))] | last | .is_error == false' \
+                   "$EXECUTION_FILE" >/dev/null 2>&1; }; then
+              status=failed
+            fi
+          fi
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          allowed='^(packages/(graph|vector|hybrid)/[^/]+/|packages/shared/contract_suite/)'
+          discarded=""
+          while IFS= read -r path; do
+            if ! [[ "$path" =~ $allowed ]] || [[ "$path" =~ (pyproject\.toml|\.lock)$ ]]; then
+              discarded+="- \`$path\`"$'\n'
+              git checkout --quiet HEAD -- "$path" 2>/dev/null || rm -rf -- "$path"
+            fi
+          done < <(git status --porcelain --untracked-files=all | cut -c4-)
+          if [ "$status" = failed ]; then
+            git checkout --quiet -- . && git clean -fdq -e .bump/
+          fi
+          { echo "discarded<<EOF"; printf '%s' "$discarded"; echo "EOF"; } >> "$GITHUB_OUTPUT"
+
+      - name: Lint and commit the agent's changes
+        id: ruff
+        if: ${{ steps.apply.outcome == 'success' }}
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -uo pipefail
+          uvx ruff format --quiet packages
+          uvx ruff check --fix --quiet packages
+          if uvx ruff check --quiet . && uvx ruff format --check --quiet .; then
+            echo "result=clean" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=**issues left, see the ruff check on this PR**" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -n "$(git status --porcelain)" ]; then
+            git add -A
+            git commit --quiet -m "feat: adapter changes for cognee $VERSION (automated)"
+          fi
+
+      - name: Push and open or update the PR
+        if: ${{ steps.apply.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ secrets.COGNEE_BUMP_PR_TOKEN }}
+          ACTION: ${{ steps.pr.outputs.action }}
+          NUMBER: ${{ steps.pr.outputs.number }}
+          OLD: ${{ steps.resolve.outputs.old_version }}
+          VERSION: ${{ steps.resolve.outputs.version }}
+          AGENT_STATUS: ${{ steps.scope.outputs.status }}
+          DISCARDED: ${{ steps.scope.outputs.discarded }}
+          RUFF: ${{ steps.ruff.outputs.result }}
+        run: |
+          set -euo pipefail
+          git push --quiet --force \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/$BRANCH"
+
+          {
+            echo "Automated bump of the database adapters from cognee $OLD to **$VERSION** ([release notes](https://github.com/topoteretes/cognee/releases/tag/v$VERSION))."
+            echo
+            echo "Opened by \`.github/workflows/bump_cognee.yml\`. To review: fix any breaking changes listed below on this branch, merge, then publish the bumped adapters to PyPI."
+            echo
+            echo "## Mechanical bump"
+            echo
+            cat .bump/summary.md
+            echo
+            echo "## Code changes"
+            echo
+            case "$AGENT_STATUS" in
+              skipped) echo "Agent step skipped (no \`ANTHROPIC_API_KEY\` secret). Check cognee's interface diff by hand." ;;
+              failed)  echo "The agent step did not finish, so its changes were dropped. Check cognee's interface diff by hand." ;;
+              *) if [ -s .bump/agent_summary.md ]; then cat .bump/agent_summary.md; else echo "The agent finished without a report."; fi ;;
+            esac
+            if [ -n "$DISCARDED" ]; then
+              echo
+              echo "Agent changes outside the allowed paths were discarded:"
+              echo
+              printf '%s\n' "$DISCARDED"
+            fi
+            echo
+            echo "## Checks"
+            echo
+            echo "- ruff: $RUFF"
+            echo "- The adapter contract, integration and ruff workflows run on this PR."
+          } > .bump/pr_body.md
+
+          title="chore: bump database adapters to cognee $VERSION"
+          if [ "$ACTION" = update ]; then
+            gh pr edit "$NUMBER" --title "$title" --body-file .bump/pr_body.md
+            echo "Updated PR #$NUMBER"
+          else
+            gh pr create --base "$BASE" --head "$BRANCH" --title "$title" --body-file .bump/pr_body.md
+          fi
