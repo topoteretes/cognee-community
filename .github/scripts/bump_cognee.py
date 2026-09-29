@@ -103,7 +103,8 @@ def published_versions(package: str) -> tuple[set[Version], set[Version]]:
     data = _get_json(f"https://pypi.org/pypi/{package}/json")
     if not data:
         return set(), set()
-    taken = {Version(v) for v, files in data["releases"].items() if files}
+    # A release whose files were all deleted still holds its number.
+    taken = {Version(v) for v in data["releases"]}
     live = {
         Version(v)
         for v, files in data["releases"].items()
