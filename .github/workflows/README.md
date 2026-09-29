@@ -57,7 +57,7 @@ each package's README for manual runs.
 
 ### Cognee version bump
 - `bump_cognee.yml` — daily and manual (optional `version` input). When a new
-  stable cognee is on PyPI, opens one PR on `automation/bump-cognee` that bumps
+  stable cognee is on PyPI, opens one PR on `automation/bump-cognee-<base>` that bumps
   every adapter under `packages/{graph,vector,hybrid}`:
   - pins, adapter package versions, version strings and lock files, done by
     `.github/scripts/bump_cognee.py`

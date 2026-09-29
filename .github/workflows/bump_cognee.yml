@@ -31,7 +31,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  BRANCH: automation/bump-cognee
+  # One branch per base, so a run from another branch never touches main's PR.
+  BRANCH: automation/bump-cognee-${{ github.ref_name }}
   BASE: ${{ github.ref_name }}
   BOT_NAME: github-actions[bot]
   BOT_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
@@ -69,7 +70,9 @@ jobs:
 
       - name: Resolve the target version
         id: resolve
-        run: ${{ env.BUMP }} resolve --version "${{ inputs.version }}"
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: ${{ env.BUMP }} resolve --version "$INPUT_VERSION"
 
       - name: Check for an open bump PR
         id: pr
@@ -81,30 +84,40 @@ jobs:
           set -euo pipefail
           pr=$(gh pr list --head "$BRANCH" --base "$BASE" --state open --json number,title \
                  --jq '.[0] // empty | "\(.number)\t\(.title)"')
-          if [ -z "$pr" ]; then
-            echo "action=create" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          number=${pr%%$'\t'*}; title=${pr#*$'\t'}
-          echo "number=$number" >> "$GITHUB_OUTPUT"
-          if [[ "$title" == *"cognee $VERSION" ]]; then
-            echo "PR #$number already bumps to cognee $VERSION; nothing to do."
-            echo "action=skip" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          # Rebuilding the branch force-pushes it. Never do that over a
-          # reviewer's commits: leave a note on the PR instead (once).
-          git fetch --quiet origin "$BRANCH"
-          others=$(git log --format='%ae' "origin/$BASE..origin/$BRANCH" | grep -vxF "$BOT_EMAIL" || true)
-          if [ -n "$others" ]; then
-            marker="<!-- bump-cognee:$VERSION -->"
-            if ! gh pr view "$number" --json comments --jq '.comments[].body' | grep -qF "$marker"; then
-              gh pr comment "$number" --body "cognee $VERSION is out. This PR has reviewer commits, so the automation won't rebuild it: merge it first, and the next run opens a PR for $VERSION. $marker"
+          number=""
+          if [ -n "$pr" ]; then
+            number=${pr%%$'\t'*}; title=${pr#*$'\t'}
+            echo "number=$number" >> "$GITHUB_OUTPUT"
+            if [[ "$title" == *"cognee $VERSION" ]]; then
+              echo "PR #$number already bumps to cognee $VERSION; nothing to do."
+              echo "action=skip" >> "$GITHUB_OUTPUT"
+              exit 0
             fi
-            echo "action=skip" >> "$GITHUB_OUTPUT"
-            exit 0
           fi
-          echo "action=update" >> "$GITHUB_OUTPUT"
+          # Rebuilding the branch force-pushes it. Never do that over anyone
+          # else's commits, with or without an open PR.
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null; then
+            git fetch --quiet origin "$BRANCH"
+            others=$(git log --format='%ae' "origin/$BASE..origin/$BRANCH" | grep -vxF "$BOT_EMAIL" || true)
+            if [ -n "$others" ]; then
+              if [ -n "$number" ]; then
+                # Leave a note on the PR instead (once).
+                marker="<!-- bump-cognee:$VERSION -->"
+                if ! gh pr view "$number" --json comments --jq '.comments[].body' | grep -qF "$marker"; then
+                  gh pr comment "$number" --body "cognee $VERSION is out. This PR has reviewer commits, so the automation won't rebuild it: merge it first, and the next run opens a PR for $VERSION. $marker"
+                fi
+              else
+                echo "::warning::$BRANCH has commits by others and no open PR; not overwriting it. Delete the branch to let the automation recreate it."
+              fi
+              echo "action=skip" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          if [ -n "$number" ]; then
+            echo "action=update" >> "$GITHUB_OUTPUT"
+          else
+            echo "action=create" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Bump pins, versions and lock files
         id: apply
@@ -142,8 +155,11 @@ jobs:
             cognee/tests/integration/infrastructure/graph \
             > .bump/interface_diff.patch
           wc -l .bump/interface_diff.patch
-          # A hook or core.fsmonitor planted by the agent would run on the next git command.
-          find .git/config .git/hooks -type f | sort | xargs sha256sum > "$RUNNER_TEMP/git.sha256"
+          # The action rewrites .git/config (bot identity, a token in the origin
+          # URL) and the agent could plant core.fsmonitor there, so the next step
+          # restores this copy before running git. A planted hook fails the run.
+          cp .git/config "$RUNNER_TEMP/git.config"
+          find .git/hooks -type f | sort | xargs -r sha256sum > "$RUNNER_TEMP/hooks.sha256"
 
       - name: Implement new adapter methods with Claude
         id: claude
@@ -174,9 +190,12 @@ jobs:
           EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
         run: |
           set -euo pipefail
-          if ! find .git/config .git/hooks -type f | sort | xargs sha256sum \
-               | diff -q "$RUNNER_TEMP/git.sha256" - >/dev/null; then
-            echo "::error::The agent step changed .git/config or .git/hooks; stopping."
+          # Before any git command: drop the action's token, identity and any
+          # config the agent added.
+          cp "$RUNNER_TEMP/git.config" .git/config
+          if ! find .git/hooks -type f | sort | xargs -r sha256sum \
+               | diff -q "$RUNNER_TEMP/hooks.sha256" - >/dev/null; then
+            echo "::error::The agent step changed .git/hooks; stopping."
             exit 1
           fi
           # The action can fail on the turn count after finishing cleanly; judge
