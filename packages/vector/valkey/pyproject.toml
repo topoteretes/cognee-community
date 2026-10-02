@@ -5,7 +5,7 @@ description = "Valkey vector database adapter for cognee"
 readme = "README.md"
 requires-python = ">=3.11,<=3.13"
 dependencies = [
-    "valkey-glide>=2.1.0",
+    "valkey-glide>=2.5.2",
     "cognee==1.6.1",
     # Transitive via cognee; pinned to the version cognee 1.6.1 locks, so CI
     # resolves the litellm the upstream release was tested against. cognee 1.6.x
@@ -27,7 +27,7 @@ dev = [
 test = [
     "pytest>=7.4",
     "pytest-asyncio>=0.23",
-    "valkey-glide>=2.1.0", # use the async client package
+    "valkey-glide>=2.5.2", # use the async client package
 ]
 
 [tool.pytest.ini_options]
