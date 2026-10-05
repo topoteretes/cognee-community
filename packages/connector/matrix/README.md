@@ -50,6 +50,14 @@ permalink and the text prefixed with who/where/when.
 | Message redacted | Removed (`_deleted` hard-delete marker → `orphan_cleanup`) |
 | Account leaves the room | Every message from that room removed (`forget_on_leave=True`, default) |
 
+Forget markers rely on dlt `hard_delete` plus cognee's `orphan_cleanup`. In
+cognee **1.3.0**, foreground `add()`/`remember(run_in_background=False)` builds
+the cleanup callback but never awaits it (only the background path does, and
+then before commit). Until that is fixed upstream, call sites that need graph
+and vector purge after a redaction should await the cleanup returned by
+`resolve_dlt_sources` themselves, or upgrade cognee when the fix lands. The
+connector still emits correct `_deleted` rows and dlt drops them on merge.
+
 Set `forget_on_leave=False` if leaving a room should only stop future sync for
 that room and keep previously ingested messages (leave is an access change, not
 an upstream deletion).
