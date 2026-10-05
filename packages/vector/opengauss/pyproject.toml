@@ -3,7 +3,7 @@ name = "cognee-community-vector-adapter-opengauss"
 version = "0.2.1"
 description = "openGauss DataVec vector database adapter for cognee"
 readme = "README.md"
-requires-python = ">=3.11,<=3.13"
+requires-python = ">=3.11,<3.14"
 dependencies = [
     "psycopg2-binary>=2.9.9",
     "cognee==1.6.1",

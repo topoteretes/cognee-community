@@ -6309,5 +6309,5 @@ dev = ["mypy"]
 
 [metadata]
 lock-version = "2.1"
-python-versions = ">=3.11,<=3.13"
-content-hash = "79bf6b3053261dd8cfbb54e98223d736bf6414c8c5e4cedbac1262cad0e30242"
+python-versions = ">=3.11,<3.14"
+content-hash = "06da31fb7f2c2832c8160af7d2635854c7939761b0e8e9cc2c72295f7cf455b6"

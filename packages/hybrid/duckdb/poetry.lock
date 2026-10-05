@@ -6367,5 +6367,5 @@ dev = ["build", "mypy", "twine"]
 
 [metadata]
 lock-version = "2.1"
-python-versions = ">=3.10,<=3.13"
-content-hash = "e465bfa5639e8b9750496d7e9d5d641ad0bae834985279235985f7b82a6a0ad5"
+python-versions = ">=3.10,<3.14"
+content-hash = "0a40e818859fae8f18e3584559db8b1ec0fd2dfbe3572960f955cef517d85a16"

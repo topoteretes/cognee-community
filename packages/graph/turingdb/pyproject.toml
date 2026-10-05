@@ -3,7 +3,7 @@ name = "cognee-community-graph-adapter-turingdb"
 version = "0.2.1"
 description = "Turingdb graph database adapter for cognee"
 readme = "README.md"
-requires-python =  ">=3.11,<=3.13"
+requires-python =  ">=3.11,<3.14"
 dependencies = [
     # 1.30.0 is the oldest release still on PyPI: the publisher deleted every
     # earlier one, including the 1.22.0 this floor used to name, which left

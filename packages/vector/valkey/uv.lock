@@ -1,12 +1,12 @@
 version = 1
 revision = 3
-requires-python = ">=3.11, <=3.13"
+requires-python = ">=3.11, <3.14"
 resolution-markers = [
     "(python_full_version >= '3.13' and 'Darwin Kernel Version 22.' not in platform_version and 'Darwin Kernel Version 23.' not in platform_version) or (python_full_version >= '3.13' and sys_platform != 'darwin')",
-    "(python_full_version >= '3.13' and 'Darwin Kernel Version 22.' in platform_version and sys_platform == 'darwin') or (python_full_version >= '3.13' and 'Darwin Kernel Version 23.' in platform_version and sys_platform == 'darwin')",
     "(python_full_version == '3.12.*' and 'Darwin Kernel Version 22.' not in platform_version and 'Darwin Kernel Version 23.' not in platform_version) or (python_full_version == '3.12.*' and sys_platform != 'darwin')",
-    "(python_full_version == '3.12.*' and 'Darwin Kernel Version 22.' in platform_version and sys_platform == 'darwin') or (python_full_version == '3.12.*' and 'Darwin Kernel Version 23.' in platform_version and sys_platform == 'darwin')",
     "(python_full_version < '3.12' and 'Darwin Kernel Version 22.' not in platform_version and 'Darwin Kernel Version 23.' not in platform_version) or (python_full_version < '3.12' and sys_platform != 'darwin')",
+    "(python_full_version >= '3.13' and 'Darwin Kernel Version 22.' in platform_version and sys_platform == 'darwin') or (python_full_version >= '3.13' and 'Darwin Kernel Version 23.' in platform_version and sys_platform == 'darwin')",
+    "(python_full_version == '3.12.*' and 'Darwin Kernel Version 22.' in platform_version and sys_platform == 'darwin') or (python_full_version == '3.12.*' and 'Darwin Kernel Version 23.' in platform_version and sys_platform == 'darwin')",
     "(python_full_version < '3.12' and 'Darwin Kernel Version 22.' in platform_version and sys_platform == 'darwin') or (python_full_version < '3.12' and 'Darwin Kernel Version 23.' in platform_version and sys_platform == 'darwin')",
 ]
 

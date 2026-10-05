@@ -3,7 +3,7 @@ name = "cognee-community-hybrid-adapter-helixdb"
 version = "0.2.1"
 description = "HelixDB hybrid graph-vector database adapter for cognee"
 readme = "README.md"
-requires-python = ">=3.11,<=3.13"
+requires-python = ">=3.11,<3.14"
 dependencies = [
     "helix-py>=0.2.30",
     "cognee==1.6.1",

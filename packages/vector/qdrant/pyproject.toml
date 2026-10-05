@@ -3,7 +3,7 @@ name = "cognee-community-vector-adapter-qdrant"
 version = "0.4.1"
 description = "Qdrant vector database adapter for cognee"
 readme = "README.md"
-requires-python = ">=3.11,<=3.13"
+requires-python = ">=3.11,<3.14"
 dependencies = [
     "qdrant-client>=1.18.0",
     "cognee==1.6.1",

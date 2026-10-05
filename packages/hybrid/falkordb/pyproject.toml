@@ -3,7 +3,7 @@ name = "cognee-community-hybrid-adapter-falkor"
 version = "0.4.1"
 description = "Falkor hybrid database adapter for cognee"
 readme = "README.md"
-requires-python = ">=3.11,<=3.13"
+requires-python = ">=3.11,<3.14"
 dependencies = [
     "falkordb>=1.0.9,<2.0.0",
     "cognee==1.6.1",

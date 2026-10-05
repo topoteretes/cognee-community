@@ -7,7 +7,7 @@ name = "cognee-community-hybrid-adapter-duckdb"
 version = "0.2.1"
 description = "DuckDB vector adapter for Cognee with planned graph support"
 readme = "README.md"
-requires-python = ">=3.10,<=3.13"
+requires-python = ">=3.10,<3.14"
 license = "Apache-2.0"
 authors = [
     {name = "Cognee Community", email = "community@cognee.ai"},
