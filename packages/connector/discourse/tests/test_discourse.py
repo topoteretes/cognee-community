@@ -35,14 +35,22 @@ BASE_URL = "https://forum.example.com"
 # ---------------------------------------------------------------------------
 
 
-def _topic(topic_id, title="Topic", slug=None, archetype="regular"):
+def _topic(
+    topic_id,
+    title="Topic",
+    slug=None,
+    archetype="regular",
+    posts_count=1,
+    bumped_at="2024-01-01T00:00:00.000Z",
+):
     return {
         "id": topic_id,
         "title": title,
         "slug": slug or f"topic-{topic_id}",
         "archetype": archetype,
-        "posts_count": 1,
-        "bumped_at": "2024-01-01T00:00:00.000Z",
+        "posts_count": posts_count,
+        "highest_post_number": posts_count,
+        "bumped_at": bumped_at,
         "views": 10,
     }
 
@@ -356,8 +364,12 @@ def test_auth_error_message_points_at_credentials():
 # ---------------------------------------------------------------------------
 
 
-def _run_sync(dlt, tmp_path, client):
-    """Run discourse_source through a dlt pipeline into a temp sqlite destination."""
+def _run_sync(dlt, tmp_path, client, **kwargs):
+    """Run discourse_source through a dlt pipeline into a temp sqlite destination.
+
+    Repeated calls with the same ``tmp_path`` reuse the pipeline, and therefore
+    its resource state, exactly like consecutive cognee syncs.
+    """
     from cognee_community_connector_discourse.discourse import discourse_source
 
     db_path = (tmp_path / "discourse.db").as_posix()
@@ -367,8 +379,13 @@ def _run_sync(dlt, tmp_path, client):
         dataset_name="discourse_ds",
         pipelines_dir=str(tmp_path / "state"),
     )
-    pipeline.run(discourse_source(client=client))
+    pipeline.run(discourse_source(client=client, **kwargs))
     return pipeline
+
+
+def _raw_fetches(client):
+    """Topic ids of every /raw request the client made, in order."""
+    return [int(path.rsplit("/", 1)[1]) for path, page in client.calls if path.startswith("/raw/")]
 
 
 def _read_topics(pipeline):
@@ -399,11 +416,15 @@ def test_first_sync_loads_topics_with_content(dlt_mod, tmp_path):
     assert rows["2"]["title"] == "Beta"
 
 
-def test_edit_is_reflected_on_resync(dlt_mod, tmp_path):
-    listings = {"/latest.json": [[_topic(1, "Alpha")]]}
-    _run_sync(dlt_mod, tmp_path, FakeDiscourseClient(listings, {1: [_post(1, "v1")]}))
+def test_new_reply_is_reflected_on_resync(dlt_mod, tmp_path):
+    first = {"/latest.json": [[_topic(1, "Alpha")]]}
+    _run_sync(dlt_mod, tmp_path, FakeDiscourseClient(first, {1: [_post(1, "v1")]}))
 
-    pipeline = _run_sync(dlt_mod, tmp_path, FakeDiscourseClient(listings, {1: [_post(1, "v2")]}))
+    # A reply bumps the topic and raises posts_count, so the signature moves.
+    bumped = {"/latest.json": [[_topic(1, "Alpha", posts_count=2, bumped_at="2024-02-01")]]}
+    pipeline = _run_sync(
+        dlt_mod, tmp_path, FakeDiscourseClient(bumped, {1: [_post(1, "v2") + _post(2, "reply")]})
+    )
 
     rows = _read_topics(pipeline)
     assert "v2" in rows["1"]["content"]
@@ -450,9 +471,216 @@ def test_fetch_error_aborts_sync(dlt_mod, tmp_path):
         FakeDiscourseClient({"/latest.json": [[_topic(1), _topic(2)]]}, raw),
     )
 
-    broken = FakeDiscourseClient({"/latest.json": [[_topic(1), _topic(2)]]}, {1: 500, 2: raw[2]})
+    # Topic 1 got a reply (so it must be re-fetched) and the fetch fails.
+    broken = FakeDiscourseClient(
+        {"/latest.json": [[_topic(1, posts_count=2, bumped_at="2024-02-01"), _topic(2)]]},
+        {1: 500, 2: raw[2]},
+    )
     with pytest.raises(Exception):  # noqa: B017 - dlt wraps the source error in PipelineStepFailed
         _run_sync(dlt_mod, tmp_path, broken)
 
     # The previous snapshot is untouched.
     assert set(_read_topics(pipeline)) == {"1", "2"}
+
+
+# ---------------------------------------------------------------------------
+# Incremental fetch: signatures, cache, periodic full refresh
+# ---------------------------------------------------------------------------
+
+
+def test_signature_uses_listing_change_markers():
+    from cognee_community_connector_discourse.discourse import _signature
+
+    topic = _topic(1, posts_count=3, bumped_at="2024-05-01")
+    assert _signature(topic) == ["2024-05-01", 3, 3]
+
+
+def test_cache_key_is_order_independent_and_scope_specific():
+    from cognee_community_connector_discourse.discourse import _cache_key
+
+    assert _cache_key(BASE_URL, [7, 5], ["b", "a"]) == _cache_key(BASE_URL, [5, 7], ["a", "b"])
+    assert _cache_key(BASE_URL, [5], None) != _cache_key(BASE_URL, [6], None)
+    assert _cache_key(BASE_URL, None, None) != _cache_key("https://other.example", None, None)
+
+
+@pytest.mark.parametrize(
+    ("cache", "incremental", "every", "force", "expected"),
+    [
+        ({}, True, 7, False, True),  # nothing cached yet
+        ({"topics": {"1": {}}, "syncs_since_full_refresh": 0}, True, 7, False, False),
+        ({"topics": {"1": {}}, "syncs_since_full_refresh": 6}, True, 7, False, True),
+        ({"topics": {"1": {}}, "syncs_since_full_refresh": 99}, True, None, False, False),
+        ({"topics": {"1": {}}, "syncs_since_full_refresh": 0}, True, 7, True, True),
+        ({"topics": {"1": {}}, "syncs_since_full_refresh": 0}, False, 7, False, True),
+    ],
+)
+def test_is_full_refresh(cache, incremental, every, force, expected):
+    from cognee_community_connector_discourse.discourse import _is_full_refresh
+
+    assert _is_full_refresh(cache, incremental, every, force) is expected
+
+
+def test_full_refresh_every_must_be_positive():
+    from cognee_community_connector_discourse.discourse import discourse_source
+
+    with pytest.raises(ValueError, match="full_refresh_every"):
+        discourse_source(base_url=BASE_URL, full_refresh_every=0)
+
+
+def _two_topic_forum(**topic_overrides):
+    listings = {"/latest.json": [[_topic(1, "Alpha", **topic_overrides), _topic(2, "Beta")]]}
+    raw = {1: [_post(1, "alpha body")], 2: [_post(1, "beta body")]}
+    return listings, raw
+
+
+def test_unchanged_topics_are_not_refetched(dlt_mod, tmp_path):
+    listings, raw = _two_topic_forum()
+    first = FakeDiscourseClient(listings, raw)
+    _run_sync(dlt_mod, tmp_path, first)
+    assert _raw_fetches(first) == [1, 2]
+
+    second = FakeDiscourseClient(listings, raw)
+    pipeline = _run_sync(dlt_mod, tmp_path, second)
+
+    # Nothing changed: no bodies fetched, yet the snapshot is still complete.
+    assert _raw_fetches(second) == []
+    rows = _read_topics(pipeline)
+    assert set(rows) == {"1", "2"}
+    assert "alpha body" in rows["1"]["content"]
+
+
+def test_only_changed_topics_are_refetched(dlt_mod, tmp_path):
+    listings, raw = _two_topic_forum()
+    _run_sync(dlt_mod, tmp_path, FakeDiscourseClient(listings, raw))
+
+    listings, _ = _two_topic_forum(posts_count=2, bumped_at="2024-02-01")
+    raw[1] = [_post(1, "alpha body") + _post(2, "new reply")]
+    client = FakeDiscourseClient(listings, raw)
+    rows = _read_topics(_run_sync(dlt_mod, tmp_path, client))
+
+    assert _raw_fetches(client) == [1]
+    assert "new reply" in rows["1"]["content"]
+
+
+def test_deleted_reply_triggers_refetch(dlt_mod, tmp_path):
+    listings, raw = _two_topic_forum(posts_count=2)
+    raw[1] = [_post(1, "question") + _post(2, "spam reply")]
+    _run_sync(dlt_mod, tmp_path, FakeDiscourseClient(listings, raw))
+
+    # A moderator deletes the reply: posts_count drops, the signature moves.
+    listings, _ = _two_topic_forum(posts_count=1)
+    raw[1] = [_post(1, "question")]
+    client = FakeDiscourseClient(listings, raw)
+    rows = _read_topics(_run_sync(dlt_mod, tmp_path, client))
+
+    assert _raw_fetches(client) == [1]
+    assert "spam reply" not in rows["1"]["content"]
+
+
+def test_title_change_is_applied_without_refetch(dlt_mod, tmp_path):
+    listings, raw = _two_topic_forum()
+    _run_sync(dlt_mod, tmp_path, FakeDiscourseClient(listings, raw))
+
+    renamed = {"/latest.json": [[_topic(1, "Alpha (solved)"), _topic(2, "Beta")]]}
+    client = FakeDiscourseClient(renamed, raw)
+    rows = _read_topics(_run_sync(dlt_mod, tmp_path, client))
+
+    # Title comes from the listing every run; only the body is cached.
+    assert _raw_fetches(client) == []
+    assert rows["1"]["title"] == "Alpha (solved)"
+
+
+def test_silent_edit_waits_for_full_refresh(dlt_mod, tmp_path):
+    # An edit to an existing post leaves the signature unchanged: incremental
+    # runs keep the cached body until the periodic full refresh re-fetches it.
+    listings, raw = _two_topic_forum()
+    _run_sync(dlt_mod, tmp_path, FakeDiscourseClient(listings, raw), full_refresh_every=2)
+
+    raw[1] = [_post(1, "alpha body, edited")]
+    rows = _read_topics(
+        _run_sync(dlt_mod, tmp_path, FakeDiscourseClient(listings, raw), full_refresh_every=2)
+    )
+    assert "edited" not in rows["1"]["content"]
+
+    client = FakeDiscourseClient(listings, raw)
+    rows = _read_topics(_run_sync(dlt_mod, tmp_path, client, full_refresh_every=2))
+    assert _raw_fetches(client) == [1, 2]
+    assert "edited" in rows["1"]["content"]
+
+
+def test_full_refresh_every_nth_run(dlt_mod, tmp_path):
+    listings, raw = _two_topic_forum()
+    fetches_per_run = []
+    for _ in range(7):
+        client = FakeDiscourseClient(listings, raw)
+        _run_sync(dlt_mod, tmp_path, client, full_refresh_every=3)
+        fetches_per_run.append(len(_raw_fetches(client)))
+
+    # Run 1 has no cache, then every 3rd run re-fetches everything.
+    assert fetches_per_run == [2, 0, 0, 2, 0, 0, 2]
+
+
+def test_force_full_refresh_refetches_everything(dlt_mod, tmp_path):
+    listings, raw = _two_topic_forum()
+    _run_sync(dlt_mod, tmp_path, FakeDiscourseClient(listings, raw))
+
+    client = FakeDiscourseClient(listings, raw)
+    _run_sync(dlt_mod, tmp_path, client, force_full_refresh=True)
+
+    assert _raw_fetches(client) == [1, 2]
+
+
+def test_incremental_disabled_always_fetches(dlt_mod, tmp_path):
+    listings, raw = _two_topic_forum()
+    for _ in range(2):
+        client = FakeDiscourseClient(listings, raw)
+        _run_sync(dlt_mod, tmp_path, client, incremental=False)
+        assert _raw_fetches(client) == [1, 2]
+
+
+def test_deleted_topic_leaves_the_cache(dlt_mod, tmp_path):
+    listings, raw = _two_topic_forum()
+    _run_sync(dlt_mod, tmp_path, FakeDiscourseClient(listings, raw))
+    _run_sync(dlt_mod, tmp_path, FakeDiscourseClient({"/latest.json": [[_topic(2)]]}, raw))
+
+    # Topic 1 comes back (e.g. restored by a moderator): it was evicted from the
+    # cache when it disappeared, so its body is fetched fresh.
+    client = FakeDiscourseClient(listings, raw)
+    rows = _read_topics(_run_sync(dlt_mod, tmp_path, client))
+
+    assert _raw_fetches(client) == [1]
+    assert set(rows) == {"1", "2"}
+
+
+def test_failed_run_keeps_previous_cache(dlt_mod, tmp_path):
+    listings, raw = _two_topic_forum()
+    _run_sync(dlt_mod, tmp_path, FakeDiscourseClient(listings, raw))
+
+    bumped, _ = _two_topic_forum(posts_count=2, bumped_at="2024-02-01")
+    with pytest.raises(Exception):  # noqa: B017 - dlt wraps the source error in PipelineStepFailed
+        _run_sync(dlt_mod, tmp_path, FakeDiscourseClient(bumped, {1: 500, 2: raw[2]}))
+
+    # The aborted run committed nothing: back on the original listing, the
+    # first run's cache still serves both topics.
+    client = FakeDiscourseClient(listings, raw)
+    _run_sync(dlt_mod, tmp_path, client)
+    assert _raw_fetches(client) == []
+
+
+def test_caches_are_kept_per_forum_scope(dlt_mod, tmp_path):
+    # cognee runs every dlt source through one shared pipeline: syncing a
+    # different scope must neither reuse nor wipe another scope's cache.
+    listings = {
+        "/c/5.json": [[_topic(1)]],
+        "/c/6.json": [[_topic(2)]],
+    }
+    raw = {1: [_post(1, "in five")], 2: [_post(1, "in six")]}
+    _run_sync(dlt_mod, tmp_path, FakeDiscourseClient(listings, raw), category_ids=[5])
+
+    other = FakeDiscourseClient(listings, raw)
+    _run_sync(dlt_mod, tmp_path, other, category_ids=[6])
+    assert _raw_fetches(other) == [2]
+
+    again = FakeDiscourseClient(listings, raw)
+    _run_sync(dlt_mod, tmp_path, again, category_ids=[5])
+    assert _raw_fetches(again) == []
