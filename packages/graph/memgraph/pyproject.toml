@@ -16,7 +16,7 @@ dependencies = [
     "instructor>=1.11"
 ]
 readme = "README.md"
-requires-python = ">=3.10,<=3.13"
+requires-python = ">=3.10,<3.14"
 
 [project.urls]
 Homepage = "https://github.com/topoteretes/cognee"

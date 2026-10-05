@@ -3,7 +3,7 @@ name = "cognee-community-vector-adapter-pinecone"
 version = "0.2.1"
 description = "Pinecone vector database adapter for cognee"
 readme = "README.md"
-requires-python = ">=3.11,<=3.13"
+requires-python = ">=3.11,<3.14"
 dependencies = [
     "pinecone>=3.0.0",
     "cognee==1.6.1",

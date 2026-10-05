@@ -6788,5 +6788,5 @@ test = ["pytest", "pytest-asyncio", "valkey-glide"]
 
 [metadata]
 lock-version = "2.1"
-python-versions = ">=3.11,<=3.13"
-content-hash = "91b36b24da205e9d88ae25af9c05c7ada9160d18b6bd502babcb5362c4de6502"
+python-versions = ">=3.11,<3.14"
+content-hash = "e2cfeb3e7e95911fb440fc6cef89444896684eeaf5cf9ee1cf363b88a0ae664d"

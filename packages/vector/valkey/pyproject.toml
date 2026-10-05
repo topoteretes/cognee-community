@@ -3,7 +3,7 @@ name = "cognee-community-vector-adapter-valkey"
 version = "0.2.1"
 description = "Valkey vector database adapter for cognee"
 readme = "README.md"
-requires-python = ">=3.11,<=3.13"
+requires-python = ">=3.11,<3.14"
 dependencies = [
     "valkey-glide>=2.5.2",
     "cognee==1.6.1",

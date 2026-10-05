@@ -3,7 +3,7 @@ name = "cognee-community-hybrid-adapter-arcadedb"
 version = "0.5.1"
 description = "ArcadeDB hybrid database adapter for Cognee (graph + vector)"
 readme = "README.md"
-requires-python = ">=3.11,<=3.13"
+requires-python = ">=3.11,<3.14"
 dependencies = [
     "aiohttp>=3.9.0",
     "cognee==1.6.1",
