@@ -17,10 +17,11 @@ The workflow gives you:
 - The old and new cognee versions.
 - `.bump/interface_diff.patch`: the diff of cognee's adapter-facing code between
   the two release tags.
-- `.bump/cognee/`: a clone of the cognee repository. Use
-  `git -C .bump/cognee diff v<old> v<new> -- <path>`,
-  `git -C .bump/cognee show v<new>:<path>` and
-  `git -C .bump/cognee log v<old>..v<new> -- <path>` for more context.
+- `.bump/interface_log.txt`: the cognee commits (hash, date, subject) between
+  the two tags that touch those paths.
+- `.bump/cognee-old/cognee/` and `.bump/cognee-new/cognee/`: cognee's package
+  source at the old and new release tags. Read and compare them for context
+  beyond the diff, such as a caller in cognee core. You have no shell or git.
 
 The adapters live in `packages/graph/*`, `packages/vector/*` and
 `packages/hybrid/*`. They implement cognee's `GraphDBInterface`

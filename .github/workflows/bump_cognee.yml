@@ -45,6 +45,11 @@ jobs:
     env:
       HAS_PR_TOKEN: ${{ secrets.COGNEE_BUMP_PR_TOKEN != '' }}
       HAS_ANTHROPIC_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+      # No repo hook ever runs: the agent can write to the working tree, and the
+      # push step holds the PAT.
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: core.hooksPath
+      GIT_CONFIG_VALUE_0: /dev/null
     steps:
       - name: Check the PR token is configured
         if: ${{ env.HAS_PR_TOKEN != 'true' }}
@@ -107,10 +112,24 @@ jobs:
             fi
           fi
           # Rebuilding the branch force-pushes it. Never do that over anyone
-          # else's commits, with or without an open PR.
-          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null; then
+          # else's commits, with or without an open PR. The push leases on the
+          # SHA seen here, so commits pushed while this run works also survive.
+          remote_sha=$(git ls-remote --heads origin "refs/heads/$BRANCH" | cut -f1)
+          echo "remote_sha=$remote_sha" >> "$GITHUB_OUTPUT"
+          if [ -n "$remote_sha" ]; then
             git fetch --quiet origin "$BRANCH"
-            others=$(git log --format='%ae' "origin/$BASE..origin/$BRANCH" | grep -vxF "$BOT_EMAIL" || true)
+            others=$(git log --format='%ae' "origin/$BASE..$remote_sha" | grep -vxF "$BOT_EMAIL" || true)
+            # A merged or closed PR whose head is the branch tip means a
+            # reviewer already finished with those commits (squash and rebase
+            # merges leave them off the base); the branch is safe to rebuild.
+            if [ -n "$others" ] && [ -z "$number" ]; then
+              done_pr=$(REMOTE_SHA=$remote_sha gh pr list --head "$BRANCH" --base "$BASE" --state all \
+                          --json number,headRefOid --jq '[.[] | select(.headRefOid == env.REMOTE_SHA)][0].number // empty')
+              if [ -n "$done_pr" ]; then
+                echo "$BRANCH is the head of finished PR #$done_pr; rebuilding it."
+                others=""
+              fi
+            fi
             if [ -n "$others" ]; then
               if [ -n "$number" ]; then
                 # Leave a note on the PR instead (once).
@@ -147,6 +166,7 @@ jobs:
           ${{ env.BUMP }} apply --version "$VERSION"
           git add -A
           git commit --quiet -m "chore: bump database adapters to cognee $VERSION"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Prepare cognee's interface diff
         if: ${{ steps.apply.outcome == 'success' }}
@@ -155,18 +175,31 @@ jobs:
           NEW: ${{ steps.resolve.outputs.version }}
         run: |
           set -euo pipefail
-          git clone --quiet --filter=blob:none https://github.com/topoteretes/cognee .bump/cognee
-          git -C .bump/cognee diff "v$OLD" "v$NEW" -- \
-            cognee/infrastructure/databases/graph/graph_db_interface.py \
-            cognee/infrastructure/databases/graph/get_graph_engine.py \
-            cognee/infrastructure/databases/vector/vector_db_interface.py \
-            cognee/infrastructure/databases/vector/create_vector_engine.py \
-            cognee/infrastructure/databases/vector/models \
-            cognee/infrastructure/databases/provenance \
-            cognee/tasks/storage \
-            cognee/tests/integration/infrastructure/graph \
-            > .bump/interface_diff.patch
-          wc -l .bump/interface_diff.patch
+          # The clone stays outside the workspace, where the agent can't edit its
+          # config; the agent gets plain copies of both releases and no git.
+          clone="$RUNNER_TEMP/cognee"
+          git clone --quiet --filter=blob:none --no-checkout https://github.com/topoteretes/cognee "$clone"
+          paths=(
+            cognee/infrastructure/databases/graph/graph_db_interface.py
+            cognee/infrastructure/databases/graph/get_graph_engine.py
+            cognee/infrastructure/databases/vector/vector_db_interface.py
+            cognee/infrastructure/databases/vector/create_vector_engine.py
+            cognee/infrastructure/databases/vector/models
+            cognee/infrastructure/databases/provenance
+            cognee/tasks/storage
+            cognee/tests/integration/infrastructure/graph
+          )
+          git -C "$clone" diff "v$OLD" "v$NEW" -- "${paths[@]}" > .bump/interface_diff.patch
+          git -C "$clone" log --format='%h %as %s' "v$OLD..v$NEW" -- "${paths[@]}" > .bump/interface_log.txt
+          for side in old new; do
+            tag=v$OLD; [ "$side" = new ] && tag=v$NEW
+            source="$RUNNER_TEMP/cognee-$side"
+            mkdir -p "$source" ".bump/cognee-$side"
+            curl -fsSL --retry 5 "https://codeload.github.com/topoteretes/cognee/tar.gz/refs/tags/$tag" \
+              | tar -xz -C "$source" --strip-components=1
+            mv "$source/cognee" ".bump/cognee-$side/"
+          done
+          wc -l .bump/interface_diff.patch .bump/interface_log.txt
           # The action rewrites .git/config (bot identity, a token in the origin
           # URL) and the agent could plant core.fsmonitor there, so the next step
           # restores this copy before running git. A planted hook fails the run.
@@ -187,16 +220,18 @@ jobs:
             - Old cognee version: ${{ steps.resolve.outputs.old_version }}
             - New cognee version: ${{ steps.resolve.outputs.version }}
             - Interface diff: `.bump/interface_diff.patch`
-            - cognee clone: `.bump/cognee`
+            - Commits touching it: `.bump/interface_log.txt`
+            - cognee sources: `.bump/cognee-old/cognee`, `.bump/cognee-new/cognee`
             - Report: `.bump/agent_summary.md`
           claude_args: >-
-            --allowed-tools Read,Edit,Write,Glob,Grep,Bash(git -C .bump/cognee diff:*),Bash(git -C .bump/cognee show:*),Bash(git -C .bump/cognee log:*)
+            --allowed-tools Read,Edit,Write,Glob,Grep
             --max-turns 80
 
       - name: Keep only in-scope agent changes
         id: scope
         if: ${{ steps.apply.outcome == 'success' }}
         env:
+          BUMP_SHA: ${{ steps.apply.outputs.sha }}
           CLAUDE_OUTCOME: ${{ steps.claude.outcome }}
           CLAUDE_CONCLUSION: ${{ steps.claude.outputs.conclusion }}
           EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
@@ -208,6 +243,12 @@ jobs:
           if ! find .git/hooks -type f | sort | xargs -r sha256sum \
                | diff -q "$RUNNER_TEMP/hooks.sha256" - >/dev/null; then
             echo "::error::The agent step changed .git/hooks; stopping."
+            exit 1
+          fi
+          # Only the bump commit may be pushed: the agent could rewrite .git/HEAD
+          # or the refs.
+          if [ "$(git symbolic-ref HEAD)" != "refs/heads/$BRANCH" ] || [ "$(git rev-parse HEAD)" != "$BUMP_SHA" ]; then
+            echo "::error::The agent step moved HEAD; stopping."
             exit 1
           fi
           # The action can fail on the turn count after finishing cleanly; judge
@@ -265,9 +306,12 @@ jobs:
           AGENT_STATUS: ${{ steps.scope.outputs.status }}
           DISCARDED: ${{ steps.scope.outputs.discarded }}
           RUFF: ${{ steps.ruff.outputs.result }}
+          REMOTE_SHA: ${{ steps.pr.outputs.remote_sha }}
         run: |
           set -euo pipefail
-          git push --quiet --force \
+          # Fails if the branch moved since the PR check (an empty SHA means it
+          # must not exist yet); the next run then sees the new commits.
+          git push --quiet --force-with-lease="refs/heads/$BRANCH:$REMOTE_SHA" \
             "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/$BRANCH"
 
           {

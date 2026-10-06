@@ -78,9 +78,20 @@ def _get_text(url: str) -> str:
     raise RuntimeError("unreachable")
 
 
-def latest_stable_cognee() -> str:
-    """PyPI's info.version is the newest non-pre-release; double-check anyway."""
+def resolve_cognee_version(requested: str = "") -> str:
+    """The latest stable cognee on PyPI, or *requested* spelled as PyPI lists it
+    (`v1.7.0` -> `1.7.0`, `1.6` -> `1.6.0`); a release PyPI doesn't have exits."""
     data = _get_json("https://pypi.org/pypi/cognee/json")
+    if requested:
+        try:
+            version = Version(requested)
+        except InvalidVersion:
+            raise SystemExit(f"{requested!r} is not a valid version") from None
+        published = {Version(v): v for v in data["releases"]}
+        if version not in published:
+            raise SystemExit(f"cognee {version} is not on PyPI")
+        return published[version]
+    # PyPI's info.version is the newest non-pre-release; double-check anyway.
     releases = [
         Version(version)
         for version, files in data["releases"].items()
@@ -317,7 +328,7 @@ def _set_output(**values: str) -> None:
 
 
 def cmd_resolve(args: argparse.Namespace) -> None:
-    target = args.version or latest_stable_cognee()
+    target = resolve_cognee_version(args.version)
     if not _is_stable(target):
         raise SystemExit(f"{target} is a pre-release; only stable releases are bumped")
     pins = current_pins()
@@ -331,7 +342,7 @@ def cmd_resolve(args: argparse.Namespace) -> None:
 
 
 def cmd_apply(args: argparse.Namespace) -> None:
-    new = args.version
+    new = str(Version(args.version))
     if not args.skip_locks:
         wait_for_pypi(new)
     direct, locked = cognee_release_metadata(new)

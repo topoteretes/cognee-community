@@ -67,7 +67,7 @@ each package's README for manual runs.
   A person reviews the PR, fixes breaking changes on its branch, merges and
   publishes to PyPI. The workflow does nothing when the adapters are up to date
   or a PR for that version is open, and never force-pushes over a reviewer's
-  commits. Closing a bump PR skips that version on the daily runs; a manual run
+  commits; a branch left behind by a merged or closed bump PR is rebuilt. Closing a bump PR skips that version on the daily runs; a manual run
   bumps it anyway. Needs the `COGNEE_BUMP_PR_TOKEN` secret (a PAT or app token, since
   PRs opened with `GITHUB_TOKEN` don't run CI) and `ANTHROPIC_API_KEY` for the
   agent step. Run the mechanical part locally with
