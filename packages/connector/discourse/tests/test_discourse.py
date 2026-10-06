@@ -114,6 +114,30 @@ def test_listing_paths_cover_categories_and_tags():
     assert _listing_paths([5, 7], ["howto"]) == ["/c/5.json", "/c/7.json", "/tag/howto.json"]
 
 
+def test_listing_paths_can_exclude_subcategories():
+    # /c/{id}.json includes subcategories; /c/{id}/none.json is the category alone.
+    assert _listing_paths([5], None, include_subcategories=False) == ["/c/5/none.json"]
+
+
+def test_subcategory_scope_is_part_of_the_cache_key():
+    from cognee_community_connector_discourse.discourse import _cache_key
+
+    assert _cache_key(BASE_URL, [5], None, True) != _cache_key(BASE_URL, [5], None, False)
+
+
+def test_source_lists_category_without_subcategories(dlt_mod, tmp_path):
+    client = FakeDiscourseClient(
+        {"/c/5.json": [[_topic(1), _topic(2)]], "/c/5/none.json": [[_topic(1)]]},
+        {1: [_post(1, "parent only")], 2: [_post(1, "in a subcategory")]},
+    )
+
+    rows = _read_topics(
+        _run_sync(dlt_mod, tmp_path, client, category_ids=[5], include_subcategories=False)
+    )
+
+    assert set(rows) == {"1"}
+
+
 def test_paginate_listing_follows_more_topics_url():
     client = FakeDiscourseClient({"/latest.json": [[_topic(1)], [_topic(2)]]}, {})
 
