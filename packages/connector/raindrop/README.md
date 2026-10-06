@@ -20,13 +20,11 @@ cd packages/connector/raindrop && uv sync --all-extras
 
 ## Usage
 
-```python
-import os
+Set the `RAINDROP_API_TOKEN` environment variable before running the example.
 
+```python
 import cognee
 from cognee_community_connector_raindrop import raindrop_source
-
-os.environ["RAINDROP_API_TOKEN"] = "<your-token>"
 
 await cognee.remember(
     raindrop_source(),
