@@ -77,6 +77,7 @@ def discourse_source(
     api_username: str | None = None,
     category_ids: list[int] | None = None,
     tags: list[str] | None = None,
+    include_subcategories: bool = True,
     request_delay: float = 0.0,
     incremental: bool = True,
     full_refresh_every: int | None = 7,
@@ -96,6 +97,10 @@ def discourse_source(
         tags: Restrict ingestion to topics with these tags. Combined with
             ``category_ids`` as a union; a topic matching both is ingested once.
             When neither is given, every topic in ``/latest`` is ingested.
+        include_subcategories: Discourse lists a parent category together with
+            all of its subcategories, which can be far larger than the parent
+            alone. ``False`` restricts ``category_ids`` to the categories
+            themselves.
         request_delay: Seconds to wait before each request, to stay polite on
             shared forums.
         incremental: Re-fetch only topics whose signature changed since the
@@ -156,14 +161,14 @@ def discourse_source(
         # run of a replace resource. cognee runs every dlt source through one
         # shared pipeline, so the cache is keyed by forum + scope.
         forums = dlt.current.source_state().setdefault("forums", {})
-        cache_key = _cache_key(client.base_url, category_ids, tags)
+        cache_key = _cache_key(client.base_url, category_ids, tags, include_subcategories)
         cache = forums.get(cache_key) or {}
         cached_topics = cache.get("topics") or {}
         full = _is_full_refresh(cache, incremental, full_refresh_every, force_full_refresh)
 
         new_topics = {}
         fetched = reused = 0
-        for topic in _iter_topics(client, category_ids, tags):
+        for topic in _iter_topics(client, category_ids, tags, include_subcategories):
             topic_id = str(topic["id"])
             signature = _signature(topic)
             cached = cached_topics.get(topic_id)
@@ -305,17 +310,22 @@ def _retry_after(headers, attempt: int) -> float:
 # ---------------------------------------------------------------------------
 
 
-def _listing_paths(category_ids, tags) -> list[str]:
-    """Listing endpoints for the configured scope (``/latest`` when unscoped)."""
-    paths = [f"/c/{int(category_id)}.json" for category_id in category_ids or []]
+def _listing_paths(category_ids, tags, include_subcategories: bool = True) -> list[str]:
+    """Listing endpoints for the configured scope (``/latest`` when unscoped).
+
+    ``/c/{id}.json`` lists a category together with its subcategories;
+    ``/c/{id}/none.json`` lists only the category itself.
+    """
+    suffix = ".json" if include_subcategories else "/none.json"
+    paths = [f"/c/{int(category_id)}{suffix}" for category_id in category_ids or []]
     paths += [f"/tag/{tag}.json" for tag in tags or []]
     return paths or ["/latest.json"]
 
 
-def _iter_topics(client, category_ids, tags):
+def _iter_topics(client, category_ids, tags, include_subcategories: bool = True):
     """Yield each topic in scope once, following every listing's pagination."""
     seen: set[int] = set()
-    for path in _listing_paths(category_ids, tags):
+    for path in _listing_paths(category_ids, tags, include_subcategories):
         for topic in _paginate_listing(client, path):
             if topic.get("archetype", "regular") != "regular":
                 continue  # private messages, if an admin key exposes them
@@ -380,11 +390,12 @@ def _signature(topic: dict) -> list:
     return [topic.get("bumped_at"), topic.get("posts_count"), topic.get("highest_post_number")]
 
 
-def _cache_key(base_url: str, category_ids, tags) -> str:
+def _cache_key(base_url: str, category_ids, tags, include_subcategories: bool = True) -> str:
     """Identify one forum + scope inside the shared pipeline state."""
     categories = ",".join(str(c) for c in sorted(int(c) for c in category_ids or []))
     tag_list = ",".join(sorted(tags or []))
-    return f"{base_url}|categories={categories}|tags={tag_list}"
+    subcategories = "" if include_subcategories else "|no-subcategories"
+    return f"{base_url}|categories={categories}|tags={tag_list}{subcategories}"
 
 
 def _is_full_refresh(cache: dict, incremental: bool, every: int | None, force: bool) -> bool:
