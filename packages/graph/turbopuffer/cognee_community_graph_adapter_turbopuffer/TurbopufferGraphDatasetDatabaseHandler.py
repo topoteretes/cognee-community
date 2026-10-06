@@ -34,7 +34,7 @@ class TurbopufferGraphDatasetDatabaseHandler(DatasetDatabaseHandlerInterface):
 
         # The dataset id becomes the namespace prefix; namespaces are created
         # lazily on first write, so there is nothing to provision here.
-        graph_db_name = f"{dataset_id}"
+        graph_db_name = f"{str(user.tenant_id)}_{dataset_id}"
 
         return {
             "graph_database_provider": "turbopuffer",
