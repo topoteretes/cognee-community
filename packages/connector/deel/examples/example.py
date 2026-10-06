@@ -36,6 +36,7 @@ import cognee
 
 from cognee_community_connector_deel import deel_source
 
+# Keep Deel organization data in its own dataset so it is easy to inspect and forget.
 DATASET_NAME = "deel_hr"
 
 
@@ -46,27 +47,47 @@ async def main() -> None:
         print("Usage: export DEEL_API_TOKEN='your_api_token'")
         return
 
-    print("Configuring Deel source (metadata-first mode) ...")
-    # Ingest worker directory and contracts metadata
+    # Start from a clean slate so the demo is reproducible.
+    await cognee.prune.prune_data()
+    await cognee.prune.prune_system(metadata=True)
+
+    # ── First sync: full backfill ──────────────────────────────────────────
+    print("\n=== Deel sync #1 (backfill) ===")
     source = deel_source(
         token=token,
         include_workers=True,
         include_contracts=True,
-        include_contract_documents=False,  # Privacy default
+        include_contract_documents=False,  # Privacy default: metadata only
     )
 
     print(f"Syncing Deel organization data into Cognee dataset '{DATASET_NAME}' ...")
-    await cognee.remember(source, dataset_name=DATASET_NAME)
+    result = await cognee.remember(source, dataset_name=DATASET_NAME)
+    print("Sync #1 result:", result)
 
-    print("Cognee memory sync complete!")
-
-    # Search the ingested memory
-    print("\nQuerying Cognee memory:")
-    search_results = await cognee.search(
-        "Who are our active software engineers and contractors?",
-        dataset_name=DATASET_NAME,
+    answer = await cognee.search(
+        query_text="Who are our active software engineers and team members?",
+        query_type=cognee.SearchType.GRAPH_COMPLETION,
+        datasets=[DATASET_NAME],
     )
-    print("Search results:", search_results)
+    print("\nWorkforce summary:\n", answer)
+
+    # ── Second sync: incremental delta + forget-on-delete ──────────────────
+    print("\n=== Deel sync #2 (incremental + forget-on-delete) ===")
+    source = deel_source(
+        token=token,
+        include_workers=True,
+        include_contracts=True,
+        include_contract_documents=False,
+    )
+    result = await cognee.remember(source, dataset_name=DATASET_NAME)
+    print("Sync #2 result:", result)
+
+    answer = await cognee.search(
+        query_text="What changed in our contracts or active workforce?",
+        query_type=cognee.SearchType.GRAPH_COMPLETION,
+        datasets=[DATASET_NAME],
+    )
+    print("\nUpdated workforce query:\n", answer)
 
 
 if __name__ == "__main__":

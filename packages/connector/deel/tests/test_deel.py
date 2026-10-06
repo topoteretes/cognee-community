@@ -260,3 +260,67 @@ def test_resource_selection_flags():
     contracts_only = deel_source(client=client, include_workers=False, include_contracts=True)
     assert DEEL_CONTRACTS_TABLE in contracts_only.resources
     assert DEEL_WORKERS_TABLE not in contracts_only.resources
+
+
+def test_contract_filters_types_and_statuses():
+    """Passes contract types and statuses to API query params."""
+    client = FakeDeelClient({"contracts": {"data": []}})
+    source = deel_source(
+        client=client,
+        include_workers=False,
+        include_contracts=True,
+        contract_types=["eor", "fixed"],
+        contract_statuses=["in_progress"],
+    )
+    contracts_res = next(
+        res for res in source.resources.values() if res.name == DEEL_CONTRACTS_TABLE
+    )
+    list(contracts_res)
+
+    endpoint, params = client.call_history[0]
+    assert endpoint == "contracts"
+    assert params["types[]"] == ["eor", "fixed"]
+    assert params["statuses[]"] == ["in_progress"]
+
+
+def test_offset_pagination_people():
+    """Paginates across multiple offset pages for people directory."""
+
+    def people_handler(params):
+        offset = params.get("offset", 0)
+        if offset == 0:
+            return {
+                "data": [{"id": f"p_{i}", "first_name": f"Worker {i}"} for i in range(50)],
+                "page": {"total_rows": 60},
+            }
+        elif offset == 50:
+            return {
+                "data": [{"id": f"p_{i}", "first_name": f"Worker {i}"} for i in range(50, 60)],
+                "page": {"total_rows": 60},
+            }
+        return {"data": []}
+
+    client = FakeDeelClient({"people": people_handler})
+    source = deel_source(client=client, include_workers=True, include_contracts=False)
+    workers_res = next(res for res in source.resources.values() if res.name == DEEL_WORKERS_TABLE)
+    rows = list(workers_res)
+    assert len(rows) == 60
+    assert rows[0]["id"] == "deel:worker:p_0"
+    assert rows[59]["id"] == "deel:worker:p_59"
+
+
+def test_retry_after_and_transient_helpers():
+    """Validates _retry_after header parsing and exponential fallback."""
+    import httpx
+
+    from cognee_community_connector_deel.deel import _is_transient, _retry_after
+
+    # Numeric header
+    assert _retry_after({"retry-after": "5"}, 0) == 5.0
+    assert _retry_after({"Retry-After": "10"}, 0) == 10.0
+    # No header fallback to 2^attempt
+    assert _retry_after({}, 2) == 4.0
+
+    # Transient check
+    assert _is_transient(httpx.ReadTimeout("timed out")) is True
+    assert _is_transient(ValueError("invalid value")) is False
