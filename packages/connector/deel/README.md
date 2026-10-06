@@ -75,9 +75,11 @@ if __name__ == "__main__":
 | `include_workers` | `bool` | `True` | Sync people directory (name, title, department, email, country, status). |
 | `include_contracts` | `bool` | `True` | Sync contracts (title, type, worker, status, dates). |
 | `include_contract_documents` | `bool` | `False` | **Privacy flag**: Opt-in to fetch and ingest full contract clauses/document bodies. |
+| `worker_ids` | `list[str] \| None` | `None` | Restrict ingestion to specific worker IDs. |
+| `contract_ids` | `list[str] \| None` | `None` | Restrict ingestion to specific contract IDs. |
 | `contract_types` | `list[str] \| None` | `None` | Filter by contract types (e.g., `["eor", "fixed", "milestone"]`). |
 | `contract_statuses` | `list[str] \| None` | `None` | Filter by status (e.g., `["in_progress", "completed"]`). |
-| `since` | `str \| None` | `None` | ISO-8601 timestamp string for incremental sync (`updated_at >= since`). |
+| `since` | `str \| None` | `None` | ISO-8601 timestamp string for incremental sync (`updated_at >= since`). Automatically managed across runs via dlt resource state if omitted. |
 | `client` | `Any` | `None` | Optional pre-configured client for dependency injection in tests. |
 
 ## Running Tests

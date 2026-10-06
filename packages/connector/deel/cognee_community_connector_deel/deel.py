@@ -136,6 +136,8 @@ def deel_source(
     include_workers: bool = True,
     include_contracts: bool = True,
     include_contract_documents: bool = False,
+    worker_ids: list[str] | None = None,
+    contract_ids: list[str] | None = None,
     contract_types: list[str] | None = None,
     contract_statuses: list[str] | None = None,
     since: str | None = None,
@@ -150,6 +152,8 @@ def deel_source(
         include_contracts: Whether to sync contracts (default: True).
         include_contract_documents: Opt-in flag to ingest full sensitive contract document
             text/clauses. Default is False (metadata-first).
+        worker_ids: Optional list of specific worker IDs to ingest.
+        contract_ids: Optional list of specific contract IDs to ingest.
         contract_types: Optional filter list of contract types (e.g. ['eor', 'fixed']).
         contract_statuses: Optional filter list of contract statuses (e.g. ['in_progress']).
         since: Optional ISO-8601 string or date watermark for incremental sync via ``updated_at``.
@@ -184,7 +188,7 @@ def deel_source(
         def deel_workers() -> Iterator[dict[str, Any]]:
             """Yield worker directory entries as document rows."""
             count = 0
-            for person in _iter_people(resolved_client):
+            for person in _iter_people(resolved_client, worker_ids=worker_ids):
                 row = _person_to_document(person)
                 if row:
                     count += 1
@@ -202,12 +206,21 @@ def deel_source(
         )
         def deel_contracts() -> Iterator[dict[str, Any]]:
             """Yield contracts as document rows with optional sensitive body opt-in."""
+            try:
+                state = dlt.current.resource_state()
+            except Exception:
+                state = {}
+
+            effective_since = since or state.get("last_updated_at")
+            newest_updated_at = effective_since
+
             count = 0
             for contract in _iter_contracts(
                 resolved_client,
+                contract_ids=contract_ids,
                 contract_types=contract_types,
                 contract_statuses=contract_statuses,
-                since=since,
+                since=effective_since,
             ):
                 row = _contract_to_document(
                     resolved_client,
@@ -216,7 +229,13 @@ def deel_source(
                 )
                 if row:
                     count += 1
+                    updated_at = contract.get("updated_at") or contract.get("created_at") or ""
+                    if updated_at and (not newest_updated_at or updated_at > newest_updated_at):
+                        newest_updated_at = updated_at
                     yield row
+
+            if newest_updated_at:
+                state["last_updated_at"] = newest_updated_at
             logger.info("Deel: synced %d contract(s).", count)
 
         resources.append(deel_contracts)
@@ -235,7 +254,10 @@ def deel_source(
 # ---------------------------------------------------------------------------
 
 
-def _iter_people(client: Any) -> Iterator[dict[str, Any]]:
+def _iter_people(
+    client: Any,
+    worker_ids: list[str] | None = None,
+) -> Iterator[dict[str, Any]]:
     """Paginate through Deel people/workers directory."""
     offset = 0
     limit = 50
@@ -251,7 +273,10 @@ def _iter_people(client: Any) -> Iterator[dict[str, Any]]:
         if not items:
             break
 
-        yield from items
+        for person in items:
+            if worker_ids and str(person.get("id")) not in worker_ids:
+                continue
+            yield person
 
         page_meta = data.get("page", {}) if isinstance(data, dict) else {}
         total_rows = page_meta.get("total_rows")
@@ -266,6 +291,7 @@ def _iter_people(client: Any) -> Iterator[dict[str, Any]]:
 
 def _iter_contracts(
     client: Any,
+    contract_ids: list[str] | None = None,
     contract_types: list[str] | None = None,
     contract_statuses: list[str] | None = None,
     since: str | None = None,
@@ -296,6 +322,8 @@ def _iter_contracts(
             break
 
         for contract in items:
+            if contract_ids and str(contract.get("id")) not in contract_ids:
+                continue
             if since:
                 updated_at = contract.get("updated_at") or contract.get("created_at") or ""
                 if updated_at and updated_at < since:

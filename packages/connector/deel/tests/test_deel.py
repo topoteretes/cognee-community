@@ -324,3 +324,72 @@ def test_retry_after_and_transient_helpers():
     # Transient check
     assert _is_transient(httpx.ReadTimeout("timed out")) is True
     assert _is_transient(ValueError("invalid value")) is False
+
+
+def test_filter_by_worker_ids():
+    """Restricts ingested workers to specified worker_ids."""
+    people_data = {
+        "data": [
+            {"id": "w1", "first_name": "Worker One"},
+            {"id": "w2", "first_name": "Worker Two"},
+            {"id": "w3", "first_name": "Worker Three"},
+        ]
+    }
+    client = FakeDeelClient({"people": people_data})
+    source = deel_source(
+        client=client,
+        include_workers=True,
+        include_contracts=False,
+        worker_ids=["w1", "w3"],
+    )
+    workers_res = next(res for res in source.resources.values() if res.name == DEEL_WORKERS_TABLE)
+    rows = list(workers_res)
+    assert len(rows) == 2
+    assert [r["id"] for r in rows] == ["deel:worker:w1", "deel:worker:w3"]
+
+
+def test_filter_by_contract_ids():
+    """Restricts ingested contracts to specified contract_ids."""
+    contracts_data = {
+        "data": [
+            {"id": "cnt_1", "title": "Contract One"},
+            {"id": "cnt_2", "title": "Contract Two"},
+        ]
+    }
+    client = FakeDeelClient({"contracts": contracts_data})
+    source = deel_source(
+        client=client,
+        include_workers=False,
+        include_contracts=True,
+        contract_ids=["cnt_2"],
+    )
+    contracts_res = next(
+        res for res in source.resources.values() if res.name == DEEL_CONTRACTS_TABLE
+    )
+    rows = list(contracts_res)
+    assert len(rows) == 1
+    assert rows[0]["id"] == "deel:contract:cnt_2"
+
+
+def test_resource_state_cursor_advancement(monkeypatch):
+    """Simulates dlt resource state and verifies cursor watermark advancement."""
+    mock_state = {}
+
+    import dlt
+
+    monkeypatch.setattr(dlt.current, "resource_state", lambda: mock_state)
+
+    contracts_data = {
+        "data": [
+            {"id": "c1", "title": "Contract 1", "updated_at": "2024-01-10T00:00:00Z"},
+            {"id": "c2", "title": "Contract 2", "updated_at": "2024-03-15T00:00:00Z"},
+        ]
+    }
+    client = FakeDeelClient({"contracts": contracts_data})
+    source = deel_source(client=client, include_workers=False, include_contracts=True)
+    contracts_res = next(
+        res for res in source.resources.values() if res.name == DEEL_CONTRACTS_TABLE
+    )
+    list(contracts_res)
+
+    assert mock_state.get("last_updated_at") == "2024-03-15T00:00:00Z"
