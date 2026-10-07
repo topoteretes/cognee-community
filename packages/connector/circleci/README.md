@@ -27,5 +27,5 @@ TODO
 ## Testing
 
 ```bash
-uv run --with pytest pytest -q
+uv run --with pytest python -m pytest -q
 ```
