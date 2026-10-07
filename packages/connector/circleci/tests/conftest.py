@@ -62,6 +62,18 @@ def fake_session():
 
 
 @pytest.fixture
+def session_for():
+    """Factory for a FakeSession over another index, e.g. ``"slow-running/index.json"``."""
+    return FakeSession
+
+
+@pytest.fixture
+def load_fixture():
+    """Read a recorded response, e.g. ``load_fixture("main/pipeline.json")``."""
+    return lambda rel: json.loads((FIXTURES / rel).read_text())
+
+
+@pytest.fixture
 def no_sleep(monkeypatch):
     """Record retry delays instead of sleeping."""
     delays: list[float] = []
