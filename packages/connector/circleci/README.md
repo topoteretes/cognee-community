@@ -88,10 +88,11 @@ Passing jobs are a single status line, and test results are only fetched for fai
 - **Expired pipelines are kept.** A pipeline that ages out of CircleCI's retention stays in memory as history.
 - **Other errors never delete.** An invalid or missing token gets a 401 and fails the run with memory untouched. Rate limits (429) and server errors are retried, honouring `Retry-After`.
 
-Two things to keep in mind:
+Three things to keep in mind:
 
 - A 404 also covers a project the token's user has lost access to. That project is forgotten, just as if it were deleted.
 - Sync each dataset with its full list of projects. A project left out of `project_slugs` is forgotten on that run.
+- **A dataset is never emptied by a sync.** cognee skips its orphan cleanup when a sync would leave a dataset with no documents, because it can't tell that apart from a broken sync. So if the deleted project was the only one in its dataset, the connector still emits the deletes, but cognee keeps that project's documents. Remove them with `await cognee.forget(dataset="circleci")`. This is cognee's behaviour for every document connector, not specific to CircleCI.
 
 ## Setup
 
@@ -114,3 +115,5 @@ uv run --with pytest python -m pytest -q
 ```
 
 No live token is needed. The tests replay real CircleCI API responses recorded from a public fixture project (see `tests/fixtures/README.md`), covering failed, passing, on-hold and mid-run pipelines. They cover the HTTP retries, the document text, the cursor, re-checking unfinished pipelines, forget-on-delete, and full runs through a dlt pipeline into a temporary sqlite database.
+
+`tests/test_remember.py` also runs the connector through `cognee.remember` itself, with the LLM and embeddings stubbed (the same technique as the Google Drive connector's forget test). It checks that new pipelines reach the dataset and the graph, that a finished pipeline replaces its earlier document instead of duplicating it, and that a deleted project's pipelines leave the graph while another project's stay.
