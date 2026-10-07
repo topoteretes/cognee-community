@@ -167,11 +167,12 @@ class FakeBambooHR:
         self.calls.append((url, params))
         if url == f"{BASE_URL}/files/view":
             # Shape from BambooHR's "List Company Files" docs.
-            files = [
-                {key: value for key, value in file.items() if key != "_data"}
-                for file in self.files.values()
-            ]
-            return FakeResponse(json_body={"categories": [{"name": "Policies", "files": files}]})
+            categories = {}
+            for file in self.files.values():
+                entry = {k: v for k, v in file.items() if not k.startswith("_")}
+                categories.setdefault(file.get("_category", "Policies"), []).append(entry)
+            body = {"categories": [{"name": n, "files": f} for n, f in categories.items()]}
+            return FakeResponse(json_body=body)
         if url.startswith(f"{BASE_URL}/files/"):
             file = self.files.get(int(url.rsplit("/", 1)[1]))
             if file is None or file["_data"] is None:
@@ -393,12 +394,13 @@ def _tiny_pdf(text):
     return out.getvalue()
 
 
-def _file(file_id, original_name, data, name=None):
+def _file(file_id, original_name, data, name=None, category="Policies"):
     return {
         "id": file_id,
         "name": name or original_name.rsplit(".", 1)[0],
         "originalFileName": original_name,
         "_data": data,
+        "_category": category,
     }
 
 
@@ -487,3 +489,33 @@ def test_files_resource_uses_merge_and_hard_delete():
 
     assert resource.write_disposition == "merge"
     assert resource.compute_table_schema()["columns"]["_deleted"]["hard_delete"] is True
+
+
+def test_file_categories_limit_what_is_synced():
+    api = FakeBambooHR(
+        files={
+            1: _file(1, "Handbook.txt", b"Be kind", category="Policies"),
+            2: _file(2, "Benefits.csv", b"name,plan", category="Benefits Upgrade"),
+        }
+    )
+
+    rows = list(sync_files(api, BASE_URL, {}, categories=["Policies"]))
+
+    assert [row["id"] for row in rows] == ["file:1"]
+    # Files outside the chosen categories are never downloaded.
+    assert f"{BASE_URL}/files/2" not in [url for url, _ in api.calls]
+
+
+def test_narrowing_categories_forgets_files_synced_before():
+    api = FakeBambooHR(
+        files={
+            1: _file(1, "Handbook.txt", b"Be kind", category="Policies"),
+            2: _file(2, "Benefits.csv", b"name,plan", category="Benefits Upgrade"),
+        }
+    )
+    state = {"file_ids": ["file:1", "file:2"]}
+
+    rows = list(sync_files(api, BASE_URL, state, categories=["Policies"]))
+
+    assert rows[-1] == {"id": "file:2", "_deleted": True}
+    assert state["file_ids"] == ["file:1"]

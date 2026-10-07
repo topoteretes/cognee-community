@@ -242,8 +242,16 @@ def _extract_text(file_name: str, data: bytes) -> str:
     return data.decode("utf-8", errors="replace")
 
 
-def sync_files(session: Any, base_url: str, state: dict) -> Iterator[dict[str, Any]]:
+def sync_files(
+    session: Any,
+    base_url: str,
+    state: dict,
+    categories: Sequence[str] | None = None,
+) -> Iterator[dict[str, Any]]:
     """Yield every readable company file, plus tombstones for files now gone.
+
+    ``categories`` limits the sync to files in those category names; files
+    outside them are treated as gone, so narrowing the list forgets them.
 
     The files API has no change feed and no modified date, so each run is a
     full snapshot: every file is re-downloaded (unchanged text keeps the same
@@ -256,6 +264,8 @@ def sync_files(session: Any, base_url: str, state: dict) -> Iterator[dict[str, A
     seen: list[str] = []
     for file in files:
         if not _is_supported(file):
+            continue
+        if categories is not None and file.get("category") not in categories:
             continue
         row_id = _file_row_id(file["id"])
         data = _download_file(session, base_url, file["id"])
@@ -296,6 +306,7 @@ def bamboohr_source(
     fields: Sequence[str] = DEFAULT_EMPLOYEE_FIELDS,
     include_inactive: bool = False,
     include_files: bool = True,
+    file_categories: Sequence[str] | None = None,
     session: Any = None,
 ):
     """Create a dlt source that syncs BambooHR employees and company files into cognee.
@@ -310,6 +321,8 @@ def bamboohr_source(
             forgotten, like deleted ones.
         include_files: Also sync company files (policies, handbooks, ...).
             Only PDF and plain-text files are read; others are skipped.
+        file_categories: Only sync files in these category names (as shown
+            under Files in BambooHR). ``None`` syncs every category.
         session: Pre-built ``requests`` session. Mainly an injection point for
             tests; when omitted one is built from ``api_key``.
 
@@ -349,7 +362,8 @@ def bamboohr_source(
         columns={"_deleted": {"data_type": "bool", "hard_delete": True}},
     )
     def bamboohr_files():
-        yield from sync_files(session, base_url, dlt.current.resource_state())
+        state = dlt.current.resource_state()
+        yield from sync_files(session, base_url, state, file_categories)
 
     @dlt.source(name=BAMBOOHR_SOURCE_NAME)
     def _bamboohr():
