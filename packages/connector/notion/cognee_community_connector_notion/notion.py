@@ -98,12 +98,33 @@ def notion_source(
         # if deleted. Letting the error abort the run leaves staging — and memory
         # — untouched, which is the safe failure. Transient blips are already
         # retried in _request; only a persistent failure reaches here.
+        state = dlt.current.source_state().setdefault("watermarks", {})
         count = 0
         for page in _iter_pages(client, page_ids, database_ids):
             if page.get("archived") or page.get("in_trash"):
                 continue
+
+            page_id = page.get("id")
+            last_edited_time = page.get("last_edited_time")
+            cached = state.get(page_id, {})
+
+            if cached.get("last_edited_time") == last_edited_time and "content" in cached:
+                # Page unchanged: yield cached content to avoid re-rendering blocks
+                row = {
+                    "id": page_id,
+                    "url": page.get("url"),
+                    "title": _page_title(page),
+                    "content": cached["content"],
+                }
+            else:
+                row = _page_to_row(client, page)
+                state[page_id] = {
+                    "last_edited_time": last_edited_time,
+                    "content": row["content"],
+                }
+
             count += 1
-            yield _page_to_row(client, page)
+            yield row
         logger.info("Notion: synced %d page(s).", count)
 
     @dlt.source(name=NOTION_SOURCE_NAME)
