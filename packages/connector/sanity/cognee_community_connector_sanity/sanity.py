@@ -21,8 +21,9 @@ from __future__ import annotations
 
 import os
 import time
-from datetime import datetime, timedelta, timezone
-from typing import Any, Iterable, Iterator
+from collections.abc import Iterable, Iterator
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from cognee.shared.logging_utils import get_logger
 from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
@@ -102,9 +103,7 @@ def sanity_source(
                     continue
                 response.raise_for_status()
                 return response.json()
-            raise RuntimeError(
-                f"Sanity API: {method} {path} failed after {_MAX_RETRIES} retries."
-            )
+            raise RuntimeError(f"Sanity API: {method} {path} failed after {_MAX_RETRIES} retries.")
 
         client = _api_request
 
@@ -119,20 +118,15 @@ def sanity_source(
         state = _runtime_dlt.current.resource_state()
         last_updated = state.get("last_updated_at")
         if last_updated:
-            cursor_dt = (
-                datetime.fromisoformat(last_updated)
-                - timedelta(minutes=_OVERLAP_WINDOW_MINUTES)
+            cursor_dt = datetime.fromisoformat(last_updated) - timedelta(
+                minutes=_OVERLAP_WINDOW_MINUTES
             )
-            cursor_iso = cursor_dt.astimezone(timezone.utc).strftime(
-                "%Y-%m-%dT%H:%M:%SZ"
-            )
+            cursor_iso = cursor_dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         else:
             cursor_iso = None
 
         count = 0
-        for doc in _iter_documents(
-            client, dataset, document_types, groq_filter, cursor_iso
-        ):
+        for doc in _iter_documents(client, dataset, document_types, groq_filter, cursor_iso):
             count += 1
             yield _doc_to_row(doc)
             updated_at = doc.get("_updatedAt")
@@ -186,8 +180,7 @@ def _iter_documents(
         docs = data.get("result", [])
         if not docs:
             break
-        for doc in docs:
-            yield doc
+        yield from docs
         if len(docs) < limit:
             break
         offset += limit
@@ -204,12 +197,12 @@ def _doc_to_row(doc: dict[str, Any]) -> dict[str, Any]:
     body_parts.append(f"Sanity document ({doc_type}): {doc_id}")
 
     for field in ["title", "name", "heading", "headline"]:
-        if field in doc and doc[field]:
+        if doc.get(field):
             body_parts.append(f"Title: {doc[field]}")
             break
 
     for field in ["slug", "url", "path"]:
-        if field in doc and doc[field]:
+        if doc.get(field):
             slug_val = doc[field]
             if isinstance(slug_val, dict) and "current" in slug_val:
                 body_parts.append(f"Slug: {slug_val['current']}")
@@ -217,7 +210,7 @@ def _doc_to_row(doc: dict[str, Any]) -> dict[str, Any]:
                 body_parts.append(f"{field}: {slug_val}")
 
     for field in ["body", "content", "description", "excerpt", "text"]:
-        if field in doc and doc[field]:
+        if doc.get(field):
             val = doc[field]
             text = _extract_portable_text(val)
             if text:

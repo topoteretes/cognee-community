@@ -24,9 +24,7 @@ class _FakeClient:
 
 def test_source_factory_accepts_client_injection() -> None:
     fake = _FakeClient()
-    source = sanity_source(
-        project_id="test", api_token="test", client=fake
-    )
+    source = sanity_source(project_id="test", api_token="test", client=fake)
     from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
 
     assert getattr(source, DOCUMENT_SOURCE_ATTR, None) == "sanity"
@@ -54,9 +52,7 @@ def test_doc_to_row_extracts_title_and_text() -> None:
         "body": [
             {
                 "_type": "block",
-                "children": [
-                    {"_type": "span", "text": "This is a test post body."}
-                ],
+                "children": [{"_type": "span", "text": "This is a test post body."}],
             }
         ],
     }

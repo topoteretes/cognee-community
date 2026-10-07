@@ -8,6 +8,7 @@ import asyncio
 import os
 
 import cognee
+
 from cognee_community_connector_sanity import sanity_source
 
 
@@ -26,7 +27,7 @@ async def main() -> None:
 
     print("Ingesting Sanity documents …")
     await cognee.add(source)
-    print("Done. Try cognee.search(\"summarize my latest blog posts\")")
+    print('Done. Try cognee.search("summarize my latest blog posts")')
 
 
 if __name__ == "__main__":
