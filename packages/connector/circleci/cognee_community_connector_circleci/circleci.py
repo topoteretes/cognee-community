@@ -8,13 +8,16 @@ from __future__ import annotations
 
 import functools
 import itertools
+import os
 import time
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import dlt
 import requests
 from cognee.shared.logging_utils import get_logger
+from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
 
 logger = get_logger("circleci_connector")
 
@@ -23,6 +26,8 @@ DEFAULT_BASE_URL = "https://circleci.com/api/v2"
 
 # Document-source tag: routes rows through cognify instead of the dlt-row path.
 CIRCLECI_SOURCE_NAME = "circleci"
+# dlt resource / staging-table name for CircleCI pipelines.
+CIRCLECI_TABLE_NAME = "circleci_pipelines"
 
 # Attempts per request (first try + retries) for rate-limited / transient failures.
 _MAX_RETRIES = 5
@@ -483,16 +488,72 @@ def circleci_source(
     token: str | None = None,
     branch: str | None = None,
     base_url: str = DEFAULT_BASE_URL,
+    max_initial_pipelines: int | None = DEFAULT_MAX_INITIAL_PIPELINES,
+    pending_timeout_days: float = DEFAULT_PENDING_TIMEOUT_DAYS,
+    max_failing_tests: int = DEFAULT_MAX_FAILING_TESTS,
+    max_message_chars: int = DEFAULT_MAX_MESSAGE_CHARS,
     session: Any = None,
 ):
     """Return a ``dlt`` resource that yields CircleCI pipelines for ``cognee.remember``.
 
+    Hand it to ``cognee.remember(..., primary_key="id", write_disposition="merge",
+    max_rows_per_table=0)``. ``merge`` matters: cognee defaults to ``replace``,
+    which would forget every pipeline not emitted on that run.
+
     Args:
         project_slugs: Projects to sync, e.g. ``["gh/org/repo"]`` or
-            ``["circleci/<org-id>/<project-id>"]`` for GitHub App projects.
+            ``["circleci/<org-id>/<project-id>"]`` for GitHub App projects. A
+            project dropped from this list is forgotten on the next sync.
         token: CircleCI personal API token. Falls back to ``CIRCLECI_TOKEN``.
         branch: Only sync pipelines on this branch.
         base_url: API base URL.
-        session: Pre-built ``requests`` session (test injection point).
+        max_initial_pipelines: Pipelines to ingest on a project's first sync
+            (most recent first). ``None`` ingests its whole history.
+        pending_timeout_days: Stop re-checking a pipeline that is still
+            unfinished after this many days.
+        max_failing_tests: Failing tests kept per failed job.
+        max_message_chars: Characters kept from the end of each failure message.
+        session: Pre-built ``requests`` session (test injection point). When
+            omitted, one is built from the token.
+
+    Returns:
+        A ``dlt`` resource (``circleci_pipelines``) with ``primary_key="id"``,
+        ``write_disposition="merge"`` and an ``_deleted`` hard-delete column,
+        tagged as a ``circleci`` document source.
     """
-    raise NotImplementedError
+    if isinstance(project_slugs, str) or not project_slugs:
+        raise ValueError('project_slugs must be a non-empty list, e.g. ["gh/org/repo"].')
+    resolved_token = token or os.environ.get("CIRCLECI_TOKEN")
+    if session is None and not resolved_token:
+        raise ValueError("CircleCI API token required: pass token= or set CIRCLECI_TOKEN.")
+    base_url = base_url.rstrip("/")
+    slugs = list(project_slugs)
+
+    @dlt.resource(
+        name=CIRCLECI_TABLE_NAME,
+        primary_key="id",
+        write_disposition="merge",
+        # _deleted is a boolean hard-delete marker: rows where it is True are
+        # removed from the dlt destination on merge, and cognee's orphan_cleanup
+        # then forgets them from the graph and vector stores.
+        columns={"_deleted": {"data_type": "bool", "hard_delete": True}},
+    )
+    def circleci_pipelines():
+        yield from sync_pipelines(
+            session or _make_session(resolved_token),
+            base_url,
+            dlt.current.resource_state(),
+            project_slugs=slugs,
+            branch=branch,
+            max_initial_pipelines=max_initial_pipelines,
+            pending_timeout_days=pending_timeout_days,
+            max_failing_tests=max_failing_tests,
+            max_message_chars=max_message_chars,
+        )
+
+    resource = circleci_pipelines()
+    # Opt into cognee's document path: each row (id/title/content/url) becomes a
+    # text document that goes through cognify. resolve_dlt_sources reads this
+    # marker; it never imports this connector.
+    setattr(resource, DOCUMENT_SOURCE_ATTR, CIRCLECI_SOURCE_NAME)
+    return resource
