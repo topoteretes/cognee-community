@@ -178,15 +178,13 @@ def iter_slack_export_messages(export_path: str | os.PathLike) -> Iterator[dict]
         channel_name = channel_meta.get("name", channel_dir.name)
 
         for message_file in sorted(channel_dir.glob("*.json")):
-            try:
-                day_messages = _load_json(message_file)
-            except (json.JSONDecodeError, OSError):
-                # One corrupt/unreadable day file should not abort the whole
-                # export — skip it and keep ingesting the rest.
-                logger.warning("Slack export: skipping unreadable file %s", message_file)
-                continue
+            # A partial snapshot would turn unread messages into upstream deletions.
+            # Let read and parse failures abort extraction before DLT replaces staging.
+            day_messages = _load_json(message_file)
             if not isinstance(day_messages, list):
-                continue
+                raise ValueError(
+                    f"Slack daily file must be a JSON array of messages: {message_file}"
+                )
 
             for message in day_messages:
                 if not isinstance(message, dict):

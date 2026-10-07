@@ -47,6 +47,10 @@ ids (`{channel_id}:{ts}`) are stable, so re-ingesting a later export only re-cog
 new/changed messages. Leave `write_disposition` at the default — passing `merge` breaks
 forget-on-delete for a snapshot source.
 
+Unreadable daily message files, invalid JSON, or daily files that are not JSON arrays
+abort the sync. The previous destination snapshot stays intact, so an incomplete export
+does not erase messages from memory. Repair the export and rerun the sync.
+
 > **Use a dedicated `dataset_name` per workspace.** On released cognee, `orphan_cleanup` scopes
 > deletions per dlt source within a dataset; a dedicated dataset guarantees cleanup only ever
 > touches this export. (A core enhancement adds table-scoped orphan cleanup so multiple dlt

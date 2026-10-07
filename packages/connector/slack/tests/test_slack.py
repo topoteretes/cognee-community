@@ -66,15 +66,6 @@ def _export_v2(tmp_path):
     return _write_export(tmp_path / "v2", {"general": GENERAL[:2], "random": RANDOM})
 
 
-def test_iter_messages_yields_expected_rows(tmp_path):
-    rows = list(iter_slack_export_messages(_export_v1(tmp_path)))
-
-    assert len(rows) == 4
-    ids = {row["id"] for row in rows}
-    assert "C001:1717200000.000100" in ids
-    assert "C002:1717200100.000100" in ids
-
-
 def test_message_ids_use_channel_id_and_ts(tmp_path):
     for row in iter_slack_export_messages(_export_v1(tmp_path)):
         channel_id, ts = row["id"].split(":", 1)
@@ -209,37 +200,80 @@ def test_slack_export_source_resource_is_configured_for_replace(tmp_path):
     assert schema["columns"]["id"].get("primary_key") is True
 
 
-def test_e2e_dlt_replace_removes_deleted_message(tmp_path):
-    """End-to-end, offline (no LLM): drive slack_export_source through a real dlt
-    ``replace`` load for two snapshots and prove a message removed from the newer
-    export is physically gone from the destination table — exactly what cognee's
-    ``orphan_cleanup`` reconciles against to forget it from the graph/vector/
-    relational stores (see test_orphan_cleanup_table_scope.py for that half).
-    """
+@pytest.fixture
+def slack_pipeline(tmp_path):
     dlt = pytest.importorskip("dlt")
 
     pipelines_dir = str(tmp_path / "dlt_pipelines")
     db_path = tmp_path / "slack.db"
 
-    def sync(export_path):
-        pipeline = dlt.pipeline(
-            pipeline_name="slack_e2e_test",
-            destination=dlt.destinations.sqlalchemy(f"sqlite:///{db_path}"),
-            dataset_name="slack_e2e",
-            pipelines_dir=pipelines_dir,
-        )
-        pipeline.run(slack_export_source(export_path))
-        with pipeline.sql_client() as client:
-            rows = client.execute_sql("SELECT id FROM slack_messages ORDER BY id")
-        return [row[0] for row in rows]
+    return dlt.pipeline(
+        pipeline_name="slack_e2e_test",
+        destination=dlt.destinations.sqlalchemy(f"sqlite:///{db_path}"),
+        dataset_name="slack_e2e",
+        pipelines_dir=pipelines_dir,
+    )
 
-    # Snapshot 1 — full history loads all four messages.
-    v1_ids = sync(_export_v1(tmp_path))
-    assert len(v1_ids) == 4
-    assert DELETED_ID in v1_ids
+
+def _loaded_ids(pipeline):
+    with pipeline.sql_client() as client:
+        rows = client.execute_sql("SELECT id FROM slack_messages ORDER BY id")
+    return [row[0] for row in rows]
+
+
+def test_e2e_dlt_replace_removes_deleted_message(tmp_path, slack_pipeline):
+    """A complete replacement removes upstream deletions from the destination."""
+    slack_pipeline.run(slack_export_source(_export_v1(tmp_path)))
+    v1_ids = _loaded_ids(slack_pipeline)
+    assert v1_ids == [
+        "C001:1717200000.000100",
+        "C001:1717200001.000200",
+        DELETED_ID,
+        "C002:1717200100.000100",
+    ]
 
     # Snapshot 2 — one message deleted upstream. replace drops + reloads, so the
     # deleted message is physically absent from the destination afterwards.
-    v2_ids = sync(_export_v2(tmp_path))
+    slack_pipeline.run(slack_export_source(_export_v2(tmp_path)))
+    v2_ids = _loaded_ids(slack_pipeline)
     assert len(v2_ids) == 3
     assert DELETED_ID not in v2_ids
+
+
+@pytest.mark.parametrize("broken_day", ["{", '{"not": "a message array"}', None])
+def test_failed_snapshot_preserves_loaded_messages(
+    tmp_path, slack_pipeline, monkeypatch, broken_day
+):
+    pytest.importorskip("dlt")
+    from dlt.pipeline.exceptions import PipelineStepFailed
+
+    export = _export_v1(tmp_path)
+    slack_pipeline.run(slack_export_source(export))
+    before = _loaded_ids(slack_pipeline)
+    day = tmp_path / "v1" / "random" / "2024-06-01.json"
+    original = day.read_text()
+    with monkeypatch.context() as patch:
+        if broken_day is None:
+            from pathlib import Path
+
+            open_file = Path.open
+
+            def read_file(path, *args, **kwargs):
+                if path == day:
+                    raise PermissionError("daily export file is unreadable")
+                return open_file(path, *args, **kwargs)
+
+            patch.setattr(Path, "open", read_file)
+        else:
+            day.write_text(broken_day)
+
+        with pytest.raises(PipelineStepFailed):
+            slack_pipeline.run(slack_export_source(export))
+
+    # An unsuccessful extraction must leave the previous destination intact.
+    assert _loaded_ids(slack_pipeline) == before
+
+    # Repairing the export lets the next sync finish without losing messages.
+    day.write_text(original)
+    slack_pipeline.run(slack_export_source(export))
+    assert _loaded_ids(slack_pipeline) == before
