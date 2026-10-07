@@ -1,5 +1,6 @@
 """DLT source for BambooHR (incremental sync + forget-on-delete)."""
 
+import io
 import os
 import time
 from collections.abc import Iterator, Sequence
@@ -14,6 +15,12 @@ logger = get_logger("bamboohr_connector")
 
 BAMBOOHR_SOURCE_NAME = "bamboohr"
 EMPLOYEES_TABLE_NAME = "bamboohr_employees"
+FILES_TABLE_NAME = "bamboohr_files"
+
+# Company files we can turn into text; anything else (images, .docx, ...) is
+# skipped. Matched on the file's original extension.
+_TEXT_EXTENSIONS = (".txt", ".md", ".csv")
+_PDF_EXTENSION = ".pdf"
 
 # Employee data is sensitive, so only these fields are ever requested (the
 # get-employee endpoint returns nothing but ``id`` unless fields are named).
@@ -193,6 +200,92 @@ def sync_employees(
 
 
 # ---------------------------------------------------------------------------
+# Company files → document rows
+# ---------------------------------------------------------------------------
+
+
+def _file_row_id(file_id: Any) -> str:
+    return f"file:{file_id}"
+
+
+def _list_company_files(session: Any, base_url: str) -> list[dict]:
+    """List every company file the API key can see, across all categories."""
+    response = _request(session, f"{base_url}/files/view")
+    response.raise_for_status()
+    files = []
+    for category in response.json().get("categories") or []:
+        for file in category.get("files") or []:
+            files.append({**file, "category": category.get("name")})
+    return files
+
+
+def _is_supported(file: dict) -> bool:
+    name = (file.get("originalFileName") or "").lower()
+    return name.endswith((*_TEXT_EXTENSIONS, _PDF_EXTENSION))
+
+
+def _download_file(session: Any, base_url: str, file_id: Any) -> bytes | None:
+    """Download a company file, or ``None`` if it is gone or no longer shared."""
+    response = _request(session, f"{base_url}/files/{file_id}")
+    if response.status_code in (403, 404):
+        return None
+    response.raise_for_status()
+    return response.content
+
+
+def _extract_text(file_name: str, data: bytes) -> str:
+    if file_name.lower().endswith(_PDF_EXTENSION):
+        from pypdf import PdfReader
+
+        reader = PdfReader(io.BytesIO(data), strict=False)
+        return "\n".join(page.extract_text() or "" for page in reader.pages)
+    return data.decode("utf-8", errors="replace")
+
+
+def sync_files(session: Any, base_url: str, state: dict) -> Iterator[dict[str, Any]]:
+    """Yield every readable company file, plus tombstones for files now gone.
+
+    The files API has no change feed and no modified date, so each run is a
+    full snapshot: every file is re-downloaded (unchanged text keeps the same
+    content hash, so cognee does not re-cognify it), and deletions are found
+    by comparing this run's file ids with the ids saved in ``state``.
+    """
+    # If listing fails it raises, so a partial list can never be mistaken for
+    # deletions.
+    files = _list_company_files(session, base_url)
+    seen: list[str] = []
+    for file in files:
+        if not _is_supported(file):
+            continue
+        row_id = _file_row_id(file["id"])
+        data = _download_file(session, base_url, file["id"])
+        if data is None:
+            # Listed but no longer downloadable: leave it out of ``seen`` so a
+            # previously synced copy is forgotten below.
+            continue
+        seen.append(row_id)
+        try:
+            text = _extract_text(file["originalFileName"], data)
+        except Exception as exc:
+            # A file that can't be parsed is skipped (any earlier copy is
+            # kept) rather than failing the whole sync.
+            logger.warning("BambooHR: could not read file %s, skipping: %s", file["id"], exc)
+            continue
+        if text.strip():
+            yield {
+                "id": row_id,
+                "title": file.get("name") or file["originalFileName"],
+                "content": f"Category: {file.get('category') or ''}\n\n{text}",
+                "_deleted": False,
+            }
+
+    for row_id in sorted(set(state.get("file_ids", [])) - set(seen)):
+        yield _deleted_row(row_id)
+    state["file_ids"] = seen
+    logger.info("BambooHR: synced %d company file(s).", len(seen))
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
@@ -202,9 +295,10 @@ def bamboohr_source(
     api_key: str | None = None,
     fields: Sequence[str] = DEFAULT_EMPLOYEE_FIELDS,
     include_inactive: bool = False,
+    include_files: bool = True,
     session: Any = None,
 ):
-    """Create a dlt source that syncs BambooHR employees into cognee.
+    """Create a dlt source that syncs BambooHR employees and company files into cognee.
 
     Args:
         company_domain: Subdomain of your BambooHR login URL ("acme" for
@@ -214,6 +308,8 @@ def bamboohr_source(
             ``DEFAULT_EMPLOYEE_FIELDS``, which excludes sensitive data.
         include_inactive: Keep terminated employees. By default they are
             forgotten, like deleted ones.
+        include_files: Also sync company files (policies, handbooks, ...).
+            Only PDF and plain-text files are read; others are skipped.
         session: Pre-built ``requests`` session. Mainly an injection point for
             tests; when omitted one is built from ``api_key``.
 
@@ -246,9 +342,18 @@ def bamboohr_source(
         state = dlt.current.resource_state()
         yield from sync_employees(session, base_url, state, fields, include_inactive)
 
+    @dlt.resource(
+        name=FILES_TABLE_NAME,
+        primary_key="id",
+        write_disposition="merge",
+        columns={"_deleted": {"data_type": "bool", "hard_delete": True}},
+    )
+    def bamboohr_files():
+        yield from sync_files(session, base_url, dlt.current.resource_state())
+
     @dlt.source(name=BAMBOOHR_SOURCE_NAME)
     def _bamboohr():
-        return bamboohr_employees
+        return [bamboohr_employees, bamboohr_files] if include_files else [bamboohr_employees]
 
     source = _bamboohr()
     # Opt into the document ingestion path (row → text document → cognify).

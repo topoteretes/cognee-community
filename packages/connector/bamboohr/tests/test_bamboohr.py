@@ -4,6 +4,8 @@ The BambooHR REST API is mocked via ``FakeSession`` — no network traffic and
 no live credentials are required, so these run in CI.
 """
 
+import io
+
 import pytest
 import requests
 
@@ -12,6 +14,7 @@ from cognee_community_connector_bamboohr.bamboohr import (
     DEFAULT_EMPLOYEE_FIELDS,
     DOCUMENT_SOURCE_ATTR,
     EMPLOYEES_TABLE_NAME,
+    FILES_TABLE_NAME,
     _base_url,
     _employee_to_row,
     _get_changed,
@@ -19,6 +22,7 @@ from cognee_community_connector_bamboohr.bamboohr import (
     _request,
     bamboohr_source,
     sync_employees,
+    sync_files,
 )
 
 BASE_URL = _base_url("acme")
@@ -28,10 +32,11 @@ BASE_URL = _base_url("acme")
 # Fake BambooHR REST API
 # ---------------------------------------------------------------------------
 class FakeResponse:
-    def __init__(self, status_code=200, json_body=None, headers=None):
+    def __init__(self, status_code=200, json_body=None, headers=None, content=b""):
         self.status_code = status_code
         self._json = json_body
         self.headers = headers or {}
+        self.content = content
 
     def json(self):
         return self._json
@@ -134,22 +139,44 @@ def test_get_changed_raises_on_auth_failure():
 # Employees
 # ---------------------------------------------------------------------------
 class FakeBambooHR:
-    """Routes requests like the real API: one change feed + per-employee records.
+    """Routes requests like the real API: change feed, employees and files.
 
     ``changes`` maps employee id → action. ``employees`` maps id → record; an
     id missing from it answers 404, like an employee that no longer exists.
     Ids in ``failing`` answer 500 on every attempt (a persistent outage).
+    ``files`` maps file id → listing entry plus ``_data`` (the download body;
+    ``None`` answers 404).
     """
 
-    def __init__(self, changes, employees, latest="2026-06-11T16:07:32.000Z", failing=()):
-        self.changes = changes
-        self.employees = employees
+    def __init__(
+        self,
+        changes=None,
+        employees=None,
+        latest="2026-06-11T16:07:32.000Z",
+        failing=(),
+        files=None,
+    ):
+        self.changes = changes or {}
+        self.employees = employees or {}
         self.latest = latest
         self.failing = set(failing)
+        self.files = files or {}
         self.calls = []
 
     def get(self, url, params=None, timeout=None):
         self.calls.append((url, params))
+        if url == f"{BASE_URL}/files/view":
+            # Shape from BambooHR's "List Company Files" docs.
+            files = [
+                {key: value for key, value in file.items() if key != "_data"}
+                for file in self.files.values()
+            ]
+            return FakeResponse(json_body={"categories": [{"name": "Policies", "files": files}]})
+        if url.startswith(f"{BASE_URL}/files/"):
+            file = self.files.get(int(url.rsplit("/", 1)[1]))
+            if file is None or file["_data"] is None:
+                return FakeResponse(404)
+            return FakeResponse(content=file["_data"])
         if url == f"{BASE_URL}/employees/changed":
             employees = {
                 eid: {"id": eid, "action": action, "lastChanged": self.latest}
@@ -334,4 +361,129 @@ def test_forget_on_delete_end_to_end_through_a_real_dlt_merge(tmp_path):
     pipeline.run(bamboohr_source(company_domain="acme", session=api))
     assert stored_ids() == ["employee:1"]
     # ...and the second run asked only for changes since the first run's cursor.
-    assert api.calls[0][1] == {"since": "2026-06-11T16:07:32.000Z"}
+    assert (f"{BASE_URL}/employees/changed", {"since": "2026-06-11T16:07:32.000Z"}) in api.calls
+
+
+# ---------------------------------------------------------------------------
+# Company files
+# ---------------------------------------------------------------------------
+def _tiny_pdf(text):
+    """Build a minimal one-page PDF containing ``text`` (real bytes, no mocks)."""
+    stream = f"BT /F1 12 Tf 72 720 Td ({text}) Tj ET".encode()
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Length %d >>\nstream\n%s\nendstream" % (len(stream), stream),
+    ]
+    out = io.BytesIO()
+    out.write(b"%PDF-1.4\n")
+    offsets = []
+    for number, body in enumerate(objects, start=1):
+        offsets.append(out.tell())
+        out.write(b"%d 0 obj\n%s\nendobj\n" % (number, body))
+    xref = out.tell()
+    out.write(b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1))
+    for offset in offsets:
+        out.write(b"%010d 00000 n \n" % offset)
+    out.write(b"trailer\n<< /Size %d /Root 1 0 R >>\n" % (len(objects) + 1))
+    out.write(b"startxref\n%d\n%%%%EOF\n" % xref)
+    return out.getvalue()
+
+
+def _file(file_id, original_name, data, name=None):
+    return {
+        "id": file_id,
+        "name": name or original_name.rsplit(".", 1)[0],
+        "originalFileName": original_name,
+        "_data": data,
+    }
+
+
+def test_files_are_read_from_pdf_and_text():
+    api = FakeBambooHR(
+        files={
+            1: _file(1, "Remote Work.pdf", _tiny_pdf("Work from home on Fridays")),
+            2: _file(2, "Holidays.txt", b"Office closed on Jan 1"),
+        }
+    )
+    state = {}
+
+    rows = list(sync_files(api, BASE_URL, state))
+
+    assert rows == [
+        {
+            "id": "file:1",
+            "title": "Remote Work",
+            "content": "Category: Policies\n\nWork from home on Fridays",
+            "_deleted": False,
+        },
+        {
+            "id": "file:2",
+            "title": "Holidays",
+            "content": "Category: Policies\n\nOffice closed on Jan 1",
+            "_deleted": False,
+        },
+    ]
+    assert state["file_ids"] == ["file:1", "file:2"]
+
+
+def test_unsupported_file_types_are_not_downloaded():
+    api = FakeBambooHR(files={3: _file(3, "Org chart.png", b"\x89PNG")})
+
+    assert list(sync_files(api, BASE_URL, {})) == []
+    assert f"{BASE_URL}/files/3" not in [url for url, _ in api.calls]
+
+
+def test_file_missing_from_listing_becomes_tombstone():
+    api = FakeBambooHR(files={2: _file(2, "Holidays.txt", b"Office closed on Jan 1")})
+    state = {"file_ids": ["file:1", "file:2"]}
+
+    rows = list(sync_files(api, BASE_URL, state))
+
+    assert rows[-1] == {"id": "file:1", "_deleted": True}
+    assert state["file_ids"] == ["file:2"]
+
+
+def test_listed_but_undownloadable_file_is_forgotten():
+    # Still in the listing, but the download now answers 404.
+    api = FakeBambooHR(files={1: _file(1, "Old.txt", None)})
+
+    rows = list(sync_files(api, BASE_URL, {"file_ids": ["file:1"]}))
+
+    assert rows == [{"id": "file:1", "_deleted": True}]
+
+
+def test_unparseable_file_is_skipped_but_not_forgotten():
+    api = FakeBambooHR(files={1: _file(1, "Broken.pdf", b"not really a pdf")})
+    state = {"file_ids": ["file:1"]}
+
+    assert list(sync_files(api, BASE_URL, state)) == []
+    # Still counted as present, so an earlier good copy is kept, not deleted.
+    assert state["file_ids"] == ["file:1"]
+
+
+def test_failed_listing_aborts_without_forgetting_anything():
+    api = FakeBambooHR()
+    api.get = lambda url, params=None, timeout=None: FakeResponse(403)
+    state = {"file_ids": ["file:1"]}
+
+    with pytest.raises(requests.HTTPError):
+        list(sync_files(api, BASE_URL, state))
+    assert state["file_ids"] == ["file:1"]
+
+
+def test_files_can_be_switched_off():
+    source = bamboohr_source(company_domain="acme", session=FakeBambooHR(), include_files=False)
+
+    assert list(source.resources) == [EMPLOYEES_TABLE_NAME]
+
+
+def test_files_resource_uses_merge_and_hard_delete():
+    source = bamboohr_source(company_domain="acme", session=FakeBambooHR())
+    resource = source.resources[FILES_TABLE_NAME]
+
+    assert resource.write_disposition == "merge"
+    assert resource.compute_table_schema()["columns"]["_deleted"]["hard_delete"] is True
