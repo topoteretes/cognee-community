@@ -1,7 +1,7 @@
 import asyncio
 import os
 from typing import Any, List, Optional
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from cognee.infrastructure.databases.exceptions import MissingQueryParameterError
 from cognee.infrastructure.databases.vector import VectorDBInterface
@@ -104,6 +104,21 @@ class QDrantAdapter(VectorDBInterface):
     async def embed_data(self, data: list[str]) -> list[float]:
         return await self.embedding_engine.embed_text(data)
 
+    def _point_id(self, data_point_id: str | UUID) -> str:
+        """Scope storage IDs to a dataset; payload IDs remain Cognee's IDs."""
+        namespace = uuid5(NAMESPACE_URL, self.database_name)
+        return str(uuid5(namespace, str(UUID(str(data_point_id)))))
+
+    def _id_filter(self, point_ids: list[str]) -> models.Filter:
+        return models.Filter(
+            must=[
+                models.FieldCondition(
+                    key="database_name", match=models.MatchValue(value=self.database_name)
+                ),
+                models.HasIdCondition(has_id=point_ids),
+            ]
+        )
+
     async def has_collection(self, collection_name: str) -> bool:
         client = self.get_qdrant_client()
         result = await client.collection_exists(collection_name)
@@ -179,8 +194,8 @@ class QDrantAdapter(VectorDBInterface):
 
         def convert_to_qdrant_point(data_point: DataPoint):
             return models.PointStruct(
-                id=str(data_point.id),
-                payload={**data_point.model_dump(), "database_name": self.database_name},
+                id=self._point_id(data_point.id),
+                payload={**data_point.model_dump(mode="json"), "database_name": self.database_name},
                 vector={"text": data_vectors[data_points.index(data_point)]},
             )
 
@@ -188,7 +203,17 @@ class QDrantAdapter(VectorDBInterface):
 
         try:
             # Use upsert for AsyncQdrantClient (upload_points doesn't exist or is sync)
-            await client.upsert(collection_name=collection_name, points=points)
+            await client.upsert(collection_name=collection_name, points=points, wait=True)
+            # Migrate only this dataset's legacy, unscoped IDs after the new
+            # points are durable. Another dataset may still own a legacy ID.
+            if points:
+                legacy_filter = self._id_filter([str(point.id) for point in data_points])
+                legacy_filter.must_not = [models.HasIdCondition(has_id=[p.id for p in points])]
+                await client.delete(
+                    collection_name,
+                    points_selector=models.FilterSelector(filter=legacy_filter),
+                    wait=True,
+                )
         except UnexpectedResponse as error:
             if "Collection not found" in str(error):
                 raise CollectionNotFoundError(
@@ -221,10 +246,28 @@ class QDrantAdapter(VectorDBInterface):
         )
 
     async def retrieve(self, collection_name: str, data_point_ids: list[str]):
+        if not data_point_ids:
+            return []
+        original_ids = [str(UUID(str(point_id))) for point_id in data_point_ids]
+        scoped_ids = [self._point_id(point_id) for point_id in original_ids]
         client = self.get_qdrant_client()
-        results = await client.retrieve(collection_name, data_point_ids, with_payload=True)
-        await client.close()
-        return results
+        try:
+            results = await client.retrieve(
+                collection_name, list(dict.fromkeys(original_ids + scoped_ids)), with_payload=True
+            )
+            # Retain legacy reads, but never return another dataset's points.
+            by_id = {}
+            for result in results:
+                if not result.payload or result.payload.get("database_name") != self.database_name:
+                    continue
+                original_id = str(result.payload.get("id", result.id))
+                if original_id not in original_ids:
+                    continue
+                if original_id not in by_id or str(result.id) == self._point_id(original_id):
+                    by_id[original_id] = result.model_copy(update={"id": original_id})
+            return list(by_id.values())
+        finally:
+            await client.close()
 
     async def search(
         self,
@@ -292,7 +335,9 @@ class QDrantAdapter(VectorDBInterface):
                 using="text",
                 limit=limit,
                 with_vectors=with_vector,
-                with_payload=include_payload,
+                # The payload ID maps the dataset-specific storage ID back to
+                # the original graph ID, even when callers omit payloads.
+                with_payload=True if include_payload else ["id"],
                 search_params=build_search_params(),
             )
 
@@ -303,10 +348,10 @@ class QDrantAdapter(VectorDBInterface):
 
             return [
                 ScoredResult(
-                    id=parse_id(str(result.id)),
+                    id=parse_id(str((result.payload or {}).get("id", result.id))),
                     payload=None
-                    if not result.payload
-                    else serialize_for_json({**result.payload, "id": str(result.id)}),
+                    if not include_payload or not result.payload
+                    else serialize_for_json(result.payload),
                     score=1 - result.score if hasattr(result, "score") else 1.0,
                 )
                 for result in results
@@ -410,9 +455,21 @@ class QDrantAdapter(VectorDBInterface):
             return []
 
     async def delete_data_points(self, collection_name: str, data_point_ids: list[str]):
+        if not data_point_ids:
+            return None
+        original_ids = [str(UUID(str(point_id))) for point_id in data_point_ids]
+        scoped_ids = [self._point_id(point_id) for point_id in original_ids]
         client = self.get_qdrant_client()
-        results = await client.delete(collection_name, data_point_ids)
-        return results
+        try:
+            return await client.delete(
+                collection_name,
+                points_selector=models.FilterSelector(
+                    filter=self._id_filter(list(dict.fromkeys(original_ids + scoped_ids)))
+                ),
+                wait=True,
+            )
+        finally:
+            await client.close()
 
     async def prune(self):
         client = self.get_qdrant_client()
