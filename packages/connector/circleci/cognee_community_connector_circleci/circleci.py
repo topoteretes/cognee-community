@@ -6,8 +6,10 @@ logs. Incremental by pipeline ``created_at``; forget-on-delete via ``_deleted``.
 
 from __future__ import annotations
 
+import functools
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import requests
@@ -44,6 +46,21 @@ _STATUS_PRIORITY = (
     "not_run",
     "success",
 )
+
+# Workflow statuses that will not change any more. Anything else (running,
+# failing, on_hold, or a status added later) means "check again next sync".
+_FINAL_WORKFLOW_STATUSES = frozenset(
+    {"success", "failed", "error", "canceled", "not_run", "unauthorized"}
+)
+# Pipeline states before CircleCI has created the workflows.
+_SETUP_PIPELINE_STATES = frozenset({"setup-pending", "setup", "pending"})
+
+# First sync of a project: how many of its most recent pipelines to ingest.
+# Later syncs take everything since the cursor.
+DEFAULT_MAX_INITIAL_PIPELINES = 50
+# Stop re-checking a pipeline that is still unfinished after this long, e.g. an
+# approval nobody clicks. Its last emitted row stays in memory.
+DEFAULT_PENDING_TIMEOUT_DAYS = 7
 
 # Slug prefix → path segment in the CircleCI web app's URLs.
 _APP_VCS_SEGMENT = {"gh": "github", "bb": "bitbucket"}
@@ -187,6 +204,19 @@ def _overall_status(pipeline: dict, workflows: list[dict]) -> str:
     return next((s for s in _STATUS_PRIORITY if s in statuses), min(statuses))
 
 
+def _is_finished(pipeline: dict, workflows: list[dict]) -> bool:
+    """True once nothing about the pipeline will change.
+
+    Decided from the workflows, not the pipeline ``state`` (which stays
+    ``created`` while they run). A pipeline with no workflows is finished unless
+    CircleCI is still setting it up: ``errored`` (bad config) and ``created``
+    with every workflow filtered out are both final.
+    """
+    if pipeline.get("state") in _SETUP_PIPELINE_STATES:
+        return False
+    return all(w.get("status") in _FINAL_WORKFLOW_STATUSES for w in workflows)
+
+
 def _render_content(
     pipeline: dict, workflows: list[dict], max_failing_tests: int, max_message_chars: int
 ) -> str:
@@ -275,6 +305,131 @@ def _pipeline_url(pipeline: dict) -> str:
         f"https://app.circleci.com/pipelines/{_APP_VCS_SEGMENT.get(vcs, vcs)}/{rest}/"
         f"{pipeline.get('number')}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Sync (pure given a session + state dict — unit-testable)
+# ---------------------------------------------------------------------------
+def sync_pipelines(
+    session: Any,
+    base_url: str,
+    state: dict,
+    *,
+    project_slugs: list[str],
+    branch: str | None = None,
+    max_initial_pipelines: int | None = DEFAULT_MAX_INITIAL_PIPELINES,
+    pending_timeout_days: float = DEFAULT_PENDING_TIMEOUT_DAYS,
+    max_failing_tests: int = DEFAULT_MAX_FAILING_TESTS,
+    max_message_chars: int = DEFAULT_MAX_MESSAGE_CHARS,
+    now: datetime | None = None,
+) -> Iterator[dict[str, Any]]:
+    """Yield a row for every new pipeline, and again for each one that has since finished.
+
+    ``state`` keeps one entry per project slug under ``state["projects"]``:
+
+    * ``cursor``: the newest pipeline ``created_at`` seen so far.
+    * ``pending``: ids of pipelines that were unfinished at the last sync.
+
+    Each run first re-checks the pending pipelines and emits a row only for
+    those that have finished, so their final status lands without re-ingesting
+    every in-between state. It then pages the newest-first pipeline listing and
+    stops at the cursor.
+    """
+    to_row = functools.partial(
+        _pipeline_to_row,
+        max_failing_tests=max_failing_tests,
+        max_message_chars=max_message_chars,
+    )
+    projects = state.setdefault("projects", {})
+    for slug in project_slugs:
+        yield from _sync_project(
+            session,
+            base_url,
+            slug,
+            projects.setdefault(slug, {}),
+            to_row=to_row,
+            branch=branch,
+            max_initial_pipelines=max_initial_pipelines,
+            pending_timeout=timedelta(days=pending_timeout_days),
+            now=now or datetime.now(UTC),
+        )
+
+
+def _sync_project(
+    session: Any,
+    base_url: str,
+    slug: str,
+    project_state: dict,
+    *,
+    to_row: Callable[[dict, list[dict]], dict[str, Any]],
+    branch: str | None,
+    max_initial_pipelines: int | None,
+    pending_timeout: timedelta,
+    now: datetime,
+) -> Iterator[dict[str, Any]]:
+    cursor: str | None = project_state.get("cursor")
+    still_pending: list[str] = []
+    new = finished = 0
+
+    # 1. Pipelines unfinished at the last sync: emit again only once finished.
+    for pipeline_id in project_state.get("pending", []):
+        try:
+            pipeline = _api_get(session, base_url, f"/pipeline/{pipeline_id}")
+        except requests.HTTPError as exc:
+            if exc.response is None or exc.response.status_code != 404:
+                raise
+            logger.info("CircleCI %s: pending pipeline %s is gone, dropping it.", slug, pipeline_id)
+            continue
+
+        workflows = _fetch_workflows(session, base_url, slug, pipeline_id)
+        if _is_finished(pipeline, workflows):
+            yield to_row(pipeline, workflows)
+            finished += 1
+        elif now - _parse_time(pipeline["created_at"]) > pending_timeout:
+            logger.warning(
+                "CircleCI %s: pipeline #%s still unfinished after %s, no longer re-checking it.",
+                slug,
+                pipeline.get("number"),
+                pending_timeout,
+            )
+        else:
+            still_pending.append(pipeline_id)
+
+    # 2. Pipelines created since the cursor. The listing is newest-first, so stop
+    #    at the first one at or before the cursor (later pages are never fetched).
+    newest = cursor
+    params = {"branch": branch} if branch else {}
+    listing = _paginate(session, base_url, f"/project/{slug}/pipeline", params)
+    for seen, pipeline in enumerate(listing):
+        created = _parse_time(pipeline["created_at"])
+        if cursor is not None and created <= _parse_time(cursor):
+            break
+        if cursor is None and max_initial_pipelines is not None and seen >= max_initial_pipelines:
+            break
+
+        workflows = _fetch_workflows(session, base_url, slug, pipeline["id"])
+        yield to_row(pipeline, workflows)
+        new += 1
+        if not _is_finished(pipeline, workflows):
+            still_pending.append(pipeline["id"])
+        if newest is None or created > _parse_time(newest):
+            newest = pipeline["created_at"]
+
+    project_state["cursor"] = newest
+    project_state["pending"] = still_pending
+    logger.info(
+        "CircleCI %s: %d new pipeline(s), %d finished since last sync, %d still pending.",
+        slug,
+        new,
+        finished,
+        len(still_pending),
+    )
+
+
+def _parse_time(timestamp: str) -> datetime:
+    # Parsed rather than compared as strings: as text, "21:33:18Z" sorts after
+    # "21:33:18.514Z" even though it is earlier.
+    return datetime.fromisoformat(timestamp)
 
 
 def circleci_source(

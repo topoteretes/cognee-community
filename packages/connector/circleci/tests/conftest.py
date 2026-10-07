@@ -24,16 +24,20 @@ def _response(status: int, body: dict | None = None, headers: dict | None = None
 class FakeSession:
     """Stand-in for ``requests.Session`` that answers GETs from ``tests/fixtures/``.
 
-    ``index`` names an index.json under fixtures/ that maps each request path to a
-    recorded response file and status. Responses queued for a path with
+    ``indexes`` name index.json files under fixtures/ that map each request path
+    to a recorded response file and status. Later indexes override earlier ones,
+    so ``FakeSession("index.json", "slow-running/index.json")`` is the project as
+    it looked once pipeline #6 had started. Responses queued for a path with
     :meth:`queue` are served first, in order: that is how tests inject 429s, 5xx
     errors, network errors or extra pages. A path that is neither queued nor
     recorded raises KeyError, so a test fails loudly if the connector asks for
     something unexpected.
     """
 
-    def __init__(self, index: str = "index.json"):
-        self.routes = json.loads((FIXTURES / index).read_text())
+    def __init__(self, *indexes: str):
+        self.routes: dict[str, dict] = {}
+        for index in indexes or ("index.json",):
+            self.routes.update(json.loads((FIXTURES / index).read_text()))
         self.queued: dict[str, list] = {}
         self.calls: list[tuple[str, dict]] = []
 
@@ -63,7 +67,7 @@ def fake_session():
 
 @pytest.fixture
 def session_for():
-    """Factory for a FakeSession over another index, e.g. ``"slow-running/index.json"``."""
+    """Factory for a FakeSession over other indexes, e.g. ``"slow-running/index.json"``."""
     return FakeSession
 
 
