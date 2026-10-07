@@ -7,6 +7,7 @@ logs. Incremental by pipeline ``created_at``; forget-on-delete via ``_deleted``.
 from __future__ import annotations
 
 import functools
+import itertools
 import time
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
@@ -323,17 +324,24 @@ def sync_pipelines(
     max_message_chars: int = DEFAULT_MAX_MESSAGE_CHARS,
     now: datetime | None = None,
 ) -> Iterator[dict[str, Any]]:
-    """Yield a row for every new pipeline, and again for each one that has since finished.
+    """Yield a row for every new pipeline, again for each one that has since finished,
+    and a ``_deleted`` row for each pipeline of a project that is gone.
 
     ``state`` keeps one entry per project slug under ``state["projects"]``:
 
     * ``cursor``: the newest pipeline ``created_at`` seen so far.
     * ``pending``: ids of pipelines that were unfinished at the last sync.
+    * ``known_ids``: every pipeline id ingested for the project, for deletes.
 
     Each run first re-checks the pending pipelines and emits a row only for
     those that have finished, so their final status lands without re-ingesting
     every in-between state. It then pages the newest-first pipeline listing and
     stops at the cursor.
+
+    A project is forgotten (all its pipelines hard-deleted) when its listing
+    returns 404, meaning it was deleted or the token can no longer see it, or
+    when its slug is dropped from ``project_slugs``. Pipelines that age out of
+    CircleCI's retention are kept, since CircleCI never deletes them on purpose.
     """
     to_row = functools.partial(
         _pipeline_to_row,
@@ -341,6 +349,9 @@ def sync_pipelines(
         max_message_chars=max_message_chars,
     )
     projects = state.setdefault("projects", {})
+    for slug in [s for s in projects if s not in project_slugs]:
+        yield from _forget_project(slug, projects.pop(slug), "no longer in project_slugs")
+
     for slug in project_slugs:
         yield from _sync_project(
             session,
@@ -367,7 +378,21 @@ def _sync_project(
     pending_timeout: timedelta,
     now: datetime,
 ) -> Iterator[dict[str, Any]]:
+    params = {"branch": branch} if branch else {}
+    listing = _paginate(session, base_url, f"/project/{slug}/pipeline", params)
+    # Fetch the first page before anything else: a 404 here means the project is
+    # gone. Only this request's 404 counts; a 404 for a single pipeline further
+    # down must never forget the whole project. A bad token is a 401 and raises.
+    try:
+        first = next(listing, None)
+    except requests.HTTPError as exc:
+        if not _is_not_found(exc):
+            raise
+        yield from _forget_project(slug, project_state, "project not found")
+        return
+
     cursor: str | None = project_state.get("cursor")
+    known_ids: set[str] = set(project_state.get("known_ids", []))
     still_pending: list[str] = []
     new = finished = 0
 
@@ -376,8 +401,9 @@ def _sync_project(
         try:
             pipeline = _api_get(session, base_url, f"/pipeline/{pipeline_id}")
         except requests.HTTPError as exc:
-            if exc.response is None or exc.response.status_code != 404:
+            if not _is_not_found(exc):
                 raise
+            # Kept in memory, like any other pipeline CircleCI no longer has.
             logger.info("CircleCI %s: pending pipeline %s is gone, dropping it.", slug, pipeline_id)
             continue
 
@@ -398,9 +424,8 @@ def _sync_project(
     # 2. Pipelines created since the cursor. The listing is newest-first, so stop
     #    at the first one at or before the cursor (later pages are never fetched).
     newest = cursor
-    params = {"branch": branch} if branch else {}
-    listing = _paginate(session, base_url, f"/project/{slug}/pipeline", params)
-    for seen, pipeline in enumerate(listing):
+    pipelines = itertools.chain([first], listing) if first is not None else iter(())
+    for seen, pipeline in enumerate(pipelines):
         created = _parse_time(pipeline["created_at"])
         if cursor is not None and created <= _parse_time(cursor):
             break
@@ -410,6 +435,7 @@ def _sync_project(
         workflows = _fetch_workflows(session, base_url, slug, pipeline["id"])
         yield to_row(pipeline, workflows)
         new += 1
+        known_ids.add(pipeline["id"])
         if not _is_finished(pipeline, workflows):
             still_pending.append(pipeline["id"])
         if newest is None or created > _parse_time(newest):
@@ -417,6 +443,7 @@ def _sync_project(
 
     project_state["cursor"] = newest
     project_state["pending"] = still_pending
+    project_state["known_ids"] = sorted(known_ids)
     logger.info(
         "CircleCI %s: %d new pipeline(s), %d finished since last sync, %d still pending.",
         slug,
@@ -424,6 +451,24 @@ def _sync_project(
         finished,
         len(still_pending),
     )
+
+
+def _forget_project(slug: str, project_state: dict, reason: str) -> Iterator[dict[str, Any]]:
+    """Hard-delete every pipeline ingested for a project and reset its state."""
+    known_ids = project_state.get("known_ids", [])
+    logger.warning("CircleCI %s: %s, forgetting its %d pipeline(s).", slug, reason, len(known_ids))
+    for pipeline_id in known_ids:
+        yield _deleted_row(pipeline_id)
+    project_state.clear()
+
+
+def _deleted_row(pipeline_id: str) -> dict[str, Any]:
+    """A minimal row that tells dlt to hard-delete a pipeline by id."""
+    return {"id": str(pipeline_id), "_deleted": True}
+
+
+def _is_not_found(exc: requests.HTTPError) -> bool:
+    return exc.response is not None and exc.response.status_code == 404
 
 
 def _parse_time(timestamp: str) -> datetime:

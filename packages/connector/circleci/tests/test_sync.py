@@ -27,6 +27,10 @@ SLOW_RERUN_CREATED = "2026-10-07T21:48:46.048Z"
 # doesn't depend on the day the tests run.
 NOW = datetime.fromisoformat("2026-10-07T22:00:00Z")
 
+# known_ids after the first sync, and after #6 has been seen.
+FIRST_FIVE = sorted([HOLD, SLOW, MANY, GREEN, MAIN])
+ALL_SIX = sorted([*FIRST_FIVE, SLOW_RERUN])
+
 
 def _sync(session, state, **kwargs):
     kwargs.setdefault("now", NOW)
@@ -47,7 +51,11 @@ def test_first_sync_emits_every_pipeline_and_keeps_unfinished_ones_pending(fake_
     rows = _sync(fake_session, state)
 
     assert [r["id"] for r in rows] == [HOLD, SLOW, MANY, GREEN, MAIN]
-    assert _project(state) == {"cursor": HOLD_CREATED, "pending": [HOLD]}
+    assert _project(state) == {
+        "cursor": HOLD_CREATED,
+        "pending": [HOLD],
+        "known_ids": FIRST_FIVE,
+    }
 
 
 def test_second_sync_with_nothing_new_emits_nothing(session_for):
@@ -59,7 +67,11 @@ def test_second_sync_with_nothing_new_emits_nothing(session_for):
 
     assert rows == []
     # HOLD is re-checked (still on hold) but not emitted again.
-    assert _project(state) == {"cursor": HOLD_CREATED, "pending": [HOLD]}
+    assert _project(state) == {
+        "cursor": HOLD_CREATED,
+        "pending": [HOLD],
+        "known_ids": FIRST_FIVE,
+    }
     # Paging stopped at the cursor: no older pipeline was fetched again.
     assert f"/pipeline/{SLOW}/workflow" not in _requested(session)
 
@@ -72,7 +84,11 @@ def test_new_running_pipeline_is_emitted_and_kept_pending(session_for):
 
     assert [r["id"] for r in rows] == [SLOW_RERUN]
     assert rows[0]["title"].endswith(": running")
-    assert _project(state) == {"cursor": SLOW_RERUN_CREATED, "pending": [HOLD, SLOW_RERUN]}
+    assert _project(state) == {
+        "cursor": SLOW_RERUN_CREATED,
+        "pending": [HOLD, SLOW_RERUN],
+        "known_ids": ALL_SIX,
+    }
 
 
 def test_pending_pipeline_is_emitted_again_once_finished(session_for):
@@ -85,7 +101,11 @@ def test_pending_pipeline_is_emitted_again_once_finished(session_for):
     assert [r["id"] for r in rows] == [SLOW_RERUN]
     assert rows[0]["title"].endswith(": failed")
     assert "- slow: success" in rows[0]["content"]
-    assert _project(state) == {"cursor": SLOW_RERUN_CREATED, "pending": [HOLD]}
+    assert _project(state) == {
+        "cursor": SLOW_RERUN_CREATED,
+        "pending": [HOLD],
+        "known_ids": ALL_SIX,
+    }
 
 
 def test_unfinished_pipeline_is_dropped_after_the_timeout(session_for):
@@ -133,8 +153,12 @@ def test_each_project_keeps_its_own_state(fake_session):
         sync_pipelines(fake_session, DEFAULT_BASE_URL, state, project_slugs=[SLUG, other], now=NOW)
     )
 
-    assert state["projects"][SLUG] == {"cursor": HOLD_CREATED, "pending": [HOLD]}
-    assert state["projects"][other] == {"cursor": None, "pending": []}
+    assert state["projects"][SLUG] == {
+        "cursor": HOLD_CREATED,
+        "pending": [HOLD],
+        "known_ids": FIRST_FIVE,
+    }
+    assert state["projects"][other] == {"cursor": None, "pending": [], "known_ids": []}
 
 
 @pytest.mark.parametrize(
