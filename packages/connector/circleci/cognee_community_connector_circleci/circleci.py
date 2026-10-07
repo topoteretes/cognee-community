@@ -25,8 +25,9 @@ from __future__ import annotations
 
 import os
 import time
-from datetime import datetime, timedelta, timezone
-from typing import Any, Iterable, Iterator
+from collections.abc import Iterable, Iterator
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from cognee.shared.logging_utils import get_logger
 from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
@@ -146,11 +147,10 @@ def circleci_source(
         last_created_at = state.get("last_created_at")
         if last_created_at:
             # Subtract the overlap window so late-updating jobs are not missed.
-            cursor_dt = (
-                datetime.fromisoformat(last_created_at)
-                - timedelta(minutes=_OVERLAP_WINDOW_MINUTES)
+            cursor_dt = datetime.fromisoformat(last_created_at) - timedelta(
+                minutes=_OVERLAP_WINDOW_MINUTES
             )
-            cursor_iso = cursor_dt.astimezone(timezone.utc).isoformat()
+            cursor_iso = cursor_dt.astimezone(UTC).isoformat()
         else:
             cursor_iso = None
 
@@ -266,7 +266,7 @@ def _execution_to_document(client: Any, execution: dict[str, Any]) -> dict[str, 
                         for job in jobs_data.get("items", []):
                             job_record = _extract_job(client, execution, job)
                             jobs.append(job_record)
-                    except Exception:  # noqa: BLE001 — best-effort enrichment
+                    except Exception:
                         logger.warning("Failed to fetch jobs for workflow %s", wf_id)
                 workflows.append(
                     {
@@ -278,7 +278,7 @@ def _execution_to_document(client: Any, execution: dict[str, Any]) -> dict[str, 
                         "jobs": jobs,
                     }
                 )
-        except Exception:  # noqa: BLE001 — best-effort enrichment
+        except Exception:
             logger.warning("Failed to fetch workflows for pipeline %s", pipeline_id)
 
     trigger = execution.get("trigger", {}) or {}
@@ -288,14 +288,12 @@ def _execution_to_document(client: Any, execution: dict[str, Any]) -> dict[str, 
     # Build a prose-friendly text body that will be cognified.
     body_sections: list[str] = []
     body_sections.append(
-        f"CircleCI pipeline #{execution.get('number')} "
-        f"({execution.get('state', 'unknown')})"
+        f"CircleCI pipeline #{execution.get('number')} ({execution.get('state', 'unknown')})"
     )
     body_sections.append(f"Project: {execution.get('project_slug', 'unknown')}")
     body_sections.append(f"Branch: {execution.get('vcs', {}).get('branch', 'unknown')}")
     body_sections.append(
-        f"Commit: {commit.get('subject', '')} "
-        f"({commit.get('sha', 'unknown')[:7]})"
+        f"Commit: {commit.get('subject', '')} ({commit.get('sha', 'unknown')[:7]})"
     )
     body_sections.append(f"Author: {actor.get('login', 'unknown')}")
     body_sections.append(f"Created: {execution.get('created_at', 'unknown')}")
@@ -371,7 +369,7 @@ def _extract_job(
                     if t.get("result") != "success"
                 ]
                 job_record["tests"] = failed_tests
-            except Exception:  # noqa: BLE001 — best-effort enrichment
+            except Exception:
                 logger.warning(
                     "Failed to fetch tests for job %s of project %s",
                     job_number,

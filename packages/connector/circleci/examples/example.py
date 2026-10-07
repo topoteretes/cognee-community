@@ -8,6 +8,7 @@ import asyncio
 import os
 
 import cognee
+
 from cognee_community_connector_circleci import circleci_source
 
 
@@ -33,7 +34,7 @@ async def main() -> None:
 
     print("Ingesting CircleCI pipeline executions …")
     await cognee.add(source)
-    print("Done. Try cognee.search(\"why did my latest build fail?\")")
+    print('Done. Try cognee.search("why did my latest build fail?")')
 
 
 if __name__ == "__main__":
