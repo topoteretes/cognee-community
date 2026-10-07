@@ -1,0 +1,8 @@
+from cognee.infrastructure.databases.dataset_database_handler import use_dataset_database_handler
+from cognee.infrastructure.databases.vector import use_vector_adapter
+
+from .ClickHouseDatasetDatabaseHandler import ClickHouseDatasetDatabaseHandler
+from .clickhouse_adapter import ClickHouseAdapter
+
+use_vector_adapter("clickhouse", ClickHouseAdapter)
+use_dataset_database_handler("clickhouse", ClickHouseDatasetDatabaseHandler, "clickhouse")
