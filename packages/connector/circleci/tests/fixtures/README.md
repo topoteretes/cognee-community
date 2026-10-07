@@ -13,5 +13,6 @@ Real CircleCI API v2 responses, captured on 2026-10-08 from the public fixture p
 | `hold/` | #5, unfinished | `needs-approval` is `on_hold`: the approval job is `on_hold`, `deploy` is `blocked` |
 | `errors/` | | 404 body for a project that doesn't exist |
 | `slow-running/` | #6, unfinished | Captured mid-run: `slow-check` and its `slow` job are `running` (`stopped_at` is null), `build-and-test` already failed. Its `pipelines.json` lists #6 first. Has its own `index.json`. |
+| `slow-finished/` | #6, success | The same pipeline after `slow-check` finished (`success`). Pair it with `slow-running/` for the re-check test: unfinished on one sync, final on the next. Has its own `index.json`. |
 
 Each pipeline's `state` is `created` even once its workflows are done, so "finished" comes from the workflow statuses.
