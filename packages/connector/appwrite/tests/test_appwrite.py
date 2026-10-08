@@ -29,8 +29,7 @@ def test_render_document_content_and_metadata():
         "api_key": "secret_key_12345",
     }
 
-    content = _render_document_content(doc, "Onboarding Guide")
-    assert "# Onboarding Guide" in content
+    content = _render_document_content(doc)
     assert "Welcome to our knowledge base." in content
     assert "author: Alice Smith" in content
     assert "category: Documentation" in content
@@ -61,7 +60,7 @@ def test_document_to_row_structure():
         == "https://cloud.appwrite.io/v1/databases/main_db/collections/articles/documents/post_999"
     )
     assert row["title"] == "Architecture Overview"
-    assert "# Architecture Overview" in row["content"]
+    assert "System architecture diagram and explanation." in row["content"]
 
 
 def test_client_pagination_streaming():
@@ -183,17 +182,22 @@ def test_appwrite_source_missing_credentials_raises():
 
 
 def test_sensitive_field_sanitization_in_nested_dict():
-    """Verify nested dictionaries have sensitive fields removed."""
+    """Verify deeply nested dictionaries and lists have sensitive fields removed."""
     doc = {
         "$id": "nested_1",
         "title": "Nested Doc",
         "metadata": {
             "department": "Engineering",
-            "password": "super_secret_value",
-            "token": "secret_jwt_token",
+            "credentials": {
+                "password": "super_secret_value",
+                "token": "secret_jwt_token",
+                "nested_array": [{"secret": "inner_secret", "name": "valid_item"}],
+            },
         },
     }
-    content = _render_document_content(doc, "Nested Doc")
+    content = _render_document_content(doc)
     assert "Engineering" in content
+    assert "valid_item" in content
     assert "super_secret_value" not in content
     assert "secret_jwt_token" not in content
+    assert "inner_secret" not in content

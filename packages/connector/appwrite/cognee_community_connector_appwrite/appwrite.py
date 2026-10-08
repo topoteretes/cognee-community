@@ -257,6 +257,8 @@ def appwrite_source(
             if client is None:
                 appwrite_client.close()
 
+    setattr(appwrite_documents, DOCUMENT_SOURCE_ATTR, APPWRITE_SOURCE_NAME)
+
     @dlt.source(name=APPWRITE_SOURCE_NAME)
     def _appwrite():
         return appwrite_documents
@@ -279,7 +281,7 @@ def _document_to_row(
 
     title = _extract_document_title(doc, doc_id)
     url = f"{endpoint}/databases/{database_id}/collections/{collection_id}/documents/{doc_id}"
-    content = _render_document_content(doc, title) or title
+    content = _render_document_content(doc) or title
 
     return {
         "id": f"appwrite:{database_id}:{collection_id}:{doc_id}",
@@ -298,9 +300,22 @@ def _extract_document_title(doc: dict[str, Any], doc_id: str) -> str:
     return f"Appwrite Document {doc_id}"
 
 
-def _render_document_content(doc: dict[str, Any], title: str) -> str:
+def _sanitize_value(val: Any) -> Any:
+    """Recursively redact sensitive field names in nested dictionaries and lists."""
+    if isinstance(val, dict):
+        return {
+            k: _sanitize_value(v)
+            for k, v in val.items()
+            if k.lower() not in _SENSITIVE_FIELD_NAMES
+        }
+    if isinstance(val, list):
+        return [_sanitize_value(item) for item in val]
+    return val
+
+
+def _render_document_content(doc: dict[str, Any]) -> str:
     """Format Appwrite document attributes into clean markdown for cognify."""
-    lines: list[str] = [f"# {title}", ""]
+    lines: list[str] = []
 
     # Body fields
     body_parts: list[str] = []
@@ -328,16 +343,12 @@ def _render_document_content(doc: dict[str, Any], title: str) -> str:
         elif isinstance(v, list) and v and isinstance(v[0], (str, int, float)):
             metadata_lines.append(f"{k}: {', '.join(str(item) for item in v)}")
         elif isinstance(v, dict):
-            # Mask sensitive values in nested dicts
-            clean_dict = {
-                dk: dv
-                for dk, dv in v.items()
-                if dk.lower() not in _SENSITIVE_FIELD_NAMES
-            }
+            clean_dict = _sanitize_value(v)
             metadata_lines.append(f"{k}: {json.dumps(clean_dict, sort_keys=True)}")
 
     if metadata_lines:
-        lines.append("---")
+        if lines:
+            lines.append("---")
         lines.extend(metadata_lines)
 
     return "\n".join(lines).strip()
