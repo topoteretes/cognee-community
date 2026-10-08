@@ -74,3 +74,53 @@ def test_noop_and_overwrite():
     assert first == snapshot_rows(s3, "bucket", "a/")
     s3.objects["a/1.txt"] = b"two"
     assert snapshot_rows(s3, "bucket", "a/")[0]["content"] == "two"
+
+
+def test_incremental_reuses_unchanged_content_and_detects_overwrite():
+    class CountingS3(FakeS3):
+        reads = 0
+
+        def get_object(self, **kwargs):
+            self.reads += 1
+            return super().get_object(**kwargs)
+
+    s3 = CountingS3({"a/1.txt": b"one"})
+    rows, manifest = snapshot_rows(s3, "bucket", "a/", previous={})
+    assert s3.reads == 1
+    rows2, manifest2 = snapshot_rows(s3, "bucket", "a/", previous=manifest)
+    assert rows2 == rows and s3.reads == 1
+    s3.objects["a/1.txt"] = b"longer"
+    rows3, manifest3 = snapshot_rows(s3, "bucket", "a/", previous=manifest2)
+    assert rows3[0]["content"] == "longer" and s3.reads == 2
+    assert manifest3 != manifest2
+
+
+def test_failed_incremental_run_does_not_mutate_checkpoint():
+    s3 = FakeS3({"a/1.txt": b"one"})
+    _, manifest = snapshot_rows(s3, "bucket", "a/", previous={})
+    original = dict(manifest)
+    s3.objects["a/1.txt"] = b"longer"
+    s3.fail_get = True
+    with pytest.raises(PermissionError):
+        snapshot_rows(s3, "bucket", "a/", previous=manifest)
+    assert manifest == original
+
+
+def test_incremental_last_object_deletion():
+    s3 = FakeS3({"a/1.txt": b"one"})
+    _, manifest = snapshot_rows(s3, "bucket", "a/", previous={})
+    s3.objects.clear()
+    rows, next_manifest = snapshot_rows(s3, "bucket", "a/", previous=manifest)
+    assert rows == [] and next_manifest == {}
+    assert manifest
+
+
+def test_incomplete_listing_fails_closed():
+    class TruncatedS3(FakeS3):
+        def get_paginator(self, name):
+            class Paginator:
+                def paginate(self, **kwargs):
+                    yield {"IsTruncated": True, "Contents": []}
+            return Paginator()
+    with pytest.raises(ValueError, match="incomplete"):
+        snapshot_rows(TruncatedS3(), "bucket")
