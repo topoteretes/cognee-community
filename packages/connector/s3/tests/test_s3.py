@@ -124,3 +124,25 @@ def test_incomplete_listing_fails_closed():
             return Paginator()
     with pytest.raises(ValueError, match="incomplete"):
         snapshot_rows(TruncatedS3(), "bucket")
+
+
+def test_scoped_manifest_persistence(tmp_path):
+    from cognee_community_connector_s3.s3 import load_manifest, save_manifest, prepare_sync
+    path = tmp_path / "checkpoint.json"
+    s3 = FakeS3({"a/1.txt": b"one"})
+    rows, pending = prepare_sync(s3, "bucket", "a/", path)
+    assert not path.exists()  # prepare never advances checkpoint
+    save_manifest(path, "bucket", "a/", pending)
+    assert load_manifest(path, "bucket", "a/")["s3://bucket/a/1.txt"]["content"] == "one"
+    with pytest.raises(ValueError, match="scope"):
+        load_manifest(path, "bucket", "b/")
+    rows2, _ = prepare_sync(s3, "bucket", "a/", path)
+    assert rows2 == rows
+
+
+def test_corrupt_manifest_fails_closed(tmp_path):
+    from cognee_community_connector_s3.s3 import load_manifest
+    path = tmp_path / "checkpoint.json"
+    path.write_text("{invalid")
+    with pytest.raises(ValueError):
+        load_manifest(path, "bucket", "a/")

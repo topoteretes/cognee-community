@@ -6,6 +6,10 @@ orphan cleanup. No credentials, contents, or object metadata are logged.
 from __future__ import annotations
 
 from urllib.parse import quote
+import json
+import os
+import tempfile
+from pathlib import Path
 
 TABLE_NAME = "s3_documents"
 SOURCE_NAME = "s3"
@@ -68,6 +72,45 @@ def snapshot_rows(client, bucket: str, prefix: str = "", *,
                      "content": content, "url": identity})
         manifest[identity] = {"signature": signature, "content": content}
     return (rows, manifest) if previous is not None else rows
+
+
+def _scope_id(bucket: str, prefix: str) -> str:
+    import hashlib
+    return hashlib.sha256(json.dumps([bucket, prefix]).encode()).hexdigest()
+
+
+def load_manifest(path, bucket: str, prefix: str):
+    """Read a scoped local checkpoint. A corrupt checkpoint is an error."""
+    file = Path(path)
+    if not file.exists():
+        return {}
+    payload = json.loads(file.read_text(encoding="utf-8"))
+    if payload.get("scope") != _scope_id(bucket, prefix) or not isinstance(payload.get("entries"), dict):
+        raise ValueError("manifest scope mismatch or invalid entries")
+    return payload["entries"]
+
+
+def save_manifest(path, bucket: str, prefix: str, entries: dict):
+    """Atomic checkpoint replacement. Call only after downstream publication."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"scope": _scope_id(bucket, prefix), "entries": entries}
+    fd, temp = tempfile.mkstemp(prefix=".s3-manifest-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            json.dump(payload, output, sort_keys=True, default=str)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temp, path)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+
+
+def prepare_sync(client, bucket: str, prefix: str, manifest_path, **limits):
+    """Prepare complete rows and a pending checkpoint; no side effects."""
+    previous = load_manifest(manifest_path, bucket, prefix)
+    return snapshot_rows(client, bucket, prefix, previous=previous, **limits)
 
 
 def s3_source(bucket: str, prefix: str = "", *, client=None,
