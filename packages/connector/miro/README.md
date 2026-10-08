@@ -88,4 +88,19 @@ uv run pytest tests/
 ```
 
 The tests use a fake Miro client and a local SQLite dlt destination. No live
-Miro credentials are required.
+Miro credentials are required; the live endpoint test is skipped by default.
+
+To verify the stable board-wide items endpoint and its cursor pagination
+against a board you can access, run:
+
+```bash
+export MIRO_ACCESS_TOKEN="your-oauth-access-token"
+export MIRO_BOARD_ID="uXjVExampleBoardId="
+uv run pytest tests/test_miro_live.py -v
+```
+
+The connector calls Miro's documented
+[`GET /v2/boards/{board_id}/items`](https://developers.miro.com/reference/get-items-1)
+operation without `parent_item_id`, so it receives the complete board inventory
+needed for frame grouping and deletion reconciliation. The live test checks
+only the returned record shape and does not print board content or credentials.

@@ -97,6 +97,9 @@ class _MiroRESTSource:
         return self._extract(config, "boards")
 
     def list_items(self, board_id: str) -> list[dict[str, Any]]:
+        # This is Miro's stable, board-wide inventory endpoint. Supplying
+        # parent_item_id would narrow the same route to one frame and make
+        # deletion reconciliation incomplete.
         config = {
             "client": self._client_config(),
             "resources": [

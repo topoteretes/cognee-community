@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 import requests
@@ -118,7 +119,7 @@ def test_declarative_rest_source_handles_auth_and_cursor_pagination() -> None:
     client = _MiroRESTSource("oauth-token", session=session)
 
     boards = client.list_boards(team_id="team-1")
-    items = client.list_items("board-1")
+    items = client.list_items("uXjVExampleBoardId=")
 
     assert [board["id"] for board in boards] == ["board-1"]
     assert [item["id"] for item in items] == ["f1", "second"]
@@ -126,6 +127,22 @@ def test_declarative_rest_source_handles_auth_and_cursor_pagination() -> None:
     assert all(
         request.headers["Authorization"] == "Bearer oauth-token" for request in adapter.requests
     )
+
+    item_requests = [request for request in adapter.requests if "/items?" in request.url]
+    assert len(item_requests) == 2
+    assert all(
+        urlsplit(request.url).path == "/v2/boards/uXjVExampleBoardId=/items"
+        for request in item_requests
+    )
+    assert all(
+        "parent_item_id" not in parse_qs(urlsplit(request.url).query)
+        for request in item_requests
+    )
+    assert parse_qs(urlsplit(item_requests[0].url).query) == {"limit": ["50"]}
+    assert parse_qs(urlsplit(item_requests[1].url).query) == {
+        "cursor": ["next-page"],
+        "limit": ["50"],
+    }
 
 
 def test_board_documents_group_by_frame_and_keep_unframed_items() -> None:
