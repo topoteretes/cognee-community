@@ -265,6 +265,114 @@ async def test_failed_graph_cleanup_is_retried_on_zero_delta_sync(local_memory):
     assert all(request["source"] is False for request in client.requests)
 
 
+async def test_delete_removes_derived_graph_and_vectors_but_preserves_shared_facts(local_memory):
+    from cognee.infrastructure.databases.graph import get_graph_engine
+    from cognee.infrastructure.databases.vector import get_vector_engine_async
+    from cognee.shared.data_models import Edge, KnowledgeGraph, Node, SummarizedContent
+
+    dataset_name = "es_shared_graph_cleanup"
+    client = FakeElasticsearch(
+        [
+            document("remove", body="Retiring service depends on Shared gateway and Platform."),
+            document("keep", body="Active service depends on Shared gateway and Platform."),
+        ]
+    )
+
+    async def output(text_input, system_prompt, response_model, **kwargs):
+        if response_model.__name__ == "KnowledgeGraph":
+            service = "Retiring service" if "Retiring service" in text_input else "Active service"
+            return KnowledgeGraph(
+                nodes=[
+                    Node(id="service", name=service, type="Concept", description=service),
+                    Node(
+                        id="gateway",
+                        name="Shared gateway",
+                        type="Concept",
+                        description="A gateway used by both services",
+                    ),
+                    Node(id="platform", name="Platform", type="Concept", description="Platform"),
+                ],
+                edges=[
+                    Edge(
+                        source_node_id="service",
+                        target_node_id="gateway",
+                        relationship_name="depends_on",
+                    ),
+                    Edge(
+                        source_node_id="gateway",
+                        target_node_id="platform",
+                        relationship_name="supports",
+                    ),
+                ],
+            )
+        if response_model.__name__ == "SummarizedContent":
+            return SummarizedContent(summary=text_input[:120], description="Test summary")
+        return response_model()
+
+    async def graph_and_entity_vectors(known_ids=()):
+        user = await get_default_user()
+        dataset = (
+            await get_authorized_existing_datasets(
+                user=user, permission_type="read", datasets=[dataset_name]
+            )
+        )[0]
+        async with set_database_global_context_variables(dataset.id, dataset.owner_id):
+            nodes, edges = await (await get_graph_engine()).get_graph_data()
+            entities = {
+                properties["name"]: node_id
+                for node_id, properties in nodes
+                if properties.get("type") == "Entity"
+            }
+            names = {node_id: name for name, node_id in entities.items()}
+            facts = {
+                (names[source], relation, names[target])
+                for source, target, relation, _ in edges
+                if source in names and target in names
+            }
+            vectors = await (await get_vector_engine_async()).retrieve(
+                "Entity_name", list(known_ids or entities.values())
+            )
+        return entities, facts, {str(vector.id) for vector in vectors}, nodes, edges
+
+    with patch(
+        "cognee.infrastructure.llm.LLMGateway.LLMGateway.acreate_structured_output",
+        side_effect=output,
+    ):
+        await remember(client, dataset_name=dataset_name)
+        entities, facts, vector_ids, _, _ = await graph_and_entity_vectors()
+        assert set(entities) == {"retiring service", "active service", "shared gateway", "platform"}
+        assert facts == {
+            ("retiring service", "depends_on", "shared gateway"),
+            ("active service", "depends_on", "shared gateway"),
+            ("shared gateway", "supports", "platform"),
+        }
+        assert vector_ids == set(entities.values())
+        original_ids = set(entities.values())
+        removed_id = entities["retiring service"]
+        client.documents = [client.documents[1]]
+
+        await remember(client, dataset_name=dataset_name)
+        survivors, facts, vector_ids, nodes, edges = await graph_and_entity_vectors(original_ids)
+        assert survivors == {name: id for name, id in entities.items() if id != removed_id}
+        assert facts == {
+            ("active service", "depends_on", "shared gateway"),
+            ("shared gateway", "supports", "platform"),
+        }
+        assert vector_ids == original_ids - {removed_id}
+        assert all(node_id != removed_id for node_id, _ in nodes)
+        assert all(removed_id not in (source, target) for source, target, _, _ in edges)
+        records, text, count = await snapshot(dataset_name)
+        assert len(records) == count == 1 and "Retiring service" not in text
+
+        client.documents = []
+        await remember(client, dataset_name=dataset_name)
+        survivors, facts, vector_ids, nodes, edges = await graph_and_entity_vectors(original_ids)
+        assert survivors == {} and facts == set() and vector_ids == set()
+        assert nodes == [] and edges == []
+        records, _, count = await snapshot(dataset_name)
+        assert records == [] and count == 0
+
+
 @pytest.mark.live
 async def test_runnable_example_with_live_source_updates_and_deletion(
     local_memory, live, monkeypatch, capsys

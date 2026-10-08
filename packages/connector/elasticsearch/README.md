@@ -128,8 +128,10 @@ prose as relational schema data. Include `title_field` in `fields` to get a titl
 
 Limitations: local indices/aliases only (no cross-cluster search); one update date
 mapping across indices; memory and persisted state scale with the selected corpus.
-An index removed entirely raises instead of authorizing a mass deletion. Empty its
-contents and sync first if that is intended. Index UUIDs distinguish an index
+An unavailable index selection raises instead of authorizing a mass deletion.
+Empty its contents and sync first if that is intended. If a wildcard or alias
+still resolves to other indices, documents from a removed index are forgotten.
+Index UUIDs distinguish an index
 recreated under the same name; sequence numbers alone are not permanent identities
 across index incarnations. Changing query or
 field selection creates a new scope; it does not remove the previous scope's memory.
