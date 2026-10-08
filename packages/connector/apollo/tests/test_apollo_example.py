@@ -19,7 +19,7 @@ def _load_example():
 
 
 @pytest.mark.asyncio
-async def test_the_example_syncs_recalls_and_resyncs(mocked_llm, monkeypatch, capsys):
+async def test_the_example_backfills_searches_and_resyncs(mocked_llm, monkeypatch, capsys):
     fake = FakeApollo()
     fake.add_sequence("s1", "Q4 Outreach")
     fake.add_account("a1", "Acme")
@@ -39,4 +39,13 @@ async def test_the_example_syncs_recalls_and_resyncs(mocked_llm, monkeypatch, ca
     assert len(stats) == 2
     assert "'failed': 0" in stats[0]
     assert "'skipped': 3" in stats[1]  # the second run finds nothing new
-    assert any(line.startswith("recall:") for line in output)
+    assert any(line.startswith("CRM answer:") for line in output)
+
+
+@pytest.mark.asyncio
+async def test_the_example_explains_a_missing_key_instead_of_crashing(monkeypatch, capsys):
+    monkeypatch.delenv("APOLLO_API_KEY", raising=False)
+
+    await _load_example().main()
+
+    assert "Set APOLLO_API_KEY" in capsys.readouterr().out
