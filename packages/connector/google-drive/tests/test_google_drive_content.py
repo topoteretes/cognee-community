@@ -2,8 +2,6 @@
 
 import io
 
-from pypdf import PdfWriter
-
 from cognee_community_connector_google_drive.google_drive import (
     GOOGLE_DOC_MIME_TYPE,
     GOOGLE_SHEET_MIME_TYPE,
@@ -11,6 +9,7 @@ from cognee_community_connector_google_drive.google_drive import (
     extract_file_content,
     is_supported_mime_type,
 )
+from pypdf import PdfWriter
 
 
 class _FakeRequest:
