@@ -107,6 +107,17 @@ poetry run python ./examples/example.py
 | `cognee-community-hybrid-adapter-duckdb`     | Hybrid   | DuckDB hybrid database adapter for cognee          |
 | `cognee-community-hybrid-adapter-falkor`     | Hybrid   | FalkorDB hybrid database adapter for cognee        |
 
+## Data Connectors
+
+| Package Name                             | Type       | Description                                                |
+|------------------------------------------|------------|------------------------------------------------------------|
+| `cognee-community-connector-confluence`  | Connector  | Atlassian Confluence Cloud wiki connector for cognee       |
+| `cognee-community-connector-gmail`       | Connector  | Gmail inbox connector for cognee                           |
+| `cognee-community-connector-google-drive`| Connector  | Google Drive folder connector for cognee                   |
+| `cognee-community-connector-notion`      | Connector  | Notion pages connector for cognee                          |
+| `cognee-community-connector-salesforce`  | Connector  | Salesforce CRM connector (Accounts, Opportunities, Cases, Chatter) |
+| `cognee-community-connector-slack`       | Connector  | Slack workspace export archive connector for cognee        |
+
 ## Custom Packages
 
 Custom packages are also a part of this repo, containing, for example, custom pipelines, tasks, and retrievers.
