@@ -56,6 +56,7 @@ import os
 import cognee
 from cognee_community_connector_salesforce import salesforce_source
 
+
 async def main():
     source = salesforce_source(
         instance_url=os.environ["SALESFORCE_INSTANCE_URL"],
@@ -82,6 +83,7 @@ async def main():
         datasets=["salesforce_crm"],
     )
     print(answer)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
