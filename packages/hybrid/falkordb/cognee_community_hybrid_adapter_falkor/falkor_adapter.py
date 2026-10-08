@@ -1234,13 +1234,13 @@ class FalkorDBAdapter(VectorDBInterface, GraphDBInterface):
 
         query = """
         MATCH (n)-[r]->(m)
-        RETURN ID(n) AS source, ID(m) AS target, TYPE(r) AS type, properties(r) AS properties
+        RETURN n.id AS source, m.id AS target, TYPE(r) AS type, properties(r) AS properties
         """
         result = await self.query(query)
         edges = [
             (
-                record[3]["source_node_id"],
-                record[3]["target_node_id"],
+                str(record[0]),
+                str(record[1]),
                 record[2],
                 record[3],
             )
