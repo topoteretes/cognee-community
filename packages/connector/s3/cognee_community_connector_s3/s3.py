@@ -53,7 +53,7 @@ def snapshot_rows(client, bucket: str, prefix: str = "", *,
     for obj in objects:
         key = obj["Key"]
         identity = f"s3://{bucket}/{quote(key, safe='/')}"
-        signature = (obj.get("LastModified"), obj.get("ETag"), obj["Size"])
+        signature = [str(obj.get("LastModified")), obj.get("ETag"), obj["Size"]]
         old = (previous or {}).get(identity)
         if (isinstance(old, dict) and old.get("signature") == signature
                 and isinstance(old.get("content"), str)

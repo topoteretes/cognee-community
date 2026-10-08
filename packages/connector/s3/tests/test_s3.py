@@ -146,3 +146,22 @@ def test_corrupt_manifest_fails_closed(tmp_path):
     path.write_text("{invalid")
     with pytest.raises(ValueError):
         load_manifest(path, "bucket", "a/")
+
+
+def test_persisted_checkpoint_avoids_download(tmp_path):
+    from cognee_community_connector_s3.s3 import prepare_sync, save_manifest
+
+    class CountingS3(FakeS3):
+        reads = 0
+
+        def get_object(self, **kwargs):
+            self.reads += 1
+            return super().get_object(**kwargs)
+
+    s3 = CountingS3({"a/1.txt": b"one"})
+    path = tmp_path / "checkpoint.json"
+    _, pending = prepare_sync(s3, "bucket", "a/", path)
+    save_manifest(path, "bucket", "a/", pending)
+    assert s3.reads == 1
+    prepare_sync(s3, "bucket", "a/", path)
+    assert s3.reads == 1
