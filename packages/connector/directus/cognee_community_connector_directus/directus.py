@@ -35,6 +35,9 @@ _DEFAULT_IGNORED_FIELDS = {
     "token",
     "auth_data",
     "tfa_secret",
+    "salt",
+    "refresh_token",
+    "secret",
 }
 
 
@@ -168,6 +171,7 @@ def directus_source(
     base_url: str | None = None,
     auth_token: str | None = None,
     collections: list[str] | None = None,
+    filter_query: dict[str, Any] | None = None,
     sort: str | None = "-date_updated",
     fields: str = "*",
     ignored_fields: set[str] | None = None,
@@ -182,6 +186,8 @@ def directus_source(
             ``DIRECTUS_TOKEN``. Optional if collections permit public read.
         collections: List of collection names to sync. If omitted, user
             collections accessible to the token are auto-discovered.
+        filter_query: Optional Directus filter dictionary
+            (e.g. ``{"status": {"_eq": "published"}}``).
         sort: Optional sort expression (e.g. ``"-date_updated"``). Set to ``None`` for
             collections without timestamp columns.
         fields: Comma-separated list of fields or ``"*"`` (default).
@@ -231,6 +237,7 @@ def directus_source(
                 try:
                     items_iter = dir_client.iter_items(
                         collection_name,
+                        filter_query=filter_query,
                         sort=sort,
                         fields=fields,
                     )

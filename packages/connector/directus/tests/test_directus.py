@@ -40,6 +40,9 @@ def test_render_item_content_filters_sensitive_fields():
         "token": "secret_session_token",
         "auth_data": {"jwt": "abc"},
         "tfa_secret": "2fa_key",
+        "salt": "password_salt",
+        "refresh_token": "refresh_123",
+        "secret": "top_secret_key",
         "author": "Engineering Lead",
         "department": "Platform",
     }
@@ -52,6 +55,10 @@ def test_render_item_content_filters_sensitive_fields():
     assert "token" not in rendered
     assert "auth_data" not in rendered
     assert "tfa_secret" not in rendered
+    assert "salt" not in rendered
+    assert "password_salt" not in rendered
+    assert "refresh_token" not in rendered
+    assert "secret" not in rendered
 
 
 def test_render_item_content_custom_ignored_fields():
