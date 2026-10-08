@@ -51,19 +51,30 @@ Candidate information is treated as **restricted by default**:
   name, email, phone, links, headline or location. Only the free text that
   interviewers wrote (feedback answers, non-secret notes) is ingested, keyed by
   the opportunity id.
+* Interviewers often write the candidate's name in that free text, so the
+  candidate's name (and each part of it), emails and phone numbers are replaced
+  with a stable pseudonym such as ``Candidate 3f2a9c1e``. The pseudonym is a
+  one-way hash of the Lever contact id: it keeps one person's documents linked
+  without revealing who they are.
 * Secret notes, deleted forms, and confidential postings/opportunities are
   skipped (``include_confidential=True`` opts confidential records back in).
+* Anonymized candidates (``isAnonymized``, e.g. after a GDPR erasure request)
+  are forgotten on the next sync.
 
-.. note::
-   Lever does not bump an opportunity's ``updatedAt`` for every feedback/notes
-   edit, only for the profile fields it documents (stage, tags, archived,
-   ``lastInteractionAt``, …). Feedback or a note that changes without touching
-   those is picked up the next time the opportunity itself is updated. Pass
-   ``full_refresh=True`` to re-read everything in scope.
+Feedback and notes freshness
+----------------------------
+Lever does not bump an opportunity's ``updatedAt`` when feedback or a note is
+added, edited or deleted. Scope the sync with ``posting_ids`` (recommended):
+every opportunity on those postings is then re-read on each run, so new
+feedback is never missed and unchanged documents are not re-cognified. Without
+``posting_ids`` the connector stays account-wide incremental, and feedback on an
+otherwise untouched opportunity is picked up on its next update or with
+``full_refresh=True``.
 """
 
 from __future__ import annotations
 
+import hashlib
 import html
 import os
 import re
@@ -333,13 +344,66 @@ def _render_forms(forms: Iterable[dict], heading: str) -> list[str]:
     return blocks
 
 
+def _candidate_label(opportunity: dict) -> str:
+    """A stable pseudonym such as ``Candidate 3f2a9c1e`` for one candidate.
+
+    Derived from the Lever contact id (one person across opportunities), falling
+    back to the opportunity id. It is a one-way hash, so the label keeps a
+    candidate's documents linked in the graph without revealing who they are,
+    and different candidates never collapse into one "candidate" entity.
+    """
+    basis = str(opportunity.get("contact") or opportunity["id"])
+    return "Candidate " + hashlib.sha256(basis.encode("utf-8")).hexdigest()[:8]
+
+
+def _identifying_strings(opportunity: dict) -> list[str]:
+    """Candidate identifiers to scrub from free text, longest first.
+
+    Covers the full name, each name part (so "Jane" and "Jane's" are caught as
+    well as "Jane Doe"), email addresses and phone numbers.
+    """
+    values: set[str] = set()
+    name = opportunity.get("name")
+    if isinstance(name, str) and name.strip():
+        values.add(name.strip())
+        for part in name.split():
+            part = part.strip(".,()\"'")
+            # Skip initials ("Q.") — too short to match safely.
+            if len(part) >= 2 and any(ch.isalpha() for ch in part):
+                values.add(part)
+    for email in opportunity.get("emails") or []:
+        if isinstance(email, str) and email.strip():
+            values.add(email.strip())
+    for phone in opportunity.get("phones") or []:
+        value = phone.get("value") if isinstance(phone, dict) else phone
+        if isinstance(value, str) and value.strip():
+            values.add(value.strip())
+    return sorted(values, key=len, reverse=True)
+
+
+def _redact(text: str, identifiers: list[str], label: str) -> str:
+    """Replace every identifier in ``text`` with ``label`` (case-insensitive).
+
+    Matches whole words only, so redacting "Jane" leaves "Janet" untouched.
+    Errs on the side of privacy: a name part that is also a common word is
+    still replaced.
+    """
+    if not identifiers:
+        return text
+    alternatives = "|".join(re.escape(value) for value in identifiers)
+    pattern = re.compile(rf"(?<!\w)(?:{alternatives})(?!\w)", re.IGNORECASE)
+    return pattern.sub(label, text)
+
+
 def _opportunity_to_row(
     session: Any, opportunity: dict, *, include_feedback: bool, include_notes: bool
 ) -> dict[str, Any] | None:
     """Build the (restricted) activity document for one opportunity.
 
     Deliberately carries **no candidate contact data**: only interviewer-written
-    feedback answers and non-secret notes, keyed by the opportunity id.
+    feedback answers and non-secret notes, keyed by the opportunity id. The
+    candidate's name, emails and phone numbers are also scrubbed from that free
+    text and replaced by a stable pseudonym (see ``_candidate_label``).
     Returns ``None`` when there is nothing to ingest.
     """
     opportunity_id = str(opportunity["id"])
@@ -353,11 +417,13 @@ def _opportunity_to_row(
     if not blocks:
         return None
 
+    label = _candidate_label(opportunity)
+    content = _redact("\n\n".join(blocks), _identifying_strings(opportunity), label)
     urls = opportunity.get("urls") or {}
     return {
         "id": _opportunity_key(opportunity_id),
-        "title": f"Lever candidate feedback (opportunity {opportunity_id})",
-        "content": "\n\n".join(blocks),
+        "title": f"Lever interview feedback for {label}",
+        "content": content,
         "url": urls.get("show") or None,
         "_deleted": False,
     }
@@ -378,6 +444,11 @@ def _tombstone(key: str) -> dict[str, Any]:
 
 def _is_confidential(record: dict) -> bool:
     return record.get("confidentiality") == "confidential"
+
+
+def _is_anonymized(opportunity: dict) -> bool:
+    """True once Lever has anonymized the candidate (e.g. a GDPR erasure)."""
+    return bool(opportunity.get("isAnonymized"))
 
 
 # ---------------------------------------------------------------------------
@@ -447,14 +518,29 @@ def sync_opportunities(
     include_confidential: bool = False,
     full_refresh: bool = False,
 ) -> Iterator[dict[str, Any]]:
-    """Yield feedback/notes documents for opportunities updated since the cursor.
+    """Yield feedback/notes documents for opportunities, plus tombstones.
 
-    Deleted opportunities (``/opportunities/deleted``) and ones that became
-    confidential or lost all ingestible content are emitted as tombstones.
+    Two modes, because Lever does not bump an opportunity's ``updatedAt`` when
+    feedback or a note is added, edited or deleted:
+
+    * **Scoped rescan** (``posting_ids`` given): every opportunity on those
+      postings is re-read each run, so new or changed feedback is never missed.
+      Unchanged documents render to identical content and keep their content-hash
+      ``data_id``, so nothing is re-cognified. Opportunities that drop out of the
+      scope since the last run are tombstoned (tracked in ``state``).
+    * **Account-wide incremental** (no ``posting_ids``): only opportunities whose
+      ``updatedAt`` moved since the cursor are re-read, which bounds the cost on
+      large accounts; feedback on an otherwise untouched opportunity waits for
+      its next update (or ``full_refresh=True``).
+
+    In both modes, deleted opportunities (``/opportunities/deleted``) and ones
+    that became confidential, were anonymized, or lost all ingestible content
+    are emitted as tombstones.
     """
     previous_cursor = state.get("opportunities_cursor")
     synced_before = previous_cursor is not None
-    cursor = None if full_refresh else previous_cursor
+    rescan = bool(posting_ids)
+    cursor = None if (full_refresh or rescan) else previous_cursor
     params: dict[str, Any] = {}
     if posting_ids:
         # Repeated query param (posting_id=a&posting_id=b): union of postings.
@@ -462,11 +548,23 @@ def sync_opportunities(
     if cursor is not None:
         params["updated_at_start"] = max(0, int(cursor) - _CURSOR_OVERLAP_MS)
 
+    # Each id is emitted at most once per run, so a record can never be both
+    # upserted and tombstoned (or tombstoned twice) in the same load.
+    emitted: set[str] = set()
+    seen_ids: set[str] = set()
     changed = removed = 0
     for opportunity in _paginate(session, "/opportunities", params):
-        key = _opportunity_key(opportunity["id"])
+        opportunity_id = str(opportunity["id"])
+        key = _opportunity_key(opportunity_id)
+        if key in emitted:
+            continue
+        seen_ids.add(opportunity_id)
         row = None
-        if include_confidential or not _is_confidential(opportunity):
+        # Anonymized (GDPR erasure) and confidential records are never read;
+        # whatever was ingested for them before is forgotten below.
+        if not _is_anonymized(opportunity) and (
+            include_confidential or not _is_confidential(opportunity)
+        ):
             row = _opportunity_to_row(
                 session,
                 opportunity,
@@ -475,11 +573,37 @@ def sync_opportunities(
             )
         if row is not None:
             changed += 1
+            emitted.add(key)
             yield row
         elif synced_before:
-            # No (longer any) ingestible content, or became confidential.
+            # No (longer any) ingestible content, became confidential, or was
+            # anonymized. Tombstoning a never-ingested id is a no-op under merge.
             removed += 1
+            emitted.add(key)
             yield _tombstone(key)
+
+    if rescan:
+        known_ids = set(state.get("opportunity_ids") or [])
+        if known_ids and not seen_ids:
+            # An empty listing while opportunities were known almost always means
+            # a transient failure or a mistyped posting id, not a real wipe.
+            # Forgetting everything would be permanent, so skip it this run.
+            logger.warning(
+                "Lever: opportunity listing returned nothing but %d were known; "
+                "skipping scope-based forgetting this run.",
+                len(known_ids),
+            )
+        else:
+            for opportunity_id in sorted(known_ids - seen_ids):
+                key = _opportunity_key(opportunity_id)
+                if key not in emitted:
+                    removed += 1
+                    emitted.add(key)
+                    yield _tombstone(key)
+            state["opportunity_ids"] = sorted(seen_ids)
+    else:
+        # Switching back to account-wide mode: the scoped id set no longer applies.
+        state.pop("opportunity_ids", None)
 
     if synced_before:
         # The delete feed is read from the *stored* cursor even on full_refresh:
@@ -488,8 +612,11 @@ def sync_opportunities(
         for opportunity_id in _deleted_ids(
             session, "/opportunities/deleted", start, now_ms, window_ms=None
         ):
-            removed += 1
-            yield _tombstone(_opportunity_key(opportunity_id))
+            key = _opportunity_key(opportunity_id)
+            if key not in emitted:
+                removed += 1
+                emitted.add(key)
+                yield _tombstone(key)
 
     state["opportunities_cursor"] = now_ms
     logger.info("Lever: %d opportunity document(s) synced, %d removed.", changed, removed)
@@ -523,7 +650,8 @@ def lever_source(
         posting_states: Only keep postings in these states, e.g.
             ``["published", "internal"]``. ``None`` keeps every state.
         posting_ids: Only sync feedback/notes for opportunities applied to these
-            postings. Recommended for large accounts.
+            postings. Recommended: in this mode every in-scope opportunity is
+            re-read each run, so new feedback/notes are never missed.
         include_confidential: Also ingest confidential postings / opportunities.
         full_refresh: Ignore the stored cursors and re-read everything in scope.
         session: Pre-built ``requests``-like session (test injection point).

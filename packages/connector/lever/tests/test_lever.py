@@ -11,6 +11,11 @@ network traffic and no live API key, so these run in CI. Coverage:
   - confidential postings/opportunities are skipped by default
   - feedback + notes are opt-in and never carry candidate contact data
   - deleted opportunities / emptied opportunities become tombstones
+  - scoped rescan (posting_ids) catches feedback added without an updatedAt
+    change, forgets opportunities that leave the scope, and never mass-forgets
+    on an empty listing
+  - candidate names/emails/phones in free text become a stable pseudonym
+  - anonymized (GDPR-erased) candidates are forgotten and never re-read
   - pagination, retry on 429, and "errors never advance the cursor"
   - the dlt resource is wired for merge + hard delete + document mode
   - a real dlt merge physically removes a tombstoned row (forget-on-delete)
@@ -33,6 +38,7 @@ from cognee_community_connector_lever.lever import (
     _CURSOR_OVERLAP_MS,
     LEVER_SOURCE_NAME,
     LEVER_TABLE_NAME,
+    _candidate_label,
     _format_value,
     _html_to_text,
     _posting_to_row,
@@ -311,6 +317,206 @@ def test_deleted_emptied_and_confidential_opportunities_are_forgotten():
 
 
 # ---------------------------------------------------------------------------
+# Scoped rescan: feedback that does not bump the opportunity's updatedAt
+# ---------------------------------------------------------------------------
+def _sync_scoped(session, state, now_ms, **kwargs):
+    return list(
+        sync_opportunities(
+            session,
+            state,
+            now_ms=now_ms,
+            include_feedback=True,
+            include_notes=True,
+            posting_ids=["p1"],
+            **kwargs,
+        )
+    )
+
+
+def test_scoped_rescan_picks_up_feedback_added_without_an_updatedat_change():
+    # The opportunity was last updated long before both runs.
+    session = _candidate_session(
+        opportunities=[opportunity("o1", updated_at=NOW - 30 * DAY_MS, posting="p1")],
+        feedback_by_opp={"o1": [feedback("f1")]},
+        notes_by_opp={},
+    )
+    state = {}
+    first = _sync_scoped(session, state, NOW)
+    assert _ids(first) == ["opportunity:o1"]
+
+    # New feedback lands; Lever does NOT move the opportunity's updatedAt.
+    session.feedback_by_opp["o1"].append(
+        feedback(
+            "f2",
+            text="Hiring manager screen",
+            fields=[{"text": "Notes", "value": "Strong ownership mindset."}],
+        )
+    )
+    session.calls.clear()
+    second = _sync_scoped(session, state, LATER)
+
+    assert _ids(second) == ["opportunity:o1"]
+    assert "Strong ownership mindset." in second[0]["content"]
+    # The scoped listing is a full rescan, never filtered by updatedAt.
+    assert "updated_at_start" not in session.calls[0][1]
+    assert state["opportunity_ids"] == ["o1"]
+
+
+def test_scoped_rescan_of_unchanged_feedback_yields_identical_rows():
+    """Identical rows keep their content-hash data_id, so nothing is re-cognified."""
+    session = _candidate_session(
+        opportunities=[opportunity("o1", updated_at=NOW - DAY_MS, posting="p1")]
+    )
+    state = {}
+    first = _sync_scoped(session, state, NOW)
+    second = _sync_scoped(session, state, LATER)
+    assert first == second
+
+
+def test_scoped_rescan_forgets_opportunities_that_leave_the_scope():
+    session = _candidate_session(
+        opportunities=[
+            opportunity("o1", updated_at=NOW - DAY_MS, posting="p1"),
+            opportunity("o2", updated_at=NOW - DAY_MS, posting="p1"),
+        ],
+        feedback_by_opp={"o1": [feedback("f1")], "o2": [feedback("f2")]},
+        notes_by_opp={},
+    )
+    state = {}
+    assert _ids(_sync_scoped(session, state, NOW)) == ["opportunity:o1", "opportunity:o2"]
+
+    # o2 is no longer on posting p1 (e.g. moved to another role).
+    session.opportunities[1]["applications"] = ["p9"]
+    rows = _sync_scoped(session, state, LATER)
+
+    assert _ids(rows) == ["opportunity:o1"]
+    assert _ids(rows, deleted=True) == ["opportunity:o2"]
+    assert state["opportunity_ids"] == ["o1"]
+
+
+def test_scoped_rescan_never_mass_forgets_on_an_empty_listing():
+    session = _candidate_session(opportunities=[], feedback_by_opp={}, notes_by_opp={})
+    state = {"opportunities_cursor": NOW, "opportunity_ids": ["o1", "o2"]}
+
+    rows = _sync_scoped(session, state, LATER)
+
+    assert rows == []
+    # The known scope is preserved, so a later healthy run still reconciles it.
+    assert state["opportunity_ids"] == ["o1", "o2"]
+    assert state["opportunities_cursor"] == LATER
+
+
+def test_each_id_is_tombstoned_at_most_once_per_run():
+    # o-gone left the scope AND appears in the delete feed.
+    session = _candidate_session(
+        opportunities=[opportunity("o1", updated_at=NOW - DAY_MS, posting="p1")],
+        deleted_opportunities=[{"id": "o-gone", "deletedAt": NOW + 5}],
+    )
+    state = {"opportunities_cursor": NOW, "opportunity_ids": ["o1", "o-gone"]}
+
+    rows = _sync_scoped(session, state, LATER)
+
+    tombstones = [r["id"] for r in rows if r.get("_deleted")]
+    assert tombstones == ["opportunity:o-gone"]
+
+
+def test_account_wide_mode_stays_incremental_and_drops_scoped_state():
+    session = _candidate_session()
+    state = {"opportunities_cursor": NOW, "opportunity_ids": ["o1"]}
+
+    list(
+        sync_opportunities(session, state, now_ms=LATER, include_feedback=True, include_notes=True)
+    )
+
+    assert session.calls[0][1]["updated_at_start"] == NOW - _CURSOR_OVERLAP_MS
+    assert "opportunity_ids" not in state
+
+
+# ---------------------------------------------------------------------------
+# Candidate pseudonymization and anonymization
+# ---------------------------------------------------------------------------
+def test_candidate_identifiers_in_free_text_become_a_stable_pseudonym():
+    session = _candidate_session(
+        opportunities=[
+            opportunity("o1", updated_at=NOW + 1, name="Jane Q. Doe", contact="contact-1")
+        ],
+        feedback_by_opp={
+            "o1": [
+                feedback(
+                    "f1",
+                    fields=[
+                        {
+                            "text": "Notes",
+                            "value": (
+                                "JANE was great; jane's design was clean. Ms. Doe asked "
+                                "about Janet's team. Reach her at Jane@Example.com or "
+                                "+1 555 0100. Jane Q. Doe is a strong hire."
+                            ),
+                        }
+                    ],
+                )
+            ]
+        },
+        notes_by_opp={},
+    )
+
+    (row,) = list(
+        sync_opportunities(session, {}, now_ms=NOW, include_feedback=True, include_notes=False)
+    )
+
+    label = _candidate_label({"id": "o1", "contact": "contact-1"})
+    content = row["content"]
+    assert label in content
+    assert label in row["title"]
+    lowered = content.lower()
+    for leaked in ("jane was", "jane's", "doe", "jane@example.com", "555 0100"):
+        assert leaked not in lowered, leaked
+    # Whole-word matching: a different person's name is left intact.
+    assert "Janet's team" in content
+    assert f"{label}'s design" in content
+    assert f"{label} is a strong hire" in content
+    assert "Jane" not in row["title"]
+
+
+def test_candidate_label_is_stable_per_person_and_distinct_across_people():
+    same_person_a = _candidate_label({"id": "o1", "contact": "c1"})
+    same_person_b = _candidate_label({"id": "o2", "contact": "c1"})
+    other_person = _candidate_label({"id": "o3", "contact": "c2"})
+    no_contact = _candidate_label({"id": "o4", "contact": None})
+
+    assert same_person_a == same_person_b
+    assert same_person_a != other_person
+    assert no_contact.startswith("Candidate ")
+    # One-way: the label never contains the underlying id.
+    assert "c1" not in same_person_a.removeprefix("Candidate ")
+
+
+def test_anonymized_candidates_are_forgotten_and_never_read():
+    session = _candidate_session(
+        opportunities=[opportunity("o1", updated_at=NOW + 1, anonymized=True)]
+    )
+
+    # First run: nothing was ingested, so nothing is emitted at all.
+    assert (
+        list(sync_opportunities(session, {}, now_ms=NOW, include_feedback=True, include_notes=True))
+        == []
+    )
+
+    # Later run: whatever was ingested for this person is tombstoned.
+    rows = list(
+        sync_opportunities(
+            session,
+            {"opportunities_cursor": NOW},
+            now_ms=LATER,
+            include_feedback=True,
+            include_notes=True,
+        )
+    )
+    assert _ids(rows, deleted=True) == ["opportunity:o1"]
+    assert not any(p.startswith("/opportunities/o1/") for p in session.paths())
+
+
+# ---------------------------------------------------------------------------
 # dlt wiring
 # ---------------------------------------------------------------------------
 def test_resource_is_configured_for_merge_hard_delete_and_document_mode():
@@ -373,3 +579,47 @@ def test_forget_on_delete_end_to_end_through_a_real_dlt_merge(tmp_path):
     )
     assert run(second) == [("posting:p1", "Senior Backend Engineer")]
     assert second.calls[0][1]["updated_at_start"] == NOW - _CURSOR_OVERLAP_MS
+
+
+def test_scoped_feedback_sync_end_to_end_through_a_real_dlt_merge(tmp_path):
+    """New feedback is upserted and an out-of-scope opportunity is removed."""
+    pipeline = dlt.pipeline(
+        pipeline_name="test_lever_feedback_e2e",
+        pipelines_dir=str(tmp_path / "pipelines"),
+        destination=dlt.destinations.sqlalchemy(f"sqlite:///{tmp_path / 'lever.db'}"),
+        dataset_name="lever",
+    )
+    session = FakeLeverSession(
+        opportunities=[
+            opportunity("o1", updated_at=NOW - 30 * DAY_MS, posting="p1"),
+            opportunity("o2", updated_at=NOW - 30 * DAY_MS, posting="p1"),
+        ],
+        feedback_by_opp={"o1": [feedback("f1")], "o2": [feedback("f2")]},
+    )
+    clock = iter([NOW, LATER])
+
+    def run():
+        pipeline.run(
+            lever_source(
+                session=session,
+                include_postings=False,
+                include_feedback=True,
+                posting_ids=["p1"],
+                clock=lambda: next(clock),
+            )
+        )
+        with pipeline.sql_client() as client:
+            rows = client.execute_sql(f"SELECT id, content FROM {LEVER_TABLE_NAME} ORDER BY id")
+        return dict(rows)
+
+    assert set(run()) == {"opportunity:o1", "opportunity:o2"}
+
+    # Feedback added to o1 (its updatedAt does not move); o2 leaves the posting.
+    session.feedback_by_opp["o1"].append(
+        feedback("f3", fields=[{"text": "Notes", "value": "Excellent debugging."}])
+    )
+    session.opportunities[1]["applications"] = ["p9"]
+    final = run()
+
+    assert set(final) == {"opportunity:o1"}
+    assert "Excellent debugging." in final["opportunity:o1"]

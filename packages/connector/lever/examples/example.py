@@ -41,6 +41,9 @@ async def main() -> None:
         return
 
     source = lever_source(posting_states=["published", "internal"])
+    # Interview feedback/notes are restricted candidate data and off by default.
+    # To opt in, scope them to specific postings (recommended), e.g.:
+    #   lever_source(include_feedback=True, include_notes=True, posting_ids=["<posting id>"])
 
     print("Syncing Lever postings into cognee ...")
     await cognee.remember(
