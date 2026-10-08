@@ -5,11 +5,11 @@ orphan cleanup. No credentials, contents, or object metadata are logged.
 """
 from __future__ import annotations
 
-from urllib.parse import quote
 import json
 import os
 import tempfile
 from pathlib import Path
+from urllib.parse import quote
 
 TABLE_NAME = "s3_documents"
 SOURCE_NAME = "s3"
@@ -35,7 +35,7 @@ def snapshot_rows(client, bucket: str, prefix: str = "", *,
     objects = []
     seen = set()
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-        if not isinstance(page, dict) or page.get("IsTruncated") is True and not page.get("NextContinuationToken"):
+        if not isinstance(page, dict) or (page.get("IsTruncated") is True and not page.get("NextContinuationToken")):
             raise ValueError("incomplete S3 listing")
         for obj in page.get("Contents", []):
             key = obj["Key"]
@@ -84,6 +84,8 @@ def load_manifest(path, bucket: str, prefix: str):
     file = Path(path)
     if not file.exists():
         return {}
+    if file.is_symlink():
+        raise ValueError("manifest symlink is not allowed")
     payload = json.loads(file.read_text(encoding="utf-8"))
     if payload.get("scope") != _scope_id(bucket, prefix) or not isinstance(payload.get("entries"), dict):
         raise ValueError("manifest scope mismatch or invalid entries")
@@ -94,9 +96,12 @@ def save_manifest(path, bucket: str, prefix: str, entries: dict):
     """Atomic checkpoint replacement. Call only after downstream publication."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink():
+        raise ValueError("manifest symlink is not allowed")
     payload = {"scope": _scope_id(bucket, prefix), "entries": entries}
     fd, temp = tempfile.mkstemp(prefix=".s3-manifest-", dir=path.parent)
     try:
+        os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as output:
             json.dump(payload, output, sort_keys=True, default=str)
             output.flush()

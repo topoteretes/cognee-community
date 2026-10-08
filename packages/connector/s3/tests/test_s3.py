@@ -198,3 +198,23 @@ def test_deletion_is_published_before_checkpoint(tmp_path):
     sync_with_publisher(s3, "bucket", "a/", path, publish_empty)
     assert events == [1, 0]
     assert load_manifest(path, "bucket", "a/") == {}
+
+
+def test_checkpoint_private_permissions(tmp_path):
+    from cognee_community_connector_s3.s3 import save_manifest
+    path = tmp_path / "checkpoint.json"
+    save_manifest(path, "bucket", "docs/", {})
+    assert path.stat().st_mode & 0o077 == 0
+
+
+def test_checkpoint_symlink_rejected(tmp_path):
+    from cognee_community_connector_s3.s3 import load_manifest, save_manifest
+    target = tmp_path / "target"
+    target.write_text("private")
+    link = tmp_path / "manifest.json"
+    link.symlink_to(target)
+    with pytest.raises(ValueError, match="symlink"):
+        load_manifest(link, "bucket", "docs/")
+    with pytest.raises(ValueError, match="symlink"):
+        save_manifest(link, "bucket", "docs/", {})
+    assert target.read_text() == "private"
