@@ -172,15 +172,17 @@ and that the `_id` sweep is a covered scan, run the same cycle against a real se
 docker run -d -p 27017:27017 --name cognee-mongo mongo:8
 python - <<'PY'
 from pymongo import MongoClient
-from cognee_community_connector_mongodb import mongodb_source
 
 collection = MongoClient("mongodb://localhost:27017")["support"]["tickets"]
 collection.create_index([("updatedAt", 1)])
-source = mongodb_source(database="support", collection="tickets", text_fields=["subject"])
 
-# After one sync, the delta read is an IXSCAN bounded by the cursor...
-print(collection.find({"updatedAt": {"$gt": 1}}).explain().get("queryPlanner", {}).get("winningPlan"))
+def winning(query, projection=None):
+    plan = collection.find(query, projection).explain()["queryPlanner"]["winningPlan"]
+    print(plan)
+
+# The incremental delta read is an IXSCAN bounded by the cursor...
+winning({"updatedAt": {"$gt": 1}})
 # ...and the id sweep is covered, so it never reads the documents themselves.
-print(collection.find({}, {"_id": 1}).explain().get("queryPlanner", {}).get("winningPlan"))
+winning({}, {"_id": 1})
 PY
 ```
