@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
-
 from cognee_community_connector_otter import otter_source
 
 
