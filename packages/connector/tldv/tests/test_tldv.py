@@ -135,6 +135,7 @@ def test_tldv_document_source_attribute() -> None:
     source = tldv_source(api_key="test_key", client=fake_client)
     assert hasattr(source, DOCUMENT_SOURCE_ATTR)
     assert getattr(source, DOCUMENT_SOURCE_ATTR) == "tldv"
+    assert DOCUMENT_SOURCE_ATTR == "cognee_document_source"
 
 
 def test_tldv_source_since_filter() -> None:

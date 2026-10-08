@@ -5,12 +5,12 @@ from typing import Any
 
 import dlt
 import httpx
+from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
 from dlt.sources import DltSource
 
 logger = logging.getLogger(__name__)
 
 TLDV_SOURCE_NAME = "tldv"
-DOCUMENT_SOURCE_ATTR = f"{TLDV_SOURCE_NAME}_document"
 TLDV_API_BASE = "https://api.tldv.io/v1"
 _MAX_RETRIES = 3
 
