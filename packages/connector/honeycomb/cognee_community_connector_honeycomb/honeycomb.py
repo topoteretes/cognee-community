@@ -5,12 +5,12 @@ from typing import Any
 
 import dlt
 import httpx
+from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
 from dlt.sources import DltSource
 
 logger = logging.getLogger(__name__)
 
 HONEYCOMB_SOURCE_NAME = "honeycomb"
-DOCUMENT_SOURCE_ATTR = f"{HONEYCOMB_SOURCE_NAME}_document"
 HONEYCOMB_API_BASE_US = "https://api.honeycomb.io/v1"
 HONEYCOMB_API_BASE_EU = "https://api.eu1.honeycomb.io/v1"
 _MAX_RETRIES = 3
@@ -73,12 +73,23 @@ class HoneycombClient:
         res = self._request("GET", "/boards")
         return res if isinstance(res, list) else []
 
+    def list_queries(self, dataset: str) -> list[dict[str, Any]]:
+        res = self._request("GET", f"/query_annotations/{dataset}")
+        if isinstance(res, list):
+            return res
+        res_queries = self._request("GET", f"/queries/{dataset}")
+        return res_queries if isinstance(res_queries, list) else []
+
     def list_triggers(self, dataset: str) -> list[dict[str, Any]]:
         res = self._request("GET", f"/triggers/{dataset}")
         return res if isinstance(res, list) else []
 
     def list_slos(self, dataset: str) -> list[dict[str, Any]]:
         res = self._request("GET", f"/slos/{dataset}")
+        return res if isinstance(res, list) else []
+
+    def list_markers(self, dataset: str) -> list[dict[str, Any]]:
+        res = self._request("GET", f"/markers/{dataset}")
         return res if isinstance(res, list) else []
 
 
@@ -117,30 +128,44 @@ def _format_board_to_row(board: dict[str, Any]) -> dict[str, Any] | None:
 
     name = board.get("name", f"Board {board_id}")
     description = board.get("description", "Observability dashboard.")
-    board_type = board.get("type", "board")
+    board_style = board.get("style") or board.get("type", "flexible")
     updated_at = board.get("updated_at") or board.get("created_at") or ""
-    queries = board.get("queries", [])
-    query_count = len(queries)
 
-    query_lines = []
-    for q in queries:
-        caption = q.get("caption") or q.get("name") or "Query"
-        q_dataset = q.get("dataset", "")
-        query_lines.append(f"  - **{caption}** (Dataset: `{q_dataset}`)")
+    panel_lines = []
+    # Support flexible boards with panels
+    panels = board.get("panels", [])
+    if panels:
+        for p in panels:
+            p_type = p.get("type", "query")
+            if p_type == "text":
+                content = p.get("text") or p.get("content") or ""
+                panel_lines.append(f"  - **Text Panel:** {content}")
+            else:
+                p_name = p.get("name") or p.get("caption") or "Query Panel"
+                p_dataset = p.get("dataset", "")
+                ds_str = f" (Dataset: `{p_dataset}`)" if p_dataset else ""
+                panel_lines.append(f"  - **Query Panel:** {p_name}{ds_str}")
+    else:
+        # Fallback for queries list
+        queries = board.get("queries", [])
+        for q in queries:
+            caption = q.get("caption") or q.get("name") or "Query"
+            q_dataset = q.get("dataset", "")
+            panel_lines.append(f"  - **{caption}** (Dataset: `{q_dataset}`)")
 
-    query_block = "\n".join(query_lines) if query_lines else "  - None specified."
+    panel_block = "\n".join(panel_lines) if panel_lines else "  - No panels or charts configured."
 
     text = f"""# Honeycomb Board: {name}
 - **Board ID:** `{board_id}`
-- **Board Type:** {board_type}
-- **Total Queries / Panels:** {query_count}
+- **Board Layout Style:** {board_style}
+- **Total Panels / Charts:** {len(panels) or len(board.get("queries", []))}
 - **Last Updated:** {updated_at}
 
 ### Description
 {description}
 
-### Configured Queries & Charts
-{query_block}""".strip()
+### Configured Panels & Queries
+{panel_block}""".strip()
 
     return {
         "id": f"honeycomb_board_{board_id}",
@@ -148,6 +173,41 @@ def _format_board_to_row(board: dict[str, Any]) -> dict[str, Any] | None:
         "text": text,
         "url": f"https://ui.honeycomb.io/boards/{board_id}",
         "resource_type": "board",
+        "last_updated": updated_at,
+    }
+
+
+def _format_query_to_row(query: dict[str, Any], dataset_slug: str) -> dict[str, Any] | None:
+    query_id = query.get("id") or query.get("query_id")
+    if not query_id:
+        return None
+
+    name = query.get("name") or query.get("caption") or f"Query {query_id}"
+    description = query.get("description", "Saved query specification.")
+    updated_at = query.get("updated_at") or query.get("created_at") or ""
+    query_spec = query.get("query") or query.get("query_spec") or {}
+
+    calcs = [str(c) for c in query_spec.get("calculations", [])]
+    filters = [str(f) for f in query_spec.get("filters", [])]
+    breakdowns = query_spec.get("breakdowns", [])
+
+    text = f"""# Honeycomb Saved Query: {name}
+- **Query ID:** `{query_id}`
+- **Dataset:** `{dataset_slug}`
+- **Calculations:** {", ".join(calcs) or "COUNT"}
+- **Breakdowns / Group By:** {", ".join(breakdowns) or "None"}
+- **Filters:** {", ".join(filters) or "None"}
+- **Last Updated:** {updated_at}
+
+### Description & Analysis Intent
+{description}""".strip()
+
+    return {
+        "id": f"honeycomb_query_{query_id}",
+        "title": f"Honeycomb Query: {name}",
+        "text": text,
+        "url": f"https://ui.honeycomb.io/datasets/{dataset_slug}/queries/{query_id}",
+        "resource_type": "query",
         "last_updated": updated_at,
     }
 
@@ -220,14 +280,47 @@ def _format_slo_to_row(slo: dict[str, Any], dataset_slug: str) -> dict[str, Any]
     }
 
 
+def _format_marker_to_row(marker: dict[str, Any], dataset_slug: str) -> dict[str, Any] | None:
+    marker_id = marker.get("id")
+    if not marker_id:
+        return None
+
+    m_type = marker.get("type", "deploy")
+    message = marker.get("message", "Release/Incident marker.")
+    start_time = marker.get("start_time") or marker.get("created_at") or ""
+    end_time = marker.get("end_time", "")
+    url = marker.get("url", "")
+
+    text = f"""# Honeycomb Timeline Marker: {message}
+- **Marker ID:** `{marker_id}`
+- **Marker Type:** `{m_type}`
+- **Dataset / Environment:** `{dataset_slug}`
+- **Start Time:** {start_time}
+- **End Time:** {end_time or "Point in time"}
+- **External URL:** {url or "None"}
+
+### Event Message & Context
+{message}""".strip()
+
+    return {
+        "id": f"honeycomb_marker_{marker_id}",
+        "title": f"Honeycomb Marker: {message}",
+        "text": text,
+        "url": url or f"https://ui.honeycomb.io/datasets/{dataset_slug}/markers/{marker_id}",
+        "resource_type": "marker",
+        "last_updated": start_time,
+    }
+
+
 def honeycomb_source(
     api_key: str,
     base_url: str = HONEYCOMB_API_BASE_US,
     include_datasets: bool = True,
     include_boards: bool = True,
+    include_queries: bool = True,
     include_triggers: bool = True,
     include_slos: bool = True,
-    since: str | None = None,
+    include_markers: bool = True,
     client: HoneycombClient | None = None,
 ) -> DltSource:
     api_client = client or HoneycombClient(api_key=api_key, base_url=base_url)
@@ -237,14 +330,17 @@ def honeycomb_source(
         count = 0
         datasets = []
 
-        if include_datasets or include_triggers or include_slos:
+        if (
+            include_datasets
+            or include_queries
+            or include_triggers
+            or include_slos
+            or include_markers
+        ):
             datasets = api_client.list_datasets()
 
         if include_datasets:
             for ds in datasets:
-                updated_at = ds.get("last_written_at") or ds.get("created_at") or ""
-                if since and updated_at and updated_at < since:
-                    continue
                 row = _format_dataset_to_row(ds)
                 if row:
                     count += 1
@@ -252,13 +348,21 @@ def honeycomb_source(
 
         if include_boards:
             for b in api_client.list_boards():
-                updated_at = b.get("updated_at") or b.get("created_at") or ""
-                if since and updated_at and updated_at < since:
-                    continue
                 row = _format_board_to_row(b)
                 if row:
                     count += 1
                     yield row
+
+        if include_queries:
+            for ds in datasets:
+                slug = ds.get("slug") or ds.get("name")
+                if not slug:
+                    continue
+                for q in api_client.list_queries(slug):
+                    row = _format_query_to_row(q, dataset_slug=slug)
+                    if row:
+                        count += 1
+                        yield row
 
         if include_triggers:
             for ds in datasets:
@@ -266,9 +370,6 @@ def honeycomb_source(
                 if not slug:
                     continue
                 for tr in api_client.list_triggers(slug):
-                    updated_at = tr.get("updated_at") or tr.get("created_at") or ""
-                    if since and updated_at and updated_at < since:
-                        continue
                     row = _format_trigger_to_row(tr, dataset_slug=slug)
                     if row:
                         count += 1
@@ -280,10 +381,25 @@ def honeycomb_source(
                 if not slug:
                     continue
                 for slo in api_client.list_slos(slug):
-                    updated_at = slo.get("updated_at") or slo.get("created_at") or ""
-                    if since and updated_at and updated_at < since:
-                        continue
                     row = _format_slo_to_row(slo, dataset_slug=slug)
+                    if row:
+                        count += 1
+                        yield row
+
+        if include_markers:
+            # Check environment-wide markers (__all__) and per-dataset markers
+            for marker in api_client.list_markers("__all__"):
+                row = _format_marker_to_row(marker, dataset_slug="__all__")
+                if row:
+                    count += 1
+                    yield row
+
+            for ds in datasets:
+                slug = ds.get("slug") or ds.get("name")
+                if not slug:
+                    continue
+                for marker in api_client.list_markers(slug):
+                    row = _format_marker_to_row(marker, dataset_slug=slug)
                     if row:
                         count += 1
                         yield row

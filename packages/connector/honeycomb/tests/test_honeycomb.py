@@ -1,10 +1,12 @@
 from typing import Any
 
+from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
 from cognee_community_connector_honeycomb.honeycomb import (
-    DOCUMENT_SOURCE_ATTR,
     HoneycombClient,
     _format_board_to_row,
     _format_dataset_to_row,
+    _format_marker_to_row,
+    _format_query_to_row,
     _format_slo_to_row,
     _format_trigger_to_row,
     honeycomb_source,
@@ -31,19 +33,41 @@ class FakeHoneycombClient:
         ]
         self.boards = [
             {
-                "id": "board_123",
+                "id": "board_flexible_1",
                 "name": "Production Reliability Overview",
                 "description": (
                     "High-level overview of error budgets and p99 latency across services."
                 ),
-                "type": "board",
+                "style": "flexible",
                 "updated_at": "2026-10-03T15:00:00Z",
-                "queries": [
-                    {"caption": "P99 Latency by Route", "dataset": "api-gateway"},
-                    {"caption": "Failed Checkout Spans", "dataset": "payments-svc"},
+                "panels": [
+                    {
+                        "type": "query",
+                        "name": "P99 Latency by Route",
+                        "dataset": "api-gateway",
+                    },
+                    {
+                        "type": "text",
+                        "text": "Please escalate checkout error rate breaches directly to on-call.",
+                    },
                 ],
             }
         ]
+        self.queries = {
+            "api-gateway": [
+                {
+                    "id": "query_slow_requests",
+                    "name": "Slow Ingress Requests",
+                    "description": "Calculates p99 response duration grouped by HTTP route.",
+                    "query": {
+                        "calculations": [{"op": "P99", "column": "duration_ms"}],
+                        "breakdowns": ["route", "http_status"],
+                        "filters": [{"column": "duration_ms", "op": ">", "value": 500}],
+                    },
+                    "updated_at": "2026-10-01T12:00:00Z",
+                }
+            ]
+        }
         self.triggers = {
             "api-gateway": [
                 {
@@ -55,18 +79,7 @@ class FakeHoneycombClient:
                     "threshold": {"op": ">", "value": 2.0},
                     "updated_at": "2026-09-20T10:00:00Z",
                 }
-            ],
-            "payments-svc": [
-                {
-                    "id": "trig_002",
-                    "name": "Stripe Webhook Timeout",
-                    "description": "Triggers when webhook processing latency exceeds 5000ms.",
-                    "disabled": False,
-                    "frequency": 120,
-                    "threshold": {"op": ">", "value": 5000},
-                    "updated_at": "2026-10-02T11:00:00Z",
-                }
-            ],
+            ]
         }
         self.slos = {
             "payments-svc": [
@@ -83,6 +96,25 @@ class FakeHoneycombClient:
                 }
             ]
         }
+        self.markers = {
+            "__all__": [
+                {
+                    "id": "mark_deploy_v2",
+                    "type": "deploy",
+                    "message": "Production Release v2.4.0 deployed across cluster.",
+                    "start_time": "2026-10-04T14:30:00Z",
+                    "url": "https://github.com/org/repo/releases/v2.4.0",
+                }
+            ],
+            "api-gateway": [
+                {
+                    "id": "mark_incident_01",
+                    "type": "incident",
+                    "message": "Gateway route flapping resolved by DNS failover.",
+                    "start_time": "2026-10-05T02:15:00Z",
+                }
+            ],
+        }
 
     def list_datasets(self) -> list[dict[str, Any]]:
         return self.datasets
@@ -90,11 +122,17 @@ class FakeHoneycombClient:
     def list_boards(self) -> list[dict[str, Any]]:
         return self.boards
 
+    def list_queries(self, dataset: str) -> list[dict[str, Any]]:
+        return self.queries.get(dataset, [])
+
     def list_triggers(self, dataset: str) -> list[dict[str, Any]]:
         return self.triggers.get(dataset, [])
 
     def list_slos(self, dataset: str) -> list[dict[str, Any]]:
         return self.slos.get(dataset, [])
+
+    def list_markers(self, dataset: str) -> list[dict[str, Any]]:
+        return self.markers.get(dataset, [])
 
 
 def test_honeycomb_client_headers() -> None:
@@ -120,20 +158,58 @@ def test_format_dataset_to_row() -> None:
     assert "Subscription renewals and invoicing service telemetry." in row["text"]
 
 
-def test_format_board_to_row() -> None:
+def test_format_flexible_board_to_row() -> None:
     board = {
-        "id": "board_xyz",
+        "id": "board_flex_xyz",
         "name": "Database Health",
         "description": "Connection pool and lock wait metrics.",
-        "type": "board",
+        "style": "flexible",
         "updated_at": "2026-10-01T00:00:00Z",
-        "queries": [{"caption": "Lock Wait Duration", "dataset": "postgres-prod"}],
+        "panels": [
+            {"type": "query", "name": "Lock Wait Duration", "dataset": "postgres-prod"},
+            {"type": "text", "text": "Escalate lock waits > 10s to DBA."},
+        ],
     }
     row = _format_board_to_row(board)
     assert row is not None
-    assert row["id"] == "honeycomb_board_board_xyz"
+    assert row["id"] == "honeycomb_board_board_flex_xyz"
     assert "Database Health" in row["text"]
-    assert "**Lock Wait Duration** (Dataset: `postgres-prod`)" in row["text"]
+    assert "**Query Panel:** Lock Wait Duration (Dataset: `postgres-prod`)" in row["text"]
+    assert "**Text Panel:** Escalate lock waits > 10s to DBA." in row["text"]
+
+
+def test_format_query_to_row() -> None:
+    query = {
+        "id": "q_p99_dur",
+        "name": "P99 Endpoint Latency",
+        "description": "Tracks p99 endpoint latency by controller.",
+        "query": {
+            "calculations": [{"op": "P99", "column": "duration_ms"}],
+            "breakdowns": ["controller_action"],
+        },
+        "updated_at": "2026-10-01T00:00:00Z",
+    }
+    row = _format_query_to_row(query, dataset_slug="web-api")
+    assert row is not None
+    assert row["id"] == "honeycomb_query_q_p99_dur"
+    assert "P99 Endpoint Latency" in row["text"]
+    assert "Breakdowns / Group By:** controller_action" in row["text"]
+
+
+def test_format_marker_to_row() -> None:
+    marker = {
+        "id": "m_rel_1",
+        "type": "deploy",
+        "message": "Deployed canary build to prod cluster.",
+        "start_time": "2026-10-05T09:00:00Z",
+        "url": "https://ci.example.com/build/123",
+    }
+    row = _format_marker_to_row(marker, dataset_slug="__all__")
+    assert row is not None
+    assert row["id"] == "honeycomb_marker_m_rel_1"
+    assert "Honeycomb Timeline Marker: Deployed canary build" in row["text"]
+    assert "- **Marker Type:** `deploy`" in row["text"]
+    assert "- **External URL:** https://ci.example.com/build/123" in row["text"]
 
 
 def test_format_trigger_to_row() -> None:
@@ -174,30 +250,23 @@ def test_honeycomb_source_iteration() -> None:
     source = honeycomb_source(api_key="test_key", client=fake_client)
 
     records = list(source)
-    # 2 datasets + 1 board + 2 triggers + 1 slo = 6 records
-    assert len(records) == 6
+    # 2 datasets + 1 board + 1 query + 1 trigger + 1 slo + 2 markers = 8 records
+    assert len(records) == 8
 
     ids = [r["id"] for r in records]
     assert "honeycomb_dataset_api-gateway" in ids
     assert "honeycomb_dataset_payments-svc" in ids
-    assert "honeycomb_board_board_123" in ids
+    assert "honeycomb_board_board_flexible_1" in ids
+    assert "honeycomb_query_query_slow_requests" in ids
     assert "honeycomb_trigger_trig_001" in ids
-    assert "honeycomb_trigger_trig_002" in ids
     assert "honeycomb_slo_slo_checkout" in ids
+    assert "honeycomb_marker_mark_deploy_v2" in ids
+    assert "honeycomb_marker_mark_incident_01" in ids
 
 
-def test_honeycomb_document_source_attribute() -> None:
+def test_honeycomb_canonical_document_source_attribute() -> None:
     fake_client = FakeHoneycombClient()
     source = honeycomb_source(api_key="test_key", client=fake_client)
     assert hasattr(source, DOCUMENT_SOURCE_ATTR)
     assert getattr(source, DOCUMENT_SOURCE_ATTR) == "honeycomb"
-
-
-def test_honeycomb_source_since_filter() -> None:
-    fake_client = FakeHoneycombClient()
-    source = honeycomb_source(api_key="test_key", since="2026-10-05T00:00:00Z", client=fake_client)
-
-    records = list(source)
-    # Only payments-svc dataset was written at 2026-10-05T08:00:00Z
-    assert len(records) == 1
-    assert records[0]["id"] == "honeycomb_dataset_payments-svc"
+    assert DOCUMENT_SOURCE_ATTR == "cognee_document_source"
