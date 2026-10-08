@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from copy import deepcopy
 from urllib.parse import parse_qs, urlsplit
@@ -135,8 +136,7 @@ def test_declarative_rest_source_handles_auth_and_cursor_pagination() -> None:
         for request in item_requests
     )
     assert all(
-        "parent_item_id" not in parse_qs(urlsplit(request.url).query)
-        for request in item_requests
+        "parent_item_id" not in parse_qs(urlsplit(request.url).query) for request in item_requests
     )
     assert parse_qs(urlsplit(item_requests[0].url).query) == {"limit": ["50"]}
     assert parse_qs(urlsplit(item_requests[1].url).query) == {
@@ -264,11 +264,30 @@ def test_failed_item_walk_does_not_advance_state() -> None:
     assert state == old_state
 
 
-def test_source_declares_document_mode() -> None:
+def test_source_declares_document_mode_and_merge_delete_schema() -> None:
     resource = miro_source(client=FakeMiroClient([], {}))
 
     assert resource.name == "miro_documents"
     assert resource.cognee_document_source == MIRO_SOURCE_NAME
+
+    schema = resource.compute_table_schema()
+    write_disposition = schema.get("write_disposition")
+    if isinstance(write_disposition, dict):
+        write_disposition = write_disposition.get("disposition")
+    assert write_disposition == "merge"
+    assert schema["columns"]["id"].get("primary_key") is True
+    assert schema["columns"]["_deleted"].get("hard_delete") is True
+
+
+@pytest.mark.parametrize("board_ids", [[], (), [""], ["  "]])
+def test_source_rejects_empty_explicit_board_selection(board_ids) -> None:
+    with pytest.raises(ValueError, match="board_ids cannot be empty"):
+        miro_source(board_ids=board_ids, client=FakeMiroClient([], {}))
+
+
+def test_source_rejects_single_string_as_board_ids() -> None:
+    with pytest.raises(TypeError, match="iterable of board IDs"):
+        miro_source(board_ids="board-1", client=FakeMiroClient([], {}))
 
 
 def test_source_requires_token_without_injected_client(monkeypatch) -> None:
@@ -303,3 +322,92 @@ def test_dlt_merge_removes_deleted_frame(tmp_path) -> None:
 
     emptied = FakeMiroClient([_board("2026-10-02T10:00:00Z")], {"board-1": []})
     assert sync(emptied) == []
+
+
+def test_cognee_add_routes_miro_documents_and_forgets_one_deleted_frame(
+    tmp_path, monkeypatch
+) -> None:
+    """Exercise document routing and orphan cleanup through cognee.add()."""
+    import cognee
+    from cognee.modules.data.methods import get_authorized_existing_datasets
+    from cognee.modules.data.methods.get_dataset_data import get_dataset_data
+    from cognee.modules.users.methods import get_default_user
+    from cognee.tasks.ingestion.dlt_utils import is_dlt_sourced
+
+    dataset_name = "miro_connector_integration_test"
+    monkeypatch.setenv("COGNEE_SKIP_CONNECTION_TEST", "true")
+    monkeypatch.chdir(tmp_path)
+    cognee.config.data_root_directory(str(tmp_path / "data"))
+    cognee.config.system_root_directory(str(tmp_path / "system"))
+    cognee.config.set_relational_db_config({"db_provider": "sqlite"})
+
+    async def miro_data():
+        user = await get_default_user()
+        datasets = await get_authorized_existing_datasets(
+            user=user,
+            permission_type="write",
+            datasets=[dataset_name],
+        )
+        if not datasets:
+            return []
+        data = await get_dataset_data(datasets[0].id)
+        return [
+            item
+            for item in data
+            if isinstance(item.external_metadata, dict)
+            and item.external_metadata.get("source") == "miro"
+        ]
+
+    async def add(client):
+        await cognee.add(
+            miro_source(client=client),
+            dataset_name=dataset_name,
+            primary_key="id",
+            write_disposition="merge",
+            max_rows_per_table=0,
+        )
+
+    async def scenario():
+        await cognee.prune.prune_data()
+        await cognee.prune.prune_system(metadata=True)
+        try:
+            client = FakeMiroClient(
+                [_board()],
+                {
+                    "board-1": [
+                        _frame("f1", "Keep"),
+                        _frame("f2", "Delete"),
+                        _item("a", "Alpha", parent_id="f1"),
+                        _item("b", "Bravo", parent_id="f2"),
+                    ]
+                },
+            )
+            await add(client)
+
+            initial = await miro_data()
+            assert len(initial) == 2
+            initial_by_external_id = {
+                item.external_metadata["external_id"]: item for item in initial
+            }
+            assert set(initial_by_external_id) == {
+                "board-1:frame:f1",
+                "board-1:frame:f2",
+            }
+            assert all(not is_dlt_sourced(item.external_metadata) for item in initial)
+
+            client.boards = [_board("2026-10-02T10:00:00Z")]
+            client.items["board-1"] = [
+                _frame("f1", "Keep"),
+                _item("a", "Alpha", parent_id="f1"),
+            ]
+            await add(client)
+
+            final = await miro_data()
+            assert len(final) == 1
+            assert final[0].external_metadata["external_id"] == "board-1:frame:f1"
+            assert final[0].id == initial_by_external_id["board-1:frame:f1"].id
+        finally:
+            await cognee.prune.prune_data()
+            await cognee.prune.prune_system(metadata=True)
+
+    asyncio.run(scenario())

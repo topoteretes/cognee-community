@@ -30,6 +30,7 @@ uv sync
 
 ```bash
 export MIRO_ACCESS_TOKEN="your-oauth-access-token"
+export MIRO_BOARD_IDS="uXjVExampleBoardId="
 export LLM_API_KEY="your-llm-key"
 ```
 
@@ -54,8 +55,9 @@ await cognee.remember(
 
 `board_ids` is the clearest way to select content. You can instead pass
 `team_id` or `project_id` and omit `board_ids` to sync every visible board in
-that scope. Always use a dedicated dataset so deletion cleanup cannot affect an
-unrelated connector.
+that scope. Passing an empty collection is rejected so it cannot accidentally
+select every visible board. Always use a dedicated dataset so deletion cleanup
+cannot affect an unrelated connector.
 
 ## Incremental sync and deletion
 
@@ -84,7 +86,15 @@ partial request cannot falsely delete valid memory.
 
 ```bash
 uv run python examples/example.py
-uv run pytest tests/
+uv run --with pytest pytest tests/
+```
+
+If your credentials are stored in this repository's root `.env`, run these
+commands from `packages/connector/miro` with:
+
+```bash
+uv run --env-file ../../../.env python examples/example.py
+uv run --env-file ../../../.env --with pytest pytest tests/ -q
 ```
 
 The tests use a fake Miro client and a local SQLite dlt destination. No live
@@ -96,11 +106,22 @@ against a board you can access, run:
 ```bash
 export MIRO_ACCESS_TOKEN="your-oauth-access-token"
 export MIRO_BOARD_ID="uXjVExampleBoardId="
-uv run pytest tests/test_miro_live.py -v
+MIRO_RUN_LIVE_TESTS=1 uv run --with pytest pytest tests/test_miro_live.py -v
+```
+
+For a root `.env`, use:
+
+```bash
+MIRO_RUN_LIVE_TESTS=1 uv run --env-file ../../../.env --with pytest \
+  pytest tests/test_miro_live.py -v
 ```
 
 The connector calls Miro's documented
 [`GET /v2/boards/{board_id}/items`](https://developers.miro.com/reference/get-items-1)
 operation without `parent_item_id`, so it receives the complete board inventory
 needed for frame grouping and deletion reconciliation. The live test checks
-only the returned record shape and does not print board content or credentials.
+board discovery, `modifiedAt`, and the shape of any returned item records. It
+does not print board content or credentials.
+The offline integration tests use mocked LLM and embedding calls to verify that
+frame documents reach cognee's graph and that deleting one frame removes its
+graph content without requiring external model credentials.

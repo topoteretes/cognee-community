@@ -175,7 +175,18 @@ def miro_source(
     if client is None and not resolved_token:
         raise ValueError("Miro access token required: pass access_token= or set MIRO_ACCESS_TOKEN.")
 
-    selected_ids = {str(board_id) for board_id in board_ids or ()}
+    if isinstance(board_ids, (str, bytes)):
+        raise TypeError("board_ids must be an iterable of board IDs, not a single string")
+
+    selected_ids: set[str] | None = None
+    if board_ids is not None:
+        selected_ids = {
+            str(board_id).strip()
+            for board_id in board_ids
+            if board_id is not None and str(board_id).strip()
+        }
+        if not selected_ids:
+            raise ValueError("board_ids cannot be empty; omit it to sync every visible board")
 
     @dlt.resource(
         name=MIRO_TABLE_NAME,
@@ -208,14 +219,14 @@ def _sync_rows(
     project_id: str | None = None,
 ):
     """Yield the incremental document delta and commit state on success only."""
-    selected_ids = selected_ids or set()
     previous_boards = state.get("boards") or {}
 
     boards = client.list_boards(team_id=team_id, project_id=project_id)
     current_boards = {
         str(board["id"]): board
         for board in boards
-        if board.get("id") is not None and (not selected_ids or str(board["id"]) in selected_ids)
+        if board.get("id") is not None
+        and (selected_ids is None or str(board["id"]) in selected_ids)
     }
 
     next_boards: dict[str, Any] = {}
