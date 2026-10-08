@@ -83,14 +83,18 @@ source.
 - **Build logs are ingested as Vercel returns them.** Vercel redacts sensitive environment
   variables of 32 characters or more. Anything else a build prints stays in its log. Pass
   `include_build_logs=False` if your builds print secrets.
-- **Auth is a token.** A personal access token and a token from an integration install both
-  work. The connector does not run an OAuth flow itself.
+- **dlt keeps its load files.** Each sync leaves a gzip copy of the loaded rows in dlt's
+  pipeline directory, and forgetting a document does not remove those copies. Set
+  `LOAD__DELETE_COMPLETED_JOBS=true` to have dlt delete them after each load.
+- **Auth is a token.** It is sent as a bearer token. That is also how a token from an
+  integration install is used, but only a personal token was tested. The connector does not run
+  an OAuth flow itself.
 - Tested live against one personal Vercel account in October 2026.
 
 ## Setup
 
-1. Create an access token at <https://vercel.com/account/tokens>. Scope it to one team or one
-   project and give it an expiry.
+1. Create an access token at <https://vercel.com/account/tokens>. Scope it to one team and give
+   it an expiry.
 2. Set it as `VERCEL_TOKEN` (or pass `token=...`), plus your `LLM_API_KEY` like any other cognee
    run.
 
