@@ -113,6 +113,22 @@ def prepare_sync(client, bucket: str, prefix: str, manifest_path, **limits):
     return snapshot_rows(client, bucket, prefix, previous=previous, **limits)
 
 
+def sync_with_publisher(client, bucket: str, prefix: str, manifest_path,
+                        publish, **limits):
+    """Synchronize only when a synchronous publisher confirms completion.
+
+    publish(rows) MUST commit both ingestion and deletion reconciliation before
+    returning. A raised error prevents checkpoint advancement. This adapter
+    does not imply that dlt or Cognee exposes a transactional commit hook.
+    """
+    if not callable(publish):
+        raise TypeError("publish must be callable")
+    rows, pending = prepare_sync(client, bucket, prefix, manifest_path, **limits)
+    publish(rows)
+    save_manifest(manifest_path, bucket, prefix, pending)
+    return len(rows)
+
+
 def s3_source(bucket: str, prefix: str = "", *, client=None,
               max_objects: int = 10000, max_bytes: int = 2_000_000):
     """Return Cognee document-mode dlt source; boto3 uses its credential chain."""

@@ -17,3 +17,12 @@ ingestion; this publication boundary is NOT yet wired into `s3_source`. It suppo
 not ingested. A failed listing, download, decoding, or exceeded limit aborts
 without returning a partial snapshot. Verify Cognee orphan cleanup behavior
 before relying on deletion propagation in production.
+
+## Controlled publication API
+
+`sync_with_publisher(client, bucket, prefix, manifest_path, publish)` is an
+optional integration hook. The supplied synchronous `publish(rows)` callback
+must finish both ingestion and deletion reconciliation before returning.
+A failure leaves the prior manifest unchanged. This is **not** automatically
+connected to Cognee's dlt lifecycle, and the callback must not acknowledge
+publication before it is durable. No claim of end-to-end transactionality is made.

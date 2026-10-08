@@ -165,3 +165,36 @@ def test_persisted_checkpoint_avoids_download(tmp_path):
     assert s3.reads == 1
     prepare_sync(s3, "bucket", "a/", path)
     assert s3.reads == 1
+
+
+def test_publication_failure_never_advances_manifest(tmp_path):
+    from cognee_community_connector_s3.s3 import sync_with_publisher, load_manifest
+    s3 = FakeS3({"a/1.txt": b"one"})
+    path = tmp_path / "manifest.json"
+
+    def failing_publisher(rows):
+        raise RuntimeError("Cognee ingestion failed")
+
+    with pytest.raises(RuntimeError):
+        sync_with_publisher(s3, "bucket", "a/", path, failing_publisher)
+    assert not path.exists()
+    published = []
+    assert sync_with_publisher(s3, "bucket", "a/", path, published.extend) == 1
+    assert len(published) == 1
+    assert len(load_manifest(path, "bucket", "a/")) == 1
+
+
+def test_deletion_is_published_before_checkpoint(tmp_path):
+    from cognee_community_connector_s3.s3 import sync_with_publisher, load_manifest
+    s3 = FakeS3({"a/1.txt": b"one"})
+    path = tmp_path / "manifest.json"
+    events = []
+    sync_with_publisher(s3, "bucket", "a/", path, lambda rows: events.append(len(rows)))
+    s3.objects.clear()
+    def publish_empty(rows):
+        assert rows == []
+        assert len(load_manifest(path, "bucket", "a/")) == 1
+        events.append(len(rows))
+    sync_with_publisher(s3, "bucket", "a/", path, publish_empty)
+    assert events == [1, 0]
+    assert load_manifest(path, "bucket", "a/") == {}
