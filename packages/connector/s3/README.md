@@ -6,7 +6,8 @@ prefix and `s3:GetObject` for selected objects. Do not commit credentials.
 
 Install from this package directory with `pip install -e .`.
 Use `s3_source(bucket="my-bucket", prefix="docs/")` as a document-mode dlt
-source with Cognee. See `examples/example.py`.
+source with Cognee. See `examples/example.py` for `cognee.remember` integration.
+The example requires explicit `COGNEE_S3_BUCKET` and uses `docs/` by default.
 
 The Cognee dlt source currently uses a complete snapshot and dlt replace,
 so it downloads eligible files each run. The separate `prepare_sync` API
