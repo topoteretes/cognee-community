@@ -281,7 +281,7 @@ def _document_to_row(base_url: str, doc: dict[str, Any]) -> dict[str, Any]:
         return {}
 
     title = doc.get("title") or f"Outline Document {doc_id}"
-    url = doc.get("url") or f"{base_url.replace('/api', '')}/doc/{doc.get('slug', doc_id)}"
+    url = doc.get("url") or f"{base_url.removesuffix('/api')}/doc/{doc.get('slug', doc_id)}"
     content = _render_document_content(doc) or title
 
     return {
