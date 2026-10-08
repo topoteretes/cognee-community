@@ -51,9 +51,9 @@ answer = await cognee.search(
 | `include_feedback` | `False` | Interview feedback forms (restricted — see below). |
 | `include_notes` | `False` | Non-secret candidate notes (restricted — see below). |
 | `posting_states` | all | Keep only postings in these states, e.g. `["published"]`. |
-| `posting_ids` | all | Only sync feedback/notes for opportunities on these postings. |
+| `posting_ids` | all | Only sync feedback/notes for opportunities on these postings. **Recommended** when you enable feedback/notes: every in-scope opportunity is re-read each run, so new feedback is never missed (see below). |
 | `include_confidential` | `False` | Also ingest confidential postings/opportunities. |
-| `full_refresh` | `False` | Ignore the stored cursor and re-read everything in scope. Use it once after narrowing `posting_states` / `posting_ids` so records that fell out of scope are forgotten. |
+| `full_refresh` | `False` | Ignore the stored cursor and re-read everything in scope. Use it once after narrowing `posting_states` so postings that fell out of scope are forgotten. |
 
 ## Candidate data is restricted by default
 
@@ -61,10 +61,21 @@ Feedback and notes describe real people, so they are **off unless you opt in**, 
 then the connector never ingests candidate contact data — no name, email, phone, links,
 headline or location. Each opportunity becomes one document holding only the text that
 interviewers wrote (feedback answers and non-secret notes), keyed by the opportunity id.
-Secret notes, deleted forms and confidential records are skipped. Free text written by
-interviewers can still mention a candidate by name, so keep this data in its own dataset
-and apply your organisation's retention rules (`cognee.forget` removes a dataset in one
-call).
+
+* **Names in free text are pseudonymized.** Interviewers often write the candidate's name in
+  their feedback, so the candidate's full name, each part of it ("Jane", "Jane's"), their
+  emails and phone numbers are replaced with a stable label such as `Candidate 3f2a9c1e`.
+  The label is a one-way hash of the Lever contact id: one person's documents stay linked in
+  the graph without revealing who they are, and different candidates never merge into one
+  "candidate" entity. Matching is whole-word and errs on the side of privacy (a name that is
+  also a common word is still replaced). Names of *other* people mentioned in the text,
+  misspellings, nicknames and differently formatted phone numbers are not caught.
+* **Anonymized candidates are forgotten.** When Lever anonymizes a candidate (`isAnonymized`,
+  for example after a GDPR erasure request), their document is deleted on the next sync.
+* Secret notes, deleted forms and confidential records are skipped.
+
+Keep this data in its own dataset and apply your organisation's retention rules
+(`cognee.forget` removes a dataset in one call).
 
 ## How sync + forget-on-delete work
 
@@ -82,9 +93,21 @@ call).
   other error aborts the run *before* the cursor advances, so nothing is skipped or forgotten
   by mistake.
 
-> Lever only bumps an opportunity's `updatedAt` for the profile fields it documents (stage,
-> tags, archived, `lastInteractionAt`, …). Feedback or a note edited without touching those is
-> picked up the next time the opportunity changes — or pass `full_refresh=True`.
+### Keeping feedback and notes fresh
+
+Lever does **not** bump an opportunity's `updatedAt` when feedback or a note is added, edited
+or deleted, so an `updated_at_start` cursor alone would miss new interview feedback. The
+connector therefore has two modes for opportunities:
+
+* **Scoped rescan (recommended)** — pass `posting_ids=[...]`. Every opportunity on those
+  postings is re-read on each run. New, edited and deleted feedback/notes are always picked
+  up; unchanged documents render to identical content and keep their `data_id`, so nothing
+  is re-cognified. Opportunities that leave the scope are forgotten. (If the listing comes
+  back empty while opportunities were known, forgetting is skipped for that run, since that
+  almost always means a transient failure or a mistyped posting id.)
+* **Account-wide incremental** — no `posting_ids`. Only opportunities whose `updatedAt` moved
+  are re-read, which keeps large accounts cheap; feedback on an otherwise untouched
+  opportunity is picked up on its next update, or with `full_refresh=True`.
 
 ## Setup
 
@@ -102,6 +125,8 @@ uv run pytest tests/
 ```
 
 The tests mock the Lever API (no live key) and cover rendering, pagination, the incremental
-cursor, delete feeds and scope changes, retry/abort behaviour, the restricted-data guarantees,
+cursor, delete feeds and scope changes, retry/abort behaviour, the restricted-data guarantees
+(including name pseudonymization and anonymized candidates), the scoped rescan that catches
+feedback added without an `updatedAt` change,
 a real `dlt` merge proving a tombstone physically removes the row, and a `cognee.add` run
 proving deleted postings are forgotten while unchanged ones keep their `data_id`.

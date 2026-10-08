@@ -43,11 +43,22 @@ def posting(
     }
 
 
-def opportunity(opportunity_id, *, updated_at, confidentiality="non-confidential", posting=None):
+def opportunity(
+    opportunity_id,
+    *,
+    updated_at,
+    confidentiality="non-confidential",
+    posting=None,
+    name="Jane Candidate",
+    contact=None,
+    anonymized=False,
+):
     return {
         "id": opportunity_id,
+        "contact": contact,
+        "isAnonymized": anonymized,
         # Candidate contact data that must never reach memory.
-        "name": "Jane Candidate",
+        "name": name,
         "emails": ["jane@example.com"],
         "phones": [{"value": "+1 555 0100"}],
         "headline": "Staff Engineer at Initech",
