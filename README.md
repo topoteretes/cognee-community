@@ -109,6 +109,13 @@ poetry run python ./examples/example.py
 
 ## Custom Packages
 
+### Contentful connector
+
+The [`cognee-community-connector-contentful`](packages/connector/contentful) package
+imports published Contentful entries, asset metadata, and content models with incremental
+updates and deletion reconciliation. Its [README](packages/connector/contentful/README.md)
+includes setup, source selection, failure recovery, offline tests, and a runnable example.
+
 Custom packages are also a part of this repo, containing, for example, custom pipelines, tasks, and retrievers.
 Every pipeline has its own package, as well as every retriever. Tasks are grouped so that all mutually relevant tasks
 are contained in one package (i.e. all tasks used in one pipeline are packaged together).
