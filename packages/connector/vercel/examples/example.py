@@ -26,7 +26,7 @@ One-time setup
        # or, from this monorepo: cd packages/connector/vercel && uv sync
 
 2. Create an access token at https://vercel.com/account/tokens. Scope it to one
-   team or project and give it an expiry.
+   team and give it an expiry.
 3. Export the token and your LLM key, then run:
 
        export VERCEL_TOKEN="vcp_..."

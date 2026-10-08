@@ -79,8 +79,7 @@ def vercel_source(
     """Create a dlt source that yields Vercel projects, deployments and failed-build output.
 
     Args:
-        token: Vercel access token, sent as a bearer token. A personal access token
-            and a token issued by an integration install both work. Falls back to
+        token: Vercel access token, sent as a bearer token. Falls back to
             ``VERCEL_TOKEN``.
         team_id: Team to read. Needed when a full-account token should read a team.
             Falls back to ``VERCEL_TEAM_ID``.
@@ -303,7 +302,8 @@ def _deployment_row(deployment: dict) -> dict:
         ("State", deployment.get("state") or deployment.get("readyState")),
         ("Created", _timestamp(deployment.get("created"))),
         ("Build started", _timestamp(deployment.get("buildingAt"))),
-        ("Ready", _timestamp(deployment.get("ready"))),
+        # Vercel sets `ready` on failed deployments too: it is when the build ended.
+        ("Finished", _timestamp(deployment.get("ready"))),
         ("Created by", creator.get("username")),
         ("Commit", _commit_meta(meta, "CommitSha")),
         ("Branch", _commit_meta(meta, "CommitRef")),

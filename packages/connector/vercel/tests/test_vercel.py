@@ -272,6 +272,13 @@ def test_deployment_row_keeps_status_commit_author_and_timing():
     assert not any(canary in json.dumps(row) for canary in CANARIES)
 
 
+def test_deployment_row_does_not_call_a_failed_build_ready():
+    # A failed deployment carries a `ready` timestamp as well.
+    content = _deployment_row(_deployment("dpl_err", "web", state="ERROR"))["content"]
+    assert "Finished: " in content
+    assert "Ready" not in content
+
+
 def test_deployment_row_reads_commit_from_any_git_provider():
     deployment = _deployment("dpl_1", "web")
     deployment["meta"] = {"gitlabCommitSha": "abc123", "gitlabCommitRef": "develop"}
