@@ -74,9 +74,14 @@ class GhostClient:
                 if attempt == _MAX_RETRIES - 1 or not self._is_transient(exc):
                     raise
                 delay = self._retry_delay(exc, attempt)
+                err_msg = (
+                    f"HTTP {exc.response.status_code}"
+                    if hasattr(exc, "response") and exc.response is not None
+                    else type(exc).__name__
+                )
                 logger.warning(
                     "Ghost: %s — retrying in %.1fs (%d/%d).",
-                    exc,
+                    err_msg,
                     delay,
                     attempt + 1,
                     _MAX_RETRIES,
@@ -102,10 +107,10 @@ class GhostClient:
             retry_header = exc.response.headers.get("Retry-After")
             if retry_header:
                 try:
-                    return float(retry_header)
+                    return min(float(retry_header), 60.0)
                 except (ValueError, TypeError):
                     pass
-        return float(2**attempt)
+        return min(float(2**attempt), 60.0)
 
     def iter_documents(
         self,
@@ -132,8 +137,9 @@ class GhostClient:
 
             yield from items
 
-            pagination = data.get("meta", {}).get("pagination", {})
-            total_pages = pagination.get("pages", 1)
+            meta = data.get("meta") or {}
+            pagination = meta.get("pagination") or {}
+            total_pages = pagination.get("pages") or 1
             if page >= total_pages:
                 break
             page += 1
@@ -235,7 +241,7 @@ def _document_to_row(base_url: str, resource_type: str, item: dict[str, Any]) ->
 
     title = item.get("title", f"Untitled {resource_type.rstrip('s')}")
     url = item.get("url") or f"{base_url}/{item.get('slug', item_id)}"
-    content = _render_document_content(item)
+    content = _render_document_content(item) or title
 
     singular = resource_type.rstrip("s")
     return {

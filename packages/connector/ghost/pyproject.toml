@@ -3,7 +3,7 @@ name = "cognee-community-connector-ghost"
 version = "0.1.0"
 description = "Ghost CMS data-source connector for cognee — sync your Ghost posts and pages into memory (full snapshot + forget-on-delete)"
 readme = "README.md"
-requires-python = ">=3.11,<=3.13"
+requires-python = ">=3.11,<3.14"
 dependencies = [
     "cognee>=1.4.0",
     "dlt[sqlalchemy]>=1.9.0,<2",
