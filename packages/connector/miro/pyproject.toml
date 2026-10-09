@@ -1,7 +1,7 @@
 [project]
 name = "cognee-community-connector-miro"
 version = "0.1.0"
-description = "Miro data-source connector for cognee — frame-aware incremental board sync"
+description = "Miro data-source connector for cognee — frame-aware full-snapshot board sync"
 readme = "README.md"
 requires-python = ">=3.11,<=3.13"
 dependencies = [

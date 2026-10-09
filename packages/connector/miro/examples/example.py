@@ -21,7 +21,7 @@ async def main() -> None:
         miro_source(board_ids=board_ids),
         dataset_name=DATASET_NAME,
         primary_key="id",
-        write_disposition="merge",
+        write_disposition="replace",
         max_rows_per_table=0,
         self_improvement=False,
     )

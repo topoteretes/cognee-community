@@ -43,6 +43,9 @@ class FakeMiroClient:
             }
         ]
 
+    def get_board(self, _board_id: str):
+        return self.list_boards()[0]
+
     def list_items(self, _board_id: str):
         return deepcopy(self.items)
 
@@ -122,7 +125,7 @@ def test_deleted_miro_frame_is_removed_from_cognified_graph(tmp_path, monkeypatc
             miro_source(client=client),
             dataset_name=DATASET_NAME,
             primary_key="id",
-            write_disposition="merge",
+            write_disposition="replace",
             max_rows_per_table=0,
         )
         await cognee.cognify(datasets=[DATASET_NAME])

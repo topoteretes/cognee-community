@@ -1,4 +1,4 @@
-"""Offline tests for frame rendering and incremental Miro sync."""
+"""Offline tests for frame rendering and full-snapshot Miro sync."""
 
 from __future__ import annotations
 
@@ -14,6 +14,8 @@ from requests.models import Response
 
 from cognee_community_connector_miro.miro import (
     MIRO_SOURCE_NAME,
+    MiroBoardNotFoundError,
+    MiroSnapshotChangedError,
     _board_documents,
     _MiroRESTSource,
     _plain_text,
@@ -22,12 +24,17 @@ from cognee_community_connector_miro.miro import (
 )
 
 
-def _board(modified_at: str = "2026-10-01T10:00:00Z") -> dict:
+def _board(
+    modified_at: str = "2026-10-01T10:00:00Z",
+    *,
+    board_id: str = "board-1",
+    name: str = "Product workshop",
+) -> dict:
     return {
-        "id": "board-1",
-        "name": "Product workshop",
+        "id": board_id,
+        "name": name,
         "modifiedAt": modified_at,
-        "viewLink": "https://miro.com/app/board/board-1/",
+        "viewLink": f"https://miro.com/app/board/{board_id}/",
     }
 
 
@@ -63,25 +70,48 @@ class FakeMiroClient:
         self,
         boards: list[dict],
         items: dict[str, list[dict]],
-        error: Exception | None = None,
+        *,
+        item_error: Exception | None = None,
+        board_errors: dict[str, Exception] | None = None,
+        board_responses: dict[str, list[dict | Exception]] | None = None,
     ):
         self.boards = boards
         self.items = items
-        self.error = error
+        self.item_error = item_error
+        self.board_errors = board_errors or {}
+        self.board_responses = board_responses or {}
         self.item_calls: list[str] = []
+        self.get_board_calls: list[str] = []
+        self.list_board_calls: list[dict] = []
 
     def list_boards(self, **kwargs):
+        self.list_board_calls.append(kwargs)
         return deepcopy(self.boards)
+
+    def get_board(self, board_id: str):
+        self.get_board_calls.append(board_id)
+        queued = self.board_responses.get(board_id)
+        if queued:
+            response = queued.pop(0)
+            if isinstance(response, Exception):
+                raise response
+            return deepcopy(response)
+        if error := self.board_errors.get(board_id):
+            raise error
+        board = next((board for board in self.boards if str(board.get("id")) == board_id), None)
+        if board is None:
+            raise MiroBoardNotFoundError(board_id)
+        return deepcopy(board)
 
     def list_items(self, board_id: str):
         self.item_calls.append(board_id)
-        if self.error:
-            raise self.error
+        if self.item_error:
+            raise self.item_error
         return deepcopy(self.items[board_id])
 
 
 class StubMiroAdapter(BaseAdapter):
-    """Small requests adapter that exercises dlt REST pagination offline."""
+    """Small requests adapter that exercises dlt REST extraction offline."""
 
     def __init__(self):
         self.requests: list[requests.PreparedRequest] = []
@@ -89,22 +119,42 @@ class StubMiroAdapter(BaseAdapter):
     def send(self, request, **kwargs):
         self.requests.append(request)
         response = Response()
-        response.status_code = 200
         response.request = request
         response.url = request.url
         response.headers["Content-Type"] = "application/json"
+        path = urlsplit(request.url).path
 
-        if "/boards?" in request.url:
+        if path == "/v2/boards/missing":
+            response.status_code = 404
+            payload = {"message": "not found"}
+        elif path == "/v2/boards/forbidden":
+            response.status_code = 403
+            payload = {"message": "forbidden"}
+        elif path == "/v2/boards/board-1":
+            response.status_code = 200
+            payload = _board()
+        elif path == "/v2/boards":
+            response.status_code = 200
             payload = {"data": [_board()], "total": 1}
         elif "cursor=next-page" in request.url:
+            response.status_code = 200
             payload = {"data": [_item("second", "Second")]}
         else:
+            response.status_code = 200
             payload = {"data": [_frame("f1", "Plan")], "cursor": "next-page"}
+
         response._content = json.dumps(payload).encode()
         return response
 
     def close(self):
         return None
+
+
+def _session_with_stub() -> tuple[requests.Session, StubMiroAdapter]:
+    session = requests.Session()
+    adapter = StubMiroAdapter()
+    session.mount("https://api.miro.com/", adapter)
+    return session, adapter
 
 
 def test_plain_text_strips_miro_html() -> None:
@@ -113,21 +163,39 @@ def test_plain_text_strips_miro_html() -> None:
     )
 
 
-def test_declarative_rest_source_handles_auth_and_cursor_pagination() -> None:
-    session = requests.Session()
-    adapter = StubMiroAdapter()
-    session.mount("https://api.miro.com/", adapter)
+def test_declarative_rest_source_handles_auth_filters_direct_lookup_and_pagination() -> None:
+    session, adapter = _session_with_stub()
     client = _MiroRESTSource("oauth-token", session=session)
 
-    boards = client.list_boards(team_id="team-1")
+    boards = client.list_boards(team_id="team-1", project_id="project-1")
+    board = client.get_board("board-1")
     items = client.list_items("uXjVExampleBoardId=")
 
-    assert [board["id"] for board in boards] == ["board-1"]
+    assert [item["id"] for item in boards] == ["board-1"]
+    assert board["id"] == "board-1"
     assert [item["id"] for item in items] == ["f1", "second"]
-    assert len(adapter.requests) == 3
+    assert len(adapter.requests) == 4
     assert all(
         request.headers["Authorization"] == "Bearer oauth-token" for request in adapter.requests
     )
+
+    board_list_request = next(
+        request for request in adapter.requests if urlsplit(request.url).path == "/v2/boards"
+    )
+    assert parse_qs(urlsplit(board_list_request.url).query) == {
+        "limit": ["50"],
+        "offset": ["0"],
+        "project_id": ["project-1"],
+        "sort": ["last_modified"],
+        "team_id": ["team-1"],
+    }
+
+    direct_request = next(
+        request
+        for request in adapter.requests
+        if urlsplit(request.url).path == "/v2/boards/board-1"
+    )
+    assert not urlsplit(direct_request.url).query
 
     item_requests = [request for request in adapter.requests if "/items?" in request.url]
     assert len(item_requests) == 2
@@ -143,6 +211,18 @@ def test_declarative_rest_source_handles_auth_and_cursor_pagination() -> None:
         "cursor": ["next-page"],
         "limit": ["50"],
     }
+
+
+def test_direct_lookup_translates_only_404_to_board_not_found() -> None:
+    session, _ = _session_with_stub()
+    client = _MiroRESTSource("oauth-token", session=session)
+
+    with pytest.raises(MiroBoardNotFoundError):
+        client.get_board("missing")
+
+    with pytest.raises(Exception) as forbidden:
+        client.get_board("forbidden")
+    assert not isinstance(forbidden.value, MiroBoardNotFoundError)
 
 
 def test_board_documents_group_by_frame_and_keep_unframed_items() -> None:
@@ -166,105 +246,123 @@ def test_board_documents_group_by_frame_and_keep_unframed_items() -> None:
     assert "ignored" not in "".join(row["content"] for row in documents)
 
 
-def test_initial_sync_then_unchanged_board_skips_item_walk() -> None:
+def test_unchanged_board_produces_a_complete_consistent_snapshot() -> None:
     client = FakeMiroClient(
         [_board()],
         {"board-1": [_frame("f1", "Plan"), _item("a", "A", parent_id="f1")]},
     )
-    state: dict = {}
 
-    first_rows = list(_sync_rows(client, state))
-    second_rows = list(_sync_rows(client, state))
-
-    assert [row["id"] for row in first_rows] == ["board-1:frame:f1"]
-    assert second_rows == []
-    assert client.item_calls == ["board-1"]
-
-
-def test_changed_board_emits_only_changed_frame() -> None:
-    client = FakeMiroClient(
-        [_board()],
-        {
-            "board-1": [
-                _frame("f1", "One"),
-                _frame("f2", "Two"),
-                _item("a", "A", parent_id="f1"),
-                _item("b", "B", parent_id="f2"),
-            ]
-        },
-    )
-    state: dict = {}
-    list(_sync_rows(client, state))
-
-    client.boards = [_board("2026-10-02T10:00:00Z")]
-    client.items["board-1"][2]["data"]["content"] = "A changed"
-    rows = list(_sync_rows(client, state))
+    rows = list(_sync_rows(client))
 
     assert [row["id"] for row in rows] == ["board-1:frame:f1"]
+    assert client.item_calls == ["board-1"]
+    assert client.get_board_calls == ["board-1"]
+    assert not any("_deleted" in row for row in rows)
 
 
-def test_moving_item_rewrites_destination_and_deletes_empty_source_frame() -> None:
+def test_board_changing_once_is_retried_and_second_snapshot_is_used() -> None:
+    first = _board("2026-10-01T10:00:00Z")
+    second = _board("2026-10-02T10:00:00Z")
     client = FakeMiroClient(
-        [_board()],
+        [first],
+        {"board-1": [_frame("f1", "Plan"), _item("a", "A", parent_id="f1")]},
+        board_responses={"board-1": [second, second]},
+    )
+
+    rows = list(_sync_rows(client))
+
+    assert [row["id"] for row in rows] == ["board-1:frame:f1"]
+    assert client.item_calls == ["board-1", "board-1"]
+    assert client.get_board_calls == ["board-1", "board-1"]
+
+
+def test_board_changing_twice_aborts_without_yielding_a_partial_snapshot() -> None:
+    client = FakeMiroClient(
+        [
+            _board("2026-10-01T10:00:00Z"),
+            _board("2026-10-01T10:00:00Z", board_id="board-2", name="Second board"),
+        ],
         {
-            "board-1": [
-                _frame("f1", "Old"),
-                _frame("f2", "New"),
-                _item("a", "Move me", parent_id="f1"),
-                _item("b", "Keep me", parent_id="f2"),
-            ]
+            "board-1": [_frame("f1", "One"), _item("a", "A", parent_id="f1")],
+            "board-2": [_frame("f2", "Two"), _item("b", "B", parent_id="f2")],
+        },
+        board_responses={
+            "board-1": [_board("2026-10-01T10:00:00Z")],
+            "board-2": [
+                _board("2026-10-02T10:00:00Z", board_id="board-2"),
+                _board("2026-10-03T10:00:00Z", board_id="board-2"),
+            ],
         },
     )
-    state: dict = {}
-    list(_sync_rows(client, state))
+    rows = _sync_rows(client)
 
-    client.boards = [_board("2026-10-02T10:00:00Z")]
-    client.items["board-1"][2]["parent"] = {"id": "f2"}
-    rows = list(_sync_rows(client, state))
-
-    assert {row["id"] for row in rows} == {"board-1:frame:f1", "board-1:frame:f2"}
-    tombstone = next(row for row in rows if row["id"] == "board-1:frame:f1")
-    assert tombstone == {"id": "board-1:frame:f1", "_deleted": True}
+    with pytest.raises(MiroSnapshotChangedError, match="changed during both snapshot attempts"):
+        next(rows)
 
 
-def test_removed_board_emits_document_tombstones() -> None:
+def test_failed_item_walk_aborts_before_any_snapshot_rows_are_yielded() -> None:
     client = FakeMiroClient(
         [_board()],
-        {"board-1": [_frame("f1", "Plan"), _item("a", "A", parent_id="f1")]},
-    )
-    state: dict = {}
-    list(_sync_rows(client, state, selected_ids={"board-1"}))
-
-    client.boards = []
-    rows = list(_sync_rows(client, state, selected_ids={"board-1"}))
-
-    assert rows == [{"id": "board-1:frame:f1", "_deleted": True}]
-    assert state == {"boards": {}}
-
-
-def test_failed_item_walk_does_not_advance_state() -> None:
-    old_state = {
-        "boards": {
-            "board-1": {
-                "modified_at": "2026-10-01T10:00:00Z",
-                "documents": {"board-1:frame:f1": "old-hash"},
-            }
-        }
-    }
-    state = deepcopy(old_state)
-    client = FakeMiroClient(
-        [_board("2026-10-02T10:00:00Z")],
         {"board-1": []},
-        error=RuntimeError("pagination failed"),
+        item_error=RuntimeError("pagination failed"),
     )
 
     with pytest.raises(RuntimeError, match="pagination failed"):
-        list(_sync_rows(client, state))
-
-    assert state == old_state
+        next(_sync_rows(client))
 
 
-def test_source_declares_document_mode_and_merge_delete_schema() -> None:
+def test_explicit_board_ids_use_direct_lookup_deduplicate_and_skip_confirmed_404() -> None:
+    board_2 = _board(board_id="board-2", name="Second board")
+    client = FakeMiroClient(
+        [_board(), board_2],
+        {
+            "board-1": [_frame("f1", "One"), _item("a", "A", parent_id="f1")],
+            "board-2": [_frame("f2", "Two"), _item("b", "B", parent_id="f2")],
+        },
+        board_errors={"missing": MiroBoardNotFoundError("missing")},
+    )
+
+    rows = list(_sync_rows(client, selected_ids={"board-2", "board-1", "missing"}))
+
+    assert {row["id"] for row in rows} == {"board-1:frame:f1", "board-2:frame:f2"}
+    assert client.list_board_calls == []
+    assert client.get_board_calls == ["board-1", "board-2", "missing", "board-1", "board-2"]
+
+    duplicate_client = FakeMiroClient(
+        [_board()],
+        {"board-1": [_frame("f1", "One"), _item("a", "A", parent_id="f1")]},
+    )
+    duplicate_resource = miro_source(
+        board_ids=["board-1", "board-1"],
+        client=duplicate_client,
+    )
+    assert [row["id"] for row in duplicate_resource] == ["board-1:frame:f1"]
+    assert duplicate_client.get_board_calls == ["board-1", "board-1"]
+
+
+@pytest.mark.parametrize("status", [401, 403, 429, 500])
+def test_non_404_direct_lookup_errors_abort_snapshot(status: int) -> None:
+    response = Response()
+    response.status_code = status
+    error = requests.HTTPError(f"HTTP {status}", response=response)
+    client = FakeMiroClient([], {}, board_errors={"board-1": error})
+
+    with pytest.raises(requests.HTTPError, match=str(status)):
+        next(_sync_rows(client, selected_ids={"board-1"}))
+
+
+def test_team_and_project_filters_are_used_only_for_discovery() -> None:
+    client = FakeMiroClient(
+        [_board()],
+        {"board-1": [_frame("f1", "Plan"), _item("a", "A", parent_id="f1")]},
+    )
+
+    list(_sync_rows(client, team_id="team-1", project_id="project-1"))
+
+    assert client.list_board_calls == [{"team_id": "team-1", "project_id": "project-1"}]
+
+
+def test_source_declares_document_mode_and_replace_schema() -> None:
     resource = miro_source(client=FakeMiroClient([], {}))
 
     assert resource.name == "miro_documents"
@@ -274,9 +372,9 @@ def test_source_declares_document_mode_and_merge_delete_schema() -> None:
     write_disposition = schema.get("write_disposition")
     if isinstance(write_disposition, dict):
         write_disposition = write_disposition.get("disposition")
-    assert write_disposition == "merge"
+    assert write_disposition == "replace"
     assert schema["columns"]["id"].get("primary_key") is True
-    assert schema["columns"]["_deleted"].get("hard_delete") is True
+    assert "_deleted" not in schema["columns"]
 
 
 @pytest.mark.parametrize("board_ids", [[], (), [""], ["  "]])
@@ -306,38 +404,73 @@ def test_source_reads_access_token_from_dlt_secret_provider(monkeypatch) -> None
     assert resource.name == "miro_documents"
 
 
-def test_dlt_merge_removes_deleted_frame(tmp_path) -> None:
+def test_dlt_replace_removes_deleted_frame_and_failed_snapshot_preserves_table(tmp_path) -> None:
     import dlt
 
     pipelines_dir = str(tmp_path / "pipelines")
     database_path = tmp_path / "miro.db"
 
-    def sync(client: FakeMiroClient) -> list[str]:
+    def sync(client: FakeMiroClient, board_ids=None) -> list[str]:
         pipeline = dlt.pipeline(
             pipeline_name="miro_e2e_test",
             destination=dlt.destinations.sqlalchemy(f"sqlite:///{database_path}"),
             dataset_name="miro_e2e",
             pipelines_dir=pipelines_dir,
         )
-        pipeline.run(miro_source(client=client))
+        pipeline.run(miro_source(client=client, board_ids=board_ids))
         with pipeline.sql_client() as sql_client:
             rows = sql_client.execute_sql("SELECT id FROM miro_documents ORDER BY id")
         return [row[0] for row in rows]
 
     initial = FakeMiroClient(
         [_board()],
-        {"board-1": [_frame("f1", "Plan"), _item("a", "A", parent_id="f1")]},
+        {
+            "board-1": [
+                _frame("f1", "Keep"),
+                _frame("f2", "Delete"),
+                _item("a", "A", parent_id="f1"),
+                _item("b", "B", parent_id="f2"),
+            ]
+        },
     )
-    assert sync(initial) == ["board-1:frame:f1"]
+    assert sync(initial) == ["board-1:frame:f1", "board-1:frame:f2"]
 
-    emptied = FakeMiroClient([_board("2026-10-02T10:00:00Z")], {"board-1": []})
-    assert sync(emptied) == []
+    deleted = FakeMiroClient(
+        [_board("2026-10-02T10:00:00Z")],
+        {"board-1": [_frame("f1", "Keep"), _item("a", "A", parent_id="f1")]},
+    )
+    assert sync(deleted) == ["board-1:frame:f1"]
+
+    failed = FakeMiroClient(
+        [_board("2026-10-03T10:00:00Z")],
+        {"board-1": []},
+        item_error=RuntimeError("transient failure"),
+    )
+    with pytest.raises(Exception, match="transient failure"):
+        sync(failed)
+
+    pipeline = dlt.pipeline(
+        pipeline_name="miro_e2e_test",
+        destination=dlt.destinations.sqlalchemy(f"sqlite:///{database_path}"),
+        dataset_name="miro_e2e",
+        pipelines_dir=pipelines_dir,
+    )
+    with pipeline.sql_client() as sql_client:
+        rows = sql_client.execute_sql("SELECT id FROM miro_documents ORDER BY id")
+    assert [row[0] for row in rows] == ["board-1:frame:f1"]
+
+    removed = FakeMiroClient(
+        [],
+        {},
+        board_errors={"board-1": MiroBoardNotFoundError("board-1")},
+    )
+    assert sync(removed, board_ids=["board-1"]) == []
 
 
 def test_cognee_add_routes_miro_documents_and_forgets_one_deleted_frame(
     tmp_path, monkeypatch
 ) -> None:
-    """Exercise document routing and orphan cleanup through cognee.add()."""
+    """Exercise full-snapshot document routing and orphan cleanup through cognee.add()."""
     import cognee
     from cognee.modules.data.methods import get_authorized_existing_datasets
     from cognee.modules.data.methods.get_dataset_data import get_dataset_data
@@ -373,7 +506,7 @@ def test_cognee_add_routes_miro_documents_and_forgets_one_deleted_frame(
             miro_source(client=client),
             dataset_name=dataset_name,
             primary_key="id",
-            write_disposition="merge",
+            write_disposition="replace",
             max_rows_per_table=0,
         )
 

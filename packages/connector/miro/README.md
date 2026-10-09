@@ -67,7 +67,7 @@ await cognee.remember(
     miro_source(board_ids=["uXjVExampleBoardId="]),
     dataset_name="my-miro-boards",
     primary_key="id",
-    write_disposition="merge",
+    write_disposition="replace",
     max_rows_per_table=0,
     self_improvement=False,
 )
@@ -79,25 +79,29 @@ that scope. Passing an empty collection is rejected so it cannot accidentally
 select every visible board. Always use a dedicated dataset so deletion cleanup
 cannot affect an unrelated connector.
 
-## Incremental sync and deletion
+## Snapshot consistency and deletion
 
-Miro does not provide a `modified_since` filter or an item deletion feed. The
-connector therefore lists the selected boards on every run and keeps each
-board's `modifiedAt` value in dlt resource state. Unchanged boards cost only the
-listing; a changed board is walked completely.
+Miro does not provide an item deletion feed. The connector therefore emits a
+complete snapshot with `write_disposition="replace"` on every run. Explicit
+`board_ids` are fetched directly; team, project, and all-visible scopes use the
+paginated board listing.
 
-Frame documents use stable IDs and content hashes. Changed documents are merged
-while missing frames, emptied frames, and removed boards produce dlt hard-delete
-tombstones. Cognee's orphan cleanup then removes their graph and vector data.
-The cursor advances only after every item page was fetched, so a failed or
-partial request cannot falsely delete valid memory.
+Frame documents use stable IDs and deterministic content. Missing frames,
+emptied frames, and boards confirmed missing with HTTP 404 fall out of the next
+snapshot. Cognee's orphan cleanup then removes the corresponding cognee data and
+graph content.
+
+For every board, the connector compares `modifiedAt` before and after reading
+all item pages. If the board changed during pagination, it discards that read
+and retries once. A second change or any non-404 API error aborts the complete
+snapshot before yielding rows, so a partial read cannot delete valid memory.
 
 ## Why this connector uses REST only
 
 This connector deliberately uses only Miro's REST API. Miro MCP can read
 comments, but its agent-oriented tools do not expose the same documented
-board `modifiedAt` checkpoint or cursor-paginated, board-wide item inventory
-used here for deterministic incremental sync and deletion reconciliation. Its
+board `modifiedAt` consistency check or cursor-paginated, board-wide item inventory
+used here for deterministic snapshot sync and deletion reconciliation. Its
 board content tools return an SVG representation intended for interactive AI
 workflows, and Miro recommends REST for repeatable backend integrations.
 
@@ -150,9 +154,21 @@ The connector calls Miro's documented
 operation without `parent_item_id`, so it receives the complete board inventory
 needed for frame grouping and deletion reconciliation. The configured test
 board must contain at least one frame with a sticky note, text item, or labelled
-shape. The live tests check board discovery, `modifiedAt`, item retrieval,
-document rendering, dlt persistence, and the unchanged-board checkpoint. They
-do not print board content or credentials.
+shape. The live tests check direct board lookup, `modifiedAt`, item retrieval,
+document rendering, and dlt full-snapshot persistence. They do not print board
+content or credentials.
 The offline integration tests use mocked LLM and embedding calls to verify that
 frame documents reach cognee's graph and that deleting one frame removes its
 graph content without requiring external model credentials.
+
+For the destructive live check, use a disposable board and a token with
+`boards:write`. The test creates two uniquely named frames, verifies a real
+shape payload, removes one frame, checks cognee data and graph cleanup, and
+removes all remaining test items in `finally`:
+
+```bash
+export MIRO_BOARD_ID="uXjVExampleBoardId="
+export SOURCES__MIRO__ACCESS_TOKEN="your-read-write-oauth-access-token"
+MIRO_RUN_LIVE_WRITE_TESTS=1 uv run --with pytest \
+  pytest tests/test_miro_live_write.py -v
+```

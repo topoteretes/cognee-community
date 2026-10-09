@@ -6,7 +6,11 @@ import os
 
 import pytest
 
-from cognee_community_connector_miro.miro import _board_documents, _MiroRESTSource, miro_source
+from cognee_community_connector_miro.miro import (
+    _board_documents,
+    _MiroRESTSource,
+    miro_source,
+)
 
 
 def _live_enabled() -> bool:
@@ -44,9 +48,7 @@ def test_live_board_discovery_and_items_endpoint() -> None:
     access_token = _access_token()
     assert access_token is not None
     client = _MiroRESTSource(access_token)
-    boards = client.list_boards()
-    selected_board = next((board for board in boards if str(board.get("id")) == board_id), None)
-    assert selected_board is not None
+    selected_board = client.get_board(board_id)
     assert selected_board.get("modifiedAt")
 
     items = client.list_items(board_id)
@@ -69,8 +71,8 @@ def test_live_board_discovery_and_items_endpoint() -> None:
         "configure sources.miro.access_token through a dlt secret provider"
     ),
 )
-def test_live_dlt_sync_persists_documents_and_skips_unchanged_board(tmp_path) -> None:
-    """Load real Miro documents through dlt and verify the modifiedAt checkpoint."""
+def test_live_dlt_replace_persists_the_complete_snapshot(tmp_path) -> None:
+    """Load the same real Miro snapshot twice and retain every stable document."""
     import dlt
 
     board_id = _board_id()
@@ -79,11 +81,7 @@ def test_live_dlt_sync_persists_documents_and_skips_unchanged_board(tmp_path) ->
     assert access_token is not None
 
     preflight_client = _MiroRESTSource(access_token)
-    selected_board = next(
-        (board for board in preflight_client.list_boards() if str(board.get("id")) == board_id),
-        None,
-    )
-    assert selected_board is not None
+    selected_board = preflight_client.get_board(board_id)
     items = preflight_client.list_items(board_id)
     assert items, "configured live board is empty; add a frame with a sticky note, shape, or text"
     assert _board_documents(selected_board, items), "live board has no supported text to sync"
@@ -92,9 +90,14 @@ def test_live_dlt_sync_persists_documents_and_skips_unchanged_board(tmp_path) ->
         def __init__(self) -> None:
             self.client = _MiroRESTSource(access_token)
             self.item_calls = 0
+            self.board_calls = 0
 
         def list_boards(self, **kwargs):
             return self.client.list_boards(**kwargs)
+
+        def get_board(self, selected_board_id: str):
+            self.board_calls += 1
+            return self.client.get_board(selected_board_id)
 
         def list_items(self, selected_board_id: str):
             self.item_calls += 1
@@ -116,6 +119,7 @@ def test_live_dlt_sync_persists_documents_and_skips_unchanged_board(tmp_path) ->
 
     assert first_ids, "live board produced no supported frame documents"
     assert client.item_calls == 1
+    assert client.board_calls == 2
 
     pipeline.run(miro_source(board_ids=[board_id], client=client))
     with pipeline.sql_client() as sql_client:
@@ -124,4 +128,5 @@ def test_live_dlt_sync_persists_documents_and_skips_unchanged_board(tmp_path) ->
         ]
 
     assert second_ids == first_ids
-    assert client.item_calls == 1
+    assert client.item_calls == 2
+    assert client.board_calls == 4

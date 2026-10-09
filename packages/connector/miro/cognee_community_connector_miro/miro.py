@@ -5,19 +5,16 @@ row loses useful context. This connector renders one prose document per frame
 and one additional document for unframed items. The documents opt into
 cognee's normal cognify path through ``DOCUMENT_SOURCE_ATTR``.
 
-The Miro API cannot filter boards or items by modification time and exposes no
-delete feed. We therefore list the selected boards on every run, compare each
-board's ``modifiedAt`` value with dlt resource state, and fully walk only boards
-that changed. Changed documents are merged and documents missing from a
-complete walk are emitted as hard-delete tombstones. State advances only after
-all required pages have been read, so an interrupted request cannot turn a
-partial response into deletions.
+The Miro API exposes no delete feed, so every run produces a full snapshot with
+``write_disposition="replace"``. Each board is read consistently: its
+``modifiedAt`` value is checked again after all item pages have been fetched.
+If the board changed during the read, the connector retries the board once and
+then aborts the entire snapshot rather than allowing a mixed-version response
+to drive deletion.
 """
 
 from __future__ import annotations
 
-import hashlib
-import json
 import os
 import re
 from collections.abc import Iterable
@@ -33,6 +30,7 @@ MIRO_API_BASE_URL = "https://api.miro.com/v2/"
 MIRO_SOURCE_NAME = "miro"
 MIRO_TABLE_NAME = "miro_documents"
 SUPPORTED_ITEM_TYPES = frozenset({"shape", "sticky_note", "text"})
+MAX_SNAPSHOT_ATTEMPTS = 2
 
 _BLOCK_TAGS = frozenset({"br", "div", "li", "ol", "p", "tr", "ul"})
 _WHITESPACE = re.compile(r"[ \t\f\v]+")
@@ -56,6 +54,14 @@ class _TextExtractor(HTMLParser):
 
     def handle_data(self, data: str) -> None:
         self.parts.append(data)
+
+
+class MiroBoardNotFoundError(LookupError):
+    """The requested Miro board was confirmed absent with HTTP 404."""
+
+
+class MiroSnapshotChangedError(RuntimeError):
+    """A board changed repeatedly while its item snapshot was being read."""
 
 
 class _MiroRESTSource:
@@ -120,6 +126,32 @@ class _MiroRESTSource:
         }
         return self._extract(config, "items")
 
+    def get_board(self, board_id: str) -> dict[str, Any]:
+        """Fetch one board through dlt's declarative single-page REST resource."""
+        config = {
+            "client": self._client_config(),
+            "resources": [
+                {
+                    "name": "board",
+                    "endpoint": {
+                        "path": f"boards/{board_id}",
+                        "paginator": "single_page",
+                        "data_selector": "$",
+                    },
+                }
+            ],
+        }
+        try:
+            rows = self._extract(config, "board")
+        except Exception as exc:
+            if _http_status(exc) == 404:
+                raise MiroBoardNotFoundError(f"Miro board {board_id!r} was not found") from exc
+            raise
+
+        if len(rows) != 1 or not isinstance(rows[0], dict):
+            raise RuntimeError(f"Miro returned an invalid response for board {board_id!r}")
+        return rows[0]
+
     def _client_config(self) -> dict[str, Any]:
         client: dict[str, Any] = {
             "base_url": MIRO_API_BASE_URL,
@@ -161,12 +193,12 @@ def miro_source(
             the team/project scope visible to the token is selected.
         team_id: Optional Miro team filter for board discovery.
         project_id: Optional Miro project/space filter for board discovery.
-        client: Pre-built client implementing ``list_boards`` and ``list_items``;
-            intended for offline tests.
+        client: Pre-built client implementing ``list_boards``, ``get_board``,
+            and ``list_items``; intended for offline tests.
 
-    The returned resource uses merge/upsert with hard-delete tombstones. Pass it
-    directly to ``cognee.remember`` with a dedicated dataset and
-    ``write_disposition="merge"``.
+    The returned resource is a full snapshot. Pass it directly to
+    ``cognee.remember`` with a dedicated dataset and
+    ``write_disposition="replace"``.
     """
     try:
         import dlt
@@ -200,15 +232,12 @@ def miro_source(
     @dlt.resource(
         name=MIRO_TABLE_NAME,
         primary_key="id",
-        write_disposition="merge",
-        columns={"_deleted": {"data_type": "bool", "hard_delete": True}},
+        write_disposition="replace",
     )
     def miro_documents():
         rest_client = client or _MiroRESTSource(resolved_token)
-        resource_state = dlt.current.resource_state()
         yield from _sync_rows(
             rest_client,
-            resource_state,
             selected_ids=selected_ids,
             team_id=team_id,
             project_id=project_id,
@@ -221,66 +250,108 @@ def miro_source(
 
 def _sync_rows(
     client: Any,
-    state: dict[str, Any],
     *,
     selected_ids: set[str] | None = None,
     team_id: str | None = None,
     project_id: str | None = None,
 ):
-    """Yield the incremental document delta and commit state on success only."""
-    previous_boards = state.get("boards") or {}
-
-    boards = client.list_boards(team_id=team_id, project_id=project_id)
-    current_boards = {
-        str(board["id"]): board
-        for board in boards
-        if board.get("id") is not None
-        and (selected_ids is None or str(board["id"]) in selected_ids)
-    }
-
-    next_boards: dict[str, Any] = {}
-    changed = 0
-    deleted = 0
-
-    for board_id, board in current_boards.items():
-        modified_at = board.get("modifiedAt") or board.get("modified_at")
-        previous = previous_boards.get(board_id) or {}
-        previous_documents = previous.get("documents") or {}
-
-        if modified_at is not None and previous and previous.get("modified_at") == modified_at:
-            next_boards[board_id] = previous
-            continue
-
-        items = client.list_items(board_id)
-        documents = _board_documents(board, items)
-        document_hashes = {row["id"]: _row_hash(row) for row in documents}
-
-        for row in documents:
-            if previous_documents.get(row["id"]) != document_hashes[row["id"]]:
-                changed += 1
-                yield row
-
-        for document_id in previous_documents.keys() - document_hashes.keys():
-            deleted += 1
-            yield {"id": document_id, "_deleted": True}
-
-        next_boards[board_id] = {
-            "modified_at": modified_at,
-            "documents": document_hashes,
-        }
-
-    for board_id in previous_boards.keys() - current_boards.keys():
-        for document_id in previous_boards[board_id].get("documents") or {}:
-            deleted += 1
-            yield {"id": document_id, "_deleted": True}
-
-    state["boards"] = next_boards
-    logger.info(
-        "Miro: %d selected board(s), %d changed document(s), %d deletion(s).",
-        len(current_boards),
-        changed,
-        deleted,
+    """Build and yield one complete, consistent snapshot of the selected boards."""
+    boards = _selected_boards(
+        client,
+        selected_ids=selected_ids,
+        team_id=team_id,
+        project_id=project_id,
     )
+
+    # Buffer every document before yielding. If any board changes repeatedly or
+    # any request fails, dlt receives no partial snapshot and therefore cannot
+    # replace valid rows with incomplete data.
+    snapshot: list[dict[str, Any]] = []
+    synced_boards = 0
+    for board in boards:
+        documents = _consistent_board_documents(client, board)
+        if documents is None:
+            continue
+        snapshot.extend(documents)
+        synced_boards += 1
+
+    logger.info("Miro: snapshotted %d board(s), %d document(s).", synced_boards, len(snapshot))
+    yield from snapshot
+
+
+def _selected_boards(
+    client: Any,
+    *,
+    selected_ids: set[str] | None,
+    team_id: str | None,
+    project_id: str | None,
+) -> list[dict[str, Any]]:
+    """Resolve the configured scope without confusing API errors with deletion."""
+    if selected_ids is None:
+        return client.list_boards(team_id=team_id, project_id=project_id)
+
+    boards: list[dict[str, Any]] = []
+    for board_id in sorted(selected_ids):
+        try:
+            boards.append(client.get_board(board_id))
+        except MiroBoardNotFoundError:
+            logger.info("Miro: selected board %s no longer exists; omitting it.", board_id)
+    return boards
+
+
+def _consistent_board_documents(
+    client: Any, initial_board: dict[str, Any]
+) -> list[dict[str, Any]] | None:
+    """Return a board snapshot, retrying once if ``modifiedAt`` changes mid-read."""
+    board = initial_board
+    board_id = str(board["id"])
+
+    for attempt in range(MAX_SNAPSHOT_ATTEMPTS):
+        initial_modified_at = _required_modified_at(board)
+        items = client.list_items(board_id)
+        try:
+            final_board = client.get_board(board_id)
+        except MiroBoardNotFoundError:
+            # A confirmed 404 means the board disappeared during this snapshot.
+            # Omitting it is correct under full-snapshot replace semantics.
+            logger.info("Miro: board %s was deleted while it was being read.", board_id)
+            return None
+
+        final_modified_at = _required_modified_at(final_board)
+        if final_modified_at == initial_modified_at:
+            return _board_documents(final_board, items)
+
+        board = final_board
+        logger.warning(
+            "Miro: board %s changed while being read; retrying snapshot (%d/%d).",
+            board_id,
+            attempt + 1,
+            MAX_SNAPSHOT_ATTEMPTS,
+        )
+
+    raise MiroSnapshotChangedError(
+        f"Miro board {board_id!r} changed during both snapshot attempts; sync aborted"
+    )
+
+
+def _required_modified_at(board: dict[str, Any]) -> str:
+    modified_at = board.get("modifiedAt") or board.get("modified_at")
+    if not modified_at:
+        raise RuntimeError(f"Miro board {board.get('id')!r} has no modifiedAt value")
+    return str(modified_at)
+
+
+def _http_status(exc: BaseException) -> int | None:
+    """Find an HTTP response status through dlt's extraction exception chain."""
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        response = getattr(current, "response", None)
+        if response is not None and getattr(response, "status_code", None) is not None:
+            return int(response.status_code)
+        current = current.__cause__ or current.__context__
+    return None
 
 
 def _board_documents(board: dict[str, Any], items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -356,7 +427,6 @@ def _document_row(
         "url": board_url,
         "title": f"{board_name} — {frame_title}",
         "content": "\n".join(lines),
-        "_deleted": False,
     }
 
 
@@ -397,11 +467,6 @@ def _plain_text(value: str) -> str:
     text = "".join(parser.parts).replace("\xa0", " ").replace("\r\n", "\n").replace("\r", "\n")
     lines = [_WHITESPACE.sub(" ", line).strip() for line in text.splitlines()]
     return _BLANK_LINES.sub("\n\n", "\n".join(line for line in lines if line)).strip()
-
-
-def _row_hash(row: dict[str, Any]) -> str:
-    payload = json.dumps(row, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _install_hint() -> str:
