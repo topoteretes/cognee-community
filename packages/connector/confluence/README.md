@@ -51,6 +51,12 @@ and forgets pages that were deleted. See `examples/example.py` for the full flow
 
 ## How sync + forget-on-delete work
 
+Pages are ingested in **document mode**: the resource sets cognee's `DOCUMENT_SOURCE_ATTR`, so
+each page becomes its own text document and flows through normal cognify entity extraction.
+(Without the marker a dlt source lands on the relational manifest path, which skips extraction
+and — because the manifest keeps a stable id — stops syncing edits/new pages/deletions after
+the first run; see [cognee#5564](https://github.com/topoteretes/cognee/issues/5564).)
+
 Incremental sync uses the page's last-version timestamp (`version.createdAt`), persisted in
 dlt's per-resource state. Confluence has no deletion feed, so each run does a lightweight id
 sweep of the space(s) and compares it to the previous run's ids (also in resource state);
