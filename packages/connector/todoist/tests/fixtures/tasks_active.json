@@ -1,0 +1,47 @@
+[
+  {
+    "id": "task-001",
+    "project_id": "proj-001",
+    "section_id": "sec-001",
+    "content": "Write deployment runbook",
+    "description": "Document every step of the production deployment process including rollback procedures.",
+    "priority": 4,
+    "due": {"date": "2026-10-15", "is_recurring": false, "string": "Oct 15"},
+    "labels": ["documentation", "infrastructure"],
+    "assignee_ids": ["user-alice"],
+    "created_at": "2026-10-01T10:00:00Z",
+    "url": "https://todoist.com/showTask?id=task-001",
+    "comment_count": 3,
+    "is_completed": false
+  },
+  {
+    "id": "task-002",
+    "project_id": "proj-001",
+    "section_id": null,
+    "content": "Review Q3 metrics dashboard",
+    "description": "",
+    "priority": 3,
+    "due": {"date": "2026-10-10", "is_recurring": false, "string": "Oct 10"},
+    "labels": ["analytics"],
+    "assignee_ids": [],
+    "created_at": "2026-10-02T14:30:00Z",
+    "url": "https://todoist.com/showTask?id=task-002",
+    "comment_count": 0,
+    "is_completed": false
+  },
+  {
+    "id": "task-003",
+    "project_id": "proj-002",
+    "section_id": null,
+    "content": "Investigate API latency spike",
+    "description": "P95 latency increased from 180ms to 320ms over the past week. Check database query plans and cache hit rates.",
+    "priority": 4,
+    "due": null,
+    "labels": ["performance", "backend"],
+    "assignee_ids": ["user-bob"],
+    "created_at": "2026-10-03T09:15:00Z",
+    "url": "https://todoist.com/showTask?id=task-003",
+    "comment_count": 5,
+    "is_completed": false
+  }
+]
