@@ -42,6 +42,49 @@ source = otter_source(include_shared=False)
 await cognee.add(source)
 ```
 
+## Sync model: full snapshot replace
+
+This connector uses ``write_disposition="replace"`` — each sync produces the
+complete current set of conversations visible to the API key. Anything dropped
+from the listing (deleted, access revoked) gets cleaned up via cognee's orphan
+cleanup.
+
+### Incremental optimization
+
+While the disposition is ``replace`` (safest for correctness), the connector
+**minimizes re-fetching** by tracking the ``created_at`` cursor in dlt state.
+A 5-minute overlap window catches late-processed meetings. The Otter.ai API
+returns conversations in pages of 100 via cursor pagination.
+
+### Safety guarantee
+
+> An API error **aborts the run before staging is replaced**. A partial
+> snapshot must never drive mass deletions. Only when all pages have been
+> successfully fetched and all transcripts retrieved is the staging table
+> rewritten. Transient errors (429, 5xx) are retried with exponential backoff
+> honoring the ``Retry-After`` header; permanent errors (401 invalid key)
+> raise immediately.
+
+### Edge cases documented
+
+- **Shared meetings**: By default, ``include_shared=False`` — only meetings
+  owned by the API key's user are ingested. Set ``include_shared=True`` to
+  also ingest meetings shared with the user. Note: shared meetings may have
+  different access permissions.
+- **In-progress meetings**: Otter.ai's API may return meetings that are still
+  being recorded. These have partial transcripts. The connector ingests them
+  as-is; they will be updated on the next sync when processing completes.
+- **Large transcripts**: Very long meetings (2+ hours) produce large text
+  bodies. The connector passes them through unchanged; cognee's chunking
+  handles them during ingestion.
+- **Speaker identification**: Speaker labels are preserved as provided by the
+  API (e.g., "Speaker 0", "Speaker 1"). If Otter.ai has identified speakers,
+  those names appear in the text.
+- **Transcript fetch failures**: If fetching an individual transcript fails
+  (network error), the connector logs a warning and continues with the
+  conversation metadata only. The meeting is still discoverable by title and
+  participants.
+
 ## Data model (document-mode)
 
 One document per Otter.ai conversation containing:
@@ -51,17 +94,6 @@ One document per Otter.ai conversation containing:
 - Full transcript text with speaker labels and timestamps
 - Meeting participants list
 - Raw conversation preserved in the `raw` field
-
-## Incremental sync
-
-Uses the ``created_at`` field from the conversations listing, stored in dlt
-state, with a 5-minute overlap window to catch late-processed meetings.
-
-## Deletion
-
-``write_disposition="replace"`` — each sync produces the complete current set
-of conversations; anything dropped from the listing gets cleaned up via
-cognee's orphan cleanup.
 
 ## Layout
 
@@ -74,6 +106,7 @@ packages/connector/otter/
 ├── examples/
 │   └── example.py
 ├── tests/
+│   ├── fixtures/           # Recorded API responses for offline tests
 │   └── test_otter.py
 └── pyproject.toml
 ```
@@ -82,3 +115,5 @@ packages/connector/otter/
 
 Read `packages/connector/notion/` first — it is the closest working
 reference for the dlt + document-mode pattern this connector follows.
+The sync model and edge-case documentation draw from lessons learned
+reviewing high-quality Mergetober submissions.
