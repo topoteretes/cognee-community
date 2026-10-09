@@ -18,7 +18,7 @@ Over the past three years, **Apache Iceberg** has become the open table format s
 
 Yet, when engineering teams plug AI agents into their infrastructure, agents have no semantic memory of these lakehouses. Traditional relational connectors either attempt to dump millions of raw table rows into context windows (which blows up tokens and leaks PII) or require cumbersome manual schema documentation that goes stale immediately.
 
-To solve this, I built the **Apache Iceberg data-source connector for [Cognee](https://github.com/topoteretes/cognee)** as part of the **Mergetober Hackathon** (`cognee-community#5553`).
+To solve this, I built the **Apache Iceberg data-source connector for [Cognee](https://github.com/topoteretes/cognee)** as part of the **Mergetober Hackathon** ([topoteretes/cognee-community#348](https://github.com/topoteretes/cognee-community/pull/348), closing [`topoteretes/cognee#5553`](https://github.com/topoteretes/cognee/issues/5553)).
 
 In this technical walkthrough, I will break down how Cognee's cognitive memory engine works, how we designed a zero-leakage metadata connector using `dlt` and `pyiceberg`, and how agents can use knowledge graphs to reason across evolving lakehouse schemas.
 
@@ -254,6 +254,6 @@ By bridging Apache Iceberg into Cognee:
 - Data engineers can query table histories, schemas, and partition specs using natural language.
 - Decommissioned tables are automatically reconciled out of memory, eliminating hallucinations.
 
-The code is available in [`somuai/cognee-community`](https://github.com/somuai/cognee-community/tree/feat/connector-iceberg) under `packages/connector/iceberg/`, proposed in [`topoteretes/cognee#5553`](https://github.com/topoteretes/cognee/issues/5553).
+The code is available in pull request [topoteretes/cognee-community#348](https://github.com/topoteretes/cognee-community/pull/348) and fork branch [`somuai/cognee-community:feat/connector-iceberg`](https://github.com/somuai/cognee-community/tree/feat/connector-iceberg) under `packages/connector/iceberg/`, resolving [`topoteretes/cognee#5553`](https://github.com/topoteretes/cognee/issues/5553).
 
 Let's build AI agents that actually understand enterprise data infrastructure!
