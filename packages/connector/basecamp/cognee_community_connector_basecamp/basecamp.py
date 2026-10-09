@@ -60,6 +60,7 @@ from typing import Any
 
 import httpx
 from cognee.shared.logging_utils import get_logger
+from cognee.tasks.ingestion import dlt_utils
 from cognee.tasks.ingestion.dlt_utils import (
     DOCUMENT_SOURCE_ATTR,
     NODE_SET_COLUMN,
@@ -415,12 +416,22 @@ def _parse_ts(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
-def _iter_rows(client: BasecampClient, config: _SyncConfig, state: dict) -> Iterator[dict]:
+def _iter_rows(
+    client: BasecampClient,
+    config: _SyncConfig,
+    state: dict,
+    stats: dict[str, int] | None = None,
+) -> Iterator[dict]:
     """Yield changed rows and delete tombstones for every configured type.
 
     ``state`` is dlt's resource state (a plain dict in tests). It holds, per
     type: the ``updated_at`` cursor, the ids already synced, and list etags.
+    ``stats`` (optional) receives counts only, never titles or content.
     """
+    if stats is None:
+        stats = {}
+    for key in ("scanned", "changed", "deleted", "skipped"):
+        stats.setdefault(key, 0)
     runs = int(state.get("runs", 0)) + 1
     sweep = (
         config.full_sync
@@ -451,11 +462,14 @@ def _iter_rows(client: BasecampClient, config: _SyncConfig, state: dict) -> Iter
                 newest = max(filter(None, (newest, updated)), default=None)
                 rid = row_id(record_type, rec["id"])
                 seen.add(rid)
+                stats["scanned"] += 1
                 row = recording_to_row(rec)
                 if row is None:
+                    stats["skipped"] += 1
                     continue
                 known.add(rid)
                 changed += 1
+                stats["changed"] += 1
                 yield row
             # Any change bumps an item's updated_at and moves it to the top of the
             # newest-first listing, so an unchanged first page means no changes.
@@ -475,6 +489,7 @@ def _iter_rows(client: BasecampClient, config: _SyncConfig, state: dict) -> Iter
             if rid in known:
                 known.discard(rid)
                 deleted += 1
+                stats["deleted"] += 1
                 yield _tombstone(record_type, rec["id"])
 
         if sweep:
@@ -482,6 +497,7 @@ def _iter_rows(client: BasecampClient, config: _SyncConfig, state: dict) -> Iter
             # more was purged (emptied trash, 25-day expiry, project removed).
             for rid in sorted(known - seen):
                 deleted += 1
+                stats["deleted"] += 1
                 yield {"id": rid, "_deleted": True}
             known = {rid for rid in known if rid in seen}
 
@@ -522,6 +538,7 @@ def basecamp_source(
     full_sync: bool = False,
     full_sync_every: int | None = None,
     http_client: httpx.Client | None = None,
+    check_active=None,
 ):
     """Return a ``dlt`` resource yielding one row per Basecamp recording.
 
@@ -540,6 +557,12 @@ def basecamp_source(
         full_sync: Force a reconciliation sweep on this run.
         full_sync_every: Run the sweep every N runs (default 10; 0 disables).
         http_client: Pre-built ``httpx.Client``; mainly an injection point for tests.
+        check_active: Optional callable a host can pass to stop a running sync
+            (for example when its stored credentials are revoked); it is called
+            between rows, as in cognee's own connectors.
+
+    The returned resource also carries ``cognee_sync_stats`` (counts only:
+    scanned, changed, deleted, skipped) for hosts that report sync progress.
     """
     try:
         import dlt
@@ -547,6 +570,13 @@ def basecamp_source(
         raise ImportError(
             'The Basecamp connector requires dlt: pip install "cognee[dlt]".'
         ) from exc
+
+    # Rows carry per-row node sets, which cognee reads from sync version 2 on.
+    if getattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 0) < 2:
+        raise RuntimeError(
+            "The Basecamp connector requires a cognee build that reads per-row node sets "
+            "(DOCUMENT_SYNC_VERSION >= 2, cognee 1.6.3 or later). Upgrade cognee before syncing."
+        )
 
     resolved_account = str(account_id or os.getenv("BASECAMP_ACCOUNT_ID") or "").strip()
     if not resolved_account:
@@ -586,10 +616,13 @@ def basecamp_source(
             "or a refresh_token with client_id and client_secret."
         )
 
+    resource_name = f"basecamp_{resolved_account}_recordings"
+    stats: dict[str, int] = {}
+
     @dlt.resource(
         # One table per account, so syncing a second account never treats the
         # first account's rows as deleted.
-        name=f"basecamp_{resolved_account}_recordings",
+        name=resource_name,
         write_disposition="merge",
         primary_key="id",
         # `_deleted` is a hard-delete marker: rows where it is True are removed
@@ -607,10 +640,19 @@ def basecamp_source(
             client_secret=csecret,
             http_client=http_client,
         )
-        yield from _iter_rows(client, config, dlt.current.resource_state())
+        stats.clear()
+        yield from dlt_utils.guarded_rows(
+            _iter_rows(client, config, dlt.current.resource_state(), stats),
+            check_active,
+        )
 
     resource = basecamp_recordings()
     # Opt into cognee's document path: each row becomes a text document that
     # goes through normal cognify. resolve_dlt_sources reads this marker.
     setattr(resource, DOCUMENT_SOURCE_ATTR, BASECAMP_SOURCE_NAME)
+    # Give this account its own dlt pipeline (state per dataset + resource), so its
+    # cursor and known ids never share a pipeline with other dlt sources.
+    setattr(resource, dlt_utils.PIPELINE_SCOPE_ATTR, resource_name)
+    # Host-readable diagnostics: counts only, never titles or content.
+    resource.cognee_sync_stats = stats
     return resource

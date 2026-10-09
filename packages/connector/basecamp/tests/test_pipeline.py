@@ -55,6 +55,53 @@ def test_source_declares_document_marker():
     assert document_source_tag(source) == "basecamp"
 
 
+def test_source_has_its_own_pipeline_scope():
+    from cognee.tasks.ingestion.dlt_utils import PIPELINE_SCOPE_ATTR, pipeline_name_for_source
+
+    a = basecamp_source("999", access_token="t", user_agent=UA)
+    b = basecamp_source("888", access_token="t", user_agent=UA)
+    assert getattr(a, PIPELINE_SCOPE_ATTR) == TABLE
+    # Each account gets its own dlt pipeline, never the shared default one.
+    assert pipeline_name_for_source(a, "ds") != "ingest_dlt_source"
+    assert pipeline_name_for_source(a, "ds") != pipeline_name_for_source(b, "ds")
+
+
+def test_source_refuses_cognee_without_per_row_node_sets(monkeypatch):
+    from cognee.tasks.ingestion import dlt_utils
+
+    monkeypatch.setattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 1)
+    with pytest.raises(RuntimeError, match="DOCUMENT_SYNC_VERSION"):
+        basecamp_source("999", access_token="t", user_agent=UA)
+
+
+def test_sync_stats_report_counts_only(seeded, tmp_path):
+    pipeline = _pipeline(tmp_path)
+    source = _source(seeded)
+    pipeline.run(source)
+    assert source.cognee_sync_stats == {"scanned": 6, "changed": 6, "deleted": 0, "skipped": 0}
+
+    doc = _doc_id(seeded)
+    seeded.set_status(doc, "trashed")
+    source = _source(seeded)
+    pipeline.run(source)
+    assert source.cognee_sync_stats["deleted"] == 1
+    assert all(isinstance(v, int) for v in source.cognee_sync_stats.values())
+
+
+def test_check_active_can_stop_a_sync(seeded, tmp_path):
+    calls = []
+
+    def check_active():
+        calls.append(1)
+        if len(calls) > 3:
+            raise PermissionError("credentials revoked")
+
+    pipeline = _pipeline(tmp_path)
+    with pytest.raises(Exception, match="credentials revoked"):
+        pipeline.run(_source(seeded, check_active=check_active))
+    assert len(calls) == 4
+
+
 def test_source_requires_user_agent_and_token(monkeypatch):
     for var in ("BASECAMP_USER_AGENT", "BASECAMP_ACCESS_TOKEN", "BASECAMP_REFRESH_TOKEN"):
         monkeypatch.delenv(var, raising=False)

@@ -81,6 +81,11 @@ to one project.
 - **A failed sync changes nothing.** Any API error stops the run. The cursor is
   only saved when the load succeeds, and cognee only forgets things after a
   successful run, so the next sync simply retries.
+- **Own sync state per account.** Each account uses its own dlt pipeline
+  (`PIPELINE_SCOPE_ATTR`, as in cognee's built-in connectors), so its cursor never
+  mixes with other dlt sources. The source also exposes `cognee_sync_stats`
+  (counts only: scanned, changed, deleted, skipped) and accepts an optional
+  `check_active` callable that a host can use to stop a running sync.
 
 ## Setup
 
@@ -126,3 +131,7 @@ modelled on what a live account returns: newest-first listings, `Link` paging,
 cover the HTTP client (retries, 404s, token refresh), rendering, the incremental
 cursor, trash and purge deletes, archived items, and a real dlt pipeline run
 including a failed run that must change nothing.
+
+`tests/test_basecamp_forget.py` goes through cognee itself (`add` + `cognify`,
+with the LLM and embeddings mocked): a trashed item and a purged item must both
+disappear from the knowledge graph, not just from the staging table.
