@@ -1,0 +1,62 @@
+[
+  {
+    "id": 1001,
+    "subject": "Implement authentication middleware",
+    "description": {"format": "markdown", "raw": "Create a reusable middleware that validates JWT tokens on protected routes. Must support role-based access control and token refresh."},
+    "createdAt": "2026-09-15T10:00:00Z",
+    "updatedAt": "2026-09-25T14:30:00Z",
+    "dueDate": "2026-10-15",
+    "startDate": "2026-09-20",
+    "estimatedTime": "PT8H",
+    "commentCount": 3,
+    "_links": {
+      "type": {"title": "Task", "href": "/api/v3/types/1"},
+      "status": {"title": "In progress", "href": "/api/v3/statuses/7"},
+      "priority": {"title": "High", "href": "/api/v3/priorities/4"},
+      "assignee": {"title": "Alice Developer", "href": "/api/v3/users/5"},
+      "project": {"title": "Platform Core", "href": "/api/v3/projects/3"},
+      "version": {"title": "v2.1", "href": "/api/v3/versions/12"},
+      "author": {"title": "Bob Manager", "href": "/api/v3/users/2"}
+    }
+  },
+  {
+    "id": 1002,
+    "subject": "Database migration script review",
+    "description": {"format": "markdown", "raw": "Review the migration scripts for the Q3 release. Check for data integrity issues, rollback procedures, and performance implications on large datasets."},
+    "createdAt": "2026-09-22T09:00:00Z",
+    "updatedAt": "2026-09-28T11:15:00Z",
+    "dueDate": "2026-10-05",
+    "startDate": null,
+    "estimatedTime": "PT4H",
+    "commentCount": 5,
+    "_links": {
+      "type": {"title": "Milestone", "href": "/api/v3/types/2"},
+      "status": {"title": "New", "href": "/api/v3/statuses/1"},
+      "priority": {"title": "Normal", "href": "/api/v3/priorities/3"},
+      "assignee": {"title": "Charlie DBA", "href": "/api/v3/users/8"},
+      "project": {"title": "Platform Core", "href": "/api/v3/projects/3"},
+      "version": {"title": "v2.1", "href": "/api/v3/versions/12"},
+      "author": {"title": "Alice Developer", "href": "/api/v3/users/5"}
+    }
+  },
+  {
+    "id": 1003,
+    "subject": "Fix login page CSS on mobile",
+    "description": {"format": "markdown", "raw": "The login form overflows on small screens. Buttons are not accessible. Fix responsive layout and test on iOS Safari and Android Chrome."},
+    "createdAt": "2026-09-28T16:45:00Z",
+    "updatedAt": "2026-10-01T08:30:00Z",
+    "dueDate": "2026-10-03",
+    "startDate": "2026-10-01",
+    "estimatedTime": "PT2H",
+    "commentCount": 1,
+    "_links": {
+      "type": {"title": "Bug", "href": "/api/v3/types/3"},
+      "status": {"title": "Closed", "href": "/api/v3/statuses/12"},
+      "priority": {"title": "Urgent", "href": "/api/v3/priorities/5"},
+      "assignee": {"title": "Dana Designer", "href": "/api/v3/users/11"},
+      "project": {"title": "Web Frontend", "href": "/api/v3/projects/5"},
+      "version": {"title": "v2.0.1", "href": "/api/v3/versions/15"},
+      "author": {"title": "QA Team", "href": "/api/v3/users/1"}
+    }
+  }
+]
