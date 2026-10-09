@@ -1,4 +1,4 @@
-"""S3 -> real dlt SQLite replacement, with no external AWS or LLM access."""
+"""S3 -> real dlt DuckDB replacement, with no external AWS or LLM access."""
 import boto3
 import dlt
 from moto import mock_aws
@@ -22,3 +22,26 @@ def test_real_dlt_replace_reconciles_deletion(tmp_path):
         pipeline.run(s3_source("test-bucket", "docs/", client=client))
         with pipeline.sql_client() as sql:
             assert sql.execute_sql("SELECT count(*) FROM s3_documents")[0][0] == 1
+
+
+def test_document_source_routes_to_cognee_document_ingestion():
+    """Verify Cognee's real document-source routing contract, not only dlt rows."""
+    from cognee.tasks.ingestion.dlt_utils import document_source_tag
+    from cognee.tasks.ingestion.resolve_dlt_sources import _build_document_data_item
+    from types import SimpleNamespace
+    from uuid import NAMESPACE_OID, uuid5
+
+    with mock_aws():
+        client = boto3.client("s3", region_name="us-east-1",
+                              aws_access_key_id="testing", aws_secret_access_key="testing")
+        source = s3_source("test-bucket", "docs/", client=client)
+        assert document_source_tag(source) == "s3"
+        identity = "s3://test-bucket/docs/one.txt"
+        row = SimpleNamespace(row_data={"id": identity, "title": "one.txt",
+                                        "url": identity, "content": "first version"},
+                              content_hash="hash")
+        item = _build_document_data_item(row, uuid5(NAMESPACE_OID, identity), "s3")
+        assert item.external_metadata["source"] == "s3"
+        assert item.external_metadata["external_id"] == identity
+        assert item.data_id == uuid5(NAMESPACE_OID, identity)
+        assert "first version" in item.data
