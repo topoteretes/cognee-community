@@ -198,16 +198,18 @@ def _is_transient(exc: Exception) -> bool:
 
 
 def _retry_after(headers: Any, attempt: int) -> float:
-    """Extract Retry-After header or calculate exponential backoff."""
+    """Extract a valid Retry-After delay or calculate exponential backoff."""
     header = (headers or {}).get("retry-after") or (headers or {}).get("Retry-After")
-    if header:
+
+    if header is not None:
         try:
-            return float(header)
-        except (ValueError, TypeError):
+            delay = float(header)
+            if 0 <= delay < float("inf"):
+                return delay
+        except (ValueError, TypeError, OverflowError):
             pass
+
     return float(2**attempt)
-
-
 def quickbooks_source(
     realm_id: str | None = None,
     access_token: str | None = None,

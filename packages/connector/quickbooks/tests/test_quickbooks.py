@@ -375,3 +375,11 @@ def test_retry_after_and_transient_helpers():
     assert _is_transient(httpx.ConnectTimeout("connection timed out")) is True
     assert _is_transient(httpx.NetworkError("network failure")) is True
     assert _is_transient(ValueError("invalid logic")) is False
+
+def test_retry_after_rejects_invalid_delays():
+    from cognee_community_connector_quickbooks.quickbooks import _retry_after
+
+    assert _retry_after({"retry-after": "-5"}, 2) == 4.0
+    assert _retry_after({"retry-after": "nan"}, 2) == 4.0
+    assert _retry_after({"retry-after": "inf"}, 2) == 4.0
+    assert _retry_after({"retry-after": "invalid"}, 2) == 4.0
