@@ -52,8 +52,16 @@ token can read. See `examples/example.py` for the full flow.
 
 ## How sync + forget-on-delete work
 
+The resource sets cognee's `DOCUMENT_SOURCE_ATTR`, so it ingests in **document mode**: each
+run becomes its own text document and flows through normal cognify entity extraction. (A dlt
+source *without* that marker lands on the relational manifest path, which skips extraction
+and does not re-sync — the run text would just sit in a staging column.) Pass
+`write_disposition="merge"` to `remember(...)` — it is **required**, because the add pipeline
+defaults to `"replace"` and the resource only emits runs new since the cursor, so a
+`"replace"` run would drop everything synced before it.
+
 A TFC run is **immutable** once created, so each run is keyed by its run id and ingested
-exactly once (`write_disposition="merge"`). The **incremental cursor** is the run
+exactly once. The **incremental cursor** is the run
 `created-at` timestamp: each sync lists the most recent runs per workspace and emits only
 runs created since the last run (plus any run new to the corpus, e.g. from a workspace you
 just added to the selection). The cursor is persisted in dlt's per-resource state.

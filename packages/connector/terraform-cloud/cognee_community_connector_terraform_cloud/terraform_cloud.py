@@ -2,8 +2,11 @@
 
 Pull HCP Terraform / Terraform Cloud (TFC) **runs** — their outcome, commit
 message, and (redacted) plan log — into cognee, incrementally and with
-forget-on-deletion. Like the sibling Confluence connector this builds entirely
-on the existing DLT ingestion subsystem; the source produced here is handed
+forget-on-deletion. Like the sibling Notion / Gmail connectors this builds on
+the existing DLT ingestion subsystem in **document mode**: the resource sets
+``DOCUMENT_SOURCE_ATTR`` so each run is ingested as its own text document and
+flows through normal cognify entity extraction (not the relational manifest
+path, which would skip extraction and not re-sync). The resource is handed
 straight to :func:`cognee.remember`::
 
     import cognee
@@ -65,8 +68,17 @@ from collections.abc import Iterator
 from typing import Any
 
 from cognee.shared.logging_utils import get_logger
+from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR, PIPELINE_SCOPE_ATTR
 
 logger = get_logger("terraform_cloud_connector")
+
+# system_metadata["source"] tag for this connector's rows. Setting
+# DOCUMENT_SOURCE_ATTR to it opts each run into cognee's document-mode ingestion
+# (one text document per run, through normal cognify entity extraction) rather
+# than the relational manifest path, which would skip extraction entirely.
+TFC_SOURCE_NAME = "terraform_cloud"
+# dlt resource / staging-table name.
+TFC_RESOURCE_NAME = "terraform_cloud_runs"
 
 # HCP Terraform / Terraform Cloud REST API v2.
 _DEFAULT_BASE_URL = "https://app.terraform.io/api/v2"
@@ -313,10 +325,14 @@ def _run_to_row(run: dict, workspace: dict, organization: str, plan_log: str) ->
     ws_name = ws_attrs.get("name") or ""
     run_id = str(run.get("id"))
 
-    body = _render_run(run_id, ws_name, organization, attrs, ws_attrs, plan_log)
+    # The document text column MUST be named ``content`` — that is the column
+    # cognee's document-mode ingestion (_build_document_data_item) reads. A row
+    # with the text under any other name ingests an empty document.
+    content = _render_run(run_id, ws_name, organization, attrs, ws_attrs, plan_log)
 
     return {
         "id": run_id,
+        "title": f"Terraform run {run_id} ({ws_name})",
         "workspace": ws_name,
         "workspace_id": str(workspace.get("id") or ""),
         "organization": organization,
@@ -324,7 +340,7 @@ def _run_to_row(run: dict, workspace: dict, organization: str, plan_log: str) ->
         "message": attrs.get("message") or "",
         "created_at": _run_created_at(run),
         "url": f"{_APP_URL}/{organization}/workspaces/{ws_name}/runs/{run_id}",
-        "body": body,
+        "content": content,
         # Hard-delete marker (always False for live runs). Runs whose workspace
         # has vanished are emitted separately with _deleted=True.
         "_deleted": False,
@@ -339,9 +355,13 @@ def _render_run(
     ws_attrs: dict,
     plan_log: str,
 ) -> str:
-    """Render a run to a readable markdown document for entity extraction."""
+    """Render a run's body to readable text for entity extraction.
+
+    No leading ``# <title>`` heading: document-mode ingestion prepends the row's
+    ``title`` as the heading, so emitting one here would duplicate it.
+    """
     lines = [
-        f"# Terraform run {run_id}",
+        f"Terraform run {run_id}",
         f"Organization: {organization}",
         f"Workspace: {ws_name}",
         f"Status: {attrs.get('status') or 'unknown'}",
@@ -480,9 +500,13 @@ def terraform_cloud_source(
             tests; when omitted one is built from ``token``.
 
     Returns:
-        A ``dlt`` resource (``terraform_cloud_runs``) configured with
-        ``primary_key="id"``, ``write_disposition="merge"`` and an ``_deleted``
-        hard-delete column. Hand it to ``cognee.remember(...)``.
+        A ``dlt`` resource (``terraform_cloud_runs``) tagged for document-mode
+        ingestion and configured with ``primary_key="id"`` and an ``_deleted``
+        hard-delete column. Hand it to ``cognee.remember(...)`` with
+        ``write_disposition="merge"`` — this is **required**: the add pipeline
+        defaults to ``"replace"``, and because the resource emits only runs new
+        since the cursor, a ``"replace"`` run would drop every previously-synced
+        run from staging.
     """
     try:
         import dlt
@@ -498,7 +522,7 @@ def terraform_cloud_source(
         )
 
     @dlt.resource(
-        name="terraform_cloud_runs",
+        name=TFC_RESOURCE_NAME,
         primary_key="id",
         write_disposition="merge",
         # _deleted is a boolean hard-delete marker: rows where it is True are
@@ -520,4 +544,10 @@ def terraform_cloud_source(
             max_plan_log_chars=max_plan_log_chars,
         )
 
+    # Opt into document-mode ingestion: each run row becomes a text document
+    # routed through normal cognify entity extraction (resolve_dlt_sources reads
+    # this marker; it never imports this connector). PIPELINE_SCOPE_ATTR keeps
+    # the incremental cursor stable across alternating destination datasets.
+    setattr(terraform_cloud_runs, DOCUMENT_SOURCE_ATTR, TFC_SOURCE_NAME)
+    setattr(terraform_cloud_runs, PIPELINE_SCOPE_ATTR, TFC_RESOURCE_NAME)
     return terraform_cloud_runs

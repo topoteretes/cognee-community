@@ -316,11 +316,11 @@ def test_plan_log_is_fetched_capped_and_redacted():
     )
     rows = list(sync_runs(session, BASE_URL, ORG, {}, max_plan_log_chars=100))
 
-    body = rows[0]["body"]
-    assert "AKIAIOSFODNN7EXAMPLE" not in body  # redacted
-    assert "[REDACTED]" in body
-    assert "plan log truncated" in body  # capped
-    assert "## Plan output" in body
+    content = rows[0]["content"]
+    assert "AKIAIOSFODNN7EXAMPLE" not in content  # redacted
+    assert "[REDACTED]" in content
+    assert "plan log truncated" in content  # capped
+    assert "## Plan output" in content
 
 
 def test_plan_log_skipped_when_disabled():
@@ -329,7 +329,7 @@ def test_plan_log_skipped_when_disabled():
         plan_logs={"plan-1": "some log"},
     )
     rows = list(sync_runs(session, BASE_URL, ORG, {}, include_plan_logs=False))
-    assert "## Plan output" not in rows[0]["body"]
+    assert "## Plan output" not in rows[0]["content"]
     # No plan endpoints were hit when logs are disabled.
     assert not any("/plans/" in url for url, _ in session.calls)
 
@@ -352,6 +352,27 @@ def test_source_resource_is_configured_for_merge_and_hard_delete():
     columns = schema["columns"]
     assert columns["id"].get("primary_key") is True
     assert columns["_deleted"].get("hard_delete") is True
+
+
+def test_source_declares_document_mode_marker():
+    # Document-mode routing is what sends each run through normal cognify entity
+    # extraction (not the relational manifest path, which skips extraction).
+    # resolve_dlt_sources routes on this marker, so keep it set and stable.
+    pytest.importorskip("dlt")
+    from cognee.tasks.ingestion.dlt_utils import document_source_tag
+
+    resource = terraform_cloud_source(organization=ORG, session=_single_ws_session([]))
+    assert document_source_tag(resource) == "terraform_cloud"
+
+
+def test_run_row_carries_content_and_title_for_document_ingestion():
+    # document-mode ingestion reads the row's `content` (+ optional `title`);
+    # a row that put its text under any other name would ingest empty.
+    session = _single_ws_session([_run("run-1", created_at="2024-01-01T10:00:00Z")])
+    row = next(iter(sync_runs(session, BASE_URL, ORG, {}, include_plan_logs=False)))
+    assert row.get("content")
+    assert row["title"].startswith("Terraform run run-1")
+    assert "body" not in row  # the old, unread column name is gone
 
 
 def test_source_requires_token_or_session(monkeypatch):
