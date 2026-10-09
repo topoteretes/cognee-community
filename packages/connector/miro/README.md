@@ -135,9 +135,11 @@ MIRO_RUN_LIVE_TESTS=1 uv run --env-file ../../../.env --with pytest \
 The connector calls Miro's documented
 [`GET /v2/boards/{board_id}/items`](https://developers.miro.com/reference/get-items-1)
 operation without `parent_item_id`, so it receives the complete board inventory
-needed for frame grouping and deletion reconciliation. The live test checks
-board discovery, `modifiedAt`, and the shape of any returned item records. It
-does not print board content or credentials.
+needed for frame grouping and deletion reconciliation. The configured test
+board must contain at least one frame with a sticky note, text item, or labelled
+shape. The live tests check board discovery, `modifiedAt`, item retrieval,
+document rendering, dlt persistence, and the unchanged-board checkpoint. They
+do not print board content or credentials.
 The offline integration tests use mocked LLM and embedding calls to verify that
 frame documents reach cognee's graph and that deleting one frame removes its
 graph content without requiring external model credentials.
