@@ -1,0 +1,478 @@
+"""Unit tests for the Intercom dlt connector.
+
+Two layers, all runnable without an Intercom workspace:
+
+* DB-free tests for rendering, pagination, retries, the incremental search
+  window and the deletion sweeps, driven through ``sync_*`` with a fake
+  ``requests`` session and a plain dict as state.
+* dlt-pipeline tests (fake session, temp sqlite destination, ``merge`` like
+  ``cognee.remember(..., write_disposition="merge")``) covering the acceptance
+  criteria: first sync, edits re-sync, and deleted content is forgotten.
+"""
+
+import pytest
+import requests
+
+from cognee_community_connector_intercom.intercom import (
+    INTERCOM_SOURCE_NAME,
+    IntercomAPI,
+    article_to_row,
+    conversation_to_row,
+    html_to_text,
+    intercom_source,
+    sync_articles,
+    sync_contact_notes,
+    sync_conversations,
+)
+
+BASE = "https://api.intercom.io"
+
+# ---------------------------------------------------------------------------
+# Fixtures / fakes
+# ---------------------------------------------------------------------------
+
+
+def _conversation(cid, updated_at, subject="Refund", parts=(), state="open", total=None):
+    return {
+        "id": cid,
+        "title": None,
+        "created_at": 1_759_276_800,  # 2025-10-01
+        "updated_at": updated_at,
+        "state": state,
+        "tags": {"tags": [{"name": "billing"}, {"name": "vip"}]},
+        "source": {
+            "subject": subject,
+            "body": "<p>My card was charged twice.</p>",
+            "author": {"type": "user", "name": "Asha Rao", "email": "asha@example.com"},
+        },
+        "conversation_parts": {
+            "conversation_parts": list(parts),
+            "total_count": len(parts) if total is None else total,
+        },
+    }
+
+
+def _part(body, part_type="comment", author_type="admin", name="Ben"):
+    return {"part_type": part_type, "body": body, "author": {"type": author_type, "name": name}}
+
+
+def _article(aid, title, body, state="published"):
+    return {
+        "id": aid,
+        "title": title,
+        "description": f"About {title.lower()}",
+        "body": body,
+        "state": state,
+        "url": f"https://help.example.com/articles/{aid}",
+    }
+
+
+class FakeResponse:
+    def __init__(self, status_code, payload=None, headers=None):
+        self.status_code = status_code
+        self._payload = payload or {}
+        self.headers = headers or {}
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"HTTP {self.status_code}", response=self)
+
+
+class FakeIntercomSession:
+    """Stand-in for a ``requests`` session talking to the Intercom REST API."""
+
+    def __init__(self, conversations=(), articles=(), contacts=None, page_size=2):
+        self.conversations = {c["id"]: c for c in conversations}
+        self.articles = list(articles)
+        self.contacts = contacts or {}  # {contact_id: {"name": ..., "notes": [...]}}
+        self.page_size = page_size  # small pages so pagination is exercised
+        self.calls = []  # (method, path, params, body)
+        self.scripted = []  # FakeResponses returned before normal handling
+
+    def request(self, method, url, params=None, json=None, timeout=None):
+        path = url.removeprefix(BASE)
+        self.calls.append((method, path, params, json))
+        if self.scripted:
+            return self.scripted.pop(0)
+        if method == "GET" and path == "/conversations":
+            items = [{"id": cid} for cid in sorted(self.conversations)]
+            return self._cursor_page(items, "conversations", (params or {}).get("starting_after"))
+        if method == "POST" and path == "/conversations/search":
+            since = json["query"]["value"]
+            items = [
+                {"id": c["id"], "updated_at": c["updated_at"]}
+                for c in sorted(self.conversations.values(), key=lambda c: c["id"])
+                if c["updated_at"] > since
+            ]
+            starting_after = json["pagination"].get("starting_after")
+            return self._cursor_page(items, "conversations", starting_after)
+        if method == "GET" and path.startswith("/conversations/"):
+            cid = path.rsplit("/", 1)[1]
+            if cid not in self.conversations:
+                return FakeResponse(404, {"type": "error.list"})
+            return FakeResponse(200, self.conversations[cid])
+        if method == "GET" and path == "/articles":
+            per_page, page = params["per_page"], params["page"]
+            chunk = self.articles[(page - 1) * per_page : page * per_page]
+            total_pages = max(1, -(-len(self.articles) // per_page))
+            return FakeResponse(200, {"data": chunk, "pages": {"total_pages": total_pages}})
+        if method == "GET" and path == "/contacts":
+            items = [{"id": k, "name": v["name"]} for k, v in sorted(self.contacts.items())]
+            return self._cursor_page(items, "data", (params or {}).get("starting_after"))
+        if method == "GET" and path.startswith("/contacts/") and path.endswith("/notes"):
+            notes = self.contacts[path.split("/")[2]]["notes"]
+            return self._cursor_page(notes, "data", (params or {}).get("starting_after"))
+        raise AssertionError(f"unexpected request {method} {path}")
+
+    def _cursor_page(self, items, key, starting_after):
+        start = 0
+        if starting_after:
+            start = [str(i["id"]) for i in items].index(starting_after) + 1
+        chunk = items[start : start + self.page_size]
+        pages = {}
+        if start + self.page_size < len(items):
+            pages["next"] = {"starting_after": str(chunk[-1]["id"])}
+        return FakeResponse(200, {key: chunk, "pages": pages})
+
+
+@pytest.fixture(autouse=True)
+def _no_sleep(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr("cognee_community_connector_intercom.intercom.time.sleep", sleeps.append)
+    return sleeps
+
+
+# ---------------------------------------------------------------------------
+# Rendering (DB-free)
+# ---------------------------------------------------------------------------
+
+
+def test_html_to_text_keeps_paragraphs_and_unescapes():
+    html = "<p>Hello&nbsp;<b>there</b></p><p>Line&amp;two<br>three</p><ul><li>a</li></ul>"
+    assert html_to_text(html) == "Hello there\nLine&two\nthree\na"
+    assert html_to_text(None) == ""
+
+
+def test_conversation_document_orders_parts_and_labels_notes():
+    conversation = _conversation(
+        "c1",
+        100,
+        parts=[
+            _part("<p>Sorry about that, refunding now.</p>"),
+            _part("<p>Checked Stripe: duplicate charge.</p>", part_type="note"),
+            _part(None, part_type="assignment"),  # no text → skipped
+            _part("Thanks!", author_type="user", name="Asha Rao"),
+        ],
+    )
+
+    row = conversation_to_row(conversation)
+
+    assert row["id"] == "c1"
+    assert row["title"] == "Refund"
+    assert row["_deleted"] is False
+    assert row["content"].split("\n\n") == [
+        "Intercom conversation c1, started 2025-10-01. State: open.",
+        "Tags: billing, vip",
+        "Customer Asha Rao: My card was charged twice.",
+        "Agent Ben: Sorry about that, refunding now.",
+        "Agent Ben (internal note): Checked Stripe: duplicate charge.",
+        "Customer Asha Rao: Thanks!",
+    ]
+    assert "asha@example.com" not in row["content"]  # names, never emails
+
+
+def test_truncated_conversation_is_noted():
+    row = conversation_to_row(_conversation("c1", 100, parts=[_part("hi")], total=700))
+    assert row["content"].endswith("(Only the 1 most recent of 700 messages are included.)")
+
+
+def test_article_document():
+    row = article_to_row(_article("a1", "Refund policy", "<h2>Refunds</h2><p>Within 30 days.</p>"))
+    assert row == {
+        "id": "a1",
+        "title": "Refund policy",
+        "content": "About refund policy\n\nRefunds\nWithin 30 days.",
+        "url": "https://help.example.com/articles/a1",
+        "_deleted": False,
+    }
+
+
+def test_source_declares_document_marker():
+    from cognee.tasks.ingestion.dlt_utils import document_source_tag
+
+    source = intercom_source(session=FakeIntercomSession())
+    assert INTERCOM_SOURCE_NAME == "intercom"
+    assert document_source_tag(source) == "intercom"
+
+
+def test_source_scopes_its_dlt_state():
+    from cognee.tasks.ingestion.dlt_utils import PIPELINE_SCOPE_ATTR, pipeline_name_for_source
+
+    us = intercom_source(session=FakeIntercomSession())
+    eu = intercom_source(session=FakeIntercomSession(), base_url="https://api.eu.intercom.io/")
+    assert getattr(us, PIPELINE_SCOPE_ATTR) == "intercom:https://api.intercom.io"
+    assert getattr(eu, PIPELINE_SCOPE_ATTR) == "intercom:https://api.eu.intercom.io"
+    assert pipeline_name_for_source(us, "a") != pipeline_name_for_source(us, "b")
+    assert pipeline_name_for_source(us, "a") != "ingest_dlt_source"  # not the shared one
+
+
+def test_source_requires_something_to_sync():
+    with pytest.raises(ValueError, match="Nothing to sync"):
+        intercom_source(
+            session=FakeIntercomSession(), include_conversations=False, include_articles=False
+        )
+
+
+# ---------------------------------------------------------------------------
+# HTTP: pagination and retries (DB-free)
+# ---------------------------------------------------------------------------
+
+
+def test_cursor_pages_follows_starting_after():
+    session = FakeIntercomSession(conversations=[_conversation(f"c{i}", 1) for i in range(5)])
+    api = IntercomAPI(session, BASE)
+
+    ids = [item["id"] for item in api.cursor_pages("GET", "/conversations", "conversations")]
+
+    assert ids == ["c0", "c1", "c2", "c3", "c4"]
+    assert [call[2].get("starting_after") for call in session.calls] == [None, "c1", "c3"]
+
+
+def test_cursor_pages_stops_on_repeated_cursor():
+    session = FakeIntercomSession()
+    stuck = FakeResponse(200, {"data": [{"id": "x"}], "pages": {"next": {"starting_after": "x"}}})
+    session.scripted = [stuck, stuck]
+    ids = [i["id"] for i in IntercomAPI(session, BASE).cursor_pages("GET", "/contacts", "data")]
+    assert ids == ["x", "x"]  # second identical cursor ends the loop instead of spinning
+
+
+def test_rate_limit_is_retried_after_the_advertised_delay(_no_sleep):
+    session = FakeIntercomSession(conversations=[_conversation("c1", 1)])
+    session.scripted = [FakeResponse(429, headers={"Retry-After": "7"}), FakeResponse(503)]
+
+    payload = IntercomAPI(session, BASE).request("GET", "/conversations/c1")
+
+    assert payload["id"] == "c1"
+    assert _no_sleep == [7.0, 2.0]  # Retry-After honoured, then exponential backoff
+
+
+def test_auth_error_is_not_retried(_no_sleep):
+    session = FakeIntercomSession()
+    session.scripted = [FakeResponse(401)]
+    with pytest.raises(requests.HTTPError):
+        IntercomAPI(session, BASE).request("GET", "/conversations")
+    assert _no_sleep == []
+
+
+# ---------------------------------------------------------------------------
+# Sync logic (DB-free)
+# ---------------------------------------------------------------------------
+
+
+def test_first_conversation_sync_fetches_everything_and_saves_cursor():
+    session = FakeIntercomSession(
+        conversations=[_conversation("c1", 100), _conversation("c2", 200)]
+    )
+    state = {}
+
+    rows = list(sync_conversations(IntercomAPI(session, BASE), state))
+
+    assert [r["id"] for r in rows] == ["c1", "c2"]
+    assert state == {"known_ids": ["c1", "c2"], "cursor": 200}
+    search = next(c for c in session.calls if c[1] == "/conversations/search")
+    assert search[3]["query"] == {"field": "updated_at", "operator": ">", "value": 0}
+
+
+def test_later_sync_searches_from_the_cursor_with_overlap():
+    session = FakeIntercomSession(
+        conversations=[_conversation("c1", 1_000), _conversation("c2", 2_000)]
+    )
+    api = IntercomAPI(session, BASE)
+    state = {}
+    list(sync_conversations(api, state))
+
+    session.conversations["c2"] = _conversation("c2", 9_000, parts=[_part("Refund sent.")])
+    session.calls.clear()
+    rows = list(sync_conversations(api, state))
+
+    search = next(c for c in session.calls if c[1] == "/conversations/search")
+    assert search[3]["query"]["value"] == 2_000 - 300  # five-minute overlap
+    retrieved = [c[1] for c in session.calls if c[1].startswith("/conversations/c")]
+    assert retrieved == ["/conversations/c2"]  # c1 unchanged → not re-fetched
+    assert "Refund sent." in rows[0]["content"]
+    assert state["cursor"] == 9_000
+
+
+def test_deleted_conversation_is_tombstoned():
+    session = FakeIntercomSession(conversations=[_conversation("c1", 1), _conversation("c2", 2)])
+    api = IntercomAPI(session, BASE)
+    state = {}
+    list(sync_conversations(api, state))
+
+    del session.conversations["c1"]
+    rows = list(sync_conversations(api, state))
+
+    assert {"id": "c1", "_deleted": True} in rows
+    assert state["known_ids"] == ["c2"]
+
+
+def test_conversation_deleted_mid_sync_is_skipped_not_tombstoned():
+    session = FakeIntercomSession(conversations=[_conversation("c1", 1), _conversation("c2", 2)])
+    real_request = session.request
+
+    def request(method, url, **kwargs):
+        if url.endswith("/conversations/c1"):  # deleted between the sweep and the fetch
+            session.calls.append((method, url, None, None))
+            return FakeResponse(404)
+        return real_request(method, url, **kwargs)
+
+    session.request = request
+    state = {}
+    rows = list(sync_conversations(IntercomAPI(session, BASE), state))
+
+    assert [r["id"] for r in rows] == ["c2"]
+    # Still in the swept id set, so the next run's sweep is what forgets it.
+    assert state["known_ids"] == ["c1", "c2"]
+
+
+def test_conversation_created_mid_sync_is_remembered_for_later_deletion():
+    session = FakeIntercomSession(conversations=[_conversation("c1", 1), _conversation("c2", 2)])
+    real_request = session.request
+    swept = []
+
+    def request(method, url, **kwargs):
+        response = real_request(method, url, **kwargs)
+        if url.endswith("/conversations") and not swept:  # c2 created after the first sweep
+            swept.append(True)
+            response._payload["conversations"] = [{"id": "c1"}]
+        return response
+
+    session.request = request
+    api = IntercomAPI(session, BASE)
+    state = {}
+    rows = list(sync_conversations(api, state))
+    assert [r["id"] for r in rows] == ["c1", "c2"]
+    assert state["known_ids"] == ["c1", "c2"]
+
+    # If it is then deleted, the next sweep must still be able to forget it.
+    del session.conversations["c2"]
+    assert {"id": "c2", "_deleted": True} in list(sync_conversations(api, state))
+
+
+def test_other_errors_abort_before_any_tombstone():
+    session = FakeIntercomSession(conversations=[_conversation("c1", 1)])
+    session.scripted = [FakeResponse(403)]
+    state = {"known_ids": ["c1", "gone"]}
+    with pytest.raises(requests.HTTPError):
+        list(sync_conversations(IntercomAPI(session, BASE), state))
+    assert state == {"known_ids": ["c1", "gone"]}  # untouched
+
+
+def test_unpublished_article_is_skipped_and_tombstoned():
+    session = FakeIntercomSession(
+        articles=[_article(f"a{i}", f"Article {i}", "<p>x</p>") for i in range(60)]
+    )
+    api = IntercomAPI(session, BASE)
+    state = {}
+    rows = list(sync_articles(api, False, state))
+    assert len(rows) == 60  # two pages of 50
+
+    session.articles[0]["state"] = "draft"
+    rows = list(sync_articles(api, False, state))
+
+    assert {"id": "a0", "_deleted": True} in rows
+    assert "a0" not in state["known_ids"]
+    assert any(r["id"] == "a0" for r in sync_articles(api, True, {}))  # drafts opt-in
+
+
+def test_contact_notes_are_opt_in_and_tombstoned():
+    contacts = {
+        "u1": {"name": "Asha Rao", "notes": [{"id": "n1", "created_at": 1, "body": "<p>VIP</p>"}]},
+        "u2": {"name": "", "notes": [{"id": "n2", "created_at": 1, "body": "Churn risk"}]},
+    }
+    session = FakeIntercomSession(contacts=contacts)
+    assert "intercom_contact_notes" not in intercom_source(session=session).resources
+    opted_in = intercom_source(session=session, include_contact_notes=True)
+    assert "intercom_contact_notes" in opted_in.resources
+
+    state = {}
+    rows = list(sync_contact_notes(IntercomAPI(session, BASE), state))
+    assert [r["title"] for r in rows] == ["Note on Asha Rao", "Note on contact u2"]
+
+    contacts["u1"]["notes"] = []
+    rows = list(sync_contact_notes(IntercomAPI(session, BASE), state))
+    assert {"id": "n1", "_deleted": True} in rows
+
+
+# ---------------------------------------------------------------------------
+# dlt pipeline: merge + _deleted hard delete (needs dlt)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def dlt_mod():
+    return pytest.importorskip("dlt")
+
+
+def _run_sync(dlt, tmp_path, session):
+    """Run intercom_source the way cognee.remember(write_disposition="merge") does."""
+    db_path = (tmp_path / "intercom.db").as_posix()
+    pipeline = dlt.pipeline(
+        pipeline_name="intercom_test",
+        destination=dlt.destinations.sqlalchemy(f"sqlite:///{db_path}"),
+        dataset_name="intercom_ds",
+        pipelines_dir=str(tmp_path / "state"),
+    )
+    pipeline.run(intercom_source(session=session), write_disposition="merge", primary_key="id")
+    return pipeline
+
+
+def _read(pipeline, table):
+    with (
+        pipeline.sql_client() as client,
+        client.execute_query(f"SELECT id, content FROM {table}") as cursor,
+    ):
+        return {row[0]: row[1] for row in cursor.fetchall()}
+
+
+def _workspace():
+    return FakeIntercomSession(
+        conversations=[_conversation("c1", 100), _conversation("c2", 200)],
+        articles=[_article("a1", "Refund policy", "<p>Within 30 days.</p>")],
+    )
+
+
+def test_first_sync_loads_conversations_and_articles(dlt_mod, tmp_path):
+    pipeline = _run_sync(dlt_mod, tmp_path, _workspace())
+
+    assert set(_read(pipeline, "intercom_conversations")) == {"c1", "c2"}
+    assert "Within 30 days." in _read(pipeline, "intercom_articles")["a1"]
+
+
+def test_edit_is_reflected_on_resync(dlt_mod, tmp_path):
+    session = _workspace()
+    _run_sync(dlt_mod, tmp_path, session)
+
+    session.conversations["c2"] = _conversation("c2", 900, parts=[_part("Refund sent.")])
+    pipeline = _run_sync(dlt_mod, tmp_path, session)
+
+    conversations = _read(pipeline, "intercom_conversations")
+    assert "Refund sent." in conversations["c2"]
+    assert set(conversations) == {"c1", "c2"}  # unchanged c1 survives the merge
+
+
+def test_deleted_conversation_and_unpublished_article_are_removed(dlt_mod, tmp_path):
+    session = _workspace()
+    _run_sync(dlt_mod, tmp_path, session)
+
+    del session.conversations["c1"]
+    session.articles[0]["state"] = "draft"
+    pipeline = _run_sync(dlt_mod, tmp_path, session)
+
+    # Tombstoned rows are hard-deleted by the merge, so cognee's read-back no
+    # longer sees them and orphan cleanup forgets them.
+    assert set(_read(pipeline, "intercom_conversations")) == {"c2"}
+    assert _read(pipeline, "intercom_articles") == {}
