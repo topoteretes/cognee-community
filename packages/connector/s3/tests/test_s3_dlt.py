@@ -45,3 +45,22 @@ def test_document_source_routes_to_cognee_document_ingestion():
         assert item.external_metadata["external_id"] == identity
         assert item.data_id == uuid5(NAMESPACE_OID, identity)
         assert "first version" in item.data
+
+
+def test_empty_s3_snapshot_replaces_staging_without_rows(tmp_path):
+    """Regression boundary: dlt empties staging; Cognee 1.4.0 may retain graph orphans."""
+    with mock_aws():
+        client = boto3.client("s3", region_name="us-east-1",
+                              aws_access_key_id="testing", aws_secret_access_key="testing")
+        client.create_bucket(Bucket="test-bucket")
+        client.put_object(Bucket="test-bucket", Key="docs/only.txt", Body=b"one")
+        pipeline = dlt.pipeline(
+            pipeline_name="s3_empty", dataset_name="s3_empty",
+            destination=dlt.destinations.duckdb(credentials=str(tmp_path / "empty.duckdb")),
+            pipelines_dir=str(tmp_path / "state"),
+        )
+        pipeline.run(s3_source("test-bucket", "docs/", client=client))
+        client.delete_object(Bucket="test-bucket", Key="docs/only.txt")
+        pipeline.run(s3_source("test-bucket", "docs/", client=client))
+        with pipeline.sql_client() as sql:
+            assert sql.execute_sql("SELECT count(*) FROM s3_documents")[0][0] == 0

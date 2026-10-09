@@ -27,3 +27,15 @@ must finish both ingestion and deletion reconciliation before returning.
 A failure leaves the prior manifest unchanged. This is **not** automatically
 connected to Cognee's dlt lifecycle, and the callback must not acknowledge
 publication before it is durable. No claim of end-to-end transactionality is made.
+
+## Empty-prefix deletion limitation (Cognee 1.4.0)
+
+A full S3 snapshot with zero matching documents replaces the dlt staging table
+with zero rows (covered by `test_empty_s3_snapshot_replaces_staging_without_rows`).
+However, Cognee 1.4.0's `resolve_dlt_sources` deliberately skips orphan cleanup
+when `document_fresh_ids` is empty. Consequently, deleting the **last** object
+from a prefix does **not** guarantee removal of the corresponding Cognee
+graph/vector records. This is an upstream reconciliation limitation, not an
+S3 listing or dlt deletion failure. Do not claim complete forget-on-delete until
+Cognee provides a separately verified successful-empty-snapshot signal to
+authorize scoped cleanup. Do not work around this by deleting an entire dataset.
