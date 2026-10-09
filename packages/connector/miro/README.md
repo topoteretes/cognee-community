@@ -72,6 +72,22 @@ tombstones. Cognee's orphan cleanup then removes their graph and vector data.
 The cursor advances only after every item page was fetched, so a failed or
 partial request cannot falsely delete valid memory.
 
+## Why this connector uses REST only
+
+This connector deliberately uses only Miro's REST API. Miro MCP can read
+comments, but its agent-oriented tools do not expose the same documented
+board `modifiedAt` checkpoint or cursor-paginated, board-wide item inventory
+used here for deterministic incremental sync and deletion reconciliation. Its
+board content tools return an SVG representation intended for interactive AI
+workflows, and Miro recommends REST for repeatable backend integrations.
+
+Combining REST for boards and items with MCP for comments would also require
+two authentication models: the connector's OAuth 2.0 access token and a
+separate, interactive MCP OAuth 2.1 client session. The package therefore does
+not mix the two transports. If Miro exposes comments through REST in the
+future, they can be added without changing the connector's authentication or
+sync architecture.
+
 ## Current Miro API limitations
 
 - Miro's REST API does not support reading comments, although comments were
