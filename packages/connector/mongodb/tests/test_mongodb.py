@@ -8,6 +8,8 @@ tests' own fake. The final link — cognee's ``orphan_cleanup`` purging the grap
 vector stores — is covered separately in ``test_mongodb_forget.py``.
 """
 
+from typing import Any, NamedTuple
+
 import pytest
 
 from cognee_community_connector_mongodb.mongodb import (
@@ -43,8 +45,8 @@ class FakeCollection:
         self.documents = list(documents)
         self.calls = []
 
-    def find(self, query_filter=None, projection=None):
-        self.calls.append((dict(query_filter or {}), projection))
+    def find(self, query_filter=None, projection=None, hint=None):
+        self.calls.append((dict(query_filter or {}), projection, hint))
         for document in self.documents:
             if not self._matches(document, query_filter or {}):
                 continue
@@ -189,6 +191,29 @@ def test_incremental_pushes_the_cursor_down_to_the_server():
     # The sweep is projection-only; the document read carries the $gt term.
     document_reads = [call for call in collection.calls if call[1] != {"_id": 1}]
     assert any(call[0].get("updatedAt") == {"$gt": 3} for call in document_reads)
+
+
+def test_id_sweep_is_hinted_to_the_id_index_when_unfiltered():
+    # Measured against a real mongod: an unfiltered _id-only projection read is
+    # planned as a collection scan (PROJECTION_SIMPLE + COLLSCAN) even at 50k
+    # documents, so the sweep has to pin the index to get a covered scan.
+    collection = FakeCollection([_doc("a", updated_at=1)])
+    _run(collection, {})
+
+    sweeps = [call for call in collection.calls if call[1] == {"_id": 1}]
+    assert len(sweeps) == 1
+    assert sweeps[0][2] == {"_id": 1}
+
+
+def test_id_sweep_defers_to_the_planner_under_a_query_filter():
+    # A selective index on the filter field beats a full _id index scan, so the
+    # connector must not pin the index out from under the planner here.
+    collection = FakeCollection([_doc("a", updated_at=1, status="open")])
+    _run(collection, {}, query_filter={"status": "open"})
+
+    sweeps = [call for call in collection.calls if call[1] == {"_id": 1}]
+    assert len(sweeps) == 1
+    assert sweeps[0][2] is None
 
 
 def test_document_new_to_the_corpus_is_fetched_despite_an_old_cursor():
@@ -421,18 +446,60 @@ def test_resource_is_marked_for_the_document_ingestion_path():
 # Against mongomock — an independent implementation of MongoDB query semantics,
 # so these do not merely re-confirm the assumptions baked into FakeCollection.
 # ---------------------------------------------------------------------------
-def _mongomock_collection(documents):
+class _HintTolerantCollection:
+    """Drops the ``hint`` kwarg before delegating to mongomock.
+
+    mongomock raises ``OperationFailure: Unrecognized field 'hint'``. The hint only
+    steers real server planning, which mongomock does not model, so the adapter
+    drops it and keeps mongomock for what it is actually good at here: an
+    independent implementation of ``$gt`` / ``$in`` / projection semantics.
+    """
+
+    def __init__(self, collection):
+        self._collection = collection
+
+    def find(self, query_filter=None, projection=None, **kwargs):
+        kwargs.pop("hint", None)
+        return self._collection.find(query_filter, projection, **kwargs)
+
+
+class _Database:
+    def __init__(self, database):
+        self._database = database
+
+    def __getitem__(self, name):
+        return _HintTolerantCollection(self._database[name])
+
+
+class _Client:
+    def __init__(self, client):
+        self._client = client
+
+    def __getitem__(self, name):
+        return _Database(self._client[name])
+
+
+class _Mongo(NamedTuple):
+    """A mongomock fixture: the hint-tolerant handle for the connector, plus the
+    raw collection for the test's own inserts / updates / deletes."""
+
+    client: Any
+    collection: Any
+    raw: Any
+
+
+def _mongomock_collection(documents) -> _Mongo:
     mongomock = pytest.importorskip("mongomock")
-    client = mongomock.MongoClient()
-    collection = client["testdb"]["testcol"]
+    raw_client = mongomock.MongoClient()
+    raw = raw_client["testdb"]["testcol"]
     if documents:
-        collection.insert_many(documents)
-    return client, collection
+        raw.insert_many(documents)
+    return _Mongo(client=_Client(raw_client), collection=_HintTolerantCollection(raw), raw=raw)
 
 
 def test_full_cycle_against_mongomock():
     """Backfill, then an edit, an insert and a delete — on real Mongo semantics."""
-    _client, collection = _mongomock_collection(
+    mongo = _mongomock_collection(
         [
             {"_id": "a", "updatedAt": 1, "subject": "Alpha"},
             {"_id": "b", "updatedAt": 2, "subject": "Beta"},
@@ -440,17 +507,17 @@ def test_full_cycle_against_mongomock():
     )
     state = {}
 
-    live, deleted = _run(collection, state, text_fields=["subject"])
+    live, deleted = _run(mongo.collection, state, text_fields=["subject"])
     assert {row["id"] for row in live} == {"a", "b"}
     assert deleted == []
     assert state["last_cursor"] == 2
 
     # Edit "a", insert "c", delete "b".
-    collection.update_one({"_id": "a"}, {"$set": {"subject": "Alpha v2", "updatedAt": 9}})
-    collection.insert_one({"_id": "c", "updatedAt": 3, "subject": "Gamma"})
-    collection.delete_one({"_id": "b"})
+    mongo.raw.update_one({"_id": "a"}, {"$set": {"subject": "Alpha v2", "updatedAt": 9}})
+    mongo.raw.insert_one({"_id": "c", "updatedAt": 3, "subject": "Gamma"})
+    mongo.raw.delete_one({"_id": "b"})
 
-    live, deleted = _run(collection, state, text_fields=["subject"])
+    live, deleted = _run(mongo.collection, state, text_fields=["subject"])
 
     # "a" changed (cursor), "c" is new (id sweep); "b" is gone.
     assert {row["id"] for row in live} == {"a", "c"}
@@ -460,17 +527,17 @@ def test_full_cycle_against_mongomock():
     assert state["known_ids"] == ["a", "c"]
 
     # A third run with nothing changed yields nothing at all.
-    live, deleted = _run(collection, state, text_fields=["subject"])
+    live, deleted = _run(mongo.collection, state, text_fields=["subject"])
     assert live == []
     assert deleted == []
 
 
 def test_projection_is_honored_against_mongomock():
-    _client, collection = _mongomock_collection(
+    mongo = _mongomock_collection(
         [{"_id": "a", "updatedAt": 1, "subject": "Keep", "secret": "drop me"}]
     )
     live, _ = _run(
-        collection,
+        mongo.collection,
         {},
         projection={"_id": 1, "subject": 1, "updatedAt": 1},
         text_fields=None,
@@ -486,7 +553,7 @@ def test_projection_is_honored_against_mongomock():
 def test_forget_on_delete_end_to_end_through_a_real_dlt_merge(tmp_path):
     dlt = pytest.importorskip("dlt")
     pytest.importorskip("duckdb")
-    _client, collection = _mongomock_collection(
+    mongo = _mongomock_collection(
         [
             {"_id": "a", "updatedAt": 1, "subject": "Alpha"},
             {"_id": "b", "updatedAt": 2, "subject": "Beta"},
@@ -503,7 +570,7 @@ def test_forget_on_delete_end_to_end_through_a_real_dlt_merge(tmp_path):
         return mongodb_source(
             database="testdb",
             collection="testcol",
-            client=_client,
+            client=mongo.client,
             text_fields=["subject"],
         )
 
@@ -514,7 +581,7 @@ def test_forget_on_delete_end_to_end_through_a_real_dlt_merge(tmp_path):
 
     # Sync #2: "b" is deleted upstream. The connector emits a hard-delete marker
     # and dlt's merge physically removes the row.
-    collection.delete_one({"_id": "b"})
+    mongo.raw.delete_one({"_id": "b"})
     pipeline.run(source(), write_disposition="merge", primary_key="id")
     with pipeline.sql_client() as client:
         rows = client.execute_sql("SELECT id FROM mongodb_documents")
@@ -525,7 +592,7 @@ def test_state_survives_across_pipeline_runs(tmp_path):
     """The high-water mark and id set must persist in dlt resource state."""
     dlt = pytest.importorskip("dlt")
     pytest.importorskip("duckdb")
-    _client, _collection = _mongomock_collection(
+    mongo = _mongomock_collection(
         [
             {"_id": "a", "updatedAt": 1, "subject": "Alpha"},
             {"_id": "b", "updatedAt": 2, "subject": "Beta"},
@@ -542,7 +609,7 @@ def test_state_survives_across_pipeline_runs(tmp_path):
         return mongodb_source(
             database="testdb",
             collection="testcol",
-            client=_client,
+            client=mongo.client,
             text_fields=["subject"],
         )
 

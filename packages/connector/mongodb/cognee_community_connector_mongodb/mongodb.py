@@ -271,11 +271,18 @@ def sync_documents(
     last_cursor = state.get("last_cursor")
     known_ids: set[str] = set(state.get("known_ids") or [])
 
-    # 1. Sweep current ids. Projection-only, so MongoDB answers from the _id
-    #    index without reading the documents themselves.
+    # 1. Sweep current ids. The sweep only ever wants ids, so with no filter to
+    #    narrow it the _id index is pinned: MongoDB otherwise plans a collection
+    #    scan for an unfiltered projection read. Under a user filter the planner
+    #    can do better (a selective index on the filter field), so it keeps the
+    #    choice.
     current_ids: dict[str, Any] = {}
     if detect_deletions:
-        for document in collection_handle.find(base_filter, {"_id": 1}):
+        # Only pass `hint` when it is set: pymongo forwards the kwarg even when
+        # its value is None, and the server rejects an explicit null hint.
+        sweep_kwargs = {} if base_filter else {"hint": {"_id": 1}}
+        sweep = collection_handle.find(base_filter, {"_id": 1}, **sweep_kwargs)
+        for document in sweep:
             current_ids[str(document.get("_id"))] = document.get("_id")
 
     # 2. Fetch the changed set.

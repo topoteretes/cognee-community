@@ -98,11 +98,15 @@ the corpus is fetched even when its cursor value is old, so a restored or back-d
 document is not missed.
 
 MongoDB reports deletions only through change streams, which need a replica set and a
-retained oplog, so this connector does not depend on them. Each run instead diffs a
-cheap `_id`-only sweep against the ids seen on the previous run, also kept in resource
-state. Vanished documents are emitted with the `_deleted` hard-delete marker, dlt drops
-them on `merge`, and cognee's `orphan_cleanup` removes them from the graph, vector, and
-relational stores.
+retained oplog, so this connector does not depend on them. Each run instead diffs an
+`_id`-only sweep against the ids seen on the previous run, also kept in resource state.
+Vanished documents are emitted with the `_deleted` hard-delete marker, dlt drops them on
+`merge`, and cognee's `orphan_cleanup` removes them from the graph, vector, and relational
+stores.
+
+The sweep reads ids and never documents. Unfiltered, it pins the `_id` index so MongoDB
+answers it as a covered scan rather than a collection scan; under a `query_filter` it
+leaves the choice to the planner, which can do better with an index on the filter field.
 
 Index the cursor field so the delta read stays an index scan:
 
@@ -118,10 +122,14 @@ db.tickets.createIndex({ updatedAt: 1 })
 - **Wiping the whole collection upstream does not forget anything**, because that is
   indistinguishable from the failure case above. It self-heals — the next run that sees
   any document reconciles normally.
-- **A document with no `cursor_field` is ingested when first seen, but later edits to it
-  are invisible**, since `$gt` can only match documents that carry the field. Set
-  `cursor_field="_id"` for insert-only collections, or have writers maintain a
-  timestamp.
+- **An edit is only picked up if the writer bumps the cursor field.** This is the single
+  biggest footgun: editing a document's content without advancing `cursor_field` is
+  invisible to the next sync, because `$gt` can only match documents whose cursor value
+  moved. Verified against a real mongod — a body edit with no timestamp bump left the
+  graph byte-identical. Make sure whatever writes to the collection maintains the field.
+  A document with no `cursor_field` at all is still ingested when first seen, but later
+  edits to it are likewise invisible; set `cursor_field="_id"` for insert-only
+  collections.
 - **Both the id sweep and the persisted id set are O(documents) per run.** That is cheap
   for tens of thousands of documents and wasteful for millions; pass
   `detect_deletions=False` there, accepting that deletions and back-dated inserts are

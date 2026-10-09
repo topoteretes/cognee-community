@@ -39,7 +39,7 @@ class FakeMongoCollection:
     def __init__(self, documents=()):
         self.documents = [dict(document) for document in documents]
 
-    def find(self, query_filter=None, projection=None):
+    def find(self, query_filter=None, projection=None, hint=None):
         for document in self.documents:
             if not self._matches(document, query_filter or {}):
                 continue
