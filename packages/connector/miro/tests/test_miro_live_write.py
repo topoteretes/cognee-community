@@ -6,6 +6,7 @@ import asyncio
 import importlib
 import os
 import time
+import uuid
 
 import pytest
 import requests
@@ -53,17 +54,44 @@ def _request(method: str, path: str, *, token: str, board_id: str, json=None):
 
 
 def _create_frame(token: str, board_id: str, title: str, x: int) -> dict:
-    return _request(
-        "POST",
-        "frames",
-        token=token,
-        board_id=board_id,
-        json={
-            "data": {"title": title},
-            "position": {"x": x, "y": 1800, "origin": "center"},
-            "geometry": {"width": 600, "height": 400},
-        },
-    )
+    payload = {
+        "data": {"title": title},
+        "position": {"x": x, "y": 1800, "origin": "center"},
+        "geometry": {"width": 600, "height": 400},
+    }
+    last_error: requests.HTTPError | None = None
+    for attempt in range(3):
+        try:
+            return _request(
+                "POST",
+                "frames",
+                token=token,
+                board_id=board_id,
+                json=payload,
+            )
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            if status != 429 and (status is None or status < 500):
+                raise
+            last_error = exc
+
+        # A failed POST response can be ambiguous. Check whether Miro created
+        # the uniquely titled frame before retrying the non-idempotent request.
+        time.sleep(attempt + 1)
+        frame = next(
+            (
+                item
+                for item in _MiroRESTSource(token).list_items(board_id)
+                if item.get("type") == "frame"
+                and (item.get("data") or {}).get("title") == title
+            ),
+            None,
+        )
+        if frame is not None:
+            return frame
+
+    assert last_error is not None
+    raise last_error
 
 
 def _create_shape(token: str, board_id: str, frame_id: str) -> dict:
@@ -117,6 +145,17 @@ def _wait_for_marker(client: _MiroRESTSource, board_id: str, marker: str, presen
     raise AssertionError(f"timed out waiting for {marker!r} to {expectation} on the live board")
 
 
+def _wait_for_board_change(
+    client: _MiroRESTSource, board_id: str, previous_modified_at: str
+) -> None:
+    """Wait until Miro's board-level incremental cursor reflects an item mutation."""
+    for _ in range(30):
+        if str(client.get_board(board_id).get("modifiedAt")) != previous_modified_at:
+            return
+        time.sleep(1)
+    raise AssertionError("timed out waiting for the live board modifiedAt cursor to advance")
+
+
 async def _mock_structured_output(
     text_input=None, system_prompt=None, response_model=str, **_kwargs
 ):
@@ -168,6 +207,10 @@ def test_live_shape_and_deleted_frame_reach_cognee_cleanup(tmp_path, monkeypatch
     assert token is not None and board_id is not None
 
     created: list[tuple[str, str]] = []
+    run_id = uuid.uuid4().hex
+    keep_frame_title = f"{KEEP_MARKER}-{run_id} frame"
+    delete_frame_title = f"{DELETE_MARKER}-{run_id} frame"
+    frame_titles = {keep_frame_title, delete_frame_title}
     dataset_name = "miro_live_deletion_test"
     client = _MiroRESTSource(token)
 
@@ -226,9 +269,9 @@ def test_live_shape_and_deleted_frame_reach_cognee_cleanup(tmp_path, monkeypatch
         await cognee.prune.prune_data()
         await cognee.prune.prune_system(metadata=True)
         try:
-            keep_frame = _create_frame(token, board_id, f"{KEEP_MARKER} frame", 1800)
+            keep_frame = _create_frame(token, board_id, keep_frame_title, 1800)
             created.append(("frames", str(keep_frame["id"])))
-            delete_frame = _create_frame(token, board_id, f"{DELETE_MARKER} frame", 2500)
+            delete_frame = _create_frame(token, board_id, delete_frame_title, 2500)
             created.append(("frames", str(delete_frame["id"])))
             shape = _create_shape(token, board_id, str(keep_frame["id"]))
             created.append(("shapes", str(shape["id"])))
@@ -247,12 +290,14 @@ def test_live_shape_and_deleted_frame_reach_cognee_cleanup(tmp_path, monkeypatch
             assert {keep_document_id, delete_document_id} <= ids_before
             assert await graph_has(KEEP_MARKER)
             assert await graph_has(DELETE_MARKER)
+            previous_modified_at = str(client.get_board(board_id)["modifiedAt"])
 
             _delete_item(token, board_id, "sticky_notes", str(sticky["id"]))
             created.remove(("sticky_notes", str(sticky["id"])))
             _delete_item(token, board_id, "frames", str(delete_frame["id"]))
             created.remove(("frames", str(delete_frame["id"])))
             _wait_for_marker(client, board_id, DELETE_MARKER, False)
+            _wait_for_board_change(client, board_id, previous_modified_at)
 
             await sync()
             ids_after = await external_ids()
@@ -263,6 +308,14 @@ def test_live_shape_and_deleted_frame_reach_cognee_cleanup(tmp_path, monkeypatch
         finally:
             for item_type, item_id in reversed(created):
                 _delete_item(token, board_id, item_type, item_id)
+            # Remove any duplicate frame from an ambiguous POST retry. Exact,
+            # per-run titles avoid touching pre-existing board content.
+            for item in client.list_items(board_id):
+                if (
+                    item.get("type") == "frame"
+                    and (item.get("data") or {}).get("title") in frame_titles
+                ):
+                    _delete_item(token, board_id, "frames", str(item["id"]))
             await cognee.prune.prune_data()
             await cognee.prune.prune_system(metadata=True)
 

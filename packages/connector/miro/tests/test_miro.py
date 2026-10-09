@@ -260,6 +260,106 @@ def test_unchanged_board_produces_a_complete_consistent_snapshot() -> None:
     assert not any("_deleted" in row for row in rows)
 
 
+def test_unchanged_board_reuses_state_without_refetching_items() -> None:
+    state: dict = {}
+    client = FakeMiroClient(
+        [_board()],
+        {"board-1": [_frame("f1", "Plan"), _item("a", "A", parent_id="f1")]},
+    )
+
+    first = list(_sync_rows(client, state=state))
+    client.item_calls.clear()
+    client.get_board_calls.clear()
+    second = list(_sync_rows(client, state=state))
+
+    assert second == first
+    assert client.item_calls == []
+    assert client.get_board_calls == []
+
+
+def test_changed_board_is_refetched_and_updates_cached_snapshot() -> None:
+    state: dict = {}
+    client = FakeMiroClient(
+        [_board()],
+        {"board-1": [_frame("f1", "Plan"), _item("a", "A", parent_id="f1")]},
+    )
+    list(_sync_rows(client, state=state))
+
+    client.boards = [_board("2026-10-02T10:00:00Z")]
+    client.items["board-1"] = [_frame("f1", "Plan"), _item("a", "Changed", parent_id="f1")]
+    client.item_calls.clear()
+    client.get_board_calls.clear()
+
+    rows = list(_sync_rows(client, state=state))
+
+    assert "Changed" in rows[0]["content"]
+    assert client.item_calls == ["board-1"]
+    assert client.get_board_calls == ["board-1"]
+
+
+def test_discovery_omission_requires_direct_404_before_removing_known_board() -> None:
+    state: dict = {}
+    board_2 = _board(board_id="board-2", name="Second board")
+    initial = FakeMiroClient(
+        [_board(), board_2],
+        {
+            "board-1": [_frame("f1", "One"), _item("a", "A", parent_id="f1")],
+            "board-2": [_frame("f2", "Two"), _item("b", "B", parent_id="f2")],
+        },
+    )
+    list(_sync_rows(initial, state=state))
+
+    omitted_but_accessible = FakeMiroClient(
+        [_board()],
+        {"board-1": [_frame("f1", "One"), _item("a", "A", parent_id="f1")]},
+        board_responses={"board-2": [board_2]},
+    )
+    preserved = list(_sync_rows(omitted_but_accessible, state=state))
+
+    assert {row["id"] for row in preserved} == {
+        "board-1:frame:f1",
+        "board-2:frame:f2",
+    }
+    assert omitted_but_accessible.get_board_calls == ["board-2"]
+
+    confirmed_missing = FakeMiroClient(
+        [_board()],
+        {"board-1": [_frame("f1", "One"), _item("a", "A", parent_id="f1")]},
+        board_errors={"board-2": MiroBoardNotFoundError("board-2")},
+    )
+    removed = list(_sync_rows(confirmed_missing, state=state))
+
+    assert [row["id"] for row in removed] == ["board-1:frame:f1"]
+    assert confirmed_missing.get_board_calls == ["board-2"]
+
+
+def test_discovery_error_preserves_snapshot_state() -> None:
+    state: dict = {}
+    board_2 = _board(board_id="board-2", name="Second board")
+    initial = FakeMiroClient(
+        [_board(), board_2],
+        {
+            "board-1": [_frame("f1", "One"), _item("a", "A", parent_id="f1")],
+            "board-2": [_frame("f2", "Two"), _item("b", "B", parent_id="f2")],
+        },
+    )
+    list(_sync_rows(initial, state=state))
+    prior_state = deepcopy(state)
+
+    response = Response()
+    response.status_code = 403
+    forbidden = requests.HTTPError("HTTP 403", response=response)
+    incomplete = FakeMiroClient(
+        [_board()],
+        {"board-1": [_frame("f1", "One"), _item("a", "A", parent_id="f1")]},
+        board_errors={"board-2": forbidden},
+    )
+
+    with pytest.raises(requests.HTTPError, match="403"):
+        next(_sync_rows(incomplete, state=state))
+    assert state == prior_state
+
+
 def test_board_changing_once_is_retried_and_second_snapshot_is_used() -> None:
     first = _board("2026-10-01T10:00:00Z")
     second = _board("2026-10-02T10:00:00Z")
@@ -277,6 +377,7 @@ def test_board_changing_once_is_retried_and_second_snapshot_is_used() -> None:
 
 
 def test_board_changing_twice_aborts_without_yielding_a_partial_snapshot() -> None:
+    state = {"existing": "state"}
     client = FakeMiroClient(
         [
             _board("2026-10-01T10:00:00Z"),
@@ -294,10 +395,11 @@ def test_board_changing_twice_aborts_without_yielding_a_partial_snapshot() -> No
             ],
         },
     )
-    rows = _sync_rows(client)
+    rows = _sync_rows(client, state=state)
 
     with pytest.raises(MiroSnapshotChangedError, match="changed during both snapshot attempts"):
         next(rows)
+    assert state == {"existing": "state"}
 
 
 def test_failed_item_walk_aborts_before_any_snapshot_rows_are_yielded() -> None:
@@ -367,6 +469,7 @@ def test_source_declares_document_mode_and_replace_schema() -> None:
 
     assert resource.name == "miro_documents"
     assert resource.cognee_document_source == MIRO_SOURCE_NAME
+    assert resource.cognee_pipeline_scope == MIRO_SOURCE_NAME
 
     schema = resource.compute_table_schema()
     write_disposition = schema.get("write_disposition")
@@ -434,6 +537,10 @@ def test_dlt_replace_removes_deleted_frame_and_failed_snapshot_preserves_table(t
         },
     )
     assert sync(initial) == ["board-1:frame:f1", "board-1:frame:f2"]
+
+    initial.item_calls.clear()
+    assert sync(initial) == ["board-1:frame:f1", "board-1:frame:f2"]
+    assert initial.item_calls == []
 
     deleted = FakeMiroClient(
         [_board("2026-10-02T10:00:00Z")],
@@ -537,6 +644,10 @@ def test_cognee_add_routes_miro_documents_and_forgets_one_deleted_frame(
                 "board-1:frame:f2",
             }
             assert all(not is_dlt_sourced(item) for item in initial)
+
+            client.item_calls.clear()
+            await add(client)
+            assert client.item_calls == []
 
             client.boards = [_board("2026-10-02T10:00:00Z")]
             client.items["board-1"] = [

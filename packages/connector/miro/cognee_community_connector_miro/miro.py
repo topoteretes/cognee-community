@@ -6,11 +6,12 @@ and one additional document for unframed items. The documents opt into
 cognee's normal cognify path through ``DOCUMENT_SOURCE_ATTR``.
 
 The Miro API exposes no delete feed, so every run produces a full snapshot with
-``write_disposition="replace"``. Each board is read consistently: its
-``modifiedAt`` value is checked again after all item pages have been fetched.
-If the board changed during the read, the connector retries the board once and
-then aborts the entire snapshot rather than allowing a mixed-version response
-to drive deletion.
+``write_disposition="replace"``. Rendered board documents are cached in dlt
+source state: unchanged boards are re-emitted from the cache, while changed
+boards are fetched again. A changed board is read consistently by checking its
+``modifiedAt`` value after all item pages have been fetched. If it changes
+during the read, the connector retries once and then aborts the entire snapshot
+rather than allowing a mixed-version response to drive deletion.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ from html.parser import HTMLParser
 from typing import Any
 
 from cognee.shared.logging_utils import get_logger
-from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
+from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR, PIPELINE_SCOPE_ATTR
 
 logger = get_logger("miro_connector")
 
@@ -31,6 +32,8 @@ MIRO_SOURCE_NAME = "miro"
 MIRO_TABLE_NAME = "miro_documents"
 SUPPORTED_ITEM_TYPES = frozenset({"shape", "sticky_note", "text"})
 MAX_SNAPSHOT_ATTEMPTS = 2
+_STATE_CACHE_KEY = "miro_snapshot_cache"
+_STATE_CACHE_VERSION = 1
 
 _BLOCK_TAGS = frozenset({"br", "div", "li", "ol", "p", "tr", "ul"})
 _WHITESPACE = re.compile(r"[ \t\f\v]+")
@@ -241,10 +244,16 @@ def miro_source(
             selected_ids=selected_ids,
             team_id=team_id,
             project_id=project_id,
+            # dlt resets resource state for ``replace`` loads, while source
+            # state survives them. Keep the full-snapshot cache in source state.
+            state=dlt.current.source_state(),
         )
 
     resource = miro_documents
     setattr(resource, DOCUMENT_SOURCE_ATTR, MIRO_SOURCE_NAME)
+    # Cognee includes the dataset name when deriving this source's dlt pipeline
+    # identity, so incremental cache state cannot leak between Miro datasets.
+    setattr(resource, PIPELINE_SCOPE_ATTR, MIRO_SOURCE_NAME)
     return resource
 
 
@@ -254,29 +263,107 @@ def _sync_rows(
     selected_ids: set[str] | None = None,
     team_id: str | None = None,
     project_id: str | None = None,
+    state: dict[str, Any] | None = None,
 ):
     """Build and yield one complete, consistent snapshot of the selected boards."""
+    scope = _scope_key(selected_ids, team_id, project_id)
+    cached_boards = _cached_boards(state, scope)
     boards = _selected_boards(
         client,
         selected_ids=selected_ids,
         team_id=team_id,
         project_id=project_id,
+        known_board_ids=set(cached_boards),
     )
 
     # Buffer every document before yielding. If any board changes repeatedly or
     # any request fails, dlt receives no partial snapshot and therefore cannot
     # replace valid rows with incomplete data.
     snapshot: list[dict[str, Any]] = []
+    next_cache: dict[str, dict[str, Any]] = {}
     synced_boards = 0
+    reused_boards = 0
     for board in boards:
-        documents = _consistent_board_documents(client, board)
+        board_id = str(board["id"])
+        initial_modified_at = _required_modified_at(board)
+        cached = cached_boards.get(board_id)
+        documents: list[dict[str, Any]] | None = None
+        final_modified_at = initial_modified_at
+
+        if cached is not None and cached.get("modified_at") == initial_modified_at:
+            cached_documents = cached.get("documents")
+            if isinstance(cached_documents, list) and all(
+                isinstance(document, dict) for document in cached_documents
+            ):
+                documents = cached_documents
+                reused_boards += 1
+
         if documents is None:
-            continue
+            result = _consistent_board_documents(client, board)
+            if result is None:
+                continue
+            final_board, documents = result
+            final_modified_at = _required_modified_at(final_board)
+
+        next_cache[board_id] = {
+            "modified_at": final_modified_at,
+            "documents": documents,
+        }
         snapshot.extend(documents)
         synced_boards += 1
 
-    logger.info("Miro: snapshotted %d board(s), %d document(s).", synced_boards, len(snapshot))
+    if state is not None:
+        # dlt commits source state with the load package. Updating only after
+        # every board has been buffered keeps the prior cache on any API or
+        # consistency failure.
+        state[_STATE_CACHE_KEY] = {
+            "version": _STATE_CACHE_VERSION,
+            "scope": scope,
+            "boards": next_cache,
+        }
+
+    logger.info(
+        "Miro: snapshotted %d board(s), %d document(s); reused %d unchanged board(s).",
+        synced_boards,
+        len(snapshot),
+        reused_boards,
+    )
     yield from snapshot
+
+
+def _scope_key(
+    selected_ids: set[str] | None,
+    team_id: str | None,
+    project_id: str | None,
+) -> dict[str, Any]:
+    """Describe the configured selection so state is never reused across scopes."""
+    if selected_ids is not None:
+        return {"mode": "explicit", "board_ids": sorted(selected_ids)}
+    return {
+        "mode": "discovery",
+        "team_id": team_id,
+        "project_id": project_id,
+    }
+
+
+def _cached_boards(
+    state: dict[str, Any] | None, scope: dict[str, Any]
+) -> dict[str, dict[str, Any]]:
+    if state is None:
+        return {}
+    cache = state.get(_STATE_CACHE_KEY)
+    if not isinstance(cache, dict):
+        return {}
+    if cache.get("version") != _STATE_CACHE_VERSION or cache.get("scope") != scope:
+        return {}
+    boards = cache.get("boards")
+    if not isinstance(boards, dict):
+        return {}
+    return {
+        str(board_id): value
+        for board_id, value in boards.items()
+        if isinstance(value, dict)
+    }
 
 
 def _selected_boards(
@@ -285,10 +372,23 @@ def _selected_boards(
     selected_ids: set[str] | None,
     team_id: str | None,
     project_id: str | None,
+    known_board_ids: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Resolve the configured scope without confusing API errors with deletion."""
     if selected_ids is None:
-        return client.list_boards(team_id=team_id, project_id=project_id)
+        listed = client.list_boards(team_id=team_id, project_id=project_id)
+        boards = {str(board["id"]): board for board in listed}
+
+        # Offset pagination can move while boards are edited. A board omitted
+        # from one listing is not deletion evidence: directly check every
+        # previously snapshotted board before allowing it to leave a replace
+        # snapshot. Only a confirmed 404 removes it; all other errors abort.
+        for board_id in sorted((known_board_ids or set()) - boards.keys()):
+            try:
+                boards[board_id] = client.get_board(board_id)
+            except MiroBoardNotFoundError:
+                logger.info("Miro: previously discovered board %s was deleted.", board_id)
+        return list(boards.values())
 
     boards: list[dict[str, Any]] = []
     for board_id in sorted(selected_ids):
@@ -301,7 +401,7 @@ def _selected_boards(
 
 def _consistent_board_documents(
     client: Any, initial_board: dict[str, Any]
-) -> list[dict[str, Any]] | None:
+) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
     """Return a board snapshot, retrying once if ``modifiedAt`` changes mid-read."""
     board = initial_board
     board_id = str(board["id"])
@@ -319,7 +419,7 @@ def _consistent_board_documents(
 
         final_modified_at = _required_modified_at(final_board)
         if final_modified_at == initial_modified_at:
-            return _board_documents(final_board, items)
+            return final_board, _board_documents(final_board, items)
 
         board = final_board
         logger.warning(

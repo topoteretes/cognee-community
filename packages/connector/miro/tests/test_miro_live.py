@@ -128,5 +128,5 @@ def test_live_dlt_replace_persists_the_complete_snapshot(tmp_path) -> None:
         ]
 
     assert second_ids == first_ids
-    assert client.item_calls == 2
-    assert client.board_calls == 4
+    assert client.item_calls == 1
+    assert client.board_calls == 3

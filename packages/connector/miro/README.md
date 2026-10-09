@@ -82,19 +82,29 @@ cannot affect an unrelated connector.
 ## Snapshot consistency and deletion
 
 Miro does not provide an item deletion feed. The connector therefore emits a
-complete snapshot with `write_disposition="replace"` on every run. Explicit
-`board_ids` are fetched directly; team, project, and all-visible scopes use the
-paginated board listing.
+complete snapshot with `write_disposition="replace"` on every run. It keeps the
+last rendered documents and `modifiedAt` value for each board in dlt source
+state. Unchanged boards are re-emitted from that cache without fetching their
+items; changed boards are read again in full. The state is scoped to the cognee
+dataset, which is another reason to keep each connector in its own dataset.
+Explicit `board_ids` are fetched directly, while team, project, and all-visible
+scopes use the paginated board listing.
 
 Frame documents use stable IDs and deterministic content. Missing frames,
 emptied frames, and boards confirmed missing with HTTP 404 fall out of the next
 snapshot. Cognee's orphan cleanup then removes the corresponding cognee data and
 graph content.
 
-For every board, the connector compares `modifiedAt` before and after reading
-all item pages. If the board changed during pagination, it discards that read
-and retries once. A second change or any non-404 API error aborts the complete
-snapshot before yielding rows, so a partial read cannot delete valid memory.
+For every changed board, the connector compares `modifiedAt` before and after
+reading all item pages. If the board changed during pagination, it discards
+that read and retries once. A second change or any non-404 API error aborts the
+complete snapshot before yielding rows, so a partial read cannot delete valid
+memory.
+
+Discovery listings are not treated as deletion proof. If a previously cached
+board is absent from a listing, the connector fetches it directly. It leaves
+the snapshot only after that lookup returns HTTP 404; permission, rate-limit,
+and server errors abort the sync and preserve the prior snapshot.
 
 ## Why this connector uses REST only
 
@@ -155,8 +165,9 @@ operation without `parent_item_id`, so it receives the complete board inventory
 needed for frame grouping and deletion reconciliation. The configured test
 board must contain at least one frame with a sticky note, text item, or labelled
 shape. The live tests check direct board lookup, `modifiedAt`, item retrieval,
-document rendering, and dlt full-snapshot persistence. They do not print board
-content or credentials.
+document rendering, and dlt full-snapshot persistence. Offline tests also
+verify incremental cache reuse and direct deletion confirmation for boards
+omitted from discovery. The tests do not print board content or credentials.
 The offline integration tests use mocked LLM and embedding calls to verify that
 frame documents reach cognee's graph and that deleting one frame removes its
 graph content without requiring external model credentials.
