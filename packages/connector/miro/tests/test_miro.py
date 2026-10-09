@@ -291,9 +291,19 @@ def test_source_rejects_single_string_as_board_ids() -> None:
 
 
 def test_source_requires_token_without_injected_client(monkeypatch) -> None:
+    monkeypatch.delenv("SOURCES__MIRO__ACCESS_TOKEN", raising=False)
     monkeypatch.delenv("MIRO_ACCESS_TOKEN", raising=False)
-    with pytest.raises(ValueError, match="MIRO_ACCESS_TOKEN"):
+    with pytest.raises(ValueError, match="dlt secret provider"):
         miro_source()
+
+
+def test_source_reads_access_token_from_dlt_secret_provider(monkeypatch) -> None:
+    monkeypatch.delenv("MIRO_ACCESS_TOKEN", raising=False)
+    monkeypatch.setenv("SOURCES__MIRO__ACCESS_TOKEN", "dlt-managed-token")
+
+    resource = miro_source()
+
+    assert resource.name == "miro_documents"
 
 
 def test_dlt_merge_removes_deleted_frame(tmp_path) -> None:

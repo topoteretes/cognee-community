@@ -23,19 +23,39 @@ uv sync
 
 1. Create a developer team and app in Miro.
 2. Add the `boards:read` scope and install the app for the team.
-3. Complete Miro's OAuth 2.0 authorization-code flow and copy the resulting
-   access token. A non-expiring token is simplest for a scheduled connector;
-   an expiring token must be refreshed by the calling application.
-4. Export the token:
+3. Complete Miro's OAuth 2.0 authorization-code flow. Miro recommends expiring
+   access tokens; the calling application is responsible for storing the token
+   response securely and refreshing it before supplying the current access
+   token to this connector.
 
-```bash
-export MIRO_ACCESS_TOKEN="your-oauth-access-token"
-export MIRO_BOARD_IDS="uXjVExampleBoardId="
-export LLM_API_KEY="your-llm-key"
+Pass the token directly when your application already uses a secret manager:
+
+```python
+miro_source(access_token=secret_manager.get("miro_access_token"), board_ids=["..."])
 ```
 
-Never commit an access token, client secret, or refresh token. Miro documents
-the OAuth flow at <https://developers.miro.com/docs/getting-started-with-oauth>.
+Alternatively, let dlt resolve it from a secret provider. For local dlt
+development, create `.dlt/secrets.toml` under the directory from which you run
+the application:
+
+```toml
+[sources.miro]
+access_token = "your-oauth-access-token"
+```
+
+For a deployed process, the equivalent dlt environment variable is:
+
+```bash
+export SOURCES__MIRO__ACCESS_TOKEN="your-oauth-access-token"
+export MIRO_BOARD_IDS="uXjVExampleBoardId="
+```
+
+This package does not load a `.env` file or require one at a particular path.
+If your application uses an env-file loader, its location is an application
+decision and the file must remain outside version control. Never commit an
+access token, client secret, refresh token, or `.dlt/secrets.toml`. Miro
+documents the OAuth flow at
+<https://developers.miro.com/docs/getting-started-with-oauth>.
 
 ## Usage
 
@@ -105,14 +125,6 @@ uv run python examples/example.py
 uv run --with pytest pytest tests/
 ```
 
-If your credentials are stored in this repository's root `.env`, run these
-commands from `packages/connector/miro` with:
-
-```bash
-uv run --env-file ../../../.env python examples/example.py
-uv run --env-file ../../../.env --with pytest pytest tests/ -q
-```
-
 The tests use a fake Miro client and a local SQLite dlt destination. No live
 Miro credentials are required; the live endpoint test is skipped by default.
 
@@ -120,15 +132,16 @@ To verify the stable board-wide items endpoint and its cursor pagination
 against a board you can access, run:
 
 ```bash
-export MIRO_ACCESS_TOKEN="your-oauth-access-token"
+export SOURCES__MIRO__ACCESS_TOKEN="your-oauth-access-token"
 export MIRO_BOARD_ID="uXjVExampleBoardId="
 MIRO_RUN_LIVE_TESTS=1 uv run --with pytest pytest tests/test_miro_live.py -v
 ```
 
-For a root `.env`, use:
+If you deliberately keep local development values in an ignored file, pass its
+location explicitly instead of relying on a repository-specific path:
 
 ```bash
-MIRO_RUN_LIVE_TESTS=1 uv run --env-file ../../../.env --with pytest \
+MIRO_RUN_LIVE_TESTS=1 uv run --env-file /path/to/private.env --with pytest \
   pytest tests/test_miro_live.py -v
 ```
 

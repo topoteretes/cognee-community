@@ -13,8 +13,8 @@ DATASET_NAME = "miro"
 async def main() -> None:
     configured_board_ids = os.getenv("MIRO_BOARD_IDS") or os.getenv("MIRO_BOARD_ID", "")
     board_ids = [value.strip() for value in configured_board_ids.split(",") if value.strip()]
-    if not os.getenv("MIRO_ACCESS_TOKEN") or not board_ids:
-        print("Set MIRO_ACCESS_TOKEN and comma-separated MIRO_BOARD_IDS before running.")
+    if not board_ids:
+        print("Set comma-separated MIRO_BOARD_IDS before running.")
         return
 
     await cognee.remember(

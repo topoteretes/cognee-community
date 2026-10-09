@@ -22,11 +22,18 @@ def _board_id() -> str | None:
     return next((value.strip() for value in board_ids.split(",") if value.strip()), None)
 
 
+def _access_token() -> str | None:
+    """Resolve the live credential without prescribing an env-file location."""
+    import dlt
+
+    return dlt.secrets.get("sources.miro.access_token") or os.getenv("MIRO_ACCESS_TOKEN")
+
+
 @pytest.mark.skipif(
-    not _live_enabled() or not os.getenv("MIRO_ACCESS_TOKEN") or not _board_id(),
+    not _live_enabled() or not _access_token() or not _board_id(),
     reason=(
-        "set MIRO_RUN_LIVE_TESTS=1, MIRO_ACCESS_TOKEN, and MIRO_BOARD_ID "
-        "(or MIRO_BOARD_IDS) for the live test"
+        "set MIRO_RUN_LIVE_TESTS=1 and MIRO_BOARD_ID (or MIRO_BOARD_IDS), then "
+        "configure sources.miro.access_token through a dlt secret provider"
     ),
 )
 def test_live_board_discovery_and_items_endpoint() -> None:
@@ -34,7 +41,9 @@ def test_live_board_discovery_and_items_endpoint() -> None:
     board_id = _board_id()
     assert board_id is not None
 
-    client = _MiroRESTSource(os.environ["MIRO_ACCESS_TOKEN"])
+    access_token = _access_token()
+    assert access_token is not None
+    client = _MiroRESTSource(access_token)
     boards = client.list_boards()
     selected_board = next((board for board in boards if str(board.get("id")) == board_id), None)
     assert selected_board is not None
@@ -54,10 +63,10 @@ def test_live_board_discovery_and_items_endpoint() -> None:
 
 
 @pytest.mark.skipif(
-    not _live_enabled() or not os.getenv("MIRO_ACCESS_TOKEN") or not _board_id(),
+    not _live_enabled() or not _access_token() or not _board_id(),
     reason=(
-        "set MIRO_RUN_LIVE_TESTS=1, MIRO_ACCESS_TOKEN, and MIRO_BOARD_ID "
-        "(or MIRO_BOARD_IDS) for the live test"
+        "set MIRO_RUN_LIVE_TESTS=1 and MIRO_BOARD_ID (or MIRO_BOARD_IDS), then "
+        "configure sources.miro.access_token through a dlt secret provider"
     ),
 )
 def test_live_dlt_sync_persists_documents_and_skips_unchanged_board(tmp_path) -> None:
@@ -66,8 +75,10 @@ def test_live_dlt_sync_persists_documents_and_skips_unchanged_board(tmp_path) ->
 
     board_id = _board_id()
     assert board_id is not None
+    access_token = _access_token()
+    assert access_token is not None
 
-    preflight_client = _MiroRESTSource(os.environ["MIRO_ACCESS_TOKEN"])
+    preflight_client = _MiroRESTSource(access_token)
     selected_board = next(
         (board for board in preflight_client.list_boards() if str(board.get("id")) == board_id),
         None,
@@ -79,7 +90,7 @@ def test_live_dlt_sync_persists_documents_and_skips_unchanged_board(tmp_path) ->
 
     class CountingClient:
         def __init__(self) -> None:
-            self.client = _MiroRESTSource(os.environ["MIRO_ACCESS_TOKEN"])
+            self.client = _MiroRESTSource(access_token)
             self.item_calls = 0
 
         def list_boards(self, **kwargs):

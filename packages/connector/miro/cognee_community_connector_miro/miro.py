@@ -153,8 +153,10 @@ def miro_source(
     """Return a dlt resource that syncs selected Miro boards into cognee.
 
     Args:
-        access_token: Miro OAuth2 bearer token. Falls back to
-            ``MIRO_ACCESS_TOKEN``. A token with ``boards:read`` is sufficient.
+        access_token: Miro OAuth2 bearer token. When omitted, dlt resolves
+            ``sources.miro.access_token`` from its secret providers. The legacy
+            ``MIRO_ACCESS_TOKEN`` environment variable remains a fallback. A
+            token with ``boards:read`` is sufficient.
         board_ids: Optional board IDs to ingest. When omitted, every board in
             the team/project scope visible to the token is selected.
         team_id: Optional Miro team filter for board discovery.
@@ -171,9 +173,16 @@ def miro_source(
     except ImportError as exc:
         raise ImportError(_install_hint()) from exc
 
-    resolved_token = access_token or os.environ.get("MIRO_ACCESS_TOKEN")
+    resolved_token = (
+        access_token
+        or dlt.secrets.get("sources.miro.access_token")
+        or os.environ.get("MIRO_ACCESS_TOKEN")
+    )
     if client is None and not resolved_token:
-        raise ValueError("Miro access token required: pass access_token= or set MIRO_ACCESS_TOKEN.")
+        raise ValueError(
+            "Miro access token required: pass access_token= or configure "
+            "sources.miro.access_token through a dlt secret provider."
+        )
 
     if isinstance(board_ids, (str, bytes)):
         raise TypeError("board_ids must be an iterable of board IDs, not a single string")
