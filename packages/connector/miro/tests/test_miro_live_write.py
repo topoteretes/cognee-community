@@ -196,10 +196,10 @@ def test_live_shape_and_deleted_frame_reach_cognee_cleanup(tmp_path, monkeypatch
             return set()
         data = await get_dataset_data(datasets[0].id)
         return {
-            str(item.external_metadata["external_id"])
+            str(item.system_metadata["external_id"])
             for item in data
-            if isinstance(item.external_metadata, dict)
-            and item.external_metadata.get("source") == "miro"
+            if isinstance(item.system_metadata, dict)
+            and item.system_metadata.get("source") == "miro"
         }
 
     async def sync() -> None:

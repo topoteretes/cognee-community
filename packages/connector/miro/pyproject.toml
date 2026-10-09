@@ -3,9 +3,11 @@ name = "cognee-community-connector-miro"
 version = "0.1.0"
 description = "Miro data-source connector for cognee — frame-aware full-snapshot board sync"
 readme = "README.md"
-requires-python = ">=3.11,<=3.13"
+requires-python = ">=3.11,<3.14"
 dependencies = [
-    "cognee==1.4.0",
+    # Requires scoped document cleanup for a successful empty replacement,
+    # which lets deleting the final board/frame remove its cognee data.
+    "cognee==1.6.3",
     "dlt[sqlalchemy]>=1.9.0,<2",
 ]
 

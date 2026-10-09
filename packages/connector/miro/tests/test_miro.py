@@ -497,8 +497,8 @@ def test_cognee_add_routes_miro_documents_and_forgets_one_deleted_frame(
         return [
             item
             for item in data
-            if isinstance(item.external_metadata, dict)
-            and item.external_metadata.get("source") == "miro"
+            if isinstance(item.system_metadata, dict)
+            and item.system_metadata.get("source") == "miro"
         ]
 
     async def add(client):
@@ -530,13 +530,13 @@ def test_cognee_add_routes_miro_documents_and_forgets_one_deleted_frame(
             initial = await miro_data()
             assert len(initial) == 2
             initial_by_external_id = {
-                item.external_metadata["external_id"]: item for item in initial
+                item.system_metadata["external_id"]: item for item in initial
             }
             assert set(initial_by_external_id) == {
                 "board-1:frame:f1",
                 "board-1:frame:f2",
             }
-            assert all(not is_dlt_sourced(item.external_metadata) for item in initial)
+            assert all(not is_dlt_sourced(item) for item in initial)
 
             client.boards = [_board("2026-10-02T10:00:00Z")]
             client.items["board-1"] = [
@@ -547,8 +547,14 @@ def test_cognee_add_routes_miro_documents_and_forgets_one_deleted_frame(
 
             final = await miro_data()
             assert len(final) == 1
-            assert final[0].external_metadata["external_id"] == "board-1:frame:f1"
+            assert final[0].system_metadata["external_id"] == "board-1:frame:f1"
             assert final[0].id == initial_by_external_id["board-1:frame:f1"].id
+
+            client.boards = []
+            client.items = {}
+            await add(client)
+
+            assert await miro_data() == []
         finally:
             await cognee.prune.prune_data()
             await cognee.prune.prune_system(metadata=True)
