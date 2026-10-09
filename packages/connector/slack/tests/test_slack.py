@@ -142,6 +142,8 @@ def test_row_has_no_out_of_scope_fields(tmp_path):
     row = next(iter(iter_slack_export_messages(_export_v1(tmp_path))))
     assert set(row) == {
         "id",
+        "title",
+        "content",
         "channel_id",
         "channel_name",
         "ts",
@@ -150,6 +152,8 @@ def test_row_has_no_out_of_scope_fields(tmp_path):
         "user_name",
         "text",
     }
+    assert row["content"] == row["text"]
+    assert "general" in row["title"]
 
 
 def test_large_export_parses_all_rows(tmp_path):
@@ -207,6 +211,22 @@ def test_slack_export_source_resource_is_configured_for_replace(tmp_path):
         write_disposition = write_disposition.get("disposition")
     assert write_disposition == "replace"
     assert schema["columns"]["id"].get("primary_key") is True
+
+
+def test_slack_export_source_opts_into_document_mode(tmp_path):
+    pytest.importorskip("dlt")
+    from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR, document_source_tag
+
+    resource = slack_export_source(_export_v1(tmp_path))
+    assert getattr(resource, DOCUMENT_SOURCE_ATTR) == "slack"
+    assert document_source_tag(resource) == "slack"
+
+    rows = list(resource)
+    assert len(rows) == 4
+    for row in rows:
+        assert row.get("title")
+        assert row.get("content")
+        assert row["content"] == row["text"]
 
 
 def test_e2e_dlt_replace_removes_deleted_message(tmp_path):
