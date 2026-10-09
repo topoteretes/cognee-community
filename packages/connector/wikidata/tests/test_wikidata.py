@@ -1,0 +1,579 @@
+"""Unit tests for the Wikidata connector.
+
+The Wikibase API is served by ``FakeWikibase`` through ``httpx.MockTransport``
+(no network), so the real HTTP, batching and retry code runs. Coverage:
+
+  - time values at every precision, entity id normalization
+  - the first run renders readable documents: mul-label fallback, statements
+    with qualifiers and units, preferred-first order, external ids and
+    deprecated statements left out, sitelinks, the row contract
+  - expansion along allowlisted properties, bounded by depth and max_items
+  - later runs re-fetch only items whose lastrevid moved
+  - deleted, merged (redirected) and never-assigned ids
+  - items leaving the selection, the empty-selection guard
+  - SPARQL selection and its error handling
+  - render / selection setting changes trigger a full re-render
+  - batching to 50 ids, retries, a failed run keeping its state
+  - the dlt resource wiring, and a real dlt merge that drops a tombstoned row
+"""
+
+import copy
+
+import dlt
+import httpx
+import pytest
+from cognee.tasks.ingestion.dlt_utils import (
+    DOCUMENT_SOURCE_ATTR,
+    NODE_SET_COLUMN,
+    PIPELINE_SCOPE_ATTR,
+)
+from fake_wikibase import (
+    API_URL,
+    SPARQL_URL,
+    FakeWikibase,
+    item_value,
+    statement,
+    string_value,
+    time_value,
+)
+
+from cognee_community_connector_wikidata import normalize_entity_id, wikidata_source
+from cognee_community_connector_wikidata.wikidata import (
+    WikidataAPIError,
+    _Settings,
+    _WikibaseClient,
+    format_time,
+    sync_items,
+)
+
+
+def _settings(**overrides) -> _Settings:
+    values = {
+        "items": ("Q42",),
+        "expand_properties": ("P800",),
+        "expand_depth": 1,
+        "sparql": None,
+        "sparql_variable": "item",
+        "max_items": 500,
+        "language": "en",
+        "include_external_ids": False,
+        "sitelinks": ("enwiki",),
+        "full_sync": False,
+    }
+    values.update(overrides)
+    for key in ("items", "expand_properties", "sitelinks"):
+        values[key] = tuple(values[key])
+    return _Settings(**values)
+
+
+def _sync(wiki: FakeWikibase, state: dict, **overrides):
+    """Run one sync; return (rows by id, tombstoned ids, stats)."""
+    client = _WikibaseClient(
+        wiki.client(), API_URL, "test-agent/1.0", 5, sparql_url=SPARQL_URL, sleep=lambda _s: None
+    )
+    stats: dict = {}
+    rows = list(sync_items(client, _settings(**overrides), state, stats))
+    live = {row["id"]: row for row in rows if not row["_deleted"]}
+    deleted = {row["id"] for row in rows if row["_deleted"]}
+    return live, deleted, stats
+
+
+@pytest.fixture
+def wiki() -> FakeWikibase:
+    wiki = FakeWikibase()
+    for entity_id, label in {
+        "P31": "instance of",
+        "P50": "author",
+        "P106": "occupation",
+        "P214": "VIAF ID",
+        "P27": "country of citizenship",
+        "P569": "date of birth",
+        "P580": "start time",
+        "P800": "notable work",
+        "P2048": "height",
+        "Q5": "human",
+        "Q145": "United Kingdom",
+        "Q36180": "writer",
+        "Q11573": "metre",
+    }.items():
+        wiki.create(entity_id, label)
+    wiki.create(
+        "Q42",
+        "Douglas Adams",
+        # Like the live item, the label exists only for all languages.
+        label_language="mul",
+        descriptions={"en": "English writer and humorist"},
+        aliases={"en": ["Douglas Noel Adams"]},
+        claims=[
+            statement("P31", item_value("Q5")),
+            statement("P800", item_value("Q25169")),
+            statement("P800", item_value("Q3107329")),
+            statement("P569", time_value("+1952-03-11T00:00:00Z"), "time"),
+            statement(
+                "P106",
+                item_value("Q36180"),
+                qualifiers={"P580": [time_value("+1979-00-00T00:00:00Z", precision=9)]},
+            ),
+            statement(
+                "P2048",
+                {
+                    "type": "quantity",
+                    "value": {"amount": "+1.96", "unit": "http://www.wikidata.org/entity/Q11573"},
+                },
+                "quantity",
+            ),
+            statement("P214", string_value("113230702"), "external-id"),
+            statement("P27", item_value("Q5"), rank="deprecated"),
+            statement("P27", item_value("Q145"), rank="preferred"),
+        ],
+        sitelinks={"enwiki": "Douglas Adams", "dewiki": "Douglas Adams"},
+    )
+    wiki.create(
+        "Q25169",
+        "The Hitchhiker's Guide to the Galaxy",
+        claims=[statement("P50", item_value("Q42"))],
+    )
+    wiki.create("Q3107329", "The Hitchhiker's Guide to the Galaxy (radio series)")
+    return wiki
+
+
+# ---------------------------------------------------------------------------
+# Values
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    ("time", "precision", "expected"),
+    [
+        ("+1952-03-11T00:00:00Z", 11, "1952-03-11"),
+        ("+1952-03-00T00:00:00Z", 10, "1952-03"),
+        ("+1979-00-00T00:00:00Z", 9, "1979"),
+        # Day precision claimed but the day is unknown: never print "-00".
+        ("+1979-05-00T00:00:00Z", 11, "1979-05"),
+        ("+1960-00-00T00:00:00Z", 8, "1960s"),
+        ("+1901-00-00T00:00:00Z", 7, "20th century"),
+        ("+2001-00-00T00:00:00Z", 6, "3rd millennium"),
+        ("-0044-03-15T00:00:00Z", 11, "0044-03-15 BCE"),
+        ("-13798000000-00-00T00:00:00Z", 3, "about 13798000000 years ago"),
+    ],
+)
+def test_format_time_respects_precision(time, precision, expected):
+    assert format_time({"time": time, "precision": precision}) == expected
+
+
+def test_format_time_marks_the_julian_calendar():
+    value = time_value("+1564-04-26T00:00:00Z")["value"]
+    value["calendarmodel"] = "http://www.wikidata.org/entity/Q1985786"
+    assert format_time(value) == "1564-04-26 (Julian calendar)"
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "Q42",
+        "q42",
+        " Q42 ",
+        "http://www.wikidata.org/entity/Q42",
+        "https://www.wikidata.org/wiki/Q42/",
+    ],
+)
+def test_normalize_entity_id_accepts_ids_uris_and_urls(raw):
+    assert normalize_entity_id(raw) == "Q42"
+
+
+def test_normalize_entity_id_handles_properties_and_rejects_garbage():
+    assert normalize_entity_id("https://www.wikidata.org/wiki/Property:P31") == "P31"
+    for bad in ("Douglas Adams", "Q0", "L123", ""):
+        with pytest.raises(ValueError):
+            normalize_entity_id(bad)
+
+
+# ---------------------------------------------------------------------------
+# First run
+# ---------------------------------------------------------------------------
+def test_initial_sync_renders_readable_documents(wiki):
+    state: dict = {}
+    live, deleted, stats = _sync(wiki, state)
+
+    # The seed plus its notable works (one hop along P800).
+    assert set(live) == {"Q42", "Q25169", "Q3107329"}
+    assert deleted == set()
+    assert stats["mode"] == "full" and stats["full_sync_reason"] == "initial"
+
+    row = live["Q42"]
+    assert row["title"] == "Douglas Adams"  # resolved through the mul fallback
+    assert row["url"] == "https://www.wikidata.org/wiki/Q42"
+    assert row["_deleted"] is False
+    assert row[NODE_SET_COLUMN] == ["wikidata:www.wikidata.org"]
+
+    content = row["content"]
+    assert content.startswith("# Douglas Adams (Q42)\nEnglish writer and humorist\n")
+    assert "Also known as: Douglas Noel Adams" in content
+    assert "- instance of: human" in content
+    assert "- notable work: The Hitchhiker's Guide to the Galaxy" in content
+    assert "- date of birth: 1952-03-11" in content
+    assert "- occupation: writer (start time: 1979)" in content
+    assert "- height: 1.96 metre" in content
+    assert "- country of citizenship: United Kingdom" in content
+    # External ids and deprecated statements are left out by default.
+    assert "VIAF" not in content and "113230702" not in content
+    assert "country of citizenship: human" not in content
+    # Only the configured sitelinks.
+    assert "- enwiki: Douglas Adams (https://en.wikipedia.org/wiki/Douglas_Adams)" in content
+    assert "dewiki" not in content
+
+
+def test_preferred_statements_come_first():
+    wiki = FakeWikibase()
+    wiki.create("P1082", "population")
+    wiki.create(
+        "Q1",
+        "Town",
+        claims=[
+            statement(
+                "P1082", {"type": "quantity", "value": {"amount": "+100", "unit": "1"}}, "quantity"
+            ),
+            statement(
+                "P1082",
+                {"type": "quantity", "value": {"amount": "+250", "unit": "1"}},
+                "quantity",
+                rank="preferred",
+            ),
+        ],
+    )
+    live, _, _ = _sync(wiki, {}, items=["Q1"], expand_properties=[])
+    assert "- population: 250\n- population: 100" in live["Q1"]["content"]
+
+
+def test_unknown_and_no_value_statements_are_spelled_out():
+    wiki = FakeWikibase()
+    wiki.create("P22", "father")
+    wiki.create("P40", "child")
+    wiki.create(
+        "Q1",
+        "Someone",
+        claims=[
+            statement("P22", None, snaktype="somevalue"),
+            statement("P40", None, snaktype="novalue"),
+        ],
+    )
+    content = _sync(wiki, {}, items=["Q1"], expand_properties=[])[0]["Q1"]["content"]
+    assert "- father: unknown value" in content
+    assert "- child: no value" in content
+
+
+def _text(text: str, language: str) -> dict:
+    return {"type": "monolingualtext", "value": {"text": text, "language": language}}
+
+
+def test_other_language_texts_are_dropped_when_one_matches():
+    wiki = FakeWikibase()
+    wiki.create("P1476", "title")
+    wiki.create("P1705", "native label")
+    wiki.create("P2096", "media legend")
+    wiki.create("P18", "image")
+    caption = {"P2096": [_text("A grave", "en"), _text("Ein Grab", "de")]}
+    wiki.create(
+        "Q1",
+        "Thing",
+        claims=[
+            statement("P1476", _text("The Title", "en"), "monolingualtext"),
+            statement("P1476", _text("Der Titel", "de"), "monolingualtext"),
+            # No English value at all: every language is kept.
+            statement("P1705", _text("Douze", "fr"), "monolingualtext"),
+            statement("P1705", _text("Zwölf", "de"), "monolingualtext"),
+            statement("P18", string_value("Grave.jpg"), "commonsMedia", qualifiers=caption),
+        ],
+    )
+    content = _sync(wiki, {}, items=["Q1"], expand_properties=[])[0]["Q1"]["content"]
+    assert "- title: The Title" in content and "Der Titel" not in content
+    assert "- native label: Douze (fr)" in content and "- native label: Zwölf (de)" in content
+    assert "- image: Grave.jpg (media legend: A grave)" in content
+
+
+def test_external_ids_can_be_included(wiki):
+    live, _, _ = _sync(wiki, {}, include_external_ids=True, expand_properties=[])
+    assert "- VIAF ID: 113230702" in live["Q42"]["content"]
+
+
+def test_labels_are_resolved_in_batches(wiki):
+    _sync(wiki, {})
+    label_requests = [r for r in wiki.requests if r.get("props") == "labels"]
+    assert len(label_requests) == 1
+    assert label_requests[0]["languagefallback"] == "1"
+
+
+# ---------------------------------------------------------------------------
+# Selection
+# ---------------------------------------------------------------------------
+def test_expansion_is_bounded_by_depth(wiki):
+    # Q25169 points back to Q42 through P50, not P800: nothing new at depth 2.
+    live, _, _ = _sync(wiki, {}, expand_properties=["P800", "P50"], expand_depth=0)
+    assert set(live) == {"Q42"}
+    live, _, _ = _sync(wiki, {}, expand_properties=["P800", "P50"], expand_depth=5)
+    assert set(live) == {"Q42", "Q25169", "Q3107329"}
+
+
+def test_max_items_caps_the_selection(wiki):
+    live, _, stats = _sync(wiki, {}, max_items=2)
+    assert set(live) == {"Q42", "Q25169"}
+    assert stats["truncated"] is True
+
+
+def test_a_never_assigned_seed_does_not_block_the_others(wiki):
+    live, _, stats = _sync(wiki, {}, items=["Q42", "Q999999999"], expand_properties=[])
+    assert set(live) == {"Q42"}
+    assert stats["items_selected"] == 1
+
+
+def test_sparql_selects_items(wiki):
+    wiki.sparql_results = ["Q25169", "Q3107329", "Q25169"]
+    live, _, _ = _sync(
+        wiki, {}, items=[], expand_properties=[], sparql="SELECT ?item WHERE {} LIMIT 10"
+    )
+    assert set(live) == {"Q25169", "Q3107329"}
+    sparql = next(r for r in wiki.requests if r["_url"] == SPARQL_URL)
+    assert sparql["query"] == "SELECT ?item WHERE {} LIMIT 10"
+    assert sparql["_user_agent"] == "test-agent/1.0"
+
+
+def test_a_sparql_timeout_raises(wiki):
+    # The query service reports a timeout as a text body, not JSON results.
+    wiki.sparql_raw = httpx.Response(200, text="java.util.concurrent.TimeoutException")
+    with pytest.raises(WikidataAPIError, match="sparql_bad_response"):
+        _sync(wiki, {}, items=[], expand_properties=[], sparql="SELECT ?item WHERE {}")
+
+
+def test_more_than_fifty_ids_are_batched(wiki):
+    for number in range(1, 121):
+        wiki.create(f"Q{1_000_000 + number}", f"Item {number}")
+    items = [f"Q{1_000_000 + number}" for number in range(1, 121)]
+    live, _, _ = _sync(wiki, {}, items=items, expand_properties=[])
+    assert len(live) == 120
+    sizes = [len(r["ids"].split("|")) for r in wiki.requests if r.get("ids")]
+    assert max(sizes) <= 50
+
+
+# ---------------------------------------------------------------------------
+# Later runs
+# ---------------------------------------------------------------------------
+def test_unchanged_run_costs_only_revision_checks(wiki):
+    state: dict = {}
+    _sync(wiki, state)
+    wiki.requests.clear()
+
+    live, deleted, stats = _sync(wiki, state)
+    assert live == {} and deleted == set()
+    assert stats["mode"] == "incremental"
+    assert stats["items_unchanged"] == 3
+    # Two levels of revision checks, no entity or label fetches.
+    assert [r["props"] for r in wiki.requests] == ["info", "info"]
+
+
+def test_an_edited_item_is_re_rendered_alone(wiki):
+    state: dict = {}
+    _sync(wiki, state)
+    wiki.edit("Q25169", descriptions={"en": "comedy science fiction series"})
+
+    live, deleted, stats = _sync(wiki, state)
+    assert set(live) == {"Q25169"}
+    assert "comedy science fiction series" in live["Q25169"]["content"]
+    assert deleted == set()
+    assert stats["items_changed"] == 1 and stats["items_unchanged"] == 2
+
+
+def test_deleted_item_is_tombstoned(wiki):
+    state: dict = {}
+    _sync(wiki, state)
+    wiki.delete("Q3107329")
+
+    live, deleted, stats = _sync(wiki, state)
+    assert live == {} and deleted == {"Q3107329"}
+    assert stats["deleted"] == 1
+    assert "Q3107329" not in state["items"]
+
+
+def test_merged_item_is_replaced_by_its_target(wiki):
+    state: dict = {}
+    _sync(wiki, state)
+    wiki.create("Q777", "Hitchhiker's Guide (radio)")
+    wiki.merge("Q3107329", "Q777")
+
+    live, deleted, stats = _sync(wiki, state)
+    # Q42 still links the old id; it now resolves to the merge target.
+    assert set(live) == {"Q777"}
+    assert deleted == {"Q3107329"}
+    assert stats["redirected"] == 1
+
+
+def test_item_leaving_the_selection_is_forgotten(wiki):
+    state: dict = {}
+    _sync(wiki, state)
+    claims = [
+        c
+        for c in wiki.entities["Q42"].claims
+        if c["mainsnak"].get("datavalue", {}).get("value", {})
+        != {"entity-type": "item", "numeric-id": 3107329, "id": "Q3107329"}
+    ]
+    wiki.edit("Q42", claims=claims)
+
+    live, deleted, _ = _sync(wiki, state)
+    assert set(live) == {"Q42"}
+    assert deleted == {"Q3107329"}
+
+
+def test_empty_selection_never_mass_deletes(wiki):
+    state: dict = {}
+    wiki.sparql_results = ["Q25169"]
+    _sync(wiki, state, items=[], expand_properties=[], sparql="SELECT ?item WHERE {}")
+    wiki.sparql_results = []
+
+    live, deleted, _ = _sync(
+        wiki, state, items=[], expand_properties=[], sparql="SELECT ?item WHERE {}"
+    )
+    assert live == {} and deleted == set()
+    assert set(state["items"]) == {"Q25169"}
+
+
+def test_render_change_re_renders_everything(wiki):
+    state: dict = {}
+    _sync(wiki, state)
+    live, _, stats = _sync(wiki, state, include_external_ids=True)
+    assert stats["full_sync_reason"] == "render_changed"
+    assert set(live) == {"Q42", "Q25169", "Q3107329"}
+
+
+def test_full_sync_flag_re_renders_everything(wiki):
+    state: dict = {}
+    _sync(wiki, state)
+    live, _, stats = _sync(wiki, state, full_sync=True)
+    assert stats["full_sync_reason"] == "requested"
+    assert len(live) == 3
+
+
+# ---------------------------------------------------------------------------
+# HTTP
+# ---------------------------------------------------------------------------
+def test_requests_identify_the_client_and_send_maxlag(wiki):
+    _sync(wiki, {})
+    for request in wiki.requests:
+        assert request["_user_agent"] == "test-agent/1.0"
+        assert request["maxlag"] == "5"
+
+
+@pytest.mark.parametrize(
+    "failure", [("api", "maxlag"), ("http", 429), ("http", 503), ("network", None)]
+)
+def test_transient_failures_are_retried(wiki, failure):
+    wiki.failures = [failure, failure]
+    live, _, _ = _sync(wiki, {})
+    assert set(live) == {"Q42", "Q25169", "Q3107329"}
+
+
+def test_api_error_aborts_the_run_and_keeps_the_previous_state(wiki):
+    state: dict = {}
+    _sync(wiki, state)
+    snapshot = copy.deepcopy(state)
+    wiki.delete("Q3107329")
+    wiki.failures = [("api", "internal_api_error_DBQueryError")]
+
+    with pytest.raises(WikidataAPIError):
+        _sync(wiki, state)
+    assert state == snapshot
+
+    _, deleted, _ = _sync(wiki, state)
+    assert deleted == {"Q3107329"}
+
+
+def test_retries_give_up_eventually(wiki):
+    wiki.failures = [("http", 503)] * 10
+    with pytest.raises(WikidataAPIError, match="http_503"):
+        _sync(wiki, {})
+
+
+# ---------------------------------------------------------------------------
+# dlt resource
+# ---------------------------------------------------------------------------
+def test_resource_is_a_merge_document_source():
+    resource = wikidata_source(["Q42"], http_client=httpx.Client())
+    assert resource.name == "wikidata_www_wikidata_org"
+    assert resource.write_disposition == "merge"
+    assert resource.columns["_deleted"]["hard_delete"] is True
+    assert getattr(resource, DOCUMENT_SOURCE_ATTR) == "wikidata"
+    assert getattr(resource, PIPELINE_SCOPE_ATTR) == resource.name
+    assert resource.cognee_sync_stats == {}
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({}, "Select something"),
+        ({"items": ["Douglas Adams"]}, "Not a Wikidata"),
+        ({"items": ["Q42"], "expand_properties": ["Q5"]}, "property ids"),
+        ({"items": ["Q42"], "max_items": 0}, "max_items"),
+        ({"items": ["Q42"], "language": "English"}, "language"),
+        ({"items": ["Q42"], "api_url": "https://www.wikidata.org/wiki/Q42"}, "api.php"),
+        (
+            {"sparql": "SELECT ?item {}", "api_url": "https://example.wikibase.cloud/w/api.php"},
+            "sparql_url",
+        ),
+    ],
+)
+def test_factory_validates_its_arguments(kwargs, message, monkeypatch):
+    for name in ("WIKIDATA_API_URL", "WIKIDATA_SPARQL_URL"):
+        monkeypatch.delenv(name, raising=False)
+    with pytest.raises(ValueError, match=message):
+        wikidata_source(**kwargs)
+
+
+def _pipeline(tmp_path, name="wikidata_test"):
+    pytest.importorskip("duckdb")
+    return dlt.pipeline(
+        pipeline_name=name,
+        pipelines_dir=str(tmp_path / "pipelines"),
+        destination=dlt.destinations.duckdb(str(tmp_path / "staging.duckdb")),
+        dataset_name="wikidata",
+    )
+
+
+def _staged(pipeline, table):
+    with pipeline.sql_client() as client:
+        rows = client.execute_sql(f"SELECT id, title FROM {table} ORDER BY id")
+    return dict(rows)
+
+
+def test_forget_on_delete_end_to_end_through_a_real_dlt_merge(wiki, tmp_path):
+    pipeline = _pipeline(tmp_path)
+
+    def run():
+        source = wikidata_source(["Q42"], expand_properties=["P800"], http_client=wiki.client())
+        pipeline.run(source)
+        return source
+
+    source = run()
+    table = source.name
+    assert _staged(pipeline, table) == {
+        "Q25169": "The Hitchhiker's Guide to the Galaxy",
+        "Q3107329": "The Hitchhiker's Guide to the Galaxy (radio series)",
+        "Q42": "Douglas Adams",
+    }
+    assert source.cognee_sync_stats["mode"] == "full"
+
+    # The state persists in dlt's resource state: the next run is incremental.
+    wiki.delete("Q3107329")
+    wiki.edit("Q25169", labels={"en": "Hitchhiker's Guide"})
+    source = run()
+    assert source.cognee_sync_stats["mode"] == "incremental"
+    assert _staged(pipeline, table) == {"Q25169": "Hitchhiker's Guide", "Q42": "Douglas Adams"}
+
+
+def test_one_resource_name_cannot_hold_two_wikibases(wiki, tmp_path):
+    pipeline = _pipeline(tmp_path)
+    pipeline.run(wikidata_source(["Q42"], http_client=wiki.client(), resource_name="items"))
+
+    other = FakeWikibase()
+    other_url = "https://example.wikibase.cloud/w/api.php"
+    with pytest.raises(Exception, match="another Wikibase"):
+        pipeline.run(
+            wikidata_source(
+                ["Q42"], api_url=other_url, http_client=other.client(), resource_name="items"
+            )
+        )
