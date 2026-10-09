@@ -25,6 +25,7 @@ from cognee_community_connector_iceberg.iceberg import (
 # Fixtures / In-Memory Catalog Fakes
 # ---------------------------------------------------------------------------
 
+
 class FakeField:
     def __init__(self, field_id, name, field_type, required=False, doc=""):
         self.field_id = field_id
@@ -106,12 +107,14 @@ class FakeIcebergCatalog:
         if ident in self._tables:
             return self._tables[ident]
         from pyiceberg.exceptions import NoSuchTableError
+
         raise NoSuchTableError(f"Table {ident} not found")
 
 
 # ---------------------------------------------------------------------------
 # Rendering Unit Tests (DB-Free)
 # ---------------------------------------------------------------------------
+
 
 def test_render_schema_formats_markdown_table():
     fields = [
@@ -156,7 +159,7 @@ def test_table_to_row_structure():
     tbl = FakeIcebergTable(
         identifier=("lake", "finance", "transactions"),
         fields=[FakeField(1, "id", "long", required=True)],
-        properties={"retention": "30d"}
+        properties={"retention": "30d"},
     )
     row = _table_to_row(tbl)
     assert row["id"] == "lake.finance.transactions"
@@ -169,6 +172,7 @@ def test_table_to_row_structure():
 # ---------------------------------------------------------------------------
 # Error Handling Unit Tests
 # ---------------------------------------------------------------------------
+
 
 def test_error_classification():
     class NoSuchTableError(Exception):
@@ -185,6 +189,7 @@ def test_error_classification():
 # dlt Pipeline Integration Tests (Mock Catalog + In-Memory Staging)
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture
 def dlt_mod():
     return pytest.importorskip("dlt")
@@ -192,12 +197,10 @@ def dlt_mod():
 
 def test_iceberg_source_sync_and_forget_on_delete(dlt_mod, tmp_path):
     table_a = FakeIcebergTable(
-        identifier=("db", "table_a"),
-        fields=[FakeField(1, "col1", "int", required=True)]
+        identifier=("db", "table_a"), fields=[FakeField(1, "col1", "int", required=True)]
     )
     table_b = FakeIcebergTable(
-        identifier=("db", "table_b"),
-        fields=[FakeField(1, "col2", "string", required=False)]
+        identifier=("db", "table_b"), fields=[FakeField(1, "col2", "string", required=False)]
     )
 
     catalog_data = {

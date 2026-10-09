@@ -21,9 +21,11 @@ from typing import Any
 
 try:
     from cognee.shared.logging_utils import get_logger
+
     logger = get_logger("iceberg_connector")
 except ImportError:
     import logging
+
     logger = logging.getLogger("iceberg_connector")
 
 try:
