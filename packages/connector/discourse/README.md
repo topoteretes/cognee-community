@@ -54,6 +54,46 @@ source = discourse_source(
 )
 ```
 
+## Sync model: full snapshot replace
+
+This connector uses ``write_disposition="replace"`` — each sync produces the
+complete current set of topics matching the configured scope. Anything dropped
+from the listing (deleted, moved to a different category, archived) gets
+cleaned up via cognee's orphan cleanup.
+
+### Incremental optimization
+
+While the disposition is ``replace`` (safest for correctness), the connector
+**minimizes re-fetching** by:
+1. Filtering the listing on ``bumped_at`` (last activity) via the cursor.
+2. Only fetching full Markdown via ``/raw/{topic_id}`` for topics that appear
+   in the current listing.
+3. A 5-minute overlap window catches late-updating threads.
+
+### Safety guarantee
+
+> A listing API error **aborts the run before any Markdown is fetched and
+> before staging is replaced**. A partial snapshot must never drive mass
+> deletions. Individual ``/raw/{topic_id}`` fetch failures are logged as
+> warnings and skipped — the topic is still discoverable by its title and
+> metadata from the listing.
+
+### Edge cases documented
+
+- **Public vs private**: Public forums work with zero configuration beyond
+  the base URL. Private forums require ``Api-Key`` + ``Api-Username`` headers.
+  The connector auto-detects based on which environment variables are set.
+- **Category scoping**: When ``category_ids`` are provided, the connector
+  fetches from each category's ``/c/{id}/l/latest.json`` feed. Topics that
+  appear in multiple categories are deduplicated by ID.
+- **Archived topics**: Discourse's ``/latest.json`` by default includes
+  archived topics. They are ingested with their current metadata.
+- **Large forums**: Page pagination with 30 topics per request handles forums
+  of any size. A safety cap of 100 pages prevents infinite loops.
+- **Deleted posts**: The ``/raw/{topic_id}`` endpoint returns the current
+  state of the topic. Deleted posts are typically redacted or removed from
+  the raw output by Discourse itself.
+
 ## Data model (document-mode)
 
 One document per Discourse topic containing:
@@ -64,18 +104,6 @@ One document per Discourse topic containing:
 - Original poster username
 - Full topic content exported as Markdown via `/raw/{topic_id}`
 - Raw topic metadata preserved in the `raw` field
-
-## Incremental sync
-
-Uses the ``bumped_at`` field (last activity timestamp) from the topic
-listing, stored in dlt state, with a 5-minute overlap window to catch
-late-updating threads.
-
-## Deletion
-
-``write_disposition="replace"`` — each sync produces the complete current set
-of topics; anything dropped from the listing gets cleaned up via cognee's
-orphan cleanup.
 
 ## Layout
 
@@ -88,6 +116,7 @@ packages/connector/discourse/
 ├── examples/
 │   └── example.py
 ├── tests/
+│   ├── fixtures/           # Recorded API responses for offline tests
 │   └── test_discourse.py
 └── pyproject.toml
 ```
@@ -96,3 +125,5 @@ packages/connector/discourse/
 
 Read `packages/connector/notion/` first — it is the closest working
 reference for the dlt + document-mode pattern this connector follows.
+The sync model and edge-case documentation draw from lessons learned
+reviewing high-quality Mergetober submissions.
