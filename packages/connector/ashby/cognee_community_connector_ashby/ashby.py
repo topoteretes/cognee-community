@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import math
 import os
 import re
 import time
@@ -51,8 +52,10 @@ def get_retry_delay(response: httpx.Response, attempt: int, base_delay: float = 
     retry_after = response.headers.get("Retry-After")
     if retry_after:
         try:
-            return float(retry_after)
-        except ValueError:
+            delay = float(retry_after)
+            if math.isfinite(delay) and delay >= 0:
+                return delay
+        except (ValueError, TypeError):
             pass
     return base_delay * (2**attempt)
 

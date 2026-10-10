@@ -34,8 +34,33 @@ def test_get_retry_delay() -> None:
     resp_with_header = httpx.Response(429, headers={"Retry-After": "4.5"})
     assert get_retry_delay(resp_with_header, 0) == 4.5
 
+    assert get_retry_delay(httpx.Response(429, headers={"Retry-After": "0"}), 0) == 0.0
+    assert get_retry_delay(httpx.Response(429, headers={"Retry-After": "0.5"}), 1) == 0.5
+
     resp_no_header = httpx.Response(429)
     assert get_retry_delay(resp_no_header, 1, base_delay=1.0) == 2.0
+
+
+@pytest.mark.parametrize(
+    "invalid_header",
+    [
+        "-1",
+        "-10.5",
+        "nan",
+        "NaN",
+        "inf",
+        "-inf",
+        "Infinity",
+        "-Infinity",
+        "invalid",
+        "",
+    ],
+)
+def test_get_retry_delay_invalid_fallback(invalid_header: str) -> None:
+    """Fallback to exponential backoff when Retry-After is negative, NaN, infinity, or invalid."""
+    resp = httpx.Response(429, headers={"Retry-After": invalid_header})
+    assert get_retry_delay(resp, 0, base_delay=1.0) == 1.0
+    assert get_retry_delay(resp, 2, base_delay=1.0) == 4.0
 
 
 def test_strip_html() -> None:
