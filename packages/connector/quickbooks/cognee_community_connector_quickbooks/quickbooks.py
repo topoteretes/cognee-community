@@ -21,6 +21,7 @@ Architecture & Design:
 
 from __future__ import annotations
 
+import math
 import os
 import time
 from collections.abc import Iterator
@@ -198,11 +199,20 @@ def _is_transient(exc: Exception) -> bool:
 
 
 def _retry_after(headers: Any, attempt: int) -> float:
-    """Extract Retry-After header or calculate exponential backoff."""
-    header = (headers or {}).get("retry-after") or (headers or {}).get("Retry-After")
-    if header:
+    """Extract Retry-After header or calculate exponential backoff.
+
+    Validates that the retry delay is a non-negative finite number, falling
+    back to exponential backoff if the header is missing, negative, NaN,
+    or infinity.
+    """
+    header = None
+    if headers and hasattr(headers, "get"):
+        header = headers.get("retry-after") or headers.get("Retry-After")
+    if header is not None:
         try:
-            return float(header)
+            delay = float(header)
+            if math.isfinite(delay) and delay >= 0:
+                return delay
         except (ValueError, TypeError):
             pass
     return float(2**attempt)
