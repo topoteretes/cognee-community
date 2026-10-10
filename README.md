@@ -122,6 +122,7 @@ are contained in one package (i.e. all tasks used in one pipeline are packaged t
 | `cognee-community-tasks-codify`        | Task       | Custom codify tasks package                                           |
 | `cognee-community-tasks-scrapegraph`   | Task       | Web scraping tasks powered by [ScrapeGraphAI](https://github.com/ScrapeGraphAI/scrapegraph-py) |
 | `cognee-community-tasks-exa`           | Task       | Web search tasks powered by [Exa](https://exa.ai)                     |
+| `cognee-community-connector-discord`   | Connector  | Discord channel messages, threads and forum posts, incremental with forget-on-delete |
 
 ## Repository Structure
 
