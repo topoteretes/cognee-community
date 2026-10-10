@@ -14,6 +14,7 @@ active snapshot and cognee's existing ``orphan_cleanup`` purges them from the kn
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import time
 from typing import Any, Iterable
@@ -33,8 +34,10 @@ def get_retry_delay(response: httpx.Response, attempt: int, base_delay: float = 
     retry_after = response.headers.get("Retry-After")
     if retry_after:
         try:
-            return float(retry_after)
-        except ValueError:
+            delay = float(retry_after)
+            if math.isfinite(delay) and delay >= 0:
+                return delay
+        except (ValueError, TypeError):
             pass
     return base_delay * (2**attempt)
 
