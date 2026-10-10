@@ -326,6 +326,43 @@ def test_retry_after_and_transient_helpers():
     assert _is_transient(ValueError("invalid value")) is False
 
 
+@pytest.mark.parametrize(
+    "invalid_header",
+    [
+        "-1",
+        "-10.5",
+        "nan",
+        "NaN",
+        "inf",
+        "-inf",
+        "Infinity",
+        "-Infinity",
+        "invalid",
+        "",
+    ],
+)
+def test_retry_after_invalid_delays_fallback(invalid_header):
+    """Fallback to exponential backoff when Retry-After is negative, NaN, infinity, or invalid."""
+    from cognee_community_connector_deel.deel import _retry_after
+
+    # attempt 0 -> 2**0 = 1.0
+    assert _retry_after({"retry-after": invalid_header}, 0) == 1.0
+    # attempt 1 -> 2**1 = 2.0
+    assert _retry_after({"Retry-After": invalid_header}, 1) == 2.0
+    # attempt 3 -> 2**3 = 8.0
+    assert _retry_after({"retry-after": invalid_header}, 3) == 8.0
+
+
+def test_retry_after_valid_delays():
+    """Validates non-negative finite retry delays are preserved."""
+    from cognee_community_connector_deel.deel import _retry_after
+
+    assert _retry_after({"retry-after": "0"}, 2) == 0.0
+    assert _retry_after({"retry-after": "0.5"}, 1) == 0.5
+    assert _retry_after({"retry-after": "12"}, 0) == 12.0
+    assert _retry_after({"Retry-After": 20}, 0) == 20.0
+
+
 def test_filter_by_worker_ids():
     """Restricts ingested workers to specified worker_ids."""
     people_data = {
