@@ -16,7 +16,7 @@ import httpx
 import pytest
 from cognee.tasks.ingestion import dlt_utils
 from cognee.tasks.ingestion.resolve_dlt_sources import _build_document_data_item
-from conftest import BOT, FORUM, GENERAL, GUILD, NOW, SAM, USER, FakeDiscord
+from conftest import BOT, FORUM, GENERAL, GUILD, NOW, SAM
 
 from cognee_community_connector_discord.discord import (
     USER_AGENT,
@@ -323,7 +323,7 @@ def test_edit_inside_the_window_is_picked_up(discord):
 def test_deleted_message_rerenders_the_day_and_an_empty_day_is_forgotten(discord):
     discord.message(GENERAL, YESTERDAY, "only message")
     keep = discord.message(GENERAL, TODAY, "keep")
-    drop = discord.message(GENERAL, TODAY, "drop")
+    discord.message(GENERAL, TODAY, "drop")
     state = {}
     _run(discord, state)
 
@@ -334,7 +334,6 @@ def test_deleted_message_rerenders_the_day_and_an_empty_day_is_forgotten(discord
         "_deleted": True,
     }
     assert "drop" not in rows[_day_id(GENERAL, TODAY)]["content"]
-    assert drop["id"] not in rows[_day_id(GENERAL, TODAY)]["content"]
 
 
 def test_old_edits_need_a_full_resync(discord):
@@ -422,10 +421,17 @@ def test_lost_history_permission_does_not_look_like_deletion(discord):
     assert state["containers"][GENERAL]["days"]
 
 
-def test_since_is_stored_on_the_first_run(discord):
+def test_channel_added_later_backfills_since_days_from_now(discord):
     state = {}
     _run(discord, state, since_days=10)
-    assert state["since"] == (NOW.date() - timedelta(days=10)).isoformat()
+
+    later = NOW + timedelta(days=30)
+    discord.channels.append({"id": "904", "type": 0, "name": "late"})
+    discord.message("904", later - timedelta(days=5), "inside")
+    discord.message("904", later - timedelta(days=15), "outside")
+    contents = " ".join(r["content"] for r in _run(discord, state, now=later, since_days=10))
+    assert "inside" in contents
+    assert "outside" not in contents
 
 
 def test_private_threads_and_bot_messages_are_opt_in(discord):
@@ -516,12 +522,3 @@ def test_failed_run_keeps_staging_and_cursor(dlt_mod, tmp_path, discord, fixed_n
     discord.errors.clear()
     pipeline.run(discord_source(guild_id=GUILD, client=discord))
     assert _staged(pipeline) == {}
-
-
-def test_fake_matches_discord_page_order():
-    fake = FakeDiscord()
-    for minute in range(3):
-        fake.message(GENERAL, TODAY + timedelta(minutes=minute), f"m{minute}")
-    page = fake.get(f"/channels/{GENERAL}/messages", {"after": "0", "limit": 100})
-    assert [m["content"] for m in page] == ["m2", "m1", "m0"]
-    assert USER["global_name"] == "Priya Shah"

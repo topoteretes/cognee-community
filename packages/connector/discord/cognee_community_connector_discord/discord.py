@@ -366,7 +366,12 @@ def _containers(client: Any, config: _DiscordConfig, channels: list[dict]) -> di
         and (not wanted or str(c["id"]) in wanted)
     }
     containers = {
-        cid: {"id": cid, "kind": "channel", "name": c.get("name") or cid}
+        cid: {
+            "id": cid,
+            "kind": "channel",
+            "name": c.get("name") or cid,
+            "last_message_id": c.get("last_message_id"),
+        }
         for cid, c in selected.items()
         if c.get("type") in _TEXT_CHANNEL_TYPES
     }
@@ -403,9 +408,6 @@ def _containers(client: Any, config: _DiscordConfig, channels: list[dict]) -> di
             "tags": sorted(tags),
             "last_message_id": thread.get("last_message_id"),
         }
-    for cid, container in containers.items():
-        if container["kind"] == "channel":
-            container["last_message_id"] = selected[cid].get("last_message_id")
     return containers
 
 
@@ -433,8 +435,7 @@ def _iter_rows(
 ) -> Iterator[dict]:
     """Yield changed day documents and tombstones. Pure of dlt, so tests drive it with a dict."""
     today = (now or _utcnow)().date()
-    since = date.fromisoformat(state["since"]) if state.get("since") else None
-    since = since or today - timedelta(days=config.since_days)
+    since = today - timedelta(days=config.since_days)
     rescan_floor = today - timedelta(days=config.rescan_days)
 
     _check_intent(client)
@@ -459,7 +460,6 @@ def _iter_rows(
             start = since
         else:
             start = min(snowflake_time(entry["cursor"]).date(), rescan_floor)
-            start = max(start, since)
         # Start at midnight so the first day is re-read whole, never in part.
         after = time_snowflake(datetime(start.year, start.month, start.day, tzinfo=UTC)) - 1
         try:
@@ -518,7 +518,6 @@ def _iter_rows(
         logger.warning(
             "Discord: messages came back without content. Check the Message Content Intent."
         )
-    state["since"] = since.isoformat()
     logger.info(
         "Discord: %d day document(s) emitted, %d deleted, %d channel(s) gone.",
         stats["emitted"],
