@@ -1,0 +1,131 @@
+[
+  {
+    "id": "p1",
+    "worker_id": "w1",
+    "first_name": "Fake1",
+    "last_name": "Person",
+    "full_name": "Fake1 Person",
+    "birth_date": "1990-01-01",
+    "emails": [
+      {
+        "type": "WORK",
+        "value": "p1@example.invalid"
+      }
+    ],
+    "addresses": [
+      {
+        "streetAddress": "1 Fake St",
+        "locality": "Faketown",
+        "country": "ZZ"
+      }
+    ],
+    "additional_details": [
+      {
+        "type": "SSN",
+        "value": "000-00-0000"
+      }
+    ],
+    "job_title": "Engineer 1",
+    "seniority": "Senior",
+    "department": {
+      "id": "d1",
+      "name": "Platform"
+    },
+    "country": "ZZ",
+    "state": "FS",
+    "hiring_type": "eor",
+    "hiring_status": "active",
+    "start_date": "2024-01-01",
+    "created_at": "2024-01-01T00:00:00Z",
+    "updated_at": "2025-02-01T00:00:00Z",
+    "direct_manager": {
+      "id": "p1"
+    }
+  },
+  {
+    "id": "p2",
+    "worker_id": "w2",
+    "first_name": "Fake2",
+    "last_name": "Person",
+    "full_name": "Fake2 Person",
+    "birth_date": "1990-01-01",
+    "emails": [
+      {
+        "type": "WORK",
+        "value": "p2@example.invalid"
+      }
+    ],
+    "addresses": [
+      {
+        "streetAddress": "1 Fake St",
+        "locality": "Faketown",
+        "country": "ZZ"
+      }
+    ],
+    "additional_details": [
+      {
+        "type": "SSN",
+        "value": "000-00-0000"
+      }
+    ],
+    "job_title": "Engineer 2",
+    "seniority": "Senior",
+    "department": {
+      "id": "d1",
+      "name": "Platform"
+    },
+    "country": "ZZ",
+    "state": "FS",
+    "hiring_type": "eor",
+    "hiring_status": "active",
+    "start_date": "2024-01-01",
+    "created_at": "2024-01-01T00:00:00Z",
+    "updated_at": "2025-02-02T00:00:00Z",
+    "direct_manager": {
+      "id": "p1"
+    }
+  },
+  {
+    "id": "p3",
+    "worker_id": "w3",
+    "first_name": "Fake3",
+    "last_name": "Person",
+    "full_name": "Fake3 Person",
+    "birth_date": "1990-01-01",
+    "emails": [
+      {
+        "type": "WORK",
+        "value": "p3@example.invalid"
+      }
+    ],
+    "addresses": [
+      {
+        "streetAddress": "1 Fake St",
+        "locality": "Faketown",
+        "country": "ZZ"
+      }
+    ],
+    "additional_details": [
+      {
+        "type": "SSN",
+        "value": "000-00-0000"
+      }
+    ],
+    "job_title": "Engineer 3",
+    "seniority": "Senior",
+    "department": {
+      "id": "d1",
+      "name": "Platform"
+    },
+    "country": "ZZ",
+    "state": "FS",
+    "hiring_type": "eor",
+    "hiring_status": "active",
+    "start_date": "2024-01-01",
+    "created_at": "2024-01-01T00:00:00Z",
+    "updated_at": "2025-02-03T00:00:00Z",
+    "direct_manager": {
+      "id": "p1"
+    }
+  }
+]
