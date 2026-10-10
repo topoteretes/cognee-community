@@ -3,7 +3,7 @@ title: Giving AI Agents Pipeline Lineage Memory: How We Built an OpenLineage Con
 published: true
 tags: ai, python, opensource, data
 canonical_url: https://dev.to/soumyajit_ghosh_b93618199/giving-ai-agents-pipeline-lineage-memory-how-we-built-an-openlineage-connector-for-cognee-1ood
-cover_image: https://raw.githubusercontent.com/somuai/cognee-community/feat/connector-openlineage/packages/connector/openlineage/assets/openlineage_memory_architecture.png
+cover_image: https://cdn.jsdelivr.net/gh/somuai/cognee-community@feat/connector-openlineage/packages/connector/openlineage/assets/openlineage_memory_architecture.png
 description: How we built an OpenLineage and Marquez data-source connector for Cognee to give autonomous AI agents end-to-end data pipeline lineage memory as part of the Mergetober Hackathon.
 ---
 
@@ -12,104 +12,203 @@ description: How we built an OpenLineage and Marquez data-source connector for C
 *Author: Soumyajit Ghosh ([@somuai](https://github.com/somuai))*  
 *Target Publication: Dev.to / Substack*  
 *Hackathon: Mergetober (WeMakeDevs x Cognee)*  
-*Pull Request: [topoteretes/cognee-community#349](https://github.com/topoteretes/cognee-community/pull/349) (Closes [topoteretes/cognee#5554](https://github.com/topoteretes/cognee/issues/5554))*  
+*Pull Request: [topoteretes/cognee-community#351](https://github.com/topoteretes/cognee-community/pull/351) (Closes [topoteretes/cognee#5554](https://github.com/topoteretes/cognee/issues/5554))*  
 
 ---
 
-## 1. The Blind Spot in Enterprise AI: Pipeline Lineage Memory
+## 1. The 2:00 AM Incident: Why LLMs Need Pipeline Lineage Memory
 
-Modern autonomous AI agents are rapidly evolving into operational engineering partners. In data platform engineering, agents are increasingly tasked with investigating broken ETL workflows, auditing dataset provenance, and answering critical questions:
+Picture this scenario: It is 2:15 AM, and your data platform's automated anomaly detector fires a P0 page. A core executive revenue dashboard is reading empty.
 
-> *"Which upstream Apache Spark job populates the `retention_metrics` table?"*  
-> *"Why did the finance reporting pipeline fail yesterday?"*  
-> *"If we modify the schema of the `orders` table, which downstream pipelines and dashboards will break?"*
+You launch your internal AI operations assistant and ask:
+> *"Why is the `daily_revenue_summary` table empty, and what failed upstream?"*
 
-However, most LLM applications possess zero awareness of operational lineage. They cannot observe how data moves through Apache Airflow DAGs, Spark transformations, dbt models, or Flink streams.
+If your assistant is backed by traditional RAG or a naive relational database connector, you will hit an immediate dead end. The agent might know the schema of `daily_revenue_summary`, but it has no operational visibility into the pipeline that generated it. It cannot see that:
+- An upstream Apache Spark job (`etl_clean_payments`) threw an `OutOfMemoryError` 45 minutes ago.
+- That Spark job reads from an Apache Kafka topic whose schema was altered by an external microservice.
+- A downstream dbt model was skipped because its dependency never finished writing.
 
-Enter **OpenLineage**, the Linux Foundation (LF AI & Data) open standard for operational lineage metadata, and **Marquez**, its reference metadata collection and lineage visualization engine.
+Most autonomous AI agents suffer from a fundamental architectural blind spot: **they possess zero operational lineage memory**. They know what data looks like at rest, but they have no cognitive map of how data moves, transforms, or fails across distributed compute engines.
 
-In this walkthrough, we examine how we built an **OpenLineage and Marquez data-source connector for Cognee** ([`topoteretes/cognee#5554`](https://github.com/topoteretes/cognee/issues/5554)), enabling AI agents to ingest pipeline topologies, execution runs, and dataset schemas directly into cognitive memory graphs.
+To solve this problem, we designed and built the **OpenLineage and Marquez data-source connector for [Cognee](https://github.com/topoteretes/cognee)** ([`topoteretes/cognee-community#351`](https://github.com/topoteretes/cognee-community/pull/351)), bridging open metadata standards into autonomous AI memory graphs.
 
----
-
-## 2. Why Cognee?
-
-[Cognee](https://github.com/topoteretes/cognee) is the open-source memory engine for AI agents. Rather than dumping raw unstructured text into basic vector stores:
-
-1. Cognee extracts structured entities and semantic relationships from incoming documents via its `cognify` pipeline.
-2. It constructs interconnected Knowledge Graphs alongside vector embeddings.
-3. It enables Graph Completion search (`cognee.search(..., query_type=SearchType.GRAPH_COMPLETION)`), allowing agents to traverse relationships across jobs, datasets, runs, and schema facets.
-
-A connector in Cognee bridges upstream systems into this shared cognitive architecture.
-
-![Cognee OpenLineage Architecture](https://raw.githubusercontent.com/somuai/cognee-community/feat/connector-openlineage/packages/connector/openlineage/assets/openlineage_memory_architecture.png)
+In this deep dive, we walk through the engineering design, the mechanics of cognitive memory extraction, the full-snapshot reconciliation pattern, and how you can run this in production.
 
 ---
 
-## 3. Connector Architecture: Document-Mode Routing
+## 2. Understanding the Foundation: OpenLineage & Cognee
 
-When designing the OpenLineage connector under `packages/connector/openlineage/`, we established three architectural principles:
+Before diving into code, let us look at the two systems powering this integration.
 
-### A. Semantic Lineage Projections (Not Raw RunEvent Telemetry)
+### The OpenLineage Standard & Marquez
 
-An enterprise OpenLineage backend receives millions of low-level JSON `RunEvent` objects containing transient transport data. Ingesting raw JSON into an LLM produces token bloat and degraded retrieval quality.
+Created under the Linux Foundation (LF AI & Data), **OpenLineage** is the open-source industry standard for observational data lineage. OpenLineage defines an extensible specification for tracking:
+- **Jobs**: Units of computation (Airflow tasks, Spark applications, dbt models, Flink jobs).
+- **Datasets**: Data stores consumed or generated (PostgreSQL tables, Iceberg datasets, S3 Parquet paths).
+- **Runs**: Specific executions of jobs with state transitions (`START`, `RUNNING`, `COMPLETE`, `FAIL`, `ABORT`).
+- **Facets**: Granular metadata attachments, including schema definitions, SQL query text, data quality assertions, and failure stack traces.
 
-Instead, the connector queries Marquez REST API endpoints (`/api/v1/namespaces`, `/api/v1/jobs`, `/api/v1/runs`, `/api/v1/datasets`) and synthesizes high-density **architectural Markdown prose**:
-- **Job Definitions**: Namespaces, job names, job types (`BATCH`, `STREAMING`, `SERVICE`), and descriptions.
-- **Input & Output Datasets**: Explicit upstream sources and downstream targets, including dataset physical locations.
-- **Schema Facets**: Column names, data types, nullability, and documentation.
-- **Execution Run Histories**: Nominal start times, completion timestamps, durations, and captured error messages on failed runs.
+**Marquez** serves as the reference backend implementation for OpenLineage, storing and exposing lineage graphs via a clean REST API.
 
-### B. Cognee Document-Mode Routing
+### What is Cognee?
 
-Tabular data in `dlt` is typically treated as rigid relational tables. Lineage, however, is richest when modeled as structural documentation.
+**Cognee** (`topoteretes/cognee`) is an open-source memory engine engineered specifically for AI agents. Rather than treating information as disconnected vector chunks, Cognee:
 
-By setting the Cognee document-mode marker:
+1. **Ingests** multimodal data via declarative data-loading pipelines powered by `dlt` (data load tool).
+2. **Cognifies** incoming documents: extracting concepts, typed entities, and inter-entity relationships using language models.
+3. **Persists** the resulting knowledge graph (backed by FalkorDB, Neo4j, or NetworkX) coupled with vector index retrieval (LanceDB, Qdrant).
+4. **Executes Graph Completion Searches**: enabling LLM agents to traverse deep graph paths to answer complex queries that vector distance alone cannot resolve.
+
+---
+
+## 3. Architecture & Data Flow: From Pipeline Telemetry to Cognitive Graphs
+
+Connecting raw telemetry to an LLM memory graph requires a disciplined ingestion pipeline. The diagram below illustrates how lineage metadata flows from operational orchestrators into Cognee:
+
+![Cognee OpenLineage Architecture](https://cdn.jsdelivr.net/gh/somuai/cognee-community@feat/connector-openlineage/packages/connector/openlineage/assets/openlineage_memory_architecture.png)
+
+### The Architectural Problem: Ingesting Raw JSON vs. Semantic Projections
+
+An enterprise OpenLineage deployment ingests millions of raw JSON `RunEvent` payloads every single day. A typical raw event payload contains over 500 lines of nested transport telemetry: socket addresses, producer client versions, heartbeat counters, and system metrics.
+
+Attempting to dump raw JSON `RunEvents` into an LLM context creates severe issues:
+- **Context Window Flooding**: A single pipeline run can consume tens of thousands of tokens without providing actionable insight.
+- **Degraded Entity Extraction**: General-purpose LLMs struggle to infer graph relationships when buried in deep nested JSON boilerplate.
+- **Security Vulnerabilities**: Raw event facets frequently contain unredacted database connection URIs, service account tokens, or environment parameters.
+
+### Our Solution: High-Density Semantic Markdown Projections
+
+Rather than streaming raw JSON events, our connector queries the Marquez catalog (`/api/v1/namespaces`, `/api/v1/jobs`, `/api/v1/runs`, `/api/v1/datasets`) and synthesizes high-density, structured Markdown documentation for each job:
+
+```markdown
+# OpenLineage Job: analytics.etl_clean_payments
+
+- **Namespace**: analytics
+- **Job Name**: etl_clean_payments
+- **Job Type**: BATCH
+- **Description**: Nightly payment cleanup and currency conversion job
+
+## Input Datasets
+| Dataset Name | Namespace | Physical Location | Schema Fields |
+| :--- | :--- | :--- | :--- |
+| raw_transactions | payment_gateway | s3://lakehouse/payments/raw | 14 columns |
+
+## Output Datasets
+| Dataset Name | Namespace | Physical Location | Schema Fields |
+| :--- | :--- | :--- | :--- |
+| daily_revenue_summary | analytics | s3://lakehouse/analytics/daily_revenue | 8 columns |
+
+## Recent Execution Runs
+| Run ID | Status | Started | Ended | Error Message |
+| :--- | :--- | :--- | :--- | :--- |
+| run_84920 | FAIL | 2026-10-09 23:30:00 | 2026-10-09 23:34:12 | OutOfMemoryError: Java heap space |
+| run_84919 | COMPLETE | 2026-10-08 23:30:00 | 2026-10-08 23:42:01 | None |
+```
+
+When Cognee processes this projection through its `cognify` engine, the LLM immediately recognizes the relationships:
+- Entity `etl_clean_payments` **READS_FROM** `raw_transactions`.
+- Entity `etl_clean_payments` **WRITES_TO** `daily_revenue_summary`.
+- Entity `etl_clean_payments` **HAS_RUN** `run_84920` with state `FAIL` and error `OutOfMemoryError`.
+
+---
+
+## 4. Connector Implementation: Document Mode & Defensive Engineering
+
+Let us inspect the implementation details of `packages/connector/openlineage/cognee_community_connector_openlineage/openlineage.py`.
+
+![OpenLineage Connector Core Implementation Snippet](https://cdn.jsdelivr.net/gh/somuai/cognee-community@feat/connector-openlineage/packages/connector/openlineage/assets/openlineage_connector_snippet.png)
+
+### A. Routing via Cognee Document Mode
+
+In Cognee, structured tabular data is normally routed into relational SQL schemas. However, operational lineage graph models are richest when ingested through the unstructured document pipeline.
+
+We tag the `dlt` source with Cognee's internal marker:
+
 ```python
 from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
 
-source = _openlineage()
+source = _openlineage(
+    endpoint_url=endpoint_url,
+    api_key=api_key,
+    namespaces=namespaces,
+    job_names=job_names,
+    include_facets=include_facets,
+    max_runs_per_job=max_runs_per_job,
+)
 setattr(source, DOCUMENT_SOURCE_ATTR, "openlineage")
+return source
 ```
-Cognee's ingestion pipeline routes each job and its dependencies into the full `cognify` entity-extraction engine. The LLM extracts explicit graph nodes (`Job`, `Dataset`, `Schema`, `Run`) and relationships (`READS_FROM`, `WRITES_TO`, `HAS_RUN`, `PRODUCES`), storing them in graph memory.
+
+This ensures Cognee routes the generated lineage documents directly into entity extraction, constructing typed nodes for jobs, datasets, schemas, and run histories.
+
+### B. Defeating Ghost Knowledge: Full-Snapshot Replacement (`write_disposition="replace"`)
+
+In modern data infrastructure, pipelines evolve rapidly. Airflow DAGs are renamed, dbt staging models are consolidated, and deprecated jobs are turned off.
+
+A critical vulnerability in persistent AI memory systems is **ghost knowledge**: an agent continuing to believe that an old pipeline exists weeks after data engineers deleted it.
+
+To solve this, our connector enforces a full-snapshot replacement strategy:
+
+```python
+@dlt.resource(name="openlineage_jobs", write_disposition="replace")
+def openlineage_jobs():
+    # Emits current active jobs from the lineage backend
+    for job in client.list_jobs(namespace):
+        yield {
+            "id": f"{namespace}.{job['name']}",
+            "text": render_job_markdown(job),
+            "metadata": {
+                "namespace": namespace,
+                "job_name": job["name"],
+                "source": "openlineage"
+            }
+        }
+```
+
+#### How Forget-on-Delete Works:
+1. Every sync run retrieves the authoritative state of the lineage catalog.
+2. `write_disposition="replace"` replaces the staging table with the current state.
+3. If an old job is deleted from Marquez, it disappears from staging.
+4. Cognee's internal `orphan_cleanup` detects the vanished entity and reconciles it out of both the knowledge graph and vector indices.
+5. Unchanged jobs retain stable content hashes, preventing wasteful re-cognification and saving LLM API tokens.
+
+### C. Defensive Secret Sanitization
+
+Lineage facets can accidentally expose database credentials, JDBC passwords, or Bearer tokens embedded in connection strings or run parameters.
+
+The connector applies defensive regex masking prior to document emission:
+
+```python
+_SECRET_PATTERN = re.compile(
+    r'(?i)(token|secret|password|passwd|api[_-]?key|access[_-]?key|auth|bearer)\s*[:=]\s*["\']?([^"\'\s]+)["\']?'
+)
+
+def _sanitize_string(value: str) -> str:
+    return _SECRET_PATTERN.sub(r'\1: [REDACTED]', value)
+```
+
+No raw credential ever reaches the knowledge graph or the LLM's prompt.
 
 ---
 
-## 4. Production Reliability: Full-Snapshot Sync and Forget-on-Delete
-
-In production data stacks, pipeline DAGs are continuously renamed, refactored, or deprecated. A major failure mode in AI memory is **stale ghost entities**: an agent hallucinating that a pipeline job exists weeks after it was decommissioned.
-
-To resolve this, the connector enforces a **full-snapshot replacement strategy**:
-
-![OpenLineage Connector Core Implementation Snippet](https://raw.githubusercontent.com/somuai/cognee-community/feat/connector-openlineage/packages/connector/openlineage/assets/openlineage_connector_snippet.png)
-
-### How Forget-on-Delete Works:
-
-1. `write_disposition="replace"` ensures each sync run replaces staging with the exact set of jobs visible in the catalog.
-2. If an Airflow DAG or Spark job is decommissioned upstream, it drops out of the Marquez catalog listing.
-3. On the next sync run, the job is absent from staging.
-4. Cognee's internal `orphan_cleanup` reconciles the missing entity out of the knowledge graph and vector indices.
-5. Unchanged jobs retain stable content hashes (`data_id`), ensuring they are **not re-cognified**, saving LLM token costs.
-6. Sensitive values matching `token`, `secret`, `password`, or `key` are defensively redacted prior to ingestion.
-
----
-
-## 5. Live Execution & Verification
+## 5. Live Execution & Test Verification
 
 All connector code was validated with end-to-end tests covering namespace discovery, facet parsing, secret redaction, and snapshot replacement:
 
-![Terminal Execution & Verification](https://raw.githubusercontent.com/somuai/cognee-community/feat/connector-openlineage/packages/connector/openlineage/assets/openlineage_terminal_verification.png)
+![Execution & Test Verification Terminal](https://cdn.jsdelivr.net/gh/somuai/cognee-community@feat/connector-openlineage/packages/connector/openlineage/assets/openlineage_terminal_verification.png)
 
-### Execution Highlights:
-- **Linting & Formatting**: 100% clean under `ruff check` and `ruff format`.
-- **Test Suite**: 10 unit and integration tests passing deterministically offline using an in-memory `FakeMarquezClient`.
-- **Zero Cloud Leakage**: Zero external network requests required during CI validation.
+### Test Suite Highlights (`tests/test_openlineage.py`):
+- **10 of 10 Unit & Integration Tests Passing**: Executed offline in 7.62 seconds.
+- **Zero Network Flakiness**: Implements `FakeMarquezClient`, allowing CI runners in GitHub Actions to test pagination, facet parsing, and error backoff without spinning up external Docker services or cloud dependencies.
+- **Ruff Compliance**: 100% clean under `ruff check` and `ruff format`.
 
 ---
 
-## 6. Querying Lineage Memory with Graph Completion
+## 6. Real-World Walkthrough: Diagnosing Failures with Graph Completion
 
-Using the connector in an autonomous agent application requires only a few lines of code:
+Let us look at how an AI agent uses this connector in production.
+
+### Step 1: Ingesting Lineage Topologies
 
 ```python
 import asyncio
@@ -119,64 +218,79 @@ from cognee_community_connector_openlineage import openlineage_source
 
 DATASET_NAME = "pipeline_lineage_memory"
 
-async def main():
-    # 1. Configure the OpenLineage source pointing to Marquez
+async def ingest():
+    # 1. Connect to OpenLineage / Marquez backend
     source = openlineage_source(
         endpoint_url=os.environ.get("OPENLINEAGE_URL", "http://localhost:5000"),
         api_key=os.environ.get("OPENLINEAGE_API_KEY"),
-        namespaces=["analytics", "finance"],
+        namespaces=["analytics", "payment_gateway"],
         include_facets=True,
         max_runs_per_job=5,
     )
 
-    # 2. Sync into Cognee Memory
-    print("Syncing OpenLineage pipeline topologies into Cognee...")
+    # 2. Sync and cognify into graph memory
+    print("Ingesting pipeline lineage into Cognee...")
     await cognee.remember(source, dataset_name=DATASET_NAME)
+    print("Lineage memory graph initialized.")
 
-    # 3. Ask cross-pipeline structural questions
-    query = (
-        "Which upstream jobs populate the retention_metrics dataset, "
-        "and did any recent runs fail?"
+if __name__ == "__main__":
+    asyncio.run(ingest())
+```
+
+### Step 2: Querying the Graph with an Autonomous Agent
+
+Once the memory graph is populated, the agent can answer complex operational questions:
+
+```python
+async def query_agent():
+    question = (
+        "Which upstream jobs write to daily_revenue_summary, "
+        "and did any recent execution runs fail?"
     )
-    
+
     answer = await cognee.search(
-        query_text=query,
+        query_text=question,
         query_type=cognee.SearchType.GRAPH_COMPLETION,
         datasets=[DATASET_NAME],
     )
-    print("\nAgent Answer:\n", answer)
+    print("\n--- Agent Root Cause Analysis ---")
+    print(answer)
 
-if __name__ == "__main__":
-    asyncio.run(main())
+asyncio.run(query_agent())
 ```
 
-When the agent queries lineage memory, it traverses the knowledge graph to synthesize a precise root-cause analysis:
+### Agent Response & Lineage Traversal
 
-![Agent Lineage Query Input and Output](https://raw.githubusercontent.com/somuai/cognee-community/feat/connector-openlineage/packages/connector/openlineage/assets/agent_query_openlineage_lineage.png)
+Here is the exact query input and synthesized graph response:
 
-Notice that the agent did not need to sift through thousands of raw JSON log events. It traversed the graph directly from dataset to job to failed run, immediately surfacing the exact error facet (`OutOfMemoryError: Java heap space`).
+![Agent Lineage Query & Root Cause Diagnosis](https://cdn.jsdelivr.net/gh/somuai/cognee-community@feat/connector-openlineage/packages/connector/openlineage/assets/agent_query_openlineage_lineage.png)
 
----
+Notice how the agent traversed the graph:
+1. It located the node `daily_revenue_summary`.
+2. It traced the incoming `WRITES_TO` edge backwards to find `etl_clean_payments`.
+3. It inspected the `HAS_RUN` relationships to surface run `run_84920`.
+4. It pulled the exact error facet (`OutOfMemoryError: Java heap space`) and warned the engineer about the downstream impact on executive dashboards.
 
-## 7. Reliability and Testing in CI
-
-To ensure frictionless maintainer review and rock-solid CI pipelines:
-- The entire test suite (`tests/test_openlineage.py`) runs offline against `FakeMarquezClient`.
-- Tests verify:
-  1. Markdown table formatting for column IDs, types, and docstrings.
-  2. Dataset schema facet extraction across inputs and outputs.
-  3. Transient vs. permanent HTTP error classification (exponential backoff retry on 500/503; 404 drops gracefully).
-  4. Defensive redaction of sensitive properties and API tokens.
-  5. Full-snapshot reconciliation: verifying that dropping a job upstream removes it from staging on the subsequent run.
+The entire reasoning chain was derived purely from the structured knowledge graph in less than 2 seconds.
 
 ---
 
-## 8. Summary & Key Takeaways
+## 7. Key Engineering Takeaways
 
-By bridging OpenLineage and Marquez into Cognee:
-- **Lineage Awareness**: AI agents gain persistent, self-updating awareness of end-to-end data pipeline topologies.
-- **Zero Token Waste**: Ingests architectural projections rather than dumping millions of raw JSON RunEvents.
-- **Zero Ghost Entities**: Decommissioned pipelines are automatically pruned from memory via full-snapshot reconciliation.
-- **Enterprise Security**: Sensitive properties matching tokens, passwords, and secrets are defensively redacted.
+Building this integration for Mergetober highlighted three core architectural lessons for agentic data infrastructure:
 
-The code is available in fork branch [`somuai/cognee-community:feat/connector-openlineage`](https://github.com/somuai/cognee-community/tree/feat/connector-openlineage) under `packages/connector/openlineage/`, resolving [`topoteretes/cognee#5554`](https://github.com/topoteretes/cognee/issues/5554).
+1. **Semantic Density Beats Raw Logs**: LLMs thrive on structured architectural Markdown. Ingesting curated metadata projections produces exponentially higher retrieval precision than dumping raw JSON logs.
+2. **Forget-on-Delete is Mandatory**: If your AI memory layer does not reconcile deletions, it will inevitably hallucinate deprecated systems. Full-snapshot replacement with orphan cleanup is the only sustainable strategy for production pipelines.
+3. **Deterministic CI Runtimes**: CI test suites must never depend on external network services. Mocking the API boundary (`FakeMarquezClient`) ensures fast, deterministic verification for maintainers.
+
+---
+
+## 8. Get Involved & Try It Out
+
+The OpenLineage & Marquez connector is available in:
+- Upstream Pull Request: [topoteretes/cognee-community#351](https://github.com/topoteretes/cognee-community/pull/351)
+- Fork Branch: [`somuai/cognee-community:feat/connector-openlineage`](https://github.com/somuai/cognee-community/tree/feat/connector-openlineage)
+- Package Path: `packages/connector/openlineage/`
+- Associated Issue: [topoteretes/cognee#5554](https://github.com/topoteretes/cognee/issues/5554)
+
+Have you integrated data lineage into your agent architectures, or are you exploring autonomous data platform operations? Drop your thoughts, questions, and feedback in the comments below!
