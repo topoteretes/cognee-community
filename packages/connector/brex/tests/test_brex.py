@@ -37,10 +37,39 @@ def test_get_retry_delay():
     req = httpx.Request("GET", "https://platform.brexapis.com/test")
     resp_with_header = httpx.Response(429, headers={"retry-after": "4"}, request=req)
     assert _get_retry_delay(resp_with_header, 0) == 4.0
+    assert (
+        _get_retry_delay(httpx.Response(429, headers={"retry-after": "0"}, request=req), 0) == 0.0
+    )
+    assert (
+        _get_retry_delay(httpx.Response(429, headers={"retry-after": "0.5"}, request=req), 1) == 0.5
+    )
 
     resp_without_header = httpx.Response(500, request=req)
     assert _get_retry_delay(resp_without_header, 2) == 4.0
     assert _get_retry_delay(None, 1) == 2.0
+
+
+@pytest.mark.parametrize(
+    "invalid_header",
+    [
+        "-1",
+        "-10.5",
+        "nan",
+        "NaN",
+        "inf",
+        "-inf",
+        "Infinity",
+        "-Infinity",
+        "invalid",
+        "",
+    ],
+)
+def test_get_retry_delay_invalid_fallback(invalid_header: str) -> None:
+    """Fallback to exponential backoff when Retry-After is negative, NaN, infinity, or invalid."""
+    req = httpx.Request("GET", "https://platform.brexapis.com/test")
+    resp = httpx.Response(429, headers={"retry-after": invalid_header}, request=req)
+    assert _get_retry_delay(resp, 0) == 1.0
+    assert _get_retry_delay(resp, 2) == 4.0
 
 
 def test_client_retry_on_429(monkeypatch):

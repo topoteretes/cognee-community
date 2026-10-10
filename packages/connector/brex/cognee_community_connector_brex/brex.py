@@ -21,6 +21,7 @@ Incremental sync uses a ``posted_at_start`` watermark stored in persistent dlt s
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import time
 from typing import Any
@@ -43,7 +44,9 @@ def _get_retry_delay(response: httpx.Response | None, attempt: int) -> float:
     """Calculate exponential retry delay honoring Retry-After headers."""
     if response is not None and "retry-after" in response.headers:
         try:
-            return float(response.headers["retry-after"])
+            delay = float(response.headers["retry-after"])
+            if math.isfinite(delay) and delay >= 0:
+                return delay
         except (ValueError, TypeError):
             pass
     return _BASE_BACKOFF * (2**attempt)
