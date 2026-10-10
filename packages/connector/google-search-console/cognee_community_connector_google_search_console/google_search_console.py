@@ -38,6 +38,7 @@ Design
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from datetime import date, datetime, timedelta
@@ -261,9 +262,11 @@ class GoogleSearchConsoleClient:
 def _get_retry_delay(headers: httpx.Headers | dict[str, str], attempt: int) -> float:
     """Calculate retry delay from Retry-After header or exponential backoff."""
     retry_after = headers.get("retry-after") if hasattr(headers, "get") else None
-    if retry_after:
+    if retry_after is not None:
         try:
-            return float(retry_after)
+            delay = float(retry_after)
+            if math.isfinite(delay) and delay >= 0:
+                return delay
         except (ValueError, TypeError):
             pass
     return float(2**attempt)

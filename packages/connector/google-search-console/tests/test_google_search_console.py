@@ -188,7 +188,30 @@ def test_client_rate_limit_and_retry(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_get_retry_delay() -> None:
     assert _get_retry_delay({"retry-after": "5"}, 0) == 5.0
+    assert _get_retry_delay({"retry-after": "0"}, 0) == 0.0
+    assert _get_retry_delay({"retry-after": "0.5"}, 1) == 0.5
     assert _get_retry_delay({}, 2) == 4.0
+
+
+@pytest.mark.parametrize(
+    "invalid_header",
+    [
+        "-1",
+        "-10.5",
+        "nan",
+        "NaN",
+        "inf",
+        "-inf",
+        "Infinity",
+        "-Infinity",
+        "invalid",
+        "",
+    ],
+)
+def test_get_retry_delay_invalid_fallback(invalid_header: str) -> None:
+    """Fallback to exponential backoff when Retry-After is negative, NaN, infinity, or invalid."""
+    assert _get_retry_delay({"retry-after": invalid_header}, 0) == 1.0
+    assert _get_retry_delay({"retry-after": invalid_header}, 2) == 4.0
 
 
 # ---------------------------------------------------------------------------
