@@ -11,7 +11,12 @@ from cognee_community_connector_logrocket import logrocket_source
 async def main() -> None:
     organization_id = os.environ.get("LOGROCKET_ORGANIZATION_ID")
     project_id = os.environ.get("LOGROCKET_PROJECT_ID")
-    if not organization_id or not project_id or not os.environ.get("LOGROCKET_API_KEY"):
+    if (
+        not organization_id
+        or not project_id
+        or not os.environ.get("LOGROCKET_API_KEY")
+        or not os.environ.get("LLM_API_KEY")
+    ):
         print(
             "Set LOGROCKET_API_KEY, LOGROCKET_ORGANIZATION_ID, LOGROCKET_PROJECT_ID, "
             "and LLM_API_KEY first."
@@ -25,6 +30,8 @@ async def main() -> None:
             resources=("sessions", "issues"),
         ),
         dataset_name="logrocket",
+        primary_key="id",
+        write_disposition="merge",
         max_rows_per_table=0,
     )
     result = await cognee.search(

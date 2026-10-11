@@ -11,14 +11,15 @@ from __future__ import annotations
 import json
 import os
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from datetime import UTC, datetime
+from hashlib import sha256
 from typing import Any
 from urllib.parse import quote
 
 import httpx
 from cognee.shared.logging_utils import get_logger
-from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
+from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR, PIPELINE_SCOPE_ATTR
 
 logger = get_logger("logrocket_connector")
 
@@ -99,7 +100,8 @@ class LogRocketMCPClient:
                 f"LogRocket MCP tool {tool_name!r} is unavailable. "
                 "Check the configured project and MCP toolset."
             )
-        if not _tool_properties(tool):
+        schema = tool.get("inputSchema")
+        if not isinstance(schema, Mapping) or not isinstance(schema.get("properties"), Mapping):
             raise LogRocketMCPError(f"LogRocket MCP tool {tool_name!r} has no input schema.")
         return tool
 
@@ -214,11 +216,10 @@ def logrocket_source(
 ):
     """Create a dlt source for LogRocket session metadata and issue reports.
 
-    ``start_time`` and ``end_time`` are mapped to the fields advertised by the
-    live MCP tool schema. For provider-specific filters, pass ``session_filters``
-    or ``issue_filters``; these are forwarded without guessing their names.
-    The selected time window is the authoritative snapshot scope for each
-    resource, which is what makes upstream disappearance safe to reconcile.
+    ``start_time`` and ``end_time`` select the session date window when the live
+    MCP schema supports it. The start and filters define a fixed sync scope;
+    advancing the end extends it. Each run scans that scope and emits only new
+    or changed rows plus deletion markers for records that disappeared.
     """
     try:
         import dlt
@@ -238,6 +239,7 @@ def logrocket_source(
     if invalid or not selected:
         raise ValueError("resources must contain one or both of: sessions, issues.")
 
+    scope_base_url = base_url
     # Project scope is enforced by LogRocket's documented MCP URL, including
     # when a tool schema omits explicit organization/project parameters.
     if base_url == LOGROCKET_MCP_URL:
@@ -258,20 +260,50 @@ def logrocket_source(
         if set(filters or {}) & args.keys():
             raise ValueError("LogRocket scope fields cannot be overridden by filters.")
         args.update(filters or {})
-        _add_time_window(args, tool, start_time, end_time)
+        if tool_name == "find_sessions":
+            _add_time_window(args, tool, start_time, end_time)
         return args
 
-    @dlt.resource(name=SESSION_TABLE_NAME, primary_key="id", write_disposition="replace")
+    @dlt.resource(
+        name=SESSION_TABLE_NAME,
+        primary_key="id",
+        write_disposition="merge",
+        columns={"_deleted": {"data_type": "bool", "hard_delete": True}},
+    )
     def sessions():
         args = tool_arguments("find_sessions", session_filters)
-        for session in mcp_client.iter_tool_records("find_sessions", args, ("sessions", "results")):
-            yield _session_to_row(session, organization_id, project_id)
+        scope = _sync_scope(
+            organization_id, project_id, scope_base_url, start_time, session_filters
+        )
+        yield from _sync_snapshot(
+            mcp_client,
+            "find_sessions",
+            args,
+            ("sessions", "results"),
+            lambda record: _session_to_row(record, organization_id, project_id),
+            dlt.current.resource_state(),
+            scope,
+            end_time,
+        )
 
-    @dlt.resource(name=ISSUE_TABLE_NAME, primary_key="id", write_disposition="replace")
+    @dlt.resource(
+        name=ISSUE_TABLE_NAME,
+        primary_key="id",
+        write_disposition="merge",
+        columns={"_deleted": {"data_type": "bool", "hard_delete": True}},
+    )
     def issues():
         args = tool_arguments("find_issues", issue_filters)
-        for issue in mcp_client.iter_tool_records("find_issues", args, ("issues", "results")):
-            yield _issue_to_row(issue, organization_id, project_id)
+        scope = _sync_scope(organization_id, project_id, scope_base_url, None, issue_filters)
+        yield from _sync_snapshot(
+            mcp_client,
+            "find_issues",
+            args,
+            ("issues", "results"),
+            lambda record: _issue_to_row(record, organization_id, project_id),
+            dlt.current.resource_state(),
+            scope,
+        )
 
     @dlt.source(name=LOGROCKET_SOURCE_NAME)
     def _logrocket():
@@ -284,7 +316,69 @@ def logrocket_source(
 
     source = _logrocket()
     setattr(source, DOCUMENT_SOURCE_ATTR, LOGROCKET_SOURCE_NAME)
+    setattr(source, PIPELINE_SCOPE_ATTR, _json_text([organization_id, project_id]))
     return source
+
+
+def _sync_scope(
+    organization_id: str,
+    project_id: str,
+    base_url: str,
+    start_time: datetime | int | str | None,
+    filters: Mapping[str, Any] | None,
+) -> str:
+    scope = {
+        "organization_id": organization_id,
+        "project_id": project_id,
+        "base_url": base_url,
+        "start_time_ms": _timestamp_ms(start_time) if start_time is not None else None,
+        "filters": filters or {},
+    }
+    return sha256(_json_text(scope).encode("utf-8")).hexdigest()
+
+
+def _sync_snapshot(
+    client: LogRocketMCPClient,
+    tool_name: str,
+    arguments: Mapping[str, Any],
+    record_keys: tuple[str, ...],
+    to_row: Callable[[Mapping[str, Any]], dict[str, Any]],
+    state: dict[str, Any],
+    scope: str,
+    end_time: datetime | int | str | None = None,
+) -> Iterator[dict[str, Any]]:
+    """Reconcile a complete listing; commit the cursor only after every page succeeds."""
+    previous_scope = state.get("scope")
+    if previous_scope is not None and previous_scope != scope:
+        raise LogRocketMCPError("LogRocket sync scope changed; use a new Cognee dataset.")
+    end_ms = _timestamp_ms(end_time) if end_time is not None else None
+    previous_end = state.get("end_time_ms")
+    if previous_scope is not None and (end_ms is None) != (previous_end is None):
+        raise LogRocketMCPError("LogRocket end_time mode changed; use a new Cognee dataset.")
+    if end_ms is not None and previous_end is not None and end_ms < previous_end:
+        raise LogRocketMCPError("LogRocket end_time cannot move backwards.")
+
+    previous = state.get("fingerprints", {})
+    current: dict[str, str] = {}
+    for record in client.iter_tool_records(tool_name, arguments, record_keys):
+        row = to_row(record)
+        identifier = row["id"]
+        fingerprint = sha256(_json_text(row).encode("utf-8")).hexdigest()
+        if identifier in current:
+            if current[identifier] != fingerprint:
+                raise LogRocketMCPError(
+                    f"LogRocket {tool_name} returned conflicting records for ID {identifier!r}."
+                )
+            continue
+        current[identifier] = fingerprint
+        if previous.get(identifier) != fingerprint:
+            yield {**row, "_deleted": False}
+
+    for identifier in previous.keys() - current.keys():
+        yield {"id": identifier, "_deleted": True}
+    state["scope"] = scope
+    state["fingerprints"] = current
+    state["end_time_ms"] = end_ms
 
 
 def _session_to_row(
@@ -474,6 +568,8 @@ def _add_time_window(
     properties = _tool_properties(tool)
     if "timeRange" in properties or "time_range" in properties:
         key = "timeRange" if "timeRange" in properties else "time_range"
+        if key in arguments:
+            raise ValueError(f"LogRocket time-window field {key!r} is specified twice.")
         arguments[key] = {
             "startMs": _timestamp_ms(start_time) if start_time is not None else None,
             "endMs": _timestamp_ms(end_time) if end_time is not None else None,
@@ -503,6 +599,8 @@ def _add_time_window(
                 f"LogRocket MCP tool {tool.get('name', '<unknown>')} does not advertise "
                 "a time-window field."
             )
+        if key in arguments:
+            raise ValueError(f"LogRocket time-window field {key!r} is specified twice.")
         arguments[key] = _timestamp_ms(value) if key.endswith("Ms") else _timestamp_iso(value)
 
 
@@ -512,12 +610,14 @@ def _timestamp_ms(value: datetime | int | str) -> int:
     if isinstance(value, datetime):
         point = value if value.tzinfo else value.replace(tzinfo=UTC)
         return int(point.timestamp() * 1000)
-    return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() * 1000)
+    point = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return int((point if point.tzinfo else point.replace(tzinfo=UTC)).timestamp() * 1000)
 
 
 def _timestamp_iso(value: datetime | int | str) -> str:
     if isinstance(value, str):
-        return value
+        point = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return (point if point.tzinfo else point.replace(tzinfo=UTC)).isoformat()
     if isinstance(value, int):
         return datetime.fromtimestamp(value / 1000, tz=UTC).isoformat()
     point = value if value.tzinfo else value.replace(tzinfo=UTC)

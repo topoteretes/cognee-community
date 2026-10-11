@@ -21,8 +21,10 @@ intended project yourself.
 
 ## Install
 
+From the `cognee-community` repository root:
+
 ```bash
-uv pip install cognee-community-connector-logrocket
+uv pip install -e packages/connector/logrocket
 ```
 
 For local development:
@@ -45,6 +47,8 @@ await cognee.remember(
         resources=("sessions", "issues"),
     ),
     dataset_name="logrocket",
+    primary_key="id",
+    write_disposition="merge",
     max_rows_per_table=0,
 )
 ```
@@ -52,16 +56,18 @@ await cognee.remember(
 Set `LOGROCKET_API_KEY` instead of passing `api_key`. The source can be scoped to
 one resource with `resources=("sessions",)` or `resources=("issues",)`. Provider-
 specific MCP filters can be forwarded with `session_filters` and `issue_filters`.
-Use `start_time` and `end_time` for the supported date-window fields advertised by
-the live MCP schema.
+Use `start_time` and `end_time` for session date-window fields advertised by the
+live MCP schema. Keep `start_time` and the filters fixed for a dataset; you may
+advance `end_time`. A changed scope raises an error before the listing starts.
 
-Keep LogRocket in a dedicated Cognee dataset. The selected date/filter scope is an
-authoritative snapshot: records that disappear from that scope on a successful sync
-are eligible for Cognee's existing orphan cleanup. An MCP error or a response
-that explicitly reports more pages without a cursor aborts the run. The MCP API
-does not currently document a complete export or deletion feed, so do not treat
-this snapshot behavior as verified forget-on-delete until tested with a real
-LogRocket project.
+Keep LogRocket in a dedicated Cognee dataset. `write_disposition="merge"` is
+required for incremental updates and hard-delete markers. Each run scans the
+selected scope, compares stable row fingerprints in dlt state, and emits only
+new or changed documents plus deletions. A complete listing is necessary to
+detect upstream deletions; the MCP API does not document a separate deletion
+feed. A failed listing or explicit incomplete page aborts without advancing
+state. Live LogRocket completeness and graph deletion still need validation
+with a real project.
 
 ## Example
 
