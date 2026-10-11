@@ -389,6 +389,52 @@ def test_recurring_series_is_one_document_and_bare_occurrences_are_skipped(graph
     assert upserts == {} and deletes == []
 
 
+def test_series_master_outside_the_window_is_fetched_by_id(graph):
+    series = graph.put_series("Weekly sync since last year", NOW + timedelta(days=1), days=3)
+    graph.hide_from_calendar_view(series)  # only the occurrences are listed
+    state: dict = {}
+
+    upserts, deletes, _ = sync(state, make_config(**CAL))
+
+    assert list(upserts) == [event(series)]
+    assert "Repeats: daily" in upserts[event(series)]["content"]
+    assert deletes == []
+    assert state["calendar"]["known"] == [series]
+
+    # A window refresh must not mistake the unlisted master for a removal.
+    upserts, deletes, stats = sync(state, make_config(**CAL), now=NOW + timedelta(days=8))
+    assert deletes == []
+    assert stats["events_left_window"] == 0
+    assert state["calendar"]["known"] == [series]
+
+
+@pytest.mark.parametrize("code", ["syncStateNotFound", "SyncStateNotFound", "resyncRequired"])
+def test_expired_token_codes_are_matched_case_insensitively(graph, code):
+    keep = graph.put_message("inbox", "Keep")
+    state: dict = {}
+    config = make_config(include_calendar=False, mail_folders=("inbox",))
+    sync(state, config)
+
+    graph.fail_next.append((400, {"error": {"code": code}}, {}))
+    upserts, deletes, _ = sync(state, config)
+
+    assert deletes == []
+    assert set(upserts) == {mail(keep)}  # resynced instead of raising
+
+
+def test_totals_use_the_keys_other_connectors_publish(graph):
+    graph.put_message("inbox", "One")
+    gone = graph.put_event("Gone", NOW + timedelta(days=2))
+    state: dict = {}
+    sync(state)
+    graph.delete_event(gone)
+
+    _, _, stats = sync(state)
+
+    assert stats["deleted"] == 1
+    assert stats["scanned"] == 0
+
+
 def test_cancelled_meeting_is_forgotten(graph):
     event_id = graph.put_event("Cancelled sync", NOW + timedelta(days=3))
     state: dict = {}

@@ -145,6 +145,11 @@ class FakeGraph:
             self.event_log.append(("upsert", occurrence_id))
         return master_id
 
+    def hide_from_calendar_view(self, event_id: str) -> None:
+        """Keep an event fetchable by id but out of calendarView listings,
+        like a series master whose own start is before the window."""
+        self.events[event_id]["_start"] = self.events[event_id]["_start"] - timedelta(days=3650)
+
     def edit_event(self, event_id: str, **fields) -> None:
         if "start" in fields:
             start = fields.pop("start")

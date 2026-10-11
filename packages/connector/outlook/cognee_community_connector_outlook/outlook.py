@@ -98,7 +98,8 @@ MAIL_FIELDS = [
     "hasAttachments",
 ]
 # Error codes Graph uses when a delta token can no longer be used.
-RESYNC_ERROR_CODES = {"syncStateNotFound", "syncStateInvalid", "resyncRequired"}
+# Compared case-insensitively: Graph's docs and responses differ in casing.
+RESYNC_ERROR_CODES = {"syncstatenotfound", "syncstateinvalid", "resyncrequired"}
 # Row ids are prefixed so mail and events can never collide in one table.
 MAIL_ID_PREFIX = "mail:"
 EVENT_ID_PREFIX = "event:"
@@ -171,7 +172,7 @@ def _error_code(exc: HTTPError) -> str | None:
 
 
 def _needs_resync(exc: HTTPError) -> bool:
-    return _status(exc) == 410 or _error_code(exc) in RESYNC_ERROR_CODES
+    return _status(exc) == 410 or (_error_code(exc) or "").lower() in RESYNC_ERROR_CODES
 
 
 def _exists(client: RESTClient, path: str) -> dict | None:
@@ -219,6 +220,10 @@ def _iter_rows(
         new_calendar_state = _sync_calendar(
             client, config, state.get("calendar", {}), rows, deletes, stats, now
         )
+
+    # Totals under the keys the other connectors publish, for host dashboards.
+    stats["scanned"] = stats["mail_changed"] + stats["events_changed"]
+    stats["deleted"] = stats["mail_deleted"] + stats["events_deleted"]
 
     for row_id in deletes:
         yield {"id": row_id, "_deleted": True}
@@ -389,6 +394,7 @@ def _sync_calendar(client, config, calendar_state, rows, deletes, stats, now) ->
     removed: set[str] = set()
     seen: set[str] = set()
     changed: dict[str, dict] = {}
+    series_ids: set[str] = set()
     for item in items:
         event_id = item["id"]
         if "@removed" in item:
@@ -399,6 +405,8 @@ def _sync_calendar(client, config, calendar_state, rows, deletes, stats, now) ->
             # the one document for the whole series.
             seen.add(event_id)
             removed.discard(event_id)
+            if item.get("seriesMasterId"):
+                series_ids.add(item["seriesMasterId"])
         elif item.get("isCancelled"):
             seen.add(event_id)
             removed.discard(event_id)
@@ -407,6 +415,16 @@ def _sync_calendar(client, config, calendar_state, rows, deletes, stats, now) ->
             seen.add(event_id)
             removed.discard(event_id)
             changed[event_id] = item
+    # A series that started before the window still has occurrences inside
+    # it, but Graph may not list its master. The occurrences prove the series
+    # is alive, and a master missing from both this round and memory is
+    # fetched by id so the meeting is not lost.
+    for master_id in sorted(series_ids - seen - set(changed) - known):
+        master = _exists(client, f"/me/events/{master_id}")
+        if master is not None and not master.get("isCancelled"):
+            changed[master_id] = master
+    seen |= series_ids
+
     if snapshot:
         # Known events missing from the fresh listing were deleted or left
         # the window; the lookup below tells which.

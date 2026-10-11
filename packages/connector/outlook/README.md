@@ -97,7 +97,8 @@ for the full flow.
 | `resource_name` | – | `outlook_items`; give each mailbox its own name when several sync into one dataset |
 
 After a run, `source.cognee_sync_stats` holds counts only (mail changed and deleted,
-events changed, deleted and left the window), never subjects or content.
+events changed, deleted and left the window, plus the `scanned` and `deleted` totals the
+other connectors publish), never subjects or content.
 
 ## How sync and forget-on-delete work
 
@@ -114,7 +115,9 @@ events changed, deleted and left the window), never subjects or content.
 - **Recurring meetings** become one document: the series master carries the title,
   description and "Repeats: daily from … until …". Graph also lists every occurrence,
   but only with its id and times, so those bare entries are skipped. Changed single
-  occurrences (exceptions) carry full details and get their own document.
+  occurrences (exceptions) carry full details and get their own document. A series that
+  started before the window may be listed only through its occurrences; its master is
+  then fetched by id, so the meeting is not lost.
 - **Immutable ids:** every request sends `Prefer: IdType="ImmutableId"`, so a message
   keeps its id when it moves between folders.
 - **Moves are not deletes.** The connector keeps, per message, the synced folders it is
