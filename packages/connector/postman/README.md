@@ -40,7 +40,10 @@ python examples/postman_example.py
 The example forces dedicated local SQLite/Ladybug/LanceDB stores under
 `~/.local/share/cognee-postman-4711`; `POSTMAN_RUNTIME_DIR` can choose a dedicated
 alternative. Inherited database paths/providers are overridden. Model configuration
-is retained. The same runtime and collection selection must be used for reruns.
+is retained. dlt's durable state and pending loads live under `runtime/dlt/pipelines`;
+inherited dlt directory overrides are replaced too. Configure the standalone runtime
+before importing Cognee/dlt. The same runtime and collection selection must be used
+for reruns. Previously created global dlt state is not automatically migrated or deleted.
 It performs foreground add, cognify and chunk search, then inspects the actual stores.
 Set `POSTMAN_FORBIDDEN_TEXT='obsolete fixture text'` to assert absence across Data,
 graph properties and vector payloads, or `POSTMAN_EXPECT_EMPTY=1` to assert zero rows,
@@ -170,9 +173,11 @@ ruff check .
 ruff format --check .
 ```
 
-60 offline tests pass; one local-model integration test is opt-in. Offline tests cover
+61 offline tests pass; one local-model integration test is opt-in. Offline tests cover
 provider faults, cursor/cache behavior, redaction, namespace identity, real dlt/SQLite
 replacement, interrupted load recovery and actual Cognee staging/read-back.
+The two-runtime regression verifies distinct real dlt working directories, isolated
+cached documents/pending loads, and preserved state when returning to the same runtime.
 
 ```sh
 # Configure local models first. Run in its own process.

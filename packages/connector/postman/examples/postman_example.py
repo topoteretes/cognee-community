@@ -6,7 +6,7 @@ import os
 import stat
 from pathlib import Path
 
-from local_runtime import configure_runtime
+from local_runtime import configure_pipeline, configure_runtime
 from verify_stores import assert_stores, inspect_stores
 
 CONFIG = Path.home() / ".config/cognee-postman-4711/credentials.json"
@@ -30,7 +30,7 @@ async def main():
         raise RuntimeError(
             "Set POSTMAN_COLLECTION_UIDS to the synthetic collection UID(s) to ingest."
         )
-    configure_runtime()
+    runtime = configure_runtime()
     import cognee
 
     from cognee_community_connector_postman import postman_source
@@ -46,6 +46,7 @@ async def main():
         confirmed_deleted=optional_list("POSTMAN_CONFIRMED_DELETED_UIDS") or [],
         missing_collection_policy="mirror_visibility",
     )
+    configure_pipeline(source, dataset, runtime)
     await cognee.add(
         source,
         dataset_name=dataset,

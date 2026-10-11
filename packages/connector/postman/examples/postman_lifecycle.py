@@ -11,7 +11,7 @@ import uuid
 from pathlib import Path
 
 import httpx
-from local_runtime import configure_runtime
+from local_runtime import configure_pipeline, configure_runtime
 from postman_example import load_config
 from verify_stores import assert_stores, inspect_stores
 
@@ -70,6 +70,7 @@ async def main():
             collection_ids=selection,
             missing_collection_policy="mirror_visibility",
         )
+        configure_pipeline(source, dataset, runtime)
         await cognee.add(
             source,
             dataset_name=dataset,

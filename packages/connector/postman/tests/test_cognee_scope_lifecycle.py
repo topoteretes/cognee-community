@@ -13,11 +13,11 @@ import pytest
 )
 def test_forgetting_one_corpus_preserves_other_populated_corpus(tmp_path, monkeypatch):
     monkeypatch.syspath_prepend(str(Path(__file__).parents[1] / "examples"))
-    from local_runtime import configure_runtime
+    from local_runtime import configure_pipeline, configure_runtime
     from test_postman import FakeClient
     from verify_stores import assert_stores, inspect_stores
 
-    configure_runtime(tmp_path / "cognee")
+    runtime = configure_runtime(tmp_path / "cognee")
     import cognee
 
     from cognee_community_connector_postman import postman_source
@@ -39,6 +39,7 @@ def test_forgetting_one_corpus_preserves_other_populated_corpus(tmp_path, monkey
             collection_ids=["1-c"],
             missing_collection_policy="mirror_visibility",
         )
+        configure_pipeline(src, dataset, runtime)
         await cognee.add(
             src,
             dataset_name=dataset,
