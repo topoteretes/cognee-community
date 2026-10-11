@@ -39,7 +39,7 @@ await cognee.remember(
     ),
     dataset_name="basecamp",
     write_disposition="merge",  # required, see below
-    max_rows_per_table=0,  # cognee reads only 50 rows per table by default
+    max_rows_per_table=0,  # 0 = no row cap, as in cognee's Notion example
 )
 
 print(await cognee.recall("Which to-dos are still open?", datasets=["basecamp"]))

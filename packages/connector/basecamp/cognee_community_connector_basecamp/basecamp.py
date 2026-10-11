@@ -10,7 +10,7 @@ cognee, incrementally and with forget-on-delete::
         basecamp_source(account_id="1234567"),
         dataset_name="basecamp",
         write_disposition="merge",  # required: remember() defaults to "replace"
-        max_rows_per_table=0,       # 0 = no row cap (the default reads only 50)
+        max_rows_per_table=0,       # 0 = no row cap, as in cognee's Notion example
     )
 
 Design

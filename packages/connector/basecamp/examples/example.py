@@ -52,7 +52,7 @@ async def main() -> None:
         # remember() defaults to "replace"; merge is what makes incremental sync
         # and the _deleted tombstones work.
         write_disposition="merge",
-        # cognee reads only 50 rows per table by default.
+        # 0 = no row cap, as in cognee's Notion example.
         max_rows_per_table=0,
     )
 
@@ -62,7 +62,8 @@ async def main() -> None:
     ):
         print(f"\nQ: {question}")
         for item in await cognee.recall(question, datasets=[DATASET_NAME]):
-            print(f"A: {item}")
+            text = item.get("text") if isinstance(item, dict) else getattr(item, "text", item)
+            print(f"A: {text}")
 
 
 if __name__ == "__main__":
