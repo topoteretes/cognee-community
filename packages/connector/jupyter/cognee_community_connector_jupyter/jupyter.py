@@ -13,10 +13,10 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 # dlt resource / table names
 JUPYTER_TABLE_NAME = "jupyter_notebooks"
@@ -46,7 +46,8 @@ def redact_sensitive_data(text: str) -> str:
         return ""
     result = text
     for pattern in _SECRET_PATTERNS:
-        result = pattern.sub(r"\1[REDACTED]\2" if r"\2" in pattern.pattern else "[REDACTED]", result)
+        replacement = r"\1[REDACTED]\2" if r"\2" in pattern.pattern else "[REDACTED]"
+        result = pattern.sub(replacement, result)
     return result
 
 
@@ -138,7 +139,7 @@ def parse_notebook_content(
     title = fallback_title
     sections: list[str] = []
 
-    for idx, cell in enumerate(cells):
+    for cell in cells:
         if not isinstance(cell, dict):
             continue
 
@@ -249,12 +250,12 @@ def jupyter_source(
         files = _find_notebook_files(notebook_paths, workspace_dir)
         for file_path in files:
             try:
-                with open(file_path, "r", encoding="utf-8") as fp:
+                with open(file_path, encoding="utf-8") as fp:
                     content_text = fp.read()
             except (UnicodeDecodeError, OSError):
                 # Retry with latin-1 or skip corrupt read
                 try:
-                    with open(file_path, "r", encoding="latin-1") as fp:
+                    with open(file_path, encoding="latin-1") as fp:
                         content_text = fp.read()
                 except Exception:
                     continue

@@ -37,13 +37,14 @@ from pathlib import Path
 import cognee
 from cognee_community_connector_jupyter import jupyter_source
 
+
 async def main():
     # 1. Point to your notebooks directory or specific list of files
     source = jupyter_source(
         workspace_dir="./notebooks",
-        include_outputs=True,       # Ingest text outputs and stdout
-        max_output_chars=2000,      # Prevent output explosion
-        redact_secrets=True,        # Scrub credentials and tokens
+        include_outputs=True,  # Ingest text outputs and stdout
+        max_output_chars=2000,  # Prevent output explosion
+        redact_secrets=True,  # Scrub credentials and tokens
     )
 
     # 2. Add to Cognee memory and build the graph
@@ -54,6 +55,7 @@ async def main():
     results = await cognee.search("What were the key findings in customer churn analysis?")
     for result in results:
         print(result)
+
 
 if __name__ == "__main__":
     asyncio.run(main())

@@ -2,13 +2,13 @@
 
 import json
 from pathlib import Path
-import pytest
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from cognee_community_connector_jupyter.jupyter import (
     DOCUMENT_SOURCE_ATTR,
     JUPYTER_SOURCE_NAME,
-    JUPYTER_TABLE_NAME,
     _find_notebook_files,
     jupyter_source,
 )
@@ -58,9 +58,11 @@ def test_find_notebook_files_deduplication(tmp_path: Path):
 
 
 def test_jupyter_source_requires_dlt_error():
-    with patch.dict("sys.modules", {"dlt": None}):
-        with pytest.raises(ImportError, match="The Jupyter connector requires dlt"):
-            jupyter_source()
+    with (
+        patch.dict("sys.modules", {"dlt": None}),
+        pytest.raises(ImportError, match="The Jupyter connector requires dlt"),
+    ):
+        jupyter_source()
 
 
 def test_jupyter_source_decorations(tmp_path: Path):
@@ -79,8 +81,15 @@ def test_notebook_row_generation(tmp_path: Path):
     nb_content = {
         "nbformat": 4,
         "cells": [
-            {"cell_type": "markdown", "source": "# Exploratory Data Analysis\nThis is a walkthrough."},
-            {"cell_type": "code", "source": "df.head()", "outputs": [{"output_type": "stream", "text": "col1 col2\n1 2\n"}]},
+            {
+                "cell_type": "markdown",
+                "source": "# Exploratory Data Analysis\nThis is a walkthrough.",
+            },
+            {
+                "cell_type": "code",
+                "source": "df.head()",
+                "outputs": [{"output_type": "stream", "text": "col1 col2\n1 2\n"}],
+            },
         ],
     }
     nb_file.write_text(json.dumps(nb_content), encoding="utf-8")
@@ -88,9 +97,10 @@ def test_notebook_row_generation(tmp_path: Path):
     # Verify discovery and generator
     files = _find_notebook_files(workspace_dir=tmp_path)
     assert len(files) == 1
-    
+
     # Check parsing output directly
     from cognee_community_connector_jupyter.jupyter import parse_notebook_content
+
     title, content = parse_notebook_content(nb_file.read_text(encoding="utf-8"))
     assert title == "Exploratory Data Analysis"
     assert "df.head()" in content

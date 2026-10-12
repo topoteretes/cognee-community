@@ -1,6 +1,5 @@
 """Unit tests for secret scrubbing and redaction."""
 
-import pytest
 from cognee_community_connector_jupyter.jupyter import redact_sensitive_data
 
 
@@ -41,4 +40,7 @@ def test_redact_openai_key():
 
 def test_redact_empty_or_clean_text():
     assert redact_sensitive_data("") == ""
-    assert redact_sensitive_data("Clean python code: def add(a, b): return a + b") == "Clean python code: def add(a, b): return a + b"
+    assert (
+        redact_sensitive_data("Clean python code: def add(a, b): return a + b")
+        == "Clean python code: def add(a, b): return a + b"
+    )

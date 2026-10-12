@@ -1,6 +1,7 @@
 """Unit tests for Jupyter notebook parser."""
 
 import pytest
+
 from cognee_community_connector_jupyter.jupyter import (
     _clean_source,
     _render_outputs,
@@ -74,7 +75,10 @@ def test_parse_notebook_simple_markdown_and_code():
         "nbformat": 4,
         "metadata": {"language_info": {"name": "python"}},
         "cells": [
-            {"cell_type": "markdown", "source": "# My Data Science Analysis\nHere is an explanation."},
+            {
+                "cell_type": "markdown",
+                "source": "# My Data Science Analysis\nHere is an explanation.",
+            },
             {"cell_type": "code", "source": "x = 10\nprint(x)", "outputs": []},
         ],
     }
@@ -112,7 +116,7 @@ def test_parse_notebook_with_outputs_enabled():
             }
         ],
     }
-    title, content = parse_notebook_content(nb, include_outputs=True)
+    _title, content = parse_notebook_content(nb, include_outputs=True)
     assert "```output" in content
     assert "[stdout]\nhello" in content
 
@@ -128,7 +132,7 @@ def test_parse_notebook_with_outputs_disabled():
             }
         ],
     }
-    title, content = parse_notebook_content(nb, include_outputs=False)
+    _title, content = parse_notebook_content(nb, include_outputs=False)
     assert "```output" not in content
     assert "[stdout]" not in content
 
@@ -160,4 +164,4 @@ def test_parse_notebook_empty_cells():
 
 def test_parse_notebook_invalid_input():
     with pytest.raises(ValueError, match="notebook_json must be a JSON string or dict"):
-        parse_notebook_content(12345)  # type: ignore
+        parse_notebook_content(12345)  # type: ignore[arg-type]

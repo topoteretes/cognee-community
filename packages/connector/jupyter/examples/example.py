@@ -1,6 +1,7 @@
 """Example usage of cognee-community-connector-jupyter.
 
-Ingests local Jupyter notebooks into Cognee and performs semantic GraphRAG search over analysis notes, code, and execution outputs.
+Ingests local Jupyter notebooks into Cognee and performs semantic GraphRAG search
+over analysis notes, code, and execution outputs.
 """
 
 import asyncio
@@ -8,6 +9,7 @@ from pathlib import Path
 
 try:
     import cognee
+
     from cognee_community_connector_jupyter import jupyter_source
 except ImportError as exc:
     raise SystemExit(
@@ -31,7 +33,7 @@ async def main():
   "cells": [
     {
       "cell_type": "markdown",
-      "source": "# Customer Churn Exploratory Analysis\\nWe analyzed customer tenure vs churn rates using Random Forest."
+      "source": "# Customer Churn Exploratory Analysis\\nTenure vs churn rates using Random Forest."
     },
     {
       "cell_type": "code",
