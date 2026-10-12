@@ -3,6 +3,7 @@
 import copy
 import hashlib
 import json
+import logging
 import os
 import re
 import time
@@ -19,6 +20,7 @@ if TYPE_CHECKING:
 # Bump when allowlisted rendering or identity semantics change, so old cached
 # rows cannot indefinitely bypass a new rendering policy on an unchanged tree.
 _RENDER_VERSION = 3
+_LOGGER = logging.getLogger(__name__)
 
 
 class DocumentRow(TypedDict):
@@ -329,6 +331,7 @@ def build_snapshot(
     page_size: int = 100,
     max_pages: int = 100,
     redact_values: Iterable[str] = (),
+    force_refresh: bool = False,
 ) -> tuple[list[DocumentRow], dict[str, Any]]:
     """Build privately, validating before yielding or modifying durable dlt state."""
 
@@ -366,17 +369,21 @@ def build_snapshot(
             "Confirm deletion/removal explicitly before sync."
         )
     fresh = {}
+    fetched = reused = 0
     for uid in sorted(selected & set(inventory)):
         entry = inventory[uid]
         old = cached.get(uid)
         if (
-            old
+            not force_refresh
+            and old
             and old["updatedAt"] == entry["updatedAt"]
             and old.get("render_policy") == render_policy
         ):
             fresh[uid] = old
+            reused += 1
             continue
         collection = client.get(f"/collections/{quote(uid, safe='')}").get("collection")
+        fetched += 1
         fresh[uid] = {
             "updatedAt": entry["updatedAt"],
             "render_policy": render_policy,
@@ -392,6 +399,14 @@ def build_snapshot(
     removed = (acknowledged | (missing & allowed)) - set(inventory)
     if removed:
         next_state["removed_collections"] = sorted(removed)
+    _LOGGER.info(
+        "Postman snapshot prepared: selected=%d fetched=%d reused=%d documents=%d; "
+        "Cognee ingestion and cleanup are not yet verified.",
+        len(selected),
+        fetched,
+        reused,
+        len(rows),
+    )
     return rows, next_state
 
 
@@ -430,6 +445,7 @@ def postman_source(
     max_pages: int = 100,
     client: PostmanReader | None = None,
     redact_values: Iterable[str] = (),
+    force_refresh: bool = False,
 ) -> "DltSource":
     """Return a scoped dlt source for foreground Cognee replace ingestion.
 
@@ -462,6 +478,8 @@ def postman_source(
         _validate_api_key(api_key)
     if missing_collection_policy not in {"require_confirmation", "mirror_visibility"}:
         raise ValueError("Unknown missing_collection_policy.")
+    if type(force_refresh) is not bool:
+        raise ValueError("force_refresh must be a boolean.")
     selection = (
         None if collection_ids is None else _validate_selection(collection_ids, "collection_ids")
     )
@@ -501,6 +519,7 @@ def postman_source(
                 page_size=page_size,
                 max_pages=max_pages,
                 redact_values=(*redact_values, api_key or ""),
+                force_refresh=force_refresh,
             )
             # Empty list + explicit columns creates a zero-row replacement table.
             # The whole cache is re-emitted on rerun, including downstream retries.

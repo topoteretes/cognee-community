@@ -329,6 +329,12 @@ def test_real_dlt_sqlite_lifecycle_empty_replace_and_replay(tmp_path):
     assert not any(path.startswith("/collections/") for path, _ in client.calls)
     with pipeline.sql_client() as sql:
         assert sql.execute_sql(f'SELECT id, content FROM "{name}" ORDER BY id') == rows
+    client.tree["info"]["description"] = "Timestamp-independent refreshed docs"
+    assert run(force_refresh=True) == name
+    with pipeline.sql_client() as sql:
+        refreshed = sql.execute_sql(f'SELECT id, content FROM "{name}" ORDER BY id')
+    assert [row[0] for row in refreshed] == [row[0] for row in rows]
+    assert all("Timestamp-independent refreshed docs" in row[1] for row in refreshed)
     client.tree["item"] = []
     client.inventory["1-c"]["updatedAt"] = "empty"
     run()
@@ -662,3 +668,61 @@ def test_real_dlt_reappearance_clears_removal_acknowledgement(tmp_path):
     with pytest.raises(PipelineStepFailed):
         pipeline.run(source(client, collection_ids=["1-c"]))
     assert pipeline.state["sources"] == saved["sources"]
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "collection_name",
+        "collection_description",
+        "folder_name",
+        "folder_description",
+        "item_name",
+        "item_description",
+        "request_description",
+        "method",
+    ],
+)
+def test_rendered_dependencies_and_timestamp_refresh(field):
+    client = FakeClient()
+    item = client.tree["item"][0]
+    folder = {"name": "Original folder", "description": "Original folder docs", "item": [item]}
+    client.tree["item"] = [folder]
+    rows, state = snapshot(client)
+    target, key = {
+        "collection_name": (client.tree["info"], "name"),
+        "collection_description": (client.tree["info"], "description"),
+        "folder_name": (folder, "name"),
+        "folder_description": (folder, "description"),
+        "item_name": (item, "name"),
+        "item_description": (item, "description"),
+        "request_description": (item["request"], "description"),
+        "method": (item["request"], "method"),
+    }[field]
+    target[key] = "PATCH" if field == "method" else "Updated dependency"
+    # No timestamp signal: default reuse is intentional, full refresh reconciles it.
+    unchanged, _ = snapshot(client, state)
+    assert unchanged == rows
+    refreshed, _ = snapshot(client, state, force_refresh=True)
+    assert refreshed != rows
+    assert refreshed[0]["id"] == rows[0]["id"]
+    client.inventory["1-c"]["updatedAt"] = "advanced"
+    changed, _ = snapshot(client, state)
+    assert changed == refreshed
+
+
+def test_snapshot_statistics_are_counts_only_and_not_cleanup_receipts(caplog):
+    caplog.set_level("INFO", logger="cognee_community_connector_postman.postman")
+    client = FakeClient()
+    _, state = snapshot(client)
+    assert "selected=1 fetched=1 reused=0 documents=2" in caplog.text
+    assert "Cognee ingestion and cleanup are not yet verified" in caplog.text
+    caplog.clear()
+    snapshot(client, state)
+    assert "selected=1 fetched=0 reused=1 documents=2" in caplog.text
+    assert "1-c" not in caplog.text
+    caplog.clear()
+    client.inventory = {}
+    with pytest.raises(PostmanSyncError):
+        snapshot(client, state)
+    assert "snapshot prepared" not in caplog.text

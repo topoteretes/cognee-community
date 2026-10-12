@@ -84,6 +84,23 @@ Explicit columns produce a zero-row replacement after the final request disappea
 No-change reruns replay the full corpus after downstream ingestion/cleanup failures.
 Keep dlt's pipeline directory persistent; do not run the same namespace concurrently.
 
+All rendered collection, folder and request names/descriptions, plus request methods,
+come from the fetched collection tree; no external display-label lookup is cached.
+Invalidation relies on inventory `updatedAt`, rendering version and redaction policy.
+If tree content changes without a timestamp change, ordinary sync reuses the prior
+snapshot. Pass `force_refresh=True` to `postman_source` to fetch every visible selected
+tree in the same scope and reconcile such changes. This preserves document identities,
+complete replacement, inventory validation and disappearance policy. It is not an
+atomic provider snapshot; edits without timestamp signals during a fetch cannot be
+excluded. Offline regressions cover each rendered dependency with advanced timestamps
+and with unchanged timestamps plus forced refresh.
+
+The module's INFO logger reports only selected/fetched/reused collection counts and
+prepared document counts after snapshot validation. Configure Python logging to see
+these statistics. They describe extraction preparation, not successful dlt loading,
+Cognee ingestion or deletion cleanup; use the store verifier for those outcomes.
+
+
 Inventory must have valid paging metadata, unique UIDs, complete totals and cursors.
 Two consecutive equal inventories converge within three attempts. Workspace access
 is checked before/after and inventory is rechecked after tree fetching. API errors,
@@ -173,7 +190,7 @@ ruff check .
 ruff format --check .
 ```
 
-61 offline tests pass; one local-model integration test is opt-in. Offline tests cover
+70 offline tests pass; one local-model integration test is opt-in. Offline tests cover
 provider faults, cursor/cache behavior, redaction, namespace identity, real dlt/SQLite
 replacement, interrupted load recovery and actual Cognee staging/read-back.
 The two-runtime regression verifies distinct real dlt working directories, isolated
@@ -189,6 +206,19 @@ one, verifies the other in Data/graph/vectors/search, then verifies complete cle
 A clean Python 3.12 installation from PyPI with Cognee 1.6.3 passed the offline suite,
 installed-wheel authenticated lifecycle and this scope test. Prior exact-release tests
 also injected ingestion and cleanup failures, then proved unchanged retry recovery.
+Validation receipts are distinct: the original installed-wheel authenticated lifecycle
+used small owned fixtures; later offline reruns use fake provider responses, and the
+separate local-model scope test uses real Cognee stores with a fake provider. The
+12 October follow-up reran the offline suite, local-model scope test, Ruff and wheel
+build; it did not repeat authenticated provider writes. The new forced-refresh and
+statistics behavior is covered offline, not by a new live-account lifecycle.
+
+Large collection trees have a depth limit but no configurable response-byte/document
+budget. State and replacement snapshots are materialized in memory; callers with very
+large workspaces should select smaller collection sets. Adding budgets would require
+fail-closed behavior and streaming response handling, not truncating a replacement
+snapshot. This is deferred hardening, not a verified defect in the tested fixtures.
+
 Small synthetic fixtures establish these behaviors; no full Python-version/backend
 matrix, every concurrent edit pattern or mid-transaction crash is claimed.
 
