@@ -124,8 +124,19 @@ class FakeIntercomSession:
             return self._cursor_page(items, "data", (params or {}).get("starting_after"))
         if method == "GET" and path.startswith("/contacts/") and path.endswith("/notes"):
             notes = self.contacts[path.split("/")[2]]["notes"]
-            return self._cursor_page(notes, "data", (params or {}).get("starting_after"))
+            return self._numbered_page(notes, path, params or {})
         raise AssertionError(f"unexpected request {method} {path}")
+
+    def _numbered_page(self, items, path, params):
+        # Shape copied from the live API: a contact's notes use numbered pages
+        # whose ``pages.next`` is a URL string, not a ``starting_after`` cursor.
+        page = params.get("page", 1)
+        chunk = items[(page - 1) * self.page_size : page * self.page_size]
+        total_pages = max(1, -(-len(items) // self.page_size))
+        pages = {"page": page, "per_page": self.page_size, "total_pages": total_pages}
+        if page < total_pages:
+            pages["next"] = f"{BASE}{path}?per_page={self.page_size}&page={page + 1}"
+        return FakeResponse(200, {"type": "list", "data": chunk, "pages": pages})
 
     def _cursor_page(self, items, key, starting_after):
         start = 0
@@ -231,22 +242,42 @@ def test_source_requires_something_to_sync():
 # ---------------------------------------------------------------------------
 
 
-def test_cursor_pages_follows_starting_after():
+def test_paginate_follows_starting_after():
     session = FakeIntercomSession(conversations=[_conversation(f"c{i}", 1) for i in range(5)])
     api = IntercomAPI(session, BASE)
 
-    ids = [item["id"] for item in api.cursor_pages("GET", "/conversations", "conversations")]
+    ids = [item["id"] for item in api.paginate("GET", "/conversations", "conversations")]
 
     assert ids == ["c0", "c1", "c2", "c3", "c4"]
     assert [call[2].get("starting_after") for call in session.calls] == [None, "c1", "c3"]
 
 
-def test_cursor_pages_stops_on_repeated_cursor():
+def test_paginate_stops_on_repeated_cursor():
     session = FakeIntercomSession()
     stuck = FakeResponse(200, {"data": [{"id": "x"}], "pages": {"next": {"starting_after": "x"}}})
     session.scripted = [stuck, stuck]
-    ids = [i["id"] for i in IntercomAPI(session, BASE).cursor_pages("GET", "/contacts", "data")]
+    ids = [i["id"] for i in IntercomAPI(session, BASE).paginate("GET", "/contacts", "data")]
     assert ids == ["x", "x"]  # second identical cursor ends the loop instead of spinning
+
+
+def test_paginate_follows_numbered_pages():
+    notes = [{"id": f"n{i}", "created_at": 1, "body": "x"} for i in range(5)]
+    session = FakeIntercomSession(contacts={"u1": {"name": "Asha", "notes": notes}})
+
+    ids = [
+        n["id"] for n in IntercomAPI(session, BASE).paginate("GET", "/contacts/u1/notes", "data")
+    ]
+
+    assert ids == ["n0", "n1", "n2", "n3", "n4"]  # all three pages, not just the first
+    assert [call[2].get("page") for call in session.calls] == [None, 2, 3]
+
+
+def test_paginate_stops_on_an_empty_numbered_page():
+    session = FakeIntercomSession()
+    empty = FakeResponse(200, {"data": [], "pages": {"next": f"{BASE}/x?page=2", "page": 1}})
+    session.scripted = [empty]
+    assert list(IntercomAPI(session, BASE).paginate("GET", "/x", "data")) == []
+    assert len(session.calls) == 1
 
 
 def test_rate_limit_is_retried_after_the_advertised_delay(_no_sleep):
@@ -394,9 +425,6 @@ def test_contact_notes_are_opt_in_and_tombstoned():
         "u2": {"name": "", "notes": [{"id": "n2", "created_at": 1, "body": "Churn risk"}]},
     }
     session = FakeIntercomSession(contacts=contacts)
-    assert "intercom_contact_notes" not in intercom_source(session=session).resources
-    opted_in = intercom_source(session=session, include_contact_notes=True)
-    assert "intercom_contact_notes" in opted_in.resources
 
     state = {}
     rows = list(sync_contact_notes(IntercomAPI(session, BASE), state))
@@ -462,6 +490,42 @@ def test_edit_is_reflected_on_resync(dlt_mod, tmp_path):
     conversations = _read(pipeline, "intercom_conversations")
     assert "Refund sent." in conversations["c2"]
     assert set(conversations) == {"c1", "c2"}  # unchanged c1 survives the merge
+
+
+def _run(dlt, tmp_path, session, **kwargs):
+    db_path = (tmp_path / "intercom.db").as_posix()
+    pipeline = dlt.pipeline(
+        pipeline_name="intercom_test",
+        destination=dlt.destinations.sqlalchemy(f"sqlite:///{db_path}"),
+        dataset_name="intercom_ds",
+        pipelines_dir=str(tmp_path / "state"),
+    )
+    source = intercom_source(session=session, **kwargs)
+    pipeline.run(source, write_disposition="merge", primary_key="id")
+    return pipeline
+
+
+def test_contact_notes_are_not_fetched_unless_enabled(dlt_mod, tmp_path):
+    session = _workspace()
+    session.contacts = {
+        "u1": {"name": "Asha", "notes": [{"id": "n1", "created_at": 1, "body": "VIP"}]}
+    }
+    _run(dlt_mod, tmp_path, session)
+    assert not any(call[1].startswith("/contacts") for call in session.calls)
+
+
+def test_switching_a_content_type_off_forgets_it(dlt_mod, tmp_path):
+    session = _workspace()
+    session.contacts = {
+        "u1": {"name": "Asha", "notes": [{"id": "n1", "created_at": 1, "body": "VIP"}]}
+    }
+    pipeline = _run(dlt_mod, tmp_path, session, include_contact_notes=True)
+    assert set(_read(pipeline, "intercom_contact_notes")) == {"n1"}
+
+    pipeline = _run(dlt_mod, tmp_path, session)  # contact notes switched off again
+
+    assert _read(pipeline, "intercom_contact_notes") == {}
+    assert set(_read(pipeline, "intercom_conversations")) == {"c1", "c2"}  # others untouched
 
 
 def test_deleted_conversation_and_unpublished_article_are_removed(dlt_mod, tmp_path):

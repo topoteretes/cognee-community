@@ -158,7 +158,11 @@ def intercom_source(
         columns=_TOMBSTONE_COLUMNS,
     )
     def intercom_conversations():
-        yield from sync_conversations(api, dlt.current.resource_state())
+        state = dlt.current.resource_state()
+        if include_conversations:
+            yield from sync_conversations(api, state)
+        else:
+            yield from forget_all(state)
 
     @dlt.resource(
         name=ARTICLES_TABLE_NAME,
@@ -167,7 +171,11 @@ def intercom_source(
         columns=_TOMBSTONE_COLUMNS,
     )
     def intercom_articles():
-        yield from sync_articles(api, include_draft_articles, dlt.current.resource_state())
+        state = dlt.current.resource_state()
+        if include_articles:
+            yield from sync_articles(api, include_draft_articles, state)
+        else:
+            yield from forget_all(state)
 
     @dlt.resource(
         name=CONTACT_NOTES_TABLE_NAME,
@@ -176,23 +184,21 @@ def intercom_source(
         columns=_TOMBSTONE_COLUMNS,
     )
     def intercom_contact_notes():
-        yield from sync_contact_notes(api, dlt.current.resource_state())
+        state = dlt.current.resource_state()
+        if include_contact_notes:
+            yield from sync_contact_notes(api, state)
+        else:
+            yield from forget_all(state)
 
-    selected = [
-        resource
-        for resource, enabled in (
-            (intercom_conversations, include_conversations),
-            (intercom_articles, include_articles),
-            (intercom_contact_notes, include_contact_notes),
-        )
-        if enabled
-    ]
-    if not selected:
+    if not (include_conversations or include_articles or include_contact_notes):
         raise ValueError("Nothing to sync: enable conversations, articles or contact notes.")
 
     @dlt.source(name=INTERCOM_SOURCE_NAME)
     def _intercom():
-        return selected
+        # All three resources always run: a disabled one only tombstones what it
+        # synced before, so switching content off forgets it instead of leaving
+        # stale documents in memory.
+        return [intercom_conversations, intercom_articles, intercom_contact_notes]
 
     source = _intercom()
     # Opt into the document ingestion path (row → text document → cognify).
@@ -264,11 +270,17 @@ class IntercomAPI:
             time.sleep(delay)
             attempt += 1
 
-    def cursor_pages(
+    def paginate(
         self, method: str, path: str, key: str, body: dict | None = None
     ) -> Iterator[dict]:
-        """Yield the items under ``key`` across ``starting_after`` cursor pagination."""
+        """Yield the items under ``key`` across every page of an Intercom list.
+
+        Intercom uses two pagination styles: cursor pages, where ``pages.next`` is
+        an object with ``starting_after`` (conversations, contacts, search), and
+        numbered pages, where ``pages.next`` is a URL (a contact's notes).
+        """
         starting_after = None
+        page_number = 1
         while True:
             if method == "POST":
                 pagination: dict[str, Any] = {"per_page": _PAGE_SIZE}
@@ -279,14 +291,26 @@ class IntercomAPI:
                 params: dict[str, Any] = {"per_page": _PAGE_SIZE}
                 if starting_after:
                     params["starting_after"] = starting_after
+                if page_number > 1:
+                    params["page"] = page_number
                 page = self.request("GET", path, params=params)
-            yield from page.get(key) or []
-            next_page = (page.get("pages") or {}).get("next")
-            cursor = next_page.get("starting_after") if isinstance(next_page, dict) else None
-            # Stop on the last page, or if the API repeats a cursor (no infinite loop).
-            if not cursor or cursor == starting_after:
+            items = page.get(key) or []
+            yield from items
+            pages = page.get("pages") or {}
+            next_page = pages.get("next")
+            if isinstance(next_page, dict):
+                cursor = next_page.get("starting_after")
+                # Stop on the last page, or if the API repeats a cursor (no infinite loop).
+                if not cursor or cursor == starting_after:
+                    return
+                starting_after = cursor
+                continue
+            total_pages = pages.get("total_pages")
+            # Numbered pages: stop when there is no next page, the last page is
+            # reached, or a page comes back empty (no infinite loop).
+            if not next_page or not items or (total_pages and page_number >= total_pages):
                 return
-            starting_after = cursor
+            page_number += 1
 
 
 def _retry_delay(headers: Any, attempt: int) -> float:
@@ -307,6 +331,16 @@ def _retry_delay(headers: Any, attempt: int) -> float:
     return min(2.0**attempt, _MAX_RETRY_DELAY_SECONDS)
 
 
+def forget_all(state: dict) -> Iterator[dict]:
+    """Tombstone every id a now-disabled resource synced before, then reset it."""
+    known_ids = state.get("known_ids", [])
+    for doc_id in sorted(known_ids):
+        yield {"id": doc_id, "_deleted": True}
+    if known_ids:
+        logger.info("Intercom: content type disabled; forgetting %d document(s).", len(known_ids))
+    state.clear()
+
+
 # ---------------------------------------------------------------------------
 # Conversations
 # ---------------------------------------------------------------------------
@@ -321,7 +355,7 @@ def sync_conversations(api: IntercomAPI, state: dict) -> Iterator[dict]:
 
     known_ids = set(state.get("known_ids", []))
     current_ids = {
-        str(item["id"]) for item in api.cursor_pages("GET", "/conversations", "conversations")
+        str(item["id"]) for item in api.paginate("GET", "/conversations", "conversations")
     }
 
     cursor = state.get("cursor")
@@ -330,7 +364,7 @@ def sync_conversations(api: IntercomAPI, state: dict) -> Iterator[dict]:
 
     newest = cursor
     fetched_ids: set[str] = set()
-    for summary in api.cursor_pages("POST", "/conversations/search", "conversations", query):
+    for summary in api.paginate("POST", "/conversations/search", "conversations", query):
         conversation_id = str(summary["id"])
         try:
             conversation = api.request(
@@ -470,8 +504,8 @@ def sync_contact_notes(api: IntercomAPI, state: dict) -> Iterator[dict]:
     known_ids = set(state.get("known_ids", []))
     current_ids: set[str] = set()
 
-    for contact in api.cursor_pages("GET", "/contacts", "data"):
-        for note in api.cursor_pages("GET", f"/contacts/{contact['id']}/notes", "data"):
+    for contact in api.paginate("GET", "/contacts", "data"):
+        for note in api.paginate("GET", f"/contacts/{contact['id']}/notes", "data"):
             row = contact_note_to_row(note, contact)
             current_ids.add(row["id"])
             yield row

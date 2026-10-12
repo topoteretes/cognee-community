@@ -88,6 +88,9 @@ deletions are emitted as `_deleted` tombstone rows; both only work under `merge`
   exist now and tombstones the ones that disappeared since the last run, and cognee's
   orphan cleanup forgets them. That covers deleted conversations, deleted or
   unpublished articles, and deleted contact notes.
+- **Turning content off.** If you switch off a content type you synced before (for
+  example `include_contact_notes`), its documents are tombstoned and forgotten on the
+  next sync rather than left in memory.
 - **Failures.** Rate limits (429) and server errors are retried, honouring
   `Retry-After` / `X-RateLimit-Reset`. Any other failed request aborts the run, so a
   broken listing never looks like a deletion.
