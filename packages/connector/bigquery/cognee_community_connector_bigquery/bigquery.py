@@ -450,7 +450,13 @@ def _sync_table_rows(
     newest: Any = None
     fetched_keys: set[str] = set()
     changed = 0
+    skipped = 0
     for row in _run_query(client, sql, params, maximum_bytes_billed):
+        if row[spec.key_column] is None:
+            # A NULL key can't identify a document: several such rows would
+            # collapse into one id and the deletion sweep couldn't track them.
+            skipped += 1
+            continue
         key = str(row[spec.key_column])
         fetched_keys.add(key)
         if spec.cursor_column:
@@ -467,10 +473,15 @@ def _sync_table_rows(
         current_keys = {
             str(row[spec.key_column])
             for row in _run_query(client, key_sql, [], maximum_bytes_billed)
+            if row[spec.key_column] is not None
         }
     else:
         current_keys = fetched_keys
 
+    if skipped:
+        logger.warning(
+            "BigQuery: %s — skipped %d row(s) with a NULL %s.", full_id, skipped, spec.key_column
+        )
     deleted = known_keys - current_keys
     for key in sorted(deleted):
         yield {"id": _row_id(full_id, key), "_deleted": True}

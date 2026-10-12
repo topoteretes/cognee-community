@@ -411,6 +411,16 @@ def test_removed_row_sync_forgets_its_rows():
     assert state["tables"] == {}
 
 
+def test_rows_with_a_null_key_are_skipped():
+    client = _orders_client(rows=[_order(1, "new", 1), _order(None, "orphan", 2)])
+    state = {}
+
+    rows = list(sync_rows(client, PROJECT, [ORDERS_SYNC], 10**9, state))
+
+    assert [r["id"] for r in rows] == ["proj.sales.orders:1"]
+    assert state["tables"]["proj.sales.orders"]["keys"] == ["1"]  # no "None" key tracked
+
+
 def test_byte_cap_stops_before_running_the_query():
     client = _orders_client(rows=[_order(1, "new", 1)], bytes_per_query=5_000)
 

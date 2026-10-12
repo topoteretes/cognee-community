@@ -106,7 +106,9 @@ disposition to every table the source produces, and this source deletes by emitt
 
 **Limits:** the row deletion sweep keeps each synced table's keys in dlt state, so row
 sync is meant for tables up to roughly a few hundred thousand rows. Metadata sync has
-no such limit. A row is only picked up incrementally if its `cursor_column` changes
+no such limit. Rows whose `key_column` is NULL are skipped with a warning. Row sync doesn't support tables
+that require a partition filter (`require_partition_filter`), because its full reads and
+key-only deletion query have no partition filter; their metadata still syncs. A row is only picked up incrementally if its `cursor_column` changes
 when the row changes.
 
 ## Testing
