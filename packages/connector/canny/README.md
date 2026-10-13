@@ -8,7 +8,8 @@ It exposes a `dlt` resource you hand to `cognee.remember(...)`. Each post is ing
 
 ## Requirements
 
-cognee **>= 1.4.0** (document-mode: `DOCUMENT_SOURCE_ATTR`).
+cognee **>= 1.4.0** (document-mode: `DOCUMENT_SOURCE_ATTR`). The package pins `cognee==1.4.0`, like the
+other connectors in this repo.
 
 ## Install
 
@@ -65,6 +66,8 @@ connectors:
 * Unchanged posts have the same id and content, so they keep the same content-hash `data_id`
   and are **not re-ingested or re-cognified**. Only new or changed posts (new comment, vote or
   status change, edited text) are processed again.
+* Posts are paged with `skip`. Pages overlap by 10 posts and are de-duplicated by id, so a post
+  deleted during a sync cannot make another post slip between pages and be forgotten by mistake.
 * Any error aborts the run, so a partial read never causes false deletions.
 * `429`/`5xx`/network errors are retried with backoff (honors `Retry-After`). A bad key raises
   `PermissionError`.

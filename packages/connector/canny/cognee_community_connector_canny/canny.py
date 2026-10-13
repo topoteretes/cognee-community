@@ -28,6 +28,9 @@ Design
   stable, so unchanged posts keep the same content-hash ``data_id`` and are not
   re-ingested or re-cognified. Only new or edited posts (new comment, vote count
   change, status change, edited text) are processed again.
+* **Stable paging** - ``posts/list`` pages by ``skip``; consecutive pages overlap
+  and are de-duplicated by id, so a post deleted mid-sync cannot make another
+  post slip between pages (and be forgotten by mistake).
 * **Safe failure** - any error aborts the run instead of skipping a post. Under
   ``replace`` a missing post would be forgotten as if it were deleted, so a
   failed run must leave memory untouched.
@@ -53,6 +56,8 @@ CANNY_POSTS_URL = "https://canny.io/api/v1/posts/list"
 CANNY_COMMENTS_URL = "https://canny.io/api/v2/comments/list"
 
 _PAGE_SIZE = 100
+# Re-read this many posts of the previous page (see _iter_posts).
+_PAGE_OVERLAP = 10
 _MAX_RETRIES = 5
 _TRANSIENT_STATUS = frozenset({429, 500, 502, 503, 504})
 
@@ -100,7 +105,7 @@ def canny_source(
             raise ValueError("Canny API key required: pass api_key= or set CANNY_API_KEY.")
         client = httpx.Client(timeout=60.0)
 
-    boards = list(board_ids) if board_ids else [None]
+    boards = list(dict.fromkeys(board_ids)) if board_ids else [None]
     status_param = ",".join(statuses) if statuses else None
 
     @dlt.resource(name=CANNY_TABLE_NAME, primary_key="id", write_disposition="replace")
@@ -178,8 +183,15 @@ def _retry_after(headers: Any, attempt: int) -> float:
 def _iter_posts(
     client: Any, api_key: str | None, board_id: str | None, statuses: str | None
 ) -> Iterator[dict]:
-    """Yield posts across ``skip`` pagination, oldest first (stable order)."""
+    """Yield posts across ``skip`` pagination, oldest first, each post once.
+
+    ``skip`` paging shifts when a post is deleted mid-sync: every later post moves
+    up one slot, so a plain ``skip += limit`` would silently miss one. Under
+    ``replace`` a missed post is forgotten as if it were deleted, so consecutive
+    pages overlap by ``_PAGE_OVERLAP`` posts and duplicates are dropped by id.
+    """
     skip = 0
+    seen: set[str] = set()
     while True:
         body: dict[str, Any] = {"limit": _PAGE_SIZE, "skip": skip, "sort": "oldest"}
         if board_id:
@@ -188,11 +200,14 @@ def _iter_posts(
             body["status"] = statuses
         payload = _request(client, CANNY_POSTS_URL, api_key, body)
         posts = payload.get("posts") or []
-        yield from posts
-        # Stop on the last page, or on an empty page so we can never loop forever.
-        if not payload.get("hasMore") or not posts:
+        fresh = [p for p in posts if p.get("id") not in seen]
+        seen.update(p.get("id") for p in fresh)
+        yield from fresh
+        # Stop on the last page, or when a page brings nothing new (an API that
+        # ignores ``skip``), so we can never loop forever.
+        if not payload.get("hasMore") or not fresh:
             return
-        skip += len(posts)
+        skip += max(len(posts) - _PAGE_OVERLAP, 1)
 
 
 def _iter_comments(client: Any, api_key: str | None, post_id: str) -> Iterator[dict]:

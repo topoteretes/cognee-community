@@ -132,9 +132,11 @@ def test_row_is_stable_for_same_input():
 
 
 def test_iter_posts_follows_skip_pagination(monkeypatch):
-    monkeypatch.setattr(cn, "_PAGE_SIZE", 2)
-    client = FakeCanny([_post(f"p{i}") for i in range(5)])
-    assert [p["id"] for p in _iter_posts(client, "k", None, None)] == [f"p{i}" for i in range(5)]
+    monkeypatch.setattr(cn, "_PAGE_SIZE", 3)
+    monkeypatch.setattr(cn, "_PAGE_OVERLAP", 1)
+    client = FakeCanny([_post(f"p{i}") for i in range(7)])
+    assert [p["id"] for p in _iter_posts(client, "k", None, None)] == [f"p{i}" for i in range(7)]
+    # each page re-reads the last post of the previous one (overlap), no repeats yielded
     assert [c[1]["skip"] for c in client.calls] == [0, 2, 4]
 
 
@@ -286,3 +288,40 @@ def test_board_filter_is_sent_and_applied(tmp_path):
     client = FakeCanny([_post("p1"), bugs])
     rows = _rows(_run(tmp_path, canny_source(client=client, board_ids=["b2"])))
     assert list(rows) == ["p2"]
+
+
+def test_post_deleted_mid_sync_does_not_drop_another_post(monkeypatch):
+    """skip paging shifts when a post is deleted between page requests."""
+    monkeypatch.setattr(cn, "_PAGE_SIZE", 3)
+    monkeypatch.setattr(cn, "_PAGE_OVERLAP", 1)
+    posts = [_post(f"p{i}") for i in range(7)]
+
+    class ShiftingCanny(FakeCanny):
+        def post(self, url, json=None):
+            response = super().post(url, json)
+            if json["skip"] == 0:
+                self.posts.remove(posts[1])  # deleted right after page 1 was served
+            return response
+
+    client = ShiftingCanny(list(posts))
+    got = [p["id"] for p in _iter_posts(client, "k", None, None)]
+    # p1 was read before it was deleted; nothing after it is lost, nothing repeats.
+    assert got == ["p0", "p1", "p2", "p3", "p4", "p5", "p6"]
+
+
+def test_iter_posts_stops_when_api_ignores_skip():
+    class StuckCanny(FakeCanny):
+        def post(self, url, json=None):
+            self.calls.append((url, dict(json)))
+            return FakeResponse(payload={"posts": [_post("p0"), _post("p1")], "hasMore": True})
+
+    client = StuckCanny([])
+    assert [p["id"] for p in _iter_posts(client, "k", None, None)] == ["p0", "p1"]
+    assert len(client.calls) == 2
+
+
+def test_duplicate_board_ids_do_not_duplicate_posts(tmp_path):
+    client = FakeCanny([_post("p1")])
+    rows = _rows(_run(tmp_path, canny_source(client=client, board_ids=["b1", "b1"])))
+    assert list(rows) == ["p1"]
+    assert sum(url == cn.CANNY_POSTS_URL for url, _ in client.calls) == 1  # board read once
