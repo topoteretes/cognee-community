@@ -1,26 +1,14 @@
 """DLT source for Guru cards (full-snapshot sync + forget-on-delete).
 
-Fetches cards from a Guru workspace and renders their HTML or Markdown bodies
-to text, then yields them as a dlt resource for cognee's ingestion pipeline.
+Cards are ingested as documents (``DOCUMENT_SOURCE_ATTR = "guru"``), so they go
+through cognify like Notion pages. Each run is a full snapshot under
+``write_disposition="replace"``: archived or deleted cards drop out of Guru's
+search results and cognee's ``orphan_cleanup`` forgets them. Unchanged cards
+keep the same content hash, so only edited cards are re-cognified.
 
-Like Notion, Guru cards are *documents*: the source declares
-``cognee_document_source = "guru"``, so ``resolve_dlt_sources`` tags each row
-``external_metadata["source"] = "guru"`` (not ``"dlt"``) and every card flows
-through the standard cognify entity-extraction pipeline rather than the
-deterministic dlt-row schema path.
-
-The source is a full snapshot: ``write_disposition="replace"`` rewrites staging
-with exactly the cards the token can see on each run. Deletions propagate for
-free -- an archived or deleted card drops out of Guru's search results, so it is
-absent from the snapshot and cognee's ``orphan_cleanup`` removes it from the
-graph and vector stores. Unchanged cards keep a stable content-hash ``data_id``,
-so a re-sync only re-cognifies what actually changed.
-
-Scoping is server-side via Guru Query Language (``q``) -- by folder, by
-verification state, or both -- so a scoped sync still sees the complete set of
-cards in that scope and therefore still forgets deletions correctly. A
-last-modified filter is deliberately *not* offered here: under ``replace`` a
-partial snapshot would look like mass deletion upstream.
+Scoping (folder, verification state) is done server-side with Guru Query
+Language, so a scoped sync still sees every card in its scope. There is no
+``lastModified`` filter: under ``replace`` a partial snapshot reads as deletion.
 """
 
 import os
@@ -127,16 +115,8 @@ def guru_source(
 
     @dlt.resource(name=GURU_TABLE_NAME, primary_key="id", write_disposition="replace")
     def guru_cards():
-        # Full-snapshot sync: each run replaces staging with exactly the cards
-        # currently visible to the token. Archived/deleted cards drop out of
-        # Guru's search results, so they fall out of staging and cognee's
-        # orphan_cleanup then forgets them from the graph + vector stores.
-        #
-        # A fetch error is NOT swallowed: staging is authoritative under
-        # replace, so a partial snapshot would forget live cards as if they were
-        # deleted upstream. Letting the error abort leaves staging -- and memory
-        # -- untouched, which is the safe failure. Transient blips are retried in
-        # _request; only a persistent failure reaches here.
+        # Fetch errors are not swallowed: under replace, a partial snapshot
+        # would forget live cards. Aborting leaves memory untouched.
         count = 0
         for card in _paginate(client, params):
             row = _card_to_row(card)
@@ -152,8 +132,7 @@ def guru_source(
         return guru_cards
 
     source = _guru()
-    # Opt into the document ingestion path (card -> text document -> cognify).
-    # resolve_dlt_sources reads this marker; it never imports this connector.
+    # Route cards through cognify as documents, not dlt rows.
     setattr(source, DOCUMENT_SOURCE_ATTR, GURU_SOURCE_NAME)
     return source
 
@@ -164,11 +143,7 @@ def guru_source(
 
 
 class _GuruClient:
-    """Minimal HTTP client for the Guru v1 API.
-
-    Wraps the two things the raw API leaves to the caller: HTTP basic auth and
-    ``Link``-header pagination (``rel="next-page"``).
-    """
+    """Minimal Guru v1 API client: basic auth + ``Link``-header paging."""
 
     def __init__(self, email: str, token: str, timeout: float = 30.0):
         import httpx
@@ -179,15 +154,13 @@ class _GuruClient:
         """Return one page of cards plus the next page's URL, if any."""
         response = _request(self._get, url, params=params)
         cards = response.json()
-        # Under replace, a page that is not a card list must abort the sync
-        # rather than be read as "no cards" and forget everything.
+        # Never read an unexpected body as "no cards": that would forget everything.
         if not isinstance(cards, list):
             raise ValueError(f"Guru: expected a list of cards, got {type(cards).__name__}")
         return cards, response.links.get("next-page", {}).get("url")
 
     def _get(self, url: str, **kwargs):
-        # httpx returns 4xx/5xx responses instead of raising; raise here so
-        # _request can retry 429/5xx and permanent errors abort the sync.
+        # httpx does not raise on 4xx/5xx; raise so _request can retry or abort.
         response = self._client.get(url, **kwargs)
         response.raise_for_status()
         return response
@@ -197,11 +170,7 @@ class _GuruClient:
 
 
 def _build_query(folder_id: str | None, verification_state: str | None) -> str:
-    """Compose a Guru Query Language filter for the requested scope.
-
-    Folders keep Guru's legacy "board" naming: ``boards`` is the documented
-    field name for the folders a card sits in.
-    """
+    """Build a Guru Query Language filter. Folders are still called ``boards``."""
     clauses = []
     if folder_id:
         clauses.append(f'boards CONTAINS ("{folder_id}")')
@@ -211,11 +180,9 @@ def _build_query(folder_id: str | None, verification_state: str | None) -> str:
 
 
 def _search_params(folder_id: str | None, verification_state: str | None) -> dict[str, Any]:
-    """Build the ``/search/query`` parameters for the requested scope.
+    """Build ``/search/query`` params.
 
-    Sorting by creation date, oldest first, keeps the order stable while a sync
-    pages through: an edit mid-sync cannot move a card across a page boundary,
-    and a card created mid-sync lands on the last page.
+    Oldest-first by creation date, so edits during a sync can't reorder pages.
     """
     params: dict[str, Any] = {
         "maxResults": _PAGE_SIZE,
@@ -230,14 +197,7 @@ def _search_params(folder_id: str | None, verification_state: str | None) -> dic
 
 
 def _request(method, *args, **kwargs):
-    """Call the Guru API, retrying rate-limit / transient responses.
-
-    httpx does not retry for us and Guru throttles per workspace, so a large
-    workspace would otherwise 429 and abort the sync. Rate-limit (429), server
-    (5xx), timeout and network errors are retried with backoff, honouring
-    ``Retry-After``; permanent errors (auth, not-found) and exhausted retries
-    propagate so the caller can decide.
-    """
+    """Call the Guru API, retrying 429/5xx/network errors (honours ``Retry-After``)."""
     for attempt in range(_MAX_RETRIES):
         try:
             return method(*args, **kwargs)
@@ -277,13 +237,7 @@ def _retry_after(response, attempt: int) -> float:
 
 
 def _paginate(client, params: dict[str, Any]):
-    """Yield every card, following Guru's ``next-page`` links.
-
-    The next-page URL already carries the query, so it is requested as-is.
-    Guarded against a repeated URL: the header is absent on the last page, so a
-    URL we have already followed means the response is malformed and continuing
-    would loop forever.
-    """
+    """Yield every card, following ``next-page`` URLs as-is; stop on a repeat."""
     url, page_params = _CARDS_PATH, params
     seen: set[str] = set()
     while True:
@@ -296,11 +250,10 @@ def _paginate(client, params: dict[str, Any]):
 
 
 def _card_to_row(card: dict) -> dict:
-    """Flatten a Guru card into a document row.
+    """Flatten a card into a document row.
 
-    Only ``title``/``content`` (+ ``id``/``url`` for identity and provenance)
-    are kept, so a metadata-only edit that bumps ``lastModified`` without
-    changing the text does not churn the content-hash ``data_id``.
+    No volatile fields (e.g. ``lastModified``), so the content hash only changes
+    when the text does.
     """
     return {
         "id": card.get("id"),
@@ -317,11 +270,9 @@ def _card_url(card: dict) -> str | None:
 
 
 def _card_text(card: dict) -> str:
-    """Card body as text, prefixed with the trust and placement context.
+    """Card body as text, prefixed with verification state and placement.
 
-    Verification state is carried into the graph on purpose: an unverified card
-    is stale knowledge, and the only way that signal reaches cognify is as part
-    of the card's text.
+    Verification state goes in the text so cognify can tell stale cards apart.
     """
     header = [line for line in (_trust_line(card), _placement_line(card)) if line]
     body = _html_to_text(card.get("content") or "")
@@ -355,11 +306,7 @@ def _placement_line(card: dict) -> str:
 
 
 def _html_to_text(content: str) -> str:
-    """Flatten a card body to text.
-
-    Guru stores card bodies as HTML or Markdown, so only bodies that actually
-    look like HTML are parsed; anything else is already text and passes through.
-    """
+    """Flatten an HTML card body to text; Markdown passes through."""
     if not _HTML_HINT.search(content):
         return _tidy(content)
 
