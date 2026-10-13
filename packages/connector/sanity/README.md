@@ -49,27 +49,30 @@ source = sanity_source(
 await cognee.add(source)
 ```
 
-## Sync model: full snapshot replace
+## Sync model: merge + _deleted tombstones
 
-This connector uses ``write_disposition="replace"`` — each sync produces the
-complete current set of Sanity documents matching the configured filters.
-Anything dropped from the GROQ query results (unpublished, deleted, filtered
-out) gets cleaned up via cognee's orphan cleanup.
+This connector uses ``write_disposition="merge"`` with a ``_deleted`` boolean column
+(rather than a full-snapshot ``replace``) so incremental syncs are cheap and safe.
+
+1. **Incremental fetch**: GROQ query filtered on ``_updatedAt`` for anything
+   changed since the last sync (plus a 5-minute overlap window).
+2. **Deletion detection** (first-run only): On the initial full sync, documents
+   that were previously known but no longer appear in the active listing
+   receive a ``_deleted=True`` tombstone. cognee's ingestion pipeline removes
+   these from the graph.
 
 ### Incremental optimization
 
-While the disposition is ``replace`` (safest for correctness), the connector
-**minimizes re-fetching** by filtering on ``_updatedAt`` in the GROQ query.
+The connector **minimizes re-fetching** by filtering on ``_updatedAt`` in the GROQ query.
 A 5-minute overlap window catches late-updating documents. Documents whose
 content hash hasn't changed are not re-cognified by cognee.
 
 ### Safety guarantee
 
-> A GROQ query error or API failure **aborts the run before staging is
-> replaced**. A partial snapshot must never drive mass deletions. Only when
-> the full query succeeds is the staging table rewritten. Transient errors
-> (429, 5xx) are retried with exponential backoff; permanent errors (auth,
-> invalid GROQ) raise immediately.
+> A transient API error **aborts the run before any tombstone is emitted**.
+> A partial snapshot must never drive mass deletions. Permanent errors (401/403,
+> invalid GROQ) raise immediately. Transient errors (429, 5xx) are retried with
+> exponential backoff and Retry-After honoring.
 
 ### Edge cases documented
 
@@ -86,8 +89,8 @@ content hash hasn't changed are not re-cognified by cognee.
   produce a minimal row with metadata; the text field carries the title and
   type information so the document is discoverable.
 - **Large datasets**: The GROQ API returns up to 100 results per query. The
-  connector paginates with ``start``/``limit`` parameters until all results
-  are fetched.
+  connector paginates with offset slicing until all results are fetched.
+  The ``merge`` disposition means we only process documents that actually changed.
 
 ## Data model (document-mode)
 
