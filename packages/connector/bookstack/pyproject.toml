@@ -1,12 +1,13 @@
 [project]
 name = "cognee-community-connector-bookstack"
 version = "0.1.0"
-description = "BookStack wiki data-source connector for cognee — sync wiki pages into memory"
+description = "BookStack wiki data-source connector for cognee — sync wiki pages into memory (merge + _deleted tombstone)"
 readme = "README.md"
 requires-python = ">=3.11,<=3.13"
 dependencies = [
-    "cognee>=1.4.0",
+    "cognee>=1.4.0,<2",
     "dlt[sqlalchemy]>=1.9.0,<2",
+    "httpx>=0.25.0,<1",
 ]
 
 [project.urls]
@@ -25,7 +26,7 @@ line-length = 100
 target-version = "py311"
 
 [tool.ruff.lint]
-select = ["E", "W", "F", "I", "N", "UP", "C4", "SIM", "RUF"]
+select = ["E", "W", "F", "I", "N", "B", "UP", "C4", "SIM", "RUF"]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]

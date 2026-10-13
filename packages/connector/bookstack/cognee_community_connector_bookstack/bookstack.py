@@ -1,21 +1,22 @@
-"""dlt source for BookStack wiki pages (incremental sync + forget-on-delete).
+"""dlt source for BookStack wiki pages (merge + _deleted tombstone + incremental).
 
 Fetches BookStack pages via the REST API, exporting each page as Markdown,
 then yields them as a dlt resource for cognee's ingestion pipeline.
 
-BookStack pages are ingested as *normal documents*: the source declares
-``cognee_document_source = "bookstack"``, so ``resolve_dlt_sources`` tags each row
-``external_metadata["source"] = "bookstack"`` (not ``"dlt"``). Pages therefore
-flow through the standard cognify entity-extraction pipeline — the right
-treatment for wiki prose content.
+BookStack pages are ingested as *normal documents* via cognee's document-mode
+marker, flowing through the standard cognify entity-extraction pipeline.
 
-Incremental sync uses the ``updated_at`` field via BookStack's
-``filter[updated_at:gt]`` listing filter, with a small overlap window to catch
-late-updating pages.
+Sync model: ``write_disposition="merge"`` with a ``_deleted`` boolean column.
+Each run:
+1. Pages the ``GET /api/pages`` listing with ``filter[updated_at:gt]`` for
+   anything changed since the last sync (plus a 5-minute overlap window).
+2. On full syncs (first run), emits ``_deleted=True`` tombstones for any page
+   id that is no longer reachable through the active listing (deleted, moved
+   to recycle bin, scope filtered out).
 
-Deletion: each run does a cheap ID-only listing of all pages. Pages that
-disappear from the listing (deleted, moved to recycle bin) get cleaned up via
-orphan cleanup. Page bodies are only re-fetched when ``updated_at`` changes.
+A transient API error aborts the run before any tombstone is emitted, so a
+partial snapshot never drives mass deletions. Permanent errors (auth, 404 on
+the root endpoint) raise immediately.
 """
 
 from __future__ import annotations
@@ -40,7 +41,7 @@ _PAGE_LIMIT = 100
 
 _EXTRA_HINT = (
     'The BookStack connector requires the "bookstack" extra: '
-    'pip install "cognee[bookstack]" (provides dlt and requests).'
+    'pip install "cognee[bookstack]" (provides dlt and httpx).'
 )
 
 
@@ -73,7 +74,7 @@ def bookstack_source(
 
     if client is None:
         try:
-            import requests
+            import httpx
         except ImportError as exc:
             raise ImportError(_EXTRA_HINT) from exc
 
@@ -91,13 +92,29 @@ def bookstack_source(
                 "BOOKSTACK_TOKEN_ID + BOOKSTACK_TOKEN_SECRET."
             )
 
-        session = requests.Session()
-        session.headers.update({"Authorization": f"Token {resolved_tok_id}:{resolved_tok_secret}"})
+        session = httpx.Client(
+            base_url=f"{resolved_url}/api",
+            headers={"Authorization": f"Token {resolved_tok_id}:{resolved_tok_secret}"},
+            timeout=30.0,
+        )
 
         def _api_request(method: str, path: str, **kwargs: Any) -> Any:
-            url = f"{resolved_url}/api{path}"
             for attempt in range(_MAX_RETRIES):
-                response = session.request(method, url, **kwargs)
+                try:
+                    response = session.request(method, path, **kwargs)
+                except (httpx.TransportError, httpx.TimeoutException):
+                    if attempt == _MAX_RETRIES - 1:
+                        raise
+                    delay = 2**attempt
+                    logger.warning(
+                        "BookStack: network error — retrying in %.1fs (%d/%d).",
+                        delay,
+                        attempt + 1,
+                        _MAX_RETRIES,
+                    )
+                    time.sleep(delay)
+                    continue
+
                 if response.status_code == 429:
                     retry_after = int(response.headers.get("retry-after", 2**attempt))
                     time.sleep(retry_after)
@@ -105,6 +122,10 @@ def bookstack_source(
                 if response.status_code >= 500 and attempt < _MAX_RETRIES - 1:
                     time.sleep(2**attempt)
                     continue
+                if response.status_code in (401, 403):
+                    raise PermissionError(
+                        f"BookStack API: {response.status_code} — check your API token."
+                    )
                 response.raise_for_status()
                 return response.json()
             raise RuntimeError(
@@ -116,13 +137,15 @@ def bookstack_source(
     @dlt.resource(
         name=BOOKSTACK_TABLE_NAME,
         primary_key="id",
-        write_disposition="replace",
+        write_disposition="merge",
     )
     def bookstack_pages() -> Iterator[dict[str, Any]]:
         import dlt as _runtime_dlt
 
         state = _runtime_dlt.current.resource_state()
         last_updated = state.get("last_updated_at")
+        known_ids: set[int] = set(state.get("known_ids", []))
+
         if last_updated:
             cursor_dt = datetime.fromisoformat(last_updated).replace(tzinfo=UTC) - timedelta(
                 minutes=_OVERLAP_WINDOW_MINUTES
@@ -140,24 +163,41 @@ def bookstack_source(
         if book_ids:
             filters["filter[book_id]"] = book_ids[0] if len(book_ids) == 1 else book_ids
 
-        count = 0
         seen_ids: set[int] = set()
+        max_updated = last_updated
 
         for page in _iter_pages(client, filters):
             page_id = page.get("id")
             if page_id is not None:
                 seen_ids.add(page_id)
-            count += 1
-            yield _page_to_row(client, page)
+                known_ids.add(page_id)
 
             updated_at = page.get("updated_at")
-            if updated_at:
-                current = state.get("last_updated_at")
-                if current is None or updated_at > current:
-                    state["last_updated_at"] = updated_at
+            if updated_at and (max_updated is None or updated_at > max_updated):
+                max_updated = updated_at
 
-        state["seen_ids"] = sorted(seen_ids)
-        logger.info("BookStack: synced %d page(s).", count)
+            yield _page_to_row(client, page)
+
+        # Deletion detection: known IDs not in current listing get tombstones
+        # Only run on full syncs (first run) when we have a complete picture
+        if not cursor_iso:
+            for known_id in known_ids - seen_ids:
+                logger.info(
+                    "BookStack: page %s no longer in active listing, tombstoning.", known_id
+                )
+                yield {"id": known_id, "_deleted": True}
+                known_ids.discard(known_id)
+
+        # Update state
+        if max_updated:
+            state["last_updated_at"] = max_updated
+        state["known_ids"] = sorted(known_ids)
+
+        logger.info(
+            "BookStack: synced %d page(s) (%d new/updated).",
+            len(seen_ids),
+            len(seen_ids),
+        )
 
     @dlt.source(name=BOOKSTACK_SOURCE_NAME)
     def _bookstack() -> Any:
@@ -166,6 +206,30 @@ def bookstack_source(
     source = _bookstack()
     setattr(source, DOCUMENT_SOURCE_ATTR, BOOKSTACK_SOURCE_NAME)
     return source
+
+
+def _is_transient(exc: Exception) -> bool:
+    """True for network / timeout / 429 / 5xx errors worth retrying."""
+    try:
+        import httpx
+    except ImportError:
+        return True
+
+    if isinstance(exc, (httpx.TransportError, httpx.TimeoutException)):
+        return True
+    if hasattr(exc, "response"):
+        status = getattr(exc.response, "status_code", None)
+        if status in (429, 500, 502, 503, 504):
+            return True
+    return False
+
+
+def _is_gone(exc: Exception) -> bool:
+    """True when a page is permanently gone (404) — safe to tombstone."""
+    if hasattr(exc, "response"):
+        status = getattr(exc.response, "status_code", None)
+        return status == 404
+    return False
 
 
 def _iter_pages(client: Any, filters: dict[str, Any]) -> Iterable[dict[str, Any]]:
@@ -221,7 +285,23 @@ def _page_to_row(client: Any, page: dict[str, Any]) -> dict[str, Any]:
             body_parts.append(f"Content:\n{md_data['markdown']}")
         elif isinstance(md_data, str):
             body_parts.append(f"Content:\n{md_data}")
-    except Exception:
+    except Exception as exc:
+        if _is_gone(exc):
+            logger.warning("Page %s gone during markdown fetch, tombstoning.", page_id)
+            return {
+                "id": page_id,
+                "book_id": page.get("book_id"),
+                "chapter_id": page.get("chapter_id"),
+                "slug": slug,
+                "name": name,
+                "url": page.get("url"),
+                "created_at": page.get("created_at"),
+                "updated_at": page.get("updated_at"),
+                "text": "\n\n".join(body_parts),
+                "raw": page,
+                "source": BOOKSTACK_SOURCE_NAME,
+                "_deleted": True,
+            }
         logger.warning("Failed to fetch markdown for page %s (%s)", page_id, slug)
 
     return {
@@ -236,4 +316,5 @@ def _page_to_row(client: Any, page: dict[str, Any]) -> dict[str, Any]:
         "text": "\n\n".join(body_parts),
         "raw": page,
         "source": BOOKSTACK_SOURCE_NAME,
+        "_deleted": False,
     }
