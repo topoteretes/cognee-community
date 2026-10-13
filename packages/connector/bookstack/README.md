@@ -52,16 +52,19 @@ source = bookstack_source(
 )
 ```
 
-## Sync model: optimized replace with lazy re-fetch
+## Sync model: merge + _deleted tombstones
 
-This connector uses ``write_disposition="replace"`` for correctness, but
-**avoids re-fetching unchanged page bodies**:
+This connector uses ``write_disposition="merge"`` with a ``_deleted`` boolean column
+(rather than a full-snapshot ``replace``) so incremental syncs are cheap and safe.
 
-1. First, a **cheap listing** call fetches page IDs and `updated_at` timestamps
-   (no body content).
-2. Pages whose `updated_at` hasn't changed since the last sync are skipped.
-3. Only new or updated pages have their Markdown body fetched via
-   ``/api/pages/{id}/export-markdown``.
+1. **Incremental fetch**: Pages the ``GET /api/pages`` listing with
+   ``filter[updated_at:gt]`` for anything changed since the last sync (plus a
+   5-minute overlap window). Only new or updated pages have their Markdown
+   body fetched via ``/api/pages/{id}/export-markdown``.
+2. **Deletion detection** (first-run only): On the initial full sync, pages
+   that were previously known but no longer appear in the active listing
+   receive a ``_deleted=True`` tombstone. cognee's ingestion pipeline removes
+   these from the graph.
 
 ### Incremental sync
 
@@ -71,17 +74,18 @@ late-updating pages. Offset pagination handles large wikis.
 
 ### Safety guarantee
 
-> A listing API error **aborts the run before any bodies are fetched and
-> before staging is replaced**. A partial snapshot must never drive mass
-> deletions. Individual page Markdown export failures are logged as warnings
-> and skipped — the page is still discoverable by its metadata from the
-> listing.
+> A transient API error **aborts the run before any tombstone is emitted**.
+> A partial snapshot must never drive mass deletions. Permanent errors (401/403)
+> raise immediately. A 404 on an individual page fetch is treated as "gone"
+> and tombstoned safely. Individual page Markdown export failures (network)
+> are logged as warnings and skipped — the page is still discoverable by its
+> metadata.
 
 ### Edge cases documented
 
 - **Recycle bin**: Pages moved to the recycle bin disappear from the active
-  listing and are cleaned up via orphan cleanup. The connector does NOT
-  explicitly fetch deleted pages.
+  listing and receive ``_deleted=True`` tombstones on the next full sync.
+  The connector does NOT explicitly fetch deleted pages.
 - **Draft pages**: BookStack's API by default returns only published pages.
   Drafts are not ingested unless the API token has "Manage all content"
   permissions and a custom filter is used.
@@ -91,7 +95,7 @@ late-updating pages. Offset pagination handles large wikis.
   NOT fetched — only the page text is ingested. Image alt text and link
   titles remain in the Markdown.
 - **Large wikis**: Offset pagination with 100 pages per request handles
-  wikis of any size. The listing-first approach means we only pay the cost
+  wikis of any size. The ``merge`` disposition means we only pay the cost
   of full Markdown exports for pages that actually changed.
 
 ## Data model (document-mode)
