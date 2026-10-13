@@ -30,7 +30,6 @@ from cognee_community_connector_guru.guru import (
     _card_url,
     _html_to_text,
     _is_transient,
-    _next_page_token,
     _paginate,
     _search_params,
     _tidy,
@@ -83,26 +82,16 @@ class FakeGuruClient:
         self._page_size = page_size
         self.calls = []
 
-    def get_cards(self, **params):
-        self.calls.append(params)
-        token = params.get("token")
-        offset = int(token) if token else 0
+    def get_cards(self, url, params=None):
+        self.calls.append((url, params))
+        offset = int(url.rpartition("=")[2]) if "offset=" in url else 0
         # The real API omits archived cards unless showArchived is set, so the
         # connector detects deletion by their absence — mirror that here.
         live = [c for c in self._cards if not c.get("archived")]
         page = live[offset : offset + self._page_size]
         next_offset = offset + self._page_size
-        next_token = str(next_offset) if next_offset < len(live) else None
-        return page, next_token
-
-
-class _Response:
-    def __init__(self, payload, headers=None):
-        self._payload = payload
-        self.headers = headers or {}
-
-    def json(self):
-        return self._payload
+        next_url = f"/search/query?offset={next_offset}" if next_offset < len(live) else None
+        return page, next_url
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +130,18 @@ def test_html_to_text_passes_markdown_through():
     )
 
 
+def test_html_to_text_parses_inline_only_html():
+    # A body with only inline tags is still HTML, not Markdown.
+    assert _html_to_text('See <a href="https://x">the <strong>guide</strong></a>') == (
+        "See the guide"
+    )
+
+
+def test_html_to_text_separates_table_cells():
+    html = "<table><tr><th>Env</th><th>URL</th></tr><tr><td>prod</td><td>p.io</td></tr></table>"
+    assert _html_to_text(html).splitlines() == ["Env URL", "prod p.io"]
+
+
 def test_html_to_text_handles_empty():
     assert _html_to_text("") == ""
 
@@ -163,7 +164,7 @@ def test_card_to_row_keeps_only_identity_and_text():
 
     assert row == {
         "id": "c1",
-        "url": "https://app.getguru.com/cards/runbook",
+        "url": "https://app.getguru.com/card/runbook",
         "title": "Runbook",
         "content": "restart the service",
     }
@@ -182,7 +183,7 @@ def test_card_to_row_drops_volatile_metadata_from_hash():
 
 
 def test_card_url_from_slug():
-    assert _card_url({"slug": "abc"}) == "https://app.getguru.com/cards/abc"
+    assert _card_url({"slug": "abc"}) == "https://app.getguru.com/card/abc"
     assert _card_url({}) is None
 
 
@@ -230,8 +231,8 @@ def test_search_params_defaults_are_stable_and_ordered():
     params = _search_params(None, None)
     assert params["maxResults"] == 50
     assert params["showArchived"] is False
-    assert params["sortField"] == "lastModified"
-    assert params["sortOrder"] == "DESC"
+    assert params["sortField"] == "dateCreated"
+    assert params["sortOrder"] == "ASC"
     assert "q" not in params
 
 
@@ -258,41 +259,26 @@ def test_search_params_embeds_scope_query():
 # ---------------------------------------------------------------------------
 
 
-def test_next_page_token_reads_link_header():
-    response = _Response(
-        [],
-        {"Link": '<https://api.getguru.com/api/v1/search/query?token=abc>; rel="next-page"'},
-    )
-    assert _next_page_token(response) == "abc"
-
-
-def test_next_page_token_absent_returns_none():
-    assert _next_page_token(_Response([], {})) is None
-    assert (
-        _next_page_token(_Response([], {"Link": '<https://x?token=abc>; rel="prev-page"'})) is None
-    )
-    assert _next_page_token(_Response([], {"Link": "garbage"})) is None
-
-
-def test_paginate_follows_tokens():
+def test_paginate_follows_next_page_urls():
     client = FakeGuruClient([_card(f"c{n}") for n in range(5)], page_size=2)
-    assert [c["id"] for c in _paginate(client, maxResults=2)] == ["c0", "c1", "c2", "c3", "c4"]
-    assert client.calls[0].get("token") is None
-    assert client.calls[1]["token"] == "2"
+    assert [c["id"] for c in _paginate(client, {"maxResults": 2})] == ["c0", "c1", "c2", "c3", "c4"]
+    # The first request carries the query; next-page URLs are followed as-is.
+    assert client.calls[0] == ("/search/query", {"maxResults": 2})
+    assert client.calls[1] == ("/search/query?offset=2", None)
 
 
-def test_paginate_stops_on_repeated_token():
-    # A malformed response repeating a token must terminate, not spin.
+def test_paginate_stops_on_repeated_url():
+    # A malformed response repeating a next-page URL must terminate, not spin.
     class Looping:
-        def get_cards(self, **params):
-            return [_card("c1")], "same"
+        def get_cards(self, url, params=None):
+            return [_card("c1")], "/search/query?token=same"
 
-    assert len(list(_paginate(Looping()))) == 2
+    assert len(list(_paginate(Looping(), {}))) == 2
 
 
 def test_paginate_omits_archived_cards():
     client = FakeGuruClient([_card("c1"), _card("c2", archived=True)])
-    assert [c["id"] for c in _paginate(client)] == ["c1"]
+    assert [c["id"] for c in _paginate(client, {})] == ["c1"]
 
 
 # ---------------------------------------------------------------------------
@@ -330,6 +316,90 @@ def test_retry_after_prefers_header_then_backoff():
 
 
 # ---------------------------------------------------------------------------
+# Real HTTP client (httpx.MockTransport, no network)
+# ---------------------------------------------------------------------------
+
+
+def _mock_client(monkeypatch, handler):
+    import httpx
+
+    from cognee_community_connector_guru import guru
+
+    monkeypatch.setattr(guru.time, "sleep", lambda _s: None)
+    client = guru._GuruClient("a@b.c", "t")
+    client._client = httpx.Client(
+        transport=httpx.MockTransport(handler), base_url="https://api.getguru.com/api/v1"
+    )
+    return client
+
+
+def test_client_retries_rate_limit_then_succeeds(monkeypatch):
+    import httpx
+
+    responses = iter(
+        [
+            httpx.Response(429, headers={"Retry-After": "1"}),
+            httpx.Response(503),
+            httpx.Response(200, json=[_card("c1")]),
+        ]
+    )
+    client = _mock_client(monkeypatch, lambda request: next(responses))
+
+    cards, next_url = client.get_cards("/search/query", {"maxResults": 50})
+
+    assert [c["id"] for c in cards] == ["c1"]
+    assert next_url is None
+
+
+def test_client_auth_error_raises_without_retry(monkeypatch):
+    import httpx
+
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(401, json={"description": "unauthorized"})
+
+    client = _mock_client(monkeypatch, handler)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        client.get_cards("/search/query")
+    assert len(calls) == 1
+
+
+def test_client_rejects_non_list_payload(monkeypatch):
+    # A 200 that is not a card list must abort, never read as "zero cards".
+    import httpx
+
+    client = _mock_client(monkeypatch, lambda request: httpx.Response(200, json={"oops": 1}))
+
+    with pytest.raises(ValueError, match="expected a list"):
+        client.get_cards("/search/query")
+
+
+def test_client_follows_link_header_pages(monkeypatch):
+    # Guru's documented paging: request the Link header's next-page URL as-is.
+    import httpx
+
+    requests = []
+
+    def handler(request):
+        requests.append(request.url)
+        if request.url.params.get("token") == "p2":
+            return httpx.Response(200, json=[_card("c2")])
+        link = '<https://api.getguru.com/api/v1/search/query?token=p2>; rel="next-page"'
+        return httpx.Response(200, json=[_card("c1")], headers={"Link": link})
+
+    client = _mock_client(monkeypatch, handler)
+
+    cards = list(_paginate(client, {"q": "verificationState = trusted"}))
+
+    assert [c["id"] for c in cards] == ["c1", "c2"]
+    assert requests[0].params["q"] == "verificationState = trusted"
+    assert str(requests[1]) == "https://api.getguru.com/api/v1/search/query?token=p2"
+
+
+# ---------------------------------------------------------------------------
 # Document-source marker / DataItem (DB-free)
 # ---------------------------------------------------------------------------
 
@@ -342,6 +412,21 @@ def test_guru_source_declares_document_marker():
     source = guru_source(email="a@b.c", token="t")
     assert GURU_SOURCE_NAME == "guru"
     assert document_source_tag(source) == "guru"
+
+
+@pytest.mark.parametrize("state", ["TRUSTED", "verified", "trusted OR x = y"])
+def test_guru_source_rejects_unknown_verification_state(state):
+    from cognee_community_connector_guru.guru import guru_source
+
+    with pytest.raises(ValueError, match="verification_state"):
+        guru_source(client=FakeGuruClient([]), verification_state=state)
+
+
+def test_guru_source_rejects_quote_in_folder_id():
+    from cognee_community_connector_guru.guru import guru_source
+
+    with pytest.raises(ValueError, match="folder id"):
+        guru_source(client=FakeGuruClient([]), folder_id='x") OR ("y')
 
 
 def test_guru_source_requires_credentials():
@@ -357,7 +442,7 @@ def test_build_document_data_item_tags_source():
     row = SimpleNamespace(
         row_data={
             "id": "c1",
-            "url": "https://app.getguru.com/cards/x",
+            "url": "https://app.getguru.com/card/x",
             "title": "Deploy",
             "content": "Verification: TRUSTED\n\nrestart the service",
         },
@@ -369,7 +454,7 @@ def test_build_document_data_item_tags_source():
 
     # source="guru" (not "dlt") is what routes the card through normal cognify.
     assert item.external_metadata["source"] == "guru"
-    assert item.external_metadata["url"] == "https://app.getguru.com/cards/x"
+    assert item.external_metadata["url"] == "https://app.getguru.com/card/x"
     assert item.external_metadata["external_id"] == "c1"
     assert item.data_id == data_id
     assert item.data.startswith("# Deploy")
@@ -433,6 +518,23 @@ def test_edit_is_reflected_on_resync(dlt_mod, tmp_path):
     rows = _read_cards(pipeline)
     assert "v2" in rows["c1"]["content"]
     assert "v1" not in rows["c1"]["content"]
+
+
+def test_resync_only_changes_rows_for_edited_cards(dlt_mod, tmp_path):
+    # Incremental behaviour: cognee keys each document by a content hash of its
+    # row, so a card whose row is byte-identical across syncs is not
+    # re-cognified. Only the edited card's row may change; a lastModified bump
+    # alone must not.
+    first = [_card("c1", "Alpha", "<p>same</p>"), _card("c2", "Beta", "<p>v1</p>")]
+    before = _read_cards(_run_sync(dlt_mod, tmp_path, first))
+
+    touched = _card("c1", "Alpha", "<p>same</p>")
+    touched["lastModified"] = "2026-10-14T00:00:00.000Z"
+    second = [touched, _card("c2", "Beta", "<p>v2</p>")]
+    after = _read_cards(_run_sync(dlt_mod, tmp_path, second, name="guru_incremental"))
+
+    assert after["c1"] == before["c1"]
+    assert after["c2"] != before["c2"]
 
 
 def test_archived_card_is_removed_on_resync(dlt_mod, tmp_path):
@@ -522,7 +624,7 @@ def test_fetch_error_aborts_sync(dlt_mod, tmp_path):
     from cognee_community_connector_guru.guru import guru_source
 
     class Broken:
-        def get_cards(self, **params):
+        def get_cards(self, url, params=None):
             raise ValueError("fetch boom")
 
     db_path = (tmp_path / "guru_boom.db").as_posix()

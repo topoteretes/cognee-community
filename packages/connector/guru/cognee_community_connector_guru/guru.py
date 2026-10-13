@@ -28,7 +28,6 @@ import re
 import time
 from html.parser import HTMLParser
 from typing import Any
-from urllib.parse import parse_qs, urlsplit
 
 from cognee.shared.logging_utils import get_logger
 from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
@@ -70,7 +69,13 @@ _BLOCK_TAGS = frozenset(
 # Never surface script/style bodies as card content.
 _SKIPPED_TAGS = frozenset({"script", "style"})
 # Presence of any of these means the body is HTML rather than Markdown.
-_HTML_HINT = re.compile(r"<(p|div|br|li|h[1-6]|table|ul|ol)\b", re.IGNORECASE)
+_HTML_HINT = re.compile(
+    r"<(p|div|br|li|h[1-6]|table|ul|ol|span|a|strong|em|b|i|img|pre|code)\b", re.IGNORECASE
+)
+# Table cells are inline in HTML; separate them so adjacent cells don't fuse.
+_CELL_TAGS = frozenset({"td", "th"})
+# Guru Query Language values for ``verificationState``.
+_VERIFICATION_STATES = frozenset({"trusted", "needsVerification"})
 
 
 def guru_source(
@@ -89,8 +94,8 @@ def guru_source(
         folder_id: Restrict ingestion to cards in this folder (Guru's legacy
             "board"). Omit to ingest every card the token can see.
         verification_state: Restrict to ``"trusted"`` or ``"needsVerification"``.
-        client: Pre-built client exposing ``get_cards(**params)`` and returning
-            ``(cards, next_token)`` (mainly a test-injection point); when omitted
+        client: Pre-built client exposing ``get_cards(url, params)`` and returning
+            ``(cards, next_url)`` (mainly a test-injection point); when omitted
             an HTTP client is built from the credentials above.
 
     Returns:
@@ -111,6 +116,13 @@ def guru_source(
             )
         client = _GuruClient(resolved_email, resolved_token)
 
+    if verification_state is not None and verification_state not in _VERIFICATION_STATES:
+        raise ValueError(
+            f"verification_state must be one of {sorted(_VERIFICATION_STATES)}, "
+            f"got {verification_state!r}"
+        )
+    if folder_id is not None and '"' in folder_id:
+        raise ValueError(f"Invalid Guru folder id: {folder_id!r}")
     params = _search_params(folder_id, verification_state)
 
     @dlt.resource(name=GURU_TABLE_NAME, primary_key="id", write_disposition="replace")
@@ -126,7 +138,7 @@ def guru_source(
         # -- untouched, which is the safe failure. Transient blips are retried in
         # _request; only a persistent failure reaches here.
         count = 0
-        for card in _paginate(client, **params):
+        for card in _paginate(client, params):
             row = _card_to_row(card)
             if row["id"] is None:
                 logger.warning("Guru: skipping card without an id: %r", card.get("preferredPhrase"))
@@ -161,13 +173,24 @@ class _GuruClient:
     def __init__(self, email: str, token: str, timeout: float = 30.0):
         import httpx
 
-        self._httpx = httpx
         self._client = httpx.Client(auth=(email, token), base_url=_GURU_API_ROOT, timeout=timeout)
 
-    def get_cards(self, **params) -> tuple[list[dict], str | None]:
-        """Return one page of cards plus the next-page token, if any."""
-        response = _request(self._client.get, _CARDS_PATH, params=params)
-        return list(response.json()), _next_page_token(response)
+    def get_cards(self, url: str, params: dict | None = None) -> tuple[list[dict], str | None]:
+        """Return one page of cards plus the next page's URL, if any."""
+        response = _request(self._get, url, params=params)
+        cards = response.json()
+        # Under replace, a page that is not a card list must abort the sync
+        # rather than be read as "no cards" and forget everything.
+        if not isinstance(cards, list):
+            raise ValueError(f"Guru: expected a list of cards, got {type(cards).__name__}")
+        return cards, response.links.get("next-page", {}).get("url")
+
+    def _get(self, url: str, **kwargs):
+        # httpx returns 4xx/5xx responses instead of raising; raise here so
+        # _request can retry 429/5xx and permanent errors abort the sync.
+        response = self._client.get(url, **kwargs)
+        response.raise_for_status()
+        return response
 
     def close(self) -> None:
         self._client.close()
@@ -190,14 +213,15 @@ def _build_query(folder_id: str | None, verification_state: str | None) -> str:
 def _search_params(folder_id: str | None, verification_state: str | None) -> dict[str, Any]:
     """Build the ``/search/query`` parameters for the requested scope.
 
-    Sorting by ``lastModified`` keeps each run's snapshot in a stable order, so
-    re-syncing an unchanged workspace produces an identical load.
+    Sorting by creation date, oldest first, keeps the order stable while a sync
+    pages through: an edit mid-sync cannot move a card across a page boundary,
+    and a card created mid-sync lands on the last page.
     """
     params: dict[str, Any] = {
         "maxResults": _PAGE_SIZE,
         "showArchived": False,
-        "sortField": "lastModified",
-        "sortOrder": "DESC",
+        "sortField": "dateCreated",
+        "sortOrder": "ASC",
     }
     query = _build_query(folder_id, verification_state)
     if query:
@@ -247,43 +271,28 @@ def _retry_after(response, attempt: int) -> float:
         return float(2**attempt)
 
 
-def _next_page_token(response) -> str | None:
-    """Extract the paging ``token`` from a ``Link: <...>; rel="next-page"`` header."""
-    headers = getattr(response, "headers", None) or {}
-    link = headers.get("link") or headers.get("Link")
-    if not link or 'rel="next-page"' not in link:
-        return None
-    target = re.search(r"<([^>]+)>", link)
-    if not target:
-        return None
-    token = parse_qs(urlsplit(target.group(1)).query).get("token")
-    return token[0] if token else None
-
-
 # ---------------------------------------------------------------------------
 # Card iteration / mapping
 # ---------------------------------------------------------------------------
 
 
-def _paginate(client, **params):
-    """Yield every card, following Guru's paging tokens.
+def _paginate(client, params: dict[str, Any]):
+    """Yield every card, following Guru's ``next-page`` links.
 
-    Guarded against a repeated token: the API contract says the header is absent
-    on the last page, so a token we have already followed means the response is
-    malformed and continuing would loop forever.
+    The next-page URL already carries the query, so it is requested as-is.
+    Guarded against a repeated URL: the header is absent on the last page, so a
+    URL we have already followed means the response is malformed and continuing
+    would loop forever.
     """
-    token = None
+    url, page_params = _CARDS_PATH, params
     seen: set[str] = set()
     while True:
-        page = dict(params)
-        if token:
-            page["token"] = token
-        cards, next_token = client.get_cards(**page)
+        cards, next_url = client.get_cards(url, page_params)
         yield from cards
-        if not next_token or next_token in seen:
+        if not next_url or next_url in seen:
             return
-        seen.add(next_token)
-        token = next_token
+        seen.add(next_url)
+        url, page_params = next_url, None
 
 
 def _card_to_row(card: dict) -> dict:
@@ -304,7 +313,7 @@ def _card_to_row(card: dict) -> dict:
 def _card_url(card: dict) -> str | None:
     """The card's web URL, built from its slug."""
     slug = card.get("slug")
-    return f"https://app.getguru.com/cards/{slug}" if slug else None
+    return f"https://app.getguru.com/card/{slug}" if slug else None
 
 
 def _card_text(card: dict) -> str:
@@ -390,6 +399,8 @@ class _TextExtractor(HTMLParser):
             self._skip_depth = max(0, self._skip_depth - 1)
         elif not self._skip_depth and tag in _BLOCK_TAGS and tag != "br":
             self._parts.append("\n")
+        elif not self._skip_depth and tag in _CELL_TAGS:
+            self._parts.append(" ")
 
     def handle_data(self, data):
         if not self._skip_depth:

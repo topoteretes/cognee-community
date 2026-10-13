@@ -62,14 +62,17 @@ await cognee.remember(source, dataset_name="guru")
 ```
 
 `guru_source(email=..., token=...)` takes explicit credentials; both fall back to
-the `GURU_USER` / `GURU_TOKEN` environment variables.
+the `GURU_USER` / `GURU_TOKEN` environment variables. `verification_state` accepts
+Guru Query Language values: `"trusted"` or `"needsVerification"`.
 
 ## How syncing behaves
 
 Each run is a **full snapshot** of the selected scope:
 
-- **Edits** re-ingest the card. Unchanged cards keep a stable content hash, so
-  they are not re-cognified.
+- **Incremental by content:** cognee keys each card by a hash of its text, so
+  only cards whose text (or verification state) changed since the last run are
+  re-cognified. Unchanged cards — including ones whose `lastModified` moved
+  without a text change — are skipped.
 - **Deletes and archives** propagate. Guru drops archived and deleted cards from
   its search results, so they fall out of the snapshot and cognee's orphan
   cleanup forgets them from the graph and vector stores.
@@ -77,9 +80,15 @@ Each run is a **full snapshot** of the selected scope:
   sync sees every card in that scope and therefore still reconciles deletions
   correctly.
 
-There is deliberately no "modified since" filter. Under a snapshot load a
-partial result set would be indistinguishable from mass deletion upstream, so the
-connector never offers one.
+There is deliberately no server-side `lastModified > cursor` filter. Guru's
+search API returns each card's full body in the listing, so a filtered fetch
+would save no API calls — and under a snapshot load a partial result set would
+be indistinguishable from mass deletion upstream. The full listing is what lets
+deletes propagate; the content hash is what keeps re-syncs cheap.
+
+If a page of results fails (after retries on rate limits and 5xx), the whole
+run aborts and memory is left untouched, rather than forgetting cards that were
+merely not fetched.
 
 ## Privacy
 
