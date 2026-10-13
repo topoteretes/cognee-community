@@ -1,20 +1,23 @@
-"""dlt source for Sanity CMS documents (incremental sync + forget-on-delete).
+"""dlt source for Sanity CMS documents (merge + _deleted tombstone + incremental).
 
 Fetches Sanity documents via GROQ from the Sanity HTTP API, then yields them
 as a dlt resource for cognee's ingestion pipeline.
 
-Sanity documents are ingested as *normal documents*: the source declares
-``cognee_document_source = "sanity"``, so ``resolve_dlt_sources`` tags each row
-``external_metadata["source"] = "sanity"`` (not ``"dlt"``). Documents therefore
-flow through the standard cognify entity-extraction pipeline — the right
-treatment for CMS prose content.
+Sanity documents are ingested as *normal documents* via cognee's document-mode
+marker, flowing through the standard cognify entity-extraction pipeline — the
+right treatment for CMS prose content.
 
-Incremental sync uses the ``_updatedAt`` field in GROQ filters with a small
-overlap window to catch late-updating documents.
+Sync model: ``write_disposition="merge"`` with a ``_deleted`` boolean column.
+Each run:
+1. Queries documents via GROQ filtered on ``_updatedAt`` for anything changed
+   since the last sync (plus a 5-minute overlap window).
+2. On full syncs (first run), emits ``_deleted=True`` tombstones for any
+   document id that is no longer reachable through the active listing (deleted,
+   unpublished, filtered out by type/query).
 
-Deletion: ``write_disposition="replace"`` so each sync produces the complete
-current set of documents matching the configured query/type; anything dropped
-from the listing gets cleaned up via orphan cleanup.
+A transient API error aborts the run before any tombstone is emitted, so a
+partial snapshot never drives mass deletions. Permanent errors (auth, 404 on
+the root endpoint) raise immediately.
 """
 
 from __future__ import annotations
@@ -38,7 +41,7 @@ _OVERLAP_WINDOW_MINUTES = 5
 
 _EXTRA_HINT = (
     'The Sanity connector requires the "sanity" extra: pip install "cognee[sanity]" '
-    "(provides dlt and requests)."
+    "(provides dlt and httpx)."
 )
 
 
@@ -74,7 +77,7 @@ def sanity_source(
 
     if client is None:
         try:
-            import requests
+            import httpx
         except ImportError as exc:
             raise ImportError(_EXTRA_HINT) from exc
 
@@ -86,14 +89,30 @@ def sanity_source(
                 "set SANITY_PROJECT_ID + SANITY_API_TOKEN environment variables."
             )
 
-        session = requests.Session()
-        session.headers.update({"Authorization": f"Bearer {resolved_token}"})
         base_url = f"https://{resolved_project}.api.sanity.io/v{api_version}"
+        session = httpx.Client(
+            base_url=base_url,
+            headers={"Authorization": f"Bearer {resolved_token}"},
+            timeout=30.0,
+        )
 
         def _api_request(method: str, path: str, **kwargs: Any) -> Any:
-            url = f"{base_url}{path}"
             for attempt in range(_MAX_RETRIES):
-                response = session.request(method, url, **kwargs)
+                try:
+                    response = session.request(method, path, **kwargs)
+                except (httpx.TransportError, httpx.TimeoutException):
+                    if attempt == _MAX_RETRIES - 1:
+                        raise
+                    delay = 2**attempt
+                    logger.warning(
+                        "Sanity: network error — retrying in %.1fs (%d/%d).",
+                        delay,
+                        attempt + 1,
+                        _MAX_RETRIES,
+                    )
+                    time.sleep(delay)
+                    continue
+
                 if response.status_code == 429:
                     retry_after = int(response.headers.get("retry-after", 2**attempt))
                     time.sleep(retry_after)
@@ -101,6 +120,10 @@ def sanity_source(
                 if response.status_code >= 500 and attempt < _MAX_RETRIES - 1:
                     time.sleep(2**attempt)
                     continue
+                if response.status_code in (401, 403):
+                    raise PermissionError(
+                        f"Sanity API: {response.status_code} — check your API token."
+                    )
                 response.raise_for_status()
                 return response.json()
             raise RuntimeError(f"Sanity API: {method} {path} failed after {_MAX_RETRIES} retries.")
@@ -110,13 +133,15 @@ def sanity_source(
     @dlt.resource(
         name=SANITY_TABLE_NAME,
         primary_key="_id",
-        write_disposition="replace",
+        write_disposition="merge",
     )
     def sanity_documents() -> Iterator[dict[str, Any]]:
         import dlt as _runtime_dlt
 
         state = _runtime_dlt.current.resource_state()
         last_updated = state.get("last_updated_at")
+        known_ids: set[str] = set(state.get("known_ids", []))
+
         if last_updated:
             cursor_dt = datetime.fromisoformat(last_updated) - timedelta(
                 minutes=_OVERLAP_WINDOW_MINUTES
@@ -125,17 +150,41 @@ def sanity_source(
         else:
             cursor_iso = None
 
-        count = 0
-        for doc in _iter_documents(client, dataset, document_types, groq_filter, cursor_iso):
-            count += 1
-            yield _doc_to_row(doc)
-            updated_at = doc.get("_updatedAt")
-            if updated_at:
-                current = state.get("last_updated_at")
-                if current is None or updated_at > current:
-                    state["last_updated_at"] = updated_at
+        seen_ids: set[str] = set()
+        max_updated = last_updated
 
-        logger.info("Sanity: synced %d document(s).", count)
+        for doc in _iter_documents(client, dataset, document_types, groq_filter, cursor_iso):
+            doc_id = doc.get("_id")
+            if doc_id:
+                seen_ids.add(doc_id)
+                known_ids.add(doc_id)
+
+            updated_at = doc.get("_updatedAt")
+            if updated_at and (max_updated is None or updated_at > max_updated):
+                max_updated = updated_at
+
+            yield _doc_to_row(doc)
+
+        # Deletion detection: known IDs not in current listing get tombstones
+        # Only run on full syncs (first run) when we have a complete picture
+        if not cursor_iso:
+            for known_id in known_ids - seen_ids:
+                logger.info(
+                    "Sanity: document %s no longer in active listing, tombstoning.", known_id
+                )
+                yield {"_id": known_id, "_deleted": True}
+                known_ids.discard(known_id)
+
+        # Update state
+        if max_updated:
+            state["last_updated_at"] = max_updated
+        state["known_ids"] = sorted(known_ids)
+
+        logger.info(
+            "Sanity: synced %d document(s) (%d new/updated).",
+            len(seen_ids),
+            len(seen_ids),
+        )
 
     @dlt.source(name=SANITY_SOURCE_NAME)
     def _sanity() -> Any:
@@ -144,6 +193,30 @@ def sanity_source(
     source = _sanity()
     setattr(source, DOCUMENT_SOURCE_ATTR, SANITY_SOURCE_NAME)
     return source
+
+
+def _is_transient(exc: Exception) -> bool:
+    """True for network / timeout / 429 / 5xx errors worth retrying."""
+    try:
+        import httpx
+    except ImportError:
+        return True
+
+    if isinstance(exc, (httpx.TransportError, httpx.TimeoutException)):
+        return True
+    if hasattr(exc, "response"):
+        status = getattr(exc.response, "status_code", None)
+        if status in (429, 500, 502, 503, 504):
+            return True
+    return False
+
+
+def _is_gone(exc: Exception) -> bool:
+    """True when a document is permanently gone (404) — safe to tombstone."""
+    if hasattr(exc, "response"):
+        status = getattr(exc.response, "status_code", None)
+        return status == 404
+    return False
 
 
 def _iter_documents(
@@ -230,6 +303,7 @@ def _doc_to_row(doc: dict[str, Any]) -> dict[str, Any]:
         "text": "\n\n".join(body_parts),
         "raw": doc,
         "source": SANITY_SOURCE_NAME,
+        "_deleted": False,
     }
 
 
