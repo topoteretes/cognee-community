@@ -42,28 +42,32 @@ source = otter_source(include_shared=False)
 await cognee.add(source)
 ```
 
-## Sync model: full snapshot replace
+## Sync model: merge + _deleted tombstones
 
-This connector uses ``write_disposition="replace"`` — each sync produces the
-complete current set of conversations visible to the API key. Anything dropped
-from the listing (deleted, access revoked) gets cleaned up via cognee's orphan
-cleanup.
+This connector uses ``write_disposition="merge"`` with a ``_deleted`` boolean column
+(rather than a full-snapshot ``replace``) so incremental syncs are cheap and safe.
+
+1. **Incremental fetch**: Pages the ``/conversations`` endpoint, filtering by
+   ``created_at`` cursor for anything new since the last sync (plus a 5-minute
+   overlap window). Cursor pagination handles large meeting histories.
+2. **Deletion detection** (first-run only): On the initial full sync, conversations
+   that were previously known but no longer appear in the active listing
+   receive a ``_deleted=True`` tombstone. cognee's ingestion pipeline removes
+   these from the graph.
 
 ### Incremental optimization
 
-While the disposition is ``replace`` (safest for correctness), the connector
-**minimizes re-fetching** by tracking the ``created_at`` cursor in dlt state.
+The connector **minimizes re-fetching** by tracking the ``created_at`` cursor in dlt state.
 A 5-minute overlap window catches late-processed meetings. The Otter.ai API
 returns conversations in pages of 100 via cursor pagination.
 
 ### Safety guarantee
 
-> An API error **aborts the run before staging is replaced**. A partial
-> snapshot must never drive mass deletions. Only when all pages have been
-> successfully fetched and all transcripts retrieved is the staging table
-> rewritten. Transient errors (429, 5xx) are retried with exponential backoff
-> honoring the ``Retry-After`` header; permanent errors (401 invalid key)
-> raise immediately.
+> A transient API error **aborts the run before any tombstone is emitted**.
+> A partial snapshot must never drive mass deletions. Permanent errors (401
+> invalid key) raise immediately. Transient errors (429, 5xx) are retried with
+> exponential backoff honoring the ``Retry-After`` header. A 404 on an
+> individual transcript fetch is treated as "gone" and tombstoned safely.
 
 ### Edge cases documented
 
@@ -81,9 +85,9 @@ returns conversations in pages of 100 via cursor pagination.
   API (e.g., "Speaker 0", "Speaker 1"). If Otter.ai has identified speakers,
   those names appear in the text.
 - **Transcript fetch failures**: If fetching an individual transcript fails
-  (network error), the connector logs a warning and continues with the
+  with a network error, the connector logs a warning and continues with the
   conversation metadata only. The meeting is still discoverable by title and
-  participants.
+  participants. A 404 response is treated as "gone" and emits a safe tombstone.
 
 ## Data model (document-mode)
 
