@@ -8,6 +8,7 @@ import asyncio
 import os
 
 import cognee
+
 from cognee_community_connector_discourse import discourse_source
 
 

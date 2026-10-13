@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+
 from cognee_community_connector_discourse import discourse_source
 
 
