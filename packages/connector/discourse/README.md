@@ -54,29 +54,35 @@ source = discourse_source(
 )
 ```
 
-## Sync model: full snapshot replace
+## Sync model: merge + _deleted tombstones
 
-This connector uses ``write_disposition="replace"`` — each sync produces the
-complete current set of topics matching the configured scope. Anything dropped
-from the listing (deleted, moved to a different category, archived) gets
-cleaned up via cognee's orphan cleanup.
+This connector uses ``write_disposition="merge"`` with a ``_deleted`` boolean column
+(rather than a full-snapshot ``replace``) so incremental syncs are cheap and safe.
+
+1. **Incremental fetch**: Pages the ``/latest.json`` feed, filtering by
+   ``bumped_at`` (last activity) cursor for anything changed since the last
+   sync (plus a 5-minute overlap window).
+2. **Deletion detection** (first-run only): On the initial full sync, topics
+   that were previously known but no longer appear in the active listing
+   receive a ``_deleted=True`` tombstone. cognee's ingestion pipeline removes
+   these from the graph.
 
 ### Incremental optimization
 
-While the disposition is ``replace`` (safest for correctness), the connector
-**minimizes re-fetching** by:
-1. Filtering the listing on ``bumped_at`` (last activity) via the cursor.
+The connector **minimizes re-fetching** by:
+1. Filtering the listing on ``bumped_at`` via the cursor.
 2. Only fetching full Markdown via ``/raw/{topic_id}`` for topics that appear
    in the current listing.
 3. A 5-minute overlap window catches late-updating threads.
 
 ### Safety guarantee
 
-> A listing API error **aborts the run before any Markdown is fetched and
-> before staging is replaced**. A partial snapshot must never drive mass
-> deletions. Individual ``/raw/{topic_id}`` fetch failures are logged as
-> warnings and skipped — the topic is still discoverable by its title and
-> metadata from the listing.
+> A transient API error **aborts the run before any tombstone is emitted**.
+> A partial snapshot must never drive mass deletions. Permanent errors (401/403)
+> raise immediately. A 404 on an individual topic fetch is treated as "gone"
+> and tombstoned safely. Individual ``/raw/{topic_id}`` fetch failures (network)
+> are logged as warnings and skipped — the topic is still discoverable by its
+> title and metadata from the listing.
 
 ### Edge cases documented
 
@@ -89,7 +95,9 @@ While the disposition is ``replace`` (safest for correctness), the connector
 - **Archived topics**: Discourse's ``/latest.json`` by default includes
   archived topics. They are ingested with their current metadata.
 - **Large forums**: Page pagination with 30 topics per request handles forums
-  of any size. A safety cap of 100 pages prevents infinite loops.
+  of any size. A safety cap of 100 pages prevents infinite loops. The
+  ``merge`` disposition means we only pay the cost of full Markdown exports
+  for topics that actually changed.
 - **Deleted posts**: The ``/raw/{topic_id}`` endpoint returns the current
   state of the topic. Deleted posts are typically redacted or removed from
   the raw output by Discourse itself.
