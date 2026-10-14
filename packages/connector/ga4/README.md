@@ -15,7 +15,9 @@ sync) with no core changes.
 - cognee 1.6.1 or later (pinned to `1.6.4`), for table-scoped document cleanup.
 - A Google Cloud service account with Viewer access to the GA4 property, and the Google
   Analytics Admin API enabled in its project. The connector only asks for the
-  `analytics.readonly` scope.
+  `analytics.readonly` scope. A standard (free) property is enough: every listing used here was
+  verified on one with a Viewer service account, including that archiving a custom dimension or
+  audience in the GA4 interface drops it from the listing.
 
 ## Install
 
