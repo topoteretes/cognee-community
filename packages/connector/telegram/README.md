@@ -110,8 +110,14 @@ dataset (`PIPELINE_SCOPE_ATTR`).
 uv run pytest tests/
 ```
 
-The tests mock the Bot API (no token, no network) with payloads shaped like the ones a
-real bot receives, and cover rendering, the cursor and replay, edits, chat selection,
-removal-driven deletion, the supergroup upgrade, paging, the webhook conflict, the dlt
-resource wiring, the row-to-document mapping in cognee, and an end-to-end dlt merge into
-SQLite that shows edits replacing rows and removed chats' rows being deleted.
+No bot token or API key is needed. `tests/fake_telegram.py` is an in-memory Bot API with
+payloads shaped like the ones a real bot receives.
+
+- `test_telegram.py` covers rendering, the cursor and replay, edits, chat selection,
+  removal-driven deletion, the supergroup upgrade, paging, the webhook conflict, the dlt
+  resource wiring, the row-to-document mapping in cognee, and an end-to-end dlt merge into
+  SQLite that shows edits replacing rows and removed chats' rows being deleted.
+- `test_telegram_forget.py` runs the real cognee pipeline (LLM and embeddings mocked, like
+  the google-drive connector's forget test) and checks that text edited out of a message
+  and the messages of a chat the bot was removed from leave the graph, while an untouched
+  message stays.
