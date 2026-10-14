@@ -364,16 +364,36 @@ def sync_tickets(
             break
         params = {"cursor": data["after_cursor"]}
 
-    changed = deleted = 0
+    deleted = 0
+    live, users = [], {}
     for tid, ticket in latest.items():
         if ticket.get("status") == "deleted":
             deleted += 1
             yield deleted_row(tid)
             continue
-        comments, users = _ticket_comments(client, tid)
-        changed += 1
+        comments, authors = _ticket_comments(client, tid)
+        users.update(authors)
+        live.append((ticket, comments))
+    # include=users only brings the people who wrote a comment, so an assignee who
+    # never replied would show up as "user <id>". Look the rest up in one go.
+    missing = {
+        t.get(key) for t, _ in live for key in ("requester_id", "assignee_id") if t.get(key)
+    } - set(users)
+    users.update(_users_by_id(client, missing))
+    for ticket, comments in live:
         yield ticket_to_row(ticket, comments, users, subdomain, include_internal)
-    logger.info("Zendesk: %d changed ticket(s), %d deleted.", changed, deleted)
+    logger.info("Zendesk: %d changed ticket(s), %d deleted.", len(live), deleted)
+
+
+def _users_by_id(client, ids) -> dict:
+    """Names for the given user ids, 100 per request (show_many's limit)."""
+    ids = sorted(ids)
+    found = {}
+    for i in range(0, len(ids), 100):
+        chunk = ",".join(str(x) for x in ids[i : i + 100])
+        for user in client.get("/api/v2/users/show_many.json", ids=chunk).get("users") or []:
+            found[user["id"]] = user
+    return found
 
 
 def sync_articles(client, state: dict, locale: str | None = None) -> Iterator[dict[str, Any]]:

@@ -1,22 +1,15 @@
-"""Unit tests for the Zendesk connector.
+"""Unit tests for the Zendesk connector, against ``FakeZendesk`` (see fake_zendesk.py).
 
-The Zendesk API is mocked by ``FakeZendesk`` (no credentials, no network). Its
-responses follow what a real trial account returned:
-
-  - the incremental ticket export returns a ticket again when only a comment
-    was added, and deleted tickets come back with ``status="deleted"``
-  - comments carry a ``public`` flag (internal notes are ``public=False``)
-  - archived Help Center articles disappear from the listing; drafts are flagged
-
-Coverage: rendering (thread, internal notes, HTML articles), first export and
-cursor resume, comment-only change, ticket deletion, a ticket listed several
-times in one window (the newest version wins, so delete-then-restore works),
-article edit / archive / unpublish / no-op, failed listing never deletes, export
-page cap, rate-limit retry, auth/config errors, dlt wiring, the row-to-document
-mapping in cognee, and a real dlt merge into SQLite.
+Coverage: rendering (thread, internal notes, HTML articles, requester and assignee
+names), first export and cursor resume, comment-only change, ticket deletion, a ticket
+listed several times in one window (the newest version wins, so delete-then-restore
+works), article edit / archive / unpublish / no-op, failed listing never deletes, export
+page cap, rate-limit retry, auth/config errors, dlt wiring, the row-to-document mapping
+in cognee, and a real dlt merge into SQLite.
 """
 
 import pytest
+from fake_zendesk import AGENT, ALICE, SUB, FakeZendesk, article, comment, ticket
 
 from cognee_community_connector_zendesk.zendesk import (
     ZendeskAPIError,
@@ -28,97 +21,6 @@ from cognee_community_connector_zendesk.zendesk import (
     ticket_to_row,
     zendesk_source,
 )
-
-SUB = "acme"
-ALICE = {"id": 11, "name": "Alice Customer", "email": "alice@example.com"}
-AGENT = {"id": 22, "name": "Sam Agent", "email": "sam@acme.test"}
-
-
-def ticket(tid, subject="Login fails", status="open", **extra):
-    return {
-        "id": tid,
-        "subject": subject,
-        "status": status,
-        "priority": "high",
-        "type": "problem",
-        "tags": ["sso", "login"],
-        "requester_id": 11,
-        "assignee_id": 22,
-        "created_at": "2026-10-05T10:00:00Z",
-        "updated_at": "2026-10-05T10:00:00Z",
-        **extra,
-    }
-
-
-def comment(cid, body, author=11, public=True, at="2026-10-05T10:00:00Z"):
-    return {
-        "id": cid,
-        "plain_body": body,
-        "body": body,
-        "author_id": author,
-        "public": public,
-        "created_at": at,
-    }
-
-
-def article(
-    aid,
-    title="Reset your password",
-    body="<p>Go to <b>Settings</b>.</p>",
-    updated="2026-10-05T12:00:00Z",
-    draft=False,
-):
-    return {
-        "id": aid,
-        "title": title,
-        "body": body,
-        "updated_at": updated,
-        "draft": draft,
-        "html_url": f"https://{SUB}.zendesk.com/hc/en-us/articles/{aid}",
-        "locale": "en-us",
-        "label_names": ["account"],
-    }
-
-
-class FakeZendesk:
-    """Serves the export as a change log: each ``touch`` appends a ticket version."""
-
-    def __init__(self):
-        self.log = []  # ticket versions in change order
-        self.comments = {}  # ticket id -> comments
-        self.articles = []
-        self.fail_articles = False
-        self.calls = []
-        self.page_size = 1000
-
-    def touch(self, t, comments=None):
-        self.log.append(dict(t))
-        if comments is not None:
-            self.comments[t["id"]] = comments
-
-    def get(self, path, **params):
-        self.calls.append((path, params))
-        if path == "/api/v2/incremental/tickets/cursor.json":
-            start = int(params["cursor"]) if "cursor" in params else 0
-            page = self.log[start : start + self.page_size]
-            end = start + len(page)
-            return {
-                "tickets": page,
-                "after_cursor": str(end),
-                "end_of_stream": end >= len(self.log),
-            }
-        if path.startswith("/api/v2/tickets/") and path.endswith("/comments.json"):
-            tid = int(path.split("/")[4])
-            return {
-                "comments": self.comments.get(tid, []),
-                "users": [ALICE, AGENT],
-                "next_page": None,
-            }
-        if path == "/api/v2/help_center/articles.json":
-            if self.fail_articles:
-                raise ZendeskAPIError("HTTP 500")
-            return {"articles": list(self.articles), "next_page": None}
-        raise AssertionError(path)
 
 
 def tickets(fake, state, **kw):
@@ -203,6 +105,16 @@ def test_deleted_ticket_becomes_tombstone():
     tickets(fake, state)
     fake.touch(ticket(4, status="deleted"))
     assert tickets(fake, state) == [{"id": 4, "_deleted": True}]
+
+
+def test_assignee_who_never_commented_is_still_named():
+    fake = FakeZendesk()
+    fake.touch(ticket(7), [comment(1, "I cannot log in.", author=11)])
+    row = tickets(fake, {})[0]
+    assert "Requester: Alice Customer <alice@example.com>" in row["content"]
+    assert "Assignee: Sam Agent <sam@acme.test>" in row["content"]
+    lookups = [p for p, _ in fake.calls if p == "/api/v2/users/show_many.json"]
+    assert lookups == ["/api/v2/users/show_many.json"]  # one batched lookup, not one per user
 
 
 def test_ticket_listed_several_times_in_one_window_keeps_its_newest_version():
