@@ -90,7 +90,7 @@ def test_an_audience_carries_its_rules_but_not_its_creation_time():
     assert "Membership duration: 30 days" in content
     assert "Logs event: joined_purchasers (audience joined)" in content
     assert "Users who bought something." in content
-    assert '"eventName": "purchase"' in content
+    assert "Include users (across all sessions): event purchase" in content
     assert "2026-10-01" not in content
     # exclusion only means something when a clause excludes
     assert "Exclusion" not in content
@@ -158,3 +158,142 @@ def test_unspecified_enums_are_left_out():
     )
 
     assert "Unit" not in render_custom_metric(metric)["content"]
+
+
+def _rules(*clauses) -> list[str]:
+    fake = FakeGA4()
+    audience = fake.add_audience("49", "Rules", "Rules.", filterClauses=list(clauses))
+    content = render_audience(audience)["content"]
+    return content.split("Definition:\n", 1)[1].splitlines()
+
+
+def _filter(*expressions, joiner="andGroup") -> dict:
+    return {joiner: {"filterExpressions": list(expressions)}}
+
+
+def _condition(**spec) -> dict:
+    return {"dimensionOrMetricFilter": spec}
+
+
+# the rules of an audience made in the GA4 interface, as the live Admin API returned them
+_MORE_THAN_ONE = _condition(
+    atAnyPointInTime=True,
+    fieldName="event_count",
+    numericFilter={"operation": "GREATER_THAN", "value": {"int64Value": "1"}},
+)
+_IN_APP_PURCHASE = {
+    "eventFilter": {
+        "eventName": "in_app_purchase",
+        "eventParameterFilterExpression": _filter(_filter(_MORE_THAN_ONE, joiner="orGroup")),
+    }
+}
+LIVE_REPEAT_BUYERS = {
+    "clauseType": "INCLUDE",
+    "simpleFilter": {
+        "scope": "AUDIENCE_FILTER_SCOPE_ACROSS_ALL_SESSIONS",
+        "filterExpression": _filter(_filter(_IN_APP_PURCHASE, joiner="orGroup")),
+    },
+}
+
+
+def test_a_live_audience_definition_reads_as_one_sentence():
+    assert _rules(LIVE_REPEAT_BUYERS) == [
+        "Include users (across all sessions): "
+        "event in_app_purchase where event_count > 1 at any point in time"
+    ]
+
+
+def test_each_kind_of_condition_reads_as_words():
+    clause = {
+        "clauseType": "INCLUDE",
+        "simpleFilter": {
+            "scope": "AUDIENCE_FILTER_SCOPE_WITHIN_SAME_SESSION",
+            "filterExpression": _filter(
+                _condition(
+                    fieldName="page_type",
+                    stringFilter={"matchType": "CONTAINS", "value": "pricing"},
+                ),
+                _condition(fieldName="country", inListFilter={"values": ["FR", "DE"]}),
+                _condition(
+                    fieldName="purchase_revenue",
+                    betweenFilter={
+                        "fromValue": {"doubleValue": 10.5},
+                        "toValue": {"int64Value": "99"},
+                    },
+                    inAnyNDayPeriod=7,
+                ),
+                {
+                    "notExpression": _condition(
+                        fieldName="plan_tier",
+                        stringFilter={"matchType": "EXACT", "value": "Free", "caseSensitive": True},
+                    )
+                },
+            ),
+        },
+    }
+
+    assert _rules(clause) == [
+        "Include users (within same session): ("
+        "country is one of DE, FR"
+        " and not plan_tier is 'Free' (case sensitive)"
+        " and page_type contains 'pricing'"
+        " and purchase_revenue between 10.5 and 99 in any 7-day period)"
+    ]
+
+
+def test_an_or_group_and_an_exclude_clause_read_as_words():
+    clause = {
+        "clauseType": "EXCLUDE",
+        "simpleFilter": {
+            "scope": "AUDIENCE_FILTER_SCOPE_ACROSS_ALL_SESSIONS",
+            "filterExpression": _filter(
+                _filter(
+                    {"eventFilter": {"eventName": "refund"}},
+                    {"eventFilter": {"eventName": "chargeback"}},
+                    joiner="orGroup",
+                )
+            ),
+        },
+    }
+
+    assert _rules(clause) == [
+        "Exclude users (across all sessions): (event chargeback or event refund)"
+    ]
+
+
+def test_a_sequence_reads_as_ordered_steps():
+    clause = {
+        "clauseType": "INCLUDE",
+        "sequenceFilter": {
+            "scope": "AUDIENCE_FILTER_SCOPE_ACROSS_ALL_SESSIONS",
+            "sequenceMaximumDuration": "604800s",
+            "sequenceSteps": [
+                {"filterExpression": _filter({"eventFilter": {"eventName": "view_item"}})},
+                {
+                    "immediatelyFollows": True,
+                    "filterExpression": _filter({"eventFilter": {"eventName": "add_to_cart"}}),
+                },
+                {
+                    "constraintDuration": "3600s",
+                    "filterExpression": _filter({"eventFilter": {"eventName": "purchase"}}),
+                },
+            ],
+        },
+    }
+
+    assert _rules(clause) == [
+        "Include users who in order (across all sessions): event view_item, "
+        "directly then event add_to_cart, then event purchase within 3600s, all within 604800s"
+    ]
+
+
+def test_a_filter_this_version_does_not_know_is_kept_as_data():
+    clause = {
+        "clauseType": "INCLUDE",
+        "simpleFilter": {
+            "scope": "AUDIENCE_FILTER_SCOPE_ACROSS_ALL_SESSIONS",
+            "filterExpression": _filter({"futureFilter": {"x": 1}}),
+        },
+    }
+
+    assert _rules(clause) == ['Include users (across all sessions): {"futureFilter": {"x": 1}}']

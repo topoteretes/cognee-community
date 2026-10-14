@@ -260,18 +260,98 @@ def render_key_event(event: dict[str, Any]) -> dict[str, Any]:
     return _document(event["name"], _text(event.get("eventName")), fields)
 
 
-def _prune(value: Any) -> Any:
-    """Drop the empty parts of an audience definition so only its rules are left."""
-    if isinstance(value, dict):
-        pruned = {key: _prune(item) for key, item in value.items()}
-        return {key: item for key, item in pruned.items() if item not in (None, "", [], {})}
-    if isinstance(value, list):
-        return [item for item in (_prune(item) for item in value) if item not in (None, "", [], {})]
-    return value
+_OPERATORS = {"EQUAL": "=", "LESS_THAN": "<", "GREATER_THAN": ">"}
+_MATCHES = {
+    "EXACT": "is",
+    "BEGINS_WITH": "begins with",
+    "ENDS_WITH": "ends with",
+    "CONTAINS": "contains",
+    "FULL_REGEXP": "matches the regex",
+}
+
+
+def _number(value: Any) -> str:
+    value = value if isinstance(value, dict) else {}
+    return _text(value.get("int64Value", value.get("doubleValue")))
+
+
+def _condition(spec: dict[str, Any]) -> str:
+    """One dimension or metric test, e.g. ``event_count > 1 in any 7-day period``."""
+    if "stringFilter" in spec:
+        match = spec["stringFilter"]
+        kind = match.get("matchType")
+        test = f"{_MATCHES.get(kind, _label(kind))} '{_text(match.get('value'))}'"
+        test += " (case sensitive)" if match.get("caseSensitive") else ""
+    elif "inListFilter" in spec:
+        values = sorted(_text(value) for value in spec["inListFilter"].get("values") or [])
+        test = f"is one of {', '.join(values)}"
+    elif "numericFilter" in spec:
+        match = spec["numericFilter"]
+        kind = match.get("operation")
+        test = f"{_OPERATORS.get(kind, _label(kind))} {_number(match.get('value'))}"
+    elif "betweenFilter" in spec:
+        match = spec["betweenFilter"]
+        test = f"between {_number(match.get('fromValue'))} and {_number(match.get('toValue'))}"
+    else:
+        return json.dumps(spec, sort_keys=True)
+    days = _text(spec.get("inAnyNDayPeriod"))
+    window = f" in any {days}-day period" if days else ""
+    ever = " at any point in time" if spec.get("atAnyPointInTime") else ""
+    return f"{_text(spec.get('fieldName'))} {test}{window}{ever}"
+
+
+def _expression(expression: Any) -> str:
+    """An audience filter expression as one line; and/or groups are sorted, they commute."""
+    if not isinstance(expression, dict):
+        return ""
+    for key, joiner in (("andGroup", " and "), ("orGroup", " or ")):
+        if key in expression:
+            group = expression[key].get("filterExpressions") or []
+            parts = sorted(part for part in map(_expression, group) if part)
+            return parts[0] if len(parts) == 1 else f"({joiner.join(parts)})"
+    if "notExpression" in expression:
+        return f"not {_expression(expression['notExpression'])}"
+    if "eventFilter" in expression:
+        event = expression["eventFilter"]
+        where = _expression(event.get("eventParameterFilterExpression"))
+        name = f"event {_text(event.get('eventName'))}"
+        return f"{name} where {where}" if where else name
+    if "dimensionOrMetricFilter" in expression:
+        return _condition(expression["dimensionOrMetricFilter"])
+    # an expression kind this version does not know is kept as data, not dropped
+    return json.dumps(expression, sort_keys=True) if expression else ""
+
+
+def _scope(value: Any) -> str:
+    return _label(_text(value).removeprefix("AUDIENCE_FILTER_SCOPE_")) or "any scope"
+
+
+def _clause(clause: dict[str, Any]) -> str:
+    verb = "Exclude" if clause.get("clauseType") == "EXCLUDE" else "Include"
+    if "simpleFilter" in clause:
+        match = clause["simpleFilter"]
+        rule = _expression(match.get("filterExpression"))
+        return f"{verb} users ({_scope(match.get('scope'))}): {rule}"
+    if "sequenceFilter" in clause:
+        match = clause["sequenceFilter"]
+        steps = []
+        for step in match.get("sequenceSteps") or []:
+            step_text = _expression(step.get("filterExpression"))
+            if steps:
+                step_text = (
+                    "directly then " if step.get("immediatelyFollows") else "then "
+                ) + step_text
+            if step.get("constraintDuration"):
+                step_text += f" within {_text(step['constraintDuration'])}"
+            steps.append(step_text)
+        limit = _text(match.get("sequenceMaximumDuration"))
+        rule = ", ".join(steps) + (f", all within {limit}" if limit else "")
+        return f"{verb} users who in order ({_scope(match.get('scope'))}): {rule}"
+    return json.dumps(clause, sort_keys=True)
 
 
 def render_audience(audience: dict[str, Any]) -> dict[str, Any]:
-    clauses = [_prune(clause) for clause in audience.get("filterClauses") or []]
+    clauses = [clause for clause in audience.get("filterClauses") or [] if isinstance(clause, dict)]
     excludes = any(clause.get("clauseType") == "EXCLUDE" for clause in clauses)
     trigger = audience.get("eventTrigger") or {}
     joined = _text(trigger.get("eventName"))
@@ -282,7 +362,7 @@ def render_audience(audience: dict[str, Any]) -> dict[str, Any]:
         ("Logs event", f"{joined} ({_label(trigger.get('logCondition'))})" if joined else ""),
     ]
     # the api calls the clauses unordered, so sort them to keep the fingerprint stable
-    rules = sorted(json.dumps(clause, sort_keys=True) for clause in clauses if clause)
+    rules = sorted(_clause(clause) for clause in clauses)
     return _document(
         audience["name"],
         _text(audience.get("displayName")) or "Untitled audience",
