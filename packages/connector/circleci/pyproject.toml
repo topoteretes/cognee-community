@@ -3,7 +3,7 @@ name = "cognee-community-connector-circleci"
 version = "0.1.0"
 description = "CircleCI data-source connector for cognee — sync pipeline execution data into memory (full snapshot + forget-on-delete)"
 readme = "README.md"
-requires-python = ">=3.11,<=3.13"
+requires-python = ">=3.11,<3.14"
 dependencies = [
     # Requires cognee "document-mode" (DOCUMENT_SOURCE_ATTR + resolve_dlt_sources
     # routing pipeline executions through cognify instead of the dlt-schema path),
