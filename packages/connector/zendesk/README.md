@@ -111,8 +111,14 @@ Zendesk subdomain and dataset (`PIPELINE_SCOPE_ATTR`).
 uv run pytest tests/
 ```
 
-The tests mock the Zendesk API with responses shaped like a real trial account's. They
-cover rendering, the export cursor and resume, comment-only changes, deleted tickets, a
-ticket changed several times in one window, article edit / archive / unpublish / no-op,
-the failed-listing guard, the export page cap, auth and config errors, the dlt wiring,
-the row-to-document mapping in cognee, and an end-to-end dlt merge into SQLite.
+No Zendesk account or API key is needed. `tests/fake_zendesk.py` is an in-memory Zendesk
+with responses shaped like a real trial account's.
+
+- `test_zendesk.py` covers rendering, requester and assignee names (also for an agent who
+  never replied), the export cursor and resume, comment-only changes, deleted tickets, a
+  ticket changed several times in one window, article edit / archive / unpublish / no-op,
+  the failed-listing guard, the export page cap, auth and config errors, the dlt wiring,
+  the row-to-document mapping in cognee, and an end-to-end dlt merge into SQLite.
+- `test_zendesk_forget.py` runs the real cognee pipeline (LLM and embeddings mocked, like
+  the google-drive connector's forget test) and checks that a deleted ticket and an
+  archived article leave the graph, while an untouched ticket stays.
