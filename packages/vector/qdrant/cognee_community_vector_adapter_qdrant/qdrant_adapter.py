@@ -371,31 +371,14 @@ class QDrantAdapter(VectorDBInterface):
         include_payload: bool = False,
         node_name: Optional[List[str]] = None,
         node_name_filter_operator: str = "OR",
-    ):
-        """
-        Perform batch search in a Qdrant collection with dynamic search requests.
-
-        Args:
-        - collection_name (str): Name of the collection to search in.
-        - query_texts (List[str]): List of query texts to search for.
-        - limit (int): List of result limits for search requests.
-        - with_vectors (bool, optional): Bool indicating whether to return
-                                         vectors for search requests.
-        - include_payload (bool, optional): Bool indicating whether to return payload in results.
-
-        Returns:
-        - results: The search results from Qdrant.
-        """
-
-        client = self.get_qdrant_client()
-        if limit is None:
-            collection_size = await client.count(collection_name=collection_name)
-            limit = collection_size.count
-        if limit == 0:
-            await client.close()
+    ) -> list[list[ScoredResult]]:
+        """Return one list of cosine-distance results per query, using Cognee embeddings."""
+        if not query_texts:
             return []
+        if limit == 0 or not await self.has_collection(collection_name):
+            return [[] for _ in query_texts]
 
-        client = self.get_qdrant_client()
+        query_vectors = await self.embed_data(query_texts)
 
         filters = [
             models.FieldCondition(
@@ -424,35 +407,47 @@ class QDrantAdapter(VectorDBInterface):
                     )
                 )
 
+        client = self.get_qdrant_client()
         try:
-            # Use query_batch instead of search_batch (API change in qdrant-client)
-            # query_batch is the correct method for AsyncQdrantClient
-            query_results = await client.query_batch(
+            query_filter = models.Filter(must=filters)
+            if limit is None:
+                collection_size = await client.count(
+                    collection_name=collection_name, count_filter=query_filter, exact=True
+                )
+                limit = collection_size.count
+            if limit == 0:
+                return [[] for _ in query_texts]
+
+            responses = await client.query_batch_points(
                 collection_name=collection_name,
-                query_texts=query_texts,
-                query_filter=filters,
-                limit=limit,
-                with_vectors=with_vectors,
-                with_payload=include_payload,
-                search_params=build_search_params(),
+                requests=[
+                    models.QueryRequest(
+                        query=vector,
+                        using="text",
+                        filter=query_filter,
+                        limit=limit,
+                        with_vector=with_vectors,
+                        with_payload=True if include_payload else ["id"],
+                        params=build_search_params(),
+                    )
+                    for vector in query_vectors
+                ],
             )
-
-            await client.close()
-
-            # Extract points from each query result and filter by score
-            filtered_results = []
-            for query_result in query_results:
-                points = query_result.points if hasattr(query_result, "points") else []
-                filtered_points = [
-                    result for result in points if hasattr(result, "score") and result.score > 0.9
+            return [
+                [
+                    ScoredResult(
+                        id=parse_id(str((point.payload or {}).get("id", point.id))),
+                        payload=serialize_for_json(point.payload)
+                        if include_payload and point.payload
+                        else None,
+                        score=1 - point.score,
+                    )
+                    for point in response.points
                 ]
-                filtered_results.append(filtered_points)
-
-            return filtered_results
-        except Exception as e:
-            logger.error(f"Error in Qdrant batch_search: {e}", exc_info=True)
+                for response in responses
+            ]
+        finally:
             await client.close()
-            return []
 
     async def delete_data_points(self, collection_name: str, data_point_ids: list[str]):
         if not data_point_ids:
