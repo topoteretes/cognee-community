@@ -3,7 +3,7 @@ name = "cognee-community-connector-discourse"
 version = "0.1.0"
 description = "Discourse forum data-source connector for cognee — sync forum topics into memory (merge + _deleted tombstone)"
 readme = "README.md"
-requires-python = ">=3.11,<=3.13"
+requires-python = ">=3.11,<3.14"
 dependencies = [
     "cognee>=1.4.0,<2",
     "dlt[sqlalchemy]>=1.9.0,<2",
