@@ -1,0 +1,99 @@
+name: Connector Package Validation
+
+on:
+  pull_request:
+    branches: [main, dev]
+    paths:
+      - "packages/connector/**"
+      - ".github/actions/community_setup/**"
+      - ".github/workflows/connector_package_validation.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: connector-validation-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    name: Discover changed connectors
+    runs-on: ubuntu-22.04
+    outputs:
+      packages: ${{ steps.changed-connectors.outputs.packages }}
+      has-connectors: ${{ steps.changed-connectors.outputs.has-connectors }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Discover changed connector packages
+        id: changed-connectors
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        shell: bash
+        run: |
+          packages=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- 'packages/connector/*' \
+            | awk -F/ 'NF >= 3 {print $1 "/" $2 "/" $3}' \
+            | sort -u \
+            | jq -Rsc 'split("\n") | map(select(length > 0))')
+          echo "packages=$packages" >> "$GITHUB_OUTPUT"
+          if [ "$packages" = "[]" ]; then
+            echo "has-connectors=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has-connectors=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  validate:
+    name: Validate ${{ matrix.package }}
+    needs: prepare
+    if: needs.prepare.outputs.has-connectors == 'true'
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        package: ${{ fromJSON(needs.prepare.outputs.packages) }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Community setup
+        uses: ./.github/actions/community_setup
+        with:
+          package-path: ${{ matrix.package }}
+          python-version: "3.11.x"
+
+      - name: Validate package layout
+        working-directory: ${{ matrix.package }}
+        shell: bash
+        run: |
+          test -f pyproject.toml
+          test -d tests
+
+      - name: Install validation tools
+        working-directory: ${{ matrix.package }}
+        run: poetry run pip install build hatchling ruff
+
+      - name: Run tests
+        working-directory: ${{ matrix.package }}
+        run: poetry run pytest tests/ -q
+
+      - name: Run Ruff lint
+        working-directory: ${{ matrix.package }}
+        run: poetry run ruff check .
+
+      - name: Check Ruff formatting
+        working-directory: ${{ matrix.package }}
+        run: poetry run ruff format --check .
+
+      - name: Compile Python sources
+        working-directory: ${{ matrix.package }}
+        run: poetry run python -m compileall -q .
+
+      - name: Build wheel
+        working-directory: ${{ matrix.package }}
+        run: poetry run python -m build --wheel
