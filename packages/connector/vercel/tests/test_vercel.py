@@ -31,6 +31,7 @@ from cognee_community_connector_vercel.vercel import (
     VERCEL_SOURCE_NAME,
     _build_log_rows,
     _deployment_row,
+    _event_text,
     _project_row,
     _timestamp,
     vercel_source,
@@ -391,6 +392,20 @@ def test_build_log_rows_keep_deployments_apart():
 # ---------------------------------------------------------------------------
 # Source construction
 # ---------------------------------------------------------------------------
+
+
+def test_vercel_source_keeps_its_state_per_dataset():
+    # The empty-account guard lives in dlt state; without a scope every unscoped
+    # dlt source in cognee would share one pipeline state.
+    from cognee.tasks.ingestion.dlt_utils import PIPELINE_SCOPE_ATTR
+
+    assert getattr(vercel_source(token="test-token"), PIPELINE_SCOPE_ATTR) == "vercel"
+
+
+def test_event_text_drops_colour_codes_and_carriage_returns():
+    assert _event_text({"text": "\x1b[31mError\x1b[0m: boom\r\n"}) == "Error: boom"
+    # Progress output overwrites itself with \r: each step becomes its own line.
+    assert _event_text({"text": "50%\r100%"}) == "50%\n100%"
 
 
 def test_vercel_source_declares_document_marker():
@@ -844,6 +859,38 @@ def test_events_body_that_is_not_a_list_aborts_sync(dlt_mod, tmp_path):
         _run_sync(dlt_mod, tmp_path, fake)
 
     assert _read(_pipeline(dlt_mod, tmp_path), VERCEL_BUILD_LOGS_TABLE) == before
+
+
+def test_an_account_that_suddenly_lists_no_projects_aborts(dlt_mod, tmp_path):
+    # A token for the wrong team answers with a valid, empty list. Under replace
+    # that would forget every project, deployment and log.
+    fake = _fleet()
+    first = _run_sync(dlt_mod, tmp_path, fake)
+    before = {table: _read(first, table) for table in _TABLES}
+
+    fake.projects, fake.deployments = [], []
+    with pytest.raises(Exception, match="no projects at all"):
+        _run_sync(dlt_mod, tmp_path, fake)
+
+    pipeline = _pipeline(dlt_mod, tmp_path)
+    assert {table: _read(pipeline, table) for table in _TABLES} == before
+
+
+def test_allow_empty_lets_an_emptied_account_through(dlt_mod, tmp_path):
+    fake = _fleet()
+    _run_sync(dlt_mod, tmp_path, fake)
+
+    fake.projects, fake.deployments = [], []
+    pipeline = _run_sync(dlt_mod, tmp_path, fake, allow_empty=True)
+    assert _read(pipeline, VERCEL_PROJECTS_TABLE) == {}
+    assert _read(pipeline, VERCEL_DEPLOYMENTS_TABLE) == {}
+    # Once the empty account is accepted, later empty syncs are fine as well.
+    _run_sync(dlt_mod, tmp_path, fake)
+
+
+def test_first_sync_of_an_empty_account_is_fine(dlt_mod, tmp_path):
+    fake = FakeVercel(projects=[], deployments=[])
+    _run_sync(dlt_mod, tmp_path, fake)  # nothing was synced before, so nothing to protect
 
 
 def test_unexpected_list_shape_aborts_sync(dlt_mod, tmp_path):

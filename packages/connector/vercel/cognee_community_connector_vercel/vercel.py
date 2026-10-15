@@ -31,6 +31,9 @@ forgotten by cognee's ``orphan_cleanup``.
 Fail closed. Staging is authoritative under replace, so a short read would be
 forgotten as if it were a deletion. An HTTP error or an unexpected response
 shape on a list call raises and aborts the run, which leaves memory untouched.
+So does an account that suddenly lists no projects at all after an earlier sync
+listed some: a token for the wrong team answers with a valid empty list, and
+replace would forget everything. ``allow_empty=True`` lets that sync through.
 
 Build output is its own document. A ``rest_api`` child resource cannot write
 back into its parent's row, so the log of a failed build is loaded as a
@@ -38,11 +41,13 @@ separate document keyed by the deployment id.
 """
 
 import os
+import re
 from datetime import UTC, datetime, timedelta
 from itertools import groupby
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
-from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
+from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR, PIPELINE_SCOPE_ATTR
 
 VERCEL_SOURCE_NAME = "vercel"
 # dlt resource / staging-table names. cognee scopes orphan cleanup by table, so
@@ -76,6 +81,7 @@ def vercel_source(
     lookback_days: int | None = 30,
     include_build_logs: bool = True,
     max_log_chars: int | None = 20000,
+    allow_empty: bool = False,
     session: Any = None,
 ):
     """Create a dlt source that yields Vercel projects, deployments and failed-build output.
@@ -95,6 +101,10 @@ def vercel_source(
         max_log_chars: Keep only the last N characters of a build log, where the
             error usually is. Only the newest ``max_log_chars // 10`` lines (at
             least 100) are requested. ``None`` requests and keeps the whole log.
+        allow_empty: Let a sync through when the account lists no projects at all
+            although an earlier sync listed some. Off by default, because that is
+            what a token for the wrong team looks like, and it would forget
+            everything. Turn it on once to forget a team that really is empty.
         session: ``requests.Session`` to send requests through (mainly a
             test-injection point). When omitted dlt's own session is used, which
             retries 429 and 5xx responses.
@@ -143,7 +153,9 @@ def vercel_source(
         window["since"] = int(since.timestamp() * 1000)
     scope = {"teamId": resolved_team} if resolved_team else {}
 
-    def listing(path: str, key: str, missing: list | None = None, **params: Any) -> dict:
+    def listing(
+        path: str, key: str, missing: list | None = None, guard: bool = False, **params: Any
+    ) -> dict:
         return {
             "path": path,
             "params": {"limit": _PAGE_SIZE, **scope, **params},
@@ -154,7 +166,7 @@ def vercel_source(
                 "cursor_path": "pagination.next",
                 "cursor_param": "until",
             },
-            "response_actions": [*(missing or []), _require_list(key)],
+            "response_actions": [*(missing or []), _require_list(key, guard, allow_empty)],
         }
 
     def wanted_project(project: dict) -> bool:
@@ -177,7 +189,7 @@ def vercel_source(
             "name": VERCEL_PROJECTS_TABLE,
             "primary_key": "id",
             "write_disposition": "replace",
-            "endpoint": listing("v10/projects", "projects"),
+            "endpoint": listing("v10/projects", "projects", guard=True),
             "processing_steps": [{"filter": wanted_project}, {"map": _project_row}],
         },
         {
@@ -263,6 +275,9 @@ def vercel_source(
     # Opt into the document ingestion path (row -> text document -> cognify).
     # Set on the object that is returned: resolve_dlt_sources reads it from there.
     setattr(source, DOCUMENT_SOURCE_ATTR, VERCEL_SOURCE_NAME)
+    # Keep this source's dlt state (the empty-account guard) per dataset. Without
+    # a scope, every unscoped dlt source shares one pipeline and its state.
+    setattr(source, PIPELINE_SCOPE_ATTR, VERCEL_SOURCE_NAME)
     return source
 
 
@@ -271,7 +286,7 @@ def vercel_source(
 # ---------------------------------------------------------------------------
 
 
-def _require_list(key: str):
+def _require_list(key: str, guard: bool = False, allow_empty: bool = False):
     """Build a response hook that aborts unless the body holds a list under ``key``.
 
     The projects endpoint is documented with a bare-array response as well. With
@@ -279,6 +294,10 @@ def _require_list(key: str):
     replace an empty read forgets everything. A body without ``pagination.next``
     is refused too: dlt's cursor paginator would stop there quietly and keep only
     the pages read so far. Raising keeps memory untouched.
+
+    With ``guard`` (the projects list), a first page with no items is refused when
+    an earlier sync saw items, unless ``allow_empty``. The flag is kept in the
+    source's dlt state, which is only saved when a load succeeds.
     """
 
     def check(response, *args, **kwargs):
@@ -296,6 +315,17 @@ def _require_list(key: str):
                 f"Vercel: expected a 'pagination.next' cursor from {response.url}. "
                 "Aborting so a partial snapshot cannot forget live rows."
             )
+        if guard and "until" not in parse_qs(urlsplit(response.url).query):
+            import dlt
+
+            state = dlt.current.source_state()
+            if not body[key] and state.get(f"had_{key}") and not allow_empty:
+                raise ValueError(
+                    f"Vercel: no {key} at all, although an earlier sync found some. A "
+                    "token for the wrong team looks like this. Aborting so memory is "
+                    "not wiped; pass allow_empty=True if the account really is empty."
+                )
+            state[f"had_{key}"] = bool(body[key])
 
     return check
 
@@ -426,13 +456,25 @@ def _build_log_rows(events: Any, max_log_chars: int | None, line_limit: int | No
         }
 
 
+# Terminal colour and cursor codes. Vercel usually strips them, but a build tool
+# that forces colour can still print them, and they are noise in a document.
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+
 def _event_text(event: dict) -> str:
-    """Return the log line of a build event, from either documented shape."""
+    """Return the log line of a build event, from either documented shape.
+
+    Colour codes are removed and carriage returns become line breaks: real build
+    logs carry progress lines that end in ``\r``.
+    """
     text = event.get("text")
     if not isinstance(text, str):
         payload = event.get("payload")
         text = payload.get("text") if isinstance(payload, dict) else None
-    return text.rstrip("\n") if isinstance(text, str) else ""
+    if not isinstance(text, str):
+        return ""
+    text = _ANSI.sub("", text).replace("\r\n", "\n").replace("\r", "\n")
+    return text.strip("\n")
 
 
 def _commit_meta(meta: dict, suffix: str) -> str | None:

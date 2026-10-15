@@ -42,6 +42,7 @@ answer = await cognee.search(
 | `project_ids` | all projects | Restrict the sync to these project ids or names (any case). One entry, or 2 to 20 `prj_` ids, is filtered by Vercel itself. A listed project that no longer exists is treated as deleted. |
 | `lookback_days` | `30` | How far back deployments are read, in days (more than 0). `None` reads all of them. |
 | `include_build_logs` | `True` | Fetch build output for failed deployments. |
+| `allow_empty` | `False` | Let a sync through when the account lists no projects at all although an earlier sync listed some. |
 | `max_log_chars` | `20000` | Keep only the end of a build log. Only the newest `max_log_chars // 10` lines (at least 100) are requested. `None` requests and keeps all of it. |
 
 See `examples/example.py` for the full flow.
@@ -73,6 +74,9 @@ Each run is a **full snapshot of a fixed window**: every deployment created in t
 - An HTTP error or an unexpected response shape aborts the run and leaves memory untouched: a
   list without its `pagination` block, or build events that are not a list, count as unexpected.
   A partial snapshot would otherwise be forgotten as if it were a deletion.
+- An account that suddenly lists no projects at all, after an earlier sync listed some, aborts the
+  run too. A token for the wrong team looks exactly like that. Pass `allow_empty=True` once to
+  forget an account that really is empty.
 
 Leave `write_disposition` at its default. Passing `merge` breaks forget-on-delete for a snapshot
 source.
