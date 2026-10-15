@@ -34,6 +34,9 @@ TOKENS = (ALPHA, BRAVO, CHARLIE, DELTA)
 ACCOUNTS = RedshiftTable("public.accounts", primary_key="id", cursor_column="updated_at")
 VENDORS = RedshiftTable("public.vendors", primary_key="id")
 
+# Chunks the mocked LLM extracted a graph from, in call order.
+EXTRACTED: list[str] = []
+
 
 def _with_required(model, **values):
     """Build a cognee data model, filling any other required text field.
@@ -60,6 +63,7 @@ async def _mock_structured_output(
     if response_model == SummarizedContent:
         return SummarizedContent(summary="Mock summary", description="Mock summary")
     if response_model == KnowledgeGraph:
+        EXTRACTED.append(text_input or "")
         name = next((t for t in TOKENS if text_input and t in text_input), None)
         nodes = (
             [
@@ -108,6 +112,7 @@ async def clean_environment(tmp_path, monkeypatch):
 
     await cognee.prune.prune_data()
     await cognee.prune.prune_system(metadata=True)
+    EXTRACTED.clear()
     yield
     await cognee.prune.prune_data()
     await cognee.prune.prune_system(metadata=True)
@@ -197,3 +202,19 @@ async def test_rows_and_their_table_card_share_a_node_set(clean_environment, fak
     nodes, _ = await (await get_graph_engine()).get_graph_data()
     node_sets = {props.get("name") for _id, props in nodes if props.get("type") == "NodeSet"}
     assert "redshift:table:public.accounts" in node_sets
+
+
+@pytest.mark.asyncio
+async def test_unchanged_resync_does_not_call_the_llm_again(clean_environment, fake):
+    await _sync(fake, [ACCOUNTS, VENDORS])
+    assert EXTRACTED, "the first sync should extract a graph"
+
+    # The cursor re-reads the rows at its boundary (>=), and the vendors table
+    # has no cursor, so both are emitted again with the same content.
+    EXTRACTED.clear()
+    await _sync(fake, [ACCOUNTS, VENDORS])
+    assert EXTRACTED == [], "unchanged rows must not be cognified again"
+
+    fake.update("accounts", "id", 1, notes="Renewed early.", updated_at="2026-03-01")
+    await _sync(fake, [ACCOUNTS, VENDORS])
+    assert len(EXTRACTED) == 1 and "Renewed early." in EXTRACTED[0]
