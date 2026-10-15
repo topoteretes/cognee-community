@@ -425,5 +425,6 @@ def brex_source(
         setattr(brex_memos, DOCUMENT_SOURCE_ATTR, "brex")
         if BREX_MEMOS_TABLE in source.resources:
             setattr(source.resources[BREX_MEMOS_TABLE], DOCUMENT_SOURCE_ATTR, "brex")
+        setattr(source, DOCUMENT_SOURCE_ATTR, "brex")
 
     return source
