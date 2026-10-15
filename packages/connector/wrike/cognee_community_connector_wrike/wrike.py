@@ -44,7 +44,9 @@ import json
 import os
 import tempfile
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
@@ -63,6 +65,9 @@ SOURCE_TAG = "wrike"
 PAGE_SIZE = 1000
 # /folders/{ids} accepts at most 100 ids per call.
 _FOLDER_BATCH = 100
+# How far each incremental run reaches back before the cursor, for clock drift
+# between this machine and Wrike. Re-reading a task is harmless under merge.
+_CURSOR_OVERLAP = timedelta(minutes=5)
 TASK_FIELDS = ["description", "customFields", "parentIds", "responsibleIds", "superTaskIds"]
 
 _MAX_RETRIES = 5
@@ -327,6 +332,7 @@ class _FolderTree:
     def __init__(self, folders: list[dict]):
         live = {f["id"]: f for f in folders if f.get("scope") in ("WsRoot", "WsFolder")}
         self.root_id = next(fid for fid, f in live.items() if f["scope"] == "WsRoot")
+        self.recycle_bin_id = next(f["id"] for f in folders if f.get("scope") == "RbRoot")
         self.folders = live
         # ponytail: a folder shared into two parents gets one path, the first seen.
         self.parent: dict[str, str] = {}
@@ -437,40 +443,120 @@ def render_folder(folder: dict, tree: _FolderTree, names: _Names) -> dict:
 # ---------------------------------------------------------------------------
 # Sync
 # ---------------------------------------------------------------------------
-def _iter_rows(client: WrikeClient, folder_ids: list[str] | None):
-    """Yield one row per in-scope folder and task.
+def _task_query(**extra: Any) -> dict[str, Any]:
+    return {
+        "descendants": True,
+        "subTasks": True,
+        "fields": TASK_FIELDS,
+        "pageSize": PAGE_SIZE,
+        **extra,
+    }
 
-    Plain function of a client, so tests drive it with a fake client and no dlt.
+
+def _stamp(moment: datetime) -> str:
+    return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _iter_rows(
+    client: WrikeClient,
+    folder_ids: list[str] | None,
+    state: dict,
+    full_resync: bool = False,
+    now: Callable[[], datetime] = lambda: datetime.now(UTC),
+):
+    """Yield rows for what changed since the last run, plus delete rows.
+
+    ``state`` is dlt's per-resource state (a plain dict in tests):
+
+    * ``cursor``: the time captured *before* the previous run started listing;
+    * ``roots``: the folders that run synced;
+    * ``seen``: the row ids currently ingested. Delete rows are only sent for
+      these, so a change elsewhere in the account never produces one.
+
+    State is only written after the last row is yielded. A run that fails part
+    way is rolled back by dlt, so the next run starts from the old state.
+
+    **Full run** (the first run, a changed ``folder_ids``, or ``full_resync``):
+    list everything in scope, and delete every seen id that was not listed. This
+    also catches what an incremental run cannot see: a Recycle Bin emptied before
+    the sync, a folder the token lost access to, or a task that left scope
+    because a second folder it sat in was deleted (that does not bump the task's
+    ``updatedDate``).
+
+    **Incremental run**: ask Wrike only for what changed since ``cursor`` (minus
+    a small overlap for clock drift; merge makes a re-read harmless), and delete
+
+    * tasks in the Recycle Bin. A deleted folder leaves its tasks pointing at the
+      folder, not at the bin, so only ``descendants=true`` finds them;
+    * tasks that changed but are no longer in scope (moved out);
+    * folders that were deleted or moved out of scope.
     """
+    started = now()
     tree = _FolderTree(client.get("/folders"))
-    roots = list(folder_ids or [tree.root_id])
+    roots = sorted(folder_ids or [tree.root_id])
     unknown = [fid for fid in roots if fid not in tree.folders]
     if unknown:
         # A configuration problem, not a deletion: never sync around it.
         raise ValueError(f"Unknown or deleted Wrike folder id(s): {', '.join(unknown)}.")
     names = _Names.load(client)
+    scope = [fid for fid in tree.subtree(roots) if fid != tree.root_id]
+    seen = set(state.get("seen", []))
 
-    folder_ids_in_scope = [fid for fid in tree.subtree(roots) if fid != tree.root_id]
-    for start in range(0, len(folder_ids_in_scope), _FOLDER_BATCH):
-        batch = folder_ids_in_scope[start : start + _FOLDER_BATCH]
+    incremental = (
+        not full_resync and state.get("cursor") is not None and state.get("roots") == roots
+    )
+    since: dict[str, Any] = {}
+    candidates: set[str] = set()  # ids that may have been removed (incremental only)
+    folders_to_render = scope
+    if incremental:
+        cursor = datetime.fromisoformat(state["cursor"].replace("Z", "+00:00"))
+        since = {"updatedDate": {"start": _stamp(cursor - _CURSOR_OVERLAP)}}
+        changed_folders = client.get("/folders", **since)
+        folders_to_render = [f["id"] for f in changed_folders if f["id"] in scope]
+        candidates |= {f"folder:{f['id']}" for f in changed_folders}
+        # Every changed task, in scope or not. Listed BEFORE the in-scope query:
+        # a task edited between the two calls then shows up in scope rather
+        # than being mistaken for one that moved out.
+        candidates |= {f"task:{t['id']}" for t in client.get("/tasks", pageSize=PAGE_SIZE, **since)}
+        candidates |= {
+            f"task:{t['id']}"
+            for t in client.get(f"/folders/{tree.recycle_bin_id}/tasks", **_task_query(**since))
+        }
+
+    yielded: set[str] = set()
+    for start in range(0, len(folders_to_render), _FOLDER_BATCH):
+        batch = folders_to_render[start : start + _FOLDER_BATCH]
         for folder in client.get(f"/folders/{','.join(batch)}"):
-            yield render_folder(folder, tree, names)
+            row = render_folder(folder, tree, names)
+            yielded.add(row["id"])
+            yield row
 
     tasks: dict[str, dict] = {}
     for root in roots:
-        for task in client.get(
-            f"/folders/{root}/tasks",
-            descendants=True,
-            subTasks=True,
-            fields=TASK_FIELDS,
-            pageSize=PAGE_SIZE,
-        ):
+        for task in client.get(f"/folders/{root}/tasks", **_task_query(**since)):
             tasks.setdefault(task["id"], task)
     task_titles = {tid: task.get("title", "") for tid, task in tasks.items()}
     for task in tasks.values():
         comments = client.get(f"/tasks/{task['id']}/comments")
-        yield render_task(task, comments, tree, names, task_titles)
-    logger.info("Wrike: synced %d folder(s) and %d task(s).", len(folder_ids_in_scope), len(tasks))
+        row = render_task(task, comments, tree, names, task_titles)
+        yielded.add(row["id"])
+        yield row
+
+    # Only ids we ingested can be forgotten; anything listed this run stays.
+    deleted = ((candidates if incremental else seen) & seen) - yielded
+    for row_id in sorted(deleted):
+        yield {"id": row_id, "_deleted": True}
+
+    state["cursor"] = _stamp(started)
+    state["roots"] = roots
+    state["seen"] = sorted((seen | yielded) - deleted)
+    logger.info(
+        "Wrike: %s sync, %d folder(s), %d task(s), %d deletion(s).",
+        "incremental" if incremental else "full",
+        len(folders_to_render),
+        len(tasks),
+        len(deleted),
+    )
 
 
 def _env_list(name: str) -> list[str] | None:
@@ -486,6 +572,7 @@ def wrike_source(
     client_secret: str | None = None,
     token_path: str | os.PathLike | None = None,
     host: str | None = None,
+    full_resync: bool = False,
     client: WrikeClient | None = None,
 ):
     """Return a ``dlt`` resource with one document row per Wrike folder and task.
@@ -501,6 +588,9 @@ def wrike_source(
         client_id, client_secret, token_path: OAuth refresh. ``token_path`` is a
             JSON file holding ``refresh_token``; it is rewritten on every run.
         host: Wrike data centre for a permanent token (default ``www.wrike.com``).
+        full_resync: List everything instead of only what changed, and forget
+            whatever is gone. Catches deletions an incremental run cannot see
+            (an emptied Recycle Bin, lost access); worth running now and then.
         client: Pre-built client, mainly a test injection point.
     """
     try:
@@ -538,11 +628,11 @@ def wrike_source(
         write_disposition="merge",
         primary_key="id",
         # Rows with _deleted=True are removed from dlt's table on merge, and
-        # cognee's orphan cleanup then forgets the document (used from step 4 on).
+        # cognee's orphan cleanup then forgets the document.
         columns={"_deleted": {"data_type": "bool", "hard_delete": True}},
     )
     def wrike_items():
-        yield from _iter_rows(build_client(), folder_ids)
+        yield from _iter_rows(build_client(), folder_ids, dlt.current.resource_state(), full_resync)
 
     resource = wrike_items()
     # Opt into cognee's document path: each row is prose for normal cognify.

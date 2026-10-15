@@ -120,7 +120,7 @@ class FakeWrike:
 
 
 def rows_by_id(folder_ids=None, client=None):
-    return {row["id"]: row for row in _iter_rows(client or FakeWrike(), folder_ids)}
+    return {row["id"]: row for row in _iter_rows(client or FakeWrike(), folder_ids, {})}
 
 
 def test_task_document_uses_names_not_ids():
@@ -153,7 +153,7 @@ def test_row_shape():
 
 
 def test_rendering_is_deterministic():
-    assert list(_iter_rows(FakeWrike(), None)) == list(_iter_rows(FakeWrike(), None))
+    assert list(_iter_rows(FakeWrike(), None, {})) == list(_iter_rows(FakeWrike(), None, {}))
 
 
 def test_subtask_names_its_parent_task():
@@ -200,7 +200,7 @@ def test_folder_ids_limit_the_scope():
 
 
 def test_overlapping_folders_yield_each_task_once():
-    ids = [row["id"] for row in _iter_rows(FakeWrike(), [PROJECT, BACKEND])]
+    ids = [row["id"] for row in _iter_rows(FakeWrike(), [PROJECT, BACKEND], {})]
     assert ids.count("task:T_DB") == 1
     assert ids.count("folder:BACK") == 1
 
@@ -208,7 +208,7 @@ def test_overlapping_folders_yield_each_task_once():
 @pytest.mark.parametrize("folder_id", ["NOPE", DELETED])
 def test_unknown_or_deleted_folder_is_a_config_error(folder_id):
     with pytest.raises(ValueError, match=folder_id):
-        list(_iter_rows(FakeWrike(), [folder_id]))
+        list(_iter_rows(FakeWrike(), [folder_id], {}))
 
 
 def test_html_to_text():
