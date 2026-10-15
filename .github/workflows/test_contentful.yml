@@ -1,0 +1,68 @@
+name: Test Contentful Connector
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'packages/connector/contentful/**'
+      - '.github/workflows/test_contentful.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'packages/connector/contentful/**'
+      - '.github/workflows/test_contentful.yml'
+
+jobs:
+  test-contentful:
+    name: Contentful (${{ matrix.python-version }}, ${{ matrix.dependencies }})
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12', '3.13']
+        dependencies: [locked]
+        include:
+          - python-version: '3.12'
+            dependencies: latest
+    defaults:
+      run:
+        working-directory: packages/connector/contentful
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: packages/connector/contentful/uv.lock
+
+      - name: Resolve newest permitted dependencies
+        if: matrix.dependencies == 'latest'
+        run: uv lock --upgrade
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Run offline unit and storage integration tests
+        run: uv run --locked pytest -q tests
+
+      - name: Check lint and formatting
+        run: |
+          uv run --locked ruff check .
+          uv run --locked ruff format --check .
+
+      - name: Build package
+        run: uv build
+
+      - name: Import built wheel outside the source directory
+        run: |
+          uv pip install --python .venv/bin/python --no-deps --reinstall dist/*.whl
+          cd /tmp
+          "${GITHUB_WORKSPACE}/packages/connector/contentful/.venv/bin/python" -c 'from cognee_community_connector_contentful import contentful_source; print("Wheel import OK")'
