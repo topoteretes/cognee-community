@@ -309,6 +309,7 @@ def test_source_requires_a_url(monkeypatch):
         ({"token": "t", "username": "u", "password": "p"}, "not both"),
         ({"username": "u"}, "both a username and a password"),
         ({"rule_type": "alerting"}, "rule_type must be one of"),
+        ({"rule_groups": "node-health"}, "not a single string"),
     ],
 )
 def test_source_rejects_bad_arguments(kwargs, message, monkeypatch):
@@ -384,6 +385,27 @@ def test_unchanged_resync_produces_identical_rows(dlt_mod, tmp_path):
 
     fake.rules = _fixture("rules_second_read.json")
     assert _read(_run_sync(dlt_mod, tmp_path, fake)) == before
+
+
+def test_one_source_object_run_twice_keeps_its_ids(dlt_mod, tmp_path):
+    # A sync loop may hand the same source object to the pipeline again. If the
+    # duplicate counter carried over, every id would change and every rule would
+    # be forgotten and re-cognified.
+    fake = FakePrometheus()
+    source = prometheus_source(BASE_URL, session=fake.session())
+    pipeline = _pipeline(dlt_mod, tmp_path)
+    pipeline.run(source)
+    first = _read(pipeline)
+    pipeline.run(source)
+    assert _read(pipeline) == first
+    assert len(fake.rule_calls()) == 2
+
+
+def test_group_names_with_braces_are_sent_as_written(dlt_mod, tmp_path):
+    # dlt formats query params with str.format, so "{{" would arrive as "{".
+    fake = FakePrometheus()
+    _run_sync(dlt_mod, tmp_path, fake, rule_groups=["slo:{{svc}}", "slo:{svc}"])
+    assert fake.rule_calls()[-1][1]["rule_group[]"] == ["slo:{{svc}}", "slo:{svc}"]
 
 
 def test_edited_rule_changes_exactly_one_row(dlt_mod, tmp_path):
@@ -492,6 +514,7 @@ _ERROR = json.dumps({"status": "error", "errorType": "bad_data", "error": "nope"
 
 
 _EMPTY_ERROR = json.dumps({"status": "error", "data": {"groups": []}}).encode()
+_NO_METADATA = "a non-empty object under 'data'"
 _NOT_SUCCESS = "expected status 'success' and a 'data.groups' list"
 
 
@@ -528,8 +551,10 @@ def test_bad_rules_response_aborts_and_keeps_previous_snapshot(dlt_mod, tmp_path
     ("failure", "message"),
     [
         pytest.param((503, b""), "503", id="http-503"),
-        pytest.param((200, _ERROR), "an object under 'data'", id="status-error-with-200"),
-        pytest.param((200, b'{"status":"success","data":[]}'), "an object under 'data'", id="list"),
+        pytest.param((200, _ERROR), _NO_METADATA, id="status-error-with-200"),
+        pytest.param((200, b'{"status":"success","data":[]}'), _NO_METADATA, id="list"),
+        # What a server returns right after a restart, before its first scrapes.
+        pytest.param((200, b'{"status":"success","data":{}}'), _NO_METADATA, id="empty"),
     ],
 )
 def test_bad_metadata_response_aborts_the_whole_run(dlt_mod, tmp_path, failure, message):
@@ -637,6 +662,11 @@ def test_removed_rule_is_forgotten_from_the_graph(tmp_path, monkeypatch):
         await cognee.add(prometheus_source(BASE_URL, session=fake.session()), dataset_name=dataset)
         await cognee.cognify(datasets=[dataset])
 
+    async def data_ids():
+        datasets = await cognee.datasets.list_datasets()
+        found = next(item for item in datasets if item.name == dataset)
+        return {str(item.id) for item in await cognee.datasets.list_data(found.id)}
+
     async def scenario():
         await cognee.prune.prune_data()
         await cognee.prune.prune_system(metadata=True)
@@ -644,12 +674,17 @@ def test_removed_rule_is_forgotten_from_the_graph(tmp_path, monkeypatch):
             await sync()
             assert await _graph_has(ALPHA)
             assert await _graph_has(BRAVO)
+            before = await data_ids()
+            assert len(before) == 2
 
             # The rule is deleted from the rule file and Prometheus is reloaded.
             group["rules"] = [_alert(ALPHA)]
             await sync()
             assert await _graph_has(ALPHA), "the surviving rule must stay"
             assert not await _graph_has(BRAVO), "the removed rule must leave the graph"
+            after = await data_ids()
+            # The surviving rule keeps its document: it was not deleted and re-made.
+            assert len(after) == 1 and after < before
         finally:
             await cognee.prune.prune_data()
             await cognee.prune.prune_system(metadata=True)

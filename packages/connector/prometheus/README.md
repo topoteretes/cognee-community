@@ -91,6 +91,9 @@ source.
 - **One dataset per server.** Each sync is a full snapshot of one server.
 - **Metadata can be large.** A bare Prometheus 3.15.0 reported 265 metrics, and a real server can
   report thousands, each one a document to cognify. That is why it is off by default.
+- **Metadata needs live targets.** Prometheus builds it from its scrape caches, so right after a
+  restart it is empty. The connector refuses an empty answer and the run fails, instead of
+  forgetting every metric. Run it again once the first scrapes are done.
 - **dlt keeps its load files.** Each sync leaves a gzip copy of the loaded rows in dlt's pipeline
   directory, and forgetting a document does not remove those copies. Set
   `LOAD__DELETE_COMPLETED_JOBS=true` to have dlt delete them after each load.

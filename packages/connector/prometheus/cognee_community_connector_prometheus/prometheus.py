@@ -124,12 +124,18 @@ def prometheus_source(
         raise ValueError("Basic auth needs both a username and a password.")
     if rule_type is not None and rule_type not in _RULE_TYPES:
         raise ValueError(f"rule_type must be one of {_RULE_TYPES} or None, not {rule_type!r}.")
+    if isinstance(rule_groups, str):
+        raise ValueError("rule_groups must be a list of group names, not a single string.")
 
     params: dict[str, Any] = {"exclude_alerts": "true"}
     if rule_type:
         params["type"] = rule_type
     if rule_groups:
-        params["rule_group[]"] = list(rule_groups)
+        # dlt runs query params through str.format, so braces in a group name
+        # would turn into a different filter (and an empty snapshot). Escape them.
+        params["rule_group[]"] = [
+            group.replace("{", "{{").replace("}", "}}") for group in rule_groups
+        ]
 
     resources: list[dict] = [
         {
@@ -172,13 +178,12 @@ def prometheus_source(
         resource.name: resource
         for resource in rest_api_resources({"client": client, "resources": resources})
     }
-    # Shared by every page of one run, so duplicate rules get the same counter
-    # whichever page they arrive on.
-    seen: Counter = Counter()
 
     @dlt.transformer(name=PROMETHEUS_RULES_TABLE, primary_key="id", write_disposition="replace")
     def prometheus_rules(groups):
-        yield from _rule_rows(groups, seen)
+        # A fresh counter per call: the rule list is one page, so this is called
+        # once per run, and a source object that is run twice keeps its ids.
+        yield from _rule_rows(groups, Counter())
 
     loaded = [by_name[_RULE_GROUPS] | prometheus_rules]
 
@@ -214,9 +219,11 @@ def _require_success(key: str | None):
     """Build a response hook that aborts unless Prometheus answered ``success``.
 
     ``key`` names the list expected under ``data`` (``"groups"`` for rules).
-    ``None`` expects ``data`` itself to be an object, as metadata returns it. With
-    ``data_selector`` set, a body of another shape would yield no rows and no
-    error, and under replace an empty read forgets everything.
+    ``None`` expects ``data`` itself to be a non-empty object, as metadata returns
+    it. With ``data_selector`` set, a body of another shape would yield no rows and
+    no error, and under replace an empty read forgets everything. Metadata comes
+    from the scrape caches of live targets, so it is empty for a while after a
+    restart, and that read is refused too.
     """
 
     def check(response, *args, **kwargs):
@@ -231,11 +238,11 @@ def _require_success(key: str | None):
             ) from exc
         data = body.get("data") if isinstance(body, dict) else None
         if key is None:
-            shaped = isinstance(data, dict)
+            shaped = isinstance(data, dict) and bool(data)
         else:
             shaped = isinstance(data, dict) and isinstance(data.get(key), list)
         if not isinstance(body, dict) or body.get("status") != "success" or not shaped:
-            expected = "an object under 'data'" if key is None else f"a 'data.{key}' list"
+            expected = "a non-empty object under 'data'" if key is None else f"a 'data.{key}' list"
             raise ValueError(
                 f"Prometheus: expected status 'success' and {expected} from "
                 f"{response.url}. Aborting so a partial snapshot cannot forget live rows."
