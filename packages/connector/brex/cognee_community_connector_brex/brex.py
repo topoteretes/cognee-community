@@ -253,7 +253,24 @@ def brex_source(
         name=BREX_EXPENSES_TABLE,
         primary_key="id",
         write_disposition="merge",
-        columns={"_deleted": {"data_type": "bool", "hard_delete": True}},
+        columns={
+            "id": {"data_type": "text"},
+            "expense_id": {"data_type": "text"},
+            "amount": {"data_type": "double"},
+            "currency": {"data_type": "text"},
+            "merchant_name": {"data_type": "text"},
+            "category": {"data_type": "text"},
+            "memo": {"data_type": "text"},
+            "status": {"data_type": "text"},
+            "user_id": {"data_type": "text"},
+            "user_name": {"data_type": "text"},
+            "budget_id": {"data_type": "text"},
+            "department_id": {"data_type": "text"},
+            "department_name": {"data_type": "text"},
+            "posted_at": {"data_type": "text"},
+            "purchased_at": {"data_type": "text"},
+            "_deleted": {"data_type": "bool", "hard_delete": True},
+        },
     )
     def brex_expenses() -> Iterator[dict[str, Any]]:
         """Yield structured rows for card expenses with incremental sync and reconciliation."""
@@ -297,7 +314,13 @@ def brex_source(
         name=BREX_MEMOS_TABLE,
         primary_key="id",
         write_disposition="merge",
-        columns={"_deleted": {"data_type": "bool", "hard_delete": True}},
+        columns={
+            "id": {"data_type": "text"},
+            "title": {"data_type": "text"},
+            "url": {"data_type": "text"},
+            "content": {"data_type": "text"},
+            "_deleted": {"data_type": "bool", "hard_delete": True},
+        },
     )
     def brex_memos() -> Iterator[dict[str, Any]]:
         """Yield Markdown document cards for expenses with memos (Document Mode)."""
@@ -341,7 +364,21 @@ def brex_source(
         name=BREX_BUDGETS_TABLE,
         primary_key="id",
         write_disposition="merge",
-        columns={"_deleted": {"data_type": "bool", "hard_delete": True}},
+        columns={
+            "id": {"data_type": "text"},
+            "budget_id": {"data_type": "text"},
+            "name": {"data_type": "text"},
+            "description": {"data_type": "text"},
+            "budget_type": {"data_type": "text"},
+            "period_type": {"data_type": "text"},
+            "limit_amount": {"data_type": "double"},
+            "spent_amount": {"data_type": "double"},
+            "currency": {"data_type": "text"},
+            "parent_budget_id": {"data_type": "text"},
+            "start_date": {"data_type": "text"},
+            "end_date": {"data_type": "text"},
+            "_deleted": {"data_type": "bool", "hard_delete": True},
+        },
     )
     def brex_budgets() -> Iterator[dict[str, Any]]:
         """Yield structured rows for departmental budgets with snapshot deletion reconciliation."""
