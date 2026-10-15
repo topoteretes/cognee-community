@@ -124,6 +124,19 @@ are contained in one package (i.e. all tasks used in one pipeline are packaged t
 | `cognee-community-tasks-exa`           | Task       | Web search tasks powered by [Exa](https://exa.ai)                     |
 | `cognee-community-tasks-firecrawl`     | Task       | Web scraping and search tasks powered by [Firecrawl](https://www.firecrawl.dev/?utm_source=cognee-community&utm_medium=github&utm_campaign=cognee-firecrawl-tasks) |
 
+## Data-Source Connectors
+
+Connectors sync an external tool into cognee memory. Each one returns a `dlt` source you pass to `cognee.remember(...)`, and lives under `packages/connector/<name>/`.
+
+| Package Name                                    | Source              | Sync                         |
+|-------------------------------------------------|---------------------|------------------------------|
+| `cognee-community-connector-azure-devops-boards` | Azure DevOps Boards | Incremental, forget-on-delete |
+| `cognee-community-connector-confluence`         | Confluence          | Incremental, forget-on-delete |
+| `cognee-community-connector-gmail`              | Gmail               | Incremental, forget-on-delete |
+| `cognee-community-connector-google-drive`       | Google Drive        | Incremental, forget-on-delete |
+| `cognee-community-connector-notion`             | Notion              | Full snapshot, forget-on-delete |
+| `cognee-community-connector-slack`              | Slack export        | Full snapshot, forget-on-delete |
+
 ## Repository Structure
 
 - **All packages are located in the `packages` directory.**
