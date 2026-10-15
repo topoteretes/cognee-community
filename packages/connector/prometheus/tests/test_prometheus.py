@@ -252,7 +252,16 @@ def test_group_without_a_rules_list_aborts():
 
 @pytest.mark.parametrize(
     ("seconds", "text"),
-    [(600, "10m"), (5400, "1h30m"), (90061, "1d1h1m1s"), (30, "30s"), (1.5, "1.5s")],
+    [
+        (600, "10m"),
+        (5400, "1h30m"),
+        (90061, "1d1h1m1s"),
+        (30, "30s"),
+        (1.5, "1s500ms"),
+        (0.25, "250ms"),
+        # A real server returned this for `for: 12d500ms`; "%g" used to print 1.0368e+06s.
+        (1036800.5, "12d500ms"),
+    ],
 )
 def test_duration_reads_like_a_rule_file(seconds, text):
     assert _duration(seconds) == text
@@ -295,6 +304,21 @@ def test_source_declares_document_marker():
     source = prometheus_source(BASE_URL)
     assert PROMETHEUS_SOURCE_NAME == "prometheus"
     assert document_source_tag(source) == "prometheus"
+
+
+def test_source_rejects_a_url_with_a_query(monkeypatch):
+    with pytest.raises(ValueError, match="query string"):
+        prometheus_source(f"{BASE_URL}/prom?tenant=a")
+
+
+def test_explicit_credentials_are_not_mixed_with_the_environment(dlt_mod, tmp_path, monkeypatch):
+    # A token exported for something else must not turn explicit basic auth into
+    # a "both" error, and must not be sent.
+    monkeypatch.setenv("PROMETHEUS_TOKEN", "from-env")
+    fake = FakePrometheus()
+    _run_sync(dlt_mod, tmp_path, fake, username="ops", password="pw")
+    ((_, _, headers),) = fake.calls
+    assert headers["Authorization"] == "Basic " + base64.b64encode(b"ops:pw").decode()
 
 
 def test_source_requires_a_url(monkeypatch):
@@ -514,7 +538,7 @@ _ERROR = json.dumps({"status": "error", "errorType": "bad_data", "error": "nope"
 
 
 _EMPTY_ERROR = json.dumps({"status": "error", "data": {"groups": []}}).encode()
-_NO_METADATA = "a non-empty object under 'data'"
+_NO_METADATA = "an object under 'data'"
 _NOT_SUCCESS = "expected status 'success' and a 'data.groups' list"
 
 
@@ -547,6 +571,41 @@ def test_bad_rules_response_aborts_and_keeps_previous_snapshot(dlt_mod, tmp_path
     assert _read(_pipeline(dlt_mod, tmp_path)) == before
 
 
+def _table_or_empty(pipeline, table):
+    try:
+        return _read(pipeline, table)
+    except Exception:  # dlt creates no table until a row was ever loaded
+        return {}
+
+
+def test_server_without_targets_loads_rules_and_no_metrics(dlt_mod, tmp_path):
+    # Rules only, or data that arrives by remote write: metadata is always empty.
+    fake = FakePrometheus(metadata={"status": "success", "data": {}})
+    pipeline = _run_sync(dlt_mod, tmp_path, fake, include_metadata=True)
+    assert len(_read(pipeline)) == 5
+    assert _table_or_empty(pipeline, PROMETHEUS_METRICS_TABLE) == {}
+    # It keeps working on every run, it is not mistaken for a restart.
+    pipeline = _run_sync(dlt_mod, tmp_path, fake, include_metadata=True)
+    assert len(_read(pipeline)) == 5
+
+
+def test_rules_response_with_warnings_aborts(dlt_mod, tmp_path):
+    # Thanos Querier answers "success" with only the reachable rulers' groups and a
+    # warning when one is down. Taking that as the snapshot would forget the rest.
+    fake = FakePrometheus()
+    before = _read(_run_sync(dlt_mod, tmp_path, fake))
+
+    partial = copy.deepcopy(fake.rules)
+    partial["data"]["groups"] = partial["data"]["groups"][:1]
+    partial["warnings"] = ["rule store 10.0.0.2:10901 unreachable"]
+    body = json.dumps(partial).encode()
+    fake.fail = lambda path: (200, body) if path.endswith("/api/v1/rules") else None
+    with pytest.raises(Exception, match="carries warnings"):
+        _run_sync(dlt_mod, tmp_path, fake)
+
+    assert _read(_pipeline(dlt_mod, tmp_path)) == before
+
+
 @pytest.mark.parametrize(
     ("failure", "message"),
     [
@@ -554,7 +613,10 @@ def test_bad_rules_response_aborts_and_keeps_previous_snapshot(dlt_mod, tmp_path
         pytest.param((200, _ERROR), _NO_METADATA, id="status-error-with-200"),
         pytest.param((200, b'{"status":"success","data":[]}'), _NO_METADATA, id="list"),
         # What a server returns right after a restart, before its first scrapes.
-        pytest.param((200, b'{"status":"success","data":{}}'), _NO_METADATA, id="empty"),
+        # The first sync had metrics, so this is refused.
+        pytest.param(
+            (200, b'{"status":"success","data":{}}'), "came back empty after earlier", id="empty"
+        ),
     ],
 )
 def test_bad_metadata_response_aborts_the_whole_run(dlt_mod, tmp_path, failure, message):

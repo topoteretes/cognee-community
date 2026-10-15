@@ -115,9 +115,15 @@ def prometheus_source(
     url = base_url or os.environ.get("PROMETHEUS_URL")
     if not url:
         raise ValueError("Prometheus URL required: pass base_url= or set PROMETHEUS_URL.")
-    username = username or os.environ.get("PROMETHEUS_USERNAME")
-    password = password or os.environ.get("PROMETHEUS_PASSWORD")
-    token = token or os.environ.get("PROMETHEUS_TOKEN")
+    if "?" in url or "#" in url:
+        # dlt appends "api/v1/rules" to the base URL as text, after any query.
+        raise ValueError("Prometheus URL must not contain a query string or a fragment.")
+    if token is None and username is None and password is None:
+        # Only when no credentials were passed, so an explicit choice is never
+        # mixed with the other kind from the environment.
+        username = os.environ.get("PROMETHEUS_USERNAME")
+        password = os.environ.get("PROMETHEUS_PASSWORD")
+        token = os.environ.get("PROMETHEUS_TOKEN")
     if token and (username or password):
         raise ValueError("Pass either a bearer token or basic-auth credentials, not both.")
     if bool(username) != bool(password):
@@ -156,7 +162,9 @@ def prometheus_source(
                 "name": _METADATA,
                 "endpoint": {
                     "path": "api/v1/metadata",
-                    "data_selector": "data",
+                    # The whole body, so the row builder runs even when `data` is
+                    # empty and can tell a restart from a server without targets.
+                    "data_selector": "$",
                     "paginator": "single_page",
                     "response_actions": [_require_success(None)],
                 },
@@ -192,8 +200,24 @@ def prometheus_source(
         @dlt.transformer(
             name=PROMETHEUS_METRICS_TABLE, primary_key="id", write_disposition="replace"
         )
-        def prometheus_metrics(pages):
-            yield from _metric_rows(pages)
+        def prometheus_metrics(bodies):
+            # Prometheus builds metadata from live scrape targets, so right after a
+            # restart it answers with an empty object for a while. Refuse that only
+            # when an earlier load had metrics, or every metric would be forgotten.
+            # A server that never had targets just loads no metrics. The flag sits
+            # in source state: dlt clears a resource's own state on every replace.
+            state = dlt.current.source_state()
+            for body in bodies if isinstance(bodies, list) else [bodies]:
+                data = body.get("data") if isinstance(body, dict) else None
+                if not data and state.get("had_metrics"):
+                    raise ValueError(
+                        "Prometheus: metric metadata came back empty after earlier loads "
+                        "had metrics, as it does right after a restart. Aborting so no "
+                        "metric is forgotten; run again once the first scrapes are done."
+                    )
+                if data:
+                    state["had_metrics"] = True
+                yield from _metric_rows(data or {})
 
         loaded.append(by_name[_METADATA] | prometheus_metrics)
 
@@ -219,11 +243,11 @@ def _require_success(key: str | None):
     """Build a response hook that aborts unless Prometheus answered ``success``.
 
     ``key`` names the list expected under ``data`` (``"groups"`` for rules).
-    ``None`` expects ``data`` itself to be a non-empty object, as metadata returns
-    it. With ``data_selector`` set, a body of another shape would yield no rows and
-    no error, and under replace an empty read forgets everything. Metadata comes
-    from the scrape caches of live targets, so it is empty for a while after a
-    restart, and that read is refused too.
+    ``None`` expects ``data`` itself to be an object, as metadata returns it. With
+    ``data_selector`` set, a body of another shape would yield no rows and no
+    error, and under replace an empty read forgets everything. A body that carries
+    ``warnings`` is refused too: Thanos Querier answers ``success`` with only the
+    reachable rulers' groups and a warning when one is down.
     """
 
     def check(response, *args, **kwargs):
@@ -238,14 +262,19 @@ def _require_success(key: str | None):
             ) from exc
         data = body.get("data") if isinstance(body, dict) else None
         if key is None:
-            shaped = isinstance(data, dict) and bool(data)
+            shaped = isinstance(data, dict)
         else:
             shaped = isinstance(data, dict) and isinstance(data.get(key), list)
         if not isinstance(body, dict) or body.get("status") != "success" or not shaped:
-            expected = "a non-empty object under 'data'" if key is None else f"a 'data.{key}' list"
+            expected = "an object under 'data'" if key is None else f"a 'data.{key}' list"
             raise ValueError(
                 f"Prometheus: expected status 'success' and {expected} from "
                 f"{response.url}. Aborting so a partial snapshot cannot forget live rows."
+            )
+        if body.get("warnings"):
+            raise ValueError(
+                f"Prometheus: the response from {response.url} carries warnings, so it may "
+                "be partial. Aborting so a partial snapshot cannot forget live rows."
             )
 
     return check
@@ -326,17 +355,16 @@ def _metric_rows(pages: Any):
 
 
 def _duration(seconds: Any) -> str | None:
-    """Render seconds the way rule files write them: 600 -> "10m", 5400 -> "1h30m"."""
+    """Render seconds the way rule files write them: 600 -> "10m", 1.5 -> "1s500ms"."""
     if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or seconds <= 0:
         return None
-    if seconds != int(seconds):
-        return f"{seconds:g}s"
-    remaining, parts = int(seconds), []
-    for unit, size in (("d", 86400), ("h", 3600), ("m", 60), ("s", 1)):
+    # Whole milliseconds, Prometheus's own precision for durations.
+    remaining, parts = round(seconds * 1000), []
+    for unit, size in (("d", 86_400_000), ("h", 3_600_000), ("m", 60_000), ("s", 1000), ("ms", 1)):
         count, remaining = divmod(remaining, size)
         if count:
             parts.append(f"{count}{unit}")
-    return "".join(parts)
+    return "".join(parts) or None
 
 
 def _lines(*pairs: tuple[str, Any]) -> list[str]:

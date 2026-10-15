@@ -76,8 +76,9 @@ Prometheus has no change feed for rules, but the whole rule list is one request.
   rule.
 - A rule removed from the server, or a whole rule file, drops out of the snapshot, and cognee's
   `orphan_cleanup` forgets it.
-- An HTTP error, a body that is not JSON, or a `status` other than `success` aborts the run and
-  leaves memory untouched. A partial snapshot would otherwise be forgotten as if it were a
+- An HTTP error, a body that is not JSON, a `status` other than `success`, or a response that
+  carries `warnings` aborts the run and leaves memory untouched. Thanos Querier answers `success`
+  with a warning and only the reachable rulers' groups when one is down. A partial snapshot would otherwise be forgotten as if it were a
   deletion. A server that answers with an empty rule list does empty memory.
 
 Leave `write_disposition` at its default. Passing `merge` breaks forget-on-delete for a snapshot
@@ -92,8 +93,9 @@ source.
 - **Metadata can be large.** A bare Prometheus 3.15.0 reported 265 metrics, and a real server can
   report thousands, each one a document to cognify. That is why it is off by default.
 - **Metadata needs live targets.** Prometheus builds it from its scrape caches, so right after a
-  restart it is empty. The connector refuses an empty answer and the run fails, instead of
-  forgetting every metric. Run it again once the first scrapes are done.
+  restart it is empty. If an earlier sync had metrics, the connector refuses that empty answer and
+  the run fails, instead of forgetting every metric. Run it again once the first scrapes are done.
+  A server that never had targets just syncs its rules with no metrics.
 - **dlt keeps its load files.** Each sync leaves a gzip copy of the loaded rows in dlt's pipeline
   directory, and forgetting a document does not remove those copies. Set
   `LOAD__DELETE_COMPLETED_JOBS=true` to have dlt delete them after each load.
