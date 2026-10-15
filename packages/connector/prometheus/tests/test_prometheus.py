@@ -77,6 +77,7 @@ class FakePrometheus(BaseAdapter):
         self.metadata = metadata if metadata is not None else _fixture("metadata.json")
         self.calls = []  # (path, params, headers)
         self.fail = None  # callable(path) -> (status, body bytes) or None
+        self.ignore_filters = False  # like an older server that ignores type/rule_group[]
 
     def session(self):
         session = requests.Session()
@@ -92,7 +93,8 @@ class FakePrometheus(BaseAdapter):
         if failure:
             return self._response(request, *failure)
         if url.path.endswith("/api/v1/rules"):
-            return self._response(request, 200, json.dumps(self._filtered(params)).encode())
+            body = self.rules if self.ignore_filters else self._filtered(params)
+            return self._response(request, 200, json.dumps(body).encode())
         if url.path.endswith("/api/v1/metadata"):
             return self._response(request, 200, json.dumps(self.metadata).encode())
         return self._response(request, 404, b"404 page not found")
@@ -311,6 +313,26 @@ def test_source_rejects_a_url_with_a_query(monkeypatch):
         prometheus_source(f"{BASE_URL}/prom?tenant=a")
 
 
+def test_source_rejects_credentials_in_the_url():
+    # They would end up in dlt's logs and in error messages.
+    with pytest.raises(ValueError, match="not in the URL"):
+        prometheus_source("http://ops:s3cret@prometheus.test:9090")
+
+
+@pytest.mark.parametrize("path", ["/api/v1", "/prom/api/v1/"])
+def test_source_rejects_the_api_path_in_the_url(path):
+    with pytest.raises(ValueError, match="without /api/v1"):
+        prometheus_source(f"{BASE_URL}{path}")
+
+
+def test_source_keeps_its_state_per_dataset():
+    # The empty-snapshot flags live in dlt state; without a scope every unscoped
+    # dlt source in cognee would share one pipeline state.
+    from cognee.tasks.ingestion.dlt_utils import PIPELINE_SCOPE_ATTR
+
+    assert getattr(prometheus_source(BASE_URL), PIPELINE_SCOPE_ATTR) == "prometheus"
+
+
 def test_explicit_credentials_are_not_mixed_with_the_environment(dlt_mod, tmp_path, monkeypatch):
     # A token exported for something else must not turn explicit basic auth into
     # a "both" error, and must not be sent.
@@ -471,12 +493,56 @@ def test_removed_rule_file_removes_its_rules(dlt_mod, tmp_path):
     assert not any("ScrapeTargetDown" in row["title"] for row in after.values())
 
 
-def test_server_with_no_rules_empties_the_table(dlt_mod, tmp_path):
+def test_server_that_suddenly_has_no_rules_aborts(dlt_mod, tmp_path):
+    # A URL pointing at the wrong server, or a filter that matches nothing,
+    # answers with a valid empty list. Under replace that would forget every rule.
+    fake = FakePrometheus()
+    before = _read(_run_sync(dlt_mod, tmp_path, fake))
+
+    fake.rules["data"]["groups"] = []
+    with pytest.raises(Exception, match="no rule groups"):
+        _run_sync(dlt_mod, tmp_path, fake)
+
+    assert _read(_pipeline(dlt_mod, tmp_path)) == before
+
+
+def test_allow_empty_lets_a_server_with_no_rules_through(dlt_mod, tmp_path):
     fake = FakePrometheus()
     _run_sync(dlt_mod, tmp_path, fake)
 
     fake.rules["data"]["groups"] = []
-    assert _read(_run_sync(dlt_mod, tmp_path, fake)) == {}
+    assert _read(_run_sync(dlt_mod, tmp_path, fake, allow_empty=True)) == {}
+    # Once the empty server is accepted, later empty syncs are fine as well.
+    _run_sync(dlt_mod, tmp_path, fake)
+
+
+def test_first_sync_of_a_server_without_rules_is_fine(dlt_mod, tmp_path):
+    fake = FakePrometheus(rules={"status": "success", "data": {"groups": []}})
+    _run_sync(dlt_mod, tmp_path, fake)  # nothing was synced before, so nothing to protect
+
+
+def test_filters_hold_when_the_server_ignores_them(dlt_mod, tmp_path):
+    # Older Prometheus versions ignore `type` and `rule_group[]` and answer with
+    # every group. The connector must not ingest what it was not asked for.
+    fake = FakePrometheus()
+    fake.ignore_filters = True
+    recording = _read(_run_sync(dlt_mod, tmp_path, fake, rule_type="record"))
+    assert [row["content"].splitlines()[0] for row in recording.values()] == [
+        "Type: recording rule"
+    ]
+    node = _read(_run_sync(dlt_mod, tmp_path, fake, rule_groups=["node-health"]))
+    assert [row["title"] for row in node.values()] == [
+        "Prometheus alerting rule ScrapeTargetDown in group node-health"
+    ]
+
+
+def test_allow_empty_also_lets_empty_metadata_through(dlt_mod, tmp_path):
+    fake = FakePrometheus()
+    _run_sync(dlt_mod, tmp_path, fake, include_metadata=True)
+
+    fake.metadata = {"status": "success", "data": {}}
+    pipeline = _run_sync(dlt_mod, tmp_path, fake, include_metadata=True, allow_empty=True)
+    assert _read(pipeline, PROMETHEUS_METRICS_TABLE) == {}
 
 
 @pytest.mark.parametrize("base_url", [f"{BASE_URL}/prom", f"{BASE_URL}/prom/"])

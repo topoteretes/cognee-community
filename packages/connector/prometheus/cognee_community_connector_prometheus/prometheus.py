@@ -38,8 +38,10 @@ was removed from the server drops out of the snapshot and cognee's
 Fail closed. Staging is authoritative under replace, so a short read would be
 forgotten as if it were a deletion. An HTTP error, a body that is not JSON, a
 ``status`` other than ``success`` or a missing ``data.groups`` list raises and
-aborts the run, which leaves memory untouched. An empty group list is what a
-server with no rules returns, and it does empty memory.
+aborts the run, which leaves memory untouched. An empty group list is accepted
+on a first sync, but refused after an earlier sync had rules: a URL pointing at
+the wrong server, or a filter that matches nothing, looks exactly like that.
+``allow_empty=True`` lets that sync through.
 """
 
 import hashlib
@@ -47,8 +49,9 @@ import json
 import os
 from collections import Counter
 from typing import Any
+from urllib.parse import urlsplit
 
-from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
+from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR, PIPELINE_SCOPE_ATTR
 
 PROMETHEUS_SOURCE_NAME = "prometheus"
 # dlt resource / staging-table names. cognee scopes orphan cleanup by table, so
@@ -81,6 +84,7 @@ def prometheus_source(
     rule_type: str | None = None,
     rule_groups: list[str] | None = None,
     include_metadata: bool = False,
+    allow_empty: bool = False,
     session: Any = None,
 ):
     """Create a dlt source that yields Prometheus rules, and optionally metric metadata.
@@ -99,6 +103,11 @@ def prometheus_source(
         rule_groups: Ingest only these rule groups. ``None`` ingests every group.
         include_metadata: Also ingest type, unit and help text for every metric
             the server knows. Off by default: a server can know thousands.
+        allow_empty: Let a sync through that finds no rules (or no metric
+            metadata) although an earlier sync found some. Off by default,
+            because a wrong URL or a filter that matches nothing looks like that,
+            and it would forget everything. Turn it on once to forget rules that
+            really were all removed.
         session: ``requests.Session`` to send requests through (mainly a
             test-injection point). When omitted dlt's own session is used, which
             retries 429 and 5xx responses.
@@ -115,9 +124,15 @@ def prometheus_source(
     url = base_url or os.environ.get("PROMETHEUS_URL")
     if not url:
         raise ValueError("Prometheus URL required: pass base_url= or set PROMETHEUS_URL.")
-    if "?" in url or "#" in url:
+    parts = urlsplit(url)
+    if parts.query or parts.fragment or url.endswith(("?", "#")):
         # dlt appends "api/v1/rules" to the base URL as text, after any query.
         raise ValueError("Prometheus URL must not contain a query string or a fragment.")
+    if parts.username or parts.password:
+        # They would show up in dlt's logs and in error messages.
+        raise ValueError("Pass credentials as username/password or token, not in the URL.")
+    if parts.path.rstrip("/").endswith("/api/v1"):
+        raise ValueError("Pass the server URL without /api/v1: the connector adds the API path.")
     if token is None and username is None and password is None:
         # Only when no credentials were passed, so an explicit choice is never
         # mixed with the other kind from the environment.
@@ -152,7 +167,7 @@ def prometheus_source(
                 "data_selector": "data.groups",
                 # The whole rule list comes back in one response.
                 "paginator": "single_page",
-                "response_actions": [_require_success("groups")],
+                "response_actions": [_require_success("groups", allow_empty)],
             },
         }
     ]
@@ -191,7 +206,9 @@ def prometheus_source(
     def prometheus_rules(groups):
         # A fresh counter per call: the rule list is one page, so this is called
         # once per run, and a source object that is run twice keeps its ids.
-        yield from _rule_rows(groups, Counter())
+        # The type and group filters are applied here as well, for a server that
+        # ignores the `type` or `rule_group[]` parameter (older Prometheus does).
+        yield from _rule_rows(groups, Counter(), rule_type, rule_groups)
 
     loaded = [by_name[_RULE_GROUPS] | prometheus_rules]
 
@@ -209,14 +226,13 @@ def prometheus_source(
             state = dlt.current.source_state()
             for body in bodies if isinstance(bodies, list) else [bodies]:
                 data = body.get("data") if isinstance(body, dict) else None
-                if not data and state.get("had_metrics"):
+                if not data and state.get("had_metrics") and not allow_empty:
                     raise ValueError(
                         "Prometheus: metric metadata came back empty after earlier loads "
                         "had metrics, as it does right after a restart. Aborting so no "
                         "metric is forgotten; run again once the first scrapes are done."
                     )
-                if data:
-                    state["had_metrics"] = True
+                state["had_metrics"] = bool(data)
                 yield from _metric_rows(data or {})
 
         loaded.append(by_name[_METADATA] | prometheus_metrics)
@@ -231,6 +247,9 @@ def prometheus_source(
     # Opt into the document ingestion path (row -> text document -> cognify).
     # Set on the object that is returned: resolve_dlt_sources reads it from there.
     setattr(source, DOCUMENT_SOURCE_ATTR, PROMETHEUS_SOURCE_NAME)
+    # Keep this source's dlt state (the empty-snapshot flags) per dataset. Without
+    # a scope, every unscoped dlt source shares one pipeline and its state.
+    setattr(source, PIPELINE_SCOPE_ATTR, PROMETHEUS_SOURCE_NAME)
     return source
 
 
@@ -239,7 +258,7 @@ def prometheus_source(
 # ---------------------------------------------------------------------------
 
 
-def _require_success(key: str | None):
+def _require_success(key: str | None, allow_empty: bool = False):
     """Build a response hook that aborts unless Prometheus answered ``success``.
 
     ``key`` names the list expected under ``data`` (``"groups"`` for rules).
@@ -247,7 +266,10 @@ def _require_success(key: str | None):
     ``data_selector`` set, a body of another shape would yield no rows and no
     error, and under replace an empty read forgets everything. A body that carries
     ``warnings`` is refused too: Thanos Querier answers ``success`` with only the
-    reachable rulers' groups and a warning when one is down.
+    reachable rulers' groups and a warning when one is down. For rules, an empty
+    group list is refused when an earlier sync had rules, unless ``allow_empty``.
+    The flag is kept in the source's dlt state, which is only saved when a load
+    succeeds.
     """
 
     def check(response, *args, **kwargs):
@@ -276,17 +298,43 @@ def _require_success(key: str | None):
                 f"Prometheus: the response from {response.url} carries warnings, so it may "
                 "be partial. Aborting so a partial snapshot cannot forget live rows."
             )
+        if key == "groups":
+            import dlt
+
+            state = dlt.current.source_state()
+            if not data[key] and state.get("had_rules") and not allow_empty:
+                raise ValueError(
+                    f"Prometheus: no rule groups from {response.url}, although an earlier "
+                    "sync found some. A wrong URL or a filter that matches nothing looks "
+                    "like this. Aborting so memory is not wiped; pass allow_empty=True "
+                    "if the rules really were all removed."
+                )
+            state["had_rules"] = bool(data[key])
 
     return check
 
 
-def _rule_rows(groups: Any, seen: Counter):
-    """Yield one row per rule, with the group's name, file and interval copied in."""
+def _rule_rows(
+    groups: Any,
+    seen: Counter,
+    rule_type: str | None = None,
+    rule_groups: list[str] | None = None,
+):
+    """Yield one row per rule, with the group's name, file and interval copied in.
+
+    ``rule_type`` (``"alert"`` or ``"record"``) and ``rule_groups`` drop what a
+    server returned although it was not asked for.
+    """
+    kind = {"alert": "alerting", "record": "recording"}.get(rule_type or "")
     for group in groups if isinstance(groups, list) else [groups]:
         rules = group.get("rules") if isinstance(group, dict) else None
         if not isinstance(rules, list):
             raise ValueError("Prometheus: a rule group without a 'rules' list. Aborting.")
+        if rule_groups and group.get("name") not in rule_groups:
+            continue
         for rule in rules:
+            if kind and rule.get("type") != kind:
+                continue
             yield _rule_row(group, rule, seen)
 
 

@@ -41,9 +41,10 @@ answer = await cognee.search(
 | `username`, `password` | `PROMETHEUS_USERNAME`, `PROMETHEUS_PASSWORD` | Basic auth. |
 | `token` | `PROMETHEUS_TOKEN` | Bearer token, for a proxy that expects one. Use a token or basic auth, not both. |
 | `headers` | none | Extra headers sent with every request. |
-| `rule_type` | both | `"alert"` or `"record"` to read one kind of rule. |
-| `rule_groups` | all groups | Read only these rule groups. |
+| `rule_type` | both | `"alert"` or `"record"` to read one kind of rule. Also applied after reading, for a server that ignores it. |
+| `rule_groups` | all groups | Read only these rule groups. Also applied after reading. |
 | `include_metadata` | `False` | Also read type, unit and help text for every metric the server knows. |
+| `allow_empty` | `False` | Let a sync through that finds no rules, or no metric metadata, although an earlier sync found some. |
 
 See `examples/example.py` for the full flow.
 
@@ -73,13 +74,17 @@ Prometheus has no change feed for rules, but the whole rule list is one request.
   again.
 - A rule's identity is its file, group, type, name and labels. Two rules with the same name in one
   group, such as one per severity, are separate documents. Changing a rule's labels makes it a new
-  rule.
+  rule, and so does moving its rule file to another path. Group-level `labels` arrive merged into
+  each rule's labels, so they count too.
 - A rule removed from the server, or a whole rule file, drops out of the snapshot, and cognee's
   `orphan_cleanup` forgets it.
 - An HTTP error, a body that is not JSON, a `status` other than `success`, or a response that
   carries `warnings` aborts the run and leaves memory untouched. Thanos Querier answers `success`
-  with a warning and only the reachable rulers' groups when one is down. A partial snapshot would otherwise be forgotten as if it were a
-  deletion. A server that answers with an empty rule list does empty memory.
+  with a warning and only the reachable rulers' groups when one is down. A partial snapshot would
+  otherwise be forgotten as if it were a deletion.
+- A server that suddenly has no rules at all, after an earlier sync found some, aborts the run too.
+  A URL pointing at the wrong server, or a filter that matches nothing, looks exactly like that.
+  Pass `allow_empty=True` once to forget rules that really were all removed.
 
 Leave `write_disposition` at its default. Passing `merge` breaks forget-on-delete for a snapshot
 source.
@@ -99,6 +104,9 @@ source.
 - **dlt keeps its load files.** Each sync leaves a gzip copy of the loaded rows in dlt's pipeline
   directory, and forgetting a document does not remove those copies. Set
   `LOAD__DELETE_COMPLETED_JOBS=true` to have dlt delete them after each load.
+- **A private CA.** For a server with a certificate from an internal CA, point
+  `REQUESTS_CA_BUNDLE` at the CA bundle. Credentials go in `username`/`password` or `token`, never
+  in the URL, where they would end up in logs.
 
 ## Setup
 
