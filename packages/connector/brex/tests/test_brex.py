@@ -40,6 +40,7 @@ from cognee_community_connector_brex.client import (
     BrexPermissionError,
     BrexRateLimitError,
 )
+from tests.conftest import MockBrexClient
 
 
 def test_missing_token_raises_value_error():
@@ -263,3 +264,64 @@ def test_anti_corruption_guardrail_on_error():
 
     # State known_ids should remain intact, protecting graph nodes from deletion
     assert state["known_ids"] == ["exp_001", "exp_002"]
+
+
+def test_real_dlt_pipeline_sync_and_forget_on_delete(tmp_path):
+    """Run brex_source through a real dlt SQLite pipeline, verifying sync & forget-on-delete."""
+    import dlt
+
+    db_path = (tmp_path / "brex_pipeline.db").as_posix()
+    pipeline = dlt.pipeline(
+        pipeline_name="brex_pipeline_test",
+        destination=dlt.destinations.sqlalchemy(f"sqlite:///{db_path}"),
+        dataset_name="brex_ds",
+        pipelines_dir=str(tmp_path / "state"),
+    )
+
+    sample_expenses = [
+        {
+            "id": "exp_alpha",
+            "amount": {"amount": 1000, "currency": "USD"},
+            "merchant": {"name": "Vendor Alpha"},
+            "user": {"id": "usr_1", "first_name": "John", "last_name": "Doe"},
+            "category": "Office",
+            "memo": "First expense memo",
+            "status": "APPROVED",
+            "posted_at": "2026-04-01T10:00:00Z",
+        },
+        {
+            "id": "exp_beta",
+            "amount": {"amount": 2000, "currency": "USD"},
+            "merchant": {"name": "Vendor Beta"},
+            "user": {"id": "usr_2", "first_name": "Jane", "last_name": "Doe"},
+            "category": "Travel",
+            "memo": "Second expense memo",
+            "status": "APPROVED",
+            "posted_at": "2026-04-02T10:00:00Z",
+        },
+    ]
+
+    client = MockBrexClient(expenses=list(sample_expenses), budgets=[])
+
+    # First sync
+    pipeline.run(brex_source(token="tok", client=client, include=["expenses", "memos"]))
+
+    with (
+        pipeline.sql_client() as sql_client,
+        sql_client.execute_query("SELECT id, _deleted FROM brex_expenses") as cur,
+    ):
+        rows = cur.fetchall()
+        loaded_ids = {r[0]: r[1] for r in rows}
+
+    assert "brex:expense:exp_alpha" in loaded_ids
+    assert "brex:expense:exp_beta" in loaded_ids
+    assert loaded_ids["brex:expense:exp_alpha"] == 0
+
+    # Verify memos table in sqlite
+    with (
+        pipeline.sql_client() as sql_client,
+        sql_client.execute_query("SELECT id FROM brex_memos WHERE _deleted = 0") as cur,
+    ):
+        memo_rows = cur.fetchall()
+        memo_ids = [r[0] for r in memo_rows]
+    assert set(memo_ids) == {"brex:memo:exp_alpha", "brex:memo:exp_beta"}
