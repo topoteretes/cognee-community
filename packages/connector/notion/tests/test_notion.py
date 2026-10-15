@@ -18,7 +18,6 @@ import pytest
 # The row → document-DataItem mapping is generic and owned by the ingestion
 # layer (any document source uses it), not the connector.
 from cognee.tasks.ingestion.resolve_dlt_sources import _build_document_data_item
-
 from cognee_community_connector_notion.notion import (
     NOTION_SOURCE_NAME,
     _page_title,
@@ -223,7 +222,6 @@ def test_notion_source_declares_document_marker():
     # resolve_dlt_sources routes on the document-source marker (not on this name),
     # but the tag it carries is the source name; keep it stable.
     from cognee.tasks.ingestion.dlt_utils import document_source_tag
-
     from cognee_community_connector_notion.notion import notion_source
 
     source = notion_source(token="test-token")
@@ -361,9 +359,8 @@ def _api_error(status, code):
 
 def test_error_classification():
     import httpx
-    from notion_client.errors import APIErrorCode
-
     from cognee_community_connector_notion.notion import _is_gone, _is_transient
+    from notion_client.errors import APIErrorCode
 
     # Retryable: rate-limit / server / timeout / network.
     assert _is_transient(httpx.ReadTimeout("t")) is True
@@ -376,9 +373,8 @@ def test_error_classification():
 
 
 def test_page_ids_skips_gone_but_reraises_other():
-    from notion_client.errors import APIErrorCode
-
     from cognee_community_connector_notion.notion import _iter_pages
+    from notion_client.errors import APIErrorCode
 
     def retrieve(page_id=None):
         if page_id == "gone":
