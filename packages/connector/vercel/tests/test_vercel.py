@@ -147,7 +147,7 @@ class FakeVercel(BaseAdapter):
         self.calls = []
         self.fail = None  # callable(path, params) -> status code to return, or None
         self.projects_as_array = False
-        self.drop_pagination = False  # list bodies without their pagination block
+        self.drop_pagination = set()  # paths whose list bodies lose their pagination block
         self.events_as_object = False  # events body that is not a list
 
     def session(self):
@@ -168,25 +168,32 @@ class FakeVercel(BaseAdapter):
         if url.path == "/v10/projects":
             page = self._page(self.projects, "updatedAt", "projects", params)
             body = page["projects"] if self.projects_as_array else page
-            if self.drop_pagination and isinstance(body, dict):
+            if url.path in self.drop_pagination and isinstance(body, dict):
                 body.pop("pagination")
             return self._response(request, 200, body)
         if url.path == "/v7/deployments":
             wanted_states = set(filter(None, params.get("state", "").split(",")))
             since = int(params.get("since", 0))
-            # Like the real API: projectId takes an id or a name, projectIds takes
-            # ids only and returns nothing (and no error) for a name.
+            # Like the real API: projectId takes an id or a name (any case) and
+            # answers 404 for an unknown one; projectIds takes at most 20 ids and
+            # returns nothing, with no error, for a name.
             one, many = params.get("projectId"), params["projectIds"]
+            if len(many) > 20:
+                return self._response(request, 400, {"error": {"code": "bad_request"}})
+            if one and not any(
+                one == item["id"] or one.lower() == item["name"] for item in self.projects
+            ):
+                return self._response(request, 404, {"error": {"code": "not_found"}})
             items = [
                 item
                 for item in self.deployments
                 if item["created"] >= since
                 and (not wanted_states or item["state"] in wanted_states)
-                and (not one or one in (item["projectId"], item["name"]))
+                and (not one or one == item["projectId"] or one.lower() == item["name"])
                 and (not many or item["projectId"] in many)
             ]
             page = self._page(items, "created", "deployments", params)
-            if self.drop_pagination:
+            if url.path in self.drop_pagination:
                 page.pop("pagination")
             return self._response(request, 200, page)
         if url.path.startswith("/v3/deployments/") and url.path.endswith("/events"):
@@ -664,6 +671,21 @@ def _deployment_calls(fake):
     return [params for path, params, _ in fake.calls if path == "/v7/deployments"]
 
 
+def _fleet_with_docs():
+    """The usual fleet plus a third project, never selected, with its own failed build."""
+    fake = _fleet()
+    fake.projects.append(_project("prj_docs", "docs"))
+    fake.deployments.append(_deployment("dpl_docs_err", "docs", state="ERROR", minutes_ago=5))
+    fake.logs["dpl_docs_err"] = _log("docs build failed")
+    return fake
+
+
+def _assert_docs_left_out(fake, pipeline):
+    assert "prj_docs" not in _read(pipeline, VERCEL_PROJECTS_TABLE)
+    assert "dpl_docs_err" not in _read(pipeline, VERCEL_DEPLOYMENTS_TABLE)
+    assert "/v3/deployments/dpl_docs_err/events" not in fake.event_paths()
+
+
 def test_one_selected_project_is_filtered_on_the_server(dlt_mod, tmp_path):
     fake = _fleet()
     pipeline = _run_sync(dlt_mod, tmp_path, fake, project_ids=["web"])  # a name works
@@ -673,8 +695,9 @@ def test_one_selected_project_is_filtered_on_the_server(dlt_mod, tmp_path):
 
 
 def test_several_project_ids_are_filtered_on_the_server(dlt_mod, tmp_path):
-    fake = _fleet()
+    fake = _fleet_with_docs()
     pipeline = _run_sync(dlt_mod, tmp_path, fake, project_ids=["prj_web", "prj_api"])
+    _assert_docs_left_out(fake, pipeline)
 
     assert all(params["projectIds"] == ["prj_api", "prj_web"] for params in _deployment_calls(fake))
     assert set(_read(pipeline, VERCEL_DEPLOYMENTS_TABLE)) == {"dpl_ok1", "dpl_ok2", "dpl_err"}
@@ -683,13 +706,54 @@ def test_several_project_ids_are_filtered_on_the_server(dlt_mod, tmp_path):
 def test_a_name_in_a_list_is_never_sent_as_project_ids(dlt_mod, tmp_path):
     # projectIds with a name returns no deployments and no error, which under
     # replace would forget them all. Such a list is filtered client-side instead.
-    fake = _fleet()
+    fake = _fleet_with_docs()
     pipeline = _run_sync(dlt_mod, tmp_path, fake, project_ids=["web", "prj_api"])
+    _assert_docs_left_out(fake, pipeline)
 
     assert all(
         not params["projectIds"] and "projectId" not in params for params in _deployment_calls(fake)
     )
     assert set(_read(pipeline, VERCEL_DEPLOYMENTS_TABLE)) == {"dpl_ok1", "dpl_ok2", "dpl_err"}
+
+
+def test_more_than_20_ids_are_filtered_after_listing(dlt_mod, tmp_path):
+    # Vercel answers 400 above 20 projectIds, which would fail every run.
+    fake = _fleet_with_docs()
+    selected = ["prj_web", "prj_api", *(f"prj_gone{number}" for number in range(19))]
+    pipeline = _run_sync(dlt_mod, tmp_path, fake, project_ids=selected)
+
+    assert all(not params["projectIds"] for params in _deployment_calls(fake))
+    assert set(_read(pipeline, VERCEL_DEPLOYMENTS_TABLE)) == {"dpl_ok1", "dpl_ok2", "dpl_err"}
+    _assert_docs_left_out(fake, pipeline)
+
+
+def test_a_project_name_matches_in_any_case(dlt_mod, tmp_path):
+    # Vercel resolves `projectId=WEB` to the project "web". If the rows it returns
+    # were then dropped here, every one of them would be forgotten.
+    fake = _fleet()
+    pipeline = _run_sync(dlt_mod, tmp_path, fake, project_ids=["WEB"])
+    assert set(_read(pipeline, VERCEL_PROJECTS_TABLE)) == {"prj_web"}
+    assert set(_read(pipeline, VERCEL_DEPLOYMENTS_TABLE)) == {"dpl_ok1", "dpl_err"}
+
+
+def test_a_selected_project_that_was_deleted_is_forgotten(dlt_mod, tmp_path):
+    fake = _fleet()
+    first = _run_sync(dlt_mod, tmp_path, fake, project_ids=["web"])
+    assert set(_read(first, VERCEL_DEPLOYMENTS_TABLE)) == {"dpl_ok1", "dpl_err"}
+
+    # Deleted in Vercel: projectId=web now answers 404 instead of a list.
+    fake.projects = [item for item in fake.projects if item["name"] != "web"]
+    fake.deployments = [item for item in fake.deployments if item["name"] != "web"]
+    pipeline = _run_sync(dlt_mod, tmp_path, fake, project_ids=["web"])
+
+    assert _read(pipeline, VERCEL_PROJECTS_TABLE) == {}
+    assert _read(pipeline, VERCEL_DEPLOYMENTS_TABLE) == {}
+
+
+@pytest.mark.parametrize("days", [0, -1])
+def test_lookback_days_must_be_positive(days):
+    with pytest.raises(ValueError, match="lookback_days"):
+        vercel_source(token="test-token", lookback_days=days)
 
 
 def test_build_logs_can_be_switched_off(dlt_mod, tmp_path):
@@ -749,12 +813,25 @@ def test_list_without_pagination_aborts_sync(dlt_mod, tmp_path):
     first = _run_sync(dlt_mod, tmp_path, fake)
     before = {table: _read(first, table) for table in _TABLES}
 
-    fake.drop_pagination = True
+    fake.drop_pagination = {"/v10/projects", "/v7/deployments"}
     with pytest.raises(Exception, match=r"pagination\.next"):
         _run_sync(dlt_mod, tmp_path, fake)
 
     pipeline = _pipeline(dlt_mod, tmp_path)
     assert {table: _read(pipeline, table) for table in _TABLES} == before
+
+
+def test_deployment_list_without_pagination_aborts_sync(dlt_mod, tmp_path):
+    # The projects list is fine here, so only the deployments check can stop it.
+    fake = _fleet()
+    first = _run_sync(dlt_mod, tmp_path, fake)
+    before = _read(first, VERCEL_DEPLOYMENTS_TABLE)
+
+    fake.drop_pagination = {"/v7/deployments"}
+    with pytest.raises(Exception, match=r"pagination\.next"):
+        _run_sync(dlt_mod, tmp_path, fake)
+
+    assert _read(_pipeline(dlt_mod, tmp_path), VERCEL_DEPLOYMENTS_TABLE) == before
 
 
 def test_events_body_that_is_not_a_list_aborts_sync(dlt_mod, tmp_path):

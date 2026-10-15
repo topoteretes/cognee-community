@@ -53,6 +53,8 @@ VERCEL_BUILD_LOGS_TABLE = "vercel_build_logs"
 
 _API_BASE = "https://api.vercel.com"
 _PAGE_SIZE = 100
+# The deployments list answers 400 when `projectIds` has more than this many items.
+_MAX_PROJECT_IDS = 20
 # Parent of the events call (listed, never loaded) and the per-line child rows.
 _FAILED_DEPLOYMENTS = "vercel_failed_deployments"
 _BUILD_EVENTS = "vercel_build_events"
@@ -83,8 +85,10 @@ def vercel_source(
             ``VERCEL_TOKEN``.
         team_id: Team to read. Needed when a full-account token should read a team.
             Falls back to ``VERCEL_TEAM_ID``.
-        project_ids: Restrict ingestion to these project ids or names. When omitted,
-            every project the token can see is ingested.
+        project_ids: Restrict ingestion to these project ids or names. Names match
+            case-insensitively, as Vercel resolves them. A listed project that no
+            longer exists is treated as deleted. When omitted, every project the
+            token can see is ingested.
         lookback_days: Deployments created within this many days stay in memory and
             older ones are forgotten on the next sync. ``None`` reads every deployment.
         include_build_logs: Fetch build output for deployments in state ``ERROR``.
@@ -109,18 +113,27 @@ def vercel_source(
         raise ValueError("Vercel access token required: pass token= or set VERCEL_TOKEN.")
     resolved_team = team_id or os.environ.get("VERCEL_TEAM_ID")
     wanted = set(project_ids or [])
+    # Vercel resolves a project name case-insensitively, so match names the same way
+    # here, or the rows it returns would all be dropped and then forgotten.
+    wanted_names = {str(item).lower() for item in wanted}
     if max_log_chars is not None and max_log_chars < 1:
         raise ValueError("max_log_chars must be a positive number of characters, or None.")
+    if lookback_days is not None and lookback_days <= 0:
+        # A window starting now or later lists nothing, and replace would forget it all.
+        raise ValueError("lookback_days must be a positive number of days, or None.")
 
     # Narrow the deployment lists on the server when that is safe. `projectId`
-    # takes one id or name. `projectIds` takes ids only: given a name it returns
-    # no deployments and no error, which under replace would forget them all, so
-    # a longer list with names in it is filtered here instead.
+    # takes one id or name. `projectIds` takes ids only, at most 20: given a name
+    # it returns no deployments and no error, which under replace would forget
+    # them all. Any other list is filtered here instead.
     on_server: dict[str, Any] = {}
     if len(wanted) == 1:
         on_server["projectId"] = next(iter(wanted))
-    elif wanted and all(str(item).startswith("prj_") for item in wanted):
+    elif 1 < len(wanted) <= _MAX_PROJECT_IDS and all(str(i).startswith("prj_") for i in wanted):
         on_server["projectIds"] = sorted(wanted)
+    # A single project that no longer exists answers 404. Treat it like a deleted
+    # id in a list, which the API just leaves out: its documents are forgotten.
+    gone = [{"status_code": 404, "action": "ignore"}] if "projectId" in on_server else []
 
     # One fixed lower bound per run. The whole window is re-read every time, so a
     # deployment that changed state or was deleted since the last run is seen.
@@ -130,7 +143,7 @@ def vercel_source(
         window["since"] = int(since.timestamp() * 1000)
     scope = {"teamId": resolved_team} if resolved_team else {}
 
-    def listing(path: str, key: str, **params: Any) -> dict:
+    def listing(path: str, key: str, missing: list | None = None, **params: Any) -> dict:
         return {
             "path": path,
             "params": {"limit": _PAGE_SIZE, **scope, **params},
@@ -141,15 +154,21 @@ def vercel_source(
                 "cursor_path": "pagination.next",
                 "cursor_param": "until",
             },
-            "response_actions": [_require_list(key)],
+            "response_actions": [*(missing or []), _require_list(key)],
         }
 
     def wanted_project(project: dict) -> bool:
-        return not wanted or project.get("id") in wanted or project.get("name") in wanted
+        return (
+            not wanted
+            or project.get("id") in wanted
+            or str(project.get("name") or "").lower() in wanted_names
+        )
 
     def wanted_deployment(deployment: dict) -> bool:
         in_scope = (
-            not wanted or deployment.get("projectId") in wanted or deployment.get("name") in wanted
+            not wanted
+            or deployment.get("projectId") in wanted
+            or str(deployment.get("name") or "").lower() in wanted_names
         )
         return in_scope and _is_live(deployment)
 
@@ -165,7 +184,7 @@ def vercel_source(
             "name": VERCEL_DEPLOYMENTS_TABLE,
             "primary_key": "id",
             "write_disposition": "replace",
-            "endpoint": listing("v7/deployments", "deployments", **window, **on_server),
+            "endpoint": listing("v7/deployments", "deployments", gone, **window, **on_server),
             "processing_steps": [{"filter": wanted_deployment}, {"map": _deployment_row}],
         },
     ]
@@ -186,7 +205,7 @@ def vercel_source(
                 "name": _FAILED_DEPLOYMENTS,
                 "selected": False,
                 "endpoint": listing(
-                    "v7/deployments", "deployments", state="ERROR", **window, **on_server
+                    "v7/deployments", "deployments", gone, state="ERROR", **window, **on_server
                 ),
                 "processing_steps": [{"filter": wanted_deployment}, {"map": _failed_parent}],
             },

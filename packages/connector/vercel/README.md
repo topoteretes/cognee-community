@@ -39,8 +39,8 @@ answer = await cognee.search(
 |---|---|---|
 | `token` | `VERCEL_TOKEN` | Access token, sent as a bearer token. |
 | `team_id` | `VERCEL_TEAM_ID` | Team to read. Needed when a full-account token should read a team. |
-| `project_ids` | all projects | Restrict the sync to these project ids or names. One entry, or a list of `prj_` ids, is filtered by Vercel itself. |
-| `lookback_days` | `30` | How far back deployments are read. `None` reads all of them. |
+| `project_ids` | all projects | Restrict the sync to these project ids or names (any case). One entry, or 2 to 20 `prj_` ids, is filtered by Vercel itself. A listed project that no longer exists is treated as deleted. |
+| `lookback_days` | `30` | How far back deployments are read, in days (more than 0). `None` reads all of them. |
 | `include_build_logs` | `True` | Fetch build output for failed deployments. |
 | `max_log_chars` | `20000` | Keep only the end of a build log. Only the newest `max_log_chars // 10` lines (at least 100) are requested. `None` requests and keeps all of it. |
 
