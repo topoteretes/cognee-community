@@ -81,9 +81,7 @@ def _invoice_to_card(invoice: dict[str, Any], id_prefix: str = DEFAULT_ID_PREFIX
 
     balance_val = float(balance or 0)
     status = (
-        "PAID"
-        if balance_val <= 0.0
-        else f"OPEN (Balance: {_format_currency(balance, currency)})"
+        "PAID" if balance_val <= 0.0 else f"OPEN (Balance: {_format_currency(balance, currency)})"
     )
 
     lines: list[str] = [
@@ -153,9 +151,7 @@ def _bill_to_card(bill: dict[str, Any], id_prefix: str = DEFAULT_ID_PREFIX) -> d
 
     balance_val = float(balance or 0)
     status = (
-        "PAID"
-        if balance_val <= 0.0
-        else f"UNPAID (Balance: {_format_currency(balance, currency)})"
+        "PAID" if balance_val <= 0.0 else f"UNPAID (Balance: {_format_currency(balance, currency)})"
     )
 
     lines: list[str] = [
@@ -182,9 +178,7 @@ def _bill_to_card(bill: dict[str, Any], id_prefix: str = DEFAULT_ID_PREFIX) -> d
             account_detail = item.get("AccountBasedExpenseLineDetail", {})
             acc_name = _get_nested(account_detail, "AccountRef", "name") or "Expense Account"
             desc_str = f" - {desc}" if desc else ""
-            item_lines.append(
-                f"- **{acc_name}**: {_format_currency(line_amt, currency)}{desc_str}"
-            )
+            item_lines.append(f"- **{acc_name}**: {_format_currency(line_amt, currency)}{desc_str}")
         elif detail_type == "ItemBasedExpenseLineDetail":
             item_detail = item.get("ItemBasedExpenseLineDetail", {})
             item_name = _get_nested(item_detail, "ItemRef", "name") or "Item"

@@ -41,6 +41,7 @@ from cognee_community_connector_quickbooks import quickbooks_source
 
 DATASET_NAME = "quickbooks_financial_memory"
 
+
 async def main():
     # Configure source with Intuit OAuth credentials
     source = quickbooks_source(
@@ -58,7 +59,7 @@ async def main():
         dataset_name=DATASET_NAME,
         primary_key="id",
         write_disposition="merge",  # MANDATORY: prevents wiping data on incremental runs
-        max_rows_per_table=0,       # MANDATORY: uncaps so orphan-cleanup sees the entire corpus
+        max_rows_per_table=0,  # MANDATORY: uncaps so orphan-cleanup sees the entire corpus
     )
 
     # Query the financial knowledge graph
@@ -68,6 +69,7 @@ async def main():
         datasets=[DATASET_NAME],
     )
     print("Answer:\n", answer)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
