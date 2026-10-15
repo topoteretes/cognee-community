@@ -89,7 +89,8 @@ def vercel_source(
             older ones are forgotten on the next sync. ``None`` reads every deployment.
         include_build_logs: Fetch build output for deployments in state ``ERROR``.
         max_log_chars: Keep only the last N characters of a build log, where the
-            error usually is. ``None`` keeps the whole log.
+            error usually is. Only the newest ``max_log_chars // 10`` lines (at
+            least 100) are requested. ``None`` requests and keeps the whole log.
         session: ``requests.Session`` to send requests through (mainly a
             test-injection point). When omitted dlt's own session is used, which
             retries 429 and 5xx responses.
@@ -108,6 +109,18 @@ def vercel_source(
         raise ValueError("Vercel access token required: pass token= or set VERCEL_TOKEN.")
     resolved_team = team_id or os.environ.get("VERCEL_TEAM_ID")
     wanted = set(project_ids or [])
+    if max_log_chars is not None and max_log_chars < 1:
+        raise ValueError("max_log_chars must be a positive number of characters, or None.")
+
+    # Narrow the deployment lists on the server when that is safe. `projectId`
+    # takes one id or name. `projectIds` takes ids only: given a name it returns
+    # no deployments and no error, which under replace would forget them all, so
+    # a longer list with names in it is filtered here instead.
+    on_server: dict[str, Any] = {}
+    if len(wanted) == 1:
+        on_server["projectId"] = next(iter(wanted))
+    elif wanted and all(str(item).startswith("prj_") for item in wanted):
+        on_server["projectIds"] = sorted(wanted)
 
     # One fixed lower bound per run. The whole window is re-read every time, so a
     # deployment that changed state or was deleted since the last run is seen.
@@ -152,10 +165,18 @@ def vercel_source(
             "name": VERCEL_DEPLOYMENTS_TABLE,
             "primary_key": "id",
             "write_disposition": "replace",
-            "endpoint": listing("v7/deployments", "deployments", **window),
+            "endpoint": listing("v7/deployments", "deployments", **window, **on_server),
             "processing_steps": [{"filter": wanted_deployment}, {"map": _deployment_row}],
         },
     ]
+    # With a cap, ask only for the newest lines, so a long log is not downloaded in
+    # full on every sync. One extra line tells whether earlier output exists.
+    log_lines = None if max_log_chars is None else max(100, max_log_chars // 10)
+    if log_lines is None:
+        events_params: dict[str, Any] = {"limit": -1, **scope}  # every line, oldest first
+    else:
+        events_params = {"limit": log_lines + 1, "direction": "backward", **scope}
+
     if include_build_logs:
         resources += [
             {
@@ -164,7 +185,9 @@ def vercel_source(
                 # so successful deployments never trigger an events request.
                 "name": _FAILED_DEPLOYMENTS,
                 "selected": False,
-                "endpoint": listing("v7/deployments", "deployments", state="ERROR", **window),
+                "endpoint": listing(
+                    "v7/deployments", "deployments", state="ERROR", **window, **on_server
+                ),
                 "processing_steps": [{"filter": wanted_deployment}, {"map": _failed_parent}],
             },
             {
@@ -172,8 +195,7 @@ def vercel_source(
                 "include_from_parent": ["uid", "name", "inspector_url"],
                 "endpoint": {
                     "path": f"v3/deployments/{{resources.{_FAILED_DEPLOYMENTS}.uid}}/events",
-                    # -1 returns every available log line in one response.
-                    "params": {"limit": -1, **scope},
+                    "params": events_params,
                     "data_selector": "$",
                     "paginator": "single_page",
                     # The deployment was deleted between the two calls: no log to
@@ -181,6 +203,7 @@ def vercel_source(
                     "response_actions": [
                         {"status_code": 404, "action": "ignore"},
                         {"status_code": 410, "action": "ignore"},
+                        _require_event_list,
                     ],
                 },
             },
@@ -207,7 +230,7 @@ def vercel_source(
         def vercel_build_logs(events):
             # rest_api yields one page per events request, so `events` holds every
             # log line of one failed deployment.
-            yield from _build_log_rows(events, max_log_chars)
+            yield from _build_log_rows(events, max_log_chars, log_lines)
 
         loaded.append(by_name[_BUILD_EVENTS] | vercel_build_logs)
 
@@ -234,7 +257,9 @@ def _require_list(key: str):
 
     The projects endpoint is documented with a bare-array response as well. With
     ``data_selector`` set, such a body would yield no rows and no error, and under
-    replace an empty read forgets everything. Raising keeps memory untouched.
+    replace an empty read forgets everything. A body without ``pagination.next``
+    is refused too: dlt's cursor paginator would stop there quietly and keep only
+    the pages read so far. Raising keeps memory untouched.
     """
 
     def check(response, *args, **kwargs):
@@ -246,8 +271,25 @@ def _require_list(key: str):
                 f"Vercel: expected an object with a '{key}' list from {response.url}. "
                 "Aborting so a partial snapshot cannot forget live rows."
             )
+        pagination = body.get("pagination")
+        if not isinstance(pagination, dict) or "next" not in pagination:
+            raise ValueError(
+                f"Vercel: expected a 'pagination.next' cursor from {response.url}. "
+                "Aborting so a partial snapshot cannot forget live rows."
+            )
 
     return check
+
+
+def _require_event_list(response, *args, **kwargs):
+    """Abort unless the events call returned a list of log lines."""
+    if not response.ok:
+        return  # 404/410 are ignored above; dlt raises for any other error status
+    if not isinstance(response.json(), list):
+        raise ValueError(
+            f"Vercel: expected a list of build events from {response.url}. "
+            "Aborting so a partial snapshot cannot forget live rows."
+        )
 
 
 def _is_live(deployment: dict) -> bool:
@@ -332,21 +374,30 @@ def _failed_parent(deployment: dict) -> dict:
     }
 
 
-def _build_log_rows(events: Any, max_log_chars: int | None):
+def _build_log_rows(events: Any, max_log_chars: int | None, line_limit: int | None = None):
     """Join the log lines of each failed deployment into one document row.
 
-    A failed deployment with no log lines (for example a build that never
+    With ``line_limit`` the events arrive newest first, at most ``line_limit + 1``
+    of them: they are put back in order, and an extra line means earlier output
+    was cut. A failed deployment with no log lines (for example a build that never
     started) yields no row here. Its deployment document still carries the error
     code and message.
     """
     items = events if isinstance(events, list) else [events]
     for uid, group in groupby(items, key=lambda event: event.get(_PARENT_UID)):
         lines = list(group)
+        truncated = False
+        if line_limit is not None:
+            lines.reverse()
+            if len(lines) > line_limit:
+                lines, truncated = lines[-line_limit:], True
         text = "\n".join(filter(None, (_event_text(event) for event in lines)))
         if not uid or not text:
             continue
         if max_log_chars is not None and len(text) > max_log_chars:
-            text = f"{_TRUNCATED_MARKER}\n{text[-max_log_chars:]}"
+            text, truncated = text[-max_log_chars:], True
+        if truncated:
+            text = f"{_TRUNCATED_MARKER}\n{text}"
         name = lines[0].get(_PARENT_NAME)
         yield {
             "id": uid,

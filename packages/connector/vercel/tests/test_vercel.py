@@ -147,6 +147,8 @@ class FakeVercel(BaseAdapter):
         self.calls = []
         self.fail = None  # callable(path, params) -> status code to return, or None
         self.projects_as_array = False
+        self.drop_pagination = False  # list bodies without their pagination block
+        self.events_as_object = False  # events body that is not a list
 
     def session(self):
         session = requests.Session()
@@ -155,7 +157,9 @@ class FakeVercel(BaseAdapter):
 
     def send(self, request, **kwargs):
         url = urlsplit(request.url)
-        params = {key: values[0] for key, values in parse_qs(url.query).items()}
+        multi = parse_qs(url.query)
+        params = {key: values[0] for key, values in multi.items()}
+        params["projectIds"] = multi.get("projectIds", [])
         self.calls.append((url.path, params, request.headers.get("Authorization")))
 
         status = self.fail(url.path, params) if self.fail else None
@@ -164,22 +168,40 @@ class FakeVercel(BaseAdapter):
         if url.path == "/v10/projects":
             page = self._page(self.projects, "updatedAt", "projects", params)
             body = page["projects"] if self.projects_as_array else page
+            if self.drop_pagination and isinstance(body, dict):
+                body.pop("pagination")
             return self._response(request, 200, body)
         if url.path == "/v7/deployments":
             wanted_states = set(filter(None, params.get("state", "").split(",")))
             since = int(params.get("since", 0))
+            # Like the real API: projectId takes an id or a name, projectIds takes
+            # ids only and returns nothing (and no error) for a name.
+            one, many = params.get("projectId"), params["projectIds"]
             items = [
                 item
                 for item in self.deployments
                 if item["created"] >= since
                 and (not wanted_states or item["state"] in wanted_states)
+                and (not one or one in (item["projectId"], item["name"]))
+                and (not many or item["projectId"] in many)
             ]
-            return self._response(request, 200, self._page(items, "created", "deployments", params))
+            page = self._page(items, "created", "deployments", params)
+            if self.drop_pagination:
+                page.pop("pagination")
+            return self._response(request, 200, page)
         if url.path.startswith("/v3/deployments/") and url.path.endswith("/events"):
             uid = url.path.split("/")[3]
             if uid not in self.logs:
                 return self._response(request, 404, {"error": {"code": "not_found"}})
-            return self._response(request, 200, self.logs[uid])
+            if self.events_as_object:
+                return self._response(request, 200, {"events": self.logs[uid]})
+            # Like the real API: backward returns the newest lines first, and a
+            # positive limit keeps that many from the start of that order.
+            events = list(self.logs[uid])
+            if params.get("direction") == "backward":
+                events.reverse()
+            limit = int(params.get("limit", -1))
+            return self._response(request, 200, events if limit < 0 else events[:limit])
         return self._response(request, 404, {"error": {"code": "not_found"}})
 
     def _page(self, items, order_key, list_key, params):
@@ -340,6 +362,19 @@ def test_build_log_rows_read_payload_text_shape():
     assert row["content"] == "from payload"
 
 
+def test_build_log_rows_put_newest_first_lines_back_in_order():
+    newest_first = list(reversed(_events("dpl_err", "one", "two", "three")))
+    (row,) = _build_log_rows(newest_first, max_log_chars=None, line_limit=5)
+    assert row["content"] == "one\ntwo\nthree"
+
+
+def test_build_log_rows_mark_output_cut_by_the_line_limit():
+    # line_limit + 1 lines came back, so earlier output exists.
+    newest_first = list(reversed(_events("dpl_err", "zero", "one", "two")))
+    (row,) = _build_log_rows(newest_first, max_log_chars=None, line_limit=2)
+    assert row["content"] == "[earlier output truncated]\none\ntwo"
+
+
 def test_build_log_rows_keep_deployments_apart():
     events = _events("dpl_a", "log a") + _events("dpl_b", "log b")
     rows = {row["id"]: row["content"] for row in _build_log_rows(events, max_log_chars=None)}
@@ -409,13 +444,21 @@ def _run_sync(dlt, tmp_path, fake, **source_kwargs):
 
 
 def _read(pipeline, table):
-    """Return {id: {"title": ..., "content": ...}} for one staging table."""
+    """Return {id: {column: value}} for one staging table, dlt's own columns left out.
+
+    cognee hashes every column that is not dlt's, ``url`` included, so a test that
+    compared only title and content could miss a column that changes.
+    """
     with (
         pipeline.sql_client() as client,
-        client.execute_query(f"SELECT id, title, content FROM {table}") as cursor,
+        client.execute_query(f"SELECT * FROM {table}") as cursor,
     ):
+        names = list(cursor.keys())  # the sqlalchemy result behind dlt's cursor
         rows = cursor.fetchall()
-    return {row[0]: {"title": row[1], "content": row[2]} for row in rows}
+    return {
+        record["id"]: {key: value for key, value in record.items() if not key.startswith("_dlt")}
+        for record in (dict(zip(names, row, strict=True)) for row in rows)
+    }
 
 
 def _everything_written(tmp_path):
@@ -470,7 +513,40 @@ def test_events_are_requested_only_for_failed_deployments(dlt_mod, tmp_path):
     # Successful builds must never cost an events request (or have their log read).
     assert fake.event_paths() == ["/v3/deployments/dpl_err/events"]
     (events_call,) = [call for call in fake.calls if call[0].endswith("/events")]
+    # Default cap of 20000 characters: only the newest 2000 lines, plus one to tell
+    # whether earlier output exists.
+    assert events_call[1]["direction"] == "backward"
+    assert events_call[1]["limit"] == "2001"
+
+
+def test_uncapped_logs_are_requested_in_full(dlt_mod, tmp_path):
+    fake = _fleet()
+    _run_sync(dlt_mod, tmp_path, fake, max_log_chars=None)
+    (events_call,) = [call for call in fake.calls if call[0].endswith("/events")]
     assert events_call[1]["limit"] == "-1"
+    assert "direction" not in events_call[1]
+
+
+def test_only_the_end_of_a_long_log_is_requested(dlt_mod, tmp_path):
+    fake = _fleet()
+    fake.logs["dpl_err"] = _log(*(f"line {number:03d}" for number in range(300)))
+    pipeline = _run_sync(dlt_mod, tmp_path, fake, max_log_chars=1000)
+
+    (events_call,) = [call for call in fake.calls if call[0].endswith("/events")]
+    assert events_call[1]["limit"] == "101"  # max(100, 1000 // 10) lines, plus one
+    content = _read(pipeline, VERCEL_BUILD_LOGS_TABLE)["dpl_err"]["content"]
+    lines = content.splitlines()
+    # Back in reading order, cut at the front, and still ending on the last line.
+    assert lines[0] == "[earlier output truncated]"
+    assert lines[-1] == "line 299"
+    assert lines[1:] == sorted(lines[1:])
+    assert len(content) <= 1000 + len("[earlier output truncated]\n")
+
+
+@pytest.mark.parametrize("cap", [0, -5])
+def test_log_cap_must_be_positive(cap):
+    with pytest.raises(ValueError, match="max_log_chars"):
+        vercel_source(token="test-token", max_log_chars=cap)
 
 
 def test_lists_are_paged_with_until_and_sent_with_bearer_auth(dlt_mod, tmp_path):
@@ -584,6 +660,38 @@ def test_project_selection_limits_every_resource(dlt_mod, tmp_path):
     assert fake.event_paths() == ["/v3/deployments/dpl_err_api/events"]
 
 
+def _deployment_calls(fake):
+    return [params for path, params, _ in fake.calls if path == "/v7/deployments"]
+
+
+def test_one_selected_project_is_filtered_on_the_server(dlt_mod, tmp_path):
+    fake = _fleet()
+    pipeline = _run_sync(dlt_mod, tmp_path, fake, project_ids=["web"])  # a name works
+
+    assert {params.get("projectId") for params in _deployment_calls(fake)} == {"web"}
+    assert set(_read(pipeline, VERCEL_DEPLOYMENTS_TABLE)) == {"dpl_ok1", "dpl_err"}
+
+
+def test_several_project_ids_are_filtered_on_the_server(dlt_mod, tmp_path):
+    fake = _fleet()
+    pipeline = _run_sync(dlt_mod, tmp_path, fake, project_ids=["prj_web", "prj_api"])
+
+    assert all(params["projectIds"] == ["prj_api", "prj_web"] for params in _deployment_calls(fake))
+    assert set(_read(pipeline, VERCEL_DEPLOYMENTS_TABLE)) == {"dpl_ok1", "dpl_ok2", "dpl_err"}
+
+
+def test_a_name_in_a_list_is_never_sent_as_project_ids(dlt_mod, tmp_path):
+    # projectIds with a name returns no deployments and no error, which under
+    # replace would forget them all. Such a list is filtered client-side instead.
+    fake = _fleet()
+    pipeline = _run_sync(dlt_mod, tmp_path, fake, project_ids=["web", "prj_api"])
+
+    assert all(
+        not params["projectIds"] and "projectId" not in params for params in _deployment_calls(fake)
+    )
+    assert set(_read(pipeline, VERCEL_DEPLOYMENTS_TABLE)) == {"dpl_ok1", "dpl_ok2", "dpl_err"}
+
+
 def test_build_logs_can_be_switched_off(dlt_mod, tmp_path):
     fake = _fleet()
     pipeline = _run_sync(dlt_mod, tmp_path, fake, include_build_logs=False)
@@ -632,6 +740,33 @@ def test_http_error_aborts_sync_and_keeps_previous_snapshot(dlt_mod, tmp_path, f
     # complete snapshot instead of a short one.
     after = _pipeline(dlt_mod, tmp_path)
     assert {table: _read(after, table) for table in _TABLES} == before
+
+
+def test_list_without_pagination_aborts_sync(dlt_mod, tmp_path):
+    # dlt's cursor paginator stops quietly when the cursor is missing, which would
+    # keep only the first page and forget the rest.
+    fake = _fleet()
+    first = _run_sync(dlt_mod, tmp_path, fake)
+    before = {table: _read(first, table) for table in _TABLES}
+
+    fake.drop_pagination = True
+    with pytest.raises(Exception, match=r"pagination\.next"):
+        _run_sync(dlt_mod, tmp_path, fake)
+
+    pipeline = _pipeline(dlt_mod, tmp_path)
+    assert {table: _read(pipeline, table) for table in _TABLES} == before
+
+
+def test_events_body_that_is_not_a_list_aborts_sync(dlt_mod, tmp_path):
+    fake = _fleet()
+    first = _run_sync(dlt_mod, tmp_path, fake)
+    before = _read(first, VERCEL_BUILD_LOGS_TABLE)
+
+    fake.events_as_object = True
+    with pytest.raises(Exception, match="list of build events"):
+        _run_sync(dlt_mod, tmp_path, fake)
+
+    assert _read(_pipeline(dlt_mod, tmp_path), VERCEL_BUILD_LOGS_TABLE) == before
 
 
 def test_unexpected_list_shape_aborts_sync(dlt_mod, tmp_path):

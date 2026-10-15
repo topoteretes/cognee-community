@@ -39,10 +39,10 @@ answer = await cognee.search(
 |---|---|---|
 | `token` | `VERCEL_TOKEN` | Access token, sent as a bearer token. |
 | `team_id` | `VERCEL_TEAM_ID` | Team to read. Needed when a full-account token should read a team. |
-| `project_ids` | all projects | Restrict the sync to these project ids or names. |
+| `project_ids` | all projects | Restrict the sync to these project ids or names. One entry, or a list of `prj_` ids, is filtered by Vercel itself. |
 | `lookback_days` | `30` | How far back deployments are read. `None` reads all of them. |
 | `include_build_logs` | `True` | Fetch build output for failed deployments. |
-| `max_log_chars` | `20000` | Keep only the end of a build log. `None` keeps all of it. |
+| `max_log_chars` | `20000` | Keep only the end of a build log. Only the newest `max_log_chars // 10` lines (at least 100) are requested. `None` requests and keeps all of it. |
 
 See `examples/example.py` for the full flow.
 
@@ -70,8 +70,9 @@ Each run is a **full snapshot of a fixed window**: every deployment created in t
   A `since` cursor would miss it, because `since` filters on creation time.
 - A deployment that was deleted, removed by Vercel's retention policy, or is now older than the
   window drops out of the snapshot, and cognee's `orphan_cleanup` forgets it.
-- An HTTP error or an unexpected response shape aborts the run and leaves memory untouched. A
-  partial snapshot would otherwise be forgotten as if it were a deletion.
+- An HTTP error or an unexpected response shape aborts the run and leaves memory untouched: a
+  list without its `pagination` block, or build events that are not a list, count as unexpected.
+  A partial snapshot would otherwise be forgotten as if it were a deletion.
 
 Leave `write_disposition` at its default. Passing `merge` breaks forget-on-delete for a snapshot
 source.
@@ -83,6 +84,10 @@ source.
 - **Build logs are ingested as Vercel returns them.** Vercel redacts sensitive environment
   variables of 32 characters or more. Anything else a build prints stays in its log. Pass
   `include_build_logs=False` if your builds print secrets.
+- **One dataset per team or project selection.** Each sync is a full snapshot of what it was asked
+  for, so two different selections synced into one dataset would forget each other's documents.
+- **Projects page by last update.** With more than 100 projects, a project updated while a sync is
+  paging can be missed by that one sync. It comes back, and is re-processed, on the next.
 - **dlt keeps its load files.** Each sync leaves a gzip copy of the loaded rows in dlt's
   pipeline directory, and forgetting a document does not remove those copies. Set
   `LOAD__DELETE_COMPLETED_JOBS=true` to have dlt delete them after each load.
