@@ -1,7 +1,9 @@
 # Connector tests
 
 `test_gitlab.py` covers token validation, project discovery, resource selection,
-and issue/MR/wiki fetching with mocked HTTP responses. These tests do not
+and issue/MR/wiki fetching with mocked HTTP responses. `test_documents.py`
+checks resource mapping, and `test_source.py` verifies source integration,
+account scoping, and DLT merge loading into temporary SQLite staging. These tests do not
 require a token or network access. Run `uv run pytest tests/` from the package
 directory.
 

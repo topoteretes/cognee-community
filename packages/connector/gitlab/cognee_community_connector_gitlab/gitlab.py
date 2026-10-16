@@ -1,9 +1,21 @@
-"""GitLab document source scaffold; API extraction and sync are not implemented yet."""
+"""Fetch GitLab resources and expose mapped documents as a DLT source."""
 
+import json
 from collections.abc import Sequence
-from typing import Any, Literal
+from hashlib import sha256
+from typing import TYPE_CHECKING, Any, Literal
 
 import httpx
+
+from .documents import (
+    _instance_url,
+    _issue_to_document,
+    _merge_request_to_document,
+    _wiki_to_document,
+)
+
+if TYPE_CHECKING:
+    from dlt.extract.source import DltSource
 
 ResourceType = Literal["issues", "merge_requests", "comments", "wiki"]
 
@@ -161,18 +173,21 @@ def gitlab_source(
     *,
     resource_types: Sequence[ResourceType],
     base_url: str = "https://gitlab.com",
-):
-    """Create a GitLab document source for cognee (not yet implemented).
+) -> "DltSource":
+    """Fetch selected GitLab content and return a document-mode DLT source.
 
-    Planned inputs:
+    Args:
         token: Required legacy PAT with read_api scope.
         base_url: GitLab instance URL, including self-hosted instances.
         resource_types: Required, non-empty selection of content types.
 
     Validates the PAT and discovers all accessible projects (including public
     projects), then fetches selected issues, merge requests, and wiki pages.
-    Comments, document rendering, incremental state, and deletion reconciliation
-    are not implemented yet.
+    Fetching and mapping complete before returning the source, so failures do
+    not publish a partial inventory. This first version buffers documents in
+    memory and uses merge staging: it does not detect upstream deletions or
+    fetch only changes. Pass write_disposition="merge" to cognee.remember().
+    Comments are not implemented and selecting them raises before HTTP calls.
     """
     if not resource_types:
         raise ValueError("Select at least one resource type.")
@@ -181,6 +196,9 @@ def gitlab_source(
         for resource_type in resource_types
     ):
         raise ValueError("Resource types must be issues, merge_requests, comments, or wiki.")
+    if "comments" in resource_types:
+        raise NotImplementedError("Comment ingestion is not implemented yet.")
+    selected = tuple(sorted(set(resource_types)))
 
     if not isinstance(token, str) or not token.strip():
         raise ValueError("A non-empty GitLab token is required.")
@@ -194,20 +212,61 @@ def gitlab_source(
     ):
         raise ValueError("base_url must be an HTTP(S) instance URL without credentials or query.")
     api_url = f"{str(url).rstrip('/')}/api/v4/"
+    instance = _instance_url(str(url))
+    documents = []
     with httpx.Client(
         base_url=api_url,
         headers={"PRIVATE-TOKEN": token},
         timeout=30.0,
         follow_redirects=False,
     ) as client:
-        _validate_token(client)
+        metadata = _validate_token(client)
+        owner_id = metadata.get("user_id")
+        if type(owner_id) is not int or owner_id <= 0:
+            raise GitLabAPIError(
+                "GitLab token metadata requires a valid user_id for source isolation."
+            )
         projects = _discover_projects(client)
         for project in projects:
-            if "issues" in resource_types:
-                _fetch_issues(client, project["id"])
-            if "merge_requests" in resource_types:
-                _fetch_merge_requests(client, project["id"])
-            if "wiki" in resource_types:
-                _fetch_wiki_pages(client, project["id"])
+            if "issues" in selected:
+                documents.extend(
+                    _issue_to_document(issue, project, instance)
+                    for issue in _fetch_issues(client, project["id"])
+                )
+            if "merge_requests" in selected:
+                documents.extend(
+                    _merge_request_to_document(mr, project, instance)
+                    for mr in _fetch_merge_requests(client, project["id"])
+                )
+            if "wiki" in selected:
+                documents.extend(
+                    _wiki_to_document(page, project, instance)
+                    for page in _fetch_wiki_pages(client, project["id"])
+                )
 
-    raise NotImplementedError("GitLab connector scaffold: ingestion is not implemented yet.")
+    import dlt
+    from cognee.tasks.ingestion import dlt_utils
+
+    if getattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 0) < 1:
+        raise RuntimeError("GitLab document ingestion requires DOCUMENT_SYNC_VERSION >= 1.")
+    # Exclude credentials from identity so rotating the PAT preserves staging.
+    scope = sha256(json.dumps([instance, owner_id, selected]).encode()).hexdigest()[:32]
+    resource_name = f"gitlab_documents_{scope}"
+
+    @dlt.resource(
+        name=resource_name,
+        primary_key="id",
+        write_disposition="merge",
+        columns={name: {"data_type": "text"} for name in ("id", "title", "content", "url")},
+    )
+    def gitlab_documents():
+        yield from documents
+
+    @dlt.source(name=f"gitlab_{scope}")
+    def source_factory():
+        return gitlab_documents
+
+    source = source_factory()
+    setattr(source, dlt_utils.DOCUMENT_SOURCE_ATTR, "gitlab")
+    setattr(source, dlt_utils.PIPELINE_SCOPE_ATTR, resource_name)
+    return source

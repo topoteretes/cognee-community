@@ -1,4 +1,4 @@
-"""Intended usage; raises NotImplementedError until the connector is implemented."""
+"""Fetch GitLab documents and build searchable memory in a dedicated dataset."""
 
 import asyncio
 import os
@@ -14,7 +14,13 @@ async def main():
         base_url=os.environ.get("GITLAB_BASE_URL", "https://gitlab.com"),
         resource_types=["issues", "merge_requests", "wiki"],
     )
-    await cognee.remember(source, dataset_name="gitlab", run_in_background=False)
+    await cognee.remember(
+        source,
+        dataset_name="gitlab",
+        primary_key="id",
+        write_disposition="merge",
+        run_in_background=False,
+    )
 
 
 if __name__ == "__main__":

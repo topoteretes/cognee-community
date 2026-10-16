@@ -15,7 +15,14 @@ from cognee_community_connector_gitlab.gitlab import (
 
 
 def token_metadata(**updates):
-    return {"active": True, "revoked": False, "expires_at": None, "scopes": ["read_api"], **updates}
+    return {
+        "active": True,
+        "revoked": False,
+        "expires_at": None,
+        "scopes": ["read_api"],
+        "user_id": 7,
+        **updates,
+    }
 
 
 def client_for(handler):
@@ -134,7 +141,6 @@ def test_source_validates_before_discovery():
             "cognee_community_connector_gitlab.gitlab.httpx.Client",
             return_value=client_for(handler),
         ),
-        pytest.raises(NotImplementedError),
     ):
         gitlab_source("test-secret", resource_types=["issues"])
     assert paths == ["/prefix/api/v4/personal_access_tokens/self", "/prefix/api/v4/projects"]
@@ -249,7 +255,6 @@ def test_source_fetches_only_selected_resources(selection):
             "cognee_community_connector_gitlab.gitlab.httpx.Client",
             return_value=client_for(handler),
         ),
-        pytest.raises(NotImplementedError),
     ):
         gitlab_source("test-secret", resource_types=selection)
     expected = ["/prefix/api/v4/personal_access_tokens/self", "/prefix/api/v4/projects"]
