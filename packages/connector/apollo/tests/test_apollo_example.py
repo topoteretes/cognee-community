@@ -29,7 +29,9 @@ async def test_the_example_backfills_searches_and_resyncs(mocked_llm, monkeypatc
     example = _load_example()
     monkeypatch.setenv("APOLLO_API_KEY", "example-key")
     monkeypatch.setattr(
-        example, "apollo_source", lambda api_key: apollo_source(service=fake, resource_name="ex")
+        example,
+        "apollo_source",
+        lambda api_key, resource_name: apollo_source(service=fake, resource_name=resource_name),
     )
 
     await example.main()

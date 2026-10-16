@@ -4,7 +4,7 @@ It ingests your team's own contacts, accounts and sequence activity, never
 Apollo's enrichment database, and is meant to be handed to ``cognee.remember``::
 
     await cognee.remember(
-        apollo_source(api_key="<apollo api key>"),
+        apollo_source(api_key="<apollo api key>", resource_name="apollo_sales"),
         dataset_name="apollo",
         primary_key="id",
         write_disposition="merge",  # required, the add pipeline defaults to "replace"
@@ -13,17 +13,18 @@ Apollo's enrichment database, and is meant to be handed to ``cognee.remember``::
 
 import hashlib
 import json
-import logging
+import re
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
 import requests
+from cognee.shared.logging_utils import get_logger
 from cognee.tasks.ingestion import dlt_utils
 from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
 
-logger = logging.getLogger(__name__)
+logger = get_logger("apollo_connector")
 
 BASE_URL = "https://api.apollo.io/api/v1"
 APP_URL = "https://app.apollo.io/#"
@@ -31,12 +32,23 @@ KINDS = ("contacts", "accounts", "sequences")
 PAGE_SIZE = 100
 # apollo search stops at 500 pages of 100 records
 SEARCH_CAP = 50_000
+# one capped listing (500 pages) per run; the rate-limit windows stop smaller plans first
 DEFAULT_MAX_REQUESTS = 500
+# requests left untouched in each rate-limit window, for the key's other users
 _REQUESTS_RESERVE = 10
+# the activity feed has no paging, so a contact keeps at most its latest 50 events
 _ACTIVITY_LIMIT = 50
 _TIMEOUT = (10, 30)
 _RETRIES = 3
-_GONE_MARKERS = ("has been deleted", "does not exist", "not found")
+_RATE_HEADERS = {
+    "minute": "x-minute-requests-left",
+    "hourly": "x-hourly-requests-left",
+    "daily": "x-24-hour-requests-left",
+}
+# legacy 422 texts seen live for a deleted or unknown contact or account, matched whole
+# so a record name can't trip them; error_details.code replaces them on 16 feb 2027
+_GONE_MESSAGE = re.compile(r"^(oops! )?this (contact|account) (has been deleted|does not exist)")
+_GONE_REASONS = ("NOT_FOUND", "DELETED")
 
 
 class ApolloSourceError(RuntimeError):
@@ -75,21 +87,29 @@ def _is_gone(body: Any) -> bool:
     if not isinstance(body, dict):
         return False
     details = body.get("error_details")
-    texts = [body.get("error"), body.get("message")]
-    if isinstance(details, dict):
-        texts.append(details.get("message"))
-    return any(
-        isinstance(text, str) and any(marker in text.lower() for marker in _GONE_MARKERS)
-        for text in texts
-    )
+    code = details.get("code") if isinstance(details, dict) else None
+    if isinstance(code, str) and code:
+        # codes read DOMAIN.CATEGORY.REASON; apollo documents no deleted-record code yet
+        reason = code.rsplit(".", 1)[-1].upper()
+        return any(marker in reason for marker in _GONE_REASONS)
+    texts = (body.get("error"), body.get("message"))
+    return any(isinstance(text, str) and _GONE_MESSAGE.match(text.lower()) for text in texts)
+
+
+def _endpoint(path: str) -> str:
+    """The path with a record id replaced, so error messages never carry one."""
+    head, _, tail = path.rpartition("/")
+    if head in ("/contacts", "/accounts") and tail != "search":
+        return f"{head}/{{id}}"
+    return path
 
 
 class ApolloClient:
     """Minimal synchronous REST client for Apollo.
 
-    After every successful call ``rate_limit`` holds the hourly and daily requests
-    left. Tests can pass any object with the same ``request`` method and
-    ``rate_limit`` attribute instead.
+    After every successful call ``rate_limit`` holds the requests left in the minute,
+    hourly and daily windows. Tests can pass any object with the same ``request``
+    method and ``rate_limit`` attribute instead.
     """
 
     def __init__(self, api_key: str, *, sleep: Callable[[float], None] = time.sleep):
@@ -137,27 +157,31 @@ class ApolloClient:
                 self._sleep(2**attempt)
                 continue
             return self._parse(response, path)
-        raise ApolloAPIError("Apollo request failed")  # pragma: no cover
 
     def _parse(self, response: Any, path: str) -> Any:
         status = response.status_code
         if status == 401:
             raise ApolloAuthError("Apollo rejected the API key (HTTP 401)")
         if status == 403:
-            raise ApolloAccessError(f"The Apollo API key or plan cannot call {path} (HTTP 403)")
+            raise ApolloAccessError(
+                f"The Apollo API key or plan cannot call {_endpoint(path)} (HTTP 403)"
+            )
         if status == 429:
             raise ApolloRateLimitedError("Apollo rate limit exceeded (HTTP 429)")
         try:
             payload = response.json()
         except ValueError:
-            payload = {}
+            payload = None
         if status == 404 or (status == 422 and _is_gone(payload)):
             raise ApolloNotFoundError(f"Apollo record not found (HTTP {status})")
         if status != 200:
             raise ApolloAPIError(f"Apollo request failed: HTTP {status}")
+        # every endpoint used answers with an object, except /labels with a list
+        if not isinstance(payload, dict | list):
+            raise ApolloAPIError(f"Apollo sent an unreadable answer for {_endpoint(path)}")
+        headers = response.headers
         self.rate_limit = {
-            "hourly": _int_header(response.headers, "x-hourly-requests-left"),
-            "daily": _int_header(response.headers, "x-24-hour-requests-left"),
+            window: _int_header(headers, name) for window, name in _RATE_HEADERS.items()
         }
         return payload
 
@@ -232,7 +256,8 @@ def render_contact(
         for event in ordered
     ]
     if activity:
-        parts.extend(["", "Sequence activity:", *activity])
+        cut = f" (cut at {_ACTIVITY_LIMIT} events)" if len(activity) >= _ACTIVITY_LIMIT else ""
+        parts.extend(["", f"Sequence activity{cut}:", *activity])
     return {
         "id": f"contact:{contact['id']}",
         "title": title,
@@ -279,6 +304,15 @@ def _hash(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
+def _total_pages(data: dict) -> int:
+    """The page count of a search answer; without it a listing can't be trusted as complete."""
+    pagination = data.get("pagination")
+    total = pagination.get("total_pages") if isinstance(pagination, dict) else None
+    if not isinstance(total, int):
+        raise ApolloAPIError("Apollo search answered without pagination")
+    return total
+
+
 # ---------------------------------------------------------------------------
 # Extraction
 # ---------------------------------------------------------------------------
@@ -313,6 +347,7 @@ class _Walker:
         include: tuple[str, ...],
         filters: dict[str, list[str]],
         max_requests: int,
+        check_active: Callable[[], None] | None,
     ):
         self.client = client
         self.state = state
@@ -322,6 +357,7 @@ class _Walker:
         self.include = include
         self.filters = filters
         self.max_requests = max_requests
+        self.check_active = check_active
         self.requests = 0
         self.emitted = 0
         self.fingerprints: dict[str, str] = state.setdefault("fingerprints", {})
@@ -330,6 +366,8 @@ class _Walker:
 
     # -- requests ----------------------------------------------------------
     def _call(self, method: str, path: str, **kwargs: Any) -> Any:
+        if self.check_active is not None:
+            self.check_active()
         self._check_budget()
         self.requests += 1
         try:
@@ -345,15 +383,17 @@ class _Walker:
         if self.requests >= self.max_requests:
             raise _CutShortError("budget")
         remaining = getattr(self.client, "rate_limit", None) or {}
-        for window in ("hourly", "daily"):
+        for window in _RATE_HEADERS:
             left = remaining.get(window)
             if left is not None and left < _REQUESTS_RESERVE:
                 raise _CutShortError("rate_limit")
 
     # -- lookups -----------------------------------------------------------
-    def _load_lookups(self) -> None:
+    def _load_lookups(self) -> list[dict]:
+        """Load the id-to-name maps and return the full sequence list."""
         contact_stages = self._call("GET", "/contact_stages").get("contact_stages") or []
         account_stages = self._call("GET", "/account_stages").get("account_stages") or []
+        self._check_team(contact_stages + account_stages)
         # /labels answers with a bare list
         labels = self._call("GET", "/labels") or []
         fields = self._call("GET", "/fields", params={"source": "custom"}).get("fields") or []
@@ -366,17 +406,30 @@ class _Walker:
             fields={f["id"].split(".", 1)[-1]: _text(f.get("label")) for f in fields},
             sequences={s["id"]: _text(s.get("name")) for s in sequences},
         )
-        self._sequences = sequences
+        return sequences
+
+    def _check_team(self, stages: list[dict]) -> None:
+        """Refuse state written for another Apollo team, which would forget that team's rows."""
+        team_id = next((s["team_id"] for s in stages if s.get("team_id")), None)
+        if team_id is None:
+            return
+        stored = self.state.setdefault("team_id", team_id)
+        if stored != team_id:
+            raise ApolloSourceError(
+                "This resource_name already holds another Apollo team's sync; "
+                "give each Apollo account its own resource_name"
+            )
 
     def _all_sequences(self) -> Iterator[dict]:
         page = 1
         while True:
+            # the openapi lists these as query params, but apollo reads the json body too
             data = self._call(
                 "POST", "/emailer_campaigns/search", body={"page": page, "per_page": PAGE_SIZE}
             )
             records = data.get("emailer_campaigns") or []
+            total_pages = _total_pages(data)
             yield from records
-            total_pages = (data.get("pagination") or {}).get("total_pages") or 0
             if len(records) < PAGE_SIZE or page >= total_pages:
                 return
             page += 1
@@ -396,19 +449,24 @@ class _Walker:
 
     def _walk(self, kind: str) -> Iterator[dict]:
         """Yield every record of a kind, resuming at the page a cut run stopped on."""
-        progress = self.state.setdefault("walks", {}).setdefault(kind, {"page": 1})
-        if progress.get("done"):
-            return
         path, _ = _SEARCHES[kind]
         body = self._search_body(kind)
+        walks = self.state.setdefault("walks", {})
+        query = _hash(body)
+        # a page reached under other filters points into a different listing
+        if walks.get(kind, {}).get("query") != query:
+            walks[kind] = {"page": 1, "query": query}
+        progress = walks[kind]
+        if progress.get("done"):
+            return
         while True:
             data = self._call("POST", path, body={**body, "page": progress["page"]})
             records = data.get(kind) or []
-            pagination = data.get("pagination") or {}
-            if (pagination.get("total_entries") or 0) > SEARCH_CAP:
+            total_pages = _total_pages(data)
+            if (data["pagination"].get("total_entries") or 0) > SEARCH_CAP:
                 progress["capped"] = True
             yield from records
-            last_page = min(pagination.get("total_pages") or 0, SEARCH_CAP // PAGE_SIZE)
+            last_page = min(total_pages, SEARCH_CAP // PAGE_SIZE)
             if len(records) < PAGE_SIZE or progress["page"] >= last_page:
                 break
             progress["page"] += 1
@@ -428,8 +486,8 @@ class _Walker:
         return row
 
     # -- kinds -------------------------------------------------------------
-    def _sequence_rows(self) -> Iterator[dict]:
-        for sequence in self._sequences:
+    def _sequence_rows(self, sequences: list[dict]) -> Iterator[dict]:
+        for sequence in sequences:
             row = render_sequence(sequence)
             fingerprint = _hash(row)
             if self._changed(row["id"], fingerprint):
@@ -448,12 +506,22 @@ class _Walker:
             statuses = contact.get("contact_campaign_statuses") or []
             # sequence events don't bump updated_at, so raw statuses and the last
             # activity date decide when the activity feed is read again
-            activity_key = _hash([statuses, contact.get("last_activity_date")]) if statuses else ""
+            activity_key = (
+                _hash([sorted(map(_hash, statuses)), contact.get("last_activity_date")])
+                if statuses
+                else ""
+            )
             fingerprint = _hash(row) + activity_key
             if not self._changed(row["id"], fingerprint):
                 continue
             if statuses:
-                row = render_contact(contact, self.lookups, self._activity(contact["id"]))
+                try:
+                    events = self._activity(contact["id"])
+                except (ApolloAPIError, ApolloAccessError) as exc:
+                    # no fingerprint is stored, so the next run reads this contact again
+                    self._failed("activity feed", exc)
+                    continue
+                row = render_contact(contact, self.lookups, events)
             yield self._emit(row, fingerprint)
 
     def _activity(self, contact_id: str) -> list[dict]:
@@ -465,7 +533,19 @@ class _Walker:
             )
         except ApolloNotFoundError:
             return []  # deleted meanwhile; the next cycle forgets it
-        return data.get("events") or []
+        events = data.get("events") or []
+        if len(events) >= _ACTIVITY_LIMIT:
+            logger.warning(
+                "Apollo returned %d activity events for a contact and has no paging; "
+                "older events are left out.",
+                _ACTIVITY_LIMIT,
+            )
+        return events
+
+    def _failed(self, step: str, exc: Exception) -> None:
+        self.stats["failed"] += 1
+        # the message names the status and endpoint, never the record id
+        logger.warning("Apollo %s failed for one record, retried next run: %s", step, exc)
 
     # -- forget-on-delete --------------------------------------------------
     def _close_cycle(self) -> None:
@@ -491,7 +571,13 @@ class _Walker:
         pending = self.state.setdefault("pending_deletes", [])
         while pending:
             row_id = pending[0]
-            if self._gone(row_id):
+            try:
+                gone = self._gone(row_id)
+            except (ApolloAPIError, ApolloAccessError) as exc:
+                # keep the row; its fingerprint queues it again when this cycle closes
+                self._failed("deletion check", exc)
+                gone = False
+            if gone:
                 self.fingerprints.pop(row_id, None)
                 self.stats["deleted"] += 1
                 yield {"id": row_id, "_deleted": True}
@@ -504,9 +590,11 @@ class _Walker:
         if kind == "sequence":
             return True  # the sequence list is read in full every run
         try:
-            record = self._call("GET", f"/{kind}s/{record_id}").get(kind) or {}
+            record = self._call("GET", f"/{kind}s/{record_id}").get(kind)
         except ApolloNotFoundError:
             return True
+        if not isinstance(record, dict):
+            raise ApolloAPIError(f"Apollo sent no {kind} for /{kind}s/{{id}}")
         # still in apollo: forget it only if it left the selected stages or lists
         return not self._in_scope(kind, record)
 
@@ -515,15 +603,17 @@ class _Walker:
         label_ids = self.filters.get(f"{kind}_label_ids")
         if stage_ids and record.get(f"{kind}_stage_id") not in stage_ids:
             return False
-        return not (label_ids and not set(record.get("label_ids") or []) & set(label_ids))
+        if not label_ids:
+            return True
+        return bool(set(record.get("label_ids") or []) & set(label_ids))
 
     # -- the run -----------------------------------------------------------
     def rows(self) -> Iterator[dict]:
-        self._load_lookups()
+        sequences = self._load_lookups()
         # finish deletions a cut run left behind before starting a new listing
         yield from self._forget()
         if "sequences" in self.include:
-            yield from self._sequence_rows()
+            yield from self._sequence_rows(sequences)
         if "accounts" in self.include:
             yield from self._account_rows()
         if "contacts" in self.include:
@@ -540,10 +630,17 @@ def _iter_rows(
     include: tuple[str, ...] = KINDS,
     filters: dict[str, list[str]] | None = None,
     max_requests: int = DEFAULT_MAX_REQUESTS,
+    check_active: Callable[[], None] | None = None,
 ) -> Iterator[dict]:
     """Yield the changed rows of a workspace. Pure of dlt, so tests drive it with a dict."""
     walker = _Walker(
-        client, state, stats, include=include, filters=filters or {}, max_requests=max_requests
+        client,
+        state,
+        stats,
+        include=include,
+        filters=filters or {},
+        max_requests=max_requests,
+        check_active=check_active,
     )
     try:
         yield from walker.rows()
@@ -558,9 +655,10 @@ def _iter_rows(
 # ---------------------------------------------------------------------------
 def apollo_source(
     *,
+    resource_name: str,
     api_key: str | None = None,
     service: Any = None,
-    resource_name: str = "apollo",
+    check_active: Callable[[], None] | None = None,
     include: tuple[str, ...] = KINDS,
     contact_stage_ids: list[str] | None = None,
     contact_label_ids: list[str] | None = None,
@@ -571,10 +669,14 @@ def apollo_source(
     """Return a ``dlt`` resource that yields an Apollo workspace's documents for ``remember``.
 
     Args:
+        resource_name: Stable name of this connection, one per Apollo account. It scopes
+            the sync state and the cleanup of deleted records, so keep it fixed across
+            runs. There is no default: two accounts sharing a name would forget each
+            other's records, and a run refuses state written for another Apollo team.
         api_key: Apollo API key. Used to build the client when ``service`` is omitted.
         service: Pre-built client, mainly an injection point for tests.
-        resource_name: Stable name of this connection. It scopes the sync state and
-            the cleanup of deleted records, so keep it fixed across runs.
+        check_active: Optional host authorization checkpoint, called before each
+            request.
         include: Which of ``"contacts"``, ``"accounts"`` and ``"sequences"`` to sync.
         contact_stage_ids, contact_label_ids: Only sync contacts in these stages or lists.
         account_stage_ids, account_label_ids: Only sync accounts in these stages or lists.
@@ -589,6 +691,8 @@ def apollo_source(
 
     if getattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 0) < 1:
         raise RuntimeError("Apollo sync requires cognee>=1.6.1 (table-scoped document cleanup).")
+    if not isinstance(resource_name, str) or not resource_name.strip():
+        raise ValueError("apollo_source needs a resource_name, one per Apollo account")
     if service is None and not api_key:
         raise ValueError("apollo_source needs a service or an api_key")
     include = tuple(include)
@@ -614,14 +718,18 @@ def apollo_source(
     def apollo_workspace():
         stats.clear()
         stats.update(scanned=0, skipped=0, deleted=0, failed=0)
-        yield from _iter_rows(
+        # the quota a reused client saw last run is stale once its windows reset
+        client.rate_limit = {}
+        rows = _iter_rows(
             client,
             dlt.current.resource_state(),
             stats,
             include=include,
             filters=filters,
             max_requests=max_requests,
+            check_active=check_active,
         )
+        yield from dlt_utils.guarded_rows(rows, check_active)
 
     resource = apollo_workspace()
     setattr(resource, DOCUMENT_SOURCE_ATTR, "apollo")

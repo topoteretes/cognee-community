@@ -3,11 +3,12 @@ name = "cognee-community-connector-apollo"
 version = "0.1.0"
 description = "Apollo.io data-source connector for cognee — sync your CRM contacts, accounts and sequence activity into memory (incremental + forget-on-delete)"
 readme = "README.md"
-requires-python = ">=3.11,<3.14"
+requires-python = ">=3.10,<3.15"
 dependencies = [
     # needs table-scoped dlt document cleanup (PIPELINE_SCOPE_ATTR), first shipped in cognee 1.6.1
-    "cognee==1.6.3",
-    "dlt[sqlalchemy]>=1.9.0,<1.31",
+    "cognee>=1.6.3,<2",
+    # cognee pins the dlt range it supports
+    "dlt[sqlalchemy]>=1.9.0,<2",
     "requests>=2.31,<3",
 ]
 
@@ -24,7 +25,7 @@ packages = ["cognee_community_connector_apollo"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "N", "B", "UP", "C4", "PGH", "SIM", "RUF"]

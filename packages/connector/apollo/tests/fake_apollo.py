@@ -15,7 +15,8 @@ FIELDS = [
 
 
 class FakeApollo:
-    def __init__(self):
+    def __init__(self, team_id: str = "team1"):
+        self.team_id = team_id
         self.contacts: dict[str, dict] = {}
         self.accounts: dict[str, dict] = {}
         self.sequences: dict[str, dict] = {}
@@ -26,6 +27,10 @@ class FakeApollo:
         self.fail_after: int | None = None
         self.fail_with: Exception | None = None
         self.fail_paths: dict[str, Exception] = {}
+        # paths answered with this payload instead, like a 200 with an empty body
+        self.answers: dict[str, object] = {}
+        self.no_pagination: set[str] = set()
+        self.bodies: list[tuple[str, dict]] = []
         self.calls: list[tuple[str, str]] = []
         self.rate_limit: dict[str, int | None] = {}
         self._clock = 0
@@ -112,30 +117,35 @@ class FakeApollo:
 
     def request(self, method: str, path: str, *, body=None, params=None):
         self.calls.append((method, path))
+        self.bodies.append((path, dict(body or {})))
         if path in self.fail_paths:
             raise self.fail_paths[path]
         if self.fail_after is not None and len(self.calls) > self.fail_after:
             raise self.fail_with
+        if path in self.answers:
+            return self.answers[path]
         body = body or {}
         if path == "/contact_stages":
-            return {"contact_stages": CONTACT_STAGES}
+            return {"contact_stages": [{**s, "team_id": self.team_id} for s in CONTACT_STAGES]}
         if path == "/account_stages":
-            return {"account_stages": ACCOUNT_STAGES}
+            return {"account_stages": [{**s, "team_id": self.team_id} for s in ACCOUNT_STAGES]}
         if path == "/labels":
             return LABELS
         if path == "/fields":
             return {"fields": FIELDS, "field_groups": []}
         if path == "/emailer_campaigns/search":
-            return self._page("emailer_campaigns", list(self.sequences.values()), body)
+            return self._page(path, "emailer_campaigns", list(self.sequences.values()), body)
         if path == "/contacts/search":
-            return self._page("contacts", self._search(self.contacts, "contact", body), body)
+            return self._page(path, "contacts", self._search(self.contacts, "contact", body), body)
         if path == "/accounts/search":
-            return self._page("accounts", self._search(self.accounts, "account", body), body)
+            return self._page(path, "accounts", self._search(self.accounts, "account", body), body)
         if path == "/emailer_campaigns/activity_feed":
             contact_id = body["contact_id"]
             if contact_id not in self.contacts:
                 raise ApolloNotFoundError("Apollo record not found (HTTP 404)")
-            return {"contact_id": contact_id, "events": list(self.events.get(contact_id, []))}
+            # the feed has no paging: per_page caps it
+            events = self.events.get(contact_id, [])[: body.get("per_page", 50)]
+            return {"contact_id": contact_id, "events": list(events)}
         for kind, store in (("contact", self.contacts), ("account", self.accounts)):
             prefix = f"/{kind}s/"
             if method == "GET" and path.startswith(prefix):
@@ -158,10 +168,12 @@ class FakeApollo:
         assert body.get("sort_by_field") == f"{kind}_created_at"
         return sorted(records, key=lambda r: r["created_at"])
 
-    def _page(self, key: str, records: list[dict], body: dict) -> dict:
+    def _page(self, path: str, key: str, records: list[dict], body: dict) -> dict:
         page, per_page = body.get("page", 1), body.get("per_page", 100)
         total = self.total_override if self.total_override is not None else len(records)
         chunk = records[(page - 1) * per_page : page * per_page]
+        if path in self.no_pagination:
+            return {key: [dict(record) for record in chunk]}
         return {
             key: [dict(record) for record in chunk],
             "pagination": {

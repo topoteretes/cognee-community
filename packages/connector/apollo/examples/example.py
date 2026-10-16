@@ -39,6 +39,8 @@ from cognee_community_connector_apollo import apollo_source
 
 # keep the crm in its own dataset so it is easy to inspect and forget
 DATASET_NAME = "apollo_crm"
+# one fixed name per apollo account: it keys the sync state and the forget-on-delete scope
+RESOURCE_NAME = "apollo_crm_main"
 
 # max_rows_per_table=0 lets orphan-cleanup compare against the whole synced corpus
 APOLLO_REMEMBER_KWARGS = {
@@ -49,7 +51,7 @@ APOLLO_REMEMBER_KWARGS = {
 
 
 async def sync(api_key: str) -> None:
-    source = apollo_source(api_key=api_key)
+    source = apollo_source(api_key=api_key, resource_name=RESOURCE_NAME)
     result = await cognee.remember(source, dataset_name=DATASET_NAME, **APOLLO_REMEMBER_KWARGS)
     print(result)
     print("sync stats:", source.cognee_sync_stats)

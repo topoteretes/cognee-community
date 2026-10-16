@@ -65,7 +65,15 @@ async def _mock_structured_output(
 
 
 async def _mock_embed_text(self, text):
-    return [[0.0] * self.get_vector_size() for _ in text]
+    vectors = [[0.0] * self.get_vector_size() for _ in text]
+    try:
+        # newer cognee reads the token count off the result
+        from cognee.infrastructure.databases.vector.embeddings.EmbeddingEngine import (
+            EmbeddingResult,
+        )
+    except ImportError:
+        return vectors
+    return EmbeddingResult(vectors, tokens=0)
 
 
 @pytest_asyncio.fixture

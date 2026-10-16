@@ -11,8 +11,13 @@ from cognee.modules.data.methods.get_dataset_data import get_dataset_data
 from cognee.modules.users.methods import get_default_user
 from fake_apollo import FakeApollo
 
+from cognee_community_connector_apollo import apollo as apollo_module
 from cognee_community_connector_apollo import apollo_source
-from cognee_community_connector_apollo.apollo import ApolloRateLimitedError
+from cognee_community_connector_apollo.apollo import (
+    BASE_URL,
+    ApolloNotFoundError,
+    ApolloRateLimitedError,
+)
 
 DATASET = "apollo_integration_test"
 TABLE = "apollo_test"
@@ -28,8 +33,7 @@ def _workspace() -> FakeApollo:
     return fake
 
 
-async def _sync(fake: FakeApollo):
-    source = apollo_source(service=fake, resource_name=TABLE)
+async def _add(source) -> None:
     await cognee.add(
         source,
         dataset_name=DATASET,
@@ -37,6 +41,11 @@ async def _sync(fake: FakeApollo):
         write_disposition="merge",
         max_rows_per_table=0,
     )
+
+
+async def _sync(fake: FakeApollo, resource_name: str = TABLE):
+    source = apollo_source(service=fake, resource_name=resource_name)
+    await _add(source)
     return source
 
 
@@ -113,12 +122,65 @@ async def test_a_rate_limited_first_sync_resumes_without_losing_documents(clean_
     assert set(await _documents()) == {"sequence:s1", "account:a1", "contact:c1", "contact:c2"}
 
 
+class _HTTPResponse:
+    def __init__(self, status: int, payload):
+        self.status_code = status
+        self._payload = payload
+        self.headers = {"x-minute-requests-left": "49", "x-hourly-requests-left": "199"}
+
+    def json(self):
+        return self._payload
+
+
+def _serve(fake: FakeApollo, keys: list[str]):
+    """Route requests.request into the fake, the way the real HTTP API would answer."""
+
+    def request(method, url, *, json=None, params=None, headers=None, timeout=None):
+        keys.append(headers["x-api-key"])
+        try:
+            payload = fake.request(method, url.removeprefix(BASE_URL), body=json, params=params)
+        except ApolloNotFoundError:
+            return _HTTPResponse(422, {"error": "This contact has been deleted."})
+        return _HTTPResponse(200, payload)
+
+    return request
+
+
 @pytest.mark.asyncio
-async def test_the_api_key_never_reaches_stored_documents(clean_environment):
-    fake = _workspace()
+async def test_the_real_client_syncs_and_the_api_key_never_reaches_stored_documents(
+    clean_environment, monkeypatch
+):
+    fake, keys = _workspace(), []
+    monkeypatch.setattr(apollo_module.requests, "request", _serve(fake, keys))
     source = apollo_source(api_key=KEY, resource_name=TABLE)
     assert KEY not in repr(source)
 
-    await _sync(fake)
-    for doc in (await _documents()).values():
-        assert KEY not in repr(doc.system_metadata)
+    await _add(source)
+    del fake.contacts["c2"]
+    await _add(apollo_source(api_key=KEY, resource_name=TABLE))
+
+    documents = await _documents()
+    assert set(documents) == {"sequence:s1", "account:a1", "contact:c1"}
+    assert keys and set(keys) == {KEY}
+    for doc in documents.values():
+        assert KEY not in repr(doc)
+        with open(doc.raw_data_location.removeprefix("file://"), encoding="utf-8") as stored:
+            assert KEY not in stored.read()
+
+
+@pytest.mark.asyncio
+async def test_two_apollo_accounts_in_one_dataset_stay_apart(clean_environment):
+    team_a, team_b = _workspace(), FakeApollo(team_id="team2")
+    team_b.add_contact("b1", "Dev Hollerith")
+    team_b.add_contact("b2", "Eve Shannon")
+
+    await _sync(team_a, "apollo_a")
+    await _sync(team_b, "apollo_b")
+    both = {"sequence:s1", "account:a1", "contact:c1", "contact:c2", "contact:b1", "contact:b2"}
+    assert set(await _documents()) == both
+
+    del team_b.contacts["b2"]
+    await _sync(team_b, "apollo_b")
+    await _sync(team_a, "apollo_a")
+
+    assert set(await _documents()) == both - {"contact:b2"}
