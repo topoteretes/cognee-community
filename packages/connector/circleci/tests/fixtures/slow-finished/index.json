@@ -1,0 +1,26 @@
+{
+  "/pipeline/4c2bfb04-d2c8-4449-a78a-ea76aae951c9": {
+    "file": "slow-finished/pipeline.json",
+    "status": 200
+  },
+  "/pipeline/4c2bfb04-d2c8-4449-a78a-ea76aae951c9/workflow": {
+    "file": "slow-finished/workflows.json",
+    "status": 200
+  },
+  "/project/gh/rokadepiyush49-rgb/cognee-circleci-fixture/24/tests": {
+    "file": "slow-finished/tests_build-and-test_test.json",
+    "status": 200
+  },
+  "/project/gh/rokadepiyush49-rgb/cognee-circleci-fixture/pipeline": {
+    "file": "slow-finished/pipelines.json",
+    "status": 200
+  },
+  "/workflow/9f75960a-0e92-4f84-a22a-ba468c6fa669/job": {
+    "file": "slow-finished/jobs_slow-check.json",
+    "status": 200
+  },
+  "/workflow/b41173c1-4649-4dc3-9b84-fd4579754079/job": {
+    "file": "slow-finished/jobs_build-and-test.json",
+    "status": 200
+  }
+}
