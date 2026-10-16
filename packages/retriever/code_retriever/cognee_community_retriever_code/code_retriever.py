@@ -73,13 +73,12 @@ class CodeRetriever(BaseRetriever):
 
     async def get_retrieved_objects(self, query: Optional[str]) -> Any:
         """Find relevant code files based on the query."""
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("The query must be a non-empty string.")
+
         logger.info(
             f"Starting code retrieval for query: '{query[:100]}{'...' if len(query) > 100 else ''}'"
         )
-
-        if not query or not isinstance(query, str):
-            logger.error("Invalid query: must be a non-empty string")
-            raise ValueError("The query must be a non-empty string.")
 
         try:
             vector_engine = get_vector_engine()
