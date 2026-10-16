@@ -9,6 +9,7 @@ import pytest
 
 from cognee_community_connector_readme.readme import (
     README_SOURCE_NAME,
+    ReadMeClient,
     _document_id,
     readme_source,
     sync_readme,
@@ -185,6 +186,14 @@ def test_empty_sweep_never_mass_deletes_known_records():
     assert state["revisions"] == {
         _document_id("stable", "guide", "welcome"): "2026-01-01T00:00:00Z"
     }
+
+
+def test_v2_pagination_path_is_resolved_from_api_origin():
+    client = ReadMeClient("test-key", api_base_url="https://api.example.test/v2")
+
+    assert client._url("/v2/changelogs?per_page=2&page=2", None) == (
+        "https://api.example.test/v2/changelogs?per_page=2&page=2"
+    )
 
 
 def test_source_declares_document_mode_marker():

@@ -25,7 +25,7 @@ import time
 from collections.abc import Iterator
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 from cognee.shared.logging_utils import get_logger
@@ -53,6 +53,9 @@ class ReadMeClient:
             raise ValueError("ReadMe API key required: pass api_key= or set README_API_KEY.")
         self._api_key = api_key
         self._api_base_url = api_base_url.rstrip("/")
+        parsed_base_url = urlsplit(self._api_base_url)
+        self._api_origin = f"{parsed_base_url.scheme}://{parsed_base_url.netloc}"
+        self._api_base_path = parsed_base_url.path.rstrip("/")
 
     def get(self, path: str) -> dict[str, Any]:
         """Return a single resource from an API v2 URI or path."""
@@ -115,6 +118,12 @@ class ReadMeClient:
                     "ReadMe pagination URL points outside the configured API base URL."
                 )
             url = path
+        elif self._api_base_path and (
+            path == self._api_base_path or path.startswith(self._api_base_path + "/")
+        ):
+            # ReadMe returns pagination links such as ``/v2/changelogs?...``.
+            # They are rooted at the API origin, not relative to ``/v2``.
+            url = f"{self._api_origin}{path}"
         else:
             url = f"{self._api_base_url}/{path.lstrip('/')}"
         if params:
