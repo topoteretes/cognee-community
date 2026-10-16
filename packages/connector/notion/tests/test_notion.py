@@ -62,6 +62,7 @@ class FakeNotionClient:
     def __init__(self, pages, blocks=None):
         self._pages = pages
         self._blocks = blocks or {}
+        self.blocks_call_count = 0
         self.blocks = SimpleNamespace(children=SimpleNamespace(list=self._blocks_list))
         self.pages = SimpleNamespace(retrieve=self._pages_retrieve)
         self.databases = SimpleNamespace(query=self._db_query)
@@ -82,6 +83,7 @@ class FakeNotionClient:
         return next(p for p in self._pages if p["id"] == page_id)
 
     def _blocks_list(self, block_id=None, start_cursor=None, **kwargs):
+        self.blocks_call_count += 1
         return {"results": self._blocks.get(block_id, []), "has_more": False}
 
 
@@ -236,18 +238,20 @@ def test_notion_source_declares_document_marker():
 # ---------------------------------------------------------------------------
 
 
-def _run_sync(dlt, tmp_path, monkeypatch, pages, blocks):
+def _run_sync(dlt, tmp_path, monkeypatch, pages, blocks, pipeline=None, client=None):
     """Run notion_source through a dlt pipeline into a temp sqlite destination."""
     from cognee_community_connector_notion.notion import notion_source
 
-    db_path = (tmp_path / "notion.db").as_posix()
-    pipeline = dlt.pipeline(
-        pipeline_name="notion_test",
-        destination=dlt.destinations.sqlalchemy(f"sqlite:///{db_path}"),
-        dataset_name="notion_ds",
-        pipelines_dir=str(tmp_path / "state"),
-    )
-    pipeline.run(notion_source(client=FakeNotionClient(pages, blocks)))
+    if pipeline is None:
+        db_path = (tmp_path / "notion.db").as_posix()
+        pipeline = dlt.pipeline(
+            pipeline_name="notion_test",
+            destination=dlt.destinations.sqlalchemy(f"sqlite:///{db_path}"),
+            dataset_name="notion_ds",
+            pipelines_dir=str(tmp_path / "state"),
+        )
+    client = client or FakeNotionClient(pages, blocks)
+    pipeline.run(notion_source(client=client))
     return pipeline
 
 
@@ -286,19 +290,44 @@ def test_first_sync_loads_pages_with_rendered_content(dlt_mod, tmp_path, monkeyp
     assert "alpha body" in rows["p1"]["content"]
 
 
-def test_edit_is_reflected_on_resync(dlt_mod, tmp_path, monkeypatch):
-    pages = [_page("p1", "2024-01-01T00:00:00.000Z", "Alpha")]
-    _run_sync(dlt_mod, tmp_path, monkeypatch, pages, {"p1": [_block("paragraph", "v1")]})
+def test_incremental_sync_skips_rendering_unchanged_pages(dlt_mod, tmp_path, monkeypatch):
+    pages = [
+        _page("p1", "2024-01-01T00:00:00.000Z", "Alpha"),
+        _page("p2", "2024-01-01T00:00:00.000Z", "Beta"),
+    ]
+    blocks = {"p1": [_block("paragraph", "v1")], "p2": [_block("paragraph", "v1")]}
 
-    # Edited content is re-fetched and replaces the prior snapshot row.
-    edited = [_page("p1", "2024-02-01T00:00:00.000Z", "Alpha")]
-    pipeline = _run_sync(
-        dlt_mod, tmp_path, monkeypatch, edited, {"p1": [_block("paragraph", "v2")]}
+    # 1. First sync renders all pages
+    client1 = FakeNotionClient(pages, blocks)
+    pipeline = _run_sync(dlt_mod, tmp_path, monkeypatch, pages, blocks, client=client1)
+    assert client1.blocks_call_count == 2
+
+    # 2. Second sync with no changes makes zero block calls
+    client2 = FakeNotionClient(pages, blocks)
+    _run_sync(dlt_mod, tmp_path, monkeypatch, pages, blocks, pipeline=pipeline, client=client2)
+    assert client2.blocks_call_count == 0
+
+    # 3. Editing one page re-renders exactly that page
+    edited_pages = [
+        _page("p1", "2024-02-01T00:00:00.000Z", "Alpha"),
+        _page("p2", "2024-01-01T00:00:00.000Z", "Beta"),
+    ]
+    blocks_edited = {"p1": [_block("paragraph", "v2")], "p2": [_block("paragraph", "v1")]}
+    client3 = FakeNotionClient(edited_pages, blocks_edited)
+    _run_sync(
+        dlt_mod,
+        tmp_path,
+        monkeypatch,
+        edited_pages,
+        blocks_edited,
+        pipeline=pipeline,
+        client=client3,
     )
+    assert client3.blocks_call_count == 1
 
     rows = _read_pages(pipeline)
     assert "v2" in rows["p1"]["content"]
-    assert "v1" not in rows["p1"]["content"]
+    assert "v1" in rows["p2"]["content"]
 
 
 def test_archived_page_is_removed_on_resync(dlt_mod, tmp_path, monkeypatch):
@@ -416,3 +445,13 @@ def test_render_error_aborts_sync(dlt_mod, tmp_path):
     )
     with pytest.raises(Exception):  # noqa: B017 - dlt wraps the source error in PipelineStepFailed
         pipeline.run(notion_source(client=fake))
+
+    # 5. Render failure mid-run aborts and leaves the watermark unchanged.
+    # We verify this by doing a successful run afterwards with the fixed renderer;
+    # it must fetch blocks because the previous partial run didn't commit the watermark.
+    fixed_fake = FakeNotionClient(
+        pages=[_page("p1", "2024-01-01T00:00:00.000Z", "Alpha")],
+        blocks={"p1": [_block("paragraph", "fixed")]},
+    )
+    pipeline.run(notion_source(client=fixed_fake))
+    assert fixed_fake.blocks_call_count == 1
