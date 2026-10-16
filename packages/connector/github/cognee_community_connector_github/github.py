@@ -36,11 +36,16 @@ Design
   changes is rendered again.
 * **Forget-on-delete**: every run lists all issue numbers of each repository
   (the sweep). A number that was there before and is missing now is asked for
-  once: ``410`` (deleted) or ``301`` (transferred) means forget it; any other
-  answer stops the run, so a permissions problem can never delete anything.
-* **Safety**: every listing and check is finished before the first row is
-  yielded, and state is written only after the last one. A failure therefore
-  deletes nothing and moves no cursor; the next run starts from the same point.
+  once: ``410`` (deleted) or ``301`` (transferred) means forget it. Any other
+  answer keeps the document and asks again next run, so a permissions problem
+  can never delete anything and one odd issue cannot stall the sync.
+* **Safety**: every listing is finished before the first row is yielded, and
+  state is written only after the last one. A failed listing therefore deletes
+  nothing and moves no cursor; the next run starts from the same point. An
+  issue that fails on its own keeps its document and is retried next run; a
+  ``401``, an exhausted rate limit or several failures in a row abort.
+* **Several sources in one dataset**: ``resource_name`` names the dlt table and
+  the sync state. Give each token or selection its own name.
 """
 
 from __future__ import annotations
@@ -60,7 +65,7 @@ from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
 
 logger = get_logger("github_connector")
 
-# dlt resource / staging-table name, and the document-source tag for its rows.
+# Default dlt resource / staging-table name, and the document-source tag for its rows.
 GITHUB_TABLE_NAME = "github_documents"
 GITHUB_SOURCE_NAME = "github"
 
@@ -71,22 +76,34 @@ _HEADERS = {
     "User-Agent": "cognee-community-connector-github",
 }
 _RAW = "application/vnd.github.raw"
+# Per request: a generous bound for one API call, so a stalled connection fails and is retried.
 _TIMEOUT_SECONDS = 60
-_PER_PAGE = 100  # GitHub's maximum
+_PER_PAGE = 100  # GitHub's maximum page size for every listing used here
 
-# Retry budget for rate-limited / transient responses.
+# Retry budget for rate-limited / transient responses: five attempts with
+# 1, 2, 4, 8 s back-off between them, about 15 s of outage tolerated per request.
 _MAX_RETRIES = 5
+# The 5xx answers GitHub's docs describe as temporary.
 _TRANSIENT_STATUSES = (500, 502, 503, 504)
 # Longest single wait for a rate limit to reset (GitHub's primary window is an hour).
 _MAX_RATE_LIMIT_WAIT_SECONDS = 3600
+# GitHub's advice for a secondary limit that says nothing about how long to wait.
+_SECONDARY_LIMIT_WAIT_SECONDS = 60.0
 
-# GitHub applies updated_at with a lag of several seconds (seen live), so the
-# change listing starts well before the cursor and a fetched copy is only
-# trusted as final once it is a minute older than its timestamp.
+# GitHub applies updated_at with a lag of several seconds (seen live: no move
+# 3 s after a review, moved 15 s later), so the change listing starts well
+# before the cursor and a fetched copy is only trusted as final once it is a
+# minute older than its timestamp. Both are wide margins over the lag seen.
 _CURSOR_OVERLAP = timedelta(minutes=5)
 _SETTLE_MARGIN = timedelta(seconds=60)
 
-# A pull request lists at most this many changed files (one page of /files).
+# Abort when this many issues in a row fail on their own. One bad issue is kept
+# and retried next run, but a streak means GitHub itself is failing, and every
+# further issue would spend five retries (about 15 s) for nothing.
+_MAX_FAILURES_IN_A_ROW = 3
+
+# A pull request lists at most this many changed files: one page of /files at
+# GitHub's maximum page size, so a huge pull request costs one request.
 _MAX_FILES = 100
 
 
@@ -102,6 +119,19 @@ class GitHubAPIError(RuntimeError):
 
 class GitHubListingError(RuntimeError):
     """A listing that answered but cannot be followed to a complete end."""
+
+
+class GitHubUnavailableError(RuntimeError):
+    """Too many issues in a row failed: GitHub is failing, not one issue."""
+
+
+class GitHubSyncStoppedError(RuntimeError):
+    """The host's ``check_active`` raised an ``OSError``; the sync must stop.
+
+    Network errors are ``OSError`` too and are retried, or kept per issue, so an
+    ``OSError`` from the host's check is re-raised as this type, which nothing
+    in the connector catches. Other exceptions from the check pass unchanged.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -212,7 +242,7 @@ def _rate_limit_wait(response: Any) -> float | None:
     try:
         reset = float(headers.get("X-RateLimit-Reset"))
     except (TypeError, ValueError):
-        return 60.0  # GitHub's advice when nothing says how long
+        return _SECONDARY_LIMIT_WAIT_SECONDS
     now = _server_time(response) or datetime.now(UTC)
     return min(max(reset - now.timestamp(), 0.0) + 1.0, float(_MAX_RATE_LIMIT_WAIT_SECONDS))
 
@@ -223,6 +253,24 @@ def _error_message(response: Any) -> str:
         return str(response.json()["message"])
     except (ValueError, KeyError, TypeError):
         return str(getattr(response, "text", ""))[:200]
+
+
+def _json(response: Any, shape: type) -> Any:
+    """The JSON body of a ``200``, which must be a ``list`` or a ``dict`` as expected.
+
+    Anything else (not JSON, or the wrong shape) raises: an empty or odd body
+    must never be read as an empty listing, which would look like deletions.
+    """
+    try:
+        body = response.json()
+    except ValueError as exc:
+        raise GitHubListingError(f"GitHub answered {response.status_code} without JSON") from exc
+    if not isinstance(body, shape):
+        raise GitHubListingError(
+            f"GitHub answered {response.status_code} with a {type(body).__name__} "
+            f"where a {shape.__name__} was expected"
+        )
+    return body
 
 
 def _next_url(response: Any) -> str | None:
@@ -301,7 +349,7 @@ def _list_pages(
             pages[url] = stored
             url = stored.get("next")
             continue
-        items = response.json()
+        items = _json(response, list)
         fresh.extend(items)
         next_url = _next_url(response)
         pages[url] = {
@@ -327,7 +375,7 @@ def _list_all(session: Any, url: str) -> tuple[list[dict], datetime | None]:
     next_url: str | None = url
     while next_url:
         response = _get(session, next_url)
-        items.extend(response.json())
+        items.extend(_json(response, list))
         dates.append(_server_time(response))
         next_url = _next_url(response)
     return items, _earliest(dates)
@@ -410,6 +458,11 @@ def _text(value: Any) -> str:
     return (value or "").strip()
 
 
+def _in_order(items: list[dict]) -> list[dict]:
+    """Comments and reviews oldest first, by id, whatever order they came in."""
+    return sorted(items, key=lambda item: item.get("id") or 0)
+
+
 def _render_issue(issue: dict, comments: list[dict]) -> str:
     """Render an issue and its comments as one text document.
 
@@ -421,7 +474,7 @@ def _render_issue(issue: dict, comments: list[dict]) -> str:
     if _text(issue.get("body")):
         sections.append(_text(issue["body"]))
     if comments:
-        lines = [f"- {_login(c)}: {_text(c.get('body'))}" for c in comments]
+        lines = [f"- {_login(c)}: {_text(c.get('body'))}" for c in _in_order(comments)]
         sections.append("Comments:\n" + "\n".join(lines))
     return "\n\n".join(sections)
 
@@ -449,11 +502,11 @@ def _render_pull(
     if _text(issue.get("body")):
         sections.append(_text(issue["body"]))
     if comments:
-        lines = [f"- {_login(c)}: {_text(c.get('body'))}" for c in comments]
+        lines = [f"- {_login(c)}: {_text(c.get('body'))}" for c in _in_order(comments)]
         sections.append("Comments:\n" + "\n".join(lines))
     # A plain "commented" review with no text only wraps line comments, which
     # are listed below; approvals and change requests count even when empty.
-    shown = [r for r in reviews if _text(r.get("body")) or r.get("state") != "COMMENTED"]
+    shown = [r for r in _in_order(reviews) if _text(r.get("body")) or r.get("state") != "COMMENTED"]
     if shown:
         lines = []
         for review in shown:
@@ -464,13 +517,13 @@ def _render_pull(
     if review_comments:
         lines = [
             f"- {_login(c)} on {c.get('path') or '?'}: {_text(c.get('body'))}"
-            for c in review_comments
+            for c in _in_order(review_comments)
         ]
         sections.append("Review comments:\n" + "\n".join(lines))
     if files:
         lines = [
             f"- {f['filename']} (+{f.get('additions', 0)}/-{f.get('deletions', 0)})"
-            for f in files[:_MAX_FILES]
+            for f in sorted(files[:_MAX_FILES], key=lambda f: f["filename"])
         ]
         more = max(int(pull.get("changed_files") or len(files)) - len(lines), 0)
         if more:
@@ -583,7 +636,7 @@ def _fetch_repo(session: Any, repo: str, previous: dict, include_readme: bool) -
     if repo_same:
         # The README changed but the repository did not: its fields are needed.
         response = _get(session, _url(f"/repos/{repo}"))
-    body = response.json()
+    body = _json(response, dict)
     if (body.get("full_name") or repo).lower() != repo:
         logger.warning(
             "GitHub: %s was renamed to %s; update repos= to the new name.",
@@ -611,33 +664,72 @@ def _commit_date(commit: dict) -> str:
     return ((commit.get("commit") or {}).get("committer") or {}).get("date") or ""
 
 
-def _confirm_gone(session: Any, repo: str, number: int) -> None:
-    """Make sure a number missing from the sweep really is gone, or raise.
+class _ItemFailures:
+    """The issues of one run that failed on their own and are kept for a retry.
+
+    Only per-item failures are kept: a :class:`GitHubAPIError`, a
+    :class:`GitHubListingError` or an ``OSError`` that outlasted the retries.
+    A ``401`` or an exhausted rate limit would fail every later issue the same
+    way, so it is re-raised, and so is the ``_MAX_FAILURES_IN_A_ROW``-th
+    failure in a row. Anything else (``check_active``'s errors among them) is
+    never caught in the first place.
+    """
+
+    def __init__(self) -> None:
+        self.in_a_row = 0
+        self.kept = 0
+
+    def keep(self, exc: Exception, endpoint: str) -> None:
+        """Count a per-item failure and log it, or raise if it is systemic."""
+        if isinstance(exc, GitHubAPIError) and (exc.status == 401 or exc.rate_limited):
+            raise exc
+        self.in_a_row += 1
+        if self.in_a_row >= _MAX_FAILURES_IN_A_ROW:
+            raise GitHubUnavailableError(
+                f"{self.in_a_row} issues in a row failed, the last on {endpoint}; stopping"
+            ) from exc
+        what = f"HTTP {exc.status}" if isinstance(exc, GitHubAPIError) else type(exc).__name__
+        self.note_kept(endpoint, what)
+
+    def note_kept(self, endpoint: str, why: str) -> None:
+        self.kept += 1
+        logger.warning("GitHub: kept %s for a retry next run (%s).", endpoint, why)
+
+    def succeeded(self) -> None:
+        self.in_a_row = 0
+
+
+# What a per-item request can fail with once the retries are spent.
+_ITEM_ERRORS = (GitHubAPIError, GitHubListingError, OSError)
+
+
+def _confirm_gone(session: Any, repo: str, number: int, failures: _ItemFailures) -> bool:
+    """True when a number missing from the sweep really is gone.
 
     Two answers allow forgetting it: ``410`` (deleted) and a ``301`` whose
     ``Location`` is an issue in *another* repository (transferred; seen live as
     ``/repos/<owner>/<other>/issues/<n>``). A renamed repository answers ``301``
     too, pointing back at itself, so any other ``Location`` does not count.
-    Everything else, including ``404`` (which GitHub also gives when the token
-    lost access) and ``200``, stops the run with nothing deleted.
+    Every other outcome, including ``404`` (which GitHub also gives when the
+    token lost access), ``200``, and an error that outlasts the retries, keeps
+    the document: the run goes on and the next run asks again. One odd issue
+    must neither delete anything nor stop every run.
     """
-    response = _get(
-        session,
-        _url(f"/repos/{repo}/issues/{number}"),
-        follow_redirects=False,
-        ok=(301, 410, 200),
-    )
+    endpoint = f"/repos/{repo}/issues/{number}"
+    try:
+        response = _get(session, _url(endpoint), follow_redirects=False, ok=(301, 410, 200))
+    except _ITEM_ERRORS as exc:
+        failures.keep(exc, endpoint)
+        return False
+    failures.succeeded()
     if response.status_code == 410:
-        return
+        return True
     if response.status_code == 301:
         target = _transfer_target((response.headers or {}).get("Location") or "")
         if target and target != repo:
-            return
-    raise GitHubAPIError(
-        response.status_code,
-        f"{repo}#{number} is missing from the issue listing but GitHub does not say it was "
-        "deleted or transferred; nothing is deleted until the listing and the issue agree",
-    )
+            return True
+    failures.note_kept(endpoint, f"missing from the listing, answering {response.status_code}")
+    return False
 
 
 def _transfer_target(location: str) -> str | None:
@@ -672,16 +764,19 @@ def sync_repos(
 
     1. *List.* For every repository: the repository and README, the sweep of
        all issue numbers, the change listing, the releases and the commits;
-       then every number missing from the sweep is confirmed gone. Any error
-       here propagates before a single row is yielded.
+       then every number missing from the sweep is asked for, and kept unless
+       GitHub says it is gone. A failed listing propagates before a single row
+       is yielded.
     2. *Render.* Fetch and yield each changed issue and pull request once,
-       then the repository, release and commit rows that changed.
+       then the repository, release and commit rows that changed. An issue
+       that fails on its own keeps its old document and is retried next run.
     3. *Delete.* Yield a hard-delete marker for every known id that is no
        longer current.
     4. *Commit.* Only now write the new ids, cursors, ETags and fingerprints.
     """
     known_ids: set[str] = set(state.get("known_ids", []))
     previous_repos: dict = state.get("repos", {})
+    failures = _ItemFailures()
     plans = [
         _plan_repo(
             session,
@@ -691,6 +786,7 @@ def sync_repos(
             include_commits,
             include_bots,
             include_readme,
+            failures,
         )
         for repo in repos
     ]
@@ -699,7 +795,7 @@ def sync_repos(
     counts = {"issues": 0, "releases": 0, "commits": 0}
     for plan in plans:
         current_ids |= plan["current_ids"]
-        for row in _render_repo_rows(session, plan, include_bots):
+        for row in _render_repo_rows(session, plan, include_bots, failures):
             if row.pop("_kind") == "issue":
                 counts["issues"] += 1
             yield row
@@ -714,12 +810,13 @@ def sync_repos(
     state["repos"] = {plan["repo"]: plan["next_state"] for plan in plans}
     logger.info(
         "GitHub: %d issue(s)/PR(s) rendered, %d release(s), %d commit(s), %d deletion(s) "
-        "across %d repo(s).",
+        "across %d repo(s); kept %d item(s) for retry.",
         counts["issues"],
         counts["releases"],
         counts["commits"],
         len(deleted),
         len(repos),
+        failures.kept,
     )
 
 
@@ -731,6 +828,7 @@ def _plan_repo(
     include_commits: bool,
     include_bots: bool,
     include_readme: bool,
+    failures: _ItemFailures,
 ) -> dict[str, Any]:
     """Step 1 for one repository: every listing and check, nothing yielded."""
     if previous.get("include_bots") != include_bots:
@@ -810,7 +908,8 @@ def _plan_repo(
         and row_id not in current_ids
     )
     for row_id in missing:
-        _confirm_gone(session, repo, int(row_id.rsplit("#", 1)[1]))
+        if not _confirm_gone(session, repo, int(row_id.rsplit("#", 1)[1]), failures):
+            current_ids.add(row_id)  # not confirmed gone: keep it, ask again next run
 
     # Releases: unchanged pages keep their rows, changed pages are re-emitted.
     fresh_releases, reused_releases, release_pages, _ = _list_pages(
@@ -880,59 +979,29 @@ def _plan_repo(
     }
 
 
-def _render_repo_rows(session: Any, plan: dict, include_bots: bool) -> Iterator[dict[str, Any]]:
+def _render_repo_rows(
+    session: Any, plan: dict, include_bots: bool, failures: _ItemFailures
+) -> Iterator[dict[str, Any]]:
     """Step 2 for one repository: fetch and yield what changed, then finish its state."""
     repo = plan["repo"]
     settled: set[int] = set(plan["settled"])
     for number in sorted(plan["changed"]):
-        issue = plan["issues"].get(number)
-        # The issue's body and header come from a listing made at listed_at.
-        body_at = plan["listed_at"]
-        if issue is None:  # only reused sweep pages mention it: fetch it whole
-            response = _get(session, _url(f"/repos/{repo}/issues/{number}"))
-            issue, body_at = response.json(), _server_time(response)
-        is_pr = plan["kinds"][number]
-        plan["current_prints"][str(number)] = _fingerprint(_header_lines(issue), include_bots)
-        comments, fetched_at = _list_all(
-            session, _url(f"/repos/{repo}/issues/{number}/comments", {"per_page": _PER_PAGE})
-        )
-        comments = _conversation(comments, include_bots)
-        if is_pr:
-            pull = _get(session, _url(f"/repos/{repo}/pulls/{number}")).json()
-            reviews, _ = _list_all(
-                session, _url(f"/repos/{repo}/pulls/{number}/reviews", {"per_page": _PER_PAGE})
-            )
-            review_comments, _ = _list_all(
-                session, _url(f"/repos/{repo}/pulls/{number}/comments", {"per_page": _PER_PAGE})
-            )
-            # One page only: the total comes from changed_files, not from paging.
-            files = _get(
-                session, _url(f"/repos/{repo}/pulls/{number}/files", {"per_page": _MAX_FILES})
-            ).json()
-            content = _render_pull(
-                issue,
-                pull,
-                comments,
-                _conversation(reviews, include_bots),
-                _conversation(review_comments, include_bots),
-                files,
-            )
-        else:
-            content = _render_issue(issue, comments)
-        # Skip it next run only if no later change can share its timestamp. The
-        # document is as old as the oldest of its parts: the listing (or GET)
-        # that gave the body, or the comments.
-        if _is_settled(plan["stamps"].get(number, ""), _earliest([body_at, fetched_at])):
+        try:
+            row, is_settled = _render_one(session, plan, number, include_bots)
+        except _ITEM_ERRORS as exc:
+            failures.keep(exc, f"/repos/{repo}/issues/{number}")
+            # No row, so the old document stays; its id is in current_ids, so
+            # it is not deleted. A fingerprint of "" matches nothing, so the
+            # next run renders it again, and with no "seen" entry it is not
+            # skipped either. An issue that was never emitted gets its first
+            # document then; until that, its id in known_ids is harmless (a
+            # hard delete of a row that does not exist is a no-op).
+            plan["current_prints"][str(number)] = ""
+            continue
+        failures.succeeded()
+        if is_settled:
             settled.add(number)
-        yield {
-            **_row(
-                _issue_row_id(repo, number, is_pr),
-                issue.get("html_url") or "",
-                issue.get("title") or "",
-                content,
-            ),
-            "_kind": "issue",
-        }
+        yield row
 
     info = plan["repo_info"]
     if not info["unchanged"]:
@@ -977,6 +1046,63 @@ def _render_repo_rows(session: Any, plan: dict, include_bots: bool) -> Iterator[
     }
 
 
+def _render_one(
+    session: Any, plan: dict, number: int, include_bots: bool
+) -> tuple[dict[str, Any], bool]:
+    """Fetch and render one changed issue or pull request: ``(row, settled)``.
+
+    Records the issue's new fingerprint only once it rendered, so a failure
+    anywhere in here leaves the caller free to keep the issue for a retry.
+    """
+    repo = plan["repo"]
+    issue = plan["issues"].get(number)
+    # The issue's body and header come from a listing made at listed_at.
+    body_at = plan["listed_at"]
+    if issue is None:  # only reused sweep pages mention it: fetch it whole
+        response = _get(session, _url(f"/repos/{repo}/issues/{number}"))
+        issue, body_at = _json(response, dict), _server_time(response)
+    is_pr = plan["kinds"][number]
+    comments, fetched_at = _list_all(
+        session, _url(f"/repos/{repo}/issues/{number}/comments", {"per_page": _PER_PAGE})
+    )
+    comments = _conversation(comments, include_bots)
+    if is_pr:
+        pull = _json(_get(session, _url(f"/repos/{repo}/pulls/{number}")), dict)
+        reviews, _ = _list_all(
+            session, _url(f"/repos/{repo}/pulls/{number}/reviews", {"per_page": _PER_PAGE})
+        )
+        review_comments, _ = _list_all(
+            session, _url(f"/repos/{repo}/pulls/{number}/comments", {"per_page": _PER_PAGE})
+        )
+        # One page only: the total comes from changed_files, not from paging.
+        files = _json(
+            _get(session, _url(f"/repos/{repo}/pulls/{number}/files", {"per_page": _MAX_FILES})),
+            list,
+        )
+        content = _render_pull(
+            issue,
+            pull,
+            comments,
+            _conversation(reviews, include_bots),
+            _conversation(review_comments, include_bots),
+            files,
+        )
+    else:
+        content = _render_issue(issue, comments)
+    plan["current_prints"][str(number)] = _fingerprint(_header_lines(issue), include_bots)
+    # Skip it next run only if no later change can share its timestamp. The
+    # document is as old as the oldest of its parts: the listing (or GET)
+    # that gave the body, or the comments.
+    settled = _is_settled(plan["stamps"].get(number, ""), _earliest([body_at, fetched_at]))
+    row = _row(
+        _issue_row_id(repo, number, is_pr),
+        issue.get("html_url") or "",
+        issue.get("title") or "",
+        content,
+    )
+    return {**row, "_kind": "issue"}, settled
+
+
 # ---------------------------------------------------------------------------
 # Public factory
 # ---------------------------------------------------------------------------
@@ -987,6 +1113,9 @@ def github_source(
     include_bots: bool = False,
     include_readme: bool = True,
     session: Any = None,
+    *,
+    resource_name: str = GITHUB_TABLE_NAME,
+    check_active: Callable[[], None] | None = None,
 ):
     """Return a ``dlt`` resource that yields GitHub documents for ``remember``.
 
@@ -1000,9 +1129,16 @@ def github_source(
         include_readme: Put the README text into the repository document.
         session: Pre-built ``requests`` session. Mainly an injection point for
             tests; when omitted one is built from the token.
+        resource_name: Stable dlt resource (table) name, which also scopes the
+            sync state. Give each token or repository selection its own name
+            when several sync into one dataset; sharing a name would make each
+            run forget the other's documents.
+        check_active: Optional host authorization checkpoint. It is called
+            before every GitHub request and around every yielded row, and
+            stops the sync by raising; nothing is deleted and no state moves.
 
     Returns:
-        A ``dlt`` resource (``github_documents``) configured with
+        A ``dlt`` resource (``resource_name``) configured with
         ``primary_key="id"``, ``write_disposition="merge"`` and an ``_deleted``
         hard-delete column. Hand it to ``cognee.remember(...)``.
     """
@@ -1031,7 +1167,7 @@ def github_source(
         raise ValueError("GitHub token required: pass token= or set GITHUB_TOKEN.")
 
     @dlt.resource(
-        name=GITHUB_TABLE_NAME,
+        name=resource_name,
         primary_key="id",
         write_disposition="merge",
         # _deleted is a boolean hard-delete marker: rows where it is True are
@@ -1040,13 +1176,21 @@ def github_source(
         columns={"_deleted": {"data_type": "bool", "hard_delete": True}},
     )
     def github_documents():
-        yield from sync_repos(
-            session or _make_session(resolved_token),
-            dlt.current.resource_state(),
-            repos=selected,
-            include_commits=include_commits,
-            include_bots=include_bots,
-            include_readme=include_readme,
+        client = session or _make_session(resolved_token)
+        check = _stop_on(check_active) if check_active is not None else None
+        if check is not None:
+            # The listing phase makes many requests before the first row.
+            client = _GuardedSession(client, check)
+        yield from dlt_utils.guarded_rows(
+            sync_repos(
+                client,
+                dlt.current.resource_state(),
+                repos=selected,
+                include_commits=include_commits,
+                include_bots=include_bots,
+                include_readme=include_readme,
+            ),
+            check,
         )
 
     resource = github_documents()
@@ -1055,5 +1199,29 @@ def github_source(
     setattr(resource, DOCUMENT_SOURCE_ATTR, GITHUB_SOURCE_NAME)
     # Give the incremental state its own dlt pipeline per dataset, so syncing
     # other dlt sources (or another dataset) cannot disturb cursors and ETags.
-    setattr(resource, dlt_utils.PIPELINE_SCOPE_ATTR, GITHUB_TABLE_NAME)
+    setattr(resource, dlt_utils.PIPELINE_SCOPE_ATTR, resource_name)
     return resource
+
+
+def _stop_on(check_active: Callable[[], None]) -> Callable[[], None]:
+    """``check_active``, turning an ``OSError`` it raises into ``GitHubSyncStoppedError``."""
+
+    def check() -> None:
+        try:
+            check_active()
+        except OSError as exc:
+            raise GitHubSyncStoppedError(f"check_active stopped the sync: {exc!r}") from exc
+
+    return check
+
+
+class _GuardedSession:
+    """A session that asks the host's ``check_active`` before every request."""
+
+    def __init__(self, session: Any, check_active: Callable[[], None]):
+        self._session = session
+        self._check_active = check_active
+
+    def get(self, *args: Any, **kwargs: Any) -> Any:
+        self._check_active()
+        return self._session.get(*args, **kwargs)

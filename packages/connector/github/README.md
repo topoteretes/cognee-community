@@ -20,8 +20,9 @@ uv pip install cognee-community-connector-github
 cd packages/connector/github && uv sync --all-extras
 ```
 
-The package pins `cognee==1.6.2`: it needs document-mode routing and the table-scoped
-orphan cleanup that ships in cognee 1.6.x.
+The package needs `cognee>=1.6.2,<2`: document-mode routing, the table-scoped orphan
+cleanup, `PIPELINE_SCOPE_ATTR` and `guarded_rows` all ship in cognee 1.6.2. The tests pass on
+1.6.2 and 1.6.4.
 
 ## Setup
 
@@ -72,13 +73,17 @@ and forgets what was deleted. See `examples/example.py` for the full flow.
 | `include_bots=False` | Keep comments and reviews written by bots (Copilot's reviewer, github-actions, ...). Off by default: they are long and repetitive. Issues and pull requests opened by a bot are ingested either way. |
 | `include_readme=True` | Put the README text into the repository document. |
 | `token="..."` | Token. Defaults to the `GITHUB_TOKEN` environment variable. |
+| `resource_name="github_documents"` | The dlt table name, which also scopes the sync state. See below. |
+| `check_active=None` | Optional callable for a host: asked before every GitHub request and around every row; raising stops the sync with nothing deleted. |
 
 A repository that does not exist, or that the token cannot read, stops the run with an error
 and deletes nothing. To forget a repository, remove it from `repos` and sync again.
 
-Pass all repositories for a dataset in **one** `github_source(...)` call. The source keeps one
-set of sync state per dataset, so two calls with different repositories into the same dataset
-would each forget the other's documents.
+**Several sources in one dataset.** Each `resource_name` has its own table and its own sync
+state, and a sync only ever forgets documents of its own table. Two `github_source(...)` calls
+into one dataset (two tokens, or two selections of repositories) therefore need two names,
+for example `resource_name="github_work"` and `resource_name="github_oss"`. With the same
+name, each run would forget the other's documents.
 
 ### What a document looks like
 
@@ -107,12 +112,13 @@ Review comments:
 - grace on src/cart.ts: Rename this.
 
 Changed files:
-- src/cart.ts (+12/-3)
 - src/cart.test.ts (+40/-0)
+- src/cart.ts (+12/-3)
 ```
 
 No diffs: a pull request lists its changed files with line counts, at most 100 of them,
-followed by `... and N more files`. The repository document holds the description, topics,
+followed by `... and N more files`. Labels, assignees and topics are sorted by name, comments
+and reviews oldest first and files by path, so the same item always renders the same text. The repository document holds the description, topics,
 homepage, language, default branch, the archived flag and the README. A release document
 holds its tag, pre-release and draft flags and its notes. Timestamps and counters are kept out
 of the text on purpose: an unchanged issue keeps its content hash and is not re-cognified.
@@ -159,17 +165,27 @@ redirects:
   repository means it was transferred. Either way its document is forgotten. (If the other
   repository is also selected, the issue appears there as a new document.) A renamed
   repository also answers `301`, pointing back at itself; that does not count.
-- **Anything else stops the run with nothing deleted**, including `404`, which GitHub also
-  answers when the token has lost access.
+- **Anything else keeps the document**, including `404` (which GitHub also answers when the
+  token has lost access), `200`, and an error that outlasts the retries. A warning names the
+  endpoint and the status, the rest of the run goes on, and the next run asks again. One odd
+  issue can neither delete anything nor stall every sync.
 
 Releases that vanish from the release list are forgotten too, and so is everything of a
 repository removed from `repos`. Forgotten ids are emitted with the `_deleted` hard-delete
 marker, dlt removes those rows on `merge`, and cognee's `orphan_cleanup` removes them from the
 graph and vector stores.
 
-All listings and checks are completed before the first row is emitted, and state is saved
-only after the last one. If anything fails (after retries), the run aborts: nothing is deleted
-and no cursor or ETag moves, so the next run starts from the same point.
+All listings are completed before the first row is emitted, and state is saved only after the
+last one. If a listing fails (after retries), or `check_active` raises, the run aborts: nothing
+is deleted and no cursor or ETag moves, so the next run starts from the same point. A listing
+page that answers `200` with something other than a JSON list also aborts the run; it is never
+read as an empty listing.
+
+An issue or pull request that fails on its own while it is rendered (an error that outlasts
+the retries on its comments, reviews or files) keeps its previous document, is logged with
+the endpoint and status, and is rendered again on the next run; the rest of the run goes on.
+Failures that would hit every issue the same way still abort with nothing saved: a `401`, a
+rate limit that outlasts the retries, and three issues failing in a row.
 
 ## Rate limits
 
@@ -182,6 +198,11 @@ errors and network failures back off and retry, up to five attempts.
 
 ## Limits
 
+- Anyone who can read the cognee dataset can read what was ingested, including issues and
+  pull requests of private repositories. Give a dataset only to people who may read all its
+  repositories.
+- Two tokens or two repository selections in one dataset need different `resource_name`s
+  (see above).
 - Commit messages are append-only: commits removed from the default branch by a force-push
   are not forgotten, and the shas of all ingested commits are kept in state. Commits brought
   in by a merge commit whose own dates are older than the cursor are missed; the merge commit
@@ -189,7 +210,8 @@ errors and network failures back off and retry, up to five attempts.
 - A renamed repository keeps syncing under its old name (GitHub redirects it) and a warning
   asks you to update `repos=`.
 - A very long thread makes a very large document, and its LLM cost grows with it. Only the
-  pull request file list is capped.
+  pull request file list is cut (at 100 files, and the document says how many more there are);
+  comments, reviews and releases are read in full.
 - Comments on commits, discussions, projects, wikis and source files are not ingested. An issue
   converted to a discussion stays as a closed issue.
 - A comment by a deleted account is attributed to `ghost`.
@@ -237,8 +259,12 @@ Taken from GitHub's documentation, not reproduced live:
 uv run pytest tests/ -q
 ```
 
-The tests mock the GitHub API (no token, no network). They cover rendering, the header
-fingerprint, Link pagination, ETags and `304`s, the cursor and its overlap, late timestamps,
-label and milestone renames, bot filtering, the pull request file cap, the README, commits,
-deleted and transferred issues, rate limits versus permission errors, the failure paths that
-must delete nothing, and a real `dlt` merge into a temp sqlite destination across runs.
+The tests mock the GitHub API (no token, no network). They cover rendering (also from
+shuffled input), the header fingerprint, Link pagination, ETags and `304`s, the cursor and its
+overlap, late timestamps, label and milestone renames, bot filtering, the pull request file
+cap, the README, commits, deleted and transferred issues, missing issues that are kept, issues that fail to render
+(kept and retried, or aborting on a `401`, a rate limit or three failures in a row), rate
+limits versus permission errors, bodies of the wrong shape, and the failure paths that must
+delete nothing. A real `dlt` pipeline into a temp sqlite destination checks edits and deletes
+across runs (the deleted row is gone from the table), two sources in one dataset staying apart,
+and `check_active` stopping a run with nothing loaded.

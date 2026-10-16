@@ -16,12 +16,14 @@ Three layers:
 * ``sync_repos`` driven with a plain dict as state (ingest, cursor, ETags,
   renames, deletion, and the failure paths that must not delete anything);
 * a real ``dlt`` pipeline into a temp sqlite destination (edit and delete
-  across runs), plus the document-source tag core routes on.
+  across runs, two sources in one dataset, ``check_active``), plus the
+  document-source tag core routes on.
 """
 
 import copy
 import hashlib
 import json
+import random
 from email.utils import format_datetime
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
@@ -35,6 +37,7 @@ from cognee_community_connector_github import github
 from cognee_community_connector_github.github import (
     GITHUB_SOURCE_NAME,
     GitHubAPIError,
+    GitHubListingError,
     _fingerprint,
     _get,
     _header_lines,
@@ -373,8 +376,38 @@ def test_render_pull_lists_reviews_and_files_without_patches():
     assert "Branch: fix-checkout -> main" in text
     assert "Reviews:\n- lin (approved)\n- grace (changes requested): Add a test." in text
     assert "Review comments:\n- grace on src/cart.ts: Rename this." in text
-    assert "Changed files:\n- src/cart.ts (+12/-3)\n- src/cart.test.ts (+40/-0)" in text
+    assert "Changed files:\n- src/cart.test.ts (+40/-0)\n- src/cart.ts (+12/-3)" in text
     assert "@@" not in text  # never a patch
+
+
+def test_shuffled_lists_render_the_same_text():
+    # The same pull request with its labels, assignees, comments, reviews,
+    # review comments and files handed over in a different order.
+    issue = {**ISSUE, "pull_request": {"merged_at": None}}
+    comments = [{"id": i, "user": user(f"u{i}"), "body": f"comment {i}"} for i in range(5)]
+    reviews = [
+        {"id": 10 + i, "user": user(f"r{i}"), "state": "APPROVED", "body": f"ok {i}"}
+        for i in range(3)
+    ]
+    review_comments = [
+        {"id": 20 + i, "user": user("lin"), "path": f"f{i}.py", "body": f"nit {i}"}
+        for i in range(3)
+    ]
+    files = [{"filename": f"src/{name}.py", "additions": 1, "deletions": 0} for name in "dbca"]
+    pull = {"base": {"ref": "main"}, "head": {"ref": "fix"}, "changed_files": 4}
+    expected = _render_pull(issue, pull, comments, reviews, review_comments, files)
+
+    rng = random.Random(7)
+    for _ in range(5):
+        shuffled = {
+            **issue,
+            "labels": rng.sample(issue["labels"], len(issue["labels"])),
+            "assignees": rng.sample(issue["assignees"], len(issue["assignees"])),
+        }
+        args = [rng.sample(x, len(x)) for x in (comments, reviews, review_comments, files)]
+        assert _render_pull(shuffled, pull, *args) == expected
+        assert _render_issue(shuffled, args[0]) == _render_issue(issue, comments)
+    assert expected.index("comment 0") < expected.index("comment 4")  # oldest first
 
 
 def test_render_pull_caps_the_file_list_and_says_how_many_more():
@@ -504,6 +537,28 @@ def test_rate_limit_is_told_apart_from_a_permission_error(status, headers, expec
     # Date is 2024-03-28T00:00:00Z = 1711584000; the reset is two minutes later.
     response = _Resp(status, {}, {**headers, "Date": format_datetime(NOW, True)})
     assert _rate_limit_wait(response) == expected
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        _Resp(200, {"message": "not a list"}),  # a dict where a listing is expected
+        _Resp(200, None, text="<html>maintenance</html>"),  # not JSON
+    ],
+)
+def test_listing_with_a_body_of_the_wrong_shape_raises(seeded, body):
+    state = {}
+    run_sync(seeded, state)
+    before = copy.deepcopy(state)
+    del seeded.repos[REPO].issues[1]
+    seeded.repos[REPO].gone[1] = 410
+    if body.text.startswith("<"):
+        body.json = lambda: json.loads(body.text)  # raises ValueError, like requests
+    seeded.queue(body, when=lambda url: "sort=created" in url)
+
+    with pytest.raises(GitHubListingError):
+        run_sync(seeded, state)
+    assert state == before  # never read as an empty listing, nothing deleted
 
 
 def test_rate_limit_waits_then_succeeds_and_permission_error_raises_at_once(fake, sleeps):
@@ -933,10 +988,9 @@ def test_issue_gone_for_good_is_forgotten(seeded, answer):
         "https://api.github.com/repos/acme/site-renamed",
     ],
 )
-def test_missing_number_with_any_other_answer_aborts_with_nothing_deleted(seeded, answer):
+def test_missing_number_with_any_other_answer_is_kept_and_asked_again(seeded, answer, caplog):
     state = {}
     run_sync(seeded, state)
-    before = copy.deepcopy(state)
 
     issue = seeded.repos[REPO].issues.pop(1)
     if answer.startswith("https://"):
@@ -946,14 +1000,18 @@ def test_missing_number_with_any_other_answer_aborts_with_nothing_deleted(seeded
             seeded.queue(_error(500), when=lambda url: url.endswith("/issues/1"))
     elif answer == "200":
         seeded.queue(_Resp(200, issue), when=lambda url: url.endswith("/issues/1"))
+    seeded.add_issue(3, updated_at=at(9))  # the rest of the sync still happens
 
-    rows = []
-    with pytest.raises(GitHubAPIError):
-        for row in sync_repos(seeded, state, repos=[REPO]):
-            rows.append(row)
+    rows = run_sync(seeded, state)
 
-    assert rows == []
-    assert state == before
+    assert tombstones(rows) == []
+    assert "issue:acme/site#3" in doc_rows(rows)
+    assert "issue:acme/site#1" in state["known_ids"]
+    # The next run asks again, and forgets it once GitHub says it is gone.
+    seeded.repos[REPO].gone[1] = 410
+    rows = run_sync(seeded, state)
+    assert seeded.requested("/issues/1") == [f"{API}/repos/{REPO}/issues/1"]
+    assert tombstones(rows) == [{"id": "issue:acme/site#1", "_deleted": True}]
 
 
 @pytest.mark.parametrize("failing", ["sweep page 2", "change listing", "releases", "readme"])
@@ -1031,6 +1089,14 @@ def test_github_source_declares_document_marker_and_pipeline_scope(fake):
     assert pipeline_name_for_source(source, "github") != "ingest_dlt_source"
 
 
+def test_resource_name_names_the_table_and_scopes_the_state(fake):
+    default = github_source(session=fake, repos=[REPO])
+    work = github_source(session=fake, repos=[REPO], resource_name="github_work")
+
+    assert work.name == "github_work"
+    assert pipeline_name_for_source(work, "github") != pipeline_name_for_source(default, "github")
+
+
 def test_build_document_data_item_tags_source():
     row = SimpleNamespace(
         row_data={
@@ -1069,31 +1135,146 @@ def test_github_source_reads_token_from_env(monkeypatch):
 # ---------------------------------------------------------------------------
 # dlt pipeline: a real merge into a temp sqlite destination
 # ---------------------------------------------------------------------------
-def _pipeline(tmp_path):
+def _pipeline(tmp_path, name):
     import dlt
 
     return dlt.pipeline(
-        pipeline_name="github_test",
+        pipeline_name=name,
         destination=dlt.destinations.sqlalchemy(f"sqlite:///{(tmp_path / 'github.db').as_posix()}"),
         dataset_name="github_ds",
         pipelines_dir=str(tmp_path / "state"),
     )
 
 
-def _run_pipeline(tmp_path, session, **kwargs):
+def _run_pipeline(tmp_path, session, repos=(REPO,), **kwargs):
     session.calls.clear()
     session.statuses = []
-    pipeline = _pipeline(tmp_path)
-    pipeline.run(github_source(session=session, repos=[REPO], **kwargs))
+    source = github_source(session=session, repos=list(repos), **kwargs)
+    # One dlt pipeline per source scope, the way cognee names them.
+    pipeline = _pipeline(tmp_path, pipeline_name_for_source(source, "github_ds"))
+    pipeline.run(source)
     return pipeline
 
 
-def _read_documents(pipeline):
+def _read_documents(pipeline, table="github_documents"):
     with (
         pipeline.sql_client() as client,
-        client.execute_query("SELECT id, content FROM github_documents") as cursor,
+        client.execute_query(f"SELECT id, content FROM {table}") as cursor,
     ):
         return dict(cursor.fetchall())
+
+
+def test_pipeline_deletion_removes_the_row_from_the_destination(seeded, tmp_path):
+    # Goes red if the _deleted marker is not emitted or hard_delete is off:
+    # the row must be gone, not kept emptied or with _deleted set.
+    pipeline = _run_pipeline(tmp_path, seeded)
+    assert "issue:acme/site#1" in _read_documents(pipeline)
+
+    del seeded.repos[REPO].issues[1]
+    seeded.repos[REPO].gone[1] = 410
+    pipeline = _run_pipeline(tmp_path, seeded)
+
+    with (
+        pipeline.sql_client() as client,
+        client.execute_query(
+            "SELECT COUNT(*) FROM github_documents WHERE id = 'issue:acme/site#1'"
+        ) as cursor,
+    ):
+        assert cursor.fetchone()[0] == 0
+    assert "pr:acme/site#2" in _read_documents(pipeline)
+
+
+def test_pipeline_two_sources_in_one_dataset_stay_apart(seeded, tmp_path):
+    seeded.add_repo("acme/blog")
+    seeded.add_issue(1, updated_at=at(1), repo="acme/blog")
+    site = {"repos": [REPO], "resource_name": "github_site"}
+    blog = {"repos": ["acme/blog"], "resource_name": "github_blog"}
+
+    _run_pipeline(tmp_path, seeded, **site)
+    _run_pipeline(tmp_path, seeded, **blog)
+    site_docs = _read_documents(_run_pipeline(tmp_path, seeded, **site), "github_site")
+    blog_docs = _read_documents(_run_pipeline(tmp_path, seeded, **blog), "github_blog")
+
+    assert "issue:acme/site#1" in site_docs and "issue:acme/blog#1" not in site_docs
+    assert set(blog_docs) == {"repo:acme/blog", "issue:acme/blog#1"}
+
+
+def test_check_active_is_asked_before_every_request(seeded):
+    checks = []
+    source = github_source(
+        session=seeded, repos=[REPO], check_active=lambda: checks.append(len(seeded.calls))
+    )
+    rows = list(source)
+
+    assert rows
+    # Asked before each request (and around each row), so never behind it.
+    assert len(checks) > len(seeded.calls)
+    assert sorted(set(checks)) == list(range(len(seeded.calls) + 1))
+
+
+@pytest.mark.parametrize("stop_after_requests", [1, 6, 9])
+def test_check_active_raising_stops_with_nothing_deleted_or_loaded(
+    seeded, tmp_path, stop_after_requests
+):
+    _run_pipeline(tmp_path, seeded)
+    before = _read_documents(_pipeline(tmp_path, _scope_name()))
+
+    del seeded.repos[REPO].issues[1]
+    seeded.repos[REPO].gone[1] = 410
+    seeded.repos[REPO].issues[2].update(body="v2", updated_at=at(9))
+
+    class AccessRevokedError(Exception):
+        pass
+
+    def check_active():
+        if len(seeded.calls) >= stop_after_requests:
+            raise AccessRevokedError
+
+    with pytest.raises(Exception) as excinfo:  # dlt wraps it in PipelineStepFailed
+        _run_pipeline(tmp_path, seeded, check_active=check_active)
+    chain, error = [], excinfo.value
+    while error is not None:
+        chain.append(error)
+        error = error.__cause__ or error.__context__
+    assert any(isinstance(error, AccessRevokedError) for error in chain)
+    assert _read_documents(_pipeline(tmp_path, _scope_name())) == before
+
+    # The state did not move: the next run does the deletion and the edit.
+    documents = _read_documents(_run_pipeline(tmp_path, seeded))
+    assert "issue:acme/site#1" not in documents
+    assert "v2" in documents["pr:acme/site#2"]
+
+
+def test_check_active_raising_an_oserror_is_not_retried_or_swallowed(seeded, tmp_path, sleeps):
+    # PermissionError is an OSError, like the network errors _get retries and
+    # the deletion check keeps; a host's check must still stop the sync.
+    _run_pipeline(tmp_path, seeded)
+    before = _read_documents(_pipeline(tmp_path, _scope_name()))
+    del seeded.repos[REPO].issues[1]
+    seeded.repos[REPO].gone[1] = 410
+
+    def check_active():
+        if seeded.requested("/issues/1"):  # the deletion check has been asked
+            raise PermissionError("access revoked")
+
+    with pytest.raises(Exception) as excinfo:  # dlt wraps it in PipelineStepFailed
+        _run_pipeline(tmp_path, seeded, check_active=check_active)
+    chain, error = [], excinfo.value
+    while error is not None:
+        chain.append(error)
+        error = error.__cause__ or error.__context__
+    assert any(isinstance(error, github.GitHubSyncStoppedError) for error in chain)
+    assert any(isinstance(error, PermissionError) for error in chain)
+    assert sleeps == []  # not retried
+    assert len(seeded.requested("/issues/1")) == 1
+    assert _read_documents(_pipeline(tmp_path, _scope_name())) == before
+
+    documents = _read_documents(_run_pipeline(tmp_path, seeded))
+    assert "issue:acme/site#1" not in documents  # state did not move
+
+
+def _scope_name():
+    return pipeline_name_for_source(github_source(session=FakeGitHub(), repos=[REPO]), "github_ds")
 
 
 def test_pipeline_round_trip_edit_rename_and_delete_across_runs(seeded, tmp_path):
@@ -1134,18 +1315,96 @@ def test_pipeline_round_trip_edit_rename_and_delete_across_runs(seeded, tmp_path
     assert seeded.fresh_calls() == []
 
 
-def test_pipeline_failure_while_rendering_leaves_destination_and_state_untouched(seeded, tmp_path):
+def test_pipeline_issue_that_fails_on_its_own_is_kept_and_retried(seeded, tmp_path):
     _run_pipeline(tmp_path, seeded)
+    old_pr = _read_documents(_pipeline(tmp_path, _scope_name()))["pr:acme/site#2"]
 
     seeded.repos[REPO].issues[1].update(body="v2", updated_at=at(9))
     seeded.repos[REPO].issues[2].update(body="v2", updated_at=at(9))
-    for _ in range(github._MAX_RETRIES):
-        seeded.queue(_error(502), when=lambda url: "/pulls/2/reviews" in url)
+    for _ in range(github._MAX_RETRIES):  # a persistent 500 on one PR's reviews
+        seeded.queue(_error(500), when=lambda url: "/pulls/2/reviews" in url)
+    documents = _read_documents(_run_pipeline(tmp_path, seeded))
+
+    assert "v2" in documents["issue:acme/site#1"]  # the run completed
+    assert documents["pr:acme/site#2"] == old_pr  # kept as it was, not deleted
+
+    # GitHub recovered. Two things bring #2 back here: its fingerprint stored as
+    # "" and, because its updated_at is still inside the change listing's
+    # 5-minute overlap, the listing itself. Removing the "" marker therefore
+    # leaves this test green; test_two_failures_in_a_row_... checks the marker.
+    documents = _read_documents(_run_pipeline(tmp_path, seeded))  # GitHub recovered
+    assert fetched_issues(seeded) == [2]
+    assert "v2" in documents["pr:acme/site#2"]
+    _run_pipeline(tmp_path, seeded)
+    assert fetched_issues(seeded) == []  # and settled after that
+
+
+def _render_failure(status, headers=None):
+    return [_error(status, "nope", headers) for _ in range(github._MAX_RETRIES)]
+
+
+@pytest.mark.parametrize("failure", ["401", "rate limit", "three in a row"])
+def test_systemic_render_failure_aborts_with_nothing_committed(seeded, failure):
+    for number in (3, 4):
+        seeded.add_issue(number, updated_at=at(2))
+    state = {}
+    run_sync(seeded, state)
+    before = copy.deepcopy(state)
+    for number in (1, 2, 3, 4):
+        seeded.repos[REPO].issues[number]["updated_at"] = at(9)
+
+    def on(number):
+        return lambda url: f"/issues/{number}/comments" in url
+
+    if failure == "401":
+        seeded.queue(_error(401, "Bad credentials"), when=on(2))
+        expected = GitHubAPIError
+    elif failure == "rate limit":
+        for response in _render_failure(403, {"Retry-After": "1"}):
+            seeded.queue(response, when=on(2))
+        expected = GitHubAPIError
+    else:
+        for number in (2, 3, 4):
+            for response in _render_failure(500):
+                seeded.queue(response, when=on(number))
+        expected = github.GitHubUnavailableError
+
+    with pytest.raises(expected):
+        run_sync(seeded, state)
+    assert state == before
+
+
+def test_two_failures_in_a_row_are_kept_and_a_success_resets_the_streak(seeded):
+    for number in (3, 4, 5):
+        seeded.add_issue(number, updated_at=at(2))
+    state = {}
+    run_sync(seeded, state)
+    for number in (1, 2, 3, 4, 5):
+        seeded.repos[REPO].issues[number]["updated_at"] = at(9)
+    for number in (1, 2, 4, 5):  # 3 succeeds in between
+        for response in _render_failure(500):
+            seeded.queue(response, when=lambda url, n=number: f"/issues/{n}/comments" in url)
+
+    rows = run_sync(seeded, state)
+
+    assert set(doc_rows(rows, "issue:") | doc_rows(rows, "pr:")) == {"issue:acme/site#3"}
+    assert tombstones(rows) == []
+    prints = state["repos"][REPO]["fingerprints"]
+    assert {n: prints[n] for n in "1245"} == dict.fromkeys("1245", "")
+
+
+def test_pipeline_abort_mid_render_leaves_destination_and_state_untouched(seeded, tmp_path):
+    _run_pipeline(tmp_path, seeded)
+    before = _read_documents(_pipeline(tmp_path, _scope_name()))
+
+    seeded.repos[REPO].issues[1].update(body="v2", updated_at=at(9))
+    seeded.repos[REPO].issues[2].update(body="v2", updated_at=at(9))
+    seeded.queue(_error(401, "Bad credentials"), when=lambda url: "/pulls/2/reviews" in url)
     with pytest.raises(Exception):  # noqa: B017 - dlt wraps the source error in PipelineStepFailed
         _run_pipeline(tmp_path, seeded)
 
-    documents = _read_documents(_pipeline(tmp_path))
-    assert "v2" not in documents["issue:acme/site#1"]  # yielded before the failure, never loaded
+    # Issue 1 was yielded before the 401, but nothing of the run was loaded.
+    assert _read_documents(_pipeline(tmp_path, _scope_name())) == before
 
     documents = _read_documents(_run_pipeline(tmp_path, seeded))
     assert fetched_issues(seeded) == [1, 2]

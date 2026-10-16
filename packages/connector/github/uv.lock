@@ -597,7 +597,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "cognee", specifier = "==1.6.2" },
+    { name = "cognee", specifier = ">=1.6.2,<2" },
     { name = "dlt", extras = ["sqlalchemy"], specifier = ">=1.9.0,<2" },
     { name = "requests", specifier = ">=2.31.0,<3" },
 ]
