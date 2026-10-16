@@ -44,13 +44,17 @@ Design
 * **Safety**: every listing is finished before the first row is yielded, and
   state is written only after the last one. A listing that fails therefore
   deletes nothing and moves no cursor; the next run starts from the same point.
+  A task that fails on its own keeps its document and is retried next run; a
+  ``401``, an exhausted rate limit or several failures in a row abort.
+* **Several sources in one dataset**: ``resource_name`` names the dlt table and
+  the sync state. Give each token or selection its own name.
 """
 
 from __future__ import annotations
 
 import os
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -60,32 +64,46 @@ from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
 
 logger = get_logger("asana_connector")
 
-# dlt resource / staging-table name, and the document-source tag for its rows.
+# Default dlt resource / staging-table name, and the document-source tag for its rows.
 ASANA_TABLE_NAME = "asana_documents"
 ASANA_SOURCE_NAME = "asana"
 
 _API_BASE = "https://app.asana.com/api/1.0"
+# Per request: a generous bound for one API call, so a stalled connection fails and is retried.
 _TIMEOUT_SECONDS = 30
-_PAGE_SIZE = 100  # Asana's maximum
+_PAGE_SIZE = 100  # Asana's maximum ``limit`` for every listing used here
 
-# Retry budget for rate-limited / transient responses.
+# Retry budget for rate-limited / transient responses: five attempts with
+# 1, 2, 4, 8 s back-off between them, or exactly Asana's Retry-After on a 429.
 _MAX_RETRIES = 5
+# 429 is Asana's rate limit (150 requests a minute on the free plan); the 5xx
+# answers are the ones Asana's docs describe as temporary.
 _TRANSIENT_STATUSES = (429, 500, 502, 503, 504)
 # How often a listing is restarted from its first page after an offset expired.
+# Offsets expire (Asana's docs); one restart normally suffices, two leave slack.
 _MAX_LISTING_RESTARTS = 2
 # How far before the cursor the modified_since listing starts (see sync_tasks).
+# The overlap only has to catch a task stamped at or just before the cursor
+# that the previous listing could not see yet; a minute is a wide margin.
 _CURSOR_OVERLAP_SECONDS = 60
-# Upper bound on chained /events pages in one run (guards against has_more loops).
+# Upper bound on chained /events pages in one run (guards against has_more
+# loops). Far more than one project produces between runs; past it the run
+# treats the feed as a gap and re-renders the project.
 _MAX_EVENT_PAGES = 100
+# Abort when this many tasks in a row fail on their own. One bad task is kept
+# and retried next run, but a streak means Asana itself is failing, and every
+# further task would spend five retries for nothing.
+_MAX_FAILURES_IN_A_ROW = 3
 
 # Asana returns compact objects unless fields are requested, and wide requests
-# count against its cost quota, so each call asks only for what is rendered.
+# count against its cost quota, so each call asks only for what is rendered
+# (plus created_at on stories, to put comments in order).
 _TASK_FIELDS = (
     "name,notes,completed,due_on,permalink_url,assignee.name,"
     "memberships.project.name,memberships.section.name,"
     "custom_fields.name,custom_fields.display_value"
 )
-_STORY_FIELDS = "resource_subtype,text,created_by.name"
+_STORY_FIELDS = "resource_subtype,text,created_by.name,created_at"
 _SUBTASK_FIELDS = "name,completed,assignee.name,due_on,notes"
 _PROJECT_FIELDS = "name,notes,permalink_url"
 # resource.target is what identifies the task of an edited comment (see
@@ -102,6 +120,23 @@ class AsanaAPIError(RuntimeError):
     def __init__(self, status: int, message: str):
         super().__init__(f"Asana API returned {status}: {message}")
         self.status = status
+
+
+class AsanaListingError(RuntimeError):
+    """Asana answered ``200`` with a body that is not JSON or not of the expected shape."""
+
+
+class AsanaUnavailableError(RuntimeError):
+    """Too many tasks in a row failed: Asana is failing, not one task."""
+
+
+class AsanaSyncStoppedError(RuntimeError):
+    """The host's ``check_active`` raised an ``OSError``; the sync must stop.
+
+    Network errors are ``OSError`` too and are retried, or kept per task, so an
+    ``OSError`` from the host's check is re-raised as this type, which nothing
+    in the connector catches. Other exceptions from the check pass unchanged.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -147,7 +182,7 @@ def _get(
 
         status = response.status_code
         if status in ok:
-            return status, response.json()
+            return status, _json_object(response)
         if status in _TRANSIENT_STATUSES and not last_attempt:
             delay = _retry_delay(response.headers, attempt)
             logger.warning("Asana: HTTP %d on %s; retrying in %.1fs.", status, path, delay)
@@ -156,6 +191,33 @@ def _get(
         raise AsanaAPIError(status, _error_message(response))
 
     raise AssertionError("unreachable: the loop returns or raises")  # pragma: no cover
+
+
+def _json_object(response: Any) -> dict:
+    """The JSON object Asana wraps every answer in; anything else raises.
+
+    An empty or odd body must never be read as an empty listing, which would
+    look like deletions.
+    """
+    try:
+        body = response.json()
+    except ValueError as exc:
+        raise AsanaListingError(f"Asana answered {response.status_code} without JSON") from exc
+    if not isinstance(body, dict):
+        raise AsanaListingError(
+            f"Asana answered {response.status_code} with a {type(body).__name__}, not an object"
+        )
+    return body
+
+
+def _data(body: dict, shape: type) -> Any:
+    """``body["data"]``, which must be a ``list`` or a ``dict`` as expected."""
+    data = body.get("data")
+    if not isinstance(data, shape):
+        raise AsanaListingError(
+            f"Asana's data is a {type(data).__name__} where a {shape.__name__} was expected"
+        )
+    return data
 
 
 def _retry_delay(headers: Any, attempt: int) -> float:
@@ -174,11 +236,6 @@ def _error_message(response: Any) -> str:
         return str(getattr(response, "text", ""))[:200]
 
 
-def _is_gone(exc: Exception) -> bool:
-    """True when a single item is deleted or no longer visible to the token."""
-    return isinstance(exc, AsanaAPIError) and exc.status in (403, 404)
-
-
 def _list_all(session: Any, path: str, params: dict) -> list[dict]:
     """Return every item of a paginated collection. Never a partial list.
 
@@ -193,7 +250,7 @@ def _list_all(session: Any, path: str, params: dict) -> list[dict]:
         try:
             while True:
                 _, body = _get(session, path, page_params)
-                items.extend(body.get("data") or [])
+                items.extend(_data(body, list))
                 offset = (body.get("next_page") or {}).get("offset")
                 if not offset:
                     return items
@@ -265,7 +322,7 @@ def _poll_events(
             raise AsanaAPIError(status, "events response carried no sync token")
         if status == 412:
             return None, sync_token
-        events.extend(body.get("data") or [])
+        events.extend(_data(body, list))
         if not body.get("has_more"):
             return events, sync_token
 
@@ -358,7 +415,10 @@ def _render_task(task: dict, comments: list[dict], subtasks: list[dict]) -> str:
 
     The text is deterministic for unchanged input and carries no timestamps or
     counters, so an unchanged task keeps its content hash and is not
-    re-cognified. The task name is not repeated here; it is the row's title.
+    re-cognified. Every list is sorted (projects, custom fields by name,
+    subtasks by creation, comments by time), so the same task renders the same
+    text whatever order Asana lists its parts in. The task name is not repeated
+    here; it is the row's title.
     """
     # "Completed", not "Status": workspaces commonly have a custom field named Status.
     lines = [f"Completed: {'yes' if task.get('completed') else 'no'}"]
@@ -369,20 +429,33 @@ def _render_task(task: dict, comments: list[dict], subtasks: list[dict]) -> str:
     if task.get("due_on"):
         lines.append(f"Due: {task['due_on']}")
     lines.extend(_membership_lines(task.get("memberships") or []))
-    for field in task.get("custom_fields") or []:
-        if field.get("name") and field.get("display_value"):
-            lines.append(f"{field['name']}: {field['display_value']}")
+    fields = sorted(
+        (field["name"], field["display_value"])
+        for field in task.get("custom_fields") or []
+        if field.get("name") and field.get("display_value")
+    )
+    lines.extend(f"{name}: {value}" for name, value in fields)
 
     sections = ["\n".join(lines)]
     notes = (task.get("notes") or "").strip()
     if notes:
         sections.append(notes)
     if subtasks:
-        lines = [line for subtask in subtasks for line in _subtask_lines(subtask)]
+        ordered = sorted(subtasks, key=_gid_order)
+        lines = [line for subtask in ordered for line in _subtask_lines(subtask)]
         sections.append("Subtasks:\n" + "\n".join(lines))
     if comments:
-        sections.append("Comments:\n" + "\n".join(_comment_line(story) for story in comments))
+        ordered = sorted(
+            comments, key=lambda story: (story.get("created_at") or "", _gid_order(story))
+        )
+        sections.append("Comments:\n" + "\n".join(_comment_line(story) for story in ordered))
     return "\n\n".join(sections)
+
+
+def _gid_order(item: dict) -> tuple[int, str]:
+    """Creation order of Asana objects: gids are numeric strings that grow over time."""
+    gid = str(item.get("gid") or "")
+    return len(gid), gid
 
 
 def _membership_lines(memberships: list[dict]) -> list[str]:
@@ -425,27 +498,57 @@ def _deleted_row(row_id: str) -> dict[str, Any]:
     return {"id": row_id, "_deleted": True}
 
 
-def _fetch_task(session: Any, task_gid: str) -> tuple[dict, list[dict], list[dict]] | None:
-    """Fetch ``(task, comments, subtasks)`` for one task.
+def _fetch_task(session: Any, task_gid: str) -> tuple[dict, list[dict], list[dict]]:
+    """Fetch ``(task, comments, subtasks)`` for one task. Errors propagate.
 
-    Returns ``None`` when the task is gone (deleted between the listing and
-    this fetch) so the caller can let it be forgotten. Other errors propagate.
+    The task was in this run's listing, so a ``403`` or ``404`` here does not
+    prove it is gone (it may be a permission or a passing glitch); the caller
+    keeps it and asks again next run, and the listing decides deletions.
     """
-    try:
-        _, body = _get(session, f"/tasks/{task_gid}", {"opt_fields": _TASK_FIELDS})
-        stories = _list_all(session, f"/tasks/{task_gid}/stories", {"opt_fields": _STORY_FIELDS})
-        subtasks = _list_all(
-            session, f"/tasks/{task_gid}/subtasks", {"opt_fields": _SUBTASK_FIELDS}
-        )
-    except AsanaAPIError as exc:
-        if _is_gone(exc):
-            logger.warning("Asana: task %s is gone, skipping: %s", task_gid, exc)
-            return None
-        raise
-
+    _, body = _get(session, f"/tasks/{task_gid}", {"opt_fields": _TASK_FIELDS})
+    task = _data(body, dict)
+    stories = _list_all(session, f"/tasks/{task_gid}/stories", {"opt_fields": _STORY_FIELDS})
+    subtasks = _list_all(session, f"/tasks/{task_gid}/subtasks", {"opt_fields": _SUBTASK_FIELDS})
     # The stories feed also holds system entries ("added to project", ...).
     comments = [story for story in stories if story.get("resource_subtype") == "comment_added"]
-    return body.get("data") or {}, comments, subtasks
+    return task, comments, subtasks
+
+
+class _ItemFailures:
+    """The tasks of one run that failed on their own and are kept for a retry.
+
+    Only per-task failures are kept: an :class:`AsanaAPIError`, an
+    :class:`AsanaListingError` or an ``OSError`` that outlasted the retries. A
+    ``401`` or a ``429`` that outlasted them would fail every later task the
+    same way, so it is re-raised, and so is the ``_MAX_FAILURES_IN_A_ROW``-th
+    failure in a row. Anything else (``check_active``'s errors among them) is
+    never caught in the first place.
+    """
+
+    def __init__(self) -> None:
+        self.in_a_row = 0
+        self.kept: set[str] = set()
+
+    def keep(self, exc: Exception, task_gid: str) -> None:
+        """Count a per-task failure and log it, or raise if it is systemic."""
+        if isinstance(exc, AsanaAPIError) and exc.status in (401, 429):
+            raise exc
+        self.in_a_row += 1
+        endpoint = f"/tasks/{task_gid}"
+        if self.in_a_row >= _MAX_FAILURES_IN_A_ROW:
+            raise AsanaUnavailableError(
+                f"{self.in_a_row} tasks in a row failed, the last on {endpoint}; stopping"
+            ) from exc
+        what = f"HTTP {exc.status}" if isinstance(exc, AsanaAPIError) else type(exc).__name__
+        logger.warning("Asana: kept %s for a retry next run (%s).", endpoint, what)
+        self.kept.add(task_gid)
+
+    def succeeded(self) -> None:
+        self.in_a_row = 0
+
+
+# What a per-task request can fail with once the retries are spent.
+_ITEM_ERRORS = (AsanaAPIError, AsanaListingError, OSError)
 
 
 def _task_row(
@@ -464,7 +567,7 @@ def _task_row(
 def _project_row(session: Any, project_gid: str) -> dict[str, Any]:
     """Fetch a project and flatten its description into a dlt row."""
     _, body = _get(session, f"/projects/{project_gid}", {"opt_fields": _PROJECT_FIELDS})
-    project = body.get("data") or {}
+    project = _data(body, dict)
     return {
         "id": _project_id(project_gid),
         "url": project.get("permalink_url") or "",
@@ -487,9 +590,10 @@ def sync_tasks(
     """Yield changed documents since the last run, plus hard-delete markers.
 
     ``state`` holds ``known_ids`` (every row id emitted so far), ``subtasks``
-    (subtask gid -> the task document its title is folded into) and, per
-    project, a ``modified_since`` ``cursor``, the tasks ``seen`` close to that
-    cursor, and an Events ``sync`` token.
+    (subtask gid -> the task document its title is folded into), ``retry``
+    (tasks that failed to render last time) and, per project, a
+    ``modified_since`` ``cursor``, the tasks ``seen`` close to that cursor, and
+    an Events ``sync`` token.
 
     The work is split so that a failure can never be mistaken for a deletion:
 
@@ -497,6 +601,7 @@ def sync_tasks(
        (the sweep), and list tasks modified since the cursor. Any error here
        propagates before a single row is yielded.
     2. *Render.* Fetch and yield each changed task once, then each project.
+       A task that fails on its own keeps its old document and is retried.
     3. *Delete.* Yield a hard-delete marker for every known id that is no
        longer current.
     4. *Commit.* Only now write the new id set, cursors and tokens to ``state``.
@@ -504,6 +609,7 @@ def sync_tasks(
     known_ids: set[str] = set(state.get("known_ids", []))
     subtask_parents: dict[str, str] = dict(state.get("subtasks", {}))
     previous: dict = state.get("projects", {})
+    failures = _ItemFailures()
 
     next_projects: dict[str, dict[str, Any]] = {}
     swept: set[str] = set()  # task gids currently in the selected projects
@@ -558,20 +664,28 @@ def sync_tasks(
         }
 
     changed |= _documents_for(event_gids, swept, subtask_parents)
+    # Tasks that failed last time are tried again, whatever their timestamps say.
+    changed |= set(state.get("retry", []))
     # Only tasks in the sweep are rendered, so every emitted id ends up in
-    # known_ids and can be deleted by a later run.
+    # known_ids and can be deleted by a later run. A retry entry for a task that
+    # left the sweep is dropped here; the sweep's own deletion applies to it.
     changed &= swept
 
     # --- 2. Render ----------------------------------------------------------
     current_ids = {_task_id(gid) for gid in swept}
     rendered = 0
     for task_gid in sorted(changed):
-        fetched = _fetch_task(session, task_gid)
-        if fetched is None:
-            # Deleted after the sweep saw it: let the deletion step forget it.
-            current_ids.discard(_task_id(task_gid))
+        try:
+            task, comments, subtasks = _fetch_task(session, task_gid)
+        except _ITEM_ERRORS as exc:
+            failures.keep(exc, task_gid)
+            # No row, so the old document stays; its id is in current_ids, so
+            # it is not deleted, and state["retry"] brings it back next run.
+            # A task that was never emitted gets its first document then; until
+            # that, its id in known_ids is harmless (a hard delete of a row that
+            # does not exist is a no-op).
             continue
-        task, comments, subtasks = fetched
+        failures.succeeded()
         # Replace what is remembered about this task's subtasks with what was
         # just rendered, so a later event about one of them finds this document.
         subtask_parents = {c: p for c, p in subtask_parents.items() if p != task_gid}
@@ -598,12 +712,19 @@ def sync_tasks(
         for child, parent in sorted(subtask_parents.items())
         if _task_id(parent) in current_ids
     }
+    for project_state in next_projects.values():
+        # A kept task must not look settled inside the overlap window.
+        project_state["seen"] = {
+            gid: when for gid, when in project_state["seen"].items() if gid not in failures.kept
+        }
     state["projects"] = next_projects
+    state["retry"] = sorted(failures.kept)
     logger.info(
-        "Asana: %d task(s) rendered, %d project(s), %d deletion(s).",
+        "Asana: %d task(s) rendered, %d project(s), %d deletion(s); kept %d task(s) for retry.",
         rendered,
         len(project_gids),
         len(deleted),
+        len(failures.kept),
     )
 
 
@@ -616,6 +737,9 @@ def asana_source(
     workspace_gid: str | None = None,
     include_completed: bool = True,
     session: Any = None,
+    *,
+    resource_name: str = ASANA_TABLE_NAME,
+    check_active: Callable[[], None] | None = None,
 ):
     """Return a ``dlt`` resource that yields Asana documents for ``remember``.
 
@@ -629,9 +753,16 @@ def asana_source(
             a task is forgotten once it is completed.
         session: Pre-built ``requests`` session. Mainly an injection point for
             tests; when omitted one is built from the token.
+        resource_name: Stable dlt resource (table) name, which also scopes the
+            sync state. Give each token or project selection its own name when
+            several sync into one dataset; sharing a name would make each run
+            forget the other's documents.
+        check_active: Optional host authorization checkpoint. It is called
+            before every Asana request and around every yielded row, and stops
+            the sync by raising; nothing is deleted and no state moves.
 
     Returns:
-        A ``dlt`` resource (``asana_documents``) configured with
+        A ``dlt`` resource (``resource_name``) configured with
         ``primary_key="id"``, ``write_disposition="merge"`` and an ``_deleted``
         hard-delete column. Hand it to ``cognee.remember(...)``.
     """
@@ -659,7 +790,7 @@ def asana_source(
         raise ValueError("Asana access token required: pass token= or set ASANA_ACCESS_TOKEN.")
 
     @dlt.resource(
-        name=ASANA_TABLE_NAME,
+        name=resource_name,
         primary_key="id",
         write_disposition="merge",
         # _deleted is a boolean hard-delete marker: rows where it is True are
@@ -669,6 +800,13 @@ def asana_source(
     )
     def asana_documents():
         client = session or _make_session(resolved_token)
+        check = _stop_on(check_active) if check_active is not None else None
+        if check is not None:
+            # The listing phase makes many requests before the first row.
+            client = _GuardedSession(client, check)
+        yield from dlt_utils.guarded_rows(_rows(client), check)
+
+    def _rows(client: Any) -> Iterator[dict[str, Any]]:
         if project_gids:
             # De-duplicate while keeping the caller's order.
             selected = list(dict.fromkeys(str(gid) for gid in project_gids))
@@ -687,5 +825,29 @@ def asana_source(
     setattr(resource, DOCUMENT_SOURCE_ATTR, ASANA_SOURCE_NAME)
     # Give the incremental state its own dlt pipeline per dataset, so syncing
     # other dlt sources (or another dataset) cannot disturb cursors and tokens.
-    setattr(resource, dlt_utils.PIPELINE_SCOPE_ATTR, ASANA_TABLE_NAME)
+    setattr(resource, dlt_utils.PIPELINE_SCOPE_ATTR, resource_name)
     return resource
+
+
+def _stop_on(check_active: Callable[[], None]) -> Callable[[], None]:
+    """``check_active``, turning an ``OSError`` it raises into ``AsanaSyncStoppedError``."""
+
+    def check() -> None:
+        try:
+            check_active()
+        except OSError as exc:
+            raise AsanaSyncStoppedError(f"check_active stopped the sync: {exc!r}") from exc
+
+    return check
+
+
+class _GuardedSession:
+    """A session that asks the host's ``check_active`` before every request."""
+
+    def __init__(self, session: Any, check_active: Callable[[], None]):
+        self._session = session
+        self._check_active = check_active
+
+    def get(self, *args: Any, **kwargs: Any) -> Any:
+        self._check_active()
+        return self._session.get(*args, **kwargs)

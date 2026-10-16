@@ -16,8 +16,9 @@ uv pip install cognee-community-connector-asana
 cd packages/connector/asana && uv sync --all-extras
 ```
 
-The package pins `cognee==1.6.2`: it needs document-mode routing and the table-scoped
-orphan cleanup that ships in cognee 1.6.x.
+The package needs `cognee>=1.6.2,<2`: document-mode routing, the table-scoped orphan
+cleanup, `PIPELINE_SCOPE_ATTR` and `guarded_rows` all ship in cognee 1.6.2. The tests pass on
+1.6.2 and 1.6.4.
 
 ## Setup
 
@@ -65,15 +66,20 @@ and forgets what was deleted. See `examples/example.py` for the full flow.
 | `workspace_gid="..."` | Ingest every project of the workspace. Used only when `project_gids` is omitted. |
 | `include_completed=False` | Only incomplete tasks. A task is forgotten once it is completed. Default `True`. |
 | `token="..."` | Access token. Defaults to the `ASANA_ACCESS_TOKEN` environment variable. |
+| `resource_name="asana_documents"` | The dlt table name, which also scopes the sync state. See below. |
+| `check_active=None` | Optional callable for a host: asked before every Asana request and around every row; raising stops the sync with nothing deleted. |
 
 A project gid that no longer exists (or that the token can no longer see) makes Asana
 answer with an error, and the run aborts without deleting anything. That is deliberate: a
 permissions hiccup must not look like "every task was deleted". To forget a deleted
 project, remove its gid from `project_gids` and sync again.
 
-Pass all projects for a dataset in **one** `asana_source(...)` call. The source keeps one set
-of sync state per dataset, so two calls with different projects into the same dataset would
-each forget the other's tasks. Removing a project from the selection forgets its documents.
+**Several sources in one dataset.** Each `resource_name` has its own table and its own sync
+state, and a sync only ever forgets documents of its own table. Two `asana_source(...)` calls
+into one dataset (two tokens or workspaces, or two selections of projects) therefore need two
+names, for example `resource_name="asana_marketing"` and `resource_name="asana_eng"`. With the
+same name, each run would forget the other's tasks. Within one source, removing a project from
+the selection forgets its documents.
 
 ### What a document looks like
 
@@ -103,6 +109,8 @@ Comments:
 
 A task that sits in two selected projects is one document. Timestamps and counters are kept
 out of the text on purpose: an unchanged task keeps its content hash and is not re-cognified.
+Projects and custom fields are sorted by name, subtasks by creation and comments by time, so
+the same task always renders the same text.
 
 ## How incremental sync works
 
@@ -151,15 +159,29 @@ marker, dlt removes those rows on `merge`, and cognee's `orphan_cleanup` removes
 the graph and vector stores.
 
 All listings are completed before the first row is emitted, and state is saved only after
-the last one. If a listing fails (after retries), the run aborts: nothing is deleted and no
-cursor or token moves, so the next run starts from the same point.
+the last one. If a listing fails (after retries), or `check_active` raises, the run aborts:
+nothing is deleted and no cursor or token moves, so the next run starts from the same point.
+A listing that answers `200` with something other than a JSON object holding a `data` list
+also aborts the run; it is never read as an empty listing.
+
+Only the listing decides that a task is gone. A task that is still listed but fails on its
+own (its `GET`, comments or subtasks answer `403`, `404` or an error that outlasts the
+retries) keeps its previous document, is logged with the endpoint and status, and is fetched
+again on the next run; the rest of the run goes on. Failures that would hit every task the
+same way still abort with nothing saved: a `401`, a `429` that outlasts the retries, and three
+tasks failing in a row.
 
 ## Limits
 
+- Anyone who can read the cognee dataset can read what was ingested, including tasks of
+  private projects. Give a dataset only to people who may read all its projects.
+- Two tokens, workspaces or project selections in one dataset need different
+  `resource_name`s (see above).
 - Subtasks are folded into the parent task's document (title, completion, assignee, due
   date and notes). They are not documents of their own, comments on subtasks are not
   ingested, and subtasks of subtasks are not read.
-- Only plain-text notes and comments are read; attachments are not.
+- Only plain-text notes and comments are read; attachments are not. Nothing else is cut:
+  every comment and subtask of a task is read.
 - Events can take a few seconds to appear in Asana's feed. A change made moments before a
   sync may be picked up by the following one.
 - A first sync, and a sync more than about a day after the previous one, fetch every task
@@ -213,7 +235,11 @@ Both are covered by the mocked tests.
 uv run pytest tests/ -q
 ```
 
-The tests mock the Asana API (no token, no network). They cover rendering, the cursor and
-its overlap, the events paths (edited comment, renamed and deleted subtask, 412), deletion, pagination and
-retries, the failure paths that must delete nothing, and a real `dlt` merge into a temp
-sqlite destination across two runs.
+The tests mock the Asana API (no token, no network). They cover rendering (also from shuffled
+input), the cursor and its overlap, the events paths (edited comment, renamed and deleted
+subtask, 412), deletion, tasks that fail on their own (kept and retried, or aborting on a
+`401`, a `429` or three failures in a row), bodies of the wrong shape, pagination and retries,
+and the failure paths that must delete nothing. A real `dlt` pipeline into a temp sqlite
+destination checks edits and deletes across runs (the deleted row is gone from the table),
+two sources in one dataset staying apart, a task kept and retried, and `check_active` stopping
+a run with nothing loaded.

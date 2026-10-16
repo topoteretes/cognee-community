@@ -13,10 +13,12 @@ Three layers:
 * ``sync_tasks`` driven with a plain dict as state (ingest, cursor, events,
   deletion, and the failure paths that must not delete anything);
 * a real ``dlt`` pipeline into a temp sqlite destination (edit and delete
-  across two runs), plus the document-source tag core routes on.
+  across two runs, two sources in one dataset, ``check_active``, a task kept
+  for a retry), plus the document-source tag core routes on.
 """
 
 import copy
+import random
 from types import SimpleNamespace
 from uuid import NAMESPACE_OID, uuid5
 
@@ -28,6 +30,8 @@ from cognee_community_connector_asana import asana
 from cognee_community_connector_asana.asana import (
     ASANA_SOURCE_NAME,
     AsanaAPIError,
+    AsanaListingError,
+    AsanaUnavailableError,
     _documents_for,
     _event_task_gids,
     _get,
@@ -346,6 +350,37 @@ def test_render_task_includes_fields_subtasks_and_comments():
         "- Grace: Looks good\n"
         "- Unknown: Shipping"
     )
+
+
+def test_shuffled_lists_render_the_same_text():
+    # The same task with its memberships, custom fields, subtasks and comments
+    # handed over in a different order.
+    task = {
+        "completed": False,
+        "memberships": [
+            {"project": {"name": name}, "section": {"name": "To do"}} for name in "CAB"
+        ],
+        "custom_fields": [
+            {"name": n, "display_value": v} for n, v in zip("ZXY", "123", strict=True)
+        ],
+    }
+    subtasks = [{"gid": str(gid), "name": f"Step {gid}", "completed": False} for gid in (9, 10, 11)]
+    comments = [
+        {"gid": str(100 + i), "text": f"comment {i}", "created_at": day(i + 1)} for i in range(4)
+    ]
+    expected = _render_task(task, comments, subtasks)
+
+    rng = random.Random(7)
+    for _ in range(5):
+        shuffled = {
+            **task,
+            "memberships": rng.sample(task["memberships"], 3),
+            "custom_fields": rng.sample(task["custom_fields"], 3),
+        }
+        assert _render_task(shuffled, rng.sample(comments, 4), rng.sample(subtasks, 3)) == expected
+    # Oldest comment first, subtasks in creation order (gid 9 before 10).
+    assert expected.index("comment 0") < expected.index("comment 3")
+    assert expected.index("Step 9") < expected.index("Step 10")
 
 
 def test_render_task_minimal_and_completed():
@@ -785,19 +820,128 @@ def test_deleted_task_emits_hard_delete_marker(fake):
     assert state["known_ids"] == ["project:P1", "task:1"]
 
 
-def test_task_deleted_between_sweep_and_fetch_is_forgotten(fake):
-    fake.add_task("1", modified_at=day(1))
+@pytest.mark.parametrize("status", [403, 404, 500])
+def test_listed_task_whose_get_fails_is_kept_and_retried(fake, status):
+    # The sweep lists task 1, but its own GET fails: that does not prove it is
+    # gone. Keep the document, retry next run, and let the listing decide.
+    fake.add_task("1", modified_at=day(1), notes="v1")
+    fake.add_task("2", modified_at=day(1))
     state = {}
     run_sync(fake, state)
 
-    # Listed as changed, but gone by the time its detail is fetched.
-    fake.tasks["1"]["modified_at"] = day(4)
-    fake.queue("/tasks/1", _error(404, "task: Unknown object"))
+    fake.tasks["1"].update(notes="v2", modified_at=day(4))
+    # Task 2 moves the cursor to day 9, so task 1 (day 4) falls outside the
+    # next run's overlap window: only state["retry"] can bring it back.
+    fake.tasks["2"]["modified_at"] = day(9)
+    for _ in range(asana._MAX_RETRIES if status == 500 else 1):
+        fake.queue("/tasks/1", _error(status, "nope"))
     rows = run_sync(fake, state)
 
-    assert task_rows(rows) == {}
+    assert set(task_rows(rows)) == {"task:2"}  # the rest of the run happened
+    assert tombstones(rows) == []
+    assert "task:1" in state["known_ids"]
+    assert state["retry"] == ["1"]
+    assert "1" not in state["projects"]["P1"]["seen"]
+
+    # Asana recovered; task 1 is not modified again, the retry brings it back.
+    rows = run_sync(fake, state)
+    assert "v2" in task_rows(rows)["task:1"]["content"]
+    assert state["retry"] == []
+
+
+def test_retry_entry_of_a_task_that_left_the_listing_is_dropped(fake):
+    fake.add_task("1", modified_at=day(1))
+    state = {}
+    run_sync(fake, state)
+    fake.tasks["1"]["modified_at"] = day(4)
+    fake.queue("/tasks/1", _error(403, "Forbidden"))
+    run_sync(fake, state)
+    assert state["retry"] == ["1"]
+
+    del fake.tasks["1"]  # now the listing says it is gone
+    fake.calls.clear()
+    rows = run_sync(fake, state)
+
     assert tombstones(rows) == [{"id": "task:1", "_deleted": True}]
-    assert state["known_ids"] == ["project:P1"]
+    assert state["retry"] == []
+    assert not fake.requested("/tasks/1")
+
+
+def _task_failure(status, gid):
+    return [(f"/tasks/{gid}", _error(status, "nope")) for _ in range(asana._MAX_RETRIES)]
+
+
+@pytest.mark.parametrize("failure", ["401", "rate limit", "three in a row"])
+def test_systemic_task_failure_aborts_with_nothing_committed(fake, failure):
+    for gid in ("1", "2", "3", "4"):
+        fake.add_task(gid, modified_at=day(1))
+    state = {}
+    run_sync(fake, state)
+    before = copy.deepcopy(state)
+    for gid in ("1", "2", "3", "4"):
+        fake.tasks[gid]["modified_at"] = day(4)
+
+    if failure == "401":
+        fake.queue("/tasks/2", _error(401, "Not Authorized"))
+        expected = AsanaAPIError
+    elif failure == "rate limit":
+        for path, response in _task_failure(429, "2"):
+            fake.queue(path, response)
+        expected = AsanaAPIError
+    else:
+        for gid in ("2", "3", "4"):
+            for path, response in _task_failure(500, gid):
+                fake.queue(path, response)
+        expected = AsanaUnavailableError
+
+    with pytest.raises(expected):
+        run_sync(fake, state)
+    assert state == before
+
+
+def test_two_failures_in_a_row_are_kept_and_a_success_resets_the_streak(fake):
+    for gid in ("1", "2", "3", "4", "5"):
+        fake.add_task(gid, modified_at=day(1))
+    state = {}
+    run_sync(fake, state)
+    for gid in ("1", "2", "3", "4", "5"):
+        fake.tasks[gid]["modified_at"] = day(4)
+    for gid in ("1", "2", "4", "5"):  # 3 succeeds in between
+        fake.queue(f"/tasks/{gid}", _error(404, "nope"))
+
+    rows = run_sync(fake, state)
+
+    assert set(task_rows(rows)) == {"task:3"}
+    assert tombstones(rows) == []
+    assert state["retry"] == ["1", "2", "4", "5"]
+
+
+@pytest.mark.parametrize("body", ["empty object", "data missing", "not JSON", "a list"])
+def test_listing_with_a_body_of_the_wrong_shape_raises(fake, body):
+    fake.add_task("1", modified_at=day(1))
+    fake.add_task("2", modified_at=day(1))
+    state = {}
+    run_sync(fake, state)
+    before = copy.deepcopy(state)
+    del fake.tasks["2"]
+
+    response = {
+        "empty object": _Resp(200, {}),
+        "data missing": _Resp(200, {"next_page": None}),
+        "not JSON": _Resp(200, None),
+        "a list": _Resp(200, []),
+    }[body]
+    if body == "not JSON":
+
+        def not_json():
+            raise ValueError("Expecting value")
+
+        response.json = not_json
+    fake.queue("/tasks", response, when=lambda params: params["opt_fields"] == "gid")
+
+    with pytest.raises(AsanaListingError):
+        run_sync(fake, state)
+    assert state == before  # never read as an empty listing, nothing deleted
 
 
 def test_project_removed_from_selection_is_forgotten(fake):
@@ -969,6 +1113,14 @@ def test_asana_source_declares_document_marker_and_pipeline_scope(fake):
     assert pipeline_name_for_source(source, "asana") != "ingest_dlt_source"
 
 
+def test_resource_name_names_the_table_and_scopes_the_state(fake):
+    default = asana_source(session=fake, project_gids=["P1"])
+    work = asana_source(session=fake, project_gids=["P1"], resource_name="asana_work")
+
+    assert work.name == "asana_work"
+    assert pipeline_name_for_source(work, "asana") != pipeline_name_for_source(default, "asana")
+
+
 def test_build_document_data_item_tags_source():
     row = SimpleNamespace(
         row_data={
@@ -1009,27 +1161,48 @@ def test_asana_source_reads_token_from_env(monkeypatch):
 # ---------------------------------------------------------------------------
 # dlt pipeline: a real merge into a temp sqlite destination
 # ---------------------------------------------------------------------------
-def _run_pipeline(tmp_path, session, **source_kwargs):
+def _pipeline(tmp_path, name):
     import dlt
 
     db_path = (tmp_path / "asana.db").as_posix()
-    pipeline = dlt.pipeline(
-        pipeline_name="asana_test",
+    return dlt.pipeline(
+        pipeline_name=name,
         destination=dlt.destinations.sqlalchemy(f"sqlite:///{db_path}"),
         dataset_name="asana_ds",
         pipelines_dir=str(tmp_path / "state"),
     )
-    pipeline.run(asana_source(session=session, **source_kwargs))
+
+
+def _scope_name(**source_kwargs):
+    """The dlt pipeline cognee would use for this source in dataset ``asana_ds``."""
+    source = asana_source(session=FakeAsana(), **{"project_gids": ["P1"], **source_kwargs})
+    return pipeline_name_for_source(source, "asana_ds")
+
+
+def _run_pipeline(tmp_path, session, **source_kwargs):
+    source = asana_source(session=session, **source_kwargs)
+    # One dlt pipeline per source scope, the way cognee names them.
+    pipeline = _pipeline(tmp_path, pipeline_name_for_source(source, "asana_ds"))
+    pipeline.run(source)
     return pipeline
 
 
-def _read_documents(pipeline):
-    """Return {id: content} for the asana_documents table."""
+def _read_documents(pipeline, table="asana_documents"):
+    """Return {id: content} for a documents table."""
     with (
         pipeline.sql_client() as client,
-        client.execute_query("SELECT id, content FROM asana_documents") as cursor,
+        client.execute_query(f"SELECT id, content FROM {table}") as cursor,
     ):
         return {row[0]: row[1] for row in cursor.fetchall()}
+
+
+def _chain(error):
+    """An exception and everything it was raised from (dlt wraps source errors)."""
+    chain = []
+    while error is not None:
+        chain.append(error)
+        error = error.__cause__ or error.__context__
+    return chain
 
 
 def test_pipeline_round_trip_edit_and_delete_across_two_runs(fake, tmp_path):
@@ -1064,6 +1237,144 @@ def test_pipeline_workspace_selection_syncs_every_project(fake, tmp_path):
 
     assert set(documents) == {"task:1", "task:2", "project:P1", "project:P2"}
     assert fake.requested("/projects")[0]["workspace"] == "W1"
+
+
+def test_pipeline_deletion_removes_the_row_from_the_destination(fake, tmp_path):
+    # Goes red if the _deleted marker is not emitted or hard_delete is off:
+    # the row must be gone, not kept emptied or with _deleted set.
+    fake.add_task("1", modified_at=day(1))
+    fake.add_task("2", modified_at=day(1))
+    _run_pipeline(tmp_path, fake, project_gids=["P1"])
+
+    del fake.tasks["2"]
+    pipeline = _run_pipeline(tmp_path, fake, project_gids=["P1"])
+
+    with (
+        pipeline.sql_client() as client,
+        client.execute_query("SELECT COUNT(*) FROM asana_documents WHERE id = 'task:2'") as cursor,
+    ):
+        assert cursor.fetchone()[0] == 0
+    assert "task:1" in _read_documents(pipeline)
+
+
+def test_pipeline_two_sources_in_one_dataset_stay_apart(fake, tmp_path):
+    fake.add_project("P2", name="Blog")
+    fake.add_task("1", modified_at=day(1), projects=("P1",))
+    fake.add_task("2", modified_at=day(1), projects=("P2",))
+    site = {"project_gids": ["P1"], "resource_name": "asana_site"}
+    blog = {"project_gids": ["P2"], "resource_name": "asana_blog"}
+
+    _run_pipeline(tmp_path, fake, **site)
+    _run_pipeline(tmp_path, fake, **blog)
+    site_docs = _read_documents(_run_pipeline(tmp_path, fake, **site), "asana_site")
+    blog_docs = _read_documents(_run_pipeline(tmp_path, fake, **blog), "asana_blog")
+
+    assert set(site_docs) == {"task:1", "project:P1"}
+    assert set(blog_docs) == {"task:2", "project:P2"}
+
+
+def test_check_active_is_asked_before_every_request(fake):
+    fake.add_task("1", modified_at=day(1))
+    checks = []
+    source = asana_source(
+        session=fake, project_gids=["P1"], check_active=lambda: checks.append(len(fake.calls))
+    )
+    assert list(source)
+    # Asked before each request (and around each row), so never behind it.
+    assert sorted(set(checks)) == list(range(len(fake.calls) + 1))
+
+
+@pytest.mark.parametrize("stop_after_requests", [1, 4, 6])
+def test_check_active_raising_stops_with_nothing_deleted_or_loaded(
+    fake, tmp_path, stop_after_requests
+):
+    fake.add_task("1", modified_at=day(1), notes="v1")
+    fake.add_task("2", modified_at=day(1))
+    _run_pipeline(tmp_path, fake, project_gids=["P1"])
+    before = _read_documents(_pipeline(tmp_path, _scope_name()))
+
+    del fake.tasks["2"]
+    fake.tasks["1"].update(notes="v2", modified_at=day(4))
+    fake.calls.clear()
+
+    class AccessRevokedError(Exception):
+        pass
+
+    def check_active():
+        if len(fake.calls) >= stop_after_requests:
+            raise AccessRevokedError
+
+    with pytest.raises(Exception) as excinfo:  # dlt wraps it in PipelineStepFailed
+        _run_pipeline(tmp_path, fake, project_gids=["P1"], check_active=check_active)
+    assert any(isinstance(error, AccessRevokedError) for error in _chain(excinfo.value))
+    assert _read_documents(_pipeline(tmp_path, _scope_name())) == before
+
+    # The state did not move: the next run does the deletion and the edit.
+    documents = _read_documents(_run_pipeline(tmp_path, fake, project_gids=["P1"]))
+    assert set(documents) == {"task:1", "project:P1"}
+    assert "v2" in documents["task:1"]
+
+
+def test_check_active_raising_an_oserror_is_not_retried_or_swallowed(fake, tmp_path, sleeps):
+    # PermissionError is an OSError, like the network errors _get retries and
+    # the render step keeps; a host's check must still stop the sync.
+    fake.add_task("1", modified_at=day(1))
+    _run_pipeline(tmp_path, fake, project_gids=["P1"])
+    before = _read_documents(_pipeline(tmp_path, _scope_name()))
+    fake.tasks["1"].update(notes="v2", modified_at=day(4))
+
+    def check_active():
+        if fake.requested("/tasks/1"):  # the task's own GET has been made
+            raise PermissionError("access revoked")
+
+    with pytest.raises(Exception) as excinfo:  # dlt wraps it in PipelineStepFailed
+        _run_pipeline(tmp_path, fake, project_gids=["P1"], check_active=check_active)
+    chain = _chain(excinfo.value)
+    assert any(isinstance(error, asana.AsanaSyncStoppedError) for error in chain)
+    assert any(isinstance(error, PermissionError) for error in chain)
+    assert sleeps == []  # not retried
+    assert _read_documents(_pipeline(tmp_path, _scope_name())) == before
+
+
+def test_pipeline_task_that_fails_on_its_own_is_kept_and_retried(fake, tmp_path):
+    fake.add_task("1", modified_at=day(1), notes="v1")
+    fake.add_task("2", modified_at=day(1), notes="v1")
+    old = _read_documents(_run_pipeline(tmp_path, fake, project_gids=["P1"]))["task:2"]
+
+    # Task 1 moves the cursor past task 2's overlap window, so only the retry
+    # list can bring task 2 back on the next run.
+    fake.tasks["1"].update(notes="v2", modified_at=day(9))
+    fake.tasks["2"].update(notes="v2", modified_at=day(4))
+    for _ in range(asana._MAX_RETRIES):  # a persistent 500 on task 2's stories
+        fake.queue("/tasks/2/stories", _error(500, "Server Error"))
+    documents = _read_documents(_run_pipeline(tmp_path, fake, project_gids=["P1"]))
+
+    assert "v2" in documents["task:1"]  # the run completed
+    assert documents["task:2"] == old  # kept as it was, not deleted
+
+    fake.calls.clear()
+    documents = _read_documents(_run_pipeline(tmp_path, fake, project_gids=["P1"]))
+    assert fake.requested("/tasks/2") and not fake.requested("/tasks/1")
+    assert "v2" in documents["task:2"]
+
+
+def test_pipeline_abort_mid_render_leaves_destination_and_state_untouched(fake, tmp_path):
+    fake.add_task("1", modified_at=day(1), notes="v1")
+    fake.add_task("2", modified_at=day(1), notes="v1")
+    _run_pipeline(tmp_path, fake, project_gids=["P1"])
+    before = _read_documents(_pipeline(tmp_path, _scope_name()))
+
+    fake.tasks["1"].update(notes="v2", modified_at=day(4))
+    fake.tasks["2"].update(notes="v2", modified_at=day(4))
+    fake.queue("/tasks/2", _error(401, "Not Authorized"))
+    with pytest.raises(Exception):  # noqa: B017 - dlt wraps the source error in PipelineStepFailed
+        _run_pipeline(tmp_path, fake, project_gids=["P1"])
+
+    # Task 1 was yielded before the 401, but nothing of the run was loaded.
+    assert _read_documents(_pipeline(tmp_path, _scope_name())) == before
+
+    documents = _read_documents(_run_pipeline(tmp_path, fake, project_gids=["P1"]))
+    assert "v2" in documents["task:1"] and "v2" in documents["task:2"]
 
 
 def test_pipeline_failure_leaves_destination_and_state_untouched(fake, tmp_path):
