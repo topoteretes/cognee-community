@@ -16,8 +16,9 @@ uv pip install cognee-community-connector-shortcut
 cd packages/connector/shortcut && uv sync --all-extras
 ```
 
-The package pins `cognee==1.6.2`: it needs document-mode routing and the table-scoped
-orphan cleanup that ships in cognee 1.6.x.
+The package needs `cognee>=1.6.2,<2`: document-mode routing, the table-scoped orphan
+cleanup, `PIPELINE_SCOPE_ATTR` and `guarded_rows` all ship in cognee 1.6.2. The tests pass on
+1.6.2 and 1.6.4.
 
 ## Setup
 
@@ -65,13 +66,18 @@ and forgets what was deleted. See `examples/example.py` for the full flow.
 | `epic_ids=[16, 42]` | Only these epics and the stories in them. Iterations are not narrowed by this. |
 | `include_archived=False` | Leave out archived stories and epics. One is forgotten once it is archived. Default `True`: archived stories are kept and marked `Archived: yes`. |
 | `token="..."` | API token. Defaults to the `SHORTCUT_API_TOKEN` environment variable. |
+| `resource_name="shortcut_documents"` | The dlt table name, which also scopes the sync state. See below. |
+| `check_active=None` | Optional callable for a host: asked before every Shortcut request and around every row; raising stops the sync with nothing deleted. |
 
 `group_ids` and `epic_ids` combine with AND: a story must be in one of the teams and in one
 of the epics.
 
-Use **one** `shortcut_source(...)` selection per dataset. The source keeps one set of sync
-state per dataset, so two calls with different selections into the same dataset would each
-forget the other's stories. Narrowing the selection forgets what fell out of it.
+**Several sources in one dataset.** Each `resource_name` has its own table and its own sync
+state, and a sync only ever forgets documents of its own table. Two `shortcut_source(...)`
+calls into one dataset (two workspaces or tokens, or two selections) therefore need two
+names, for example `resource_name="shortcut_web"` and `resource_name="shortcut_mobile"`. With
+the same name, each run would forget the other's stories. Within one source, narrowing the
+selection forgets what fell out of it.
 
 ### What a document looks like
 
@@ -96,7 +102,8 @@ Comments:
 
 An epic document is its state, deadline and description; an iteration document is its
 status, dates and description. Timestamps and counters are kept out of the text on purpose:
-an unchanged story keeps its content hash and is not re-cognified.
+an unchanged story keeps its content hash and is not re-cognified. Owners and labels are
+sorted by name and comments by id, so the same story always renders the same text.
 
 ## How incremental sync works
 
@@ -158,11 +165,26 @@ with the `_deleted` hard-delete marker, dlt removes those rows on `merge`, and c
 `orphan_cleanup` removes them from the graph and vector stores.
 
 All listings and lookups are completed before the first row is emitted, and state is saved
-only after the last one. If any request fails (after retries), the run aborts: nothing is
-deleted and the cursor does not move, so the next run starts from the same point.
+only after the last one. If a listing or lookup fails (after retries), or `check_active`
+raises, the run aborts: nothing is deleted and the cursor does not move, so the next run
+starts from the same point. A listing that answers with something other than a JSON list
+also aborts the run, in every window of a split too; it is never read as an empty window.
+
+Only the listings decide that a story or iteration is gone. One that is still listed but
+whose own `GET` fails (`403`, `404` or an error that outlasts the retries) keeps its previous
+document, is logged with the endpoint and status, and is fetched again on the next run; the
+rest of the run goes on. Epics and labels come from their listings and have no request of
+their own. Failures that would hit every item the same way still abort with nothing saved: a
+`401`, a `429` that outlasts the retries, and three items failing in a row.
 
 ## Limits
 
+- Anyone who can read the cognee dataset can read what was ingested, including stories of
+  every team the token can see. Give a dataset only to people who may read all of it.
+- Two workspaces, tokens or selections in one dataset need different `resource_name`s (see
+  above).
+- Nothing is cut: every comment of a story is read. The story listing is checked for
+  completeness by splitting any window of 2,500 stories or more (see "Large workspaces").
 - Story tasks (checklists), attachments, linked files and story relationships are not
   ingested. Comments are rendered flat, in order, without their reply threading.
 - A renamed member updates the stories they own. A comment keeps its author's old name
@@ -223,6 +245,10 @@ uv run pytest tests/ -q
 The tests mock the Shortcut API (no token, no network). They cover rendering, the header
 fingerprint, the date-window splitting, the cursor and its overlap, one-second timestamps,
 renames and deletions of epics, iterations, labels, states and owners, iterations fetched
-only on change, story deletion, retries, the failure paths that must delete nothing (during
-a listing and in the middle of rendering), and a real `dlt` merge into a temp sqlite
-destination across three runs.
+only on change, story deletion, stories and iterations that fail on their own (kept and
+retried, or aborting on a `401`, a `429` or three failures in a row), listings of the wrong
+shape (also on the split path), retries, and the failure paths that must delete nothing. A
+real `dlt` pipeline into a temp sqlite destination checks edits, renames and deletes across
+runs (the deleted row is gone from the table), two sources in one dataset staying apart, a
+story kept and retried, an abort in the middle of rendering, and `check_active` stopping a
+run with nothing loaded. Rendering is also checked from shuffled input.

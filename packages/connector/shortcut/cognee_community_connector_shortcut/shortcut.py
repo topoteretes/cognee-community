@@ -46,6 +46,10 @@ Design
 * **Safety**: every listing is finished before the first row is yielded, and
   state is written only after the last one. A listing that fails therefore
   deletes nothing and moves no cursor; the next run starts from the same point.
+  A story or iteration that fails on its own keeps its document and is retried
+  next run; a ``401``, an exhausted rate limit or several failures in a row abort.
+* **Several sources in one dataset**: ``resource_name`` names the dlt table and
+  the sync state. Give each token or selection its own name.
 """
 
 from __future__ import annotations
@@ -53,7 +57,7 @@ from __future__ import annotations
 import hashlib
 import os
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from typing import Any
@@ -64,7 +68,7 @@ from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
 
 logger = get_logger("shortcut_connector")
 
-# dlt resource / staging-table name, and the document-source tag for its rows.
+# Default dlt resource / staging-table name, and the document-source tag for its rows.
 SHORTCUT_TABLE_NAME = "shortcut_documents"
 SHORTCUT_SOURCE_NAME = "shortcut"
 
@@ -72,9 +76,16 @@ _API_BASE = "https://api.app.shortcut.com/api/v3"
 # The story listing is one unpaginated response; 2,609 stories took up to 14 seconds.
 _TIMEOUT_SECONDS = 120
 
-# Retry budget for rate-limited / transient responses.
+# Retry budget for rate-limited / transient responses: five attempts with
+# 1, 2, 4, 8 s back-off between them, or exactly Shortcut's Retry-After on a 429.
 _MAX_RETRIES = 5
+# 429 is Shortcut's rate limit (200 requests a minute, per its docs); the 5xx
+# answers are the usual temporary ones.
 _TRANSIENT_STATUSES = (429, 500, 502, 503, 504)
+# Abort when this many stories or iterations in a row fail on their own. One
+# bad item is kept and retried next run, but a streak means Shortcut itself is
+# failing, and every further item would spend five retries for nothing.
+_MAX_FAILURES_IN_A_ROW = 3
 
 # A story listing with this many results or more is treated as possibly
 # truncated and split. Listings up to 2,609 stories were verified complete.
@@ -86,9 +97,13 @@ _SECOND = timedelta(seconds=1)
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _CLOCK_MARGIN = timedelta(days=1)
 # How far before the cursor the updated_at listing starts (see sync_stories).
+# The overlap only has to catch a story stamped at or just before the cursor
+# that the previous listing could not see yet; a minute is a wide margin.
 _CURSOR_OVERLAP = timedelta(seconds=60)
 # How long after a story's updated_at second a fetch must happen before that
-# copy counts as final for the timestamp (see _is_settled).
+# copy counts as final for the timestamp (see _is_settled): the one second of
+# timestamp resolution, plus one for any clock difference between Shortcut's
+# servers.
 _SETTLE_MARGIN = timedelta(seconds=2)
 
 
@@ -101,7 +116,20 @@ class ShortcutAPIError(RuntimeError):
 
 
 class ShortcutListingError(RuntimeError):
-    """A story listing that succeeded but cannot be shown to be complete."""
+    """A listing that succeeded but cannot be shown to be complete, or has the wrong shape."""
+
+
+class ShortcutUnavailableError(RuntimeError):
+    """Too many items in a row failed: Shortcut is failing, not one item."""
+
+
+class ShortcutSyncStoppedError(RuntimeError):
+    """The host's ``check_active`` raised an ``OSError``; the sync must stop.
+
+    Network errors are ``OSError`` too and are retried, or kept per item, so an
+    ``OSError`` from the host's check is re-raised as this type, which nothing
+    in the connector catches. Other exceptions from the check pass unchanged.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -162,10 +190,36 @@ def _send(
 
 
 def _request(
-    session: Any, method: str, path: str, *, params: dict | None = None, body: dict | None = None
+    session: Any,
+    method: str,
+    path: str,
+    shape: type,
+    *,
+    params: dict | None = None,
+    body: dict | None = None,
 ) -> Any:
-    """Call a Shortcut API path (see ``_send``) and return the decoded JSON body."""
-    return _send(session, method, path, params=params, body=body).json()
+    """Call a Shortcut API path (see ``_send``) and return its JSON ``list`` or ``dict``."""
+    return _json(_send(session, method, path, params=params, body=body), shape)
+
+
+def _json(response: Any, shape: type) -> Any:
+    """The JSON body of a success, which must be a ``list`` or a ``dict`` as expected.
+
+    Anything else (not JSON, or the wrong shape) raises: an empty or odd body
+    must never be read as an empty listing, which would look like deletions.
+    """
+    try:
+        body = response.json()
+    except ValueError as exc:
+        raise ShortcutListingError(
+            f"Shortcut answered {response.status_code} without JSON"
+        ) from exc
+    if not isinstance(body, shape):
+        raise ShortcutListingError(
+            f"Shortcut answered {response.status_code} with a {type(body).__name__} "
+            f"where a {shape.__name__} was expected"
+        )
+    return body
 
 
 def _retry_delay(headers: Any, attempt: int) -> float:
@@ -182,11 +236,6 @@ def _error_message(response: Any) -> str:
         return response.json()["message"]
     except (ValueError, KeyError, TypeError):
         return str(getattr(response, "text", ""))[:200]
-
-
-def _is_gone(exc: Exception) -> bool:
-    """True when a single item is deleted or no longer visible to the token."""
-    return isinstance(exc, ShortcutAPIError) and exc.status in (403, 404)
 
 
 # ---------------------------------------------------------------------------
@@ -256,7 +305,7 @@ def _query_stories(
     kept once.
     """
     query = {**filters, f"{field}_start": _stamp(start), f"{field}_end": _stamp(end)}
-    stories = _request(session, "POST", "/stories/search", body=query)
+    stories = _request(session, "POST", "/stories/search", list, body=query)
     if len(stories) < _WINDOW_CAP:
         return stories
     if end - start <= _SECOND:
@@ -318,7 +367,7 @@ def _scope_filters(
 # ---------------------------------------------------------------------------
 def _state_names(session: Any) -> dict[Any, str]:
     """Map every workflow state id to its name, across all workflows."""
-    workflows = _request(session, "GET", "/workflows")
+    workflows = _request(session, "GET", "/workflows", list)
     return {
         state["id"]: state.get("name") or ""
         for workflow in workflows
@@ -328,7 +377,7 @@ def _state_names(session: Any) -> dict[Any, str]:
 
 def _member_names(session: Any) -> dict[Any, str]:
     """Map every member id to the member's display name."""
-    members = _request(session, "GET", "/members")
+    members = _request(session, "GET", "/members", list)
     return {member["id"]: (member.get("profile") or {}).get("name") or "" for member in members}
 
 
@@ -410,14 +459,20 @@ def _render_story(story: dict, names: dict[str, dict]) -> str:
 
     The text is deterministic for unchanged input and carries no timestamps or
     counters, so an unchanged story keeps its content hash and is not
-    re-cognified. The story name is not repeated here; it is the row's title.
+    re-cognified. Owners and labels are sorted by name and comments by id, so
+    the same story renders the same text whatever order its parts are listed
+    in. The story name is not repeated here; it is the row's title.
     """
     sections = ["\n".join(_header_lines(story, names))]
     description = (story.get("description") or "").strip()
     if description:
         sections.append(description)
     # A deleted comment stays in the list with ``deleted: true`` and no text.
-    comments = [comment for comment in story.get("comments") or [] if not comment.get("deleted")]
+    # Comments come oldest first by id, whatever order they are listed in.
+    comments = sorted(
+        (comment for comment in story.get("comments") or [] if not comment.get("deleted")),
+        key=lambda comment: comment.get("id") or 0,
+    )
     if comments:
         lines = [_comment_line(comment, names["member"]) for comment in comments]
         sections.append("Comments:\n" + "\n".join(lines))
@@ -480,20 +535,52 @@ def _deleted_row(row_id: str) -> dict[str, Any]:
     return {"id": row_id, "_deleted": True}
 
 
-def _fetch(session: Any, path: str) -> tuple[dict, datetime | None] | None:
+def _fetch(session: Any, path: str) -> tuple[dict, datetime | None]:
     """GET one story or iteration in full, with Shortcut's clock at that moment.
 
-    Returns ``None`` when it is gone (deleted between the listing and this
-    fetch) so the caller can let it be forgotten. Other errors propagate.
+    Errors propagate. The item was in this run's listing, so a ``403`` or
+    ``404`` here does not prove it is gone (it may be a permission or a passing
+    glitch); the caller keeps it and asks again next run, and the listing
+    decides deletions.
     """
-    try:
-        response = _send(session, "GET", path)
-        return response.json(), _server_time(response)
-    except ShortcutAPIError as exc:
-        if _is_gone(exc):
-            logger.warning("Shortcut: %s is gone, skipping: %s", path, exc)
-            return None
-        raise
+    response = _send(session, "GET", path)
+    return _json(response, dict), _server_time(response)
+
+
+class _ItemFailures:
+    """The stories and iterations of one run that failed on their own, kept for a retry.
+
+    Only per-item failures are kept: a :class:`ShortcutAPIError`, a
+    :class:`ShortcutListingError` or an ``OSError`` that outlasted the
+    retries. A ``401`` or a ``429`` that outlasted them would fail every later
+    item the same way, so it is re-raised, and so is the
+    ``_MAX_FAILURES_IN_A_ROW``-th failure in a row. Anything else
+    (``check_active``'s errors among them) is never caught in the first place.
+    """
+
+    def __init__(self) -> None:
+        self.in_a_row = 0
+        self.kept = 0
+
+    def keep(self, exc: Exception, endpoint: str) -> None:
+        """Count a per-item failure and log it, or raise if it is systemic."""
+        if isinstance(exc, ShortcutAPIError) and exc.status in (401, 429):
+            raise exc
+        self.in_a_row += 1
+        if self.in_a_row >= _MAX_FAILURES_IN_A_ROW:
+            raise ShortcutUnavailableError(
+                f"{self.in_a_row} items in a row failed, the last on {endpoint}; stopping"
+            ) from exc
+        what = f"HTTP {exc.status}" if isinstance(exc, ShortcutAPIError) else type(exc).__name__
+        logger.warning("Shortcut: kept %s for a retry next run (%s).", endpoint, what)
+        self.kept += 1
+
+    def succeeded(self) -> None:
+        self.in_a_row = 0
+
+
+# What a per-item request can fail with once the retries are spent.
+_ITEM_ERRORS = (ShortcutAPIError, ShortcutListingError, OSError)
 
 
 # ---------------------------------------------------------------------------
@@ -522,7 +609,8 @@ def sync_stories(
        in-scope story (the sweep), and list the stories updated since the
        cursor. Any error here propagates before a single row is yielded.
     2. *Render.* Fetch and yield each changed story once, then each epic and
-       each new or changed iteration.
+       each new or changed iteration. One that fails on its own keeps its old
+       document and is retried next run.
     3. *Delete.* Yield a hard-delete marker for every known id that is no
        longer current.
     4. *Commit.* Only now write the new id set, cursor, fingerprints and marks.
@@ -535,8 +623,8 @@ def sync_stories(
     end = (now or datetime.now(UTC)).replace(microsecond=0) + _CLOCK_MARGIN
 
     # --- 1. List ------------------------------------------------------------
-    all_epics = _request(session, "GET", "/epics", params={"includes_description": "true"})
-    all_iterations = _request(session, "GET", "/iterations")
+    all_epics = _request(session, "GET", "/epics", list, params={"includes_description": "true"})
+    all_iterations = _request(session, "GET", "/iterations", list)
     # Names come from the whole workspace: an in-scope story may sit in an epic
     # or iteration that is not itself selected for ingestion.
     names = {
@@ -588,15 +676,23 @@ def sync_stories(
 
     # --- 2. Render ----------------------------------------------------------
     current_ids = {_story_id(story_id) for story_id in swept}
+    failures = _ItemFailures()
     rendered = 0
     for story_id in sorted(changed):
-        fetched = _fetch(session, f"/stories/{story_id}")
-        if fetched is None:
-            # Deleted after the sweep saw it: let the deletion step forget it.
-            current_ids.discard(_story_id(story_id))
-            del current_prints[str(story_id)]
+        endpoint = f"/stories/{story_id}"
+        try:
+            story, fetched_at = _fetch(session, endpoint)
+        except _ITEM_ERRORS as exc:
+            failures.keep(exc, endpoint)
+            # No row, so the old document stays; its id is in current_ids, so
+            # it is not deleted. A fingerprint of "" matches nothing, so the
+            # next run renders it again, and it is not settled either. A story
+            # that was never emitted gets its first document then; until that,
+            # its id in known_ids is harmless (a hard delete of a row that does
+            # not exist is a no-op).
+            current_prints[str(story_id)] = ""
             continue
-        story, fetched_at = fetched
+        failures.succeeded()
         # Skip this story next run only if no later edit can share the
         # timestamp it was listed with (see _is_settled).
         if _is_settled(stamps.get(story_id, ""), fetched_at):
@@ -621,11 +717,16 @@ def sync_stories(
             current_ids.add(_iteration_id(item["id"]))
             current_marks[key] = mark
             continue
-        fetched = _fetch(session, f"/iterations/{item['id']}")
-        if fetched is None:
-            continue
-        iteration, fetched_at = fetched
+        # Listed, so current either way; without a mark it is fetched again
+        # next run if this fetch fails.
         current_ids.add(_iteration_id(item["id"]))
+        endpoint = f"/iterations/{item['id']}"
+        try:
+            iteration, fetched_at = _fetch(session, endpoint)
+        except _ITEM_ERRORS as exc:
+            failures.keep(exc, endpoint)
+            continue
+        failures.succeeded()
         # Same one-second rule as for stories: remember it only once final.
         if _is_settled(item.get("updated_at") or "", fetched_at):
             current_marks[key] = mark
@@ -650,11 +751,13 @@ def sync_stories(
         if story_id in settled and when >= window_start
     }
     logger.info(
-        "Shortcut: %d story(ies) rendered, %d epic(s), %d iteration(s), %d deletion(s).",
+        "Shortcut: %d story(ies) rendered, %d epic(s), %d iteration(s), %d deletion(s); "
+        "kept %d item(s) for retry.",
         rendered,
         len(epics),
         len(iterations),
         len(deleted),
+        failures.kept,
     )
 
 
@@ -667,6 +770,9 @@ def shortcut_source(
     epic_ids: list[int] | None = None,
     include_archived: bool = True,
     session: Any = None,
+    *,
+    resource_name: str = SHORTCUT_TABLE_NAME,
+    check_active: Callable[[], None] | None = None,
 ):
     """Return a ``dlt`` resource that yields Shortcut documents for ``remember``.
 
@@ -679,12 +785,19 @@ def shortcut_source(
             out, and one is forgotten once it is archived.
         session: Pre-built ``requests`` session. Mainly an injection point for
             tests; when omitted one is built from the token.
+        resource_name: Stable dlt resource (table) name, which also scopes the
+            sync state. Give each token or selection its own name when several
+            sync into one dataset; sharing a name would make each run forget
+            the other's documents.
+        check_active: Optional host authorization checkpoint. It is called
+            before every Shortcut request and around every yielded row, and
+            stops the sync by raising; nothing is deleted and no state moves.
 
     With no selection the whole workspace is ingested. ``group_ids`` and
     ``epic_ids`` combine with AND.
 
     Returns:
-        A ``dlt`` resource (``shortcut_documents``) configured with
+        A ``dlt`` resource (``resource_name``) configured with
         ``primary_key="id"``, ``write_disposition="merge"`` and an ``_deleted``
         hard-delete column. Hand it to ``cognee.remember(...)``.
     """
@@ -712,7 +825,7 @@ def shortcut_source(
         raise ValueError("Shortcut API token required: pass token= or set SHORTCUT_API_TOKEN.")
 
     @dlt.resource(
-        name=SHORTCUT_TABLE_NAME,
+        name=resource_name,
         primary_key="id",
         write_disposition="merge",
         # _deleted is a boolean hard-delete marker: rows where it is True are
@@ -721,12 +834,20 @@ def shortcut_source(
         columns={"_deleted": {"data_type": "bool", "hard_delete": True}},
     )
     def shortcut_documents():
-        yield from sync_stories(
-            session or _make_session(resolved_token),
-            dlt.current.resource_state(),
-            group_ids=group_ids,
-            epic_ids=epic_ids,
-            include_archived=include_archived,
+        client = session or _make_session(resolved_token)
+        check = _stop_on(check_active) if check_active is not None else None
+        if check is not None:
+            # The listing phase makes several requests before the first row.
+            client = _GuardedSession(client, check)
+        yield from dlt_utils.guarded_rows(
+            sync_stories(
+                client,
+                dlt.current.resource_state(),
+                group_ids=group_ids,
+                epic_ids=epic_ids,
+                include_archived=include_archived,
+            ),
+            check,
         )
 
     resource = shortcut_documents()
@@ -735,5 +856,29 @@ def shortcut_source(
     setattr(resource, DOCUMENT_SOURCE_ATTR, SHORTCUT_SOURCE_NAME)
     # Give the incremental state its own dlt pipeline per dataset, so syncing
     # other dlt sources (or another dataset) cannot disturb the cursor.
-    setattr(resource, dlt_utils.PIPELINE_SCOPE_ATTR, SHORTCUT_TABLE_NAME)
+    setattr(resource, dlt_utils.PIPELINE_SCOPE_ATTR, resource_name)
     return resource
+
+
+def _stop_on(check_active: Callable[[], None]) -> Callable[[], None]:
+    """``check_active``, turning an ``OSError`` it raises into ``ShortcutSyncStoppedError``."""
+
+    def check() -> None:
+        try:
+            check_active()
+        except OSError as exc:
+            raise ShortcutSyncStoppedError(f"check_active stopped the sync: {exc!r}") from exc
+
+    return check
+
+
+class _GuardedSession:
+    """A session that asks the host's ``check_active`` before every request."""
+
+    def __init__(self, session: Any, check_active: Callable[[], None]):
+        self._session = session
+        self._check_active = check_active
+
+    def request(self, *args: Any, **kwargs: Any) -> Any:
+        self._check_active()
+        return self._session.request(*args, **kwargs)

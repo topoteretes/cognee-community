@@ -5,9 +5,10 @@ description = "Shortcut data-source connector for cognee: sync stories, comments
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
 dependencies = [
-    # Needs document-mode routing (DOCUMENT_SOURCE_ATTR) plus the table-scoped
-    # orphan cleanup marked by DOCUMENT_SYNC_VERSION, which ships in cognee 1.6.x.
-    "cognee==1.6.2",
+    # Needs document-mode routing (DOCUMENT_SOURCE_ATTR), the table-scoped
+    # orphan cleanup marked by DOCUMENT_SYNC_VERSION, PIPELINE_SCOPE_ATTR and
+    # guarded_rows, all in cognee 1.6.2 and later 1.x releases.
+    "cognee>=1.6.2,<2",
     "dlt[sqlalchemy]>=1.9.0,<2",
     "requests>=2.31.0,<3",
 ]
