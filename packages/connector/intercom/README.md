@@ -18,10 +18,9 @@ the deterministic dlt-row path.
 ## Requirements
 
 Pins cognee 1.6.2. Document mode (`DOCUMENT_SOURCE_ATTR`) arrived in 1.4.0, and 1.6.x
-adds `PIPELINE_SCOPE_ATTR`, which this source sets so its sync state (conversation
-cursor and known ids) is kept per workspace region and cognee dataset. On 1.4.0 every
-dlt source shares one pipeline state, so syncing a second dataset on the same machine
-resets the cursor and the deletion sweep. Sync one workspace per cognee dataset.
+adds `PIPELINE_SCOPE_ATTR`, which this source sets so its sync state lives in its own
+dlt pipeline per cognee dataset (as cognee's built-in Gmail and Google Drive connectors
+do) instead of the shared `ingest_dlt_source` pipeline.
 
 ## Install
 
