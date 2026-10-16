@@ -12,8 +12,7 @@ async def main():
     os.environ["SGAI_API_KEY"] = os.getenv("SGAI_API_KEY", "YOUR_SGAI_API_KEY")
 
     urls = [
-        "https://cognee.ai",
-        "https://docs.cognee.ai",
+        "https://example.com",
     ]
 
     # --- Example 1: scrape only ---
