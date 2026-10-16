@@ -1,0 +1,44 @@
+# cognee web UI: upstream cognee-frontend (Next.js), published by cognee as
+# cognee/cognee-ui, pointed at the cognee API from ../docker-compose.yml.
+#
+# Stateless. The browser calls the API directly (login cookie, uploads, search),
+# and the UI's own server calls it too for the graph and schema views, so
+# COGNEE_BACKEND_URL must be the API address as the BROWSER sees it, i.e. the
+# reverse proxy's public URL, never a container name or 127.0.0.1. Keep its
+# version equal to COGNEE_VERSION in ../.env (same upstream release).
+#
+#   cp .env.example .env        # set COGNEE_BACKEND_URL
+#   docker compose up -d        # UI -> 127.0.0.1:3000
+
+name: cognee-ui
+
+services:
+  ui:
+    image: cognee/cognee-ui:${COGNEE_UI_VERSION:-1.6.1}
+    restart: unless-stopped
+    environment:
+      # Validated at start: the container exits with the reason in its logs if
+      # this is not an absolute http(s) URL.
+      COGNEE_BACKEND_URL: ${COGNEE_BACKEND_URL:?missing in .env}
+      # DEFAULT_USER_PASSWORD / DEFAULT_USER_EMAIL are deliberately NOT passed:
+      # with them set, the UI server logs in as that user on behalf of any
+      # browser that arrives without a session (see .env.example).
+    ports:
+      - "${UI_BIND_ADDRESS:-127.0.0.1}:${UI_PORT:-3000}:3000"
+    extra_hosts:
+      # Lets COGNEE_BACKEND_URL resolve to this host when the proxy runs here
+      # and the public hostname points at it.
+      - "host.docker.internal:host-gateway"
+    # Health check comes from the image: GET /api/runtime-config, which also
+    # proves COGNEE_BACKEND_URL resolved.
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+        compress: "true"
+    deploy:
+      resources:
+        limits:
+          cpus: ${UI_CPUS:-1.0}
+          memory: ${UI_MEMORY:-1g}

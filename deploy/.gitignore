@@ -1,0 +1,8 @@
+.env
+arcadedb/.env
+arcadedb/data/
+arcadedb/root_password
+embeddings/.env
+embeddings/data/
+postgres-ssl/.env
+postgres-ssl/data/

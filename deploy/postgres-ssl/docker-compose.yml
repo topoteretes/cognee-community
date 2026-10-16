@@ -1,0 +1,69 @@
+# Standalone PostgreSQL 17 for cognee, on the Railway postgres-ssl image
+# (self-signed TLS, pgvector, pgbackrest, in-place major upgrades).
+#
+# Run this stack first, then start the cognee stack against it:
+#   docker compose up -d                               # here
+#   # in deploy/.env:  DB_HOST=host.docker.internal  DB_PORT=5405
+#   docker compose up -d --build                       # in deploy/
+#
+# postgresql.conf / pg_hba.conf live next to this file. postgresql.conf must
+# `include` the image-generated $PGDATA/postgresql.conf first (that is where
+# the wrapper writes ssl=on and the cert paths) and set listen_addresses='*',
+# because the custom `command` below replaces the image's CMD that did it.
+# pg_hba.conf must carry the remote rule itself (the wrapper only appends
+# `host all all all scram-sha-256` to $PGDATA/pg_hba.conf, which is unused
+# once hba_file is overridden); use `hostssl` there to enforce TLS.
+
+services:
+  postgres:
+    image: kolosek/postgres-ssl:17.11
+    restart: always
+    # The wrapper runs under tini and stops postgres with SIGINT (fast
+    # shutdown); give the checkpoint time before the runtime escalates.
+    stop_grace_period: 60s
+    shm_size: 256m
+    environment:
+      POSTGRES_DB: ${DB_NAME:-cognee_db}
+      POSTGRES_USER: ${DB_USERNAME:-cognee}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
+      # Railway layout: the cluster in a SUB-directory of the volume. The
+      # wrapper requires PGDATA under /var/lib/postgresql/data, and only this
+      # layout can take the image's in-place 17->18 upgrade job (a cluster at
+      # the volume root has no sibling slot for the new data dir).
+      # Only for a fresh ./data: pointing an existing root-layout cluster
+      # here would initdb a new, empty cluster beside it.
+      PGDATA: /var/lib/postgresql/data/pgdata
+      SSL_CERT_DAYS: 3650
+    command:
+      - "postgres"
+      - "-c"
+      - "config_file=/etc/postgresql/postgresql.conf"
+      - "-c"
+      - "hba_file=/etc/postgresql/pg_hba.conf"
+    volumes:
+      - ./data:/var/lib/postgresql/data
+      - ./postgresql.conf:/etc/postgresql/postgresql.conf:ro
+      - ./pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+    ports:
+      # Published on all interfaces because the point of this image is TLS
+      # for remote clients. If only the cognee container on this host needs
+      # it, bind to the Docker bridge gateway instead, e.g. "172.17.0.1:5405:5432"
+      # (`docker network inspect bridge`); that is what host.docker.internal
+      # resolves to inside containers. Do NOT bind 127.0.0.1: containers
+      # cannot reach the host's loopback.
+      - "5405:5432"
+    ulimits:
+      nproc: 65535
+      nofile: 262144
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "3"
+        compress: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s

@@ -1,0 +1,81 @@
+# cognee API - INGEST node (add, cognify, remember, memify, update). Same image
+# and .env as the query node (docker-compose.yml); own system prefix in the
+# bucket, own port and limits. Route the ingestion paths here, everything else
+# to the query node.
+#
+#   docker compose -f docker-compose.ingest.yml up -d
+
+name: cognee-ingest
+
+services:
+  cognee:
+    # Published image (Dockerfile here = cognee/cognee + the ArcadeDB adapter).
+    # To build locally instead, add -f docker-compose.build.yml (see README).
+    image: ${COGNEE_IMAGE:-kolosek/cognee-arcadedb}:${COGNEE_VERSION:-1.6.1}
+    restart: unless-stopped
+    # Must exceed cognee's background-task drain so a cognify is not SIGKILLed mid-write.
+    stop_grace_period: 60s
+    # Wait for Postgres, ArcadeDB and the S3 endpoint before cognee's own
+    # entrypoint runs migrations. The databases are separate compose stacks, so
+    # depends_on cannot order them, and after a host reboot Docker starts every
+    # container at once. Runs on every (re)start; see wait_for_backends.py.
+    entrypoint: ["/bin/bash", "-c", "python /wait_for_backends.py && exec /app/entrypoint.sh"]
+    env_file:
+      - .env
+    environment:
+      DB_HOST: ${DB_HOST:?missing in .env}
+      DB_PASSWORD: ${DB_PASSWORD:?missing in .env}
+      GRAPH_DATABASE_PASSWORD: ${GRAPH_DATABASE_PASSWORD:?missing in .env}
+      FASTAPI_USERS_JWT_SECRET: ${FASTAPI_USERS_JWT_SECRET:?missing in .env}
+      FASTAPI_USERS_VERIFICATION_TOKEN_SECRET: ${FASTAPI_USERS_VERIFICATION_TOKEN_SECRET:?missing in .env}
+      FASTAPI_USERS_RESET_PASSWORD_TOKEN_SECRET: ${FASTAPI_USERS_RESET_PASSWORD_TOKEN_SECRET:?missing in .env}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:?missing in .env}
+      # Storage: S3-compatible bucket, shared by both nodes (STORAGE_BUCKET_NAME,
+      # AWS_* in .env). All paths derive from the bucket name; only the system
+      # directory differs per node.
+      STORAGE_BACKEND: s3
+      STORAGE_BUCKET_NAME: ${STORAGE_BUCKET_NAME:?missing in .env}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:?missing in .env}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:?missing in .env}
+      DATA_ROOT_DIRECTORY: s3://${STORAGE_BUCKET_NAME}/data
+      SYSTEM_ROOT_DIRECTORY: s3://${STORAGE_BUCKET_NAME}/system/ingest
+      # Node-specific (wins over .env): how many datasets are cognified at once.
+      DATASET_QUEUE_MAX_CONCURRENT: ${INGEST_DATASET_QUEUE_MAX_CONCURRENT:-4}
+    volumes:
+      # Local embedding model cache (EMBEDDING_PROVIDER=fastembed): downloaded
+      # once per node instead of on every container recreate. Unused otherwise.
+      - fastembed_cache:/tmp/fastembed_cache
+      # Long form so a missing file fails `up` instead of being auto-created
+      # as an empty directory (copy wait_for_backends.py along with this file).
+      - type: bind
+        source: ./wait_for_backends.py
+        target: /wait_for_backends.py
+        read_only: true
+        bind:
+          create_host_path: false
+      # - /srv/cognee-ingest:/data:ro   # host files the API may ingest by path
+    ports:
+      - "${COGNEE_BIND_ADDRESS:-127.0.0.1}:${INGEST_PORT:-8001}:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      # Covers the backend wait plus migrations after a reboot.
+      start_period: 180s
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "3"
+        compress: "true"
+    deploy:
+      resources:
+        limits:
+          cpus: ${INGEST_CPUS:-4.0}
+          memory: ${INGEST_MEMORY:-8g}
+
+volumes:
+  fastembed_cache:

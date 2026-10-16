@@ -1,0 +1,18 @@
+# Build override: layer on docker-compose.yml or docker-compose.ingest.yml to
+# build the cognee image from this checkout instead of pulling it.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml build && \
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml push
+#
+# The adapter pins an exact cognee version in its pyproject.toml; keep
+# COGNEE_VERSION in step with it.
+
+services:
+  cognee:
+    build:
+      context: ..                      # repo root; root .dockerignore whitelists the adapter
+      dockerfile: deploy/Dockerfile
+      args:
+        COGNEE_VERSION: ${COGNEE_VERSION:-1.6.1}
+        ADAPTER_SOURCE: ${ADAPTER_SOURCE:-/tmp/adapter-src}

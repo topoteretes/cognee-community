@@ -1,0 +1,8 @@
+# Build context for deploy/Dockerfile is the repo root; only ship what the image needs.
+*
+!deploy/sitecustomize.py
+!packages/hybrid/arcadedb/pyproject.toml
+!packages/hybrid/arcadedb/README.md
+!packages/hybrid/arcadedb/cognee_community_hybrid_adapter_arcadedb/
+**/__pycache__
+**/*.pyc

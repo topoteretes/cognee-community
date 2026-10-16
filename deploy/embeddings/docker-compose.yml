@@ -1,0 +1,35 @@
+# Optional local embedding server (text-embeddings-inference, CPU, no GPU),
+# shared by the query and ingest nodes. Published on the Docker bridge gateway
+# like the databases; cognee reaches it as http://host.docker.internal:8080/v1
+# (see the EMBEDDING_* block in deploy/.env.example).
+#
+#   cp .env.example .env
+#   docker compose up -d        # model weights download once into ./data
+
+name: embeddings
+
+services:
+  embeddings:
+    image: ghcr.io/huggingface/text-embeddings-inference:${TEI_VERSION:-cpu-1.9}
+    restart: unless-stopped
+    command:
+      - "--model-id"
+      - "${TEI_MODEL:-intfloat/multilingual-e5-base}"
+      - "--auto-truncate"
+      - "--max-client-batch-size"
+      - "256"
+    volumes:
+      - ${DATA_DIR:-./data}:/data
+    ports:
+      - "${TEI_BIND_ADDRESS:-172.17.0.1}:${TEI_PORT:-8080}:80"
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "3"
+        compress: "true"
+    deploy:
+      resources:
+        limits:
+          cpus: ${TEI_CPUS:-4.0}
+          memory: ${TEI_MEMORY:-3g}

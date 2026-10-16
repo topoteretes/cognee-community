@@ -1,0 +1,104 @@
+# ArcadeDB: graph + vector store for cognee. One ArcadeDB database per cognee
+# dataset is created here by the cognee API (root credentials, server-level op).
+#
+# Runs on its own so cognee can be rebuilt/restarted/torn down without touching
+# the database. Published on the host like postgres-ssl/, on the Docker bridge
+# gateway by default so only containers on this host can reach it:
+# http://host.docker.internal:2480 (HTTP) and bolt://host.docker.internal:7687.
+# The cognee adapter always uses ports 2480/7687, so keep them.
+#
+#   cp .env.example .env
+#   (umask 077 && openssl rand -base64 24 > root_password)   # root password, no quotes
+#   docker compose up -d
+#
+# No sudo/chown needed: the data/ tree is created by Docker on first start and
+# the `init` service fixes ownership and stages the password for uid 1000.
+
+name: arcadedb
+
+services:
+  # Runs once before arcadedb, as root, on every `docker compose up`:
+  #  - gives the bind-mounted directories to uid 1000. Docker creates missing
+  #    bind-mount sources as root:root, which makes ArcadeDB fail with
+  #    AccessDeniedException on ./log and ./databases;
+  #  - copies the root password file into the `secrets` volume owned by uid 1000,
+  #    mode 400, so the host file can stay owned by whoever ran `openssl`.
+  init:
+    image: arcadedata/arcadedb:${ARCADEDB_VERSION:-26.10.1}
+    user: "0:0"
+    entrypoint: ["sh", "-ec"]
+    command:
+      - |
+        chown -R 1000:1000 /home/arcadedb/databases /home/arcadedb/backups /home/arcadedb/log /home/arcadedb/certs
+        install -o 1000 -g 1000 -m 400 /run/secrets/arcadedb_root_password /staged-secrets/arcadedb_root_password
+    secrets:
+      - arcadedb_root_password
+    volumes:
+      - ${DATA_DIR:-./data}/databases:/home/arcadedb/databases
+      - ${DATA_DIR:-./data}/backups:/home/arcadedb/backups
+      - ${DATA_DIR:-./data}/log:/home/arcadedb/log
+      - ${DATA_DIR:-./data}/certs:/home/arcadedb/certs
+      - secrets:/staged-secrets
+
+  arcadedb:
+    image: arcadedata/arcadedb:${ARCADEDB_VERSION:-26.10.1}
+    restart: unless-stopped
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    hostname: arcadedb
+    stop_grace_period: 60s
+    environment:
+      # The root password is read from the file staged by `init`, so it is neither
+      # on the JVM command line nor in `docker inspect`. ARCADEDB_TLS_SETTINGS
+      # is empty unless enabled in .env.
+      ARCADEDB_SETTINGS: >-
+        -Darcadedb.server.rootPasswordPath=/run/secrets/arcadedb_root_password
+        -Darcadedb.server.mode=production
+        -Darcadedb.server.plugins=Bolt:com.arcadedb.bolt.BoltProtocolPlugin
+        -Darcadedb.profile=${ARCADEDB_PROFILE:-default}
+        -Darcadedb.studio.enabled=${ARCADEDB_STUDIO_ENABLED:-true}
+        ${ARCADEDB_TLS_SETTINGS:-}
+    volumes:
+      - secrets:/run/secrets:ro
+      - ${DATA_DIR:-./data}/databases:/home/arcadedb/databases
+      - ${DATA_DIR:-./data}/backups:/home/arcadedb/backups
+      - ${DATA_DIR:-./data}/log:/home/arcadedb/log
+      # TLS material (keystore.p12); only read when ARCADEDB_TLS_SETTINGS is set.
+      - ${DATA_DIR:-./data}/certs:/home/arcadedb/certs:ro
+    ports:
+      # 172.17.0.1 = docker0 gateway, what host.docker.internal resolves to in
+      # containers. 0.0.0.0 to serve other hosts; 127.0.0.1 is NOT reachable
+      # from containers. Studio is on the HTTP port. 2490 (HTTPS) only answers
+      # when TLS is enabled; the cognee adapter never uses it (see .env.example).
+      - "${ARCADEDB_BIND_ADDRESS:-172.17.0.1}:2480:2480"
+      - "${ARCADEDB_BIND_ADDRESS:-172.17.0.1}:2490:2490"
+      - "${ARCADEDB_BIND_ADDRESS:-172.17.0.1}:7687:7687"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:2480/api/v1/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "3"
+        compress: "true"
+    deploy:
+      resources:
+        limits:
+          cpus: ${ARCADEDB_CPUS:-4.0}
+          memory: ${ARCADEDB_MEMORY:-4g}
+
+volumes:
+  # Root password staged by `init` for uid 1000; recreated on every `up`.
+  secrets:
+
+secrets:
+  # Plain file holding only the root password (a trailing newline is ignored).
+  # `docker compose up` refuses to start when the file is missing. Read by the
+  # root-running `init` service, so any owner/mode (600 recommended) works.
+  arcadedb_root_password:
+    file: ${ARCADEDB_ROOT_PASSWORD_FILE:-./root_password}
