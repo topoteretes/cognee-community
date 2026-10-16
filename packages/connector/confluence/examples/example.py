@@ -38,7 +38,6 @@ import asyncio
 import os
 
 import cognee
-
 from cognee_community_connector_confluence import confluence_source
 
 # Keep the wiki in its own dataset so it is easy to inspect and forget.
