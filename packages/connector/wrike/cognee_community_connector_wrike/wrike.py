@@ -53,7 +53,7 @@ from typing import Any
 
 import httpx
 from cognee.shared.logging_utils import get_logger
-from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
+from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR, PIPELINE_SCOPE_ATTR
 
 logger = get_logger("wrike_connector")
 
@@ -63,8 +63,8 @@ TABLE_NAME = "wrike_items"
 SOURCE_TAG = "wrike"
 # Wrike allows pageSize 1..1000 on list endpoints (1001 is rejected).
 PAGE_SIZE = 1000
-# /folders/{ids} accepts at most 100 ids per call.
-_FOLDER_BATCH = 100
+# /folders/{ids} and /tasks/{ids} accept at most 100 ids per call.
+_FOLDER_BATCH = _TASK_BATCH = 100
 # How far each incremental run reaches back before the cursor, for clock drift
 # between this machine and Wrike. Re-reading a task is harmless under merge.
 _CURSOR_OVERLAP = timedelta(minutes=5)
@@ -332,7 +332,7 @@ class _FolderTree:
     def __init__(self, folders: list[dict]):
         live = {f["id"]: f for f in folders if f.get("scope") in ("WsRoot", "WsFolder")}
         self.root_id = next(fid for fid, f in live.items() if f["scope"] == "WsRoot")
-        self.recycle_bin_id = next(f["id"] for f in folders if f.get("scope") == "RbRoot")
+        self.recycle_bin_id = next((f["id"] for f in folders if f.get("scope") == "RbRoot"), None)
         self.folders = live
         # ponytail: a folder shared into two parents gets one path, the first seen.
         self.parent: dict[str, str] = {}
@@ -369,10 +369,36 @@ def _custom_field_lines(values: list[dict], names: _Names) -> list[str]:
     for item in values or []:
         field = names.fields.get(item.get("id"))
         value = str(item.get("value") or "").strip()
-        if not field or not value:
+        kind = (field or {}).get("type")
+        if not field or not value or kind == "LinkToDatabase":
+            # LinkToDatabase holds Wrike database record ids ('["RE10306931"]'),
+            # and API v4 cannot resolve them to names: leave them out rather
+            # than put opaque ids into memory.
             continue
-        if field.get("type") == "Currency":
+        if kind in ("Currency", "CalculatedNumeric"):
+            # A formula field formatted as money carries the currency too.
             value = f"{value} {field.get('settings', {}).get('currency', '')}".strip()
+        elif kind == "CalculatedDate":
+            value = value[:10]  # '2026-10-22T17:00:00Z'; Wrike shows the date
+        elif kind == "Contacts":
+            # Stored as comma-separated contact ids (tested): show names instead.
+            value = ", ".join(sorted(names.person(i) for i in value.split(",") if i))
+        elif kind == "Text":
+            value = html_to_text(value)  # rich text: Wrike's UI renders the HTML
+        elif kind == "Percentage":
+            value = f"{value}%"  # "25" is shown as 25% (checked in Wrike's UI)
+        elif kind == "Duration":
+            value = f"{value}h"  # "150" is shown as 150h: hours, not minutes
+        elif kind == "Checkbox":
+            value = "Yes" if value.lower() == "true" else "No"
+        elif kind == "Multiple":
+            # Stored as a JSON list in a string (tested), e.g. '["api", "docs"]'.
+            try:
+                items = json.loads(value)
+            except ValueError:
+                items = None
+            if isinstance(items, list):
+                value = ", ".join(str(item) for item in items)
         rendered.append((field.get("title") or field["id"], value))
     return _lines(sorted(rendered))
 
@@ -469,19 +495,23 @@ def _iter_rows(
     ``state`` is dlt's per-resource state (a plain dict in tests):
 
     * ``cursor``: the time captured *before* the previous run started listing;
-    * ``roots``: the folders that run synced;
+    * ``roots`` / ``scope``: the folders that run synced, as configured and
+      with everything below them;
     * ``seen``: the row ids currently ingested. Delete rows are only sent for
       these, so a change elsewhere in the account never produces one.
 
     State is only written after the last row is yielded. A run that fails part
     way is rolled back by dlt, so the next run starts from the old state.
 
-    **Full run** (the first run, a changed ``folder_ids``, or ``full_resync``):
-    list everything in scope, and delete every seen id that was not listed. This
-    also catches what an incremental run cannot see: a Recycle Bin emptied before
-    the sync, a folder the token lost access to, or a task that left scope
-    because a second folder it sat in was deleted (that does not bump the task's
-    ``updatedDate``).
+    **Full run** (the first run, ``full_resync``, or a changed set of folders in
+    scope: new ``folder_ids``, or a folder moved in, moved out or deleted. Moving
+    a folder does not bump its tasks' ``updatedDate``, so only a full listing sees
+    them arrive or leave):
+    list everything in scope, and delete every seen id that was not listed. The
+    folder-scope rule covers a task that leaves scope with its folder (moved, or
+    deleted while the task sits in a second folder) and a folder the token lost
+    access to. ``full_resync`` covers what nothing else can see: a task removed
+    from the Recycle Bin before the sync, or a single task the token lost.
 
     **Incremental run**: ask Wrike only for what changed since ``cursor`` (minus
     a small overlap for clock drift; merge makes a re-read harmless), and delete
@@ -503,7 +533,10 @@ def _iter_rows(
     seen = set(state.get("seen", []))
 
     incremental = (
-        not full_resync and state.get("cursor") is not None and state.get("roots") == roots
+        not full_resync
+        and state.get("cursor") is not None
+        and state.get("roots") == roots
+        and state.get("scope") == sorted(scope)
     )
     since: dict[str, Any] = {}
     candidates: set[str] = set()  # ids that may have been removed (incremental only)
@@ -518,10 +551,15 @@ def _iter_rows(
         # a task edited between the two calls then shows up in scope rather
         # than being mistaken for one that moved out.
         candidates |= {f"task:{t['id']}" for t in client.get("/tasks", pageSize=PAGE_SIZE, **since)}
-        candidates |= {
-            f"task:{t['id']}"
-            for t in client.get(f"/folders/{tree.recycle_bin_id}/tasks", **_task_query(**since))
-        }
+        if tree.recycle_bin_id:
+            deleted_tasks = client.get(
+                f"/folders/{tree.recycle_bin_id}/tasks",
+                descendants=True,
+                subTasks=True,
+                pageSize=PAGE_SIZE,
+                **since,
+            )
+            candidates |= {f"task:{t['id']}" for t in deleted_tasks}
 
     yielded: set[str] = set()
     for start in range(0, len(folders_to_render), _FOLDER_BATCH):
@@ -536,6 +574,12 @@ def _iter_rows(
         for task in client.get(f"/folders/{root}/tasks", **_task_query(**since)):
             tasks.setdefault(task["id"], task)
     task_titles = {tid: task.get("title", "") for tid, task in tasks.items()}
+    # An incremental run may re-render a subtask whose parent did not change;
+    # fetch those parents' titles so the document stays the same as a full run's.
+    missing = sorted({p for t in tasks.values() for p in t.get("superTaskIds", [])} - tasks.keys())
+    for start in range(0, len(missing), _TASK_BATCH):
+        for parent in client.get(f"/tasks/{','.join(missing[start : start + _TASK_BATCH])}"):
+            task_titles[parent["id"]] = parent.get("title", "")
     for task in tasks.values():
         comments = client.get(f"/tasks/{task['id']}/comments")
         row = render_task(task, comments, tree, names, task_titles)
@@ -549,6 +593,7 @@ def _iter_rows(
 
     state["cursor"] = _stamp(started)
     state["roots"] = roots
+    state["scope"] = sorted(scope)
     state["seen"] = sorted((seen | yielded) - deleted)
     logger.info(
         "Wrike: %s sync, %d folder(s), %d task(s), %d deletion(s).",
@@ -637,4 +682,8 @@ def wrike_source(
     resource = wrike_items()
     # Opt into cognee's document path: each row is prose for normal cognify.
     setattr(resource, DOCUMENT_SOURCE_ATTR, SOURCE_TAG)
+    # Give each cognee dataset its own dlt pipeline, so its cursor and seen ids
+    # are its own. Without this every dlt source shares one pipeline, and two
+    # Wrike syncs into different datasets would overwrite each other's state.
+    setattr(resource, PIPELINE_SCOPE_ATTR, SOURCE_TAG)
     return resource

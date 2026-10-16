@@ -1,7 +1,11 @@
 """Scope, rendering and the dlt resource, driven by a fake Wrike client (no network)."""
 
 import pytest
-from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
+from cognee.tasks.ingestion.dlt_utils import (
+    DOCUMENT_SOURCE_ATTR,
+    PIPELINE_SCOPE_ATTR,
+    pipeline_name_for_source,
+)
 
 from cognee_community_connector_wrike.wrike import (
     _iter_rows,
@@ -45,6 +49,18 @@ DB_TASK = {
         {"id": "CF_BUDGET", "value": "2000"},
         {"id": "CF_DELETED", "value": "x"},
         {"id": "CF_PRIORITY_EMPTY", "value": ""},
+        # Raw values as Wrike returns them: contact ids, and a JSON list string.
+        {"id": "CF_REVIEWER", "value": "U2,U1"},
+        {"id": "CF_TAGS", "value": '["api", "docs"]'},
+        {"id": "CF_NOTE", "value": "Ship <b>v2</b> &amp; docs"},
+        {"id": "CF_DONE", "value": "25"},
+        {"id": "CF_EST", "value": "150"},
+        {"id": "CF_OK", "value": "true"},
+        {"id": "CF_SHIP", "value": "2026-10-31"},
+        {"id": "CF_DOUBLE", "value": "4000.0"},
+        {"id": "CF_RATIO", "value": "0.5"},
+        {"id": "CF_END", "value": "2026-10-22T17:00:00Z"},
+        {"id": "CF_CLIENT", "value": '["RE10306931"]'},
     ],
     "description": 'Schema for <a href="/u">@Ana Lee</a>:<br />users<ul><li>orders</li></ul>',
     "permalink": "https://w/t_db",
@@ -103,6 +119,22 @@ class FakeWrike:
             return [
                 {"id": "CF_PRIORITY", "title": "Priority", "type": "DropDown"},
                 {"id": "CF_PRIORITY_EMPTY", "title": "Impact", "type": "DropDown"},
+                {"id": "CF_REVIEWER", "title": "Reviewer", "type": "Contacts"},
+                {"id": "CF_TAGS", "title": "Tags", "type": "Multiple"},
+                {"id": "CF_NOTE", "title": "Note", "type": "Text"},
+                {"id": "CF_DONE", "title": "Done", "type": "Percentage"},
+                {"id": "CF_EST", "title": "Estimate", "type": "Duration"},
+                {"id": "CF_OK", "title": "Approved", "type": "Checkbox"},
+                {"id": "CF_SHIP", "title": "Ship date", "type": "Date"},
+                {
+                    "id": "CF_DOUBLE",
+                    "title": "Double budget",
+                    "type": "CalculatedNumeric",
+                    "settings": {"currency": "USD"},
+                },
+                {"id": "CF_RATIO", "title": "Ratio", "type": "CalculatedNumeric"},
+                {"id": "CF_END", "title": "Ends", "type": "CalculatedDate"},
+                {"id": "CF_CLIENT", "title": "Client", "type": "LinkToDatabase"},
                 {
                     "id": "CF_BUDGET",
                     "title": "Budget",
@@ -132,8 +164,18 @@ def test_task_document_uses_names_not_ids():
         "Importance: High\n"
         "Start: 2026-10-12\n"
         "Due: 2026-10-15\n"
+        "Approved: Yes\n"
         "Budget: 2000 USD\n"
+        "Done: 25%\n"
+        "Double budget: 4000.0 USD\n"
+        "Ends: 2026-10-22\n"
+        "Estimate: 150h\n"
+        "Note: Ship v2 & docs\n"
         "Priority: High\n"
+        "Ratio: 0.5\n"
+        "Reviewer: Ana Lee, Bo\n"
+        "Ship date: 2026-10-31\n"
+        "Tags: api, docs\n"
         "\n"
         "Schema for @Ana Lee:\n"
         "users\n"
@@ -219,6 +261,9 @@ def test_html_to_text():
 def test_source_is_a_merge_document_resource():
     resource = wrike_source(client=FakeWrike())
     assert getattr(resource, DOCUMENT_SOURCE_ATTR) == "wrike"
+    assert getattr(resource, PIPELINE_SCOPE_ATTR) == "wrike"
+    # One dlt pipeline (so one cursor and seen set) per cognee dataset.
+    assert pipeline_name_for_source(resource, "a") != pipeline_name_for_source(resource, "b")
     assert resource.write_disposition == "merge"
     assert resource.columns["_deleted"]["hard_delete"] is True
     assert {row["id"] for row in resource} == set(rows_by_id())
