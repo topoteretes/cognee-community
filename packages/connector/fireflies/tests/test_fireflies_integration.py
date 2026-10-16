@@ -1,7 +1,7 @@
 """Real dlt + SQLite + Cognee graph/vector integration, with external APIs mocked.
 
-The LLM fixture verifies the extraction input and returns a deterministic graph.
-This proves document routing and persistence/cleanup, not a live LLM's accuracy.
+The LLM fixture deliberately returns no entities or relationships. Speakers
+must still be stored, searchable, updated and forgotten by the connector.
 """
 
 import sys
@@ -10,6 +10,7 @@ import cognee
 import pytest
 import pytest_asyncio
 from cognee.infrastructure.databases.graph import get_graph_engine
+from cognee.infrastructure.databases.vector import get_vector_engine_async
 from cognee.infrastructure.databases.vector.embeddings.LiteLLMEmbeddingEngine import (
     LiteLLMEmbeddingEngine,
 )
@@ -67,6 +68,11 @@ async def environment(tmp_path_factory, monkeypatch):
     cognee.config.data_root_directory(str(tmp_path / "d"))
     cognee.config.system_root_directory(str(tmp_path / "s"))
     cognee.config.set_relational_db_config({"db_provider": "sqlite"})
+    from cognee.tasks.ingestion.get_dlt_destination import get_dlt_destination
+
+    # The destination cache is keyed by dataset name, not storage root. Each
+    # isolated test uses a different root with the same dataset name.
+    get_dlt_destination.cache_clear()
     inputs = []
     original_pipeline = dlt.pipeline
 
@@ -84,7 +90,7 @@ async def environment(tmp_path_factory, monkeypatch):
         monkeypatch.setattr(proxy, "install_json_extension", lambda *_args: None)
 
     async def structured(text_input=None, system_prompt=None, response_model=str, **kwargs):
-        from cognee.shared.data_models import Edge, KnowledgeGraph, Node, SummarizedContent
+        from cognee.shared.data_models import KnowledgeGraph, SummarizedContent
 
         if response_model is str:
             return "A mocked answer."
@@ -92,30 +98,12 @@ async def environment(tmp_path_factory, monkeypatch):
             return SummarizedContent(summary="Meeting summary", description="Meeting summary")
         if response_model == KnowledgeGraph:
             inputs.append(text_input)
-            nodes, edges = [], []
-            for name, meeting in (("AliceBlue", "a"), ("BobGreen", "b")):
+            for name in ("AliceBlue", "BobGreen"):
                 if name not in (text_input or ""):
                     continue
-                assert f"{name} (speaker_id: 1) said:" in text_input
-                nodes.extend(
-                    [
-                        Node(id=name, name=name, type="Person", description=f"{name} is a speaker"),
-                        Node(
-                            id=f"meeting-{meeting}",
-                            name=f"Meeting {meeting}",
-                            type="Meeting",
-                            description=f"Meeting with {name}",
-                        ),
-                    ]
-                )
-                edges.append(
-                    Edge(
-                        source_node_id=name,
-                        target_node_id=f"meeting-{meeting}",
-                        relationship_name="spoke_in",
-                    )
-                )
-            return KnowledgeGraph(nodes=nodes, edges=edges)
+                if "## Transcript" in text_input:
+                    assert f"{name} (speaker_id: 1) said:" in text_input
+            return KnowledgeGraph(nodes=[], edges=[])
         return response_model()
 
     async def embed(self, texts):
@@ -149,6 +137,39 @@ async def source_records():
     ]
 
 
+async def speaker_entities():
+    nodes, _ = await (await get_graph_engine()).get_graph_data()
+    return {node_id: node for node_id, node in nodes if node.get("type") == "Entity"}
+
+
+async def assert_speaker_links():
+    graph = await get_graph_engine()
+    nodes, edges = await graph.get_graph_data()
+    person_ids = {
+        i for i, n in nodes if n.get("type") == "EntityType" and n.get("name") == "Person"
+    }
+    documents = {
+        str(item.id): item.external_metadata["external_id"] for item in await source_records()
+    }
+    for entity_id in await speaker_entities():
+        links = [
+            (target, props)
+            for source, target, rel, props in edges
+            if source == entity_id and rel == "spoke_in"
+        ]
+        assert len(links) == 1
+        target, props = links[0]
+        assert props["fireflies_transcript_id"] == documents[target]
+        assert any(
+            source == entity_id and target in person_ids and rel == "is_a"
+            for source, target, rel, _ in edges
+        )
+
+
+async def speaker_vectors(ids):
+    return await (await get_vector_engine_async()).retrieve("Entity_name", list(ids))
+
+
 @pytest.mark.asyncio
 async def test_speakers_search_updates_and_forget_including_last_meeting(environment):
     client = MeetingClient()
@@ -156,13 +177,21 @@ async def test_speakers_search_updates_and_forget_including_last_meeting(environ
     nodes, edges = await graph_text()
     assert "AliceBlue" in nodes and "BobGreen" in nodes
     assert "spoke_in" in edges
+    assert {node["name"] for node in (await speaker_entities()).values()} == {
+        "AliceBlue",
+        "BobGreen",
+    }
     assert len(await source_records()) == 2
     first_ids = {item.id for item in await source_records()}
     first_extractions = len(environment)
+    first_speakers = set(await speaker_entities())
+    await assert_speaker_links()
+    assert len(await speaker_vectors(first_speakers)) == 2
 
     await sync_fireflies(fireflies_source(client=client), dataset_name=DATASET)
     assert {item.id for item in await source_records()} == first_ids
     assert len(environment) == first_extractions
+    assert set(await speaker_entities()) == first_speakers
 
     original_listing = client.list_transcripts
 
@@ -196,13 +225,84 @@ async def test_speakers_search_updates_and_forget_including_last_meeting(environ
     nodes, _ = await graph_text()
     assert "AliceBlue" in nodes and "BobGreen" not in nodes
     assert len(await source_records()) == 1
+    remaining_speakers = set(await speaker_entities())
+    assert await speaker_vectors(first_speakers - remaining_speakers) == []
+    assert len(await speaker_vectors(remaining_speakers)) == 1
 
     client.meetings.clear()
     await sync_fireflies(fireflies_source(client=client), dataset_name=DATASET)
     nodes, _ = await graph_text()
     assert "AliceBlue" not in nodes and "BobGreen" not in nodes
     assert await source_records() == []
+    assert await speaker_vectors(first_speakers) == []
     results = await cognee.search(
         query_text="sapphire", query_type=cognee.SearchType.CHUNKS, datasets=[DATASET]
     )
     assert "sapphire" not in str(results)
+
+
+@pytest.mark.asyncio
+async def test_speaker_only_scope_rename_and_selection(environment, monkeypatch):
+    client = MeetingClient()
+    client.meetings = {"a": ("Speaker 1", "one"), "b": ("Speaker 1", "two")}
+    options = {"include_transcript": False, "include_summary": False, "include_action_items": False}
+    await sync_fireflies(fireflies_source(client=client, **options), dataset_name=DATASET)
+    entities = await speaker_entities()
+    assert {node["name"] for node in entities.values()} == {
+        "Speaker 1 in meeting a",
+        "Speaker 1 in meeting b",
+    }
+    first_ids = set(entities)
+    await assert_speaker_links()
+    extractions = len(environment)
+
+    async def unexpected_embedding(*_args, **_kwargs):
+        raise AssertionError("Unchanged speaker sync must not repeat embeddings")
+
+    with monkeypatch.context() as unchanged:
+        unchanged.setattr(LiteLLMEmbeddingEngine, "embed_text", unexpected_embedding)
+        await sync_fireflies(fireflies_source(client=client, **options), dataset_name=DATASET)
+    assert len(environment) == extractions
+    assert set(await speaker_entities()) == first_ids
+
+    client.meetings["a"] = ("AliceActual", "one")
+    await sync_fireflies(fireflies_source(client=client, **options), dataset_name=DATASET)
+    entities = await speaker_entities()
+    assert set(entities) == first_ids
+    assert {node["name"] for node in entities.values()} == {"AliceActual", "Speaker 1 in meeting b"}
+
+    # Switching off speakers replaces documents and removes old speaker artifacts.
+    await sync_fireflies(
+        fireflies_source(client=client, include_speakers=False), dataset_name=DATASET
+    )
+    assert await speaker_entities() == {}
+
+
+@pytest.mark.asyncio
+async def test_failed_speaker_write_retries_without_repeating_llm(environment, monkeypatch):
+    import cognee.tasks.storage as storage
+
+    client = MeetingClient()
+    original = storage.add_data_points
+
+    async def partial_failure(*args, **kwargs):
+        await original(*args, **kwargs)
+        raise RuntimeError("speaker vector write failed")
+
+    with monkeypatch.context() as failure:
+        failure.setattr(storage, "add_data_points", partial_failure)
+        with pytest.raises(RuntimeError, match="speaker vector write failed"):
+            await sync_fireflies(fireflies_source(client=client), dataset_name=DATASET)
+    assert all(
+        "fireflies_speaker_sync" not in item.external_metadata for item in await source_records()
+    )
+    extractions = len(environment)
+    await sync_fireflies(fireflies_source(client=client), dataset_name=DATASET)
+    assert len(environment) == extractions
+    assert {node["name"] for node in (await speaker_entities()).values()} == {
+        "AliceBlue",
+        "BobGreen",
+    }
+    assert all(
+        item.external_metadata.get("fireflies_speaker_sync") for item in await source_records()
+    )

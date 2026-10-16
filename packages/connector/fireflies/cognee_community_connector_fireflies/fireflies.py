@@ -32,6 +32,7 @@ logger = get_logger("fireflies_connector")
 FIREFLIES_API_URL = "https://api.fireflies.ai/graphql"
 FIREFLIES_TABLE_NAME = "fireflies_transcripts"
 FIREFLIES_SOURCE_NAME = "fireflies"
+_SPEAKER_RECORDS_ATTR = "_cognee_fireflies_speaker_records"
 _MAX_PAGE_SIZE = 50
 _MAX_ATTEMPTS = 5
 
@@ -213,6 +214,8 @@ def sync_transcripts(
     client: Any,
     state: dict[str, Any],
     config: _FirefliesConfig | None = None,
+    *,
+    speaker_records: dict[str, list[dict[str, str]]] | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Yield new/changed transcripts and tombstones, then advance state.
 
@@ -227,6 +230,7 @@ def sync_transcripts(
     previous_hashes = state.get("content_hashes", {})
     current_hashes: dict[str, str] = {}
     current_ids: set[str] = set()
+    current_speakers: dict[str, list[dict[str, str]]] = {}
     changed = 0
 
     for metadata in _iter_transcript_metadata(client, config.page_size):
@@ -238,6 +242,9 @@ def sync_transcripts(
         if str(detail.get("id")) != transcript_id:
             raise RuntimeError("Fireflies transcript detail did not match the requested id.")
         merged = {**metadata, **detail, "id": transcript_id}
+        current_speakers[transcript_id] = (
+            _collect_speakers(merged) if config.include_speakers else []
+        )
         row = _transcript_to_row(merged, config)
         fingerprint = hashlib.sha256(
             json.dumps(row, sort_keys=True, ensure_ascii=False).encode("utf-8")
@@ -261,6 +268,12 @@ def sync_transcripts(
     state["known_ids"] = sorted(current_ids)
     state["last_date"] = newest_date
     state["content_hashes"] = current_hashes
+    if speaker_records is not None:
+        # Publish the full selected speaker snapshot only after extraction
+        # succeeds. Unchanged meetings are included so existing graphs can be
+        # repaired without re-ingesting documents or repeating API requests.
+        speaker_records.clear()
+        speaker_records.update(current_speakers)
     logger.info(
         "Fireflies: synced %d new/changed transcript(s), %d deletion(s).",
         changed,
@@ -316,28 +329,41 @@ def _transcript_to_row(transcript: dict[str, Any], config: _FirefliesConfig) -> 
     }
 
 
+def _collect_speakers(transcript: dict[str, Any]) -> list[dict[str, str]]:
+    """Keep speaker identities separate from prose and scope them to a meeting."""
+    speakers: dict[str, dict[str, str]] = {}
+    entries = [
+        (speaker.get("id"), speaker.get("name"))
+        for speaker in transcript.get("speakers") or []
+        if isinstance(speaker, dict)
+    ]
+    entries.extend(
+        (sentence.get("speaker_id"), sentence.get("speaker_name"))
+        for sentence in transcript.get("sentences") or []
+        if isinstance(sentence, dict)
+    )
+    for raw_id, raw_name in entries:
+        speaker_id, name = _as_text(raw_id), _as_text(raw_name)
+        identity = f"id:{speaker_id}" if speaker_id else f"name:{name}"
+        if identity not in speakers or (not speakers[identity]["raw_name"] and name):
+            speakers[identity] = {
+                "key": identity,
+                "speaker_id": speaker_id,
+                "raw_name": name,
+                "name": _speaker_label(name, speaker_id, str(transcript["id"])),
+            }
+    return [
+        {key: value for key, value in speaker.items() if key != "raw_name"}
+        for speaker in speakers.values()
+    ]
+
+
 def _render_speakers(transcript: dict[str, Any]) -> str:
-    speakers: dict[str, str] = {}
-    for speaker in transcript.get("speakers") or []:
-        if not isinstance(speaker, dict):
-            continue
-        speaker_id = _as_text(speaker.get("id"))
-        name = _speaker_label(speaker.get("name"), speaker_id, str(transcript["id"]))
-        speakers[speaker_id or name] = name
-
-    # Some responses omit the top-level speaker list; preserve attribution from
-    # sentences instead of silently dropping the people involved.
-    for sentence in transcript.get("sentences") or []:
-        if not isinstance(sentence, dict):
-            continue
-        speaker_id = _as_text(sentence.get("speaker_id"))
-        name = _speaker_label(sentence.get("speaker_name"), speaker_id, str(transcript["id"]))
-        speakers.setdefault(speaker_id or name, name)
-
     lines = []
-    for speaker_id, name in speakers.items():
-        suffix = f" (Fireflies speaker ID: {speaker_id})" if speaker_id != name else ""
-        lines.append(f"- Speaker: {name}{suffix}")
+    for speaker in _collect_speakers(transcript):
+        speaker_id = speaker["speaker_id"]
+        suffix = f" (Fireflies speaker ID: {speaker_id})" if speaker_id else ""
+        lines.append(f"- Speaker: {speaker['name']}{suffix}")
     return "\n".join(lines)
 
 
@@ -480,6 +506,7 @@ def fireflies_source(
         include_speakers=include_speakers,
         page_size=page_size,
     )
+    speaker_records: dict[str, list[dict[str, str]]] = {}
 
     @dlt.resource(
         name=FIREFLIES_TABLE_NAME,
@@ -488,8 +515,11 @@ def fireflies_source(
         columns={"_deleted": {"data_type": "bool", "hard_delete": True}},
     )
     def fireflies_transcripts():
-        yield from sync_transcripts(client, dlt.current.resource_state(), config)
+        yield from sync_transcripts(
+            client, dlt.current.resource_state(), config, speaker_records=speaker_records
+        )
 
     # Route each row through the normal document -> cognify extraction path.
     setattr(fireflies_transcripts, DOCUMENT_SOURCE_ATTR, FIREFLIES_SOURCE_NAME)
+    setattr(fireflies_transcripts, _SPEAKER_RECORDS_ATTR, speaker_records)
     return fireflies_transcripts

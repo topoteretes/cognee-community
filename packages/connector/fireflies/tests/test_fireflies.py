@@ -5,9 +5,11 @@ from copy import deepcopy
 import pytest
 
 from cognee_community_connector_fireflies.fireflies import (
+    _SPEAKER_RECORDS_ATTR,
     DOCUMENT_SOURCE_ATTR,
     FirefliesClient,
     _build_transcript_query,
+    _collect_speakers,
     _FirefliesConfig,
     _iter_transcript_metadata,
     _transcript_to_row,
@@ -234,6 +236,7 @@ def test_real_dlt_merge_removes_a_deleted_transcript(tmp_path, monkeypatch):
     # Keep dlt's global working directory inside the test sandbox. On Windows,
     # expanduser() consults USERPROFILE before dlt creates its run context.
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setenv("LOAD__WORKERS", "1")
     db_path = (tmp_path / "fireflies.db").as_posix()
     pipeline = dlt.pipeline(
         pipeline_name="test_fireflies_delete",
@@ -251,7 +254,9 @@ def test_real_dlt_merge_removes_a_deleted_transcript(tmp_path, monkeypatch):
 
     # The same pipeline restores dlt resource state. Transcript b disappears
     # from the successful sweep, so the connector emits its hard-delete row.
-    pipeline.run(fireflies_source(client=FakeFirefliesClient([_metadata("a", 1000)])))
+    source = fireflies_source(client=FakeFirefliesClient([_metadata("a", 1000)]))
+    pipeline.run(source)
+    assert set(getattr(source, _SPEAKER_RECORDS_ATTR)) == {"a"}
     with pipeline.sql_client() as sql_client:
         rows = sql_client.execute_sql("SELECT id FROM fireflies_transcripts ORDER BY id")
     assert [row[0] for row in rows] == ["a"]
@@ -259,6 +264,41 @@ def test_real_dlt_merge_removes_a_deleted_transcript(tmp_path, monkeypatch):
     pipeline.run(fireflies_source(client=FakeFirefliesClient([])))
     with pipeline.sql_client() as sql_client:
         assert sql_client.execute_sql("SELECT id FROM fireflies_transcripts") == []
+
+
+def test_structured_speakers_use_sentence_names_and_preserve_zero_id():
+    transcript = _detail("a")
+    transcript["speakers"] = [{"id": 0, "name": None}]
+    transcript["sentences"][0].update(speaker_id=0, speaker_name="Alice")
+    transcript["sentences"].append(dict(transcript["sentences"][0]))
+    assert _collect_speakers(transcript) == [{"key": "id:0", "speaker_id": "0", "name": "Alice"}]
+    transcript["speakers"] = []
+    assert _collect_speakers(transcript)[0]["name"] == "Alice"
+
+
+def test_speaker_snapshot_includes_unchanged_meetings_and_obeys_selection():
+    client = FakeFirefliesClient([_metadata("a", 1000)])
+    state, snapshot = {}, {}
+    list(sync_transcripts(client, state, speaker_records=snapshot))
+    expected = deepcopy(snapshot)
+    snapshot.clear()
+    assert list(sync_transcripts(client, state, speaker_records=snapshot)) == []
+    assert snapshot == expected
+    list(
+        sync_transcripts(
+            client, state, _FirefliesConfig(include_speakers=False), speaker_records=snapshot
+        )
+    )
+    assert snapshot == {"a": []}
+
+
+def test_failed_sweep_does_not_publish_partial_speaker_snapshot():
+    client = FakeFirefliesClient([_metadata("a", 1000), _metadata("b", 1000)])
+    client.details.pop("b")
+    snapshot = {"previous": []}
+    with pytest.raises(KeyError):
+        list(sync_transcripts(client, {}, speaker_records=snapshot))
+    assert snapshot == {"previous": []}
 
 
 def test_source_validates_selection_page_size_and_credentials(monkeypatch):

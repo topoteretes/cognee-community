@@ -2,7 +2,8 @@
 
 from typing import Any
 
-from .fireflies import FIREFLIES_SOURCE_NAME
+from .fireflies import _SPEAKER_RECORDS_ATTR, FIREFLIES_SOURCE_NAME
+from .speakers import preserve_speaker_sync_metadata, store_speaker_entities
 
 
 async def sync_fireflies(source: Any, *, dataset_name: str = "fireflies_meetings", user=None):
@@ -27,6 +28,9 @@ async def sync_fireflies(source: Any, *, dataset_name: str = "fireflies_meetings
         raise ValueError("sync_fireflies requires a local Cognee instance.")
     if document_source_tag(source) != FIREFLIES_SOURCE_NAME:
         raise ValueError("Pass a resource returned by fireflies_source().")
+    speaker_records = getattr(source, _SPEAKER_RECORDS_ATTR, None)
+    if speaker_records is None:
+        raise ValueError("Pass a resource returned by fireflies_source().")
 
     await setup()
     user, dataset = await resolve_authorized_user_dataset(dataset_name=dataset_name, user=user)
@@ -41,10 +45,13 @@ async def sync_fireflies(source: Any, *, dataset_name: str = "fireflies_meetings
     if documents:
         # The resolver has already materialized standard DataItems. Passing
         # them to add does not execute the source a second time.
+        await preserve_speaker_sync_metadata(documents, dataset)
         await cognee.add(documents, dataset_name=dataset_name, user=user)
         if cleanup is not None:
             await cleanup()
-        return await cognee.cognify(datasets=[dataset_name], user=user)
+        result = await cognee.cognify(datasets=[dataset_name], user=user)
+        await store_speaker_entities(documents, speaker_records, dataset=dataset, user=user)
+        return result
 
     # Empty means the complete source loaded and the full staging read-back
     # succeeded with no documents. Failures above propagate before deletion.
