@@ -166,6 +166,10 @@ def _build_transcript_query(config: _FirefliesConfig) -> str:
         fields.append(
             "sentences { index speaker_name speaker_id text raw_text start_time end_time }"
         )
+    elif config.include_speakers:
+        # Some meetings expose diarization only on sentences. Recover speaker
+        # identities even when transcript text was not selected.
+        fields.append("sentences { speaker_name speaker_id }")
 
     summary_fields: list[str] = []
     if config.include_summary:

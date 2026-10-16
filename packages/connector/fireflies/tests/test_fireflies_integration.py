@@ -279,6 +279,40 @@ async def test_speaker_only_scope_rename_and_selection(environment, monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_sentence_only_speakers_without_transcript_text(environment):
+    class SentenceSpeakerClient(MeetingClient):
+        def get_transcript(self, transcript_id, config):
+            transcript = super().get_transcript(transcript_id, config)
+            transcript["speakers"] = []
+            # Match the minimal sentence selection used without transcript text.
+            transcript["sentences"] = [
+                {key: sentence[key] for key in ("speaker_id", "speaker_name")}
+                for sentence in transcript["sentences"]
+            ]
+            return transcript
+
+    await sync_fireflies(
+        fireflies_source(
+            client=SentenceSpeakerClient(),
+            include_transcript=False,
+            include_summary=False,
+            include_action_items=False,
+            include_speakers=True,
+        ),
+        dataset_name=DATASET,
+    )
+    assert {node["name"] for node in (await speaker_entities()).values()} == {
+        "AliceBlue",
+        "BobGreen",
+    }
+    await assert_speaker_links()
+    assert len(await speaker_vectors(set(await speaker_entities()))) == 2
+    nodes, _ = await graph_text()
+    assert "## Transcript" not in nodes
+    assert "ship the cobalt feature" not in nodes
+
+
+@pytest.mark.asyncio
 async def test_failed_speaker_write_retries_without_repeating_llm(environment, monkeypatch):
     import cognee.tasks.storage as storage
 

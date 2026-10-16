@@ -130,6 +130,23 @@ def test_pagination_uses_limit_and_skip():
     assert client.list_calls == [(2, 0), (2, 2), (2, 4)]
 
 
+def test_speaker_only_query_keeps_sentence_attribution_without_transcript_text():
+    query = _build_transcript_query(
+        _FirefliesConfig(
+            include_transcript=False,
+            include_summary=False,
+            include_action_items=False,
+            include_speakers=True,
+        )
+    )
+    assert "speakers { id name }" in query
+    assert "sentences { speaker_name speaker_id }" in query
+    assert "raw_text" not in query
+    assert "start_time" not in query
+    assert " text " not in query
+    assert "summary" not in query
+
+
 def test_rendered_document_preserves_speaker_entities_and_attribution():
     row = _transcript_to_row(_detail("meeting-1"), _FirefliesConfig())
 

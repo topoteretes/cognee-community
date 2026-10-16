@@ -58,6 +58,8 @@ meeting document. Speaker creation does not depend on LLM extraction. IDs are
 scoped by dataset and meeting: two meetings' `Speaker 1` labels, or two people
 with the same name, are not automatically merged. Missing names fall back to
 meeting-scoped labels; sentence attribution fills in missing speaker lists.
+When only speakers are selected, sentence speaker IDs and names are queried
+for this fallback without querying transcript text.
 
 Speaker nodes and vectors carry the document's normal Cognee provenance, so
 edits and upstream deletions clean them up with the document. Successful speaker
