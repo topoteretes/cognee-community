@@ -332,7 +332,6 @@ class _FolderTree:
     def __init__(self, folders: list[dict]):
         live = {f["id"]: f for f in folders if f.get("scope") in ("WsRoot", "WsFolder")}
         self.root_id = next(fid for fid, f in live.items() if f["scope"] == "WsRoot")
-        self.recycle_bin_id = next((f["id"] for f in folders if f.get("scope") == "RbRoot"), None)
         self.folders = live
         # ponytail: a folder shared into two parents gets one path, the first seen.
         self.parent: dict[str, str] = {}
@@ -495,31 +494,21 @@ def _iter_rows(
     ``state`` is dlt's per-resource state (a plain dict in tests):
 
     * ``cursor``: the time captured *before* the previous run started listing;
-    * ``roots`` / ``scope``: the folders that run synced, as configured and
-      with everything below them;
-    * ``seen``: the row ids currently ingested. Delete rows are only sent for
-      these, so a change elsewhere in the account never produces one.
+    * ``seen``: the row ids currently ingested.
 
-    State is only written after the last row is yielded. A run that fails part
-    way is rolled back by dlt, so the next run starts from the old state.
+    State is only written after the last row is yielded, so a run that fails
+    part way changes nothing and the next run starts from the same state.
 
-    **Full run** (the first run, ``full_resync``, or a changed set of folders in
-    scope: new ``folder_ids``, or a folder moved in, moved out or deleted. Moving
-    a folder does not bump its tasks' ``updatedDate``, so only a full listing sees
-    them arrive or leave):
-    list everything in scope, and delete every seen id that was not listed. The
-    folder-scope rule covers a task that leaves scope with its folder (moved, or
-    deleted while the task sits in a second folder) and a folder the token lost
-    access to. ``full_resync`` covers what nothing else can see: a task removed
-    from the Recycle Bin before the sync, or a single task the token lost.
+    Every run lists the ids of everything in scope, which is one light request
+    per 1000 tasks. Whatever was ingested but is no longer listed gets a
+    ``_deleted`` row: a task deleted (or purged from the Recycle Bin), moved
+    out of the selected folders, removed with its folder, or no longer visible
+    to the token. The Recycle Bin alone cannot see all of these; a deleted
+    folder's tasks even keep the folder as their parent.
 
-    **Incremental run**: ask Wrike only for what changed since ``cursor`` (minus
-    a small overlap for clock drift; merge makes a re-read harmless), and delete
-
-    * tasks in the Recycle Bin. A deleted folder leaves its tasks pointing at the
-      folder, not at the bin, so only ``descendants=true`` finds them;
-    * tasks that changed but are no longer in scope (moved out);
-    * folders that were deleted or moved out of scope.
+    Content is fetched only for what is new to the listing or changed since
+    ``cursor`` (minus a small overlap for clock drift; merge makes a re-read
+    harmless). A first run and ``full_resync`` fetch everything.
     """
     started = now()
     tree = _FolderTree(client.get("/folders"))
@@ -531,35 +520,40 @@ def _iter_rows(
     names = _Names.load(client)
     scope = [fid for fid in tree.subtree(roots) if fid != tree.root_id]
     seen = set(state.get("seen", []))
+    incremental = not full_resync and state.get("cursor") is not None
 
-    incremental = (
-        not full_resync
-        and state.get("cursor") is not None
-        and state.get("roots") == roots
-        and state.get("scope") == sorted(scope)
-    )
-    since: dict[str, Any] = {}
-    candidates: set[str] = set()  # ids that may have been removed (incremental only)
-    folders_to_render = scope
+    tasks: dict[str, dict] = {}
     if incremental:
         cursor = datetime.fromisoformat(state["cursor"].replace("Z", "+00:00"))
         since = {"updatedDate": {"start": _stamp(cursor - _CURSOR_OVERLAP)}}
-        changed_folders = client.get("/folders", **since)
-        folders_to_render = [f["id"] for f in changed_folders if f["id"] in scope]
-        candidates |= {f"folder:{f['id']}" for f in changed_folders}
-        # Every changed task, in scope or not. Listed BEFORE the in-scope query:
-        # a task edited between the two calls then shows up in scope rather
-        # than being mistaken for one that moved out.
-        candidates |= {f"task:{t['id']}" for t in client.get("/tasks", pageSize=PAGE_SIZE, **since)}
-        if tree.recycle_bin_id:
-            deleted_tasks = client.get(
-                f"/folders/{tree.recycle_bin_id}/tasks",
-                descendants=True,
-                subTasks=True,
-                pageSize=PAGE_SIZE,
-                **since,
+        # The id sweep first: a task created or moved in after it is caught by
+        # the next run, never deleted by mistake.
+        listed = {
+            t["id"]
+            for root in roots
+            for t in client.get(
+                f"/folders/{root}/tasks", descendants=True, subTasks=True, pageSize=PAGE_SIZE
             )
-            candidates |= {f"task:{t['id']}" for t in deleted_tasks}
+        }
+        for root in roots:
+            for task in client.get(f"/folders/{root}/tasks", **_task_query(**since)):
+                tasks.setdefault(task["id"], task)
+        # New to the listing without being edited: its folder moved into scope,
+        # or the token was given access.
+        new = sorted(t for t in listed - tasks.keys() if f"task:{t}" not in seen)
+        for start in range(0, len(new), _TASK_BATCH):
+            for task in client.get(f"/tasks/{','.join(new[start : start + _TASK_BATCH])}"):
+                tasks.setdefault(task["id"], task)
+        changed_folders = {f["id"] for f in client.get("/folders", **since)}
+        folders_to_render = [
+            fid for fid in scope if fid in changed_folders or f"folder:{fid}" not in seen
+        ]
+    else:
+        for root in roots:
+            for task in client.get(f"/folders/{root}/tasks", **_task_query()):
+                tasks.setdefault(task["id"], task)
+        listed = set(tasks)
+        folders_to_render = scope
 
     yielded: set[str] = set()
     for start in range(0, len(folders_to_render), _FOLDER_BATCH):
@@ -569,10 +563,6 @@ def _iter_rows(
             yielded.add(row["id"])
             yield row
 
-    tasks: dict[str, dict] = {}
-    for root in roots:
-        for task in client.get(f"/folders/{root}/tasks", **_task_query(**since)):
-            tasks.setdefault(task["id"], task)
     task_titles = {tid: task.get("title", "") for tid, task in tasks.items()}
     # An incremental run may re-render a subtask whose parent did not change;
     # fetch those parents' titles so the document stays the same as a full run's.
@@ -586,14 +576,12 @@ def _iter_rows(
         yielded.add(row["id"])
         yield row
 
-    # Only ids we ingested can be forgotten; anything listed this run stays.
-    deleted = ((candidates if incremental else seen) & seen) - yielded
+    in_scope = {f"folder:{fid}" for fid in scope} | {f"task:{tid}" for tid in listed}
+    deleted = seen - in_scope - yielded
     for row_id in sorted(deleted):
         yield {"id": row_id, "_deleted": True}
 
     state["cursor"] = _stamp(started)
-    state["roots"] = roots
-    state["scope"] = sorted(scope)
     state["seen"] = sorted((seen | yielded) - deleted)
     logger.info(
         "Wrike: %s sync, %d folder(s), %d task(s), %d deletion(s).",
@@ -633,9 +621,8 @@ def wrike_source(
         client_id, client_secret, token_path: OAuth refresh. ``token_path`` is a
             JSON file holding ``refresh_token``; it is rewritten on every run.
         host: Wrike data centre for a permanent token (default ``www.wrike.com``).
-        full_resync: List everything instead of only what changed, and forget
-            whatever is gone. Catches deletions an incremental run cannot see
-            (an emptied Recycle Bin, lost access); worth running now and then.
+        full_resync: Re-fetch and re-render everything instead of only what
+            changed. Deletions never need it: every run finds them.
         client: Pre-built client, mainly a test injection point.
     """
     try:

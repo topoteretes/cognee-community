@@ -105,20 +105,13 @@ class FakeAccount:
             return self._since(list(self.folders.values()), params)
         if path in ("/workflows", "/spaces", "/contacts", "/customfields"):
             return []
-        if path == "/tasks":
-            live = [t for t in self.tasks.values() if t["scope"] == "WsTask"]
-            return self._since(live, params)
         if path.startswith("/folders/") and path.endswith("/tasks"):
-            fid = path.split("/")[2]
-            if fid == "RB":
-                found = [t for t in self.tasks.values() if t["scope"] == "RbTask"]
-            else:
-                scope = set(self._subtree(fid))
-                found = [
-                    t
-                    for t in self.tasks.values()
-                    if t["scope"] == "WsTask" and scope & set(t["parentIds"])
-                ]
+            scope = set(self._subtree(path.split("/")[2]))
+            found = [
+                t
+                for t in self.tasks.values()
+                if t["scope"] == "WsTask" and scope & set(t["parentIds"])
+            ]
             return self._since(found, params)
         if path.startswith("/folders/"):
             return [self.folders[fid] for fid in path.split("/")[2].split(",")]

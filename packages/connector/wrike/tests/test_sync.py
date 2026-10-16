@@ -32,7 +32,6 @@ def test_first_run_lists_everything_and_saves_the_cursor(account):
     assert rows == {"folder:A", "folder:A1", "folder:B", "task:T1", "task:T2", "task:T3"}
     assert deletes == set()
     assert state["cursor"] == stamp(T0)
-    assert state["roots"] == ["ROOT"]
     assert state["seen"] == sorted(rows)
 
 
@@ -60,12 +59,10 @@ def test_deleted_task_is_forgotten(account, state):
 
 
 def test_deleted_folder_forgets_the_folder_and_its_tasks(account, state):
+    # The folder's task keeps the deleted folder as its parent and is not in
+    # /tasks any more; it is simply missing from the id sweep.
     account.delete_folder("A1")
-    # The folders in scope changed, so this is a full run: what remains is
-    # re-sent (harmless under merge) and the folder and its task are forgotten.
-    rows, deletes = sync(account, state)
-    assert deletes == {"folder:A1", "task:T2"}
-    assert rows == {"folder:A", "folder:B", "task:T1", "task:T3"}
+    assert sync(account, state) == (set(), {"folder:A1", "task:T2"})
 
 
 def test_folder_moved_into_scope_brings_its_tasks(account):
@@ -134,10 +131,12 @@ def test_edit_during_a_sync_is_picked_up_next_time(account, state):
     assert "task:T3" in sync(account, state)[0]
 
 
-def test_changing_folder_ids_runs_a_full_sync_and_forgets_the_old_scope(account, state):
-    rows, deletes = sync(account, state, folder_ids=["B"])
-    assert rows == {"folder:B", "task:T3"}
-    assert deletes == {"folder:A", "folder:A1", "task:T1", "task:T2"}
+def test_changing_folder_ids_forgets_the_old_scope(account, state):
+    # Beta and its task were already ingested and did not change: kept, not refetched.
+    assert sync(account, state, folder_ids=["B"]) == (
+        set(),
+        {"folder:A", "folder:A1", "task:T1", "task:T2"},
+    )
 
 
 def test_multi_folder_task_leaving_scope_with_a_deleted_folder(account):
@@ -150,14 +149,28 @@ def test_multi_folder_task_leaving_scope_with_a_deleted_folder(account):
     assert sync(account, state, folder_ids=["A"])[1] == {"folder:A1", "task:T2"}
 
 
-def test_full_resync_forgets_a_task_purged_from_the_recycle_bin(account, state):
+def test_task_purged_from_the_recycle_bin_is_forgotten(account, state):
     account.delete_task("T1")
     del account.tasks["T1"]  # recycle bin emptied before the next sync
-    assert sync(account, state) == (set(), set())  # incremental cannot see it
-    assert sync(account, state, full_resync=True) == (
-        {"folder:A", "folder:A1", "folder:B", "task:T2", "task:T3"},
-        {"task:T1"},
-    )
+    assert sync(account, state) == (set(), {"task:T1"})
+
+
+def test_task_the_token_lost_access_to_is_forgotten(account, state):
+    del account.tasks["T3"]  # gone from every listing, never in the Recycle Bin
+    assert sync(account, state) == (set(), {"task:T3"})
+
+
+def test_task_shared_into_scope_without_an_edit_is_fetched(account, state):
+    # Appears in the listing with an old updatedDate (e.g. access was granted).
+    account.add_task("T4", ["A"])
+    account.tasks["T4"]["updatedDate"] = stamp(T0 - timedelta(days=30))
+    assert sync(account, state) == ({"task:T4"}, set())
+
+
+def test_full_resync_re_renders_everything(account, state):
+    rows, deletes = sync(account, state, full_resync=True)
+    assert rows == {"folder:A", "folder:A1", "folder:B", "task:T1", "task:T2", "task:T3"}
+    assert deletes == set()
 
 
 def test_failed_run_leaves_state_untouched(account, state):
