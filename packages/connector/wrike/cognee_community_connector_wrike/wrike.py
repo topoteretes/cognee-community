@@ -54,7 +54,11 @@ from typing import Any
 
 import httpx
 from cognee.shared.logging_utils import get_logger
-from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR, PIPELINE_SCOPE_ATTR
+from cognee.tasks.ingestion.dlt_utils import (
+    DOCUMENT_SOURCE_ATTR,
+    PIPELINE_SCOPE_ATTR,
+    guarded_rows,
+)
 
 logger = get_logger("wrike_connector")
 
@@ -649,6 +653,7 @@ def wrike_source(
     token_path: str | os.PathLike | None = None,
     host: str | None = None,
     full_resync: bool = False,
+    check_active: Callable[[], None] | None = None,
     client: WrikeClient | None = None,
 ):
     """Return a ``dlt`` resource with one document row per Wrike folder and task.
@@ -666,6 +671,8 @@ def wrike_source(
         host: Wrike data centre for a permanent token (default ``www.wrike.com``).
         full_resync: Re-fetch and re-render everything instead of only what
             changed. Deletions never need it: every run finds them.
+        check_active: Optional host authorization checkpoint, called before the
+            sync starts and between rows; raising from it stops the sync.
         client: Pre-built client, mainly a test injection point.
     """
     try:
@@ -707,7 +714,10 @@ def wrike_source(
         columns={"_deleted": {"data_type": "bool", "hard_delete": True}},
     )
     def wrike_items():
-        yield from _iter_rows(build_client(), folder_ids, dlt.current.resource_state(), full_resync)
+        yield from guarded_rows(
+            _iter_rows(build_client(), folder_ids, dlt.current.resource_state(), full_resync),
+            check_active,
+        )
 
     resource = wrike_items()
     # Opt into cognee's document path: each row is prose for normal cognify.

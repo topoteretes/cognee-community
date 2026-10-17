@@ -3,7 +3,7 @@ name = "cognee-community-connector-wrike"
 version = "0.1.0"
 description = "Wrike data-source connector for cognee — sync Wrike folders and tasks into memory (incremental + forget-on-delete)"
 readme = "README.md"
-requires-python = ">=3.11,<=3.13"
+requires-python = ">=3.11,<3.14"
 dependencies = [
     # Document-mode ingestion (DOCUMENT_SOURCE_ATTR) plus orphan cleanup that
     # forgets the last document of a table emptied by delete rows.

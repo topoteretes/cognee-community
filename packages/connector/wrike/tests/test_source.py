@@ -6,6 +6,7 @@ from cognee.tasks.ingestion.dlt_utils import (
     PIPELINE_SCOPE_ATTR,
     pipeline_name_for_source,
 )
+from dlt.extract.exceptions import ResourceExtractionError
 
 from cognee_community_connector_wrike.wrike import (
     _iter_rows,
@@ -267,6 +268,20 @@ def test_source_is_a_merge_document_resource():
     assert resource.write_disposition == "merge"
     assert resource.columns["_deleted"]["hard_delete"] is True
     assert {row["id"] for row in resource} == set(rows_by_id())
+
+
+def test_check_active_runs_between_rows_and_can_stop_the_sync():
+    calls = []
+
+    def check_active():
+        calls.append(1)
+        if len(calls) > 3:
+            raise PermissionError("access revoked")
+
+    # dlt wraps errors raised inside a resource; the run fails and state is not saved.
+    with pytest.raises(ResourceExtractionError, match="access revoked"):
+        list(wrike_source(client=FakeWrike(), check_active=check_active))
+    assert len(calls) == 4
 
 
 def test_source_needs_credentials(monkeypatch):

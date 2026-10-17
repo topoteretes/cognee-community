@@ -69,6 +69,9 @@ its folder, or is no longer visible to the token. The Recycle Bin alone cannot: 
 folder's tasks even keep the folder as their parent.
 
 Comments are part of their task's document; adding, editing or deleting one updates the task.
+Comments are read one request per task (`/tasks/{ids}/comments` takes one id, and the
+account-wide `/comments` accepts at most a 7-day range), so a first run on a large account takes a
+while: Wrike allows about 400 requests a minute, and rate-limited requests are retried.
 State is saved only at the end of a successful run: a failed run raises, deletes nothing, and the
 next run starts from the same cursor. `full_resync=True` re-fetches and re-renders everything.
 
