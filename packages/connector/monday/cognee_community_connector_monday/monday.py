@@ -20,6 +20,7 @@ requests, dlt's retrying session for rate limits and server errors, and dlt's
 cursor paginator, which writes monday.com's page cursor into the query variables.
 """
 
+import json
 from collections.abc import Iterator
 from typing import Any
 
@@ -173,3 +174,153 @@ def _clean_token(token: str | None) -> str:
     if not cleaned.isascii() or any(character.isspace() for character in cleaned):
         raise MondayAuthError("The monday.com API token contains spaces or non-ASCII characters.")
     return cleaned
+
+
+# ---------------------------------------------------------------------------
+# Rendering: one document per item, deterministic, no volatile fields.
+#
+# The shape follows the Linear connector in cognee core ("Label: value" lines,
+# then the text, then the discussion), so work items from both trackers read
+# the same way in the graph.
+# ---------------------------------------------------------------------------
+
+ID_PREFIX = "monday:"
+
+# Columns that are never written into a document:
+# * name and subtasks are rendered as the title and the Parent line instead.
+# * last_updated changes on every edit and time_tracking while a timer runs, so
+#   they would make every sync look like a change.
+# * file text is a list of signed download links, and button has no value.
+_SKIPPED_COLUMN_TYPES = {"name", "subtasks", "last_updated", "time_tracking", "file", "button"}
+
+# Description blocks, rendered as markdown so headings and lists survive. The
+# API names block types with spaces ("large title", "bulleted list").
+_BLOCK_PREFIX = {
+    "large title": "# ",
+    "medium title": "## ",
+    "small title": "### ",
+    "bulleted list": "- ",
+    "numbered list": "1. ",
+    "check list": "- [ ] ",
+    "quote": "> ",
+}
+
+
+def _render_item(item: dict, board: dict, updates: list[dict]) -> dict:
+    """Render one monday.com item, with its updates, as a document row.
+
+    ``board`` carries the board name and its columns in board order; ``updates``
+    are the item's updates with their replies. Only text a person entered is
+    used, never ``updated_at`` or a column's raw value (that JSON carries a
+    ``changed_at`` time), so an unchanged item renders to the same text.
+    """
+    name = str(item.get("name") or "").strip() or "Untitled item"
+    columns = _columns_by_id(item)
+    # The first status and people columns become the State and Assignee lines,
+    # as in the Linear connector. Any other column keeps its own title.
+    state_column, state = _first_of_type(board, columns, "status")
+    assignee_column, assignee = _first_of_type(board, columns, "people")
+    fields = [
+        ("Board", str(board.get("name") or "").strip()),
+        ("Group", str((item.get("group") or {}).get("title") or "").strip()),
+        ("State", state),
+        ("Assignee", assignee),
+        ("Parent", str((item.get("parent_item") or {}).get("name") or "").strip()),
+    ]
+    used = {state_column, assignee_column}
+    for column in board.get("columns") or []:
+        if column.get("id") in used or column.get("type") in _SKIPPED_COLUMN_TYPES:
+            continue
+        fields.append((str(column.get("title") or "").strip(), columns.get(column.get("id"), "")))
+
+    parts = [f"{label}: {value}" for label, value in fields if label and value]
+    description = _render_description(item.get("description"))
+    if description:
+        parts.extend(["", description])
+    discussion = _render_updates(updates)
+    if discussion:
+        parts.extend(["", "Updates:", *discussion])
+
+    return {
+        "id": f"{ID_PREFIX}{item['id']}",
+        "title": name,
+        "content": "\n".join(parts).strip() or name,
+        "url": item.get("url") or "",
+        "_deleted": False,
+    }
+
+
+def _columns_by_id(item: dict) -> dict[str, str]:
+    """Readable value of each column. Formula, mirror and connected-board
+    columns leave ``text`` empty and carry their value in ``display_value``."""
+    values = {}
+    for column in item.get("column_values") or []:
+        value = column.get("display_value") or column.get("text") or ""
+        values[column.get("id")] = " ".join(str(value).split())
+    return values
+
+
+def _first_of_type(board: dict, columns: dict[str, str], column_type: str) -> tuple[str, str]:
+    """The first column of a type, in board order, as (column id, value)."""
+    for column in board.get("columns") or []:
+        if column.get("type") == column_type:
+            return column.get("id"), columns.get(column.get("id"), "")
+    return "", ""
+
+
+def _render_description(description: Any) -> str:
+    """The item description, a small monday doc, as markdown in block order."""
+    blocks = (description or {}).get("blocks") if isinstance(description, dict) else None
+    lines = []
+    for block in sorted(blocks or [], key=lambda b: (float(b.get("position") or 0), str(b["id"]))):
+        line = _render_block(block)
+        if line:
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def _render_block(block: dict) -> str:
+    """One description block. Its content is JSON with the text as a list of
+    ``deltaFormat`` inserts, and list items carry an ``indentation`` level."""
+    content = block.get("content")
+    if isinstance(content, str):
+        try:
+            content = json.loads(content)
+        except ValueError:
+            return content.strip()
+    if not isinstance(content, dict):
+        return ""
+    inserts = content.get("deltaFormat") or []
+    text = "".join(str(part.get("insert") or "") for part in inserts if isinstance(part, dict))
+    text = " ".join(text.split())
+    if not text:
+        return ""
+    indent = "  " * int(content.get("indentation") or 0)
+    return indent + _BLOCK_PREFIX.get(block.get("type"), "") + text
+
+
+def _render_updates(updates: list[dict]) -> list[str]:
+    """Updates oldest first, each followed by its replies."""
+    lines = []
+    for update in _oldest_first(updates):
+        line = _update_line(update)
+        if line:
+            lines.append(line)
+            lines.extend(
+                f"  Reply from {reply}"
+                for reply in map(_update_line, _oldest_first(update.get("replies")))
+                if reply
+            )
+    return lines
+
+
+def _oldest_first(updates: list[dict] | None) -> list[dict]:
+    return sorted(updates or [], key=lambda u: (str(u.get("created_at") or ""), str(u.get("id"))))
+
+
+def _update_line(update: dict) -> str:
+    body = " ".join(str(update.get("text_body") or "").split())
+    if not body:
+        return ""
+    author = str((update.get("creator") or {}).get("name") or "").strip() or "Unknown"
+    return f"{author} ({str(update.get('created_at') or '')[:10]}): {body}"
