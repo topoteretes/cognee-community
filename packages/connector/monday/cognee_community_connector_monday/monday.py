@@ -20,6 +20,7 @@ requests, dlt's retrying session for rate limits and server errors, and dlt's
 cursor paginator, which writes monday.com's page cursor into the query variables.
 """
 
+import hashlib
 import json
 from collections.abc import Iterator
 from typing import Any
@@ -392,3 +393,149 @@ def _update_line(update: dict) -> str:
         return ""
     author = str((update.get("creator") or {}).get("name") or "").strip() or "Unknown"
     return f"{author} ({str(update.get('created_at') or '')[:10]}): {body}"
+
+
+# ---------------------------------------------------------------------------
+# Change detection
+#
+# Every sync lists each board's items with a few cheap stamps: the item's
+# updated_at, plus the id and updated_at of each update and reply. Posting or
+# editing an update does not move the item's updated_at, so the update stamps
+# are what catch new, edited and deleted comments. Items whose stamps differ
+# from the last sync are then fetched in full, a hundred per call.
+#
+# An item description has no cheap change signal at all (the item's updated_at
+# does not move and its blocks only carry a date), so a description is re-read
+# whenever its item changes for any other reason, and on a full refresh.
+# ---------------------------------------------------------------------------
+
+# monday.com's maximum page size for items_page, and for items(ids).
+_LISTING_PAGE_SIZE = 500
+_FETCH_CHUNK = 100
+
+_BOARDS_QUERY = """
+query Boards($ids: [ID!]) {
+  boards(ids: $ids) { id name state columns { id title type settings_str } }
+}"""
+
+# Measured on API 2026-07: a 500 item page with these stamps stays far inside
+# the per-minute complexity budget. Asking for description blocks here does not:
+# that alone used up the whole minute's budget.
+_STAMPS_QUERY = """
+query ItemStamps($board: [ID!], $limit: Int!, $cursor: String) {
+  boards(ids: $board) {
+    items_page(limit: $limit, cursor: $cursor) {
+      cursor
+      items { id updated_at updates(limit: 100) { id updated_at replies { id updated_at } } }
+    }
+  }
+}"""
+
+_ITEMS_QUERY = """
+query ItemDetails($ids: [ID!], $limit: Int!) {
+  items(ids: $ids, limit: $limit) {
+    id name url state board { id } group { title } parent_item { name }
+    description { blocks { id type position content } }
+    column_values {
+      id type text
+      ... on FormulaValue { display_value }
+      ... on MirrorValue { display_value }
+      ... on BoardRelationValue { display_value }
+      ... on DependencyValue { display_value }
+    }
+    updates(limit: 100) {
+      id text_body created_at creator { name }
+      replies { id text_body created_at creator { name } }
+    }
+  }
+}"""
+
+
+def _iter_rows(client, board_ids: list[str], state: dict, stats: dict, full_refresh=False):
+    """Yield a document row for every new or changed item on the selected boards.
+
+    Sub-items live on their own board, so each selected board's sub-item board
+    is synced with it. ``state`` is dlt's resource state; it is only written
+    once a board's rows have all been yielded.
+    """
+    boards = _load_boards(client, board_ids)
+    subitem_ids = [i for board in boards.values() for i in _subitem_board_ids(board)]
+    boards.update(_load_boards(client, [i for i in subitem_ids if i not in boards]))
+
+    for board_id, board in boards.items():
+        board_state = state.setdefault("boards", {}).setdefault(board_id, {})
+        yield from _sync_board(client, board, board_state, stats, full_refresh)
+
+
+def _load_boards(client, board_ids: list[str]) -> dict[str, dict]:
+    """Board names and columns. A board the token cannot see raises: monday.com
+    answers with an empty list rather than an error, and that must never be
+    read as a board whose items were all deleted."""
+    if not board_ids:
+        return {}
+    found = client.query(_BOARDS_QUERY, {"ids": board_ids})["boards"] or []
+    boards = {str(board["id"]): board for board in found}
+    missing = [board_id for board_id in board_ids if board_id not in boards]
+    if missing:
+        raise MondayAPIError(
+            f"{len(missing)} selected board(s) were not found or are not shared with this token."
+        )
+    return {board_id: boards[board_id] for board_id in board_ids}
+
+
+def _subitem_board_ids(board: dict) -> list[str]:
+    """The boards holding this board's sub-items, from its subtasks column."""
+    ids = []
+    for column in board.get("columns") or []:
+        if column.get("type") != "subtasks":
+            continue
+        try:
+            settings = json.loads(column.get("settings_str") or "{}")
+        except ValueError:
+            continue
+        ids.extend(str(board_id) for board_id in settings.get("boardIds") or [])
+    return ids
+
+
+def _sync_board(client, board: dict, board_state: dict, stats: dict, full_refresh: bool):
+    board_id = str(board["id"])
+    stamps = _list_stamps(client, board_id)
+    seen = board_state.setdefault("items", {})
+    changed = [i for i, stamp in stamps.items() if full_refresh or seen.get(i) != stamp]
+    stats["scanned"] = stats.get("scanned", 0) + len(stamps)
+
+    for item in _fetch_items(client, changed):
+        # An item archived, deleted or moved after the listing is left for the
+        # next sync, which will see it gone from this board.
+        if item.get("state") != "active" or str((item.get("board") or {}).get("id")) != board_id:
+            continue
+        stats["changed"] = stats.get("changed", 0) + 1
+        yield _render_item(item, board, item.get("updates") or [])
+
+    seen.update(stamps)
+
+
+def _list_stamps(client, board_id: str) -> dict[str, str]:
+    """Every active item on a board, mapped to a short hash of its stamps."""
+    items = client.paginate(
+        _STAMPS_QUERY,
+        {"board": [board_id], "limit": _LISTING_PAGE_SIZE},
+        cursor_path="data.boards[0].items_page.cursor",
+        items_path="data.boards[0].items_page.items",
+    )
+    return {str(item["id"]): _stamp(item) for item in items}
+
+
+def _stamp(item: dict) -> str:
+    parts = [str(item.get("updated_at") or "")]
+    for update in sorted(item.get("updates") or [], key=lambda u: str(u.get("id"))):
+        parts.append(f"{update.get('id')}@{update.get('updated_at')}")
+        for reply in sorted(update.get("replies") or [], key=lambda r: str(r.get("id"))):
+            parts.append(f"{reply.get('id')}@{reply.get('updated_at')}")
+    return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
+
+
+def _fetch_items(client, item_ids: list[str]) -> Iterator[dict]:
+    for start in range(0, len(item_ids), _FETCH_CHUNK):
+        chunk = item_ids[start : start + _FETCH_CHUNK]
+        yield from client.query(_ITEMS_QUERY, {"ids": chunk, "limit": _FETCH_CHUNK})["items"] or []
