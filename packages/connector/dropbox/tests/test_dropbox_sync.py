@@ -5,6 +5,8 @@ change (edit, move, delete, cursor reset, ...) and checks the rows the
 connector yields and the state it keeps for the next run.
 """
 
+import logging
+
 import pytest
 from dropbox import files
 from fake_dropbox import FakeDropbox, api_error, make_pdf
@@ -12,10 +14,10 @@ from fake_dropbox import FakeDropbox, api_error, make_pdf
 from cognee_community_connector_dropbox.dropbox import _DropboxConfig, _iter_rows
 
 
-def sync(fake, state, folders=("",), max_file_size_mb=25):
+def sync(fake, state, folders=("",), max_file_size_mb=25, check_active=None):
     config = _DropboxConfig(folder_paths=tuple(folders), max_file_size_mb=max_file_size_mb)
     stats: dict[str, int] = {}
-    rows = list(_iter_rows(fake, config, state, stats))
+    rows = list(_iter_rows(fake, config, state, stats, check_active))
     upserts = {row["id"]: row for row in rows if not row["_deleted"]}
     deletes = sorted(row["id"] for row in rows if row["_deleted"])
     return upserts, deletes, stats
@@ -433,3 +435,97 @@ def test_widening_to_a_parent_folder_keeps_existing_files(fake):
 
     assert deletes == []
     assert set(upserts) == {a, b}
+
+
+# ---------------------------------------------------------------------------
+# Authorization checkpoint and privacy
+# ---------------------------------------------------------------------------
+class _RevokedError(Exception):
+    pass
+
+
+@pytest.mark.parametrize(
+    "allowed",
+    [
+        ["list_folder"],  # blocks the next page of the first listing
+        ["list_folder", "list_folder_continue", "list_folder_continue", "download"],
+    ],
+)
+def test_check_active_runs_before_every_api_call_not_only_between_rows(fake, allowed):
+    fake.page_size = 2
+    for i in range(5):
+        fake.put(f"/f{i}.md", f"file {i}")
+    state: dict = {}
+
+    def check_active():
+        # The connection is revoked once these calls have been made.
+        if len(fake.api_calls) >= len(allowed):
+            raise _RevokedError
+
+    with pytest.raises(_RevokedError):
+        sync(fake, state, check_active=check_active)
+
+    assert fake.api_calls == allowed, "no request after the revocation"
+    assert state == {}
+
+
+def test_check_active_also_guards_incremental_rounds(fake):
+    fake.put("/a.md", "alpha")
+    state: dict = {}
+    sync(fake, state)
+    before = {"cursors": dict(state["cursors"]), "index": dict(state["index"])}
+    fake.put("/b.md", "bravo")
+    fake.api_calls.clear()
+
+    def check_active():
+        raise _RevokedError
+
+    with pytest.raises(_RevokedError):
+        sync(fake, state, check_active=check_active)
+
+    assert fake.api_calls == [], "list_folder/continue must not run once revoked"
+    assert state == before
+
+
+def test_check_active_is_not_swallowed_by_the_download_error_handling(fake):
+    fake.put("/a.md", "alpha")
+
+    def check_active():
+        if fake.api_calls == ["list_folder"]:  # revoked right before the download
+            raise _RevokedError
+
+    with pytest.raises(_RevokedError):
+        sync(fake, {}, check_active=check_active)
+
+    assert "download" not in fake.api_calls
+
+
+def test_no_file_names_paths_or_ids_reach_the_logs(fake, caplog):
+    caplog.set_level(logging.DEBUG)
+    folder = ("/secret plans",)
+    budget = fake.put("/Secret Plans/budget-2027.md", "numbers")
+    photo = fake.put("/Secret Plans/photo.png", b"\x89PNG")
+    broken = fake.put("/Secret Plans/broken.pdf", b"not a pdf")
+    offline = fake.put("/Secret Plans/offline.md", "later")
+    fake.download_errors[offline] = ConnectionError("timeout for /Secret Plans/offline.md")
+    blocked = fake.put("/Secret Plans/blocked.md", "no")
+    fake.download_errors[blocked] = api_error(
+        files.DownloadError.path(files.LookupError.restricted_content)
+    )
+    state: dict = {}
+
+    # Every path that logs: skips, a failed download, a reset cursor, a vanished folder.
+    sync(fake, state, folder)
+    del fake.download_errors[offline]
+    sync(fake, state, folder)
+    fake.reset_cursors.add(state["cursors"]["/secret plans"])
+    sync(fake, state, folder)
+    fake.delete("/Secret Plans")
+    sync(fake, state, folder)
+
+    assert caplog.text, "the paths above log"
+    names = ("budget-2027.md", "photo.png", "broken.pdf", "offline.md", "blocked.md")
+    for secret in ("Secret Plans", "secret plans", *names):
+        assert secret not in caplog.text
+    for file_id in (budget, photo, broken, offline, blocked):
+        assert file_id not in caplog.text

@@ -29,6 +29,19 @@ CHARLIE = "Charliecorp"
 TOKENS = (ALPHA, BRAVO, CHARLIE)
 
 
+def _with_required(model, **values):
+    """Build a cognee data model, filling any other required text field.
+
+    cognee swaps in Node and KnowledgeGraph models with extra required fields
+    (label, summary, description) when the configured LLM provider is Gemini,
+    so the mock must work with both variants.
+    """
+    for field_name, field in model.model_fields.items():
+        if field.is_required() and field_name not in values:
+            values[field_name] = "mock"
+    return model(**values)
+
+
 async def _mock_structured_output(
     text_input=None, system_prompt=None, response_model=str, **_kwargs
 ):
@@ -43,11 +56,15 @@ async def _mock_structured_output(
     if response_model == KnowledgeGraph:
         name = next((t for t in TOKENS if text_input and t in text_input), None)
         nodes = (
-            [KGNode(id=name, name=name, type="Company", description=f"{name} entity")]
+            [
+                _with_required(
+                    KGNode, id=name, name=name, type="Company", description=f"{name} entity"
+                )
+            ]
             if name
             else []
         )
-        return KnowledgeGraph(nodes=nodes, edges=[])
+        return _with_required(KnowledgeGraph, nodes=nodes, edges=[])
     return response_model()
 
 

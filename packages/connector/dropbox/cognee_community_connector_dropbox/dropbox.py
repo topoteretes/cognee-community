@@ -45,6 +45,11 @@ Design
   with ``pypdf`` (a cognee dependency), and non-downloadable files such as
   Paper docs are exported through ``files/export``.  Unsupported, too large,
   empty or unparseable files are skipped with a warning and counted.
+* **Host checkpoint** — ``check_active`` runs before every Dropbox request,
+  outside any error handling, so a revoked connection stops the sync between
+  two calls and is never counted as a failed or skipped file.
+* **Privacy** — logs and ``cognee_sync_stats`` carry counts and skip reasons
+  only, never file names, paths or Dropbox ids.
 * **Self-describing** — the resource declares its document source, so a plain
   ``remember()`` call routes file content through normal chunking + LLM graph
   extraction.  The file's folder path is written into the content so the graph
@@ -184,12 +189,21 @@ def _is_reset(exc: ApiError) -> bool:
     return hasattr(error, "is_reset") and error.is_reset()
 
 
+def _call(check_active: Callable[[], None] | None, method, *args, **kwargs):
+    """Run one Dropbox API call after the host's authorization checkpoint."""
+    if check_active is not None:
+        check_active()
+    return method(*args, **kwargs)
+
+
 # ---------------------------------------------------------------------------
 # Listing
 # ---------------------------------------------------------------------------
-def _list_folder(client, path: str) -> tuple[list, str]:
+def _list_folder(client, path: str, check_active=None) -> tuple[list, str]:
     """Full recursive listing of one folder. Returns (entries, cursor)."""
-    result = client.files_list_folder(
+    result = _call(
+        check_active,
+        client.files_list_folder,
         path,
         recursive=True,
         limit=LIST_FOLDER_LIMIT,
@@ -197,16 +211,16 @@ def _list_folder(client, path: str) -> tuple[list, str]:
     )
     entries = list(result.entries)
     while result.has_more:
-        result = client.files_list_folder_continue(result.cursor)
+        result = _call(check_active, client.files_list_folder_continue, result.cursor)
         entries.extend(result.entries)
     return entries, result.cursor
 
 
-def _list_changes(client, cursor: str) -> tuple[list, str]:
+def _list_changes(client, cursor: str, check_active=None) -> tuple[list, str]:
     """Every change since ``cursor``. Returns (entries, new cursor)."""
     entries: list = []
     while True:
-        result = client.files_list_folder_continue(cursor)
+        result = _call(check_active, client.files_list_folder_continue, cursor)
         entries.extend(result.entries)
         cursor = result.cursor
         # The cursor is only complete once has_more is false.
@@ -217,7 +231,13 @@ def _list_changes(client, cursor: str) -> tuple[list, str]:
 # ---------------------------------------------------------------------------
 # Sync state machine (pure given a client + state dict — unit-testable)
 # ---------------------------------------------------------------------------
-def _iter_rows(client, config: _DropboxConfig, state: dict, stats: dict[str, int] | None = None):
+def _iter_rows(
+    client,
+    config: _DropboxConfig,
+    state: dict,
+    stats: dict[str, int] | None = None,
+    check_active: Callable[[], None] | None = None,
+):
     """Yield one row per new or changed file, plus hard-delete tombstones.
 
     ``state`` holds ``cursors`` (folder path -> list_folder cursor) and
@@ -262,13 +282,13 @@ def _iter_rows(client, config: _DropboxConfig, state: dict, stats: dict[str, int
         cursor = old_cursors.get(folder)
         if cursor is not None:
             try:
-                entries, new_cursors[folder] = _list_changes(client, cursor)
+                entries, new_cursors[folder] = _list_changes(client, cursor, check_active)
             except ApiError as exc:
                 if _is_reset(exc):
-                    logger.info("Dropbox: cursor for '%s' was reset; re-listing.", folder or "/")
+                    logger.info("Dropbox: a folder's cursor was reset; listing it again.")
                 elif _path_lookup_error(exc) is not None:
                     # Confirm with a fresh listing before deleting anything.
-                    logger.info("Dropbox: '%s' is not reachable; re-listing.", folder or "/")
+                    logger.info("Dropbox: a synced folder is not reachable; listing it again.")
                 else:
                     raise
             else:
@@ -279,11 +299,11 @@ def _iter_rows(client, config: _DropboxConfig, state: dict, stats: dict[str, int
         # First run, reset cursor, or a path error to confirm: list the whole
         # folder and reconcile it against the index like a snapshot.
         try:
-            entries, new_cursors[folder] = _list_folder(client, folder)
+            entries, new_cursors[folder] = _list_folder(client, folder, check_active)
         except ApiError as exc:
             if not _is_not_found(exc):
                 raise
-            logger.warning("Dropbox: folder '%s' was not found; forgetting its files.", folder)
+            logger.warning("Dropbox: a synced folder was not found; forgetting its files.")
             forget(folder)
             continue
         forget(folder)
@@ -303,7 +323,7 @@ def _iter_rows(client, config: _DropboxConfig, state: dict, stats: dict[str, int
         # Added and then deleted within the same round: nothing to store.
         if file_id not in present_ids:
             continue
-        row = _file_to_row(client, entry, config, stats)
+        row = _file_to_row(client, entry, config, stats, check_active)
         if row is not None:
             yielded += 1
             yield row
@@ -322,15 +342,15 @@ def _iter_rows(client, config: _DropboxConfig, state: dict, stats: dict[str, int
         )
     else:
         state["cursors"] = new_cursors
-    logger.info(
-        "Dropbox: sync yielded %d changed file(s), %d deletion(s).", yielded, stats["deleted"]
-    )
+    logger.info("Dropbox: sync yielded %d changed file(s); stats %s", yielded, stats)
 
 
 # ---------------------------------------------------------------------------
 # Content extraction
 # ---------------------------------------------------------------------------
-def _file_to_row(client, entry, config: _DropboxConfig, stats: dict[str, int]) -> dict | None:
+def _file_to_row(
+    client, entry, config: _DropboxConfig, stats: dict[str, int], check_active=None
+) -> dict | None:
     stats["scanned"] += 1
     name = entry.name
 
@@ -343,27 +363,21 @@ def _file_to_row(client, entry, config: _DropboxConfig, stats: dict[str, int]) -
             parse = _extract_pdf_text
         else:
             _count_skip(stats, "unsupported_type")
-            logger.warning("Skipping unsupported Dropbox file '%s' (%s).", name, entry.id)
             return None
         if entry.size > config.max_file_size_mb * 1024 * 1024:
             _count_skip(stats, "too_large")
-            logger.warning(
-                "Skipping Dropbox file '%s' (%s): size exceeds max_file_size_mb=%d.",
-                name,
-                entry.id,
-                config.max_file_size_mb,
-            )
             return None
     else:
         export_format = _pick_export_format(entry.export_info)
         if export_format is None:
             _count_skip(stats, "unsupported_type")
-            logger.warning(
-                "Skipping Dropbox file '%s' (%s): no text export format.", name, entry.id
-            )
             return None
         parse = _decode
 
+    if check_active is not None:
+        # Outside the try below: a revoked connection must stop the sync, not
+        # be counted as a failed download.
+        check_active()
     try:
         data = _fetch_bytes(client, entry.id, export_format)
     except ApiError as exc:
@@ -373,23 +387,19 @@ def _file_to_row(client, entry, config: _DropboxConfig, stats: dict[str, int]) -
             # listed (the next sync reports the deletion) or can never be
             # downloaded, like restricted content. Skip it, don't retry it.
             _count_skip(stats, "not_found" if lookup.is_not_found() else "unavailable")
-            logger.warning("Skipping Dropbox file '%s' (%s): %s", name, entry.id, exc)
             return None
         stats["failed"] += 1
-        logger.warning("Dropbox file '%s' (%s) failed to download: %s", name, entry.id, exc)
         return None
-    except Exception as exc:
+    except Exception:
         stats["failed"] += 1
-        logger.warning("Dropbox file '%s' (%s) failed to download: %s", name, entry.id, exc)
         return None
 
     try:
         text = parse(data)
-    except Exception as exc:
+    except Exception:
         # A corrupt file fails the same way every time, so skip it rather than
         # blocking the cursor forever.
         _count_skip(stats, "unparseable")
-        logger.warning("Skipping Dropbox file '%s' (%s): could not parse: %s", name, entry.id, exc)
         return None
     if not text.strip():
         _count_skip(stats, "empty_content")
@@ -540,7 +550,7 @@ def dropbox_source(
     )
     def dropbox_files():
         yield from dlt_utils.guarded_rows(
-            _iter_rows(dropbox_client, config, dlt.current.resource_state(), stats),
+            _iter_rows(dropbox_client, config, dlt.current.resource_state(), stats, check_active),
             check_active,
         )
 

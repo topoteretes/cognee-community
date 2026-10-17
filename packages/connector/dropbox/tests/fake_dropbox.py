@@ -44,6 +44,8 @@ class FakeDropbox:
         self.download_errors: dict[str, Exception] = {}
         self.downloads: list[str] = []
         self.exports: list[tuple[str, str]] = []
+        # Every SDK call the connector made, in order, by method name.
+        self.api_calls: list[str] = []
         self._pages: dict[str, tuple[list, str]] = {}
         self._ids = 0
         self._revs = 0
@@ -97,6 +99,7 @@ class FakeDropbox:
     # SDK surface used by the connector
     # ------------------------------------------------------------------
     def files_list_folder(self, path, recursive=False, limit=None, **_kwargs):
+        self.api_calls.append("list_folder")
         if self.list_errors:
             raise self.list_errors.pop(0)
         assert recursive, "the connector always lists recursively"
@@ -112,6 +115,7 @@ class FakeDropbox:
         return self._page(entries, self._cursor(path))
 
     def files_list_folder_continue(self, cursor):
+        self.api_calls.append("list_folder_continue")
         if self.continue_errors:
             raise self.continue_errors.pop(0)
         if cursor in self._pages:
@@ -130,6 +134,7 @@ class FakeDropbox:
         return self._page(entries, self._cursor(path))
 
     def files_download(self, path):
+        self.api_calls.append("download")
         meta = self._by_id(path)
         self.downloads.append(path)
         if path in self.download_errors:
@@ -137,6 +142,7 @@ class FakeDropbox:
         return meta, FakeResponse(self.content[meta.id])
 
     def files_export(self, path, export_format=None):
+        self.api_calls.append("export")
         meta = self._by_id(path)
         self.exports.append((path, export_format))
         if path in self.download_errors:

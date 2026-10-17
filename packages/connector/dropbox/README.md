@@ -108,6 +108,13 @@ failed, deleted), never file names or content.
 - **Failed downloads are retried.** If a file fails to download, the cursor is held back,
   so the same changes are replayed next run. Files that can never be downloaded, like
   restricted content, are skipped instead of blocking the cursor.
+- **One failing folder fails the run.** Folders are not independent here: a file moved
+  from one synced folder into another shows up as a delete in the first. If the second
+  folder could not be read, the move would look like a delete, so the run stops before
+  anything is emitted and dlt keeps the previous state.
+- **Host checkpoint:** `check_active` runs before every Dropbox request, outside any error
+  handling, so a revoked connection stops the sync between two calls and is never counted
+  as a failed file.
 
 ## Privacy
 
@@ -118,7 +125,8 @@ failed, deleted), never file names or content.
   like any other document you add to cognee. Choose local models if that matters.
 - dlt state stores folder cursors and the `path_lower -> id` index, so file **paths** are
   kept locally; contents are not.
-- Logs and sync stats never include file contents. Skip warnings include the file name.
+- Logs and sync stats carry counts and skip reasons only: never file contents, names,
+  paths or Dropbox ids.
 - Keep the refresh token out of your repo. Revoke it any time in Dropbox under
   **Settings → Connected apps**.
 
@@ -144,9 +152,12 @@ through cursors.
 - `test_dropbox_sync.py` covers first sync, pagination, edits, moves (within, between
   and out of synced folders), file and folder deletes, a path reused by a new file,
   cursor reset, a vanished folder, listing errors that must not delete, failed downloads
-  and their replay, restricted files, PDF and Paper export, skip reasons and folder
-  configuration.
+  and their replay, restricted files, PDF and Paper export, skip reasons, folder
+  configuration, `check_active` before every request (listing pages, incremental rounds and
+  downloads) and never swallowed by the download error handling, and no file names, paths
+  or ids in the logs.
 - `test_dropbox_source.py` covers `dropbox_source()` itself: credentials, refusing an empty
   folder list, folder normalization and the document-mode and pipeline-scope markers.
-- `test_dropbox_forget.py` runs the real cognee pipeline (LLM and embeddings mocked) and
-  checks that a deleted file and a deleted folder leave the graph while a moved file stays.
+- `test_dropbox_forget.py` runs the real cognee pipeline (LLM and embeddings mocked,
+  working with both cognee model variants, including the one used with Gemini) and checks
+  that a deleted file and a deleted folder leave the graph while a moved file stays.
