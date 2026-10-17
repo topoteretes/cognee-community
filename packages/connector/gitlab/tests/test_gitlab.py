@@ -81,6 +81,19 @@ def test_http_failures_do_not_expose_response_body(status):
         assert "test-secret" not in str(exc.value)
 
 
+def test_rate_limit_reports_clear_error_without_retrying():
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(429, headers={"Retry-After": "30"}, text="test-secret")
+
+    with client_for(handler) as client, pytest.raises(GitLabAPIError) as exc:
+        _validate_token(client)
+    assert str(exc.value) == "GitLab rate limit reached. Retry the sync later."
+    assert len(requests) == 1
+
+
 def test_project_pagination():
     def handler(request):
         assert request.url.path == "/prefix/api/v4/projects"

@@ -32,6 +32,9 @@ Discovery uses keyset pagination on `GET /api/v4/projects` to list all accessibl
 public projects. There is no mandatory `project_ids` parameter. HTTP failures,
 redirects, timeouts, and malformed responses abort the operation rather than
 being interpreted as empty results. No response bodies or tokens are logged.
+HTTP 429 raises a specific rate-limit error without waiting or retrying. A
+rate-limited fetch preserves existing staged documents and sync checkpoints;
+rerun the sync later.
 
 When `issues` is selected, the connector reads `/projects/:id/issues` for each
 discovered project, with `scope=all`, `state=all`, and offset pagination. It

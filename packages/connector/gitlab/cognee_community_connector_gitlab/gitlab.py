@@ -32,6 +32,8 @@ def _get_json(client: httpx.Client, path: str, *, missing_ok: bool = False, **kw
         raise GitLabAPIError("GitLab denied access. Check read_api scope and project permissions.")
     if response.status_code == 404 and missing_ok:
         return None
+    if response.status_code == 429:
+        raise GitLabAPIError("GitLab rate limit reached. Retry the sync later.")
     if response.status_code != 200:
         raise GitLabAPIError(f"GitLab read failed with HTTP {response.status_code}.")
     try:
