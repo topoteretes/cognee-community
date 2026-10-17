@@ -128,11 +128,12 @@ This connector reads customer data. Be clear about what it does:
 **What is read**
 
 - Tickets: subject, status, priority, source, type, tags, created and updated time, the
-  description, the requester's name and email, and the text of public replies.
+  description, the requester's name, and the text of public replies. Freshdesk also returns
+  the requester's email; it is dropped and never stored.
 - Private notes only with `include_private_notes=True`.
 - Published solution articles: title, location (category and folders), tags and text.
-- Not read: attachments, draft articles, contacts and companies beyond the requester's name
-  and email, satisfaction ratings, time entries.
+- Not read: attachments, draft articles, contacts and companies beyond the requester's name,
+  satisfaction ratings, time entries.
 - The connector only sends `GET` requests. It never changes anything in Freshdesk.
 
 **Where it goes**

@@ -107,7 +107,7 @@ def test_ticket_row_shape_and_content(fd):
         "content": (
             f"Freshdesk ticket #{ticket}: Login fails after password reset\n"
             "Status: Open. Priority: Low. Source: Phone. Type: Problem\n"
-            "Requester: Meera Joshi <meera@example.com>\n"
+            "Requester: Meera Joshi\n"
             "Tags: login, sso\n"
             f"Created: {t['created_at']}. Updated: {t['updated_at']}\n\n"
             "I reset my password but the login page still says invalid credentials.\n\n"
@@ -117,6 +117,24 @@ def test_ticket_row_shape_and_content(fd):
         "url": f"https://{HOST}/a/tickets/{ticket}",
         "_deleted": False,
     }
+
+
+@pytest.mark.parametrize(
+    "requester",
+    [
+        {"id": 901, "name": "Ravi Kumar", "email": "ravi@example.com"},
+        {"id": 902, "name": "ravi@example.com", "email": "ravi@example.com"},
+        {"id": 903, "name": None, "email": "ravi@example.com"},
+    ],
+)
+def test_requester_email_never_reaches_the_document(fd, requester):
+    ticket = fd.put_ticket("Invoice question", requester=requester)
+
+    upserts, _, _ = sync(fd, {}, _Config(articles=False))
+
+    content = upserts[tid(ticket)]["content"]
+    assert "ravi@example.com" not in content
+    assert ("Requester: Ravi Kumar\n" in content) == (requester["name"] == "Ravi Kumar")
 
 
 def test_custom_status_shows_its_number_instead_of_a_guess(fd):

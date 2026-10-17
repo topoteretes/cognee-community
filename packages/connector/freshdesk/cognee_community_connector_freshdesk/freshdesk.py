@@ -475,10 +475,10 @@ def _label(names: dict[int, str], value) -> str:
 
 
 def _person(person: dict) -> str:
-    name, email = person.get("name"), person.get("email")
-    if name and email and name != email:
-        return f"{name} <{email}>"
-    return email or name or ""
+    # Name only: the graph doesn't need customer emails.  A contact without a
+    # name can have its email as the name, so that is dropped too.
+    name = person.get("name") or ""
+    return "" if "@" in name else name
 
 
 # ---------------------------------------------------------------------------
