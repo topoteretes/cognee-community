@@ -40,6 +40,7 @@ sync time, no counts, no ``updatedDate``, comments and fields in a fixed order),
 so re-syncing an unchanged task never churns the graph.
 """
 
+import hashlib
 import json
 import os
 import tempfile
@@ -69,6 +70,9 @@ _FOLDER_BATCH = _TASK_BATCH = 100
 # between this machine and Wrike. Re-reading a task is harmless under merge.
 _CURSOR_OVERLAP = timedelta(minutes=5)
 TASK_FIELDS = ["description", "customFields", "parentIds", "responsibleIds", "superTaskIds"]
+# What the id sweep asks for on top of the defaults (which include the title):
+# enough to work out each task's folder and parent-task lines without content.
+_LISTING_FIELDS = ["parentIds", "superTaskIds"]
 
 _MAX_RETRIES = 5
 _MAX_RETRY_DELAY = 60.0
@@ -333,19 +337,20 @@ class _FolderTree:
         live = {f["id"]: f for f in folders if f.get("scope") in ("WsRoot", "WsFolder")}
         self.root_id = next(fid for fid, f in live.items() if f["scope"] == "WsRoot")
         self.folders = live
-        # ponytail: a folder shared into two parents gets one path, the first seen.
-        self.parent: dict[str, str] = {}
+        # A folder can sit in several parents, like a task (tested with addParents).
+        self.parents: dict[str, list[str]] = {}
         for fid, folder in live.items():
             for child in folder.get("childIds", []):
                 if child in live:
-                    self.parent.setdefault(child, fid)
+                    self.parents.setdefault(child, []).append(fid)
 
-    def path(self, folder_id: str) -> str:
-        titles = []
-        while folder_id in self.folders and folder_id != self.root_id:
-            titles.append(self.folders[folder_id]["title"])
-            folder_id = self.parent.get(folder_id, self.root_id)
-        return " / ".join(reversed(titles))
+    def paths(self, folder_id: str) -> list[str]:
+        """Every path from a space down to ``folder_id``, sorted; none for the root."""
+        if folder_id == self.root_id or folder_id not in self.folders:
+            return []
+        title = self.folders[folder_id]["title"]
+        above = {p for parent in self.parents.get(folder_id, []) for p in self.paths(parent)}
+        return sorted(f"{p} / {title}" for p in above) or [title]
 
     def subtree(self, roots: list[str]) -> list[str]:
         seen: list[str] = []
@@ -402,6 +407,24 @@ def _custom_field_lines(values: list[dict], names: _Names) -> list[str]:
     return _lines(sorted(rendered))
 
 
+def _task_context(task: dict, tree: _FolderTree, task_titles: dict[str, str]) -> list:
+    """The lines of a task's document that come from other objects.
+
+    Renaming a folder, moving it or adding it to a second parent, or renaming
+    a parent task, changes them without touching the task's own
+    ``updatedDate`` (tested), so the sync compares them on every run instead.
+    """
+    folders = sorted({p for fid in task.get("parentIds", []) for p in tree.paths(fid)})
+    # A subtask's parentIds is the account root; its real home is the parent task.
+    parents = sorted(t for t in (task_titles.get(i) for i in task.get("superTaskIds", [])) if t)
+    return [("Folder", "; ".join(folders)), ("Parent task", ", ".join(parents))]
+
+
+def _digest(context: Any) -> str:
+    # Kept per row in dlt state, so store a short hash rather than the text.
+    return hashlib.sha256(json.dumps(context).encode()).hexdigest()[:16]
+
+
 def render_task(
     task: dict,
     comments: list[dict],
@@ -410,12 +433,8 @@ def render_task(
     task_titles: dict[str, str],
 ) -> dict:
     dates = task.get("dates") or {}
-    folders = sorted(p for p in (tree.path(fid) for fid in task.get("parentIds", [])) if p)
-    # A subtask's parentIds is the account root; its real home is the parent task.
-    parents = sorted(t for t in (task_titles.get(i) for i in task.get("superTaskIds", [])) if t)
     fields = [
-        ("Folder", "; ".join(folders)),
-        ("Parent task", ", ".join(parents)),
+        *_task_context(task, tree, task_titles),
         ("Status", names.statuses.get(task.get("customStatusId"), task.get("status", ""))),
         ("Assignees", ", ".join(sorted(names.person(i) for i in task.get("responsibleIds", [])))),
         ("Importance", task.get("importance", "")),
@@ -447,7 +466,7 @@ def render_task(
 def render_folder(folder: dict, tree: _FolderTree, names: _Names) -> dict:
     project = folder.get("project") or {}
     fields = [
-        ("Path", tree.path(folder["id"])),
+        ("Path", "; ".join(tree.paths(folder["id"]))),
         ("Project status", names.statuses.get(project.get("customStatusId"), "")),
         ("Owners", ", ".join(sorted(names.person(i) for i in project.get("ownerIds", [])))),
     ]
@@ -494,7 +513,8 @@ def _iter_rows(
     ``state`` is dlt's per-resource state (a plain dict in tests):
 
     * ``cursor``: the time captured *before* the previous run started listing;
-    * ``seen``: the row ids currently ingested.
+    * ``seen``: each ingested row id, mapped to a hash of the document lines
+      that come from other objects (folder paths, parent-task titles).
 
     State is only written after the last row is yielded, so a run that fails
     part way changes nothing and the next run starts from the same state.
@@ -506,9 +526,13 @@ def _iter_rows(
     to the token. The Recycle Bin alone cannot see all of these; a deleted
     folder's tasks even keep the folder as their parent.
 
-    Content is fetched only for what is new to the listing or changed since
+    Content is fetched only for what is new to the listing, changed since
     ``cursor`` (minus a small overlap for clock drift; merge makes a re-read
-    harmless). A first run and ``full_resync`` fetch everything.
+    harmless), or shown under a folder path or parent-task title that changed.
+    Wrike does not bump ``updatedDate`` below a renamed or moved folder or
+    under a renamed parent task (tested), so the listing carries each task's
+    parents and the hashes are compared. A first run and ``full_resync``
+    fetch everything.
     """
     started = now()
     tree = _FolderTree(client.get("/folders"))
@@ -519,7 +543,7 @@ def _iter_rows(
         raise ValueError(f"Unknown or deleted Wrike folder id(s): {', '.join(unknown)}.")
     names = _Names.load(client)
     scope = [fid for fid in tree.subtree(roots) if fid != tree.root_id]
-    seen = set(state.get("seen", []))
+    seen: dict[str, str] = state.get("seen", {})
     incremental = not full_resync and state.get("cursor") is not None
 
     tasks: dict[str, dict] = {}
@@ -528,61 +552,80 @@ def _iter_rows(
         since = {"updatedDate": {"start": _stamp(cursor - _CURSOR_OVERLAP)}}
         # The id sweep first: a task created or moved in after it is caught by
         # the next run, never deleted by mistake.
-        listed = {
-            t["id"]
-            for root in roots
-            for t in client.get(
-                f"/folders/{root}/tasks", descendants=True, subTasks=True, pageSize=PAGE_SIZE
-            )
-        }
+        listing: dict[str, dict] = {}
+        for root in roots:
+            for task in client.get(
+                f"/folders/{root}/tasks",
+                descendants=True,
+                subTasks=True,
+                fields=_LISTING_FIELDS,
+                pageSize=PAGE_SIZE,
+            ):
+                listing.setdefault(task["id"], task)
         for root in roots:
             for task in client.get(f"/folders/{root}/tasks", **_task_query(**since)):
                 tasks.setdefault(task["id"], task)
-        # New to the listing without being edited: its folder moved into scope,
-        # or the token was given access.
-        new = sorted(t for t in listed - tasks.keys() if f"task:{t}" not in seen)
-        for start in range(0, len(new), _TASK_BATCH):
-            for task in client.get(f"/tasks/{','.join(new[start : start + _TASK_BATCH])}"):
-                tasks.setdefault(task["id"], task)
-        changed_folders = {f["id"] for f in client.get("/folders", **since)}
-        folders_to_render = [
-            fid for fid in scope if fid in changed_folders or f"folder:{fid}" not in seen
-        ]
     else:
         for root in roots:
             for task in client.get(f"/folders/{root}/tasks", **_task_query()):
                 tasks.setdefault(task["id"], task)
-        listed = set(tasks)
+        listing = tasks
+
+    known = {**listing, **tasks}
+    task_titles = {tid: task.get("title", "") for tid, task in known.items()}
+    # A subtask can be in scope without its parent task; fetch those titles so
+    # its document is the same whichever run renders it.
+    missing = sorted({p for t in known.values() for p in t.get("superTaskIds", [])} - known.keys())
+    for start in range(0, len(missing), _TASK_BATCH):
+        for parent in client.get(f"/tasks/{','.join(missing[start : start + _TASK_BATCH])}"):
+            task_titles[parent["id"]] = parent.get("title", "")
+
+    if incremental:
+        # New to the listing (moved into scope, or shared with the token), or
+        # its folder or parent-task lines changed: fetch it even if unedited.
+        stale = sorted(
+            tid
+            for tid, task in listing.items()
+            if tid not in tasks
+            and seen.get(f"task:{tid}") != _digest(_task_context(task, tree, task_titles))
+        )
+        for start in range(0, len(stale), _TASK_BATCH):
+            for task in client.get(f"/tasks/{','.join(stale[start : start + _TASK_BATCH])}"):
+                tasks.setdefault(task["id"], task)
+        changed_folders = {f["id"] for f in client.get("/folders", **since)}
+        folders_to_render = [
+            fid
+            for fid in scope
+            if fid in changed_folders or seen.get(f"folder:{fid}") != _digest(tree.paths(fid))
+        ]
+    else:
         folders_to_render = scope
 
-    yielded: set[str] = set()
+    rendered: dict[str, str] = {}
     for start in range(0, len(folders_to_render), _FOLDER_BATCH):
         batch = folders_to_render[start : start + _FOLDER_BATCH]
         for folder in client.get(f"/folders/{','.join(batch)}"):
             row = render_folder(folder, tree, names)
-            yielded.add(row["id"])
+            rendered[row["id"]] = _digest(tree.paths(folder["id"]))
             yield row
 
-    task_titles = {tid: task.get("title", "") for tid, task in tasks.items()}
-    # An incremental run may re-render a subtask whose parent did not change;
-    # fetch those parents' titles so the document stays the same as a full run's.
-    missing = sorted({p for t in tasks.values() for p in t.get("superTaskIds", [])} - tasks.keys())
-    for start in range(0, len(missing), _TASK_BATCH):
-        for parent in client.get(f"/tasks/{','.join(missing[start : start + _TASK_BATCH])}"):
-            task_titles[parent["id"]] = parent.get("title", "")
     for task in tasks.values():
         comments = client.get(f"/tasks/{task['id']}/comments")
         row = render_task(task, comments, tree, names, task_titles)
-        yielded.add(row["id"])
+        rendered[row["id"]] = _digest(_task_context(task, tree, task_titles))
         yield row
 
-    in_scope = {f"folder:{fid}" for fid in scope} | {f"task:{tid}" for tid in listed}
-    deleted = seen - in_scope - yielded
+    in_scope = {f"folder:{fid}" for fid in scope} | {f"task:{tid}" for tid in listing}
+    deleted = set(seen) - in_scope - rendered.keys()
     for row_id in sorted(deleted):
         yield {"id": row_id, "_deleted": True}
 
     state["cursor"] = _stamp(started)
-    state["seen"] = sorted((seen | yielded) - deleted)
+    state["seen"] = {
+        row_id: digest
+        for row_id, digest in sorted({**seen, **rendered}.items())
+        if row_id not in deleted
+    }
     logger.info(
         "Wrike: %s sync, %d folder(s), %d task(s), %d deletion(s).",
         "incremental" if incremental else "full",

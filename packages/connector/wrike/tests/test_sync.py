@@ -32,7 +32,7 @@ def test_first_run_lists_everything_and_saves_the_cursor(account):
     assert rows == {"folder:A", "folder:A1", "folder:B", "task:T1", "task:T2", "task:T3"}
     assert deletes == set()
     assert state["cursor"] == stamp(T0)
-    assert state["seen"] == sorted(rows)
+    assert set(state["seen"]) == rows
 
 
 def test_no_changes_means_nothing_is_synced(account, state):
@@ -89,6 +89,63 @@ def test_subtask_keeps_its_parent_title_when_only_it_changes(account, state):
     assert set(later) == {"task:SUB"}
     assert "Parent task: Task T1" in later["task:SUB"]["content"]
     assert "Parent task: Task T1" in first["task:SUB"]["content"]
+
+
+def content(account, state):
+    rows = _iter_rows(account, None, state, now=lambda: account.clock)
+    result = {r["id"]: r["content"] for r in rows if not r["_deleted"]}
+    account.tick()
+    return result
+
+
+def test_renamed_folder_re_renders_everything_below_it(account, state):
+    # Wrike bumps only the renamed folder's updatedDate, not its subfolders' or tasks'.
+    account.rename_folder("A", "Apex")
+    account.tick()  # outside the next run's overlap window
+    rows = content(account, state)
+    assert set(rows) == {"folder:A", "folder:A1", "task:T1", "task:T2"}
+    assert "Path: Apex / Alpha child" in rows["folder:A1"]
+    assert "Folder: Apex / Alpha child" in rows["task:T2"]
+    assert content(account, state) == {}
+
+
+def test_renamed_parent_task_re_renders_its_subtasks(account, state):
+    account.add_task("SUB", ["ROOT"], super_task="T1")
+    account.tick()
+    content(account, state)
+    account.touch("T1", title="Database")
+    account.tick()  # outside the next run's overlap window
+    rows = content(account, state)
+    assert set(rows) == {"task:T1", "task:SUB"}
+    assert "Parent task: Database" in rows["task:SUB"]
+    assert content(account, state) == {}
+
+
+def test_moved_folder_re_renders_the_paths_below_it(account, state):
+    account.move_folder("A1", "B")
+    rows = content(account, state)
+    assert set(rows) == {"folder:A1", "task:T2"}
+    assert "Folder: Beta / Alpha child" in rows["task:T2"]
+
+
+def test_folder_in_two_places_shows_every_path(account, state):
+    account.add_folder_parent("A1", "B")
+    rows = content(account, state)
+    assert set(rows) == {"folder:A1", "task:T2"}
+    assert "Path: Alpha / Alpha child; Beta / Alpha child" in rows["folder:A1"]
+    assert "Folder: Alpha / Alpha child; Beta / Alpha child" in rows["task:T2"]
+
+
+def test_task_losing_one_of_two_folders_drops_that_path(account):
+    # Deleting A1 removes it from T2's parents without bumping T2's updatedDate.
+    account.tasks["T2"]["parentIds"].append("B")
+    state = {}
+    sync(account, state)
+    account.delete_folder("A1")
+    rows = _iter_rows(account, None, state, now=lambda: account.clock)
+    rows = {r["id"]: r for r in rows}
+    assert rows["folder:A1"]["_deleted"]
+    assert rows["task:T2"]["content"].startswith("Folder: Beta\n")
 
 
 def test_task_moved_out_of_scope_is_forgotten_and_comes_back_when_moved_in(account):

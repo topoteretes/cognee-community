@@ -8,6 +8,9 @@ task that loses one of two folders to a folder delete keeps its ``updatedDate``.
 from datetime import UTC, datetime, timedelta
 
 T0 = datetime(2026, 10, 15, 9, 0, tzinfo=UTC)
+# Left out of task listings unless asked for with ``fields`` (as tested; the
+# title is always there).
+OPTIONAL_TASK_FIELDS = {"description", "parentIds", "superTaskIds"}
 
 
 def stamp(moment):
@@ -67,6 +70,14 @@ class FakeAccount:
     def delete_task(self, tid):
         self.touch(tid, scope="RbTask")
 
+    def rename_folder(self, fid, title):
+        # Only the folder's own updatedDate moves, not its subfolders' or tasks' (tested).
+        self.folders[fid].update(title=title, updatedDate=stamp(self.clock))
+
+    def add_folder_parent(self, fid, parent):
+        self.folders[parent]["childIds"].append(fid)
+        self.folders[fid]["updatedDate"] = stamp(self.clock)
+
     def move_folder(self, fid, new_parent):
         for folder in self.folders.values():
             if fid in folder["childIds"]:
@@ -112,7 +123,10 @@ class FakeAccount:
                 for t in self.tasks.values()
                 if t["scope"] == "WsTask" and scope & set(t["parentIds"])
             ]
-            return self._since(found, params)
+            hidden = OPTIONAL_TASK_FIELDS - set(params.get("fields", []))
+            return [
+                {k: v for k, v in t.items() if k not in hidden} for t in self._since(found, params)
+            ]
         if path.startswith("/folders/"):
             return [self.folders[fid] for fid in path.split("/")[2].split(",")]
         if path.endswith("/comments"):

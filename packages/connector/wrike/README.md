@@ -59,7 +59,9 @@ curl -s -H "Authorization: bearer $WRIKE_ACCESS_TOKEN" https://www.wrike.com/api
 The cursor (the time the last run started) and the ids already ingested are kept in dlt's
 per-resource state, separately for each dataset. Every run lists the ids of all tasks in scope
 (one light request per 1,000 tasks) and fetches full content only for tasks changed since the
-cursor or new to the listing; the first run fetches everything. Anything ingested but no longer
+cursor, new to the listing, or shown under a folder path or parent-task title that changed (Wrike
+does not mark the tasks below a renamed or moved folder, or the subtasks of a renamed task, as
+updated); the first run fetches everything. Anything ingested but no longer
 listed is emitted as a `_deleted` hard-delete row, which dlt drops on `merge` and cognee's
 `orphan_cleanup` removes from the graph, vector and relational stores. That covers a task that
 was deleted (even purged from the Recycle Bin), moved out of the selected folders, removed with
@@ -131,9 +133,8 @@ dedicated dataset so you can wipe it with a single `cognee.forget`.
 
 ## Limitations
 
-- Renaming a folder or a parent task updates the documents below it when those tasks next
-  change, or on `full_resync=True`.
-- A folder that sits in two places is shown under one path.
+- Renaming a status, a person or a custom field updates the documents that show it when they
+  next change, or on `full_resync=True`.
 - Attachments are not ingested. *Link to database* custom fields are left out: the API returns
   only record ids, which it cannot resolve to names.
 - Two syncs must not share one OAuth token file at the same time: the first refresh invalidates
