@@ -99,7 +99,7 @@ come from the normal boto3 chain (env vars, `~/.aws`, an instance, task or Lambd
 | Provisioned, IAM identity | `database`, `cluster_identifier` | as above, without `REDSHIFT_DB_USER` |
 | Either, database user and password in Secrets Manager | add `secret_arn` | `REDSHIFT_SECRET_ARN` |
 
-Set the region with `region_name=` or `AWS_REGION`. No password is ever passed to the
+Set the region with `region_name=`, `AWS_REGION`, or your AWS profile (`AWS_DEFAULT_REGION`). No password is ever passed to the
 connector: the Data API gets temporary credentials or reads the secret itself.
 
 ### 2. Allow the Data API calls
@@ -282,6 +282,16 @@ connection = DirectConnection(
 - dlt keeps the cursors outside cognee's data. If you prune cognee's data but keep the dlt
   pipeline directory, run once with `full_refresh=True`.
 - Table cards come from `svv_all_tables` and `svv_all_columns`. Queries have no card.
+
+## Trying it on a real Redshift
+
+`examples/seed.sql` creates the `public.support_tickets` table (with table and column comments)
+that `examples/example.py` reads. Paste it into Query Editor v2 and run it, then set the
+`REDSHIFT_*` variables from the example's docstring and run the example. Change or delete a
+ticket in Query Editor v2 and run the example again to see the cursor and forget-on-delete.
+
+Redshift Serverless has a free trial for new users, so a short test costs little. Delete the
+workgroup, namespace and secret afterwards: charges only stop once they are gone.
 
 ## Testing
 
