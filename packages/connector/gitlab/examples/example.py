@@ -19,6 +19,7 @@ async def main():
         dataset_name="gitlab",
         primary_key="id",
         write_disposition="merge",
+        max_rows_per_table=0,
         run_in_background=False,
     )
 

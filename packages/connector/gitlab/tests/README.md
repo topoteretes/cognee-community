@@ -2,17 +2,15 @@
 
 `test_gitlab.py` covers token validation, project discovery, resource selection,
 and issue/MR/wiki fetching with mocked HTTP responses. `test_documents.py`
-checks resource mapping, and `test_source.py` verifies source integration,
-account scoping, and DLT merge loading into temporary SQLite staging. These tests do not
-require a token or network access. Run `uv run pytest tests/` from the package
-directory.
+checks resource mapping. `test_sync.py` exercises checkpoints, overlap, timestamp
+ties, wiki hashes, verified deletion candidates, pagination-race retention, and
+failure atomicity, and whole-project cleanup (including hidden projects returning
+404). `test_source.py` verifies account scoping, DLT state persistence
+across pipeline instances, merge updates, and hard deletions in temporary SQLite
+staging. These tests require no credentials or network access.
 
-Further coverage will accompany the remaining implementation:
+Run `uv run pytest tests/` from this package directory.
 
-- Authentication and access failures versus successfully empty results.
-- Resource selection and document rendering for issues, MRs, comments, and wikis.
-- Pagination, rate limits, retries, and configurable instance URLs.
-- Incremental cursors, timestamp ties, and comment-only edits/deletions.
-- Wiki edits and renames.
-- Verified deletions; preserve prior memory on incomplete or unauthorized reads.
-- Integration with document-mode ingestion and downstream deletion cleanup.
+Remaining coverage depends on future work: comment-only updates/deletions,
+retry handling, and live GitLab-to-Cognee graph integration. The local staging
+tests do not exercise LLM extraction or graph/vector deletion cleanup.

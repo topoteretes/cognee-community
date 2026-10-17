@@ -25,8 +25,11 @@ def token_metadata(**updates):
     }
 
 
+HTTPClient = httpx.Client
+
+
 def client_for(handler):
-    return httpx.Client(
+    return HTTPClient(
         base_url="https://gitlab.example/prefix/api/v4/",
         headers={"PRIVATE-TOKEN": "test-secret"},
         transport=httpx.MockTransport(handler),
@@ -139,11 +142,17 @@ def test_source_validates_before_discovery():
     with (
         patch(
             "cognee_community_connector_gitlab.gitlab.httpx.Client",
-            return_value=client_for(handler),
+            side_effect=lambda **kwargs: client_for(handler),
         ),
     ):
-        gitlab_source("test-secret", resource_types=["issues"])
-    assert paths == ["/prefix/api/v4/personal_access_tokens/self", "/prefix/api/v4/projects"]
+        source = gitlab_source("test-secret", resource_types=["issues"])
+        assert paths == ["/prefix/api/v4/personal_access_tokens/self"]
+        list(source)
+    assert paths == [
+        "/prefix/api/v4/personal_access_tokens/self",
+        "/prefix/api/v4/personal_access_tokens/self",
+        "/prefix/api/v4/projects",
+    ]
 
 
 def test_empty_selection_rejected_before_network():
@@ -169,7 +178,7 @@ def test_invalid_token_stops_discovery():
     with (
         patch(
             "cognee_community_connector_gitlab.gitlab.httpx.Client",
-            return_value=client_for(handler),
+            side_effect=lambda **kwargs: client_for(handler),
         ),
         pytest.raises(GitLabAPIError),
     ):
@@ -253,11 +262,15 @@ def test_source_fetches_only_selected_resources(selection):
     with (
         patch(
             "cognee_community_connector_gitlab.gitlab.httpx.Client",
-            return_value=client_for(handler),
+            side_effect=lambda **kwargs: client_for(handler),
         ),
     ):
-        gitlab_source("test-secret", resource_types=selection)
-    expected = ["/prefix/api/v4/personal_access_tokens/self", "/prefix/api/v4/projects"]
+        list(gitlab_source("test-secret", resource_types=selection))
+    expected = [
+        "/prefix/api/v4/personal_access_tokens/self",
+        "/prefix/api/v4/personal_access_tokens/self",
+        "/prefix/api/v4/projects",
+    ]
     for project_id in (42, 105):
         for resource, endpoint in (
             ("issues", "issues"),

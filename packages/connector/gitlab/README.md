@@ -2,11 +2,10 @@
 
 Python connector for [cognee issue #4709](https://github.com/topoteretes/cognee/issues/4709).
 
-**Status:** PAT validation, paginated project discovery, issue and merge request
-fetching, wiki page fetching, and document-mode DLT integration are implemented.
-`gitlab_source()` validates the token, fetches selected resources, maps them using
-`documents.py`, and returns a source for `cognee.remember()`. Comments, incremental
-fetching, and upstream deletion reconciliation remain unimplemented.
+**Status:** legacy PAT validation, project discovery, issue/MR/wiki fetching,
+DLT document ingestion, persistent checkpoints, and resource deletion reconciliation
+are implemented. Comments remain unimplemented. `gitlab_source()` validates the
+PAT immediately; fetching and mapping happen during DLT extraction.
 
 This folder is staged in the core cognee checkout for development. Its intended
 contribution location is `packages/connector/gitlab/` in cognee-community.
@@ -37,12 +36,12 @@ being interpreted as empty results. No response bodies or tokens are logged.
 When `issues` is selected, the connector reads `/projects/:id/issues` for each
 discovered project, with `scope=all`, `state=all`, and offset pagination. It
 maps the issue payloads into documents. A failed page aborts the operation.
-This is a full fetch, not yet an
-incremental sync or a deletion inventory safe against concurrent upstream edits.
+Later runs apply `updated_after` from the saved per-project issue checkpoint.
 
 When `merge_requests` is selected, the connector reads `/projects/:id/merge_requests`
 with `scope=all`, `state=all`, and offset pagination, including closed and merged
-MRs. Issues and MRs share pagination and identity validation helpers.
+MRs. Issues and MRs share pagination and identity validation helpers. Later MR
+fetches also use their own `updated_after` checkpoint.
 
 When `wiki` is selected, the connector reads `/projects/:id/wikis?with_content=1`.
 GitLab returns the entire wiki page list without pagination. Pages are identified
@@ -92,6 +91,7 @@ await cognee.remember(
     dataset_name="gitlab",
     primary_key="id",
     write_disposition="merge",
+    max_rows_per_table=0,
     run_in_background=False,
 )
 ```
@@ -101,18 +101,58 @@ cognee's default is `replace`. The source declares document mode so each row is
 processed as prose, rather than a relational schema manifest. A compatible core
 must provide `DOCUMENT_SYNC_VERSION >= 1`.
 
-Fetching and mapping complete before the source is returned. This initial
-implementation buffers the documents in memory; recreate the source for each
-fresh ingestion. A failed fetch or mapping aborts before publishing a source.
-Staging table and pipeline names are scoped by instance URL, token owner ID, and
-resource selection. Token rotation preserves these names; different users,
-instances, and selections use separate staging scopes.
+## Persistent sync state
 
-Merge updates known document rows without treating missing upstream records as
-deletions. Removed records remain until deletion reconciliation is implemented.
-This is not yet a complete sync implementation. Resource visibility filtering
-also remains pending: currently readable confidential issues are included, so
-choose the destination dataset's permissions accordingly.
+`sync.py` coordinates fetching and reconciliation; `gitlab.py` contains HTTP
+helpers and the DLT entry point, and `documents.py` maps resource payloads.
+
+Inside the DLT resource, `dlt.current.resource_state()` holds per-project and
+per-resource checkpoints, document hashes, and upstream identities. Full document
+bodies are stored in staging, not in state. DLT persists state in its pipeline
+working directory (normally `~/.dlt/pipelines/<pipeline_name>/`) and destination
+`_dlt_pipeline_state` table. Keep the same destination and dataset across runs.
+Staging and pipeline names are scoped by instance URL, token owner ID, resource
+selection, and destination dataset. Token rotation preserves the scope.
+
+- First run: fetch all selected resources and establish a baseline.
+- Later issue/MR runs: use the greatest observed upstream `updated_at`, minus a
+  one-minute overlap, as `updated_after`. Each resource has its own cursor.
+  Invalid or timezone-free timestamps abort the run. Empty resources retain no
+  timestamp until an upstream record supplies one.
+- Wiki: fetch all pages and compare mapped-document hashes, since its listing
+  endpoint has no `updated_after` filter.
+- Only changed mapped documents are emitted; stable IDs and merge make replay
+  idempotent. Hashing also catches changes to project metadata rendered in text.
+- Deletion checks still fetch a complete unfiltered issue/MR inventory every
+  run. **This implementation reduces emitted documents, not total API traffic:**
+  inventories return full payloads, so a later run can make more API calls than
+  a full snapshot alone. GitLab does not supply a deletion feed here.
+- Previously known records absent from both inventory and delta are checked
+  individually. A successful individual read retains the record (protecting
+  against pagination races); HTTP 404 emits an `_deleted` hard-delete marker.
+  DLT removes the staged row on merge, and Cognee reconciles the retained corpus.
+  GitLab can also hide inaccessible records behind 404: this means removal from
+  the token's visible resource scope, not proof of a physical upstream deletion.
+- Previously known projects missing from discovery are checked with
+  `GET /projects/:id`. A 200 response keeps the project in the sync; a 404 emits
+  deletion markers for all its known documents and removes its saved checkpoints.
+  This covers deleted projects and projects hidden after access is revoked;
+  GitLab's 404 does not distinguish those cases. Cleanup runs on the next sync.
+  HTTP 401/403, failed pages, malformed payloads, and mapping errors abort the
+  run without publishing partial checkpoints or tombstones.
+
+The coordinator builds the next state separately and assigns it only after all
+reads, mapping, and row iteration finish. DLT owns extraction/load state and
+retry handling; the checkpoint is a staging checkpoint, not a guarantee that
+Cognee graph processing finished. Retained staging rows allow graph processing
+to be retried even when the next extraction has no changes.
+
+Always pass `write_disposition="merge"` and `max_rows_per_table=0` to
+`cognee.remember()`: replace would erase unchanged rows, and a row limit would
+truncate the corpus used for reconciliation. Recreate the source for each sync.
+Current scans buffer documents and bookkeeping in memory; large inventories
+will need a database-backed state strategy. Readable confidential issues are
+included, so choose the destination dataset's permissions accordingly.
 
 ## Development setup
 

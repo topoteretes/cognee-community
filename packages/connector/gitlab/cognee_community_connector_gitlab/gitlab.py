@@ -7,12 +7,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import httpx
 
-from .documents import (
-    _instance_url,
-    _issue_to_document,
-    _merge_request_to_document,
-    _wiki_to_document,
-)
+from .documents import _instance_url
 
 if TYPE_CHECKING:
     from dlt.extract.source import DltSource
@@ -24,7 +19,7 @@ class GitLabAPIError(RuntimeError):
     """GitLab could not complete a required read; never treat this as empty data."""
 
 
-def _get_json(client: httpx.Client, path: str, **kwargs) -> Any:
+def _get_json(client: httpx.Client, path: str, *, missing_ok: bool = False, **kwargs) -> Any:
     """Make a GitLab GET request and parse its successful JSON response."""
     try:
         response = client.get(path, **kwargs)
@@ -35,6 +30,8 @@ def _get_json(client: httpx.Client, path: str, **kwargs) -> Any:
         raise GitLabAPIError("GitLab rejected the token: invalid, expired, or revoked.")
     if response.status_code == 403:
         raise GitLabAPIError("GitLab denied access. Check read_api scope and project permissions.")
+    if response.status_code == 404 and missing_ok:
+        return None
     if response.status_code != 200:
         raise GitLabAPIError(f"GitLab read failed with HTTP {response.status_code}.")
     try:
@@ -92,28 +89,37 @@ def _discover_projects(client: httpx.Client) -> list[dict[str, Any]]:
             return projects
 
 
-def _fetch_issues(client: httpx.Client, project_id: int) -> list[dict[str, Any]]:
+def _fetch_issues(
+    client: httpx.Client, project_id: int, *, updated_after: str | None = None
+) -> list[dict[str, Any]]:
     """Fetch open and closed project issues, preserving their API payloads.
 
     Offset pagination supports older self-hosted GitLab releases as well.
     Errors abort the fetch rather than returning a partial issue inventory.
     """
-    return _fetch_project_items(client, project_id, "issues")
+    return _fetch_project_items(client, project_id, "issues", updated_after=updated_after)
 
 
-def _fetch_merge_requests(client: httpx.Client, project_id: int) -> list[dict[str, Any]]:
+def _fetch_merge_requests(
+    client: httpx.Client, project_id: int, *, updated_after: str | None = None
+) -> list[dict[str, Any]]:
     """Fetch project MRs in all states, including closed and merged MRs."""
-    return _fetch_project_items(client, project_id, "merge_requests")
+    return _fetch_project_items(client, project_id, "merge_requests", updated_after=updated_after)
 
 
 def _fetch_project_items(
-    client: httpx.Client, project_id: int, resource: Literal["issues", "merge_requests"]
+    client: httpx.Client,
+    project_id: int,
+    resource: Literal["issues", "merge_requests"],
+    *,
+    updated_after: str | None = None,
 ) -> list[dict[str, Any]]:
     """Read all pages of project issues or MRs, preserving their raw payloads."""
     items = []
     seen_ids = set()
     page_number = 1
     while True:
+        filters = {"updated_after": updated_after} if updated_after is not None else {}
         page = _get_json(
             client,
             f"projects/{project_id}/{resource}",
@@ -124,6 +130,7 @@ def _fetch_project_items(
                 "sort": "asc",
                 "per_page": 100,
                 "page": page_number,
+                **filters,
             },
         )
         if not isinstance(page, list):
@@ -181,12 +188,9 @@ def gitlab_source(
         base_url: GitLab instance URL, including self-hosted instances.
         resource_types: Required, non-empty selection of content types.
 
-    Validates the PAT and discovers all accessible projects (including public
-    projects), then fetches selected issues, merge requests, and wiki pages.
-    Fetching and mapping complete before returning the source, so failures do
-    not publish a partial inventory. This first version buffers documents in
-    memory and uses merge staging: it does not detect upstream deletions or
-    fetch only changes. Pass write_disposition="merge" to cognee.remember().
+    Validates the PAT immediately. Resource fetching runs during DLT extraction,
+    using per-project checkpoints in DLT resource state. Pass
+    write_disposition="merge" and max_rows_per_table=0 to cognee.remember().
     Comments are not implemented and selecting them raises before HTTP calls.
     """
     if not resource_types:
@@ -213,36 +217,19 @@ def gitlab_source(
         raise ValueError("base_url must be an HTTP(S) instance URL without credentials or query.")
     api_url = f"{str(url).rstrip('/')}/api/v4/"
     instance = _instance_url(str(url))
-    documents = []
-    with httpx.Client(
-        base_url=api_url,
-        headers={"PRIVATE-TOKEN": token},
-        timeout=30.0,
-        follow_redirects=False,
-    ) as client:
+    client_options = {
+        "base_url": api_url,
+        "headers": {"PRIVATE-TOKEN": token},
+        "timeout": 30.0,
+        "follow_redirects": False,
+    }
+    with httpx.Client(**client_options) as client:
         metadata = _validate_token(client)
         owner_id = metadata.get("user_id")
         if type(owner_id) is not int or owner_id <= 0:
             raise GitLabAPIError(
                 "GitLab token metadata requires a valid user_id for source isolation."
             )
-        projects = _discover_projects(client)
-        for project in projects:
-            if "issues" in selected:
-                documents.extend(
-                    _issue_to_document(issue, project, instance)
-                    for issue in _fetch_issues(client, project["id"])
-                )
-            if "merge_requests" in selected:
-                documents.extend(
-                    _merge_request_to_document(mr, project, instance)
-                    for mr in _fetch_merge_requests(client, project["id"])
-                )
-            if "wiki" in selected:
-                documents.extend(
-                    _wiki_to_document(page, project, instance)
-                    for page in _fetch_wiki_pages(client, project["id"])
-                )
 
     import dlt
     from cognee.tasks.ingestion import dlt_utils
@@ -257,10 +244,19 @@ def gitlab_source(
         name=resource_name,
         primary_key="id",
         write_disposition="merge",
-        columns={name: {"data_type": "text"} for name in ("id", "title", "content", "url")},
+        columns={
+            **{name: {"data_type": "text"} for name in ("id", "title", "content", "url")},
+            "_deleted": {"data_type": "bool", "hard_delete": True},
+        },
     )
     def gitlab_documents():
-        yield from documents
+        from .sync import sync_documents
+
+        with httpx.Client(**client_options) as client:
+            # A source can be extracted long after construction: recheck auth.
+            if _validate_token(client).get("user_id") != owner_id:
+                raise GitLabAPIError("GitLab token owner changed before extraction.")
+            yield from sync_documents(client, instance, selected, dlt.current.resource_state())
 
     @dlt.source(name=f"gitlab_{scope}")
     def source_factory():
