@@ -107,13 +107,52 @@ def _retrying_session(**client_kwargs):
     A rate limit can also arrive as a 200 whose error carries ``retry_in_seconds``.
     ``client_kwargs`` override dlt's retry settings (tests turn the backoff off).
     """
-    return Client(raise_for_status=False, retry_condition=_is_rate_limited, **client_kwargs).session
+    session = Client(
+        raise_for_status=False, retry_condition=_is_rate_limited, **client_kwargs
+    ).session
+    session.hooks["response"].append(_set_retry_after)
+    return session
 
 
 def _is_rate_limited(response, exception) -> bool:
     if response is None or response.status_code != 200:
         return False
     return any("retry_in_seconds" in _extensions(error) for error in _errors(response))
+
+
+def _set_retry_after(response, *args, **kwargs):
+    """Tell dlt how long monday.com wants us to wait, as a ``Retry-After`` header.
+
+    When the per-minute complexity budget runs out, monday.com answers 429 with
+    an HTML page and no ``Retry-After``; the wait is only in the ``RateLimit``
+    header, such as ``"complexityMinute";r=0;t=46``. An in-body rate limit
+    carries ``retry_in_seconds`` instead. Without this, dlt's default backoff
+    gives up after about 15 seconds, long before the budget refills.
+    """
+    if "Retry-After" in response.headers:
+        return response
+    wait = None
+    if response.status_code == 429:
+        wait = _exhausted_rate_limit_wait(response.headers.get("RateLimit"))
+    elif _is_rate_limited(response, None):
+        wait = max(int(_extensions(e).get("retry_in_seconds") or 0) for e in _errors(response))
+    if wait:
+        response.headers["Retry-After"] = str(wait)
+    return response
+
+
+def _exhausted_rate_limit_wait(header: str | None) -> int | None:
+    """Seconds until the longest exhausted policy in a ``RateLimit`` header resets.
+
+    The header lists policies like ``"minuteRate";r=1331, "complexityMinute";r=0;t=46``,
+    where ``r`` is what is left and ``t`` the seconds until it resets.
+    """
+    waits = []
+    for policy in (header or "").split(","):
+        params = dict(part.strip().split("=", 1) for part in policy.split(";")[1:] if "=" in part)
+        if params.get("r") == "0" and params.get("t", "").isdigit():
+            waits.append(int(params["t"]))
+    return max(waits, default=None)
 
 
 def _raise_for_errors(response, *args, **kwargs) -> None:
@@ -123,6 +162,8 @@ def _raise_for_errors(response, *args, **kwargs) -> None:
             f"monday.com refused the token (HTTP {response.status_code}). "
             "Check that it is valid and can read the selected boards."
         )
+    if response.status_code == 429:
+        raise MondayAPIError("monday.com rate limit still exceeded after retrying (HTTP 429).")
     if response.status_code != 200:
         raise MondayAPIError(f"monday.com returned HTTP {response.status_code}.")
 

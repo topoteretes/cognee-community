@@ -5,6 +5,7 @@ and error handling run exactly as in production, without any network calls.
 """
 
 import json
+import time
 
 import pytest
 import requests
@@ -15,8 +16,20 @@ from cognee_community_connector_monday.monday import (
     MondayAPIError,
     MondayAuthError,
     _clean_token,
+    _exhausted_rate_limit_wait,
     _MondayClient,
     _retrying_session,
+)
+
+# The headers and body monday.com sent when a real query used up the minute's
+# complexity budget: an HTML page, no Retry-After, the wait only in RateLimit.
+BUDGET_EXHAUSTED = (
+    429,
+    "<!doctypehtml><html><head>...</head></html>",
+    {
+        "Content-Type": "text/html",
+        "RateLimit": '"minuteRate";r=1331, "concurrency";r=79, "complexityMinute";r=0;t=46',
+    },
 )
 
 TOKEN = "test-token-123"
@@ -38,7 +51,8 @@ class FakeMonday(BaseAdapter):
         status, body, headers = self.replies.pop(0)
         response = requests.Response()
         response.status_code = status
-        response._content = json.dumps(body).encode()
+        # A str body is sent as is, like the HTML page monday.com returns on a 429.
+        response._content = (body if isinstance(body, str) else json.dumps(body)).encode()
         response.headers.update(headers or {})
         response.request = request
         response.url = request.url
@@ -48,12 +62,21 @@ class FakeMonday(BaseAdapter):
         pass
 
 
-def make_client(*replies):
+def make_client(*replies, **retry_settings):
     fake = FakeMonday(*replies)
-    # Real retry logic, with the waits between attempts turned off.
-    session = _retrying_session(request_backoff_factor=0, request_max_retry_delay=0)
+    # Real retry logic, with the waits between attempts turned off by default.
+    retry_settings = {"request_backoff_factor": 0, "request_max_retry_delay": 0, **retry_settings}
+    session = _retrying_session(**retry_settings)
     session.mount("https://", fake)
     return _MondayClient(TOKEN, session=session), fake
+
+
+@pytest.fixture
+def waits(monkeypatch):
+    """Record the waits dlt's retry asks for, without sleeping."""
+    recorded = []
+    monkeypatch.setattr(time, "sleep", recorded.append)
+    return recorded
 
 
 def ok(data):
@@ -112,6 +135,45 @@ def test_rate_limit_inside_a_200_is_retried():
 
     assert client.query("{ x }") == {"x": 1}
     assert len(fake.sent) == 2
+
+
+def test_exhausted_budget_waits_as_long_as_the_ratelimit_header_says(waits):
+    client, fake = make_client(BUDGET_EXHAUSTED, ok({"x": 1}), request_max_retry_delay=300)
+
+    assert client.query("{ x }") == {"x": 1}
+    assert len(fake.sent) == 2
+    assert waits == [46]
+
+
+def test_in_body_rate_limit_waits_retry_in_seconds(waits):
+    limited = {"errors": [{"message": "Minute limit", "extensions": {"retry_in_seconds": 12}}]}
+    client, _ = make_client((200, limited, None), ok({"x": 1}), request_max_retry_delay=300)
+
+    assert client.query("{ x }") == {"x": 1}
+    assert waits == [12]
+
+
+def test_rate_limit_that_never_clears_raises_a_clear_error():
+    client, fake = make_client(*[BUDGET_EXHAUSTED] * 5)
+
+    with pytest.raises(MondayAPIError, match="rate limit"):
+        client.query("{ x }")
+    assert len(fake.sent) == 5
+
+
+@pytest.mark.parametrize(
+    ("header", "expected"),
+    [
+        ('"minuteRate";r=1331, "complexityMinute";r=0;t=46', 46),
+        ('"minuteRate";r=0;t=20, "complexityMinute";r=0;t=46', 46),
+        ('"minuteRate";r=1331;t=20', None),
+        ("", None),
+        (None, None),
+        ("garbage;;=", None),
+    ],
+)
+def test_exhausted_rate_limit_wait(header, expected):
+    assert _exhausted_rate_limit_wait(header) == expected
 
 
 def test_rejected_token_raises_auth_error_without_echoing_it():
