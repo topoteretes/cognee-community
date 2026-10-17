@@ -98,9 +98,10 @@ def test_item_renders_like_a_linear_issue():
                 "Group: This week",
                 "State: Working on it",
                 "Assignee: Alex Doe, Sam Roe",
+                # Other columns follow in column id order: due, notes, risk, score.
                 "Due date: 2026-10-20",
-                "Risk: High",
                 "Notes: Needs the new pricing page",
+                "Risk: High",
                 "Score: 13",
                 "",
                 "Updates:",
@@ -130,6 +131,20 @@ def test_rendering_is_deterministic():
     second = _render_item(shuffled, BOARD, list(reversed(UPDATES)))
 
     assert first == second
+
+
+def test_reordering_people_is_not_a_change():
+    reordered = make_item()
+    reordered["column_values"][1] = column("owner", "people", "Sam Roe, Alex Doe")
+
+    assert _render_item(reordered, BOARD, []) == _render_item(make_item(), BOARD, [])
+
+
+def test_moving_a_column_on_the_board_is_not_a_change():
+    # Dragging a column must not change every item's text and re-extract the board.
+    moved = {**BOARD, "columns": list(reversed(BOARD["columns"]))}
+
+    assert _render_item(make_item(), moved, []) == _render_item(make_item(), BOARD, [])
 
 
 def test_board_without_status_or_people_columns():

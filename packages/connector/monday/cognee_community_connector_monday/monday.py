@@ -193,6 +193,14 @@ ID_PREFIX = "monday:"
 # * file text is a list of signed download links, and button has no value.
 _SKIPPED_COLUMN_TYPES = {"name", "subtasks", "last_updated", "time_tracking", "file", "button"}
 
+# Preferred titles for the columns rendered as State and Assignee, in order.
+# These are monday.com's default titles for its status and people columns.
+_STATE_TITLES = ("status",)
+_ASSIGNEE_TITLES = ("owner", "person", "assignee", "people")
+
+# Columns holding a comma separated set, where order carries no meaning.
+_MULTI_VALUE_COLUMN_TYPES = {"people", "dropdown", "tags"}
+
 # Description blocks, rendered as markdown so headings and lists survive. The
 # API names block types with spaces ("large title", "bulleted list").
 _BLOCK_PREFIX = {
@@ -216,10 +224,10 @@ def _render_item(item: dict, board: dict, updates: list[dict]) -> dict:
     """
     name = str(item.get("name") or "").strip() or "Untitled item"
     columns = _columns_by_id(item)
-    # The first status and people columns become the State and Assignee lines,
-    # as in the Linear connector. Any other column keeps its own title.
-    state_column, state = _first_of_type(board, columns, "status")
-    assignee_column, assignee = _first_of_type(board, columns, "people")
+    # One status and one people column become the State and Assignee lines, as
+    # in the Linear connector. Any other column keeps its own title.
+    state_column, state = _pick_column(board, columns, "status", _STATE_TITLES)
+    assignee_column, assignee = _pick_column(board, columns, "people", _ASSIGNEE_TITLES)
     fields = [
         ("Board", str(board.get("name") or "").strip()),
         ("Group", str((item.get("group") or {}).get("title") or "").strip()),
@@ -228,7 +236,9 @@ def _render_item(item: dict, board: dict, updates: list[dict]) -> dict:
         ("Parent", str((item.get("parent_item") or {}).get("name") or "").strip()),
     ]
     used = {state_column, assignee_column}
-    for column in board.get("columns") or []:
+    # Ordered by column id, not board position: dragging a column on the board
+    # must not change the text of every item and re-extract the whole board.
+    for column in sorted(board.get("columns") or [], key=lambda c: str(c.get("id"))):
         if column.get("id") in used or column.get("type") in _SKIPPED_COLUMN_TYPES:
             continue
         fields.append((str(column.get("title") or "").strip(), columns.get(column.get("id"), "")))
@@ -255,17 +265,34 @@ def _columns_by_id(item: dict) -> dict[str, str]:
     columns leave ``text`` empty and carry their value in ``display_value``."""
     values = {}
     for column in item.get("column_values") or []:
-        value = column.get("display_value") or column.get("text") or ""
-        values[column.get("id")] = " ".join(str(value).split())
+        value = " ".join(str(column.get("display_value") or column.get("text") or "").split())
+        if column.get("type") in _MULTI_VALUE_COLUMN_TYPES and value:
+            # Sorted, so reordering the same people or labels is not a change.
+            value = ", ".join(sorted(part.strip() for part in value.split(",")))
+        values[column.get("id")] = value
     return values
 
 
-def _first_of_type(board: dict, columns: dict[str, str], column_type: str) -> tuple[str, str]:
-    """The first column of a type, in board order, as (column id, value)."""
-    for column in board.get("columns") or []:
-        if column.get("type") == column_type:
-            return column.get("id"), columns.get(column.get("id"), "")
-    return "", ""
+def _pick_column(
+    board: dict, columns: dict[str, str], column_type: str, titles: tuple[str, ...]
+) -> tuple[str, str]:
+    """The column of a type that plays the State or Assignee role, as
+    (column id, value).
+
+    A column with one of the usual titles wins, then the lowest column id.
+    Board position is never used: dragging a second status column to the front
+    must not turn it into the item's state.
+    """
+    candidates = [c for c in board.get("columns") or [] if c.get("type") == column_type]
+    if not candidates:
+        return "", ""
+
+    def rank(column):
+        title = str(column.get("title") or "").strip().lower()
+        return (titles.index(title) if title in titles else len(titles), str(column.get("id")))
+
+    chosen = min(candidates, key=rank)
+    return chosen.get("id"), columns.get(chosen.get("id"), "")
 
 
 def _render_description(description: Any) -> str:
