@@ -57,7 +57,9 @@ class DataApiConnection:
     Serverless workgroups take ``workgroup_name`` and optionally
     ``secret_arn``.
 
-    Every argument falls back to a ``REDSHIFT_*`` environment variable.
+    Every argument falls back to a ``REDSHIFT_*`` environment variable. The
+    region is ``region_name``, else ``AWS_REGION``, else boto3's own choice
+    (``AWS_DEFAULT_REGION`` or your profile).
     """
 
     def __init__(
@@ -105,7 +107,9 @@ class DataApiConnection:
             self._target["DbUser"] = db_user
         if secret_arn:
             self._target["SecretArn"] = secret_arn
-        self._region_name = region_name
+        # boto3 itself only reads AWS_DEFAULT_REGION and the profile, so honour
+        # the AWS_REGION that the AWS CLI docs and most tooling set as well.
+        self._region_name = region_name or os.getenv("AWS_REGION") or None
         self._timeout = timeout
         self._poll_interval = poll_interval
         self._client = client

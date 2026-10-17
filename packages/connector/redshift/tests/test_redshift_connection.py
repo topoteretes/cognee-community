@@ -236,3 +236,12 @@ def test_direct_connection_uses_redshift_connector_by_default(monkeypatch):
     connection = DirectConnection(host="localhost", port=5439, database="dev", iam=True)
     connection._connect()
     assert calls == [{"host": "localhost", "port": 5439, "database": "dev", "iam": True}]
+
+
+def test_region_comes_from_the_argument_then_aws_region(monkeypatch):
+    monkeypatch.setenv("AWS_REGION", "eu-north-1")
+    base = {"database": "dev", "workgroup_name": "wg"}
+    assert DataApiConnection(**base)._region_name == "eu-north-1"
+    assert DataApiConnection(**base, region_name="us-west-2")._region_name == "us-west-2"
+    monkeypatch.delenv("AWS_REGION")
+    assert DataApiConnection(**base)._region_name is None
