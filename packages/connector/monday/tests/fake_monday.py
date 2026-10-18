@@ -78,14 +78,34 @@ class FakeMonday:
     def archive(self, item_id):
         self.items[item_id]["state"] = "archived"
 
+    def delete(self, item_id):
+        """Deleted items are still returned by id, with state "deleted"."""
+        self.items[item_id]["state"] = "deleted"
+
+    def purge(self, item_id):
+        """Gone for good, e.g. emptied from the trash: not returned at all."""
+        del self.items[item_id]
+
+    def move(self, item_id, board_id):
+        self.items[item_id].update(board_id=board_id, updated_at=_now())
+
+    def set_board_state(self, board_id, state):
+        """Archived and deleted boards are only answered with state: all."""
+        self.boards[board_id]["state"] = state
+
+    def revoke_access(self, board_id):
+        """A board the token cannot see is simply left out of the answer."""
+        del self.boards[board_id]
+
     # -- the client interface ----------------------------------------------
     def query(self, query, variables=None):
         name = _operation(query)
         self.calls.append(name)
         variables = variables or {}
         if name == "Boards":
+            assert "state: all" in query
             return {"boards": [self.boards[i] for i in variables["ids"] if i in self.boards]}
-        if name == "ItemDetails":
+        if name in ("ItemDetails", "ItemStates"):
             ids = variables["ids"]
             assert len(ids) <= variables["limit"]
             return {"items": [self._details(i) for i in ids if i in self.items]}

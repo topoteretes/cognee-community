@@ -413,9 +413,12 @@ def _update_line(update: dict) -> str:
 _LISTING_PAGE_SIZE = 500
 _FETCH_CHUNK = 100
 
+# state: all, because an archived or deleted board otherwise vanishes from the
+# answer exactly like a board the token cannot see, and its items still report
+# themselves active. With it, a deleted board comes back with state "deleted".
 _BOARDS_QUERY = """
 query Boards($ids: [ID!]) {
-  boards(ids: $ids) { id name state columns { id title type settings_str } }
+  boards(ids: $ids, state: all) { id name state columns { id title type settings_str } }
 }"""
 
 # Measured on API 2026-07: a 500 item page with these stamps stays far inside
@@ -429,6 +432,11 @@ query ItemStamps($board: [ID!], $limit: Int!, $cursor: String) {
       items { id updated_at updates(limit: 100) { id updated_at replies { id updated_at } } }
     }
   }
+}"""
+
+_ITEM_STATES_QUERY = """
+query ItemStates($ids: [ID!], $limit: Int!) {
+  items(ids: $ids, limit: $limit, exclude_nonactive: false) { id state board { id } }
 }"""
 
 _ITEMS_QUERY = """
@@ -452,25 +460,37 @@ query ItemDetails($ids: [ID!], $limit: Int!) {
 
 
 def _iter_rows(client, board_ids: list[str], state: dict, stats: dict, full_refresh=False):
-    """Yield a document row for every new or changed item on the selected boards.
+    """Yield a row for every new or changed item, and a ``_deleted`` row for every
+    item that is gone, on the selected boards.
 
     Sub-items live on their own board, so each selected board's sub-item board
     is synced with it. ``state`` is dlt's resource state; it is only written
     once a board's rows have all been yielded.
     """
     boards = _load_boards(client, board_ids)
-    subitem_ids = [i for board in boards.values() for i in _subitem_board_ids(board)]
+    subitem_ids = [i for board in _active(boards) for i in _subitem_board_ids(board)]
     boards.update(_load_boards(client, [i for i in subitem_ids if i not in boards]))
+    saved = state.setdefault("boards", {})
 
-    for board_id, board in boards.items():
-        board_state = state.setdefault("boards", {}).setdefault(board_id, {})
-        yield from _sync_board(client, board, board_state, stats, full_refresh)
+    # A board that was deleted or archived upstream, or is no longer selected,
+    # takes all of its items with it.
+    for board_id in list(saved):
+        if board_id not in boards or boards[board_id].get("state") != "active":
+            yield from _forget_items(saved.pop(board_id).get("items", {}), stats)
+
+    for board in _active(boards):
+        board_state = saved.setdefault(str(board["id"]), {})
+        yield from _sync_board(client, board, board_state, stats, full_refresh, boards)
+
+
+def _active(boards: dict[str, dict]) -> list[dict]:
+    return [board for board in boards.values() if board.get("state") == "active"]
 
 
 def _load_boards(client, board_ids: list[str]) -> dict[str, dict]:
-    """Board names and columns. A board the token cannot see raises: monday.com
-    answers with an empty list rather than an error, and that must never be
-    read as a board whose items were all deleted."""
+    """Board names, states and columns. A board the token cannot see raises:
+    monday.com leaves it out of the answer rather than returning an error, and
+    that must never be read as a board whose items were all deleted."""
     if not board_ids:
         return {}
     found = client.query(_BOARDS_QUERY, {"ids": board_ids})["boards"] or []
@@ -497,12 +517,19 @@ def _subitem_board_ids(board: dict) -> list[str]:
     return ids
 
 
-def _sync_board(client, board: dict, board_state: dict, stats: dict, full_refresh: bool):
+def _sync_board(client, board, board_state, stats, full_refresh, boards):
     board_id = str(board["id"])
     stamps = _list_stamps(client, board_id)
     seen = board_state.setdefault("items", {})
     changed = [i for i, stamp in stamps.items() if full_refresh or seen.get(i) != stamp]
     stats["scanned"] = stats.get("scanned", 0) + len(stamps)
+
+    missing = [item_id for item_id in seen if item_id not in stamps]
+    gone, moved = _confirm_gone(client, missing, board_id, boards)
+    for item_id in moved:
+        # Moved to another selected board, which lists it as new and emits it.
+        del seen[item_id]
+    yield from _forget_items({item_id: seen.pop(item_id) for item_id in gone}, stats)
 
     for item in _fetch_items(client, changed):
         # An item archived, deleted or moved after the listing is left for the
@@ -539,3 +566,40 @@ def _fetch_items(client, item_ids: list[str]) -> Iterator[dict]:
     for start in range(0, len(item_ids), _FETCH_CHUNK):
         chunk = item_ids[start : start + _FETCH_CHUNK]
         yield from client.query(_ITEMS_QUERY, {"ids": chunk, "limit": _FETCH_CHUNK})["items"] or []
+
+
+def _confirm_gone(client, item_ids: list[str], board_id: str, boards: dict[str, dict]):
+    """Look up items that dropped out of a complete listing before forgetting them.
+
+    Returns (gone, moved). An item is gone when monday.com reports it archived
+    or deleted, no longer returns it at all, or it moved to a board that is not
+    being synced. An item that is still active on this same board contradicts
+    the listing, so it is kept rather than forgotten on one signal.
+    """
+    gone, moved = [], []
+    found = {}
+    for start in range(0, len(item_ids), _FETCH_CHUNK):
+        chunk = item_ids[start : start + _FETCH_CHUNK]
+        answer = client.query(_ITEM_STATES_QUERY, {"ids": chunk, "limit": _FETCH_CHUNK})
+        found.update({str(item["id"]): item for item in answer["items"] or []})
+
+    for item_id in item_ids:
+        item = found.get(item_id)
+        if item is None or item.get("state") != "active":
+            gone.append(item_id)
+            continue
+        now_on = str((item.get("board") or {}).get("id"))
+        if now_on == board_id:
+            continue
+        if now_on in boards and boards[now_on].get("state") == "active":
+            moved.append(item_id)
+        else:
+            gone.append(item_id)
+    return gone, moved
+
+
+def _forget_items(items: dict, stats: dict) -> Iterator[dict]:
+    """``_deleted`` rows, which make cognee forget the documents on merge."""
+    for item_id in sorted(items):
+        stats["deleted"] = stats.get("deleted", 0) + 1
+        yield {"id": f"{ID_PREFIX}{item_id}", "_deleted": True}

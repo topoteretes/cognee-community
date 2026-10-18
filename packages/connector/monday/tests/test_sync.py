@@ -164,3 +164,140 @@ def test_rows_are_documents_with_a_stable_id(monday):
     assert row["id"] == "monday:2"
     assert row["_deleted"] is False
     assert row["url"].endswith("/pulses/2")
+
+
+# -- forget-on-delete --------------------------------------------------------
+
+
+def forgotten(rows):
+    return sorted(row["id"] for row in rows if row.get("_deleted"))
+
+
+@pytest.mark.parametrize("remove", ["archive", "delete", "purge"])
+def test_an_archived_deleted_or_purged_item_is_forgotten(monday, remove):
+    state = {}
+    sync(monday, state)
+    getattr(monday, remove)("2")
+
+    rows, stats = sync(monday, state)
+
+    assert forgotten(rows) == ["monday:2"]
+    assert stats["deleted"] == 1
+    assert "2" not in state["boards"][BOARD]["items"]
+
+
+def test_a_forgotten_item_is_forgotten_once(monday):
+    state = {}
+    sync(monday, state)
+    monday.delete("2")
+    sync(monday, state)
+
+    rows, _ = sync(monday, state)
+
+    assert rows == []
+
+
+def test_an_item_still_active_on_the_board_is_not_forgotten(monday):
+    # The listing missed an item that the lookup says is still there:
+    # one contradicted signal must never delete.
+    state = {}
+    sync(monday, state)
+    original = monday.paginate
+
+    def listing_that_drops_item_2(*args, **kwargs):
+        yield from (item for item in original(*args, **kwargs) if item["id"] != "2")
+
+    monday.paginate = listing_that_drops_item_2
+
+    rows, _ = sync(monday, state)
+
+    assert forgotten(rows) == []
+    assert "2" in state["boards"][BOARD]["items"]
+
+
+def test_an_item_moved_to_an_unsynced_board_is_forgotten(monday):
+    monday.add_board("200", "Someone else's board")
+    state = {}
+    sync(monday, state)
+    monday.move("2", "200")
+
+    rows, _ = sync(monday, state)
+
+    assert forgotten(rows) == ["monday:2"]
+
+
+def test_an_item_moved_between_synced_boards_is_kept(monday):
+    monday.add_board("200", "Second board")
+    state = {}
+    list(_iter_rows(monday, [BOARD, "200"], state, {}))
+    monday.move("2", "200")
+
+    rows = list(_iter_rows(monday, [BOARD, "200"], state, {}))
+
+    assert forgotten(rows) == []
+    assert [row["title"] for row in rows] == ["Write docs"]
+    assert "2" in state["boards"]["200"]["items"]
+    assert "2" not in state["boards"][BOARD]["items"]
+
+
+@pytest.mark.parametrize("board_state", ["archived", "deleted"])
+def test_an_archived_or_deleted_board_forgets_its_items(monday, board_state):
+    state = {}
+    sync(monday, state)
+    monday.set_board_state(BOARD, board_state)
+
+    rows, _ = sync(monday, state)
+
+    # Its sub-item board is no longer reached either, so sub-items go too.
+    assert forgotten(rows) == ["monday:1", "monday:2", "monday:3"]
+    assert state["boards"] == {}
+
+
+def test_a_board_removed_from_the_selection_forgets_its_items(monday):
+    monday.add_board("200", "Second board")
+    monday.add_item("9", "200", "Only on the second board")
+    state = {}
+    list(_iter_rows(monday, [BOARD, "200"], state, {}))
+
+    rows = list(_iter_rows(monday, [BOARD], state, {}))
+
+    assert forgotten(rows) == ["monday:9"]
+
+
+def test_losing_access_to_a_board_raises_and_forgets_nothing(monday):
+    state = {}
+    sync(monday, state)
+    monday.revoke_access(BOARD)
+
+    with pytest.raises(MondayAPIError, match="not found or are not shared"):
+        sync(monday, state)
+    assert set(state["boards"][BOARD]["items"]) == {"1", "2"}
+
+
+def test_an_error_during_the_lookup_forgets_nothing(monday):
+    state = {}
+    sync(monday, state)
+    monday.delete("2")
+    original = monday.query
+
+    def failing_lookup(query, variables=None):
+        if "ItemStates" in query:
+            raise MondayAPIError("boom")
+        return original(query, variables)
+
+    monday.query = failing_lookup
+
+    with pytest.raises(MondayAPIError):
+        sync(monday, state)
+    assert "2" in state["boards"][BOARD]["items"]
+
+
+def test_an_empty_board_still_forgets_its_last_item(monday):
+    state = {}
+    sync(monday, state)
+    monday.delete("1")
+    monday.delete("2")
+
+    rows, _ = sync(monday, state)
+
+    assert forgotten(rows) == ["monday:1", "monday:2"]
