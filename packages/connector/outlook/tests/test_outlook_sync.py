@@ -4,15 +4,18 @@ No network, no LLM. The fake Graph is served over HTTP with ``responses``, so
 dlt's real RESTClient, the nextLink paginator and its retries all run.
 """
 
+import json
+import logging
 from datetime import timedelta
 
 import pytest
+import requests
 import responses
 from fake_graph import BASE, NOW, FakeGraph
-from requests import HTTPError
 
 from cognee_community_connector_outlook.graph_auth import GraphAuth, GraphTokenProvider
 from cognee_community_connector_outlook.outlook import (
+    OutlookError,
     _iter_rows,
     _OutlookConfig,
     build_graph_client,
@@ -42,13 +45,24 @@ def make_config(**overrides) -> _OutlookConfig:
     return _OutlookConfig(**values)
 
 
-def sync(state, config=None, now=NOW):
+def sync(state, config=None, now=NOW, check_active=None, stats=None):
     client = build_graph_client(GraphAuth(GraphTokenProvider(access_token="test-token")), BASE)
-    stats: dict[str, int] = {}
-    rows = list(_iter_rows(client, config or make_config(), state, stats, now=now))
+    stats = {} if stats is None else stats
+    rows = list(
+        _iter_rows(
+            client, config or make_config(), state, stats, now=now, check_active=check_active
+        )
+    )
     upserts = {row["id"]: row for row in rows if not row["_deleted"]}
     deletes = sorted(row["id"] for row in rows if row["_deleted"])
     return upserts, deletes, stats
+
+
+@pytest.fixture
+def no_retry_wait(monkeypatch):
+    """dlt's client retries 429s and lost connections with real back-off sleeps;
+    keep the retries but skip the waiting."""
+    monkeypatch.setattr("tenacity.nap.time.sleep", lambda _seconds: None)
 
 
 def mail(message_id):
@@ -282,7 +296,7 @@ def test_errors_raise_and_never_delete(graph, status, code):
     before = {"mail": {k: dict(v) for k, v in state["mail"].items()}}
 
     graph.fail_next.append((status, {"error": {"code": code}}, {}))
-    with pytest.raises(HTTPError):
+    with pytest.raises(OutlookError, match=f"HTTP {status}"):
         sync(state, make_config(include_calendar=False))
 
     assert state == before
@@ -494,7 +508,7 @@ def test_event_lookup_error_raises_instead_of_deleting(graph):
         return original(query)
 
     graph._calendar_delta = delta_then_fail_lookup
-    with pytest.raises(HTTPError):
+    with pytest.raises(OutlookError, match="HTTP 403"):
         sync(state, make_config(**CAL))
 
     assert state == before
@@ -511,3 +525,262 @@ def test_mail_and_events_share_one_table_with_prefixed_ids(graph):
     upserts, _, _ = sync({})
 
     assert set(upserts) == {mail(message_id), event(event_id)}
+
+
+def test_attendee_order_from_graph_does_not_change_the_content(graph):
+    ada = {"emailAddress": {"name": "Ada", "address": "ada@example.com"}, "status": {}}
+    bob = {"emailAddress": {"name": "Bob", "address": "bob@example.com"}, "status": {}}
+    first = graph.put_event("Sync", NOW + timedelta(days=1), attendees=[bob, ada])
+    second = graph.put_event("Sync", NOW + timedelta(days=1), attendees=[ada, bob])
+
+    upserts, _, _ = sync({}, make_config(**CAL))
+
+    content = upserts[event(first)]["content"]
+    assert content == upserts[event(second)]["content"]
+    assert content.index("ada@example.com") < content.index("bob@example.com")
+
+
+@pytest.mark.parametrize(
+    ("days", "expected"),
+    [(1, "When: all day, 2026-06-03"), (3, "When: all day, 2026-06-03 to 2026-06-05")],
+)
+def test_all_day_event_ends_on_its_last_day_not_the_exclusive_end(graph, days, expected):
+    # Graph ends an all-day event at midnight after its last day.
+    day = {"dateTime": "2026-06-03T00:00:00.0000000", "timeZone": "UTC"}
+    end = {"dateTime": f"2026-06-{3 + days:02d}T00:00:00.0000000", "timeZone": "UTC"}
+    holiday = graph.put_event("Holiday", NOW + timedelta(days=2), isAllDay=True)
+    graph.events[holiday].update(start=day, end=end)
+
+    upserts, _, _ = sync({}, make_config(**CAL))
+
+    assert expected in upserts[event(holiday)]["content"].splitlines()
+
+
+# ---------------------------------------------------------------------------
+# Mail and calendar fail separately
+# ---------------------------------------------------------------------------
+def test_a_failing_mail_round_keeps_its_state_while_the_calendar_finishes(graph):
+    graph.put_message("inbox", "Hello")
+    meeting = graph.put_event("Weekly sync", NOW + timedelta(days=2))
+    graph.fail_next.append((403, {"error": {"code": "ErrorAccessDenied"}}, {}))
+    state: dict = {}
+
+    upserts, deletes, stats = sync(state, make_config(mail_folders=("inbox",)))
+
+    assert set(upserts) == {event(meeting)}
+    assert deletes == []
+    assert "mail" not in state and "calendar" in state
+    assert stats["failed"] == 1 and stats["failed_mail"] == 1
+
+
+def test_a_failing_calendar_round_leaves_nothing_behind_while_mail_finishes(graph):
+    message_id = graph.put_message("inbox", "Hello")
+    cancelled = graph.put_event("Cancelled later", NOW + timedelta(days=2))
+    removed = graph.put_event("Deleted later", NOW + timedelta(days=3))
+    state: dict = {}
+    sync(state, make_config(mail_folders=("inbox",)))
+    calendar_before = dict(state["calendar"])
+
+    graph.edit_message("inbox", message_id, subject="Hello again")
+    graph.edit_event(cancelled, isCancelled=True)
+    graph.delete_event(removed)
+    original = graph._calendar_delta
+
+    def delta_then_fail_lookup(query):
+        graph.fail_next.append((403, {"error": {"code": "ErrorAccessDenied"}}, {}))
+        return original(query)
+
+    graph._calendar_delta = delta_then_fail_lookup
+    upserts, deletes, stats = sync(state, make_config(mail_folders=("inbox",)))
+
+    # The cancelled meeting was already queued for forgetting when the lookup
+    # failed; it must not leak out of the failed calendar round.
+    assert deletes == []
+    assert set(upserts) == {mail(message_id)}
+    assert state["calendar"] == calendar_before
+    assert stats["failed_calendar"] == 1 and stats["events_deleted"] == 0
+
+
+def test_mail_and_calendar_both_failing_raises_and_saves_nothing(graph):
+    graph.put_message("inbox", "Hello")
+    graph.put_event("Weekly sync", NOW + timedelta(days=2))
+    for _ in range(2):
+        graph.fail_next.append((403, {"error": {"code": "ErrorAccessDenied"}}, {}))
+    state: dict = {}
+
+    with pytest.raises(OutlookError, match="HTTP 403"):
+        sync(state, make_config(mail_folders=("inbox",)))
+
+    assert state == {}
+
+
+@pytest.mark.parametrize(("status", "key"), [(401, "failed_auth"), (429, "failed_rate_limit")])
+def test_auth_and_throttling_end_the_run(graph, status, key, no_retry_wait):
+    graph.put_message("inbox", "Hello")
+    graph.put_event("Weekly sync", NOW + timedelta(days=2))
+    # More 429s than the client retries, so throttling outlasts the retries.
+    for _ in range(10):
+        graph.fail_next.append((status, {"error": {"code": "Nope"}}, {"Retry-After": "0"}))
+    stats: dict = {}
+
+    with pytest.raises(OutlookError, match=f"HTTP {status}"):
+        sync({}, make_config(mail_folders=("inbox",)), stats=stats)
+
+    assert stats[key] == 1
+    assert not any("calendarView" in r.url for r in graph.requests), "calendar not tried"
+
+
+def test_a_lost_connection_is_a_clean_error_without_the_url(graph, no_retry_wait):
+    graph.put_event("Weekly sync", NOW + timedelta(days=2))
+
+    def unreachable(folder, query):
+        raise requests.ConnectionError(f"Max retries exceeded with url: {BASE}/me/{folder}")
+
+    graph._mail_delta = unreachable
+    stats: dict = {}
+
+    with pytest.raises(OutlookError, match="could not be reached") as error:
+        sync({}, make_config(mail_folders=("inbox",)), stats=stats)
+
+    assert "graph.test" not in str(error.value)
+    assert stats["failed_connection"] == 1
+    assert not any("calendarView" in r.url for r in graph.requests), "calendar not tried"
+
+
+# ---------------------------------------------------------------------------
+# Authorization checkpoint
+# ---------------------------------------------------------------------------
+class _RevokedError(Exception):
+    pass
+
+
+@pytest.mark.parametrize("allowed", [0, 1, 2, 3])
+def test_check_active_runs_before_every_graph_request(graph, allowed):
+    # Inbox spans two pages, then Sent Items: requests 1 and 2, then 3.
+    # Zero: revoked before the run's very first request.
+    for i in range(3):
+        graph.put_message("inbox", f"In {i}")
+    graph.put_message("sentitems", "Out")
+    state: dict = {}
+
+    def check_active():
+        if len(graph.requests) >= allowed:
+            raise _RevokedError
+
+    with pytest.raises(_RevokedError):
+        sync(state, make_config(include_calendar=False), check_active=check_active)
+
+    assert len(graph.requests) == allowed, "no request after the revocation"
+    assert state == {}
+
+
+def test_check_active_guards_every_event_lookup(graph):
+    first = graph.put_event("Gone 1", NOW + timedelta(days=3))
+    second = graph.put_event("Gone 2", NOW + timedelta(days=4))
+    state: dict = {}
+    sync(state, make_config(**CAL))
+    graph.delete_event(first)
+    graph.delete_event(second)
+    graph.requests.clear()
+
+    def check_active():
+        if any("/me/events/" in r.url for r in graph.requests):  # after the first lookup
+            raise _RevokedError
+
+    with pytest.raises(_RevokedError):
+        sync(state, make_config(**CAL), check_active=check_active)
+
+    assert sum("/me/events/" in r.url for r in graph.requests) == 1
+
+
+def test_check_active_is_not_swallowed_by_the_per_part_error_handling(graph):
+    graph.put_message("inbox", "Hello")
+    graph.put_event("Weekly sync", NOW + timedelta(days=2))
+
+    def check_active():
+        if any("calendarView" in r.url for r in graph.requests) or (
+            graph.requests and "messages/delta" in graph.requests[-1].url
+        ):
+            raise _RevokedError
+
+    with pytest.raises(_RevokedError):
+        sync({}, make_config(mail_folders=("inbox",)), check_active=check_active)
+
+
+# ---------------------------------------------------------------------------
+# No ids in logs or errors
+# ---------------------------------------------------------------------------
+def test_a_round_without_a_delta_link_fails_its_part_without_the_url(graph):
+    graph.put_message("inbox", "Hello")
+    meeting = graph.put_event("Weekly sync", NOW + timedelta(days=2))
+    original = graph._mail_delta
+
+    def no_delta_link(folder, query):
+        status, headers, body = original(folder, query)
+        page = json.loads(body)
+        page.pop("@odata.deltaLink", None)
+        return status, headers, json.dumps(page)
+
+    graph._mail_delta = no_delta_link
+    stats: dict = {}
+    state: dict = {}
+
+    upserts, _, _ = sync(state, make_config(mail_folders=("inbox",)), stats=stats)
+
+    # Not a lost connection: only mail fails, and the calendar still finishes.
+    assert set(upserts) == {event(meeting)}
+    assert stats["failed_mail"] == 1 and "failed_connection" not in stats
+    assert "mail" not in state
+
+    # An incremental round requests the saved deltaLink, delta token and all.
+    graph._mail_delta = original
+    mail_only = make_config(include_calendar=False, mail_folders=("inbox",))
+    mail_state: dict = {}
+    sync(mail_state, mail_only)
+    graph._mail_delta = no_delta_link
+    with pytest.raises(OutlookError, match="without a deltaLink") as error:
+        sync(mail_state, mail_only)
+    assert "deltatoken" not in str(error.value) and "graph.test" not in str(error.value)
+
+
+def test_no_ids_or_delta_tokens_reach_logs_or_error_text(graph, caplog):
+    caplog.set_level(logging.DEBUG)
+    graph.folders["AAMkSecretFolder"] = {}
+    graph.mail_log["AAMkSecretFolder"] = []
+    secret_message = graph.put_message("AAMkSecretFolder", "Secret plans")
+    secret_event = graph.put_event("Secret meeting", NOW + timedelta(days=3), id="AAMk-secret-evt")
+    config = make_config(mail_folders=("AAMkSecretFolder",))
+    state: dict = {}
+    sync(state, config)
+    secret_token = state["mail"]["delta_links"]["AAMkSecretFolder"].split("$deltatoken=")[1]
+
+    # Every path that logs or raises: an expired folder token, a vanished folder,
+    # a failed event lookup, then a run where everything fails.
+    graph.expired_tokens.add(secret_token)
+    sync(state, config)
+    graph.delete_event(secret_event)
+    original = graph._calendar_delta
+
+    def delta_then_fail_lookup(query):
+        graph.fail_next.append((403, {"error": {"code": "ErrorAccessDenied"}}, {}))
+        return original(query)
+
+    graph._calendar_delta = delta_then_fail_lookup
+    sync(state, config)
+    graph.delete_folder("AAMkSecretFolder")
+    sync(state, config)
+    graph.fail_next.append((403, {"error": {"code": "ErrorAccessDenied"}}, {}))  # mail fails too
+    with pytest.raises(OutlookError) as error:
+        sync(state, config)
+
+    assert caplog.text, "the paths above log"
+    for secret in (
+        "AAMkSecretFolder",
+        secret_message,
+        "AAMk-secret-evt",
+        secret_token,
+        "graph.test",
+    ):
+        assert secret not in caplog.text
+        assert secret not in str(error.value)
+    assert error.value.__cause__ is None, "the raw error, with its URL, is not chained"

@@ -135,8 +135,15 @@ other connectors publish), never subjects or content.
   graph and vector stores.
 - **Errors never delete.** An expired delta token (`410 Gone`, `syncStateNotFound`)
   starts a fresh round for that folder or the calendar, reconciled like a snapshot. A
-  folder that disappears is looked up first and only forgotten on a confirmed 404. Any
-  other error stops the run, and dlt keeps the previous state.
+  folder that disappears is looked up first and only forgotten on a confirmed 404.
+- **Mail and calendar fail separately.** When one of them gets a Graph error, the other
+  still finishes and saves its state, and the failed one keeps its previous state and is
+  retried next run. The run raises only when nothing finished. A 401, a 429 after the
+  retries, or a lost connection end the run, since the other part would fail the same
+  way. Mail folders stay all or nothing: a message moved between two synced folders
+  would look deleted if only one of them were read.
+- **Host checkpoint:** `check_active` runs before every Graph request, so a revoked
+  connection stops the sync between two calls.
 
 ## Privacy
 
@@ -163,7 +170,9 @@ This connector reads personal data. Be clear about what it does:
   that matters to you.
 - dlt state stores the delta links, message and event ids and which synced folder each
   message is in. It does not store subjects or bodies.
-- Logs and `cognee_sync_stats` contain counts only.
+- Logs, errors and `cognee_sync_stats` contain counts and HTTP statuses only: no message,
+  event or folder ids, and not the request URL with its delta token that `requests` puts
+  in its own error text.
 - The MSAL token cache holds a refresh token. It is written private (0600); never
   commit it. Revoke access any time at <https://account.live.com/consent/Manage> for
   personal accounts, or **My Apps** for work or school accounts, and delete the file.
@@ -200,10 +209,15 @@ folder and for the calendar and replays it through delta tokens.
   headers-only mode, the received-after filter, edits, moves between synced folders
   (also split across two runs), deletes through Deleted Items, moves out of scope,
   expired delta tokens, a deleted folder, dropping a folder from the config, auth and
-  API errors that must not delete, throttling, the calendar window, a recurring series with its
-  bare occurrences, events deleted versus moved out of the window, cancelled meetings, window refresh and failed event lookups.
+  API errors that must not delete, throttling, the calendar window, a recurring series
+  with its bare occurrences, events deleted versus moved out of the window, cancelled
+  meetings, window refresh, failed event lookups, all-day events ending on their last
+  day, a stable attendee order, mail and calendar failing separately without leaking a
+  half-finished round, auth, throttling and a lost connection ending the run,
+  `check_active` before every request, and no ids or delta tokens in logs or errors.
 - `test_outlook_source.py` covers the device-code login, the token cache file mode,
   ready-made tokens, scopes per option, folder normalization and the resource markers.
-- `test_outlook_forget.py` runs the real cognee pipeline (LLM and embeddings mocked) and
+- `test_outlook_forget.py` runs the real cognee pipeline (LLM and embeddings mocked,
+  working with both cognee model variants, including the one used with Gemini) and
   checks that a deleted message and a deleted meeting leave the graph while a message
   moved between synced folders stays.

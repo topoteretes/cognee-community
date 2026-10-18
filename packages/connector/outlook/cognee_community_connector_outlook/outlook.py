@@ -40,7 +40,19 @@ Design
 * **Errors never delete** — an expired delta token (``410 Gone`` or
   ``syncStateNotFound``) triggers a fresh round reconciled like a snapshot.
   A missing folder is confirmed with a lookup before its mail is forgotten.
-  Any other error stops the run, and dlt keeps the previous state.
+* **Mail and calendar fail separately** — they share no state, so when one
+  fails with a Graph error the other still finishes and saves its state, and
+  the failed one keeps its previous state and is retried next run.  The run
+  raises only when nothing finished, since dlt rolls back the state of a
+  failed run.  A 401, a 429 after the retries, or a lost connection end the
+  run, because the other part would fail the same way.  Mail folders stay all
+  or nothing: a message moved between two synced folders would look deleted
+  if only one of them were read.
+* **Host checkpoint** — ``check_active`` runs before every Graph request, so a
+  revoked connection stops the sync between two calls.
+* **Privacy** — logs and errors carry counts and HTTP statuses only, never
+  message, event or folder ids, nor the request URL with its delta token that
+  requests puts in its own error text.
 * **Document path** — mail and events become text documents with sender,
   recipients, organizer and attendees written into the content, so cognify
   links one person across emails and meetings.
@@ -54,9 +66,9 @@ Limitations
 """
 
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 from cognee.shared.logging_utils import get_logger
@@ -64,7 +76,7 @@ from cognee.tasks.ingestion import dlt_utils
 from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
 from dlt.sources.helpers.rest_client import RESTClient
 from dlt.sources.helpers.rest_client.paginators import BaseNextUrlPaginator
-from requests import HTTPError
+from requests import HTTPError, RequestException
 
 from .graph_auth import (
     CALENDARS_READ,
@@ -134,6 +146,20 @@ class _ODataNextLinkPaginator(BaseNextUrlPaginator):
         self._next_reference = response.json().get("@odata.nextLink")
 
 
+class OutlookError(RuntimeError):
+    """A Microsoft Graph request or delta round failed.
+
+    The message holds the HTTP status at most, never a message, event or
+    folder id, nor the request URL that requests puts in its own error text.
+    """
+
+    def __init__(self, message: str, status: int | None = None, connection: bool = False):
+        super().__init__(message)
+        self.status = status
+        # Graph could not be reached at all, so every later call would fail too.
+        self.connection = connection
+
+
 # ---------------------------------------------------------------------------
 # Graph helpers
 # ---------------------------------------------------------------------------
@@ -141,10 +167,19 @@ def build_graph_client(auth: Any, base_url: str = GRAPH_BASE_URL) -> RESTClient:
     return RESTClient(base_url=base_url, auth=auth)
 
 
-def _delta_round(client: RESTClient, url: str, params: dict | None) -> tuple[list[dict], str]:
+def _check(check_active: Callable[[], None] | None) -> None:
+    """The host's authorization checkpoint, run before every Graph request."""
+    if check_active is not None:
+        check_active()
+
+
+def _delta_round(
+    client: RESTClient, url: str, params: dict | None, check_active=None
+) -> tuple[list[dict], str]:
     """Read every page of one delta round. Returns (items, deltaLink)."""
     items: list[dict] = []
     delta_link = None
+    _check(check_active)
     for page in client.paginate(
         url,
         params=params,
@@ -154,9 +189,11 @@ def _delta_round(client: RESTClient, url: str, params: dict | None) -> tuple[lis
     ):
         items.extend(page)
         delta_link = page.response.json().get("@odata.deltaLink") or delta_link
+        # The paginator requests the next page when the loop continues.
+        _check(check_active)
     if not delta_link:
         # Without it the next run could not resume, so treat it as a failure.
-        raise RuntimeError(f"Microsoft Graph delta round for {url!r} ended without a deltaLink.")
+        raise OutlookError("Microsoft Graph delta round ended without a deltaLink.")
     return items, delta_link
 
 
@@ -175,8 +212,9 @@ def _needs_resync(exc: HTTPError) -> bool:
     return _status(exc) == 410 or (_error_code(exc) or "").lower() in RESYNC_ERROR_CODES
 
 
-def _exists(client: RESTClient, path: str) -> dict | None:
+def _exists(client: RESTClient, path: str, check_active=None) -> dict | None:
     """GET one item: its JSON, or None on a confirmed 404. Other errors raise."""
+    _check(check_active)
     response = client.get(path, headers=PREFER_HEADERS)
     if response.status_code == 404:
         return None
@@ -187,57 +225,124 @@ def _exists(client: RESTClient, path: str) -> dict | None:
 # ---------------------------------------------------------------------------
 # Sync state machine (pure given a client + state dict — unit-testable)
 # ---------------------------------------------------------------------------
+_PART_STATS = {
+    "mail": ("mail_changed", "mail_deleted"),
+    "calendar": ("events_changed", "events_deleted", "events_left_window"),
+}
+
+
 def _iter_rows(
     client: RESTClient,
     config: _OutlookConfig,
     state: dict,
     stats: dict[str, int] | None = None,
     now: datetime | None = None,
-):
+    check_active: Callable[[], None] | None = None,
+) -> Iterator[dict]:
     """Yield one row per new or changed message and event, plus tombstones.
 
     ``state`` is a plain dict standing in for dlt's resource state, so this is
-    directly unit-testable.  Every Graph call happens before the first yield,
-    and the state is only written after the last one, so a failed run changes
-    nothing.
+    directly unit-testable.  Every Graph call happens before the first yield
+    and the state is only written after the last one.  Mail and calendar each
+    keep their old state when they fail; the run raises only when neither
+    finished (see the module docstring).
     """
     if stats is None:
         stats = {}
     stats.clear()
     stats.update(
-        mail_changed=0, mail_deleted=0, events_changed=0, events_deleted=0, events_left_window=0
+        mail_changed=0,
+        mail_deleted=0,
+        events_changed=0,
+        events_deleted=0,
+        events_left_window=0,
+        failed=0,
     )
     now = now or datetime.now(UTC)
 
-    rows: list[dict] = []
-    deletes: list[str] = []
-    new_mail_state = None
-    new_calendar_state = None
+    parts = [p for p in ("mail", "calendar") if getattr(config, f"include_{p}")]
+    finished: dict[str, tuple[dict, list[dict], list[str]]] = {}
+    last_error: OutlookError | None = None
+    for part in parts:
+        # Each part works on its own lists and counters, so a part that fails
+        # halfway leaves nothing behind.
+        rows: list[dict] = []
+        deletes: list[str] = []
+        part_stats = dict.fromkeys(_PART_STATS[part], 0)
+        try:
+            if part == "mail":
+                new_state = _sync_mail(
+                    client, config, state.get("mail", {}), rows, deletes, part_stats, check_active
+                )
+            else:
+                new_state = _sync_calendar(
+                    client,
+                    config,
+                    state.get("calendar", {}),
+                    rows,
+                    deletes,
+                    part_stats,
+                    now,
+                    check_active,
+                )
+        except (RequestException, OutlookError) as exc:
+            last_error = exc if isinstance(exc, OutlookError) else _graph_error(exc)
+            reason = _failure_reason(last_error) or part
+            stats["failed"] += 1
+            stats[f"failed_{reason}"] = stats.get(f"failed_{reason}", 0) + 1
+            logger.warning(
+                "Outlook: the %s sync failed (HTTP %s); it keeps its state and is retried "
+                "on the next run.",
+                part,
+                last_error.status,
+            )
+            if reason in ("auth", "rate_limit", "connection"):
+                break  # the other part would fail the same way
+            continue
+        stats.update(part_stats)
+        finished[part] = (new_state, rows, deletes)
 
-    if config.include_mail:
-        new_mail_state = _sync_mail(client, config, state.get("mail", {}), rows, deletes, stats)
-    if config.include_calendar:
-        new_calendar_state = _sync_calendar(
-            client, config, state.get("calendar", {}), rows, deletes, stats, now
-        )
+    if last_error is not None and not finished:
+        # Nothing finished, so there is no state to save and nothing is lost by raising.
+        raise OutlookError(f"Outlook sync failed: {last_error}", last_error.status) from None
 
     # Totals under the keys the other connectors publish, for host dashboards.
     stats["scanned"] = stats["mail_changed"] + stats["events_changed"]
     stats["deleted"] = stats["mail_deleted"] + stats["events_deleted"]
 
-    for row_id in deletes:
-        yield {"id": row_id, "_deleted": True}
-    yield from rows
+    for _state, _rows, deletes in finished.values():
+        for row_id in deletes:
+            yield {"id": row_id, "_deleted": True}
+    for _state, rows, _deletes in finished.values():
+        yield from rows
 
-    if new_mail_state is not None:
-        state["mail"] = new_mail_state
-    if new_calendar_state is not None:
-        state["calendar"] = new_calendar_state
+    for part, (new_state, _rows, _deletes) in finished.items():
+        state[part] = new_state
     logger.info("Outlook: sync stats %s", stats)
 
 
+def _graph_error(exc: RequestException) -> OutlookError:
+    """A clean error: requests puts the URL, with ids and the delta token, in its text."""
+    response = getattr(exc, "response", None)
+    status = response.status_code if response is not None else None
+    if status is None:
+        return OutlookError("Microsoft Graph could not be reached.", connection=True)
+    return OutlookError(f"Microsoft Graph request failed: HTTP {status}", status)
+
+
+def _failure_reason(error: OutlookError) -> str | None:
+    """Why a part failed. Auth, throttling and a lost connection end the run."""
+    if error.connection:
+        return "connection"
+    if error.status == 401:
+        return "auth"
+    if error.status == 429:
+        return "rate_limit"
+    return None
+
+
 # --- mail ------------------------------------------------------------------
-def _sync_mail(client, config, mail_state, rows, deletes, stats) -> dict:
+def _sync_mail(client, config, mail_state, rows, deletes, stats, check_active=None) -> dict:
     """One delta round per selected folder. Returns the new mail state."""
     old_links: dict[str, str] = dict(mail_state.get("delta_links", {}))
     # message id -> folders it is currently in, across the synced folders.
@@ -270,22 +375,25 @@ def _sync_mail(client, config, mail_state, rows, deletes, stats) -> dict:
         items = None
         if link:
             try:
-                items, new_links[folder] = _delta_round(client, link, None)
+                items, new_links[folder] = _delta_round(client, link, None, check_active)
             except HTTPError as exc:
                 if not (_needs_resync(exc) or _status(exc) == 404):
                     raise
-                logger.info("Outlook: delta token for folder '%s' expired; resyncing.", folder)
+                logger.info("Outlook: a mail folder's delta token expired; listing it again.")
         if items is None:
             # First run or an expired token: a fresh round lists the whole
             # folder, so reconcile it like a snapshot.
             try:
                 items, new_links[folder] = _delta_round(
-                    client, f"/me/mailFolders/{folder}/messages/delta", params
+                    client, f"/me/mailFolders/{folder}/messages/delta", params, check_active
                 )
             except HTTPError as exc:
-                if _status(exc) != 404 or _exists(client, f"/me/mailFolders/{folder}") is not None:
+                if (
+                    _status(exc) != 404
+                    or _exists(client, f"/me/mailFolders/{folder}", check_active) is not None
+                ):
                     raise
-                logger.warning("Outlook: mail folder '%s' was not found; forgetting it.", folder)
+                logger.warning("Outlook: a synced mail folder was not found; forgetting its mail.")
                 new_links.pop(folder, None)
                 leave_folder(folder)
                 continue
@@ -352,7 +460,9 @@ def _mail_row(item: dict, folder: str, include_body: bool = True) -> dict:
 
 
 # --- calendar --------------------------------------------------------------
-def _sync_calendar(client, config, calendar_state, rows, deletes, stats, now) -> dict:
+def _sync_calendar(
+    client, config, calendar_state, rows, deletes, stats, now, check_active=None
+) -> dict:
     """One delta round over the date window. Returns the new calendar state."""
     known: set[str] = set(calendar_state.get("known", []))
     link = calendar_state.get("delta_link")
@@ -372,7 +482,7 @@ def _sync_calendar(client, config, calendar_state, rows, deletes, stats, now) ->
     items = None
     if not stale:
         try:
-            items, link = _delta_round(client, link, None)
+            items, link = _delta_round(client, link, None, check_active)
         except HTTPError as exc:
             if not _needs_resync(exc):
                 raise
@@ -388,6 +498,7 @@ def _sync_calendar(client, config, calendar_state, rows, deletes, stats, now) ->
             client,
             "/me/calendarView/delta",
             {"startDateTime": _iso(start), "endDateTime": _iso(end)},
+            check_active,
         )
         opened_at = now.isoformat()
 
@@ -420,7 +531,7 @@ def _sync_calendar(client, config, calendar_state, rows, deletes, stats, now) ->
     # is alive, and a master missing from both this round and memory is
     # fetched by id so the meeting is not lost.
     for master_id in sorted(series_ids - seen - set(changed) - known):
-        master = _exists(client, f"/me/events/{master_id}")
+        master = _exists(client, f"/me/events/{master_id}", check_active)
         if master is not None and not master.get("isCancelled"):
             changed[master_id] = master
     seen |= series_ids
@@ -433,7 +544,7 @@ def _sync_calendar(client, config, calendar_state, rows, deletes, stats, now) ->
     for event_id in sorted(removed - seen):
         # Graph also reports an event that left the window as removed, so
         # check it before forgetting anything.
-        event = _exists(client, f"/me/events/{event_id}")
+        event = _exists(client, f"/me/events/{event_id}", check_active)
         if event is None or event.get("isCancelled"):
             _forget_event(event_id, known, deletes, stats)
         else:
@@ -463,14 +574,16 @@ def _event_row(item: dict) -> dict:
     subject = item.get("subject") or "(no title)"
     lines = [f"Calendar event: {subject}"]
     if item.get("isAllDay"):
-        lines.append(f"When: all day, {_when(item.get('start'))}")
+        lines.append(f"When: {_all_day(item.get('start'), item.get('end'))}")
     else:
         lines.append(f"When: {_when(item.get('start'))} to {_when(item.get('end'))}")
     location = (item.get("location") or {}).get("displayName")
     if location:
         lines.append(f"Location: {location}")
     lines.append(f"Organizer: {_person(item.get('organizer'))}")
-    attendees = item.get("attendees") or []
+    # Graph's order is not stable between fetches, and the content hash decides
+    # whether the event is re-cognified.
+    attendees = sorted(item.get("attendees") or [], key=_person_key)
     if attendees:
         lines.append(
             "Attendees: "
@@ -513,6 +626,11 @@ def _person(recipient: dict | None) -> str:
     return email or name or "unknown"
 
 
+def _person_key(recipient: dict) -> str:
+    address = (recipient or {}).get("emailAddress") or {}
+    return (address.get("address") or address.get("name") or "").lower()
+
+
 def _people(recipients: list[dict] | None) -> str:
     return ", ".join(_person(r) for r in recipients or []) or "none"
 
@@ -520,6 +638,23 @@ def _people(recipients: list[dict] | None) -> str:
 def _when(value: dict | None) -> str:
     value = value or {}
     return f"{value.get('dateTime', 'unknown')} {value.get('timeZone', '')}".strip()
+
+
+def _all_day(start: dict | None, end: dict | None) -> str:
+    """The span of an all-day event, with its last day inclusive.
+
+    Graph ends an all-day event at midnight after its last day: a one-day event
+    on 2026-11-08 ends on 2026-11-09, so a three-day one reads "2026-11-08 to
+    2026-11-10", and a one-day one needs no "to".
+    """
+    try:
+        first = date.fromisoformat((start or {})["dateTime"][:10])
+        last = date.fromisoformat((end or {})["dateTime"][:10]) - timedelta(days=1)
+    except (KeyError, TypeError, ValueError):
+        return f"all day, {_when(start)}"
+    if last <= first:
+        return f"all day, {first}"
+    return f"all day, {first} to {last}"
 
 
 def _iso(moment: datetime) -> str:
@@ -654,9 +789,10 @@ def outlook_source(
         columns={"_deleted": {"data_type": "bool", "hard_delete": True}},
     )
     def outlook_items():
-        yield from dlt_utils.guarded_rows(
-            _iter_rows(client, config, dlt.current.resource_state(), stats), check_active
+        rows = _iter_rows(
+            client, config, dlt.current.resource_state(), stats, check_active=check_active
         )
+        yield from dlt_utils.guarded_rows(rows, check_active)
 
     resource = outlook_items()
     # Opt into the document ingestion path: each message and event becomes a
