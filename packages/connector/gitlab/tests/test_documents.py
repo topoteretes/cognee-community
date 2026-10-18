@@ -1,7 +1,6 @@
 import pytest
 
 from cognee_community_connector_gitlab.documents import (
-    MAX_COMMENTS_CHARS,
     _issue_to_document,
     _merge_request_to_document,
     _wiki_to_document,
@@ -146,18 +145,9 @@ def test_comment_author_fallbacks():
     assert "unknown (2026-10-17):" in content
 
 
-def test_comment_section_keeps_newest_within_cap():
-    size = MAX_COMMENTS_CHARS // 4
-    notes = [note(i, f"comment-{i} " + "x" * size) for i in range(1, 7)]
+def test_long_threads_keep_every_comment():
+    notes = [note(i, f"comment-{i} " + "x" * 10_000) for i in range(1, 7)]
     content = _issue_to_document(item(), PROJECT, INSTANCE, notes=notes)["content"]
-    section = content.split("## Comments", 1)[1]
-    assert "comment-6" in section and "comment-1 " not in section
-    assert "earlier comments omitted)" in section
-    assert len(section) < MAX_COMMENTS_CHARS + 500
-
-
-def test_single_oversized_comment_is_truncated():
-    notes = [note(1, "y" * (MAX_COMMENTS_CHARS * 2))]
-    content = _issue_to_document(item(), PROJECT, INSTANCE, notes=notes)["content"]
-    assert content.endswith("[truncated]")
-    assert len(content.split("## Comments", 1)[1]) < MAX_COMMENTS_CHARS + 100
+    for i in range(1, 7):
+        assert f"comment-{i} " in content
+    assert "omitted" not in content and "[truncated]" not in content

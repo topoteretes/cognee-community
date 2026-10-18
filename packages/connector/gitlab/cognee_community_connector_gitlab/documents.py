@@ -3,10 +3,6 @@
 from typing import Any, TypedDict
 from urllib.parse import quote, urlsplit, urlunsplit
 
-# Upper bound on the rendered comment section, so one long thread cannot turn
-# its issue into an oversized document. The newest comments are kept.
-MAX_COMMENTS_CHARS = 20_000
-
 
 class DocumentRow(TypedDict):
     id: str
@@ -52,7 +48,9 @@ def _project_url(project: dict[str, Any], instance: str) -> str:
 
 
 def _render_comments(notes: list[dict[str, Any]]) -> list[str]:
-    """Render user comments, newest kept first under ``MAX_COMMENTS_CHARS``.
+    """Render every user comment, oldest first.
+
+    Long threads are not trimmed: cognify chunks long documents like any other.
 
     System notes (label changes, cross-references) are dropped. Internal
     comments are kept and marked, like confidential issues are.
@@ -74,20 +72,8 @@ def _render_comments(notes: list[dict[str, Any]]) -> list[str]:
     if not entries:
         return []
 
-    kept = []
-    used = 0
-    for entry in reversed(entries):
-        if used + len(entry) > MAX_COMMENTS_CHARS:
-            if not kept:
-                kept.append(entry[:MAX_COMMENTS_CHARS].rstrip() + " [truncated]")
-            break
-        kept.append(entry)
-        used += len(entry)
-    kept.reverse()
     lines = ["", "## Comments"]
-    if len(kept) < len(entries):
-        lines.extend(["", f"({len(entries) - len(kept)} earlier comments omitted)"])
-    for entry in kept:
+    for entry in entries:
         lines.extend(["", entry])
     return lines
 

@@ -129,8 +129,8 @@ Confirmed, fixed in !28.
 
 - System notes (label changes, cross-references, "mentioned in") are skipped.
 - Internal comments the token can read are kept and marked `[internal]`.
-- The section is capped at 20,000 characters, keeping the newest comments and
-  noting how many earlier ones were omitted.
+- Every user comment is kept, however long the thread; cognify chunks long
+  documents like any other.
 - Comments live inside their parent document, so deleting an issue or MR
   removes its comments too, and a changed comment re-ingests its parent.
 
