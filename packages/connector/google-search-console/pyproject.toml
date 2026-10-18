@@ -1,0 +1,41 @@
+[project]
+name = "cognee-community-connector-google-search-console"
+version = "0.1.0"
+description = "Google Search Console data-source connector for cognee — sync search performance by month (incremental trailing window + forget-on-delete)"
+readme = "README.md"
+requires-python = ">=3.10,<3.15"
+dependencies = [
+    # Needs cognee's document-mode with table-scoped cleanup and per-row node
+    # sets (DOCUMENT_SYNC_VERSION 2, cognee_node_set), present in cognee 1.6.4.
+    "cognee>=1.6.4,<2",
+    "dlt[sqlalchemy]>=1.9.0,<2",
+    "google-auth-oauthlib>=1.1.0,<2",
+    "httpx>=0.27,<1",
+]
+
+[project.urls]
+Homepage = "https://github.com/topoteretes/cognee"
+Repository = "https://github.com/topoteretes/cognee-community"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cognee_community_connector_google_search_console"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "N", "B", "UP", "C4", "PGH", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8,<9",
+    "pytest-asyncio>=0.23,<2",
+]
