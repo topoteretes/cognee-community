@@ -8,6 +8,10 @@ from cognee_community_connector_google_search_console.client import (
     SearchConsoleAPIError,
     SearchConsoleClient,
 )
+from cognee_community_connector_google_search_console.google_search_console import (
+    google_search_console_source,
+    list_properties,
+)
 
 __all__ = [
     "GoogleSearchConsoleSettings",
@@ -16,4 +20,6 @@ __all__ = [
     "SearchConsoleClient",
     "SearchConsoleCredentials",
     "authorize",
+    "google_search_console_source",
+    "list_properties",
 ]
