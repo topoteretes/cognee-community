@@ -6,8 +6,10 @@ listed several times in one window (the newest version wins, so delete-then-rest
 works), turning internal notes off, article edit / archive / unpublish / publish again /
 no-op, failed or short listings never deleting, rendering independent of input order,
 export page cap, a sync through the real HTTP client, rate-limit retry, record ids kept
-out of errors, auth/config errors, per-account tables, check_active, dlt wiring, the
-row-to-document mapping in cognee, and a real dlt merge into SQLite.
+out of errors, a 200 without JSON, auth/config errors, per-account tables, check_active,
+tickets and articles failing separately (with the ticket cursor put back), a large
+backfill saving progress every run, the sync stats, dlt wiring, the row-to-document
+mapping in cognee, and a real dlt merge into SQLite.
 """
 
 import pytest
@@ -298,6 +300,18 @@ def test_client_waits_out_rate_limit_and_stops_on_bad_credentials(monkeypatch):
     assert sleeps == [7.0]  # no retries on a 401
 
 
+@pytest.mark.parametrize("body", [b"", b"<html>maintenance</html>", b"[]", b"null"])
+def test_a_200_without_a_json_object_raises_a_clean_error(monkeypatch, body):
+    import io
+
+    from cognee_community_connector_zendesk import zendesk as module
+
+    monkeypatch.setattr(module.urllib.request, "urlopen", lambda request, timeout: io.BytesIO(body))
+    with pytest.raises(ZendeskAPIError, match="without a JSON object") as caught:
+        ZendeskClient(SUB, oauth_token="t").get("/api/v2/help_center/articles.json")
+    assert caught.value.status == 200 and not caught.value.ends_run
+
+
 def test_404_names_the_endpoint_but_not_the_record(monkeypatch):
     import urllib.error
 
@@ -456,6 +470,126 @@ def test_e2e_dlt_merge_keeps_unchanged_and_removes_deleted(tmp_path):
     fake.articles = [article(5)]
     t, a = sync()
     assert [x[0] for x in t] == [2] and a == [5]
+
+
+# --------------------------------------------------------------------- partial failure
+def _pipeline(tmp_path):
+    dlt = pytest.importorskip("dlt")
+    return dlt.pipeline(
+        pipeline_name="zendesk_partial",
+        destination=dlt.destinations.sqlalchemy(f"sqlite:///{tmp_path / 'zendesk.db'}"),
+        dataset_name="zendesk_partial",
+        pipelines_dir=str(tmp_path / "pipelines"),
+    )
+
+
+def _ids(pipeline, table):
+    with pipeline.sql_client() as sql:
+        try:
+            return [r[0] for r in sql.execute_sql(f"SELECT id FROM {table} ORDER BY id")]
+        except Exception:  # the table does not exist yet
+            return []
+
+
+def _state(pipeline, resource):
+    return pipeline.state["sources"]["zendesk"]["resources"][resource]
+
+
+def test_failing_articles_do_not_block_tickets(tmp_path):
+    """Help Center switched off, say: tickets still sync and keep their progress."""
+    pipeline, fake = _pipeline(tmp_path), FakeZendesk()
+    fake.touch(ticket(1), [comment(1, "a")])
+    fake.articles = [article(5)]
+    fake.fail_articles = 403
+    source = zendesk_source(SUB, client=fake)
+    pipeline.run(source)  # does not raise
+    assert _ids(pipeline, "zendesk_acme_tickets") == [1]
+    assert _ids(pipeline, "zendesk_acme_articles") == []
+    assert source.cognee_sync_stats == {
+        "scanned": 1,
+        "deleted": 0,
+        "failed": 1,
+        "failed_articles": 1,
+    }
+
+    fake.fail_articles = False  # fixed: the articles are picked up on the next run
+    source = zendesk_source(SUB, client=fake)
+    pipeline.run(source)
+    assert _ids(pipeline, "zendesk_acme_articles") == [5]
+    assert source.cognee_sync_stats["failed"] == 0
+
+
+def test_failing_tickets_keep_their_cursor_and_do_not_block_articles(tmp_path):
+    """The cursor moves while the export is read; a failure after that must put it
+    back, or the tickets whose comments were never fetched would be skipped forever."""
+    pipeline, fake = _pipeline(tmp_path), FakeZendesk()
+    fake.touch(ticket(1), [comment(1, "a")])
+    pipeline.run(zendesk_source(SUB, resources=["tickets"], client=fake))
+    cursor = _state(pipeline, "zendesk_acme_tickets")["after_cursor"]
+
+    fake.touch(ticket(2, "Billing"), [comment(2, "b")])
+    fake.articles = [article(5)]
+    fake.fail_comments = {2: 500}
+    source = zendesk_source(SUB, client=fake)
+    pipeline.run(source)  # does not raise
+    assert _state(pipeline, "zendesk_acme_tickets")["after_cursor"] == cursor
+    assert _ids(pipeline, "zendesk_acme_tickets") == [1]
+    assert _ids(pipeline, "zendesk_acme_articles") == [5]
+    assert source.cognee_sync_stats["failed_tickets"] == 1
+
+    fake.fail_comments = {}  # the next run reads the same window again
+    pipeline.run(zendesk_source(SUB, client=fake))
+    assert _ids(pipeline, "zendesk_acme_tickets") == [1, 2]
+
+
+def test_a_run_where_everything_fails_raises(tmp_path):
+    pipeline, fake = _pipeline(tmp_path), FakeZendesk()
+    fake.touch(ticket(1), [comment(1, "a")])
+    fake.fail_comments = {1: 500}
+    fake.fail_articles = 500
+    with pytest.raises(Exception, match="HTTP 500"):
+        pipeline.run(zendesk_source(SUB, client=fake))
+    with pytest.raises(Exception, match="HTTP 500"):  # also with only one resource selected
+        pipeline.run(zendesk_source(SUB, resources=["articles"], client=fake))
+
+
+@pytest.mark.parametrize("status", [401, 429])
+def test_bad_credentials_or_an_exhausted_rate_limit_end_the_run(tmp_path, status):
+    """These would fail the other resource the same way, so they are not isolated."""
+    pipeline, fake = _pipeline(tmp_path), FakeZendesk()
+    fake.touch(ticket(1), [comment(1, "a")])
+    fake.articles = [article(5)]
+    fake.fail_articles = status
+    with pytest.raises(Exception, match=f"HTTP {status}"):
+        pipeline.run(zendesk_source(SUB, client=fake))
+    assert _ids(pipeline, "zendesk_acme_tickets") == []
+
+
+def test_a_large_first_backfill_saves_progress_every_run(tmp_path):
+    """By default one export page is read per run, so a backfill that cannot finish
+    in one run (an OAuth token expiring, a run failing late) still moves forward."""
+    pipeline, fake = _pipeline(tmp_path), FakeZendesk()
+    fake.page_size = 2
+    for i in range(1, 6):
+        fake.touch(ticket(i), [comment(i, "x")])
+    loaded = []
+    for _ in range(3):
+        pipeline.run(zendesk_source(SUB, resources=["tickets"], client=fake))
+        loaded.append(_ids(pipeline, "zendesk_acme_tickets"))
+    assert loaded == [[1, 2], [1, 2, 3, 4], [1, 2, 3, 4, 5]]
+
+
+def test_sync_stats_count_rows_and_tombstones(tmp_path):
+    pipeline, fake = _pipeline(tmp_path), FakeZendesk()
+    fake.touch(ticket(1), [comment(1, "a")])
+    fake.touch(ticket(2), [comment(2, "b")])
+    fake.articles = [article(5)]
+    pipeline.run(zendesk_source(SUB, client=fake))
+    fake.touch(ticket(2, status="deleted"))
+    fake.articles = []
+    source = zendesk_source(SUB, client=fake)
+    pipeline.run(source)
+    assert source.cognee_sync_stats == {"scanned": 0, "deleted": 2, "failed": 0}
 
 
 def test_each_account_gets_its_own_tables_and_sync_state():

@@ -54,6 +54,7 @@ Design
 from __future__ import annotations
 
 import base64
+import copy
 import json
 import os
 import re
@@ -76,6 +77,11 @@ logger = get_logger("zendesk_connector")
 
 ZENDESK_SOURCE_NAME = "zendesk"
 _RESOURCES = ("tickets", "articles")
+# One export page holds up to 1000 tickets. Each changed ticket also costs one comments
+# request, so a single page keeps a run to roughly 1000 requests: a large first backfill
+# saves its progress every run instead of starting over when a run fails or a short-lived
+# OAuth token expires.
+DEFAULT_EXPORT_PAGES_PER_RUN = 1
 # Attempts per request: the first try plus four retries on 429, 5xx and network
 # errors (429 waits for Retry-After), before the run fails and dlt keeps its state.
 _MAX_RETRIES = 5
@@ -88,7 +94,22 @@ _COLUMNS = {
 
 
 class ZendeskAPIError(RuntimeError):
-    """A Zendesk API call failed permanently."""
+    """A Zendesk API call failed permanently.
+
+    ``status`` is the HTTP status when Zendesk answered (``None`` otherwise), and
+    ``transport`` is set when it could not be reached at all.
+    """
+
+    def __init__(self, message: str, status: int | None = None, transport: bool = False):
+        super().__init__(message)
+        self.status = status
+        self.transport = transport
+
+    @property
+    def ends_run(self) -> bool:
+        """Bad credentials, an exhausted rate limit or no connection would fail the
+        other resource the same way, so they end the run instead of only one part."""
+        return self.transport or self.status in (401, 429)
 
 
 # ---------------------------------------------------------------------------
@@ -144,18 +165,19 @@ class ZendeskClient:
             )
             try:
                 with urllib.request.urlopen(request, timeout=self._timeout) as response:
-                    return json.load(response)
+                    body = response.read()
             except urllib.error.HTTPError as exc:
                 if exc.code in (401, 403):
                     raise ZendeskAPIError(
                         f"Zendesk rejected the credentials (HTTP {exc.code}). OAuth access "
                         "tokens expire; mint a fresh one, and check the token can read "
-                        "tickets / Help Center."
+                        "tickets / Help Center.",
+                        exc.code,
                     ) from None
                 if exc.code == 404:
                     # The endpoint without record ids: status and endpoint are enough.
                     endpoint = re.sub(r"/\d+", "/{id}", urllib.parse.urlparse(url).path)
-                    raise ZendeskAPIError(f"Zendesk returned 404 for {endpoint}.") from None
+                    raise ZendeskAPIError(f"Zendesk returned 404 for {endpoint}.", 404) from None
                 if (exc.code == 429 or exc.code >= 500) and attempt < _MAX_RETRIES - 1:
                     delay = _retry_after(exc.headers, attempt)
                     logger.warning(
@@ -167,12 +189,23 @@ class ZendeskClient:
                     )
                     time.sleep(delay)
                     continue
-                raise ZendeskAPIError(f"Zendesk request failed: HTTP {exc.code}.") from None
+                raise ZendeskAPIError(
+                    f"Zendesk request failed: HTTP {exc.code}.", exc.code
+                ) from None
             except (urllib.error.URLError, TimeoutError) as exc:
                 if attempt < _MAX_RETRIES - 1:
                     time.sleep(float(2**attempt))
                     continue
-                raise ZendeskAPIError(f"Zendesk request failed: {exc}") from None
+                raise ZendeskAPIError(f"Zendesk request failed: {exc}", transport=True) from None
+            # Every endpoint used answers with a JSON object. An empty or garbled 200
+            # must not read as "nothing there"; raise like any other failed request.
+            try:
+                payload = json.loads(body)
+            except ValueError:
+                payload = None
+            if not isinstance(payload, dict):
+                raise ZendeskAPIError("Zendesk returned HTTP 200 without a JSON object.", 200)
+            return payload
 
 
 def _retry_after(headers, attempt: int) -> float:
@@ -471,6 +504,54 @@ def sync_articles(client, state: dict, locale: str | None = None) -> Iterator[di
     logger.info("Zendesk: %d new/edited article(s), %d removed.", changed, len(removed))
 
 
+def _isolated(name: str, rows: Callable[[dict], Iterator[dict]], state: dict, run: dict):
+    """Run one resource so that its ordinary API errors do not fail the other one.
+
+    Tickets and articles share no state. When one of them gets an error from
+    Zendesk, its state is put back as it was (the ticket cursor moves while the
+    export is read, and must not skip tickets whose comments were never fetched),
+    it is counted as failed, and the other one still finishes and saves its
+    progress. The failed one is retried on the next run. Errors that would fail
+    the other one too (``ZendeskAPIError.ends_run``), anything that is not a
+    ``ZendeskAPIError`` (``check_active`` revoking access), and a second failure
+    when every selected resource has failed, are raised: dlt then keeps the
+    previous state of both.
+    """
+    run["failed"].discard(name)
+    counts = run["counts"][name] = {"scanned": 0, "deleted": 0}
+    before = copy.deepcopy(dict(state))
+    try:
+        for row in rows(state):
+            counts["deleted" if row.get("_deleted") else "scanned"] += 1
+            yield row
+    except ZendeskAPIError as exc:
+        state.clear()
+        state.update(before)
+        run["failed"].add(name)
+        if exc.ends_run or run["failed"] >= run["selected"]:
+            raise
+        logger.warning(
+            "Zendesk: %s failed (HTTP %s); the other resource still syncs, %s are retried "
+            "on the next run.",
+            name,
+            exc.status,
+            name,
+        )
+    finally:
+        _publish_stats(run)
+
+
+def _publish_stats(run: dict) -> None:
+    """Count-only diagnostics for hosts (``cognee_sync_stats``), never ids or text."""
+    stats = run["stats"]
+    stats.clear()
+    stats["scanned"] = sum(c["scanned"] for c in run["counts"].values())
+    stats["deleted"] = sum(c["deleted"] for c in run["counts"].values())
+    stats["failed"] = len(run["failed"])
+    for name in sorted(run["failed"]):
+        stats[f"failed_{name}"] = 1
+
+
 # ---------------------------------------------------------------------------
 # Public factory
 # ---------------------------------------------------------------------------
@@ -483,7 +564,7 @@ def zendesk_source(
     resources: tuple[str, ...] | list[str] = _RESOURCES,
     include_internal_notes: bool = False,
     locale: str | None = None,
-    max_export_pages_per_run: int | None = None,
+    max_export_pages_per_run: int | None = DEFAULT_EXPORT_PAGES_PER_RUN,
     resource_name: str | None = None,
     check_active: Callable[[], None] | None = None,
     client: Any = None,
@@ -501,9 +582,10 @@ def zendesk_source(
         include_internal_notes: Also ingest private agent notes (off by default;
             they often hold internal or sensitive information).
         locale: Help Center locale to list articles for (account default when None).
-        max_export_pages_per_run: Cap the ticket export pages per run (each page
-            holds up to 1000 tickets) for a large first backfill; the next run
-            continues from the saved cursor.
+        max_export_pages_per_run: Ticket export pages read per run (each holds up
+            to 1000 tickets); the next run continues from the saved cursor, so a
+            large first backfill makes progress on every run. ``None`` reads the
+            whole export in one run.
         resource_name: Prefix of the two table names, and the key of the sync
             state. Defaults to ``zendesk_<subdomain>``, so two Zendesk accounts
             in one dataset never share a table (their ids overlap). Keep it fixed
@@ -516,6 +598,9 @@ def zendesk_source(
     Returns:
         A dlt source. Every resource uses ``primary_key="id"``,
         ``write_disposition="merge"`` and an ``_deleted`` hard-delete column.
+        Tickets and articles fail separately (see ``_isolated``); after a run,
+        ``source.cognee_sync_stats`` holds counts only (``scanned``, ``deleted``,
+        ``failed``, ``failed_tickets``, ``failed_articles``).
     """
     try:
         import dlt
@@ -540,6 +625,12 @@ def zendesk_source(
     if check_active is not None:
         client = _CheckedClient(client, check_active)
     resource_name = resource_name or f"zendesk_{subdomain}"
+    run: dict = {
+        "selected": {name for name in _RESOURCES if name in resources},
+        "failed": set(),
+        "counts": {},
+        "stats": {},
+    }
 
     @dlt.resource(
         name=f"{resource_name}_tickets",
@@ -548,16 +639,17 @@ def zendesk_source(
         columns=_COLUMNS,
     )
     def zendesk_tickets():
-        yield from guarded_rows(
-            sync_tickets(
+        def rows(state):
+            return sync_tickets(
                 client,
-                dlt.current.resource_state(),
+                state,
                 subdomain,
                 include_internal=include_internal_notes,
                 max_pages=max_export_pages_per_run,
-            ),
-            check_active,
-        )
+            )
+
+        state = dlt.current.resource_state()
+        yield from guarded_rows(_isolated("tickets", rows, state, run), check_active)
 
     @dlt.resource(
         name=f"{resource_name}_articles",
@@ -566,9 +658,11 @@ def zendesk_source(
         columns=_COLUMNS,
     )
     def zendesk_articles():
-        yield from guarded_rows(
-            sync_articles(client, dlt.current.resource_state(), locale=locale), check_active
-        )
+        def rows(state):
+            return sync_articles(client, state, locale=locale)
+
+        state = dlt.current.resource_state()
+        yield from guarded_rows(_isolated("articles", rows, state, run), check_active)
 
     selected = {"tickets": zendesk_tickets, "articles": zendesk_articles}
 
@@ -582,4 +676,5 @@ def zendesk_source(
     # Keep the export cursor per resource_name (and, in cognee, per dataset), so
     # syncing two accounts or datasets never resumes from the other's cursor.
     setattr(source, PIPELINE_SCOPE_ATTR, resource_name)
+    source.cognee_sync_stats = run["stats"]
     return source

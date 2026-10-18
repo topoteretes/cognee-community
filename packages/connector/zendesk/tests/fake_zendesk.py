@@ -69,7 +69,8 @@ class FakeZendesk:
         self.log = []  # ticket versions in change order
         self.comments = {}  # ticket id -> comments
         self.articles = []
-        self.fail_articles = False
+        self.fail_articles = False  # True, or an HTTP status to fail the listing with
+        self.fail_comments = {}  # ticket id -> HTTP status its comments request fails with
         self.calls = []
         self.page_size = 1000
 
@@ -91,6 +92,9 @@ class FakeZendesk:
             }
         if path.startswith("/api/v2/tickets/") and path.endswith("/comments.json"):
             tid = int(path.split("/")[4])
+            if tid in self.fail_comments:
+                status = self.fail_comments[tid]
+                raise ZendeskAPIError(f"HTTP {status}", status)
             comments = self.comments.get(tid, [])
             authors = {c["author_id"] for c in comments}
             # include=users only sideloads the people who wrote a comment
@@ -104,7 +108,8 @@ class FakeZendesk:
             return {"users": [u for u in (ALICE, AGENT) if u["id"] in ids]}
         if path == "/api/v2/help_center/articles.json":
             if self.fail_articles:
-                raise ZendeskAPIError("HTTP 500")
+                status = 500 if self.fail_articles is True else self.fail_articles
+                raise ZendeskAPIError(f"HTTP {status}", status)
             # Like Zendesk, the listing reports how many articles there are in all.
             return {"articles": list(self.articles), "count": len(self.articles), "next_page": None}
         raise AssertionError(path)

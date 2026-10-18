@@ -57,7 +57,7 @@ Options:
 | `resources` | `("tickets", "articles")` | What to ingest. |
 | `include_internal_notes` | `False` | Also ingest private agent notes (labelled `[internal note]`). Changing it re-reads every ticket on the next run, so turning it off also removes notes already stored. |
 | `locale` | account default | Help Center locale to list articles for. |
-| `max_export_pages_per_run` | `None` | Cap ticket export pages (up to 1000 tickets each) for a large first backfill; the next run continues from the saved cursor. |
+| `max_export_pages_per_run` | `1` | Ticket export pages read per run (up to 1000 tickets each). The next run continues from the saved cursor, so a large first backfill makes progress on every run; `None` reads the whole export in one run. |
 | `resource_name` | `zendesk_<subdomain>` | Prefix of the table names (`<resource_name>_tickets`, `<resource_name>_articles`) and key of the sync state. Keep it fixed across runs. |
 | `check_active` | `None` | Optional callable checked before every API request and around every row; raising from it stops the sync (for hosts that need to stop a sync whose access was revoked). |
 
@@ -73,8 +73,9 @@ Set `ZENDESK_SUBDOMAIN` (the `acme` in `acme.zendesk.com`), then **one** of:
   run the authorization-code flow with the `read` scope, and pass the access token. The
   connector does not run the OAuth flow or refresh tokens itself. Access tokens can be
   short-lived (on a trial account they lasted about 30 minutes), and the token has
-  to stay valid for the whole run, so split a very large first backfill with
-  `max_export_pages_per_run`.
+  to stay valid for the whole run. By default each run reads one export page (up to 1000
+  tickets), so a large first backfill is spread over several runs and saves its progress
+  each time.
 - **Email + API token** (`ZENDESK_EMAIL` + `ZENDESK_API_TOKEN`) for existing setups.
 
 The ticket export needs an admin's credentials. Articles need Help Center (Guide) to be
@@ -92,6 +93,8 @@ enabled.
 | Removed articles | An article missing from a complete listing (archived or deleted), or turned back into a draft, is emitted as a tombstone. A failed listing, or one that does not add up to the `count` Zendesk reports, raises instead, so it can never forget live articles. |
 | Stable documents | A ticket document leaves out `updated_at`, which Zendesk bumps for metadata-only changes, so unchanged conversations keep their content hash and are not re-cognified. |
 | Rate limits | 429 and 5xx responses are retried, honouring `Retry-After`. The export allows 10 requests a minute. |
+| Failures | Tickets and articles fail separately: when one gets an error from Zendesk (Help Center switched off, say), the other still syncs and saves its progress, and the failed one keeps its old state and is retried on the next run. Bad credentials (401), a rate limit that outlasts the retries (429), no connection, or both failing end the run, and dlt keeps the previous state. A 200 without a JSON body counts as an error. |
+| Sync stats | After a run, `source.cognee_sync_stats` holds counts only: `scanned`, `deleted`, `failed`, and `failed_tickets` / `failed_articles`. |
 
 ## Resetting a sync
 
@@ -146,8 +149,8 @@ Tickets hold customer personal data. Be clear about what the connector does:
 ## Limitations
 
 - The ticket export needs an admin's credentials and allows 10 requests a minute. Each
-  changed ticket also costs one comments request, so a large first backfill takes a while;
-  `max_export_pages_per_run` splits it over several runs.
+  changed ticket also costs one comments request, so a large first backfill takes several
+  runs (one export page each by default).
 - Articles have no delete feed, so every run lists all of them (one request per 100
   articles).
 - The connector does not run the OAuth flow or refresh OAuth tokens; the token has to stay
@@ -173,8 +176,9 @@ with responses shaped like a real trial account's.
   ticket changed several times in one window, turning internal notes off, article edit /
   archive / unpublish / publish again / no-op, the failed-listing and count guards,
   rendering independent of input order, a sync through the real HTTP client (the token
-  is sent but never stored), record ids kept out of errors, per-account tables,
-  `check_active`, the export page cap, auth and config errors, the dlt wiring,
+  is sent but never stored), record ids kept out of errors, a 200 without JSON,
+  per-account tables, `check_active`, tickets and articles failing separately (with the
+  ticket cursor put back), a large backfill saving progress every run, the sync stats, the export page cap, auth and config errors, the dlt wiring,
   the row-to-document mapping in cognee, and an end-to-end dlt merge into SQLite.
 - `test_zendesk_forget.py` runs the real cognee pipeline (LLM and embeddings mocked, like
   the google-drive connector's forget test). It checks that a deleted ticket and an
