@@ -161,6 +161,9 @@ class FakeSearchConsole:
             }
             rows.append({"keys": list(keys), **row} if dims else row)
         rows.sort(key=lambda r: (-r["clicks"], -r["impressions"], r.get("keys", [])))
+        if not rows and not dims:
+            # Google answers a dimensionless query with one all-zero row, not an empty body.
+            rows = [{"clicks": 0, "impressions": 0, "ctr": 0, "position": 0}]
         page = rows[start : start + limit]
         return httpx.Response(200, json={"rows": page} if page else {})
 

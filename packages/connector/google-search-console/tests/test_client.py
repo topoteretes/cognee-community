@@ -64,7 +64,9 @@ def test_property_urls_are_percent_encoded_in_the_path(client, fake, url):
 
 
 def test_a_bad_token_raises_with_google_s_message(fake):
-    client = SearchConsoleClient(SearchConsoleCredentials(access_token="wrong"), transport=fake.transport())
+    client = SearchConsoleClient(
+        SearchConsoleCredentials(access_token="wrong"), transport=fake.transport()
+    )
     with pytest.raises(SearchConsoleAPIError) as error:
         client.list_sites()
     assert error.value.status == 401
