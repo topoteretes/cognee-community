@@ -335,8 +335,21 @@ def _read_items(client, selection, collection, stats) -> dict[str, dict]:
     path = f"/collections/{collection['id']}/items"
     if not selection.include_drafts:
         path += "/live"
+    try:
+        listing = client.list_all(path, "items")
+    except WebflowAPIError as exc:
+        if exc.status != 409 or selection.include_drafts:
+            raise
+        # Webflow has no live items until the site is published once. Failing
+        # is the safe answer: reading it as "no items" would forget everything.
+        raise WebflowAPIError(
+            409,
+            f"{exc.message} Publish the site in Webflow, or pass include_drafts=True to "
+            "sync the staged items instead.",
+            exc.code,
+        ) from exc
     items: dict[str, dict] = {}
-    for item in client.list_all(path, "items"):
+    for item in listing:
         item_id = item.get("id")
         out_of_scope = (
             not item_id

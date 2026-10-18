@@ -24,6 +24,8 @@ class FakeWebflow:
         self.pages: dict[str, list[dict]] = {}
         self.dom: dict[str, list[dict]] = {}
         self.calls: list[tuple[str, dict]] = []
+        # A site that was never published has no live items (Webflow answers 409).
+        self.published = True
         # Called before each request, to change data while a listing is read.
         self.on_request: Callable[[str, dict], None] | None = None
         # path prefix -> responses to give before answering normally.
@@ -182,6 +184,10 @@ class FakeWebflow:
         if parts[0] == "collections" and parts[2] == "items":
             rows = self.items[parts[1]]
             if parts[3:] == ["live"]:
+                if not self.published:
+                    return _error(
+                        409, "conflict", "Conflict with server data: The site is not published."
+                    )
                 rows = [i for i in rows if not i["isDraft"] and not i["isArchived"]]
             elif parts[3:]:
                 raise KeyError(path)

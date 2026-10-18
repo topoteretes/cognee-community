@@ -238,6 +238,33 @@ def test_localized_variants_sharing_an_id_keep_the_first(fake):
     assert run.stats["skipped"] == 1
 
 
+def test_a_site_that_was_never_published_stops_the_run_with_a_hint(fake):
+    fake.published = False
+
+    with pytest.raises(WebflowAPIError, match="include_drafts=True") as error:
+        sync(fake, {})
+
+    assert error.value.status == 409
+
+
+def test_a_never_published_site_syncs_its_staged_items_with_drafts_on(fake):
+    fake.published = False
+
+    assert sync(fake, {}, include_drafts=True).items == {fake.alpha, fake.bravo}
+
+
+def test_the_site_becoming_unpublished_forgets_nothing(fake):
+    state: dict = {}
+    sync(fake, state)
+    before = {**state}
+    fake.published = False
+
+    with pytest.raises(WebflowAPIError):
+        sync(fake, state)
+
+    assert state == before
+
+
 # ---------------------------------------------------------------------------
 # lastUpdated cursor
 # ---------------------------------------------------------------------------
