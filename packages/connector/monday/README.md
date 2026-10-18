@@ -29,7 +29,7 @@ cd packages/connector/monday && uv sync
 
 1. In monday.com, click your avatar, then **Developers**, then **API token**, and copy it.
    An OAuth access token from your own monday.com app works the same way; it needs the
-   `boards:read` and `updates:read` scopes.
+   `boards:read` and `updates:read` scopes, plus `workspaces:read` for `list_boards`.
 2. Find the ids of the boards you want. The id is the number in a board's URL, or run:
 
    ```bash
