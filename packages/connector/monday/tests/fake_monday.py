@@ -40,7 +40,10 @@ class FakeMonday:
         self.boards[board_id] = {
             "id": board_id,
             "name": name,
+            # Like monday.com, which names and types sub-item boards this way.
+            "type": "sub_items_board" if name.startswith("Subitems of") else "board",
             "state": "active",
+            "workspace": {"name": "Main workspace"},
             "columns": columns,
         }
 
@@ -105,6 +108,10 @@ class FakeMonday:
         if name == "Boards":
             assert "state: all" in query
             return {"boards": [self.boards[i] for i in variables["ids"] if i in self.boards]}
+        if name == "ListBoards":
+            boards = [b for b in self.boards.values() if b["state"] == "active"]
+            start = (variables["page"] - 1) * variables["limit"]
+            return {"boards": boards[start : start + variables["limit"]]}
         if name in ("ItemDetails", "ItemStates"):
             ids = variables["ids"]
             assert len(ids) <= variables["limit"]

@@ -158,6 +158,45 @@ def monday_source(
     return resource
 
 
+_LIST_BOARDS_QUERY = """
+query ListBoards($page: Int!, $limit: Int!) {
+  boards(page: $page, limit: $limit, state: active) { id name type workspace { name } }
+}"""
+_LIST_BOARDS_PAGE_SIZE = 100
+
+
+def list_boards(token: str | None = None, *, client: Any = None) -> list[dict]:
+    """The active boards a token can read, as ``{"id", "name", "workspace"}``.
+
+    Use it to find the ids for ``board_ids``. Sub-item boards are left out:
+    they are synced together with their parent board.
+    """
+    if client is None:
+        resolved = token or os.environ.get("MONDAY_API_TOKEN")
+        if not resolved:
+            raise MondayAuthError(
+                "A monday.com API token is required: pass token= or set MONDAY_API_TOKEN."
+            )
+        client = _MondayClient(resolved)
+
+    boards, page = [], 1
+    while True:
+        variables = {"page": page, "limit": _LIST_BOARDS_PAGE_SIZE}
+        found = client.query(_LIST_BOARDS_QUERY, variables)["boards"] or []
+        boards.extend(
+            {
+                "id": str(board["id"]),
+                "name": board.get("name") or "",
+                "workspace": (board.get("workspace") or {}).get("name") or "",
+            }
+            for board in found
+            if board.get("type") != "sub_items_board"
+        )
+        if len(found) < _LIST_BOARDS_PAGE_SIZE:
+            return boards
+        page += 1
+
+
 def _normalize_board_ids(board_ids) -> list[str]:
     if board_ids is None:
         board_ids = os.environ.get("MONDAY_BOARD_IDS", "").split(",")

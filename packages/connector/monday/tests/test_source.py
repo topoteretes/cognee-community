@@ -58,3 +58,27 @@ def test_board_ids_come_from_the_environment_and_are_deduplicated(monkeypatch):
 def test_board_ids_must_be_numeric():
     with pytest.raises(ValueError, match="numeric"):
         monday_source(board_ids=["my board"], client=FakeMonday())
+
+
+def test_list_boards_hides_subitem_boards_and_pages_through_all():
+    from cognee_community_connector_monday import list_boards
+
+    monday = FakeMonday()
+    monday.add_board("100", "Launch plan", subitems_board="101")
+    monday.add_board("101", "Subitems of Launch plan")
+    for n in range(150):
+        monday.add_board(str(1000 + n), f"Board {n}")
+
+    boards = list_boards(client=monday)
+
+    assert boards[0] == {"id": "100", "name": "Launch plan", "workspace": "Main workspace"}
+    assert len(boards) == 151
+    assert "101" not in {board["id"] for board in boards}
+    assert monday.calls == ["ListBoards", "ListBoards"]
+
+
+def test_list_boards_needs_a_token():
+    from cognee_community_connector_monday import list_boards
+
+    with pytest.raises(MondayAuthError, match="MONDAY_API_TOKEN"):
+        list_boards()
