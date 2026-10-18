@@ -3,7 +3,7 @@ name = "cognee-community-connector-hubspot"
 version = "0.1.0"
 description = "HubSpot data-source connector for cognee — sync CRM records, their relationships and engagements into memory (incremental + forget-on-delete)"
 readme = "README.md"
-requires-python = ">=3.11,<=3.13"
+requires-python = ">=3.11,<3.14"
 dependencies = [
     # 1.6.x: cognee 1.4 skips orphan cleanup when a table's last row is deleted, so the final
     # deleted record was never forgotten; 1.6 handles the empty table (verified end to end).
@@ -11,7 +11,7 @@ dependencies = [
     "dlt[sqlalchemy]>=1.9.0,<2",
 ]
 
-[project.optional-dependencies]
+[dependency-groups]
 dev = ["pytest>=8", "pytest-asyncio>=0.23,<2"]
 
 [project.urls]

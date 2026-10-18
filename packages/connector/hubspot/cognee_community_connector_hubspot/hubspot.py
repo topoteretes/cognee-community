@@ -66,7 +66,11 @@ from html.parser import HTMLParser
 from typing import Any
 
 from cognee.shared.logging_utils import get_logger
-from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR, PIPELINE_SCOPE_ATTR
+from cognee.tasks.ingestion.dlt_utils import (
+    DOCUMENT_SOURCE_ATTR,
+    PIPELINE_SCOPE_ATTR,
+    guarded_rows,
+)
 
 logger = get_logger("hubspot_connector")
 
@@ -194,7 +198,40 @@ class HubSpotClient:
             )
         if response.status_code >= 400:
             raise HubSpotAPIError(f"HubSpot request to {path} failed: HTTP {response.status_code}.")
-        return response.json() if response.content else {}
+        # Every endpoint used answers with a JSON object. An empty or non-JSON body
+        # must not read as "no records": with reconcile_deletes that would forget
+        # every stored record.
+        try:
+            payload = response.json() if response.content else None
+        except ValueError:
+            payload = None
+        if not isinstance(payload, dict):
+            raise HubSpotAPIError(
+                f"HubSpot request to {path} returned HTTP {response.status_code} "
+                "without a JSON object."
+            )
+        return payload
+
+
+class _CheckedClient:
+    """Runs the host's ``check_active`` before every API request.
+
+    All requests of a run happen before its first rows are emitted, so checking
+    only around rows would let a sync whose access was revoked keep calling
+    HubSpot until the end.
+    """
+
+    def __init__(self, client, check_active: Callable[[], None]):
+        self._client = client
+        self._check_active = check_active
+
+    def get(self, path: str, **params: Any) -> dict:
+        self._check_active()
+        return self._client.get(path, **params)
+
+    def post(self, path: str, body: dict) -> dict:
+        self._check_active()
+        return self._client.post(path, body)
 
 
 def refresh_access_token(client_id: str, client_secret: str, refresh_token: str) -> str:
@@ -771,6 +808,8 @@ def hubspot_source(
     extra_properties: dict[str, list[str]] | None = None,
     reconcile_deletes: bool = False,
     portal_id: str | None = None,
+    resource_name: str = HUBSPOT_SOURCE_NAME,
+    check_active: Callable[[], None] | None = None,
     client: Any = None,
 ):
     """Create a dlt source that yields HubSpot records as documents.
@@ -790,12 +829,19 @@ def hubspot_source(
             or archived more than 90 days ago (one request per 100 records).
         portal_id: The HubSpot account id, for record links and state scoping;
             looked up when omitted.
+        resource_name: Prefix of the table names (``<resource_name>_contacts``,
+            ...). Record ids are only unique inside one HubSpot account, so give
+            each account its own name when several sync into one dataset. Keep it
+            fixed across runs.
+        check_active: Optional host authorization checkpoint, called before every
+            API request and around every row (``dlt_utils.guarded_rows``);
+            raising from it stops the sync.
         client: Object with ``get(path, **params)`` and ``post(path, body)``; a
             test injection point.
 
     Returns:
         A dlt source with one resource writing one table per object type
-        (``hubspot_contacts``, ...), each with ``primary_key="id"``,
+        (``<resource_name>_contacts``, ...), each with ``primary_key="id"``,
         ``write_disposition="merge"`` and an ``_deleted`` hard-delete column.
     """
     try:
@@ -829,23 +875,26 @@ def hubspot_source(
             )
         client = HubSpotClient(token, refresh=refresh)
     portal_id = portal_id or os.environ.get("HUBSPOT_PORTAL_ID") or _portal_id(client)
+    if check_active is not None:
+        client = _CheckedClient(client, check_active)
 
     @dlt.resource(
-        name=HUBSPOT_SOURCE_NAME,
+        name=resource_name,
         primary_key="id",
         write_disposition="merge",
         columns=_COLUMNS,
     )
     def hubspot_records():
-        for object_type, row in sync_hubspot(
+        rows = sync_hubspot(
             client,
             dlt.current.resource_state(),
             objects=objects,
             extra_properties=extra_properties,
             portal_id=portal_id,
             reconcile_deletes=reconcile_deletes,
-        ):
-            yield dlt.mark.with_table_name(row, f"hubspot_{object_type}")
+        )
+        for object_type, row in guarded_rows(rows, check_active):
+            yield dlt.mark.with_table_name(row, f"{resource_name}_{object_type}")
 
     @dlt.source(name=HUBSPOT_SOURCE_NAME)
     def _hubspot():
@@ -855,6 +904,10 @@ def hubspot_source(
     # CRM records are rendered as text with their relationships: route them
     # through cognify (document mode).
     setattr(source, DOCUMENT_SOURCE_ATTR, HUBSPOT_SOURCE_NAME)
-    # Keep the cursors per HubSpot account (and, in cognee, per dataset).
-    setattr(source, PIPELINE_SCOPE_ATTR, f"hubspot:{portal_id or 'default'}")
+    # Keep the cursors per HubSpot account and resource name (and, in cognee, per
+    # dataset). The default keeps the scope existing syncs already use.
+    scope = f"hubspot:{portal_id or 'default'}"
+    if resource_name != HUBSPOT_SOURCE_NAME:
+        scope = f"{scope}:{resource_name}"
+    setattr(source, PIPELINE_SCOPE_ATTR, scope)
     return source

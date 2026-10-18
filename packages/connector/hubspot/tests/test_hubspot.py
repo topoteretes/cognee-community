@@ -4,10 +4,14 @@ Coverage: rendering (relationships by name, stage and owner labels, engagement
 bodies from HTML), the property allowlist, first sync and cursor, the cursor
 staying behind the search index, the 10,000-result window restart, related
 documents re-rendered after a rename (notes included), archived, merged and
-reconciled deletions, a failed listing never deleting, missing owner scope, auth
-and config errors, the dlt wiring, the row-to-document mapping in cognee, and a
-real dlt merge into SQLite.
+reconciled deletions, a failed listing or an empty response never deleting, link
+order not changing a document, resource_name, check_active, missing owner scope,
+auth and config errors, the dlt wiring, the row-to-document mapping in cognee, and
+a real dlt merge into SQLite.
 """
+
+import json
+from json import dumps as _dumps
 
 import pytest
 from fake_hubspot import DAY, NOW, FakeHubSpot, crm
@@ -252,6 +256,65 @@ def test_reconcile_catches_records_removed_for_good():
     assert ("tickets", {"id": "30", "_deleted": True}) in rows
 
 
+class _Response:
+    def __init__(self, content, status_code=200):
+        self.status_code, self.content = status_code, content
+
+    def json(self):
+        return json.loads(self.content)
+
+
+@pytest.mark.parametrize("body", [b"", b"<html>maintenance</html>", b"[]", b"null"])
+def test_a_200_without_a_json_object_raises(body):
+    with pytest.raises(HubSpotAPIError, match="without a JSON object"):
+        hs.HubSpotClient._check(_Response(body), "/crm/v3/objects/contacts")
+
+
+def test_an_empty_listing_body_never_deletes(monkeypatch):
+    """Through the real client: one empty 200 on the id listing must not read as
+    "no records left" and tombstone the whole CRM with reconcile_deletes."""
+    fake = crm()
+    state = {}
+    run(fake, state)
+
+    client = hs.HubSpotClient("token")
+
+    def get(path, params=None):
+        params = params or {}
+        if path.startswith("/crm/v3/objects/") and params.get("archived") != "true":
+            return _Response(b"")  # the id listing comes back empty
+        return _Response(_dumps(fake.get(path, **params)).encode())
+
+    def post(path, json=None):  # the keyword dlt's RESTClient.post is called with
+        return _Response(_dumps(fake.post(path, json)).encode())
+
+    monkeypatch.setattr(client._rest, "get", get)
+    monkeypatch.setattr(client._rest, "post", post)
+    with pytest.raises(HubSpotAPIError, match="without a JSON object"):
+        run(client, state, reconcile_deletes=True)
+    assert sorted(state["known"]["contacts"]) == ["1"]  # nothing was forgotten
+
+
+def test_documents_render_the_same_whatever_order_hubspot_sends():
+    import random
+
+    def busy_crm():
+        # Acme has several contacts, so the order HubSpot lists them in matters.
+        fake = crm()
+        for rid, (first, last) in enumerate([("Ada", "King"), ("Bo", "Li"), ("Cy", "Ng")], 2):
+            fake.put("contacts", rid, NOW - 9 * DAY, firstname=first, lastname=last)
+            fake.link("contacts", rid, "companies", 10)
+            fake.link("notes", 40, "contacts", rid)
+        return fake
+
+    expected = by_id(run(busy_crm(), {}))
+    assert "Ada King; Bo Li; Cy Ng; Jane Doe" in expected[("companies", "10")]["content"]
+    for seed in range(10):
+        fake = busy_crm()
+        fake.shuffle = random.Random(seed)
+        assert by_id(run(fake, {})) == expected
+
+
 def test_failed_listing_never_deletes():
     fake = crm()
     state = {}
@@ -341,6 +404,36 @@ def test_source_is_merge_with_hard_delete_and_document_mode():
     assert resource.compute_table_schema()["columns"]["_deleted"]["hard_delete"] is True
     assert getattr(source, DOCUMENT_SOURCE_ATTR) == "hubspot"
     assert getattr(source, hs.PIPELINE_SCOPE_ATTR) == "hubspot:4242"
+
+
+def test_resource_name_names_the_tables_and_the_sync_state():
+    source = hubspot_source(client=crm(), portal_id="4242", resource_name="crm_eu")
+    assert set(source.resources) == {"crm_eu"}
+    assert getattr(source, hs.PIPELINE_SCOPE_ATTR) == "hubspot:4242:crm_eu"
+
+
+def test_check_active_runs_before_every_request():
+    """A connection revoked mid-run stops the sync before the next API call, not
+    only between emitted rows (every request happens before the first row)."""
+
+    class AccessRevokedError(Exception):
+        pass
+
+    fake = crm()
+
+    def revoked_after_first_request():
+        if fake.calls:
+            raise AccessRevokedError
+
+    source = hubspot_source(client=fake, portal_id="4242", check_active=revoked_after_first_request)
+    with pytest.raises(Exception) as caught:
+        list(source.resources["hubspot"])
+    causes, error = [], caught.value
+    while error is not None:
+        causes.append(error)
+        error = error.__cause__ or error.__context__
+    assert any(isinstance(e, AccessRevokedError) for e in causes)
+    assert len(fake.calls) == 1
 
 
 def test_portal_id_is_looked_up_when_not_given():

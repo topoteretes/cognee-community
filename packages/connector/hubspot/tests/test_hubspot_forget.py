@@ -20,6 +20,9 @@ from cognee.infrastructure.databases.vector.embeddings.LiteLLMEmbeddingEngine im
     LiteLLMEmbeddingEngine,
 )
 from cognee.infrastructure.llm import LLMGateway
+from cognee.modules.data.methods import get_authorized_existing_datasets
+from cognee.modules.data.methods.get_dataset_data import get_dataset_data
+from cognee.modules.users.methods import get_default_user
 from fake_hubspot import DAY, NOW, FakeHubSpot, iso
 
 from cognee_community_connector_hubspot import hubspot_source
@@ -63,10 +66,35 @@ async def _graph_has(token: str) -> bool:
     )
 
 
+def _reset_cached_engines() -> None:
+    """Drop cognee's cached engines and dlt's active pipeline, so each test starts
+    from its own storage and sync state."""
+    from cognee.context_global_variables import graph_db_config, vector_db_config
+    from cognee.infrastructure.databases.graph.get_graph_engine import _create_graph_engine
+    from cognee.infrastructure.databases.relational.create_relational_engine import (
+        create_relational_engine,
+    )
+    from cognee.infrastructure.databases.vector.create_vector_engine import _create_vector_engine
+    from cognee.tasks.ingestion.get_dlt_destination import get_dlt_destination
+    from dlt.common.configuration.container import Container
+    from dlt.common.pipeline import PipelineContext
+
+    Container()[PipelineContext].deactivate()
+    _create_graph_engine.cache_clear()
+    _create_vector_engine.cache_clear()
+    create_relational_engine.cache_clear()
+    get_dlt_destination.cache_clear()
+    graph_db_config.set(None)
+    vector_db_config.set(None)
+
+
 @pytest_asyncio.fixture
 async def clean_environment(tmp_path, monkeypatch):
     monkeypatch.setenv("COGNEE_SKIP_CONNECTION_TEST", "true")
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "databases"))
     monkeypatch.setenv("DLT_DATA_DIR", str(tmp_path / "dlt"))
+    monkeypatch.setenv("PIPELINES_DIR", str(tmp_path / "dlt" / "pipelines"))
+    _reset_cached_engines()
     cognee.config.data_root_directory(str(tmp_path / "data"))
     cognee.config.system_root_directory(str(tmp_path / "system"))
     cognee.config.set_relational_db_config({"db_provider": "sqlite"})
@@ -79,7 +107,15 @@ async def clean_environment(tmp_path, monkeypatch):
     monkeypatch.setattr(LLMGateway, "acreate_structured_output", _mock_structured_output)
 
     async def _mock_embed_text(self, text):
-        return [[0.0] * self.get_vector_size() for _ in text]
+        vectors = [[0.0] * self.get_vector_size() for _ in text]
+        try:
+            # newer cognee reads the token count off the result
+            from cognee.infrastructure.databases.vector.embeddings.EmbeddingEngine import (
+                EmbeddingResult,
+            )
+        except ImportError:
+            return vectors
+        return EmbeddingResult(vectors, tokens=0)
 
     monkeypatch.setattr(LiteLLMEmbeddingEngine, "embed_text", _mock_embed_text)
 
@@ -88,11 +124,25 @@ async def clean_environment(tmp_path, monkeypatch):
     yield
     await cognee.prune.prune_data()
     await cognee.prune.prune_system(metadata=True)
+    _reset_cached_engines()
 
 
-async def _sync(fake):
+async def _documents() -> dict[tuple[str, str], object]:
+    """The dataset's Data records, keyed by (table, HubSpot id)."""
+    user = await get_default_user()
+    datasets = await get_authorized_existing_datasets(
+        user=user, permission_type="read", datasets=[DATASET]
+    )
+    return {
+        (data.system_metadata["table_name"], data.system_metadata["external_id"]): data.id
+        for data in await get_dataset_data(datasets[0].id)
+        if isinstance(data.system_metadata, dict)
+    }
+
+
+async def _sync(fake, portal_id="4242", resource_name="hubspot"):
     await cognee.add(
-        hubspot_source(client=fake, portal_id="4242"),
+        hubspot_source(client=fake, portal_id=portal_id, resource_name=resource_name),
         dataset_name=DATASET,
         primary_key="id",
         write_disposition="merge",
@@ -118,13 +168,43 @@ async def test_deleted_note_and_contact_leave_the_graph(clean_environment):
     await _sync(fake)
     for token in TOKENS:
         assert await _graph_has(token), f"{token} should be in the graph after the first sync"
+    before = await _documents()
+    deleted = {("hubspot_notes", "41"), ("hubspot_contacts", "2")}
+    assert deleted <= set(before)
 
     fake.archive("notes", 41, NOW - DAY)  # deleting in HubSpot archives the record
     fake.archive("contacts", 2, NOW - DAY)
     await _sync(fake)
+
+    after = await _documents()
+    assert not deleted & set(after), "the deleted note's and contact's Data records must go"
+    kept = ("hubspot_notes", "40")
+    assert after[kept] == before[kept], "a note that was not touched must keep its id"
 
     assert await _graph_has(ALPHA), "a note that was not deleted must stay"
     assert not await _graph_has(BRAVO), "a deleted note must be forgotten from the graph"
     assert not await _graph_has(CHARLIE), (
         "a deleted contact must be forgotten, including from her company's document"
     )
+
+
+@pytest.mark.asyncio
+async def test_two_accounts_with_their_own_resource_name_stay_apart(clean_environment):
+    # Record ids are only unique inside one account: both have a note 40.
+    then = NOW - 9 * DAY
+    first, second = FakeHubSpot(), FakeHubSpot()
+    first.put("notes", 40, then, hs_note_body=f"{ALPHA} signed.", hs_timestamp=iso(then))
+    second.put("notes", 40, then, hs_note_body=f"{BRAVO} wants 15% off.", hs_timestamp=iso(then))
+
+    await _sync(first, "1001", "hubspot_eu")
+    await _sync(second, "2002", "hubspot_us")
+    both = {("hubspot_eu_notes", "40"), ("hubspot_us_notes", "40")}
+    assert set(await _documents()) == both
+
+    second.archive("notes", 40, NOW - DAY)
+    await _sync(second, "2002", "hubspot_us")
+    await _sync(first, "1001", "hubspot_eu")
+
+    assert set(await _documents()) == {("hubspot_eu_notes", "40")}
+    assert await _graph_has(ALPHA), "deleting one account's note 40 must not touch the other's"
+    assert not await _graph_has(BRAVO)

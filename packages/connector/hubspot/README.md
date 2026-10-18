@@ -19,7 +19,7 @@ so the last deleted record would stay in memory. 1.6.3 handles that case.
 ```bash
 uv pip install cognee-community-connector-hubspot
 # or, from this monorepo:
-cd packages/connector/hubspot && uv sync --all-extras
+cd packages/connector/hubspot && uv sync
 ```
 
 ## Usage
@@ -51,6 +51,8 @@ Options:
 | `extra_properties` | none | More properties to read per object, e.g. `{"contacts": ["phone"]}`. |
 | `reconcile_deletes` | `False` | Also list every id, to catch records removed for good (one request per 100 records). |
 | `portal_id` | looked up | The HubSpot account id, used for record links and to keep sync state per account. |
+| `resource_name` | `hubspot` | Prefix of the table names (`<resource_name>_contacts`, ...). Give each HubSpot account its own name when several sync into one dataset. Keep it fixed across runs. |
+| `check_active` | `None` | Optional callable checked before every API request and around every row; raising from it stops the sync (for hosts that need to stop a sync whose access was revoked). |
 
 ## Setup and auth
 
@@ -96,7 +98,7 @@ A record's linked records are only named when their object type is synced as wel
 | Relationships stay current | When a record's name or label changes, every document that names it is re-rendered too (notes included), so a renamed company is not left under its old name in its contacts' documents or in the notes about it. Adding or removing a link refreshes both sides. HubSpot also bumps the modified date on its own (activity counts, rollups); such a bump re-reads that record but does not ripple into its linked documents. |
 | Forget-on-delete | Deleting a record archives it, and search never returns archived records, so the archived list (kept 90 days) is the delete feed: records archived since the last run become `_deleted` hard-delete rows and cognee's `orphan_cleanup` forgets them. Documents that named a deleted record are re-rendered without it. |
 | Merged records | A merged-away record disappears without being archived. The survivor's `hs_merged_object_ids` names it, and it is tombstoned too. |
-| Removed for good | GDPR deletes and records archived more than 90 days ago leave no trace in the archived list. `reconcile_deletes=True` compares a full id listing with what is stored; a failed listing raises instead of deleting. |
+| Removed for good | GDPR deletes and records archived more than 90 days ago leave no trace in the archived list. `reconcile_deletes=True` compares a full id listing with what is stored; a failed listing, or a response without a JSON body, raises instead of deleting. |
 | Stable documents | Documents leave out modified timestamps, so an unchanged record keeps its content hash and is not re-cognified. |
 | Rate limits | Requests go through dlt's REST client, which retries 429 and 5xx responses and honours `Retry-After`. Search calls are paced to its 5 requests per second. |
 
@@ -142,6 +144,9 @@ dataset (`PIPELINE_SCOPE_ATTR`).
   date, gender, phone or address by default); `extra_properties` adds more on purpose.
   Keep the data in its own dataset so you can remove it with one
   `cognee.forget(dataset=...)` call.
+- Anyone who can read the cognee dataset can recall the synced records: names, emails,
+  deal amounts and note text. Share the dataset only with people who may see those
+  records in HubSpot.
 
 ## Limitations
 
@@ -151,6 +156,8 @@ dataset (`PIPELINE_SCOPE_ATTR`).
 - Invoices, products, line items and custom objects are not synced yet. Invoices would be
   one more object type (with `crm.objects.invoices.read`) rendered the same way.
 - Attachments, and email bodies beyond `hs_email_text`, are not ingested.
+- Record ids are only unique inside one HubSpot account. To sync two accounts into one
+  dataset, give each its own `resource_name`; with the same name they would share tables.
 
 ## Testing
 
@@ -167,10 +174,13 @@ account's responses.
   property allowlist, the cursor per object type, the cursor staying behind the search
   index, the 10,000-result window restart, related documents refreshed after a rename
   (notes included) or a delete, archived, merged and reconciled deletions, the
-  failed-listing guard, missing scopes, auth and config errors, the dlt wiring, the
+  failed-listing and empty-response guards, documents rendering the same whatever order
+  HubSpot sends links in, `resource_name`, `check_active`, missing scopes, auth and
+  config errors, the dlt wiring, the
   row-to-document mapping in cognee, and an end-to-end dlt merge into SQLite with one
   table per object type.
 - `test_hubspot_forget.py` runs the real cognee pipeline (LLM and embeddings mocked, like
-  the google-drive connector's forget test) and checks that a deleted note and a deleted
-  contact leave the graph, including the contact's name on her company's document, while
-  an untouched note stays.
+  the google-drive connector's forget test). It checks that a deleted note and a deleted
+  contact lose their Data records and leave the graph, including the contact's name on
+  her company's document, while an untouched note keeps its id, and that two accounts
+  with their own `resource_name` stay apart in one dataset.

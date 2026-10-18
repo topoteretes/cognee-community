@@ -31,6 +31,7 @@ class FakeHubSpot:
         self.links = set()  # (type_a, id_a, type_b, id_b), stored both ways
         self.owners_forbidden = False
         self.fail_listing = False
+        self.shuffle = None  # a random.Random: serve associations in a shuffled order
         self.calls = []
 
     # -- setup helpers --------------------------------------------------------
@@ -102,10 +103,14 @@ class FakeHubSpot:
                 to = sorted(
                     i2 for (x, i, y, i2) in self.links if x == a and i == item["id"] and y == b
                 )
+                if self.shuffle:
+                    self.shuffle.shuffle(to)
                 if to:
                     results.append(
                         {"from": {"id": item["id"]}, "to": [{"toObjectId": int(t)} for t in to]}
                     )
+            if self.shuffle:
+                self.shuffle.shuffle(results)
             return {"results": results}
         if path.endswith("/batch/read"):
             object_type = parts[3]
