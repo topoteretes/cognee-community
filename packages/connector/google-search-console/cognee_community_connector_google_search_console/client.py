@@ -12,7 +12,7 @@ from .auth import SearchConsoleCredentials
 
 logger = get_logger("google_search_console_connector")
 
-API_URL = "https://www.googleapis.com/webmasters/v3"
+API_URL = "https://searchconsole.googleapis.com/webmasters/v3"
 
 # The most rows one searchAnalytics.query call returns.
 ROW_LIMIT = 25_000
