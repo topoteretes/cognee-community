@@ -263,8 +263,7 @@ class ServiceNowAPI:
             else:
                 retryable = response.status_code == 429 or response.status_code >= 500
                 if not retryable or attempt == _MAX_RETRIES - 1:
-                    response.raise_for_status()
-                    return response.json()
+                    return _parse(response, path)
                 reason = f"HTTP {response.status_code}"
                 delay = _retry_delay(response.headers, attempt)
             logger.warning("ServiceNow: %s on %s — retrying in %.1fs.", reason, path, delay)
@@ -284,6 +283,28 @@ class ServiceNowAPI:
             if len(records) < page_size:
                 return
             offset += page_size
+
+
+def _parse(response: Any, path: str) -> dict:
+    """Raise on a failed response with a hint for the common causes; else decode JSON."""
+    import requests
+
+    if response.status_code == 401:
+        raise requests.HTTPError(
+            "ServiceNow rejected the credentials (HTTP 401). Check the username and "
+            "password; on newer instances the integration user also needs the "
+            "snc_basic_auth_api_access role and Internal Integration User ticked.",
+            response=response,
+        )
+    response.raise_for_status()
+    try:
+        return response.json()
+    except ValueError:
+        raise RuntimeError(
+            f"ServiceNow answered {path} with a web page instead of JSON (HTTP "
+            f"{response.status_code}). A Personal Developer Instance does this while it is "
+            "hibernating: wake it at developer.servicenow.com and run the sync again."
+        ) from None
 
 
 def _retry_delay(headers: Any, attempt: int) -> float:

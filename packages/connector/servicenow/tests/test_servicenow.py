@@ -65,6 +65,8 @@ class FakeResponse:
         self.headers = headers or {}
 
     def json(self):
+        if isinstance(self._payload, str):  # an HTML page, as a hibernating instance sends
+            raise ValueError("not JSON")
         return self._payload
 
     def raise_for_status(self):
@@ -212,9 +214,17 @@ def test_rate_limit_is_retried_and_auth_errors_are_not(_no_sleep):
     assert _no_sleep == [3.0, 2.0]
 
     session.scripted = [FakeResponse(401)]
-    with pytest.raises(requests.HTTPError):
+    with pytest.raises(requests.HTTPError, match="snc_basic_auth_api_access"):
         list(_api(session).table("incident", {}))
     assert _no_sleep == [3.0, 2.0]  # no extra retry for 401
+
+
+def test_web_page_instead_of_json_names_hibernation():
+    session = FakeServiceNowSession({"incident": []})
+    session.scripted = [FakeResponse(200, "<html>Instance hibernating</html>")]
+
+    with pytest.raises(RuntimeError, match="hibernating"):
+        list(_api(session).table("incident", {}))
 
 
 # ---------------------------------------------------------------------------
