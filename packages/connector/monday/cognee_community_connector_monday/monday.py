@@ -1,32 +1,67 @@
-"""DLT source for monday.com boards (incremental sync + forget-on-delete).
+"""monday.com connector for cognee: a ``dlt`` source that turns boards into memory.
 
-Work in progress. The planned design, based on tests against a real account:
+Sync monday.com boards into cognee, incrementally and with forget-on-delete.
+The resource is handed directly to :func:`cognee.remember`::
 
-* Each item becomes one document on cognee's document path, in the same shape
-  as the Linear connector: a state line, an assignee line, a parent line for
-  sub-items, the other columns, and the item's updates folded in.
-* Every sync lists the ids and last-updated times of all active items, and
-  fetches full details only for items that changed.
-* Posting or editing an update does not change an item's last-updated time and
-  is not in the activity log, so updates are read as their own stream.
-* An id missing from a complete listing is looked up by id. Archived or deleted
-  items get a ``_deleted`` marker so cognee forgets them. A failed or partial
-  listing never deletes anything.
+    import cognee
+    from cognee_community_connector_monday import monday_source
+
+    await cognee.remember(
+        monday_source(board_ids=[1234567890]),  # token from MONDAY_API_TOKEN
+        dataset_name="monday",
+        primary_key="id",
+        write_disposition="merge",   # incremental upserts and deletes
+        max_rows_per_table=0,        # no row cap; a board exceeds the default 50
+    )
+
+Design
+------
+* **Documents** - each item becomes one document on cognee's document path, in
+  the shape of the Linear connector in cognee core: board, group, state,
+  assignee, parent for sub-items, the other columns, the item description, and
+  the updates with their replies. Sub-items live on their own board, which is
+  synced with its parent board.
+* **Incremental sync** - every run lists each board's items with cheap stamps:
+  the item's ``updated_at`` and the id and ``updated_at`` of every update and
+  reply. Posting or editing an update does not move the item's ``updated_at``
+  and is not in the activity log, so the update stamps are what catch new,
+  edited and deleted comments. Only items whose stamps changed are fetched.
+* **Forget-on-delete** - an item missing from a complete listing is looked up
+  by id, and forgotten with a ``_deleted`` row only when monday.com confirms it
+  is archived, deleted, gone, or moved off the synced boards. A deleted or
+  archived board, or one dropped from ``board_ids``, takes its items with it.
+* **Errors never delete** - a board the token cannot see is reported as
+  failed, never as empty. A failing board keeps its state while the others
+  finish, and the run only raises when no board finished or the token is
+  refused.
+* **Rate limits** - monday.com's ``RateLimit`` header and ``retry_in_seconds``
+  are honored, and listing queries are sized to stay inside the per-minute
+  complexity budget.
 
 monday.com has a single GraphQL endpoint, so the declarative ``rest_api`` source
 does not fit the sync above (list, compare, fetch what changed, confirm what is
 gone). The client is still built on dlt's REST toolkit: ``RESTClient`` for the
 requests, dlt's retrying session for rate limits and server errors, and dlt's
 cursor paginator, which writes monday.com's page cursor into the query variables.
+
+Limitations
+-----------
+* monday.com gives no signal when only an item's description is edited, so a
+  description is re-read when its item changes for any other reason, or on a
+  ``full_refresh``.
+* The newest 100 updates of an item are read. Files and their contents are not.
 """
 
 import hashlib
 import json
+import os
 from collections.abc import Callable, Iterator
 from typing import Any
 
 import requests
 from cognee.shared.logging_utils import get_logger
+from cognee.tasks.ingestion import dlt_utils
+from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
 from dlt.sources.helpers.requests.retry import Client
 from dlt.sources.helpers.rest_client.client import RESTClient
 from dlt.sources.helpers.rest_client.paginators import JSONResponseCursorPaginator
@@ -50,9 +85,91 @@ class MondayAuthError(MondayAPIError):
     """The token is missing, malformed, revoked, or lacks access."""
 
 
-def monday_source(*args, **kwargs):
-    """Create a dlt source that yields monday.com items as documents."""
-    raise NotImplementedError("The monday.com connector is still being built.")
+def monday_source(
+    board_ids: list[str | int] | str | int | None = None,
+    *,
+    token: str | None = None,
+    full_refresh: bool = False,
+    resource_name: str = "monday_items",
+    check_active: Callable[[], None] | None = None,
+    client: Any = None,
+):
+    """Return a ``dlt`` resource yielding one row per new or changed monday.com item.
+
+    Hand the result to ``cognee.remember(...)`` with ``write_disposition="merge"``,
+    ``primary_key="id"`` and ``max_rows_per_table=0``.
+
+    Args:
+        board_ids: Boards to sync, by id (the number in the board's URL). Their
+            sub-item boards are synced with them. ``MONDAY_BOARD_IDS`` takes a
+            comma-separated list.
+        token: A personal API token or an OAuth access token with read access to
+            the boards. Falls back to ``MONDAY_API_TOKEN``.
+        full_refresh: Re-read every item, for example to pick up edited item
+            descriptions. Unchanged documents are not re-processed by cognee.
+        resource_name: Stable dlt resource name. Give each account its own name
+            when several sync into one dataset, so their state stays separate.
+        check_active: Optional host authorization checkpoint, run before every
+            API call and every row.
+        client: A pre-built client, mainly for tests.
+    """
+    import dlt
+
+    if getattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 0) < 1:
+        raise RuntimeError(
+            "The monday.com connector requires a cognee build with table-scoped dlt "
+            "document cleanup. Upgrade cognee before syncing."
+        )
+
+    boards = _normalize_board_ids(board_ids)
+    if client is None:
+        # Built here, so a missing or malformed token fails when the source is
+        # created, not halfway through a pipeline run.
+        resolved = token or os.environ.get("MONDAY_API_TOKEN")
+        if not resolved:
+            raise MondayAuthError(
+                "A monday.com API token is required: pass token= or set MONDAY_API_TOKEN."
+            )
+        client = _MondayClient(resolved, check_active=check_active)
+
+    stats: dict[str, int] = {}
+
+    @dlt.resource(
+        name=resource_name,
+        write_disposition="merge",
+        primary_key="id",
+        # `_deleted` is a boolean hard-delete marker: rows where it is True are
+        # removed from the dlt destination on merge, and cognee's orphan
+        # cleanup then forgets their documents.
+        columns={"_deleted": {"data_type": "bool", "hard_delete": True}},
+    )
+    def monday_items():
+        stats.clear()
+        rows = _iter_rows(client, boards, dlt.current.resource_state(), stats, full_refresh)
+        yield from dlt_utils.guarded_rows(rows, check_active)
+
+    resource = monday_items()
+    # Opt into the document ingestion path: each item becomes a text document
+    # that flows through normal cognify (LLM graph extraction).
+    setattr(resource, DOCUMENT_SOURCE_ATTR, "monday")
+    setattr(resource, dlt_utils.PIPELINE_SCOPE_ATTR, resource_name)
+    # Host-readable diagnostics: counts only, never names or content.
+    resource.cognee_sync_stats = stats
+    return resource
+
+
+def _normalize_board_ids(board_ids) -> list[str]:
+    if board_ids is None:
+        board_ids = os.environ.get("MONDAY_BOARD_IDS", "").split(",")
+    elif isinstance(board_ids, (str, int)):
+        board_ids = [board_ids]
+    cleaned = [str(board_id).strip() for board_id in board_ids if str(board_id).strip()]
+    if not cleaned:
+        # An empty selection would forget every board synced before, so refuse it.
+        raise ValueError("board_ids is empty. Pass boards like board_ids=[1234567890].")
+    if not all(board_id.isdigit() for board_id in cleaned):
+        raise ValueError("board_ids must be numeric monday.com board ids.")
+    return list(dict.fromkeys(cleaned))
 
 
 # ---------------------------------------------------------------------------
