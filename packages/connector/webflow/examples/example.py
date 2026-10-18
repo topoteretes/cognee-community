@@ -27,6 +27,8 @@ Setup
        export LLM_API_KEY="sk-..."
        export WEBFLOW_COLLECTIONS="blog-posts,team"   # optional: slugs, ids or names
        export WEBFLOW_INCLUDE_PAGES=1                 # optional: needs pages:read
+       export WEBFLOW_INCLUDE_DRAFTS=1                # optional: staged items; needed until
+                                                      # the site has been published once
 
 4. Run:  uv run python examples/example.py
 """
@@ -51,6 +53,7 @@ async def main() -> None:
     source = webflow_source(
         collections=[name for name in wanted if name] or None,  # None = every collection
         include_pages=bool(os.getenv("WEBFLOW_INCLUDE_PAGES")),
+        include_drafts=bool(os.getenv("WEBFLOW_INCLUDE_DRAFTS")),
     )
 
     print("Syncing Webflow into cognee ...")

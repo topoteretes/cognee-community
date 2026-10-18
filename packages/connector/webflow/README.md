@@ -96,7 +96,10 @@ its content on purpose.
 ## How a sync works
 
 - **What is read.** Published items by default (`/items/live`). With `include_drafts=True` the
-  staged items, drafts included; archived items are always out of scope.
+  staged items, drafts included; archived items are always out of scope. A site that has never
+  been published has no live items (Webflow answers 409), so the run stops with a hint: publish
+  the site once, or use `include_drafts=True`. It never reads this as "no items", which would
+  forget everything.
 - **Incremental sync.** Webflow's list endpoints return whole items and do not report deletions, so each run lists
   the selected collections (100 items per request) and compares each item's `lastUpdated` with
   the value kept from the last run. Only new or changed items are sent on; an unchanged item is
