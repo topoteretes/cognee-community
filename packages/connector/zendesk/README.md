@@ -10,10 +10,13 @@ pipeline, via the document-mode marker, the same way the Notion connector works.
 
 ## Requirements
 
-cognee **1.6.3** (pinned). cognee 1.4 skips orphan cleanup when the last row of a table is
-deleted, so the final deleted record was never forgotten. This was verified end to end:
-on 1.4 the last deleted record stayed in memory, on 1.6.3 it is removed and comes back if
-restored.
+- cognee **1.6.3** (pinned). cognee 1.4 skips orphan cleanup when the last row of a table is
+  deleted, so the final deleted record was never forgotten. This was verified end to end:
+  on 1.4 the last deleted record stayed in memory, on 1.6.3 it is removed and comes back if
+  restored.
+- Python 3.11 to 3.13.
+- A Zendesk account with admin access (the ticket export needs it), and Help Center
+  (Guide) enabled for articles.
 
 ## Install
 
@@ -98,19 +101,47 @@ cognee does not reset them, so the next sync would only fetch changes. To re-syn
 scratch, delete that pipeline folder as well. The state is kept per `resource_name` and
 dataset (`PIPELINE_SCOPE_ATTR`).
 
-## Privacy and security
+## Privacy
 
+Tickets hold customer personal data. Be clear about what the connector does:
+
+**What is read**
+
+- Tickets: subject, status, priority, type, tags, created date, the requester's and
+  assignee's name and email, and each comment's author, date and plain text.
+- Internal notes only when `include_internal_notes=True` (they are labelled
+  `[internal note]`); they are left out by default.
+- Help Center articles: published ones only, with their title, body (as text), labels,
+  locale and link. Drafts are skipped.
+- Never put in a document: attachments, custom ticket fields, satisfaction ratings and
+  organizations (the export returns some of these, the connector drops them), and
+  nothing is requested outside the selected `resources`.
+- The connector is read-only (GET requests only). It never creates, changes or deletes
+  anything in Zendesk.
+
+**Where it goes**
+
+- The text above becomes cognee documents. During cognify it is sent to your configured LLM
+  and embedding providers, like any document you add to cognee. Use local models if that
+  matters to you.
+- Anyone who can read the cognee dataset can recall what the synced tickets say, including
+  customer names and emails, and internal notes when they are on. Share the dataset only
+  with people who may read those tickets in Zendesk.
+- dlt state stores the export cursor, the `include_internal_notes` setting and each
+  article's id and `updated_at`. It does not store ticket or article text.
+- Logs and error messages carry counts, HTTP statuses and endpoints, never ticket ids,
+  names or ticket content.
 - Credentials come from the environment or arguments, are only sent to
   `https://<subdomain>.zendesk.com`, and are never logged. Pagination links to any other
   host are refused.
-- The connector is read-only (GET requests only).
-- Logs and error messages carry counts, HTTP statuses and endpoints, never ticket ids,
-  names or ticket content.
-- Tickets contain customer personal data. Internal notes are excluded by default. Keep the
-  data in its own dataset so you can remove it with one `cognee.forget(dataset=...)` call.
-- Anyone who can read the cognee dataset can recall what the synced tickets say, including
-  customer names and emails, and internal notes when `include_internal_notes` is on. Share
-  the dataset only with people who may read those tickets in Zendesk.
+
+**How deletion is honoured**
+
+- Deleted tickets, and archived, deleted or unpublished articles, are forgotten on the
+  **next sync**.
+- Turning `include_internal_notes` off removes the notes already stored on the next sync.
+- To remove everything at once, keep the data in its own dataset and forget it with
+  `cognee.forget(dataset=...)`.
 
 ## Limitations
 
