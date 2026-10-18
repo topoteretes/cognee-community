@@ -18,7 +18,7 @@ so the last deleted record would stay in memory. 1.6.3 handles that case.
 ```bash
 uv pip install cognee-community-connector-telegram
 # or, from this monorepo:
-cd packages/connector/telegram && uv sync --all-extras
+cd packages/connector/telegram && uv sync
 ```
 
 ## Usage
@@ -68,6 +68,7 @@ pipeline default (`replace`) would wipe earlier messages on the second sync.
 | Forget-on-delete | When the bot is removed from a chat or the chat is deleted, Telegram sends `my_chat_member` with `left`/`kicked`; every stored message of that chat is emitted with the `_deleted` hard-delete marker and cognee's `orphan_cleanup` forgets it. |
 | Group to supergroup | Telegram gives the chat a new id and restarts message ids (`migrate_to_chat_id`). Old rows keep their key, the new id keeps syncing if the old one was selected, and removal forgets messages under both ids. |
 | Service messages | Joins, pins and media without a caption have no text and are skipped. Media captions are kept as `[photo] caption`. |
+| Several bots | Each bot writes its own table and sync state, `telegram_<bot id>` (the part of the token before `:`). Two bots in one chat see the same keys, so with one shared table, removing one bot would forget the messages the other still sees. Pass `resource_name=` to choose the name; keep it fixed across runs. |
 | Forwards and links | A forwarded message keeps its original author (`Forwarded from: ...`) so it is not credited to whoever forwarded it. Public chats link to `t.me/<username>/<id>`, private supergroups and channels to the members-only `t.me/c/<id>/<id>`. |
 
 ## Limitations of the Bot API
@@ -92,8 +93,8 @@ a bot token.
 The update cursor and the stored message ids live in dlt's pipeline state (under
 `~/.dlt/pipelines`, or `$DLT_DATA_DIR/pipelines`), not in cognee's data folders. Pruning
 cognee does not reset them, so the next sync would only fetch changes. To re-sync from
-scratch, delete that pipeline folder as well. On cognee 1.6+ this state is kept per bot and
-dataset (`PIPELINE_SCOPE_ATTR`).
+scratch, delete that pipeline folder as well. This state is kept per bot, `resource_name`
+and dataset (`PIPELINE_SCOPE_ATTR`).
 
 ## Privacy and security
 
@@ -101,23 +102,31 @@ dataset (`PIPELINE_SCOPE_ATTR`).
   `api.telegram.org`; it is never logged (it is part of the request path, so URLs are not
   logged either).
 - The connector is read-only: it only calls `getMe` and `getUpdates`.
+- Logs name groups and channels (to help pick chat ids) but never the person behind a
+  private chat.
+- Hosts can pass `check_active=`, a callable run before every Bot API call and around
+  every row; raising from it stops the sync.
+- Anyone who can read the cognee dataset can recall the synced messages. Share it only
+  with people who may read those chats.
 - Messages contain personal data. Keep them in their own dataset so you can remove them
   with one `cognee.forget(dataset=...)` call.
 
 ## Testing
 
 ```bash
-uv run pytest tests/
+uv run python -m pytest -v -p no:warnings
 ```
 
 No bot token or API key is needed. `tests/fake_telegram.py` is an in-memory Bot API with
 payloads shaped like the ones a real bot receives.
 
 - `test_telegram.py` covers rendering, the cursor and replay, edits, chat selection,
-  removal-driven deletion, the supergroup upgrade, paging, the webhook conflict, the dlt
+  removal-driven deletion, the supergroup upgrade, paging, the webhook conflict, a table
+  and sync state per bot, `check_active`, private-chat names kept out of logs, the dlt
   resource wiring, the row-to-document mapping in cognee, and an end-to-end dlt merge into
   SQLite that shows edits replacing rows and removed chats' rows being deleted.
 - `test_telegram_forget.py` runs the real cognee pipeline (LLM and embeddings mocked, like
   the google-drive connector's forget test) and checks that text edited out of a message
-  and the messages of a chat the bot was removed from leave the graph, while an untouched
-  message stays.
+  and the messages of a chat the bot was removed from leave the graph and lose their Data
+  records, while an untouched message keeps its id, and that removing one of two bots from a
+  shared chat leaves the other bot's messages in place.

@@ -37,6 +37,10 @@ Design
   their old key (re-keying could collide with the new ids); the connector follows
   the new id so a chat selected by id keeps syncing, and removal from the new chat
   forgets the messages stored under both ids.
+* **Several bots**: two bots in one chat see the same ``chat_id:message_id`` keys,
+  so each bot writes its own table and sync state, named after ``resource_name``
+  (``telegram_<bot id>`` by default). Otherwise removing one bot from a chat would
+  forget the messages the other bot still sees.
 
 .. important::
    ``write_disposition="merge"`` is mandatory. The add pipeline defaults to
@@ -65,21 +69,19 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from datetime import UTC, datetime
 from typing import Any
 
 from cognee.shared.logging_utils import get_logger
-from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
-
-try:  # cognee >= 1.6: per-dataset, per-bot dlt state
-    from cognee.tasks.ingestion.dlt_utils import PIPELINE_SCOPE_ATTR
-except ImportError:  # cognee 1.4: one shared pipeline state
-    PIPELINE_SCOPE_ATTR = None
+from cognee.tasks.ingestion.dlt_utils import (
+    DOCUMENT_SOURCE_ATTR,
+    PIPELINE_SCOPE_ATTR,
+    guarded_rows,
+)
 
 logger = get_logger("telegram_connector")
 
-TELEGRAM_TABLE_NAME = "telegram_messages"
 TELEGRAM_SOURCE_NAME = "telegram"
 
 _API_BASE = "https://api.telegram.org"
@@ -173,6 +175,23 @@ class TelegramBotClient:
         raise TelegramAPIError(f"Telegram {method} failed after {_MAX_RETRIES} attempts.")
 
 
+class _CheckedClient:
+    """Runs the host's ``check_active`` before every Bot API call.
+
+    A run makes all its calls before it emits the first row, so checking only
+    around rows would let a sync whose access was revoked keep calling Telegram
+    until the end.
+    """
+
+    def __init__(self, client, check_active: Callable[[], None]):
+        self._client = client
+        self._check_active = check_active
+
+    def call(self, method: str, **params: Any) -> Any:
+        self._check_active()
+        return self._client.call(method, **params)
+
+
 def _read_error_payload(exc: urllib.error.HTTPError) -> dict:
     try:
         return json.loads(exc.read().decode() or "{}")
@@ -203,6 +222,11 @@ def _chat_label(chat: dict) -> str:
         or (" ".join(p for p in (chat.get("first_name"), chat.get("last_name")) if p))
         or str(chat.get("id"))
     )
+
+
+def _log_label(chat: dict) -> str:
+    """How a chat is named in logs: a private chat's name is a person's name."""
+    return "private chat" if chat.get("type") == "private" else _chat_label(chat)
 
 
 def _user_label(user: dict) -> str:
@@ -412,7 +436,7 @@ def sync_updates(
                         key = row_key(chat_id, message_id)
                         rows[key] = deleted_row(key)
                 logger.info(
-                    "Telegram: bot removed from %s; forgetting its messages.", _chat_label(chat)
+                    "Telegram: bot removed from %s; forgetting its messages.", _log_label(chat)
                 )
             continue
 
@@ -428,7 +452,7 @@ def sync_updates(
         if message.get("migrate_from_chat_id"):
             migrated_from[str(chat.get("id"))] = str(message["migrate_from_chat_id"])
         if chat.get("id") is not None:
-            seen_chats[chat["id"]] = _chat_label(chat)
+            seen_chats[chat["id"]] = _log_label(chat)
         if not _selected(chat, ids, usernames, state):
             continue
         row = message_to_row(message)
@@ -469,6 +493,8 @@ def telegram_source(
     token: str | None = None,
     chats: Iterable[int | str] | None = None,
     max_updates_per_run: int | None = None,
+    resource_name: str | None = None,
+    check_active: Callable[[], None] | None = None,
     client: Any = None,
 ):
     """Create a dlt source that yields Telegram messages as documents.
@@ -480,11 +506,17 @@ def telegram_source(
             from other chats are still consumed (use a dedicated bot).
         max_updates_per_run: Fetch at most this many updates per run
             (``100`` = a single page, see the module notes). ``None`` = all.
+        resource_name: Table name and part of the sync state key. Defaults to
+            ``telegram_<bot id>`` (the part of the token before ``:``), so two
+            bots in one dataset never share a table. Keep it fixed across runs.
+        check_active: Optional host authorization checkpoint, called before every
+            Bot API call and around every row (``dlt_utils.guarded_rows``);
+            raising from it stops the sync.
         client: Object with ``call(method, **params)``; a test injection point.
             Built from the token when omitted.
 
     Returns:
-        A dlt source with one ``telegram_messages`` resource
+        A dlt source with one ``<resource_name>`` resource
         (``primary_key="id"``, ``write_disposition="merge"``, ``_deleted`` hard
         delete). Pass ``write_disposition="merge"`` to ``cognee.remember`` too.
     """
@@ -503,9 +535,13 @@ def telegram_source(
         client = TelegramBotClient(resolved)
     # The part of a bot token before ":" is the bot's public numeric id.
     bot_id = resolved.split(":", 1)[0] if resolved else "default"
+    default_name = f"telegram_{bot_id}"
+    resource_name = resource_name or default_name
+    if check_active is not None:
+        client = _CheckedClient(client, check_active)
 
     @dlt.resource(
-        name=TELEGRAM_TABLE_NAME,
+        name=resource_name,
         primary_key="id",
         write_disposition="merge",
         columns={
@@ -520,11 +556,12 @@ def telegram_source(
         },
     )
     def telegram_messages():
+        yield from guarded_rows(_messages(dlt.current.resource_state()), check_active)
+
+    def _messages(state):
         me = client.call("getMe")  # fail fast on a bad token
         logger.info("Telegram: syncing as @%s.", (me or {}).get("username", "?"))
-        yield from sync_updates(
-            client, dlt.current.resource_state(), chats=chats, max_updates=max_updates_per_run
-        )
+        yield from sync_updates(client, state, chats=chats, max_updates=max_updates_per_run)
 
     @dlt.source(name=TELEGRAM_SOURCE_NAME)
     def _telegram():
@@ -533,8 +570,10 @@ def telegram_source(
     source = _telegram()
     # Route rows through the document path (text -> cognify), like Notion.
     setattr(source, DOCUMENT_SOURCE_ATTR, TELEGRAM_SOURCE_NAME)
-    # Keep the update cursor per bot (and, in cognee, per dataset), so two bots or
-    # datasets never resume from each other's cursor.
-    if PIPELINE_SCOPE_ATTR:
-        setattr(source, PIPELINE_SCOPE_ATTR, f"telegram:{bot_id}")
+    # Keep the update cursor per bot and resource name (and, in cognee, per dataset),
+    # so two bots or datasets never resume from each other's cursor.
+    scope = f"telegram:{bot_id}"
+    if resource_name != default_name:
+        scope = f"{scope}:{resource_name}"
+    setattr(source, PIPELINE_SCOPE_ATTR, scope)
     return source

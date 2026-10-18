@@ -16,7 +16,9 @@ so these run in CI. Coverage:
   - webhook conflict (409) raises a clear error
   - dlt resource is wired with merge + id PK + hard_delete column
   - a row becomes a cognee document tagged ``source="telegram"``
-  - each run logs the chats it saw, with their ids
+  - each run logs the chats it saw, with their ids (private chats without names)
+  - each bot gets its own table and sync state (``resource_name``)
+  - ``check_active`` runs before every Bot API call
   - a real dlt merge physically removes deleted rows (what orphan_cleanup reads)
 """
 
@@ -241,7 +243,7 @@ def test_resource_is_configured_for_merge_and_hard_delete():
     from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
 
     source = telegram_source(client=FakeBot())
-    resource = source.resources["telegram_messages"]
+    resource = source.resources["telegram_default"]
     assert resource.write_disposition == "merge"
     assert resource.compute_table_schema()["columns"]["_deleted"]["hard_delete"] is True
     assert getattr(source, DOCUMENT_SOURCE_ATTR) == "telegram"
@@ -284,7 +286,7 @@ def test_e2e_dlt_merge_upserts_edits_and_removes_deleted(tmp_path):
         )
         pipeline.run(telegram_source(client=bot))
         with pipeline.sql_client() as client:
-            return client.execute_sql("SELECT id, content FROM telegram_messages ORDER BY id")
+            return client.execute_sql("SELECT id, content FROM telegram_default ORDER BY id")
 
     bot.add(message=msg(GROUP, 1, "hello"))
     bot.add(message=msg(OTHER, 1, "elsewhere"))
@@ -323,10 +325,58 @@ def test_known_ids_are_not_duplicated_across_edits_and_runs():
     assert state["known"]["-100"] == [1, 2]
 
 
-def test_pipeline_scope_is_set_when_cognee_supports_it():
-    from cognee_community_connector_telegram.telegram import PIPELINE_SCOPE_ATTR
+def test_each_bot_gets_its_own_table_and_sync_state():
+    from cognee.tasks.ingestion.dlt_utils import PIPELINE_SCOPE_ATTR
 
     source = telegram_source(token="12345:secret", client=FakeBot())
-    if PIPELINE_SCOPE_ATTR is None:
-        pytest.skip("cognee < 1.6 has no PIPELINE_SCOPE_ATTR")
+    assert set(source.resources) == {"telegram_12345"}
     assert getattr(source, PIPELINE_SCOPE_ATTR) == "telegram:12345"
+    named = telegram_source(token="12345:secret", resource_name="team_bot", client=FakeBot())
+    assert set(named.resources) == {"team_bot"}
+    assert getattr(named, PIPELINE_SCOPE_ATTR) == "telegram:12345:team_bot"
+
+
+def test_check_active_runs_before_every_request():
+    """A connection revoked mid-run stops the sync before the next Bot API call,
+    not only between emitted rows (every call happens before the first row)."""
+
+    class AccessRevokedError(Exception):
+        pass
+
+    bot = FakeBot()
+    bot.add(message=msg(GROUP, 1, "a"))
+
+    def revoked_after_first_request():
+        if bot.calls:
+            raise AccessRevokedError
+
+    source = telegram_source(client=bot, check_active=revoked_after_first_request)
+    with pytest.raises(Exception) as caught:
+        list(source.resources["telegram_default"])
+    causes, error = [], caught.value
+    while error is not None:
+        causes.append(error)
+        error = error.__cause__ or error.__context__
+    assert any(isinstance(e, AccessRevokedError) for e in causes)
+    assert [method for method, _ in bot.calls] == ["getMe"]  # getUpdates never ran
+
+
+def test_private_chat_names_stay_out_of_the_logs(monkeypatch):
+    from cognee_community_connector_telegram import telegram as module
+
+    lines = []
+
+    class RecordingLogger:
+        def info(self, fmt, *args):
+            lines.append(fmt % args)
+
+        warning = info
+
+    monkeypatch.setattr(module, "logger", RecordingLogger())
+    private = {"id": 42, "type": "private", "first_name": "Carol", "last_name": "Diaz"}
+    bot = FakeBot()
+    bot.add(message=msg(private, 1, "hi bot"))
+    bot.add(my_chat_member=removed(private, "kicked"))
+    run(bot, {})
+    assert lines and not any("Carol" in line or "Diaz" in line for line in lines)
+    assert any("private chat (42)" in line for line in lines)
