@@ -3,9 +3,11 @@
 Coverage: rendering (thread, internal notes, HTML articles, requester and assignee
 names), first export and cursor resume, comment-only change, ticket deletion, a ticket
 listed several times in one window (the newest version wins, so delete-then-restore
-works), article edit / archive / unpublish / no-op, failed listing never deletes, export
-page cap, rate-limit retry, auth/config errors, dlt wiring, the row-to-document mapping
-in cognee, and a real dlt merge into SQLite.
+works), turning internal notes off, article edit / archive / unpublish / publish again /
+no-op, failed or short listings never deleting, rendering independent of input order,
+export page cap, a sync through the real HTTP client, rate-limit retry, record ids kept
+out of errors, auth/config errors, per-account tables, check_active, dlt wiring, the
+row-to-document mapping in cognee, and a real dlt merge into SQLite.
 """
 
 import pytest
@@ -137,6 +139,21 @@ def test_ticket_listed_several_times_in_one_window_keeps_its_newest_version():
     assert sum(1 for path, _ in fake.calls if path.endswith("/comments.json")) == 2
 
 
+def test_turning_internal_notes_off_re_renders_every_ticket_without_them():
+    fake = FakeZendesk()
+    fake.touch(ticket(1), [comment(1, "hello"), comment(2, "SSO token expired", 22, public=False)])
+    fake.touch(ticket(2, "Billing"), [comment(3, "invoice please")])
+    state = {}
+    rows = tickets(fake, state, include_internal=True)
+    assert "SSO token expired" in rows[0]["content"]
+    assert tickets(fake, state, include_internal=True) == []  # nothing changed
+
+    rows = tickets(fake, state, include_internal=False)  # setting changed: start over
+    assert [r["id"] for r in rows] == [1, 2]
+    assert not any("SSO token expired" in r["content"] for r in rows)
+    assert tickets(fake, state, include_internal=False) == []
+
+
 def test_export_page_cap_resumes_next_run():
     fake = FakeZendesk()
     fake.page_size = 2
@@ -170,6 +187,23 @@ def test_articles_first_run_edit_noop_archive_and_unpublish():
     assert state["versions"] == {}
 
 
+def test_archived_article_that_is_published_again_comes_back():
+    fake = FakeZendesk()
+    fake.articles = [article(5), article(6, "VPN setup")]
+    state = {}
+    list(sync_articles(fake, state))
+    fake.articles = [article(5)]  # 6 archived
+    assert list(sync_articles(fake, state)) == [{"id": 6, "_deleted": True}]
+
+    # Restoring an archived article brings it back as a draft: still skipped.
+    fake.articles = [article(5), article(6, "VPN setup", draft=True)]
+    assert list(sync_articles(fake, state)) == []
+    # Published again: it is stored again.
+    fake.articles = [article(5), article(6, "VPN setup", updated="2026-10-08T09:00:00Z")]
+    rows = list(sync_articles(fake, state))
+    assert [r["id"] for r in rows] == [6] and rows[0]["_deleted"] is False
+
+
 def test_failed_article_listing_never_deletes():
     fake = FakeZendesk()
     fake.articles = [article(5)]
@@ -179,6 +213,51 @@ def test_failed_article_listing_never_deletes():
     with pytest.raises(ZendeskAPIError):
         list(sync_articles(fake, state))
     assert state["versions"] == {"5": "2026-10-05T12:00:00Z"}
+
+
+class _Listing:
+    """Serves one article listing page as given, to check the count guard."""
+
+    def __init__(self, page):
+        self.page = page
+
+    def get(self, path, **params):
+        return self.page
+
+
+def test_article_listing_that_does_not_add_up_never_deletes():
+    fake = FakeZendesk()
+    fake.articles = [article(5), article(6, "VPN setup")]
+    state = {}
+    list(sync_articles(fake, state))
+    short = {"articles": [article(5)], "count": 2, "next_page": None}
+    with pytest.raises(ZendeskAPIError, match="1 of 2"):
+        list(sync_articles(_Listing(short), state))
+    no_count = {"articles": [article(5)], "next_page": None}
+    with pytest.raises(ZendeskAPIError, match="no count"):
+        list(sync_articles(_Listing(no_count), state))
+    assert set(state["versions"]) == {"5", "6"}  # nothing was forgotten
+
+
+def test_ticket_renders_the_same_whatever_order_zendesk_sends():
+    import random
+
+    comments = [comment(1, "I cannot log in."), comment(2, "Fixed, please retry.", 22)]
+    users = {11: ALICE, 22: AGENT}
+    base = ticket(7, tags=["sso", "login", "urgent", "enterprise"])
+    expected = ticket_to_row(base, comments, users, SUB, False)
+    for seed in range(20):
+        rng = random.Random(seed)
+        shuffled = dict(base, tags=rng.sample(base["tags"], len(base["tags"])))
+        shuffled_users = dict(rng.sample(list(users.items()), len(users)))
+        assert ticket_to_row(shuffled, comments, shuffled_users, SUB, False) == expected
+
+    labelled = article(5) | {"label_names": ["account", "billing", "sso"]}
+    expected = article_to_row(labelled)
+    for seed in range(20):
+        rng = random.Random(seed)
+        labels = rng.sample(labelled["label_names"], 3)
+        assert article_to_row(labelled | {"label_names": labels}) == expected
 
 
 # --------------------------------------------------------------------- config / auth
@@ -219,6 +298,53 @@ def test_client_waits_out_rate_limit_and_stops_on_bad_credentials(monkeypatch):
     assert sleeps == [7.0]  # no retries on a 401
 
 
+def test_404_names_the_endpoint_but_not_the_record(monkeypatch):
+    import urllib.error
+
+    from cognee_community_connector_zendesk import zendesk as module
+
+    def missing(request, timeout):
+        raise urllib.error.HTTPError(request.full_url, 404, "Not Found", {}, None)
+
+    monkeypatch.setattr(module.urllib.request, "urlopen", missing)
+    with pytest.raises(ZendeskAPIError) as caught:
+        ZendeskClient(SUB, oauth_token="t").get("/api/v2/tickets/48213/comments.json")
+    assert "/api/v2/tickets/{id}/comments.json" in str(caught.value)
+    assert "48213" not in str(caught.value)
+
+
+def test_sync_through_the_real_client_sends_the_token_but_never_stores_it(monkeypatch):
+    """The real ZendeskClient against FakeZendesk: URLs, query parameters and the
+    auth header take the same path as against Zendesk, and the token never ends up
+    in a stored row."""
+    import io
+    import json
+    import urllib.parse
+
+    from cognee_community_connector_zendesk import zendesk as module
+
+    fake = FakeZendesk()
+    fake.touch(ticket(1), [comment(1, "I cannot log in.")])
+    fake.articles = [article(5)]
+    token, headers = "zd-secret-token-123", []
+
+    def urlopen(request, timeout):
+        url = urllib.parse.urlparse(request.full_url)
+        assert url.netloc == "acme.zendesk.com"
+        headers.append(request.get_header("Authorization"))
+        params = {k: v[0] for k, v in urllib.parse.parse_qs(url.query).items()}
+        return io.BytesIO(json.dumps(fake.get(url.path, **params)).encode())
+
+    monkeypatch.setattr(module.urllib.request, "urlopen", urlopen)
+    client = ZendeskClient(SUB, oauth_token=token)
+    rows = list(sync_tickets(client, {}, SUB)) + list(sync_articles(client, {}))
+
+    assert [r["id"] for r in rows] == [1, 5]
+    assert "I cannot log in." in rows[0]["content"]
+    assert headers and all(h == f"Bearer {token}" for h in headers)
+    assert token not in json.dumps(rows)
+
+
 def test_client_refuses_pagination_link_to_another_host():
     with pytest.raises(ZendeskAPIError):
         ZendeskClient(SUB, oauth_token="t")._url("https://evil.example/next", {})
@@ -237,14 +363,42 @@ def test_resources_are_merge_with_hard_delete_and_document_mode():
     from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
 
     source = zendesk_source(SUB, client=FakeZendesk())
-    assert set(source.resources) == {"zendesk_tickets", "zendesk_articles"}
+    assert set(source.resources) == {"zendesk_acme_tickets", "zendesk_acme_articles"}
     for resource in source.resources.values():
         assert resource.write_disposition == "merge"
         assert resource.compute_table_schema()["columns"]["_deleted"]["hard_delete"] is True
     assert getattr(source, DOCUMENT_SOURCE_ATTR) == "zendesk"
     assert set(zendesk_source(SUB, resources=["articles"], client=FakeZendesk()).resources) == {
-        "zendesk_articles"
+        "zendesk_acme_articles"
     }
+
+
+def test_check_active_runs_before_every_request():
+    """A connection revoked mid-run stops the sync before the next API call, not
+    only between emitted rows (every request happens before the first row)."""
+
+    class AccessRevokedError(Exception):
+        pass
+
+    fake = FakeZendesk()
+    for i in range(1, 4):
+        fake.touch(ticket(i), [comment(i, "x")])
+
+    def revoked_after_first_request():
+        if fake.calls:
+            raise AccessRevokedError
+
+    source = zendesk_source(
+        SUB, resources=["tickets"], check_active=revoked_after_first_request, client=fake
+    )
+    with pytest.raises(Exception) as caught:
+        list(source.resources["zendesk_acme_tickets"])
+    causes, error = [], caught.value
+    while error is not None:
+        causes.append(error)
+        error = error.__cause__ or error.__context__
+    assert any(isinstance(e, AccessRevokedError) for e in causes)
+    assert len(fake.calls) == 1  # the export page; no comments were fetched
 
 
 def test_ticket_row_becomes_a_zendesk_document_in_cognee():
@@ -284,8 +438,8 @@ def test_e2e_dlt_merge_keeps_unchanged_and_removes_deleted(tmp_path):
         )
         pipeline.run(zendesk_source(SUB, client=fake))
         with pipeline.sql_client() as client:
-            t = client.execute_sql("SELECT id, title FROM zendesk_tickets ORDER BY id")
-            a = client.execute_sql("SELECT id FROM zendesk_articles ORDER BY id")
+            t = client.execute_sql("SELECT id, title FROM zendesk_acme_tickets ORDER BY id")
+            a = client.execute_sql("SELECT id FROM zendesk_acme_articles ORDER BY id")
         return [tuple(r) for r in t], [r[0] for r in a]
 
     fake.touch(ticket(1, "Login fails"), [comment(1, "a")])
@@ -304,10 +458,38 @@ def test_e2e_dlt_merge_keeps_unchanged_and_removes_deleted(tmp_path):
     assert [x[0] for x in t] == [2] and a == [5]
 
 
-def test_pipeline_scope_is_set_when_cognee_supports_it():
-    from cognee_community_connector_zendesk.zendesk import PIPELINE_SCOPE_ATTR
+def test_each_account_gets_its_own_tables_and_sync_state():
+    from cognee.tasks.ingestion.dlt_utils import PIPELINE_SCOPE_ATTR
 
     source = zendesk_source(SUB, client=FakeZendesk())
-    if PIPELINE_SCOPE_ATTR is None:
-        pytest.skip("cognee < 1.6 has no PIPELINE_SCOPE_ATTR")
-    assert getattr(source, PIPELINE_SCOPE_ATTR) == "zendesk:acme"
+    assert getattr(source, PIPELINE_SCOPE_ATTR) == "zendesk_acme"
+    other = zendesk_source("globex", client=FakeZendesk())
+    assert set(other.resources) == {"zendesk_globex_tickets", "zendesk_globex_articles"}
+    named = zendesk_source(SUB, resource_name="support_eu", client=FakeZendesk())
+    assert set(named.resources) == {"support_eu_tickets", "support_eu_articles"}
+    assert getattr(named, PIPELINE_SCOPE_ATTR) == "support_eu"
+
+
+@pytest.mark.parametrize("resource", ["tickets", "articles"])
+def test_check_active_can_stop_a_sync_before_anything_is_emitted(tmp_path, resource):
+    dlt = pytest.importorskip("dlt")
+
+    class AccessRevokedError(Exception):
+        pass
+
+    def revoked():
+        raise AccessRevokedError
+
+    fake = FakeZendesk()
+    fake.touch(ticket(1), [comment(1, "a")])
+    fake.articles = [article(5)]
+    source = zendesk_source(SUB, resources=[resource], check_active=revoked, client=fake)
+    pipeline = dlt.pipeline(pipeline_name="zendesk_guard", pipelines_dir=str(tmp_path))
+    with pytest.raises(Exception) as caught:
+        pipeline.extract(source)
+    causes, error = [], caught.value
+    while error is not None:
+        causes.append(error)
+        error = error.__cause__ or error.__context__
+    assert any(isinstance(e, AccessRevokedError) for e in causes)
+    assert fake.calls == []  # stopped before the first request

@@ -105,5 +105,6 @@ class FakeZendesk:
         if path == "/api/v2/help_center/articles.json":
             if self.fail_articles:
                 raise ZendeskAPIError("HTTP 500")
-            return {"articles": list(self.articles), "next_page": None}
+            # Like Zendesk, the listing reports how many articles there are in all.
+            return {"articles": list(self.articles), "count": len(self.articles), "next_page": None}
         raise AssertionError(path)

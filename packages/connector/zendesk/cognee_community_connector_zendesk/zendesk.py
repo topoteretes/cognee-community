@@ -38,7 +38,11 @@ Design
   ``status="deleted"`` and are emitted as ``_deleted`` hard-delete rows. An
   article that disappears from a *complete* listing (archived or deleted) or
   turns back into a draft is emitted the same way. cognee's ``orphan_cleanup``
-  then forgets the rows. A failed or partial listing raises instead of deleting.
+  then forgets the rows. A failed listing, or one that does not add up to the
+  ``count`` Zendesk reports, raises instead of deleting.
+* **Several accounts**: ticket and article ids are only unique inside one
+  Zendesk account, so each account writes its own tables, named after
+  ``resource_name`` (``zendesk_<subdomain>`` by default).
 
 .. important::
    ``write_disposition="merge"`` is mandatory, for both tables. cognee passes
@@ -52,28 +56,28 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from html.parser import HTMLParser
 from typing import Any
 
 from cognee.shared.logging_utils import get_logger
-from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
-
-try:  # cognee >= 1.6: per-dataset, per-account dlt state (see _scope_state below)
-    from cognee.tasks.ingestion.dlt_utils import PIPELINE_SCOPE_ATTR
-except ImportError:  # cognee 1.4: one shared pipeline state
-    PIPELINE_SCOPE_ATTR = None
+from cognee.tasks.ingestion.dlt_utils import (
+    DOCUMENT_SOURCE_ATTR,
+    PIPELINE_SCOPE_ATTR,
+    guarded_rows,
+)
 
 logger = get_logger("zendesk_connector")
 
 ZENDESK_SOURCE_NAME = "zendesk"
-TICKETS_TABLE = "zendesk_tickets"
-ARTICLES_TABLE = "zendesk_articles"
 _RESOURCES = ("tickets", "articles")
+# Attempts per request: the first try plus four retries on 429, 5xx and network
+# errors (429 waits for Retry-After), before the run fails and dlt keeps its state.
 _MAX_RETRIES = 5
 _COLUMNS = {
     "_deleted": {"data_type": "bool", "hard_delete": True},
@@ -149,9 +153,9 @@ class ZendeskClient:
                         "tickets / Help Center."
                     ) from None
                 if exc.code == 404:
-                    raise ZendeskAPIError(
-                        f"Zendesk returned 404 for {url.split('?')[0]}."
-                    ) from None
+                    # The endpoint without record ids: status and endpoint are enough.
+                    endpoint = re.sub(r"/\d+", "/{id}", urllib.parse.urlparse(url).path)
+                    raise ZendeskAPIError(f"Zendesk returned 404 for {endpoint}.") from None
                 if (exc.code == 429 or exc.code >= 500) and attempt < _MAX_RETRIES - 1:
                     delay = _retry_after(exc.headers, attempt)
                     logger.warning(
@@ -169,7 +173,6 @@ class ZendeskClient:
                     time.sleep(float(2**attempt))
                     continue
                 raise ZendeskAPIError(f"Zendesk request failed: {exc}") from None
-        raise ZendeskAPIError("Zendesk request failed after retries.")
 
 
 def _retry_after(headers, attempt: int) -> float:
@@ -177,6 +180,23 @@ def _retry_after(headers, attempt: int) -> float:
         return float((headers or {}).get("Retry-After"))
     except (TypeError, ValueError):
         return float(min(60, 2 ** (attempt + 2)))
+
+
+class _CheckedClient:
+    """Runs the host's ``check_active`` before every API request.
+
+    All requests of a run happen before its first rows are emitted, so checking
+    only around rows would let a sync whose access was revoked keep calling
+    Zendesk until the end.
+    """
+
+    def __init__(self, client, check_active: Callable[[], None]):
+        self._client = client
+        self._check_active = check_active
+
+    def get(self, path_or_url: str, **params: Any) -> dict:
+        self._check_active()
+        return self._client.get(path_or_url, **params)
 
 
 # ---------------------------------------------------------------------------
@@ -304,16 +324,31 @@ def deleted_row(row_id) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Sync
 # ---------------------------------------------------------------------------
-def _paginate(client, path: str, key: str, **params) -> Iterator[dict]:
-    """Follow ``next_page`` links (offset or cursor pagination) to the end."""
-    data = client.get(path, **params)
+def _list_articles(client, path: str) -> list[dict]:
+    """Every article, checked against the ``count`` Zendesk reports.
+
+    A complete listing is the only delete signal for articles, so a listing that
+    comes back without a count, or does not add up to it, raises instead of
+    letting the articles it missed be forgotten. A listing that shifts while it
+    is read (an article edited mid-run) also fails the check; the next run reads
+    it again.
+    """
+    data = client.get(path, per_page=100, sort_by="updated_at")
+    expected = data.get("count")
+    if not isinstance(expected, int):
+        raise ZendeskAPIError("Zendesk article listing has no count; nothing is forgotten.")
+    articles: dict = {}
     while True:
-        yield from data.get(key) or []
-        nxt = data.get("next_page") or (data.get("links") or {}).get("next")
-        has_more = (data.get("meta") or {}).get("has_more", bool(nxt))
-        if not nxt or not has_more:
-            return
-        data = client.get(nxt)
+        for article in data.get("articles") or []:
+            articles[article["id"]] = article
+        if not data.get("next_page"):
+            break
+        data = client.get(data["next_page"])
+    if len(articles) != expected:
+        raise ZendeskAPIError(
+            f"Zendesk listed {len(articles)} of {expected} articles; nothing is forgotten."
+        )
+    return list(articles.values())
 
 
 def _ticket_comments(client, ticket_id) -> tuple[list[dict], dict]:
@@ -341,7 +376,15 @@ def sync_tickets(
     The first run starts the export at ``start_time=0``; later runs resume from
     ``state['after_cursor']``. dlt persists the cursor only after the load
     succeeds, so a failed run reads the same window again.
+
+    The cursor is kept together with ``include_internal``: when that setting
+    changes, the export starts over, so every stored ticket is rendered again
+    and turning internal notes off removes them from memory too.
     """
+    if state.get("include_internal", include_internal) != include_internal:
+        logger.info("Zendesk: include_internal_notes changed; re-reading every ticket.")
+        state.pop("after_cursor", None)
+    state["include_internal"] = include_internal
     cursor = state.get("after_cursor")
     params = {"cursor": cursor} if cursor else {"start_time": 0}
     pages = 0
@@ -408,7 +451,7 @@ def sync_articles(client, state: dict, locale: str | None = None) -> Iterator[di
         if locale
         else "/api/v2/help_center/articles.json"
     )
-    listed = list(_paginate(client, path, "articles", per_page=100, sort_by="updated_at"))
+    listed = _list_articles(client, path)
     versions: dict[str, str] = state.setdefault("versions", {})
     live: set[str] = set()
     changed = 0
@@ -441,9 +484,12 @@ def zendesk_source(
     include_internal_notes: bool = False,
     locale: str | None = None,
     max_export_pages_per_run: int | None = None,
+    resource_name: str | None = None,
+    check_active: Callable[[], None] | None = None,
     client: Any = None,
 ):
-    """Create a dlt source with ``zendesk_tickets`` and/or ``zendesk_articles``.
+    """Create a dlt source with ``<resource_name>_tickets`` and/or
+    ``<resource_name>_articles``.
 
     Args:
         subdomain: The ``<subdomain>`` of ``<subdomain>.zendesk.com``
@@ -458,6 +504,13 @@ def zendesk_source(
         max_export_pages_per_run: Cap the ticket export pages per run (each page
             holds up to 1000 tickets) for a large first backfill; the next run
             continues from the saved cursor.
+        resource_name: Prefix of the two table names, and the key of the sync
+            state. Defaults to ``zendesk_<subdomain>``, so two Zendesk accounts
+            in one dataset never share a table (their ids overlap). Keep it fixed
+            across runs.
+        check_active: Optional host authorization checkpoint, called before every
+            API request and around every row (``dlt_utils.guarded_rows``);
+            raising from it stops the sync.
         client: Object with ``get(path_or_url, **params)``; a test injection point.
 
     Returns:
@@ -484,30 +537,38 @@ def zendesk_source(
             email=email or os.environ.get("ZENDESK_EMAIL"),
             api_token=api_token or os.environ.get("ZENDESK_API_TOKEN"),
         )
+    if check_active is not None:
+        client = _CheckedClient(client, check_active)
+    resource_name = resource_name or f"zendesk_{subdomain}"
 
     @dlt.resource(
-        name=TICKETS_TABLE,
+        name=f"{resource_name}_tickets",
         primary_key="id",
         write_disposition="merge",
         columns=_COLUMNS,
     )
     def zendesk_tickets():
-        yield from sync_tickets(
-            client,
-            dlt.current.resource_state(),
-            subdomain,
-            include_internal=include_internal_notes,
-            max_pages=max_export_pages_per_run,
+        yield from guarded_rows(
+            sync_tickets(
+                client,
+                dlt.current.resource_state(),
+                subdomain,
+                include_internal=include_internal_notes,
+                max_pages=max_export_pages_per_run,
+            ),
+            check_active,
         )
 
     @dlt.resource(
-        name=ARTICLES_TABLE,
+        name=f"{resource_name}_articles",
         primary_key="id",
         write_disposition="merge",
         columns=_COLUMNS,
     )
     def zendesk_articles():
-        yield from sync_articles(client, dlt.current.resource_state(), locale=locale)
+        yield from guarded_rows(
+            sync_articles(client, dlt.current.resource_state(), locale=locale), check_active
+        )
 
     selected = {"tickets": zendesk_tickets, "articles": zendesk_articles}
 
@@ -518,8 +579,7 @@ def zendesk_source(
     source = _zendesk()
     # Tickets and articles are prose: route them through cognify (document mode).
     setattr(source, DOCUMENT_SOURCE_ATTR, ZENDESK_SOURCE_NAME)
-    # Keep the export cursor per Zendesk account (and, in cognee, per dataset), so
+    # Keep the export cursor per resource_name (and, in cognee, per dataset), so
     # syncing two accounts or datasets never resumes from the other's cursor.
-    if PIPELINE_SCOPE_ATTR:
-        setattr(source, PIPELINE_SCOPE_ATTR, f"zendesk:{subdomain}")
+    setattr(source, PIPELINE_SCOPE_ATTR, resource_name)
     return source
