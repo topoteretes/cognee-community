@@ -15,7 +15,14 @@ def stop_patches():
     patch.stopall()
 
 
-def build_source(selection, *, owner_id=7, token="test-token", instance="https://gitlab.example"):
+def build_source(
+    selection,
+    *,
+    owner_id=7,
+    token="test-token",
+    instance="https://gitlab.example",
+    project_ids=None,
+):
     def handler(request):
         path = request.url.path
         if path.endswith("/self"):
@@ -41,7 +48,9 @@ def build_source(selection, *, owner_id=7, token="test-token", instance="https:/
         "cognee_community_connector_gitlab.gitlab.httpx.Client",
         side_effect=lambda **kwargs: HTTPClient(**kwargs, transport=httpx.MockTransport(handler)),
     ).start()
-    return gitlab_source(token, resource_types=selection, base_url=instance)
+    return gitlab_source(
+        token, resource_types=selection, base_url=instance, project_ids=project_ids
+    )
 
 
 def test_source_yields_mapped_documents():
@@ -70,6 +79,15 @@ def test_staging_identity_survives_token_rotation_and_selection_order():
         first.cognee_pipeline_scope
         != build_source(["issues", "wiki"], instance="https://other.example").cognee_pipeline_scope
     )
+
+
+def test_project_selection_has_its_own_staging_scope():
+    discovered = build_source(["issues"]).cognee_pipeline_scope
+    selected = build_source(["issues"], project_ids=[42, "team/app"]).cognee_pipeline_scope
+    reordered = build_source(["issues"], project_ids=["team/app", 42, 42]).cognee_pipeline_scope
+    assert selected == reordered
+    assert selected != discovered
+    assert selected != build_source(["issues"], project_ids=[42]).cognee_pipeline_scope
 
 
 def test_dlt_pipeline_loads_document_rows(tmp_path, monkeypatch):

@@ -30,21 +30,40 @@ def _digest(document: dict) -> str:
     return sha256(json.dumps(document, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
-def sync_documents(client, instance: str, selected: tuple[str, ...], state: dict):
+def _tombstones(document_ids) -> list[dict]:
+    return [{"id": document_id, "_deleted": True} for document_id in document_ids]
+
+
+def sync_documents(
+    client,
+    instance: str,
+    selected: tuple[str, ...],
+    state: dict,
+    *,
+    project_ids: tuple[int | str, ...] | None = None,
+):
     """Yield changed documents and tombstones, then update DLT-managed state.
 
     Issue/MR cursors use upstream updated_at, with a one-minute overlap. A full
     unfiltered inventory is still necessary for deletion reconciliation; GitLab
-    has no deletion feed on these endpoints. Missing projects are checked
-    individually; 404 removes their documents from this token's visible scope.
+    has no deletion feed on these endpoints. Without ``project_ids``, projects
+    missing from membership discovery are checked individually; 404 removes
+    their documents from this token's visible scope. With ``project_ids``, a
+    selected project that is no longer accessible has its documents removed.
+
+    A resource a project has turned off (by metadata, or 403/404 on its list
+    endpoint) is skipped for that project only, and documents previously synced
+    from it are removed. Other projects and resources continue normally.
     """
     from .gitlab import (
         GitLabAPIError,
         _discover_projects,
+        _feature_enabled,
         _fetch_issues,
         _fetch_merge_requests,
         _fetch_wiki_pages,
         _get_json,
+        _read_selected_projects,
     )
 
     next_projects = deepcopy(state.get("projects", {}))
@@ -54,17 +73,26 @@ def sync_documents(client, instance: str, selected: tuple[str, ...], state: dict
         "merge_requests": (_fetch_merge_requests, _merge_request_to_document),
         "wiki": (_fetch_wiki_pages, _wiki_to_document),
     }
-    projects = _discover_projects(client)
+    projects = (
+        _discover_projects(client)
+        if project_ids is None
+        else _read_selected_projects(client, project_ids)
+    )
     discovered_ids = {str(project["id"]) for project in projects}
     for project_id in next_projects.keys() - discovered_ids:
-        project = _get_json(client, f"projects/{project_id}", missing_ok=True)
+        # An explicit selection was already read project by project.
+        project = (
+            _get_json(client, f"projects/{project_id}", missing_ok=True)
+            if project_ids is None
+            else None
+        )
         if project is None:
             document_ids = {
                 document_id
                 for resource_state in next_projects.pop(project_id).values()
                 for document_id in resource_state.get("hashes", {})
             }
-            rows.extend({"id": document_id, "_deleted": True} for document_id in document_ids)
+            rows.extend(_tombstones(document_ids))
         else:
             if (
                 not isinstance(project, dict)
@@ -84,15 +112,26 @@ def sync_documents(client, instance: str, selected: tuple[str, ...], state: dict
             fetch, mapper = handlers[resource]
             previous = project_state.get(resource, {})
             cursor = previous.get("updated_after")
-            if resource != "wiki" and cursor:
+            changes = inventory = None
+            if not _feature_enabled(project, resource):
+                pass
+            elif resource != "wiki" and cursor:
                 overlap = (_timestamp(cursor) - timedelta(minutes=1)).isoformat()
-                changes = fetch(client, project["id"], updated_after=overlap)
+                changes = fetch(client, project["id"], updated_after=overlap, unavailable_ok=True)
                 # Never compare known IDs against the filtered delta. Fetch all
                 # pages without a timestamp before making deletion decisions.
-                inventory = fetch(client, project["id"])
+                if changes is not None:
+                    # The delta was readable, so a 403/404 now is not a turned
+                    # off feature; never let it delete the inventory.
+                    inventory = fetch(client, project["id"])
             else:
-                inventory = fetch(client, project["id"])
+                inventory = fetch(client, project["id"], unavailable_ok=True)
                 changes = inventory
+            if changes is None or inventory is None:
+                # Turned off for this project: drop what it synced earlier.
+                rows.extend(_tombstones(previous.get("hashes", {})))
+                project_state.pop(resource, None)
+                continue
 
             # Hash the authoritative inventory as well as the delta, catching
             # edits to rendered project metadata and races between the reads.

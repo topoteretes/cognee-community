@@ -2,19 +2,18 @@
 
 Python connector for [cognee issue #4709](https://github.com/topoteretes/cognee/issues/4709).
 
-**Status:** legacy PAT validation, project discovery, issue/MR/wiki fetching,
+**Status:** legacy PAT validation, project discovery or selection, issue/MR/wiki fetching,
 DLT document ingestion, persistent checkpoints, and resource deletion reconciliation
 are implemented. Comments remain unimplemented. `gitlab_source()` validates the
 PAT immediately; fetching and mapping happen during DLT extraction.
-
-This folder is staged in the core cognee checkout for development. Its intended
-contribution location is `packages/connector/gitlab/` in cognee-community.
 
 ## Planned scope
 
 - Required legacy Personal Access Token with `read_api`, supplied through `token`.
   The broader `api` scope also passes validation but is not needed.
 - Configurable `base_url`, defaulting to `https://gitlab.com`.
+- Optional `project_ids`: numeric IDs or `group/project` paths to sync. When
+  omitted, every project the token owner is a member of is synced.
 - Required `resource_types`: `issues`, `merge_requests`, `comments`, and `wiki`.
   An empty selection is rejected.
   Unsupported names are rejected before any HTTP requests.
@@ -28,8 +27,44 @@ contribution location is `packages/connector/gitlab/` in cognee-community.
 Token validation uses `GET /api/v4/personal_access_tokens/self` and checks active
 status and read scope. GitLab's active status already accounts for expiry and
 revocation; the connector does not compare dates against the local clock.
-Discovery uses keyset pagination on `GET /api/v4/projects` to list all accessible projects, including
-public projects. There is no mandatory `project_ids` parameter. HTTP failures,
+
+## Choosing projects
+
+Without `project_ids`, discovery uses keyset pagination on
+`GET /api/v4/projects?membership=true`. That lists the token owner's own
+projects and projects shared with them directly or through a group, and leaves
+out unrelated public projects on the instance.
+
+With `project_ids`, discovery is skipped and each entry is read with
+`GET /api/v4/projects/:id` (paths are URL-encoded, so `team/app` becomes
+`team%2Fapp`). A numeric ID and a path naming the same project are synced once.
+A selected project that returns 404 is logged and skipped, and documents synced
+from it earlier are removed. Each distinct selection has its own staging scope,
+so changing the selection starts a separate corpus rather than deleting
+documents from the previous one.
+
+```python
+source = gitlab_source(
+    token=os.environ["GITLAB_TOKEN"],
+    resource_types=["issues", "merge_requests"],
+    project_ids=["my-team/backend", 87746024],
+)
+```
+
+## Projects with features turned off
+
+A project can turn off its issues, merge requests, or wiki. The connector skips
+only that resource for that project and continues with the rest of the project
+and with the next project. A feature counts as turned off when project metadata
+says so (`<feature>_access_level: "disabled"`, or `<feature>_enabled: false` on
+older releases), or when the first list request returns HTTP 403 or 404.
+Documents synced earlier from a resource that is now turned off are removed.
+A 403/404 on a later page, or on the full inventory after a readable delta,
+still aborts the run, because it means the inventory would be incomplete.
+
+## Error handling
+
+HTTP failures,
 redirects, timeouts, and malformed responses abort the operation rather than
 being interpreted as empty results. No response bodies or tokens are logged.
 HTTP 429 raises a specific rate-limit error without waiting or retrying. A
@@ -49,7 +84,8 @@ fetches also use their own `updated_after` checkpoint.
 When `wiki` is selected, the connector reads `/projects/:id/wikis?with_content=1`.
 GitLab returns the entire wiki page list without pagination. Pages are identified
 by their unique slug and include raw content and format. Empty content is valid;
-missing content is an error. HTTP 403/404 is not treated as an empty wiki.
+missing content is an error. HTTP 403/404 means the wiki is turned off (see
+above), not an empty wiki.
 
 ## Resource payloads and document mapping
 
@@ -115,7 +151,7 @@ bodies are stored in staging, not in state. DLT persists state in its pipeline
 working directory (normally `~/.dlt/pipelines/<pipeline_name>/`) and destination
 `_dlt_pipeline_state` table. Keep the same destination and dataset across runs.
 Staging and pipeline names are scoped by instance URL, token owner ID, resource
-selection, and destination dataset. Token rotation preserves the scope.
+selection, project selection (when given), and destination dataset. Token rotation preserves the scope.
 
 - First run: fetch all selected resources and establish a baseline.
 - Later issue/MR runs: use the greatest observed upstream `updated_at`, minus a
@@ -136,13 +172,14 @@ selection, and destination dataset. Token rotation preserves the scope.
   DLT removes the staged row on merge, and Cognee reconciles the retained corpus.
   GitLab can also hide inaccessible records behind 404: this means removal from
   the token's visible resource scope, not proof of a physical upstream deletion.
-- Previously known projects missing from discovery are checked with
+- Previously known projects missing from membership discovery are checked with
   `GET /projects/:id`. A 200 response keeps the project in the sync; a 404 emits
   deletion markers for all its known documents and removes its saved checkpoints.
   This covers deleted projects and projects hidden after access is revoked;
   GitLab's 404 does not distinguish those cases. Cleanup runs on the next sync.
-  HTTP 401/403, failed pages, malformed payloads, and mapping errors abort the
-  run without publishing partial checkpoints or tombstones.
+  With `project_ids`, a selected project returning 404 is removed the same way.
+  HTTP 401/429/5xx, failed pages, malformed payloads, and mapping errors abort
+  the run without publishing partial checkpoints or tombstones.
 
 The coordinator builds the next state separately and assigns it only after all
 reads, mapping, and row iteration finish. DLT owns extraction/load state and
@@ -171,6 +208,7 @@ before release. HTTP requests use `httpx` with a 30-second timeout.
 ## Example and tests
 
 `examples/example.py` runs the initial ingestion flow. It requires `GITLAB_TOKEN`
-and a configured cognee LLM/embedding provider. Run the mocked API and local
+and a configured cognee LLM/embedding provider. Set `GITLAB_PROJECT_IDS` (comma
+separated, e.g. `my-team/backend,87746024`) to limit the sync to those projects. Run the mocked API and local
 SQLite DLT integration tests with
 `uv run pytest tests/`. These do not require credentials or network access.

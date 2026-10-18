@@ -6,9 +6,11 @@ import pytest
 from cognee_community_connector_gitlab.gitlab import (
     GitLabAPIError,
     _discover_projects,
+    _feature_enabled,
     _fetch_issues,
     _fetch_merge_requests,
     _fetch_wiki_pages,
+    _read_selected_projects,
     _validate_token,
     gitlab_source,
 )
@@ -98,6 +100,7 @@ def test_project_pagination():
     def handler(request):
         assert request.url.path == "/prefix/api/v4/projects"
         assert request.url.params["pagination"] == "keyset"
+        assert request.url.params["membership"] == "true"
         if "id_after" not in request.url.params:
             return httpx.Response(200, json=[{"id": i} for i in range(1, 101)])
         assert request.url.params["id_after"] == "100"
@@ -376,3 +379,113 @@ def test_invalid_merge_request_payload(payload):
         pytest.raises(GitLabAPIError),
     ):
         _fetch_merge_requests(client, 42)
+
+
+def test_selected_projects_by_id_and_path_are_deduplicated():
+    paths = []
+
+    def handler(request):
+        paths.append(request.url.raw_path.decode())
+        return httpx.Response(200, json={"id": 42, "path_with_namespace": "team/app"})
+
+    with client_for(handler) as client:
+        projects = _read_selected_projects(client, (42, "team/app"))
+    assert [project["id"] for project in projects] == [42]
+    assert paths == ["/prefix/api/v4/projects/42", "/prefix/api/v4/projects/team%2Fapp"]
+
+
+def test_inaccessible_selected_project_is_skipped():
+    def handler(request):
+        if request.url.path.endswith("/projects/1"):
+            return httpx.Response(404)
+        return httpx.Response(200, json={"id": 2})
+
+    with client_for(handler) as client:
+        assert [project["id"] for project in _read_selected_projects(client, (1, 2))] == [2]
+
+
+@pytest.mark.parametrize("response", [httpx.Response(403), httpx.Response(500)])
+def test_selected_project_failure_aborts(response):
+    with client_for(lambda _: response) as client, pytest.raises(GitLabAPIError):
+        _read_selected_projects(client, (42,))
+
+
+@pytest.mark.parametrize("payload", [{}, [], {"id": 99}, {"id": "42"}])
+def test_selected_project_invalid_identity_aborts(payload):
+    with (
+        client_for(lambda _: httpx.Response(200, json=payload)) as client,
+        pytest.raises(GitLabAPIError, match="project identity"),
+    ):
+        _read_selected_projects(client, (42,))
+
+
+@pytest.mark.parametrize(
+    ("project", "enabled"),
+    [
+        ({}, True),
+        ({"issues_access_level": "enabled", "issues_enabled": True}, True),
+        ({"issues_access_level": "private"}, True),
+        ({"issues_access_level": "disabled"}, False),
+        ({"issues_enabled": False}, False),
+        ({"wiki_access_level": "disabled"}, True),
+    ],
+)
+def test_feature_enabled(project, enabled):
+    assert _feature_enabled(project, "issues") is enabled
+
+
+@pytest.mark.parametrize("status", [403, 404])
+@pytest.mark.parametrize("fetch", [_fetch_issues, _fetch_merge_requests, _fetch_wiki_pages])
+def test_unavailable_resource_returns_none_when_allowed(fetch, status):
+    with client_for(lambda _: httpx.Response(status)) as client:
+        assert fetch(client, 42, unavailable_ok=True) is None
+
+
+@pytest.mark.parametrize("status", [401, 429, 500])
+@pytest.mark.parametrize("fetch", [_fetch_issues, _fetch_merge_requests, _fetch_wiki_pages])
+def test_unavailable_ok_still_raises_other_failures(fetch, status):
+    with client_for(lambda _: httpx.Response(status)) as client, pytest.raises(GitLabAPIError):
+        fetch(client, 42, unavailable_ok=True)
+
+
+def test_unavailable_ok_does_not_hide_later_page_failure():
+    def handler(request):
+        if request.url.params["page"] == "1":
+            return httpx.Response(200, json=[issue_payload(i) for i in range(1, 101)])
+        return httpx.Response(403)
+
+    with client_for(handler) as client, pytest.raises(GitLabAPIError):
+        _fetch_issues(client, 42, unavailable_ok=True)
+
+
+@pytest.mark.parametrize("project_ids", [[], "team/app", 42, [0], [-1], [""], ["/"], [None], [1.5]])
+def test_invalid_project_ids_rejected_before_network(project_ids):
+    with (
+        patch("cognee_community_connector_gitlab.gitlab.httpx.Client") as client,
+        pytest.raises(ValueError, match="project_ids"),
+    ):
+        gitlab_source("test-secret", resource_types=["issues"], project_ids=project_ids)
+    client.assert_not_called()
+
+
+def test_source_with_project_ids_skips_discovery():
+    paths = []
+
+    def handler(request):
+        paths.append(request.url.raw_path.decode().split("?")[0])
+        if request.url.path.endswith("/self"):
+            return httpx.Response(200, json=token_metadata())
+        if request.url.raw_path.decode().endswith("/projects/team%2Fapp"):
+            return httpx.Response(200, json={"id": 42, "path_with_namespace": "team/app"})
+        return httpx.Response(200, json=[])
+
+    with patch(
+        "cognee_community_connector_gitlab.gitlab.httpx.Client",
+        side_effect=lambda **kwargs: client_for(handler),
+    ):
+        list(gitlab_source("test-secret", resource_types=["issues"], project_ids=["team/app"]))
+    assert "/prefix/api/v4/projects" not in paths
+    assert paths[2:] == [
+        "/prefix/api/v4/projects/team%2Fapp",
+        "/prefix/api/v4/projects/42/issues",
+    ]

@@ -244,3 +244,121 @@ def test_reconciliation_permission_failure_preserves_state():
     ):
         list(sync_documents(None, "https://gitlab.example", ("issues",), state))
     assert state == before
+
+
+def run_projects(
+    state, projects, responses, *, selected=("issues", "merge_requests", "wiki"), **kw
+):
+    """Sync several projects; ``responses`` maps "<project_id>/<endpoint>" to a payload or status."""
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        path = request.url.path.removeprefix("/api/v4/projects")
+        if path == "":
+            return httpx.Response(200, json=projects)
+        response = responses.get(path.strip("/"), [])
+        if isinstance(response, int):
+            return httpx.Response(response)
+        return httpx.Response(200, json=response)
+
+    with httpx.Client(
+        base_url="https://gitlab.example/api/v4/", transport=httpx.MockTransport(handler)
+    ) as client:
+        rows = list(sync_documents(client, "https://gitlab.example", selected, state, **kw))
+    return rows, [request.url.path for request in requests]
+
+
+def project_item(project_id, identity):
+    return {**item(identity), "id": project_id * 1000 + identity, "project_id": project_id}
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        {"issues_access_level": "disabled", "wiki_access_level": "disabled"},
+        {"issues_enabled": False, "wiki_enabled": False},
+    ],
+)
+def test_disabled_features_are_skipped_and_sync_continues(flags):
+    projects = [
+        {"id": 1, "path_with_namespace": "team/mr-only", **flags},
+        {"id": 2, "path_with_namespace": "team/full"},
+    ]
+    responses = {
+        "1/merge_requests": [project_item(1, 1)],
+        "2/issues": [project_item(2, 1)],
+        "2/merge_requests": [project_item(2, 2)],
+        "2/wikis": [{"slug": "home", "title": "Home", "content": "Hi"}],
+    }
+    rows, paths = run_projects({}, projects, responses)
+    assert len(rows) == 4
+    assert "/api/v4/projects/1/issues" not in paths
+    assert "/api/v4/projects/1/wikis" not in paths
+    assert "/api/v4/projects/1/merge_requests" in paths
+
+
+@pytest.mark.parametrize("status", [403, 404])
+def test_unavailable_endpoints_are_skipped_without_metadata(status):
+    projects = [{"id": 1, "path_with_namespace": "a/b"}, {"id": 2, "path_with_namespace": "c/d"}]
+    responses = {
+        "1/issues": status,
+        "1/wikis": status,
+        "1/merge_requests": [project_item(1, 1)],
+        "2/issues": [project_item(2, 1)],
+    }
+    state = {}
+    rows, _ = run_projects(state, projects, responses)
+    assert {row["id"].split(":", 2)[2] for row in rows} == {
+        "project:1:merge_request:1001",
+        "project:2:issue:2001",
+    }
+    assert set(state["projects"]["1"]) == {"merge_requests"}
+
+
+@pytest.mark.parametrize("status", [401, 429, 500])
+def test_other_resource_failures_still_abort(status):
+    projects = [{"id": 1, "path_with_namespace": "a/b"}]
+    state = {}
+    with pytest.raises(GitLabAPIError):
+        run_projects(state, projects, {"1/wikis": status})
+    assert state == {}
+
+
+def test_feature_turned_off_later_removes_its_documents():
+    project = {"id": 1, "path_with_namespace": "a/b"}
+    responses = {
+        "1/issues": [project_item(1, 1)],
+        "1/wikis": [{"slug": "home", "title": "Home", "content": "Hi"}],
+    }
+    state = {}
+    first, _ = run_projects(state, [project], responses, selected=("issues", "wiki"))
+    wiki_id = next(row["id"] for row in first if ":wiki:" in row["id"])
+    rows, paths = run_projects(
+        state,
+        [{**project, "wiki_access_level": "disabled"}],
+        responses,
+        selected=("issues", "wiki"),
+    )
+    assert rows == [{"id": wiki_id, "_deleted": True}]
+    assert "wiki" not in state["projects"]["1"]
+    assert "/api/v4/projects/1/wikis" not in paths
+
+
+def test_selected_projects_skip_discovery_and_remove_inaccessible_ones():
+    state = {}
+    responses = {
+        "1": {"id": 1, "path_with_namespace": "a/b"},
+        "2": {"id": 2, "path_with_namespace": "c/d"},
+        "1/issues": [project_item(1, 1)],
+        "2/issues": [project_item(2, 1)],
+    }
+    first, paths = run_projects(state, [], responses, selected=("issues",), project_ids=(1, 2))
+    assert len(first) == 2 and "/api/v4/projects" not in paths
+    removed = next(row["id"] for row in first if ":project:2:" in row["id"])
+    rows, paths = run_projects(
+        state, [], {**responses, "2": 404}, selected=("issues",), project_ids=(1, 2)
+    )
+    assert rows == [{"id": removed, "_deleted": True}]
+    assert set(state["projects"]) == {"1"}
+    assert paths.count("/api/v4/projects/2") == 1
