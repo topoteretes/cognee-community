@@ -28,7 +28,12 @@ cd packages/connector/servicenow && uv sync
 1. Use your instance, or a free [Personal Developer Instance](https://developer.servicenow.com)
    (it comes with demo incidents, problems, changes and knowledge articles).
 2. Create a read-only integration user that can read the synced tables (and
-   `sys_journal_field` if you turn on journal entries).
+   `sys_journal_field` if you turn on journal entries). Tick **Internal Integration
+   User** (called _Web service access only_ on older releases) so multi-factor
+   login, which the API cannot complete, does not apply to it. Newer instances
+   also reject Basic auth on the REST API unless the user has the
+   `snc_basic_auth_api_access` role, so grant it; without it every request
+   returns `401 User is not authenticated`.
 3. Export the instance and credentials, plus your `LLM_API_KEY`:
 
 ```bash
@@ -68,9 +73,9 @@ Pass `write_disposition="merge"` to `remember`: this source only emits records t
 changed and deletes by emitting `_deleted` tombstone rows, which only `merge` applies.
 
 - **Incremental sync without date queries.** Each run lists every in-scope record's
-  `sys_id` and raw `sys_updated_on` (two fields, UTC) and compares them with the previous
-  run, kept in dlt state. Only new or changed records are fetched in full, in batches of
-  100. This avoids encoded date filters, whose `gs.dateGenerate` values are interpreted
+  `sys_id`, raw `sys_updated_on` (UTC) and `sys_mod_count` and compares them with the
+  previous run, kept in dlt state. The update counter catches a second edit within the
+  same second, which the one-second timestamp alone would miss. Only new or changed records are fetched in full, in batches of 100. This avoids encoded date filters, whose `gs.dateGenerate` values are interpreted
   in the integration user's time zone.
 - **Deletions.** A record missing from the listing — deleted, or out of scope (a retired
   knowledge article, an incident no longer matching the table's query) — is tombstoned and
@@ -78,8 +83,8 @@ changed and deletes by emitting `_deleted` tombstone rows, which only `merge` ap
 - **Failures.** 429 and 5xx responses are retried (honouring `Retry-After`); any other
   failed request aborts the run, so a broken listing never looks like a deletion.
 
-**Limits:** the listing reads two fields of every in-scope record each run and the state
-keeps one timestamp per record, so narrow very large tables with a query. Journal entries
+**Limits:** the listing reads three small fields of every in-scope record each run and the
+state keeps one version string per record, so narrow very large tables with a query. Journal entries
 need read access to `sys_journal_field`.
 
 ## Testing

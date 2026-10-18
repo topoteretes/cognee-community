@@ -36,6 +36,7 @@ def _incident(sys_id, number, summary, updated, **fields):
         "number": number,
         "short_description": summary,
         "sys_updated_on": updated,
+        "sys_mod_count": "0",
         "state": "In Progress",
         "priority": "2 - High",
         "assignment_group": "Network",
@@ -50,6 +51,7 @@ def _article(sys_id, number, title, updated, state="published"):
         "number": number,
         "short_description": title,
         "sys_updated_on": updated,
+        "sys_mod_count": "0",
         "workflow_state": state,
         "kb_knowledge_base": "IT",
         "text": "<p>Restart the VPN&nbsp;client.</p><p>Then sign in again.</p>",
@@ -235,10 +237,10 @@ def test_first_sync_fetches_everything_with_display_values():
 
     assert [r["id"] for r in rows] == ["incident:s1", "incident:s2"]
     listing, fetch = session.calls
-    assert listing[1]["sysparm_fields"] == "sys_id,sys_updated_on"  # cheap listing first
+    assert listing[1]["sysparm_fields"] == "sys_id,sys_updated_on,sys_mod_count"  # cheap listing
     assert fetch[1]["sysparm_query"] == "sys_idINs1,s2"
     assert fetch[1]["sysparm_display_value"] == "true"
-    assert state == {"tables": {"incident": {"s1": "t1", "s2": "t1"}}}
+    assert state == {"tables": {"incident": {"s1": "t1/0", "s2": "t1/0"}}}
 
 
 def test_only_changed_records_are_fetched_again():
@@ -259,6 +261,20 @@ def test_only_changed_records_are_fetched_again():
     assert session.calls[1][1]["sysparm_query"] == "sys_idINs2"
 
 
+def test_edit_within_the_same_second_is_caught_by_the_mod_count():
+    incidents = [_incident("s1", "INC001", "VPN down", "2026-10-17 06:00:00")]
+    session = FakeServiceNowSession({"incident": incidents})
+    state = {}
+    list(sync_records(_api(session), ONLY_INCIDENTS, False, state))
+
+    # A second update lands in the same second, so sys_updated_on does not move.
+    incidents[0].update(sys_mod_count="1", close_notes="Rebooted the gateway")
+    rows = list(sync_records(_api(session), ONLY_INCIDENTS, False, state))
+
+    assert [r["id"] for r in rows] == ["incident:s1"]
+    assert "Resolution notes: Rebooted the gateway" in rows[0]["content"]
+
+
 def test_deleted_or_out_of_scope_records_are_tombstoned():
     articles = [_article("k1", "KB001", "VPN", "t1"), _article("k2", "KB002", "SSO", "t1")]
     incidents = [_incident("s1", "INC001", "VPN down", "t1")]
@@ -273,7 +289,7 @@ def test_deleted_or_out_of_scope_records_are_tombstoned():
 
     assert {"id": "kb_knowledge:k1", "_deleted": True} in rows
     assert {"id": "incident:s1", "_deleted": True} in rows
-    assert state["tables"] == {"kb_knowledge": {"k2": "t1"}, "incident": {}}
+    assert state["tables"] == {"kb_knowledge": {"k2": "t1/0"}, "incident": {}}
 
 
 def test_removed_table_forgets_its_records():

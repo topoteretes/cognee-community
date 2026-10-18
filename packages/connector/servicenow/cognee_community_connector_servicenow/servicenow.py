@@ -36,8 +36,8 @@ Design
   Work notes and comments are opt-in (``include_journal=True``) because they
   often contain customer details.
 * **Incremental sync without date queries** — each run lists every in-scope
-  record's ``sys_id`` and raw ``sys_updated_on`` (two fields, UTC) and compares
-  them with the previous run, kept in dlt's per-resource state. Only new or
+  record's ``sys_id``, raw ``sys_updated_on`` (UTC) and ``sys_mod_count`` and
+  compares them with the previous run, kept in dlt's per-resource state. Only new or
   changed records are then fetched in full, in batches. This avoids encoded
   date filters, whose ``gs.dateGenerate`` values are interpreted in the
   integration user's time zone. Adding a work note or comment updates the parent
@@ -52,8 +52,8 @@ Design
 
 Limitations
 -----------
-* The listing reads two fields of every in-scope record each run, and the state
-  keeps one timestamp per record, so narrow very large tables with a query
+* The listing reads three small fields of every in-scope record each run, and the
+  state keeps one version string per record, so narrow very large tables with a query
   (e.g. ``active=true`` or a ``sys_created_on`` window).
 * Journal entries are read from ``sys_journal_field``, which the integration user
   must be able to read when ``include_journal=True``.
@@ -325,13 +325,18 @@ def _sync_table(
     include_journal: bool,
     known: dict,
 ) -> Iterator[dict]:
-    # 1. Cheap listing: every in-scope sys_id with its raw (UTC) sys_updated_on.
+    # 1. Cheap listing: every in-scope sys_id with its version. sys_updated_on (raw,
+    # UTC) has one-second precision, so sys_mod_count, which every update bumps,
+    # catches a second edit within the same second as the last sync.
     listing_query = f"{query}^ORDERBYsys_id" if query else "ORDERBYsys_id"
     current = {
-        record["sys_id"]: record["sys_updated_on"]
+        record["sys_id"]: f"{record['sys_updated_on']}/{record.get('sys_mod_count', '')}"
         for record in api.table(
             table,
-            {"sysparm_query": listing_query, "sysparm_fields": "sys_id,sys_updated_on"},
+            {
+                "sysparm_query": listing_query,
+                "sysparm_fields": "sys_id,sys_updated_on,sys_mod_count",
+            },
         )
     }
     changed = sorted(sys_id for sys_id, updated in current.items() if known.get(sys_id) != updated)
