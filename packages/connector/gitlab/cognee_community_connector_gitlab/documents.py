@@ -3,6 +3,10 @@
 from typing import Any, TypedDict
 from urllib.parse import quote, urlsplit, urlunsplit
 
+# Upper bound on the rendered comment section, so one long thread cannot turn
+# its issue into an oversized document. The newest comments are kept.
+MAX_COMMENTS_CHARS = 20_000
+
 
 class DocumentRow(TypedDict):
     id: str
@@ -47,8 +51,54 @@ def _project_url(project: dict[str, Any], instance: str) -> str:
     return f"{instance}/{quote(path, safe='/')}"
 
 
+def _render_comments(notes: list[dict[str, Any]]) -> list[str]:
+    """Render user comments, newest kept first under ``MAX_COMMENTS_CHARS``.
+
+    System notes (label changes, cross-references) are dropped. Internal
+    comments are kept and marked, like confidential issues are.
+    """
+    entries = []
+    for note in notes:
+        if note.get("system") is not False or not _text(note.get("body")):
+            continue
+        author = note.get("author")
+        name = (
+            _text(author.get("username")) or _text(author.get("name"))
+            if isinstance(author, dict)
+            else ""
+        ) or "unknown"
+        created = _text(note.get("created_at"))[:10]
+        internal = " [internal]" if note.get("internal") or note.get("confidential") else ""
+        header = f"{name} ({created}){internal}:" if created else f"{name}{internal}:"
+        entries.append(f"{header}\n{note['body'].strip()}")
+    if not entries:
+        return []
+
+    kept = []
+    used = 0
+    for entry in reversed(entries):
+        if used + len(entry) > MAX_COMMENTS_CHARS:
+            if not kept:
+                kept.append(entry[:MAX_COMMENTS_CHARS].rstrip() + " [truncated]")
+            break
+        kept.append(entry)
+        used += len(entry)
+    kept.reverse()
+    lines = ["", "## Comments"]
+    if len(kept) < len(entries):
+        lines.extend(["", f"({len(entries) - len(kept)} earlier comments omitted)"])
+    for entry in kept:
+        lines.extend(["", entry])
+    return lines
+
+
 def _item_to_document(
-    item: dict[str, Any], project: dict[str, Any], instance_url: str, *, merge_request: bool
+    item: dict[str, Any],
+    project: dict[str, Any],
+    instance_url: str,
+    *,
+    merge_request: bool,
+    notes: list[dict[str, Any]] | None = None,
 ) -> DocumentRow:
     instance = _instance_url(instance_url)
     project_id = _positive_id(project, "id")
@@ -98,6 +148,8 @@ def _item_to_document(
         raise ValueError("GitLab description must be a string or null.")
     if _text(description):
         lines.extend(["", description.strip()])
+    if notes is not None:
+        lines.extend(_render_comments(notes))
     return {
         "id": f"{instance}:project:{project_id}:{kind}:{upstream_id}",
         "title": item["title"].strip(),
@@ -107,17 +159,31 @@ def _item_to_document(
 
 
 def _issue_to_document(
-    issue: dict[str, Any], project: dict[str, Any], instance_url: str
+    issue: dict[str, Any],
+    project: dict[str, Any],
+    instance_url: str,
+    *,
+    notes: list[dict[str, Any]] | None = None,
 ) -> DocumentRow:
-    """Map an issue to prose and provenance; comments are not part of this payload."""
-    return _item_to_document(issue, project, instance_url, merge_request=False)
+    """Map an issue to prose and provenance, with its comments when ``notes`` is given.
+
+    The issue payload carries only a comment count; notes are fetched separately.
+    """
+    return _item_to_document(issue, project, instance_url, merge_request=False, notes=notes)
 
 
 def _merge_request_to_document(
-    merge_request: dict[str, Any], project: dict[str, Any], instance_url: str
+    merge_request: dict[str, Any],
+    project: dict[str, Any],
+    instance_url: str,
+    *,
+    notes: list[dict[str, Any]] | None = None,
 ) -> DocumentRow:
-    """Map an MR description and branch metadata; commits and comments are excluded."""
-    return _item_to_document(merge_request, project, instance_url, merge_request=True)
+    """Map an MR description and branch metadata, plus comments when ``notes`` is given.
+
+    Commits and diffs are excluded.
+    """
+    return _item_to_document(merge_request, project, instance_url, merge_request=True, notes=notes)
 
 
 def _wiki_to_document(

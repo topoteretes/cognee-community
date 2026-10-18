@@ -244,6 +244,51 @@ def _fetch_project_items(
         page_number += 1
 
 
+def _fetch_notes(
+    client: httpx.Client,
+    project_id: int,
+    resource: Literal["issues", "merge_requests"],
+    iid: int,
+) -> list[dict[str, Any]]:
+    """Read every comment on one issue or MR, oldest first, including system notes.
+
+    The parent payload only carries ``user_notes_count``; comment bodies come
+    from this endpoint. A failed page aborts rather than dropping comments.
+    """
+    notes = []
+    seen_ids = set()
+    page_number = 1
+    while True:
+        page = _get_json(
+            client,
+            f"projects/{project_id}/{resource}/{iid}/notes",
+            params={
+                "order_by": "created_at",
+                "sort": "asc",
+                "per_page": 100,
+                "page": page_number,
+            },
+        )
+        if not isinstance(page, list):
+            raise GitLabAPIError("GitLab returned an invalid note list.")
+        for note in page:
+            if (
+                not isinstance(note, dict)
+                or type(note.get("id")) is not int
+                or note["id"] <= 0
+                or not isinstance(note.get("body"), str)
+                or not isinstance(note.get("system"), bool)
+            ):
+                raise GitLabAPIError("GitLab returned invalid note fields.")
+            if note["id"] in seen_ids:
+                raise GitLabAPIError("GitLab returned duplicate notes during pagination.")
+            seen_ids.add(note["id"])
+            notes.append(note)
+        if len(page) < 100:
+            return notes
+        page_number += 1
+
+
 def _fetch_wiki_pages(
     client: httpx.Client, project_id: int, *, unavailable_ok: bool = False
 ) -> list[dict[str, Any]] | None:
@@ -317,7 +362,8 @@ def gitlab_source(
     Validates the PAT immediately. Resource fetching runs during DLT extraction,
     using per-project checkpoints in DLT resource state. Pass
     write_disposition="merge" and max_rows_per_table=0 to cognee.remember().
-    Comments are not implemented and selecting them raises before HTTP calls.
+    Selecting ``comments`` adds each issue's or MR's comments to its document;
+    it requires ``issues`` or ``merge_requests`` too.
     Projects with issues, MRs, or the wiki turned off skip that resource only.
     """
     if not resource_types:
@@ -327,8 +373,8 @@ def gitlab_source(
         for resource_type in resource_types
     ):
         raise ValueError("Resource types must be issues, merge_requests, comments, or wiki.")
-    if "comments" in resource_types:
-        raise NotImplementedError("Comment ingestion is not implemented yet.")
+    if "comments" in resource_types and not {"issues", "merge_requests"} & set(resource_types):
+        raise ValueError("Selecting comments requires issues or merge_requests as well.")
     selected = tuple(sorted(set(resource_types)))
     project_refs = _normalize_project_ids(project_ids)
 

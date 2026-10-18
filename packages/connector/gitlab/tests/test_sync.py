@@ -362,3 +362,101 @@ def test_selected_projects_skip_discovery_and_remove_inaccessible_ones():
     assert rows == [{"id": removed, "_deleted": True}]
     assert set(state["projects"]) == {"1"}
     assert paths.count("/api/v4/projects/2") == 1
+
+
+def with_notes(identity, updated_at, count, *, project_id=1):
+    return {
+        **project_item(project_id, identity),
+        "updated_at": updated_at,
+        "user_notes_count": count,
+    }
+
+
+def comment(note_id, body):
+    return {"id": note_id, "body": body, "system": False, "author": {"username": "bob"}}
+
+
+COMMENT_SELECTION = ("comments", "issues", "merge_requests")
+PROJECT_ONE = [{"id": 1, "path_with_namespace": "a/b"}]
+
+
+def notes_calls(paths):
+    return [path for path in paths if path.endswith("/notes")]
+
+
+def test_comments_follow_updated_at_and_note_count():
+    state = {}
+    t0, t1 = "2026-10-17T10:00:00Z", "2026-10-17T10:05:00Z"
+    responses = {
+        "1/issues": [with_notes(1, t0, 1), with_notes(2, t0, 0)],
+        "1/merge_requests": [with_notes(3, t0, 1)],
+        "1/issues/1/notes": [comment(10, "first")],
+        "1/issues/2/notes": [],
+        "1/merge_requests/3/notes": [comment(30, "review note")],
+    }
+    first, paths = run_projects(state, PROJECT_ONE, responses, selected=COMMENT_SELECTION)
+    assert len(first) == 3 and len(notes_calls(paths)) == 3
+    issue_one = next(row for row in first if row["id"].endswith(":issue:1001"))
+    assert "first" in issue_one["content"]
+    assert any("review note" in row["content"] for row in first)
+
+    # Unchanged marks: no note reads, nothing emitted.
+    rows, paths = run_projects(state, PROJECT_ONE, responses, selected=COMMENT_SELECTION)
+    assert rows == [] and notes_calls(paths) == []
+
+    # A comment added: GitLab bumps updated_at.
+    responses["1/issues"] = [with_notes(1, t1, 2), with_notes(2, t0, 0)]
+    responses["1/issues/1/notes"] = [comment(10, "first"), comment(11, "second")]
+    rows, paths = run_projects(state, PROJECT_ONE, responses, selected=COMMENT_SELECTION)
+    assert notes_calls(paths) == ["/api/v4/projects/1/issues/1/notes"]
+    assert len(rows) == 1 and "second" in rows[0]["content"]
+
+    # A comment edited: updated_at bumps again, count unchanged.
+    t2 = "2026-10-17T10:10:00Z"
+    responses["1/issues"] = [with_notes(1, t2, 2), with_notes(2, t0, 0)]
+    responses["1/issues/1/notes"] = [comment(10, "first, edited"), comment(11, "second")]
+    rows, _ = run_projects(state, PROJECT_ONE, responses, selected=COMMENT_SELECTION)
+    assert len(rows) == 1 and "first, edited" in rows[0]["content"]
+
+    # A comment deleted: GitLab leaves updated_at alone, only the count drops.
+    responses["1/issues"] = [with_notes(1, t2, 1), with_notes(2, t0, 0)]
+    responses["1/issues/1/notes"] = [comment(10, "first, edited")]
+    rows, paths = run_projects(state, PROJECT_ONE, responses, selected=COMMENT_SELECTION)
+    assert notes_calls(paths) == ["/api/v4/projects/1/issues/1/notes"]
+    assert len(rows) == 1 and "second" not in rows[0]["content"]
+    assert rows[0]["id"] == issue_one["id"]
+
+
+def test_comment_mode_still_deletes_removed_items():
+    state = {}
+    t0 = "2026-10-17T10:00:00Z"
+    responses = {
+        "1/issues": [with_notes(1, t0, 1)],
+        "1/issues/1/notes": [comment(10, "first")],
+        "1/issues/1": 404,
+    }
+    first, _ = run_projects(state, PROJECT_ONE, responses, selected=("comments", "issues"))
+    responses["1/issues"] = []
+    rows, _ = run_projects(state, PROJECT_ONE, responses, selected=("comments", "issues"))
+    assert rows == [{"id": first[0]["id"], "_deleted": True}]
+    assert state["projects"]["1"]["issues"]["notes_marks"] == {}
+
+
+def test_notes_failure_preserves_state():
+    state = {}
+    t0 = "2026-10-17T10:00:00Z"
+    responses = {"1/issues": [with_notes(1, t0, 1)], "1/issues/1/notes": [comment(10, "a")]}
+    run_projects(state, PROJECT_ONE, responses, selected=("comments", "issues"))
+    before = deepcopy(state)
+    responses["1/issues"] = [with_notes(1, "2026-10-17T11:00:00Z", 2)]
+    responses["1/issues/1/notes"] = 500
+    with pytest.raises(GitLabAPIError):
+        run_projects(state, PROJECT_ONE, responses, selected=("comments", "issues"))
+    assert state == before
+
+
+def test_without_comments_no_notes_are_read():
+    responses = {"1/issues": [with_notes(1, "2026-10-17T10:00:00Z", 3)]}
+    rows, paths = run_projects({}, PROJECT_ONE, responses, selected=("issues", "wiki"))
+    assert notes_calls(paths) == []
+    assert "## Comments" not in rows[0]["content"]

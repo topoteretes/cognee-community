@@ -2,12 +2,12 @@
 
 Python connector for [cognee issue #4709](https://github.com/topoteretes/cognee/issues/4709).
 
-**Status:** legacy PAT validation, project discovery or selection, issue/MR/wiki fetching,
-DLT document ingestion, persistent checkpoints, and resource deletion reconciliation
-are implemented. Comments remain unimplemented. `gitlab_source()` validates the
+**Status:** legacy PAT validation, project discovery or selection, issue/MR/wiki
+fetching, issue/MR comments, DLT document ingestion, persistent checkpoints, and
+resource deletion reconciliation are implemented. `gitlab_source()` validates the
 PAT immediately; fetching and mapping happen during DLT extraction.
 
-## Planned scope
+## Scope
 
 - Required legacy Personal Access Token with `read_api`, supplied through `token`.
   The broader `api` scope also passes validation but is not needed.
@@ -17,8 +17,8 @@ PAT immediately; fetching and mapping happen during DLT extraction.
 - Required `resource_types`: `issues`, `merge_requests`, `comments`, and `wiki`.
   An empty selection is rejected.
   Unsupported names are rejected before any HTTP requests.
-- Comments on issues and merge requests are reserved for a later implementation;
-  selecting `comments` currently raises before any HTTP requests.
+- `comments` adds each issue's or MR's comments to that issue's or MR's
+  document. It requires `issues` or `merge_requests` in the same selection.
 - Document rows with `id`, `title`, `content`, and `url`, exposed as a `dlt` source
   for `cognee.remember()`.
 - Incremental updates and verified upstream deletion reconciliation.
@@ -109,8 +109,45 @@ changes do not affect external identity. Null/missing descriptions become empty
 text; absent optional metadata is omitted. Wiki markup is preserved, not
 converted from AsciiDoc/RDoc to Markdown. Unknown API fields are not ingested.
 
-Comments, MR commits, diffs, attachments, repository README files, and `docs/`
-files are not fetched or included. Comment counts are not comment content.
+MR commits, diffs, attachments, repository README files, and `docs/` files are
+not fetched or included.
+
+## Comments
+
+GitLab's issue and MR payloads only carry `user_notes_count`, not comment text.
+With `comments` selected, the connector reads
+`/projects/:id/issues/:iid/notes` (or `merge_requests`) for each item, oldest
+first, and appends a `## Comments` section to that item's document:
+
+```
+alice (2026-10-12):
+I think the bug is in the auth middleware.
+
+bob (2026-10-13) [internal]:
+Confirmed, fixed in !28.
+```
+
+- System notes (label changes, cross-references, "mentioned in") are skipped.
+- Internal comments the token can read are kept and marked `[internal]`.
+- The section is capped at 20,000 characters, keeping the newest comments and
+  noting how many earlier ones were omitted.
+- Comments live inside their parent document, so deleting an issue or MR
+  removes its comments too, and a changed comment re-ingests its parent.
+
+Notes are re-read only for items whose `updated_at` or `user_notes_count`
+changed since the last run. This was checked against GitLab's source and a live
+gitlab.com test:
+
+| Comment action | Parent `updated_at` | `user_notes_count` |
+| --- | --- | --- |
+| Added | bumped | +1 |
+| Edited | bumped | unchanged |
+| Deleted | **unchanged** | -1 |
+
+GitLab bumps `updated_at` at most once a minute per item; the one-minute cursor
+overlap covers that window. Comments on items whose two fields did not change
+are not re-read, so a project rename (rendered into content) is picked up for
+those items only when they next change.
 This package maps GitLab payloads only; GitHub has no adapter here.
 
 ## Ingest into cognee
@@ -151,7 +188,8 @@ bodies are stored in staging, not in state. DLT persists state in its pipeline
 working directory (normally `~/.dlt/pipelines/<pipeline_name>/`) and destination
 `_dlt_pipeline_state` table. Keep the same destination and dataset across runs.
 Staging and pipeline names are scoped by instance URL, token owner ID, resource
-selection, project selection (when given), and destination dataset. Token rotation preserves the scope.
+selection (including `comments`), project selection (when given), and
+destination dataset. Token rotation preserves the scope.
 
 - First run: fetch all selected resources and establish a baseline.
 - Later issue/MR runs: use the greatest observed upstream `updated_at`, minus a

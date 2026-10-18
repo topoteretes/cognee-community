@@ -20,7 +20,7 @@ async def main():
     source = gitlab_source(
         token=os.environ["GITLAB_TOKEN"],
         base_url=os.environ.get("GITLAB_BASE_URL", "https://gitlab.com"),
-        resource_types=["issues", "merge_requests", "wiki"],
+        resource_types=["issues", "merge_requests", "comments", "wiki"],
         project_ids=project_ids,
     )
     await cognee.remember(

@@ -1,6 +1,7 @@
 import pytest
 
 from cognee_community_connector_gitlab.documents import (
+    MAX_COMMENTS_CHARS,
     _issue_to_document,
     _merge_request_to_document,
     _wiki_to_document,
@@ -102,3 +103,61 @@ def test_invalid_issue_payload_is_rejected(updates):
 def test_missing_wiki_content_is_rejected():
     with pytest.raises(TypeError):
         _wiki_to_document({"slug": "home", "title": "Home"}, PROJECT, INSTANCE)
+
+
+def note(note_id, body, *, system=False, **updates):
+    return {
+        "id": note_id,
+        "body": body,
+        "system": system,
+        "author": {"username": f"user{note_id}"},
+        "created_at": "2026-10-17T10:00:00Z",
+        **updates,
+    }
+
+
+@pytest.mark.parametrize("mapper", [_issue_to_document, _merge_request_to_document])
+def test_comments_rendered_oldest_first_without_system_notes(mapper):
+    notes = [
+        note(1, "First thought"),
+        note(2, "added ~bug label", system=True),
+        note(3, "Second thought", internal=True),
+        note(4, "   "),
+    ]
+    content = mapper(item(), PROJECT, INSTANCE, notes=notes)["content"]
+    section = content.split("## Comments", 1)[1]
+    assert section.index("First thought") < section.index("Second thought")
+    assert "user1 (2026-10-17):\nFirst thought" in section
+    assert "user3 (2026-10-17) [internal]:" in section
+    assert "label" not in section
+    assert "user4" not in section
+
+
+@pytest.mark.parametrize("notes", [None, [], [note(1, "bot", system=True)]])
+def test_no_comment_section_without_user_comments(notes):
+    content = _issue_to_document(item(), PROJECT, INSTANCE, notes=notes)["content"]
+    assert "## Comments" not in content
+
+
+def test_comment_author_fallbacks():
+    notes = [note(1, "a", author={"name": "Alice A"}), note(2, "b", author=None)]
+    content = _issue_to_document(item(), PROJECT, INSTANCE, notes=notes)["content"]
+    assert "Alice A (2026-10-17):" in content
+    assert "unknown (2026-10-17):" in content
+
+
+def test_comment_section_keeps_newest_within_cap():
+    size = MAX_COMMENTS_CHARS // 4
+    notes = [note(i, f"comment-{i} " + "x" * size) for i in range(1, 7)]
+    content = _issue_to_document(item(), PROJECT, INSTANCE, notes=notes)["content"]
+    section = content.split("## Comments", 1)[1]
+    assert "comment-6" in section and "comment-1 " not in section
+    assert "earlier comments omitted)" in section
+    assert len(section) < MAX_COMMENTS_CHARS + 500
+
+
+def test_single_oversized_comment_is_truncated():
+    notes = [note(1, "y" * (MAX_COMMENTS_CHARS * 2))]
+    content = _issue_to_document(item(), PROJECT, INSTANCE, notes=notes)["content"]
+    assert content.endswith("[truncated]")
+    assert len(content.split("## Comments", 1)[1]) < MAX_COMMENTS_CHARS + 100

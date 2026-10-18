@@ -31,6 +31,16 @@ def build_source(
             payload = [{"id": 42, "path_with_namespace": "team/app"}]
         elif path.endswith("/wikis"):
             payload = [{"slug": "home", "title": "Home", "content": "Welcome"}]
+        elif path.endswith("/notes"):
+            payload = [
+                {
+                    "id": 5,
+                    "body": "Looks good",
+                    "system": False,
+                    "author": {"username": "bob"},
+                    "created_at": "2026-10-17T10:00:00Z",
+                }
+            ]
         else:
             payload = [
                 {
@@ -109,13 +119,21 @@ def test_dlt_pipeline_loads_document_rows(tmp_path, monkeypatch):
         assert client.execute_sql(f'SELECT count(*) FROM "{table_name}"')[0][0] == 3
 
 
-def test_comments_rejected_before_http():
+@pytest.mark.parametrize("selection", [["comments"], ["comments", "wiki"]])
+def test_comments_without_parent_rejected_before_http(selection):
     with (
         patch("cognee_community_connector_gitlab.gitlab.httpx.Client") as client,
-        pytest.raises(NotImplementedError, match="Comment ingestion"),
+        pytest.raises(ValueError, match="requires issues or merge_requests"),
     ):
-        gitlab_source("test-token", resource_types=["issues", "comments"])
+        gitlab_source("test-token", resource_types=selection)
     client.assert_not_called()
+
+
+def test_comments_are_rendered_into_issue_documents():
+    rows = list(build_source(["issues", "comments"]))
+    assert len(rows) == 1
+    assert "## Comments" in rows[0]["content"]
+    assert "bob (2026-10-17):\nLooks good" in rows[0]["content"]
 
 
 def test_persistent_state_and_hard_deletion_across_pipeline_instances(tmp_path):

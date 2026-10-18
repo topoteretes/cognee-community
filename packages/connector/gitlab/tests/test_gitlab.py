@@ -9,6 +9,7 @@ from cognee_community_connector_gitlab.gitlab import (
     _feature_enabled,
     _fetch_issues,
     _fetch_merge_requests,
+    _fetch_notes,
     _fetch_wiki_pages,
     _read_selected_projects,
     _validate_token,
@@ -489,3 +490,53 @@ def test_source_with_project_ids_skips_discovery():
         "/prefix/api/v4/projects/team%2Fapp",
         "/prefix/api/v4/projects/42/issues",
     ]
+
+
+def note_payload(note_id, system=False):
+    return {"id": note_id, "body": f"note {note_id}", "system": system}
+
+
+@pytest.mark.parametrize("resource", ["issues", "merge_requests"])
+def test_notes_pagination_reads_all_pages_oldest_first(resource):
+    first_page = [note_payload(i) for i in range(1, 101)]
+    final_page = [note_payload(101, system=True)]
+
+    def handler(request):
+        assert request.url.path == f"/prefix/api/v4/projects/42/{resource}/7/notes"
+        assert request.url.params["sort"] == "asc"
+        assert request.url.params["order_by"] == "created_at"
+        page = request.url.params["page"]
+        return httpx.Response(200, json=first_page if page == "1" else final_page)
+
+    with client_for(handler) as client:
+        assert _fetch_notes(client, 42, resource, 7) == first_page + final_page
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        [None],
+        [{"id": 1, "body": "x"}],
+        [{"id": 1, "body": None, "system": False}],
+        [{"id": "1", "body": "x", "system": False}],
+        [note_payload(1), note_payload(1)],
+    ],
+)
+def test_invalid_notes_abort(payload):
+    with (
+        client_for(lambda _: httpx.Response(200, json=payload)) as client,
+        pytest.raises(GitLabAPIError),
+    ):
+        _fetch_notes(client, 42, "issues", 7)
+
+
+@pytest.mark.parametrize("status", [403, 404, 429, 500])
+def test_failed_notes_page_aborts(status):
+    def handler(request):
+        if request.url.params["page"] == "1":
+            return httpx.Response(200, json=[note_payload(i) for i in range(1, 101)])
+        return httpx.Response(status)
+
+    with client_for(handler) as client, pytest.raises(GitLabAPIError):
+        _fetch_notes(client, 42, "issues", 7)

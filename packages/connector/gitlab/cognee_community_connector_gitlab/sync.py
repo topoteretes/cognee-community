@@ -51,6 +51,12 @@ def sync_documents(
     their documents from this token's visible scope. With ``project_ids``, a
     selected project that is no longer accessible has its documents removed.
 
+    With ``comments`` selected, issue/MR documents include their comments.
+    Notes are re-read only when an item's ``updated_at`` or ``user_notes_count``
+    changed: GitLab bumps ``updated_at`` when a comment is added or edited (at
+    most once a minute, covered by the cursor overlap), but not when one is
+    deleted, which only lowers the count. Unchanged items keep their stored hash.
+
     A resource a project has turned off (by metadata, or 403/404 on its list
     endpoint) is skipped for that project only, and documents previously synced
     from it are removed. Other projects and resources continue normally.
@@ -61,6 +67,7 @@ def sync_documents(
         _feature_enabled,
         _fetch_issues,
         _fetch_merge_requests,
+        _fetch_notes,
         _fetch_wiki_pages,
         _get_json,
         _read_selected_projects,
@@ -106,10 +113,14 @@ def sync_documents(
             # A successful direct read means it must still be synced.
             projects.append(project)
 
+    with_comments = "comments" in selected
     for project in projects:
         project_state = next_projects.setdefault(str(project["id"]), {})
         for resource in selected:
+            if resource == "comments":
+                continue  # Rendered into issue/MR documents below.
             fetch, mapper = handlers[resource]
+            include_notes = with_comments and resource != "wiki"
             previous = project_state.get(resource, {})
             cursor = previous.get("updated_after")
             changes = inventory = None
@@ -133,21 +144,20 @@ def sync_documents(
                 project_state.pop(resource, None)
                 continue
 
-            # Hash the authoritative inventory as well as the delta, catching
-            # edits to rendered project metadata and races between the reads.
-            documents = {}
-            identities = {}
+            old_hashes = previous.get("hashes", {})
+            old_marks = previous.get("notes_marks", {})
             timestamps = [_timestamp(cursor)] if cursor else []
+            # The complete inventory wins over the delta for the same item, so
+            # each item is mapped (and its notes read) once.
+            latest = {}
             for item in changes + inventory:
-                document = mapper(item, project, instance)
-                documents[document["id"]] = document
-                identities[document["id"]] = item["slug"] if resource == "wiki" else item["iid"]
+                identity = item["slug"] if resource == "wiki" else item["iid"]
+                latest[mapper(item, project, instance)["id"]] = (identity, item)
                 if resource != "wiki":
                     timestamps.append(_timestamp(item.get("updated_at")))
-            old_hashes = previous.get("hashes", {})
             # Offset pagination can skip a live item when an earlier item is
             # deleted mid-scan. Confirm candidates individually before deleting.
-            for document_id in old_hashes.keys() - documents.keys():
+            for document_id in old_hashes.keys() - latest.keys():
                 identity = previous["identities"][document_id]
                 endpoint = "wikis" if resource == "wiki" else resource
                 item = _get_json(
@@ -158,22 +168,39 @@ def sync_documents(
                 if item is None:
                     rows.append({"id": document_id, "_deleted": True})
                     continue
-                document = mapper(item, project, instance)
-                if document["id"] != document_id:
+                if mapper(item, project, instance)["id"] != document_id:
                     raise GitLabAPIError(
                         "GitLab returned a different identity during reconciliation."
                     )
-                documents[document_id] = document
-                identities[document_id] = identity
+                latest[document_id] = (identity, item)
                 if resource != "wiki":
                     timestamps.append(_timestamp(item.get("updated_at")))
-            current_hashes = {}
+
+            documents = {}
+            identities = {}
+            kept_hashes = {}  # Comment mode: items whose notes did not change.
+            notes_marks = {}
+            for document_id, (identity, item) in latest.items():
+                identities[document_id] = identity
+                if not include_notes:
+                    documents[document_id] = mapper(item, project, instance)
+                    continue
+                mark = [item.get("updated_at"), item.get("user_notes_count")]
+                notes_marks[document_id] = mark
+                if old_marks.get(document_id) == mark and document_id in old_hashes:
+                    kept_hashes[document_id] = old_hashes[document_id]
+                    continue
+                notes = _fetch_notes(client, project["id"], resource, item["iid"])
+                documents[document_id] = mapper(item, project, instance, notes=notes)
+            current_hashes = dict(kept_hashes)
             for document_id, document in documents.items():
                 digest = _digest(document)
                 current_hashes[document_id] = digest
                 if old_hashes.get(document_id) != digest:
                     rows.append(document)
             project_state[resource] = {"hashes": current_hashes, "identities": identities}
+            if include_notes:
+                project_state[resource]["notes_marks"] = notes_marks
             if timestamps:
                 project_state[resource]["updated_after"] = max(timestamps).isoformat()
 
