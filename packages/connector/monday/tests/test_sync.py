@@ -3,7 +3,7 @@
 import pytest
 from fake_monday import FakeMonday
 
-from cognee_community_connector_monday.monday import MondayAPIError, _iter_rows
+from cognee_community_connector_monday.monday import MondayAPIError, MondayAuthError, _iter_rows
 
 BOARD, SUBITEMS = "100", "101"
 
@@ -153,7 +153,7 @@ def test_an_item_archived_after_the_listing_is_not_emitted(monday):
 
 
 def test_a_board_the_token_cannot_see_raises_instead_of_looking_empty(monday):
-    with pytest.raises(MondayAPIError, match="not found or are not shared"):
+    with pytest.raises(MondayAPIError, match="No monday\\.com board could be synced"):
         list(_iter_rows(monday, ["999"], {}, {}))
 
 
@@ -269,9 +269,11 @@ def test_losing_access_to_a_board_raises_and_forgets_nothing(monday):
     sync(monday, state)
     monday.revoke_access(BOARD)
 
-    with pytest.raises(MondayAPIError, match="not found or are not shared"):
+    with pytest.raises(MondayAPIError, match="Nothing was forgotten"):
         sync(monday, state)
     assert set(state["boards"][BOARD]["items"]) == {"1", "2"}
+    # The sub-item board is not forgotten either: its parent board failed.
+    assert set(state["boards"][SUBITEMS]["items"]) == {"3"}
 
 
 def test_an_error_during_the_lookup_forgets_nothing(monday):
@@ -287,9 +289,11 @@ def test_an_error_during_the_lookup_forgets_nothing(monday):
 
     monday.query = failing_lookup
 
-    with pytest.raises(MondayAPIError):
-        sync(monday, state)
+    rows, stats = sync(monday, state)
+
+    assert forgotten(rows) == []
     assert "2" in state["boards"][BOARD]["items"]
+    assert stats["failed"] == 1
 
 
 def test_an_empty_board_still_forgets_its_last_item(monday):
@@ -301,3 +305,93 @@ def test_an_empty_board_still_forgets_its_last_item(monday):
     rows, _ = sync(monday, state)
 
     assert forgotten(rows) == ["monday:1", "monday:2"]
+
+
+# -- one failing board -------------------------------------------------------
+
+
+def fail_listing_of(monday, board_id, error):
+    original = monday.paginate
+
+    def paginate(query, variables, **kwargs):
+        if variables["board"] == [board_id]:
+            raise error
+        yield from original(query, variables, **kwargs)
+
+    monday.paginate = paginate
+
+
+def test_a_failing_board_does_not_stop_the_others(monday):
+    monday.add_board("200", "Second board")
+    monday.add_item("9", "200", "Only on the second board")
+    state = {}
+    list(_iter_rows(monday, [BOARD, "200"], state, {}))
+    saved_before = dict(state["boards"][BOARD]["items"])
+    monday.set_status("9", "Done")
+    monday.set_status("1", "Done")
+    fail_listing_of(monday, BOARD, MondayAPIError("boom"))
+
+    stats = {}
+    rows = list(_iter_rows(monday, [BOARD, "200"], state, stats))
+
+    # The healthy board synced; the failing one kept its state for next time.
+    assert [row["title"] for row in rows] == ["Only on the second board"]
+    assert state["boards"][BOARD]["items"] == saved_before
+    assert stats["failed"] == 1
+
+
+def test_a_network_error_on_one_board_is_isolated_too(monday):
+    import requests
+
+    monday.add_board("200", "Second board")
+    fail_listing_of(monday, BOARD, requests.ConnectionError("reset"))
+
+    stats = {}
+    list(_iter_rows(monday, [BOARD, "200"], {}, stats))
+
+    assert stats["failed"] == 1
+
+
+def test_a_refused_token_stops_the_whole_sync(monday):
+    monday.add_board("200", "Second board")
+    fail_listing_of(monday, BOARD, MondayAuthError("refused"))
+
+    with pytest.raises(MondayAuthError):
+        list(_iter_rows(monday, [BOARD, "200"], {}, {}))
+
+
+def test_one_missing_board_does_not_stop_the_others(monday):
+    stats = {}
+    rows = list(_iter_rows(monday, [BOARD, "999"], {}, stats))
+
+    assert len(rows) == 3
+    assert stats["failed"] == 1
+
+
+def test_the_same_board_selected_twice_is_synced_once(monday):
+    rows = list(_iter_rows(monday, [BOARD, BOARD, int(BOARD)], {}, {}))
+
+    assert len(rows) == 3
+
+
+def test_logs_carry_counts_only(monday, monkeypatch):
+    import cognee_community_connector_monday.monday as module
+
+    messages = []
+
+    class Recorder:
+        def info(self, message, *args):
+            messages.append(message % args)
+
+        warning = info
+
+    monkeypatch.setattr(module, "logger", Recorder())
+    monday.post_update("1", "Secret roadmap discussion")
+    fail_listing_of(monday, SUBITEMS, MondayAPIError(f"board {SUBITEMS} failed"))
+
+    list(_iter_rows(monday, [BOARD], {}, {}))
+
+    text = " ".join(messages)
+    assert messages
+    for private in ("Ship the beta", "Secret roadmap", BOARD, SUBITEMS, "monday:"):
+        assert private not in text

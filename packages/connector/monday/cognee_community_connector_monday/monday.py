@@ -22,12 +22,16 @@ cursor paginator, which writes monday.com's page cursor into the query variables
 
 import hashlib
 import json
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Any
 
+import requests
+from cognee.shared.logging_utils import get_logger
 from dlt.sources.helpers.requests.retry import Client
 from dlt.sources.helpers.rest_client.client import RESTClient
 from dlt.sources.helpers.rest_client.paginators import JSONResponseCursorPaginator
+
+logger = get_logger("monday_connector")
 
 API_URL = "https://api.monday.com/v2"
 # Pinned so a schema change upstream can't silently alter parsing. 2026-07 is the
@@ -64,14 +68,23 @@ class _MondayClient:
     ``_raise_for_errors`` so such a reply can never be read as an empty result.
     """
 
-    def __init__(self, token: str, session: Any = None):
+    def __init__(
+        self,
+        token: str,
+        session: Any = None,
+        check_active: Callable[[], None] | None = None,
+    ):
         headers = {"Authorization": _clean_token(token), "API-Version": API_VERSION}
         self._rest = RESTClient(
             base_url=API_URL, headers=headers, session=session or _retrying_session()
         )
+        # A host's authorization checkpoint, run before every request so a
+        # revoked connection stops the sync at the next call, not at its end.
+        self._check_active = check_active or (lambda: None)
 
     def query(self, query: str, variables: dict | None = None) -> dict:
         """Run one query and return its ``data``."""
+        self._check_active()
         response = self._rest.request(
             "", method="POST", json={"query": query, "variables": variables or {}}
         )
@@ -97,7 +110,12 @@ class _MondayClient:
             data_selector=items_path,
             hooks={"response": [_raise_for_errors]},
         )
-        for page in pages:
+        while True:
+            # Pages are requested lazily, so this runs before each request.
+            self._check_active()
+            page = next(pages, None)
+            if page is None:
+                return
             yield from page
 
 
@@ -464,23 +482,77 @@ def _iter_rows(client, board_ids: list[str], state: dict, stats: dict, full_refr
     item that is gone, on the selected boards.
 
     Sub-items live on their own board, so each selected board's sub-item board
-    is synced with it. ``state`` is dlt's resource state; it is only written
-    once a board's rows have all been yielded.
-    """
-    boards = _load_boards(client, board_ids)
-    subitem_ids = [i for board in _active(boards) for i in _subitem_board_ids(board)]
-    boards.update(_load_boards(client, [i for i in subitem_ids if i not in boards]))
-    saved = state.setdefault("boards", {})
+    is synced with it, and remembers which board it belongs to.
 
-    # A board that was deleted or archived upstream, or is no longer selected,
-    # takes all of its items with it.
+    A board that fails keeps its saved state and is retried on the next run,
+    while the other boards finish. Raising would make dlt drop the state of the
+    whole run, so boards that did finish would lose their progress. The run only
+    raises when no board finished, or when the token itself is refused.
+    """
+    selected = list(dict.fromkeys(str(board_id) for board_id in board_ids))
+    saved = state.setdefault("boards", {})
+    boards, failed = _load_boards(client, selected), set()
+    failed.update(board_id for board_id in selected if board_id not in boards)
+
+    parent_of = {
+        sub_id: str(board["id"])
+        for board in _active(boards)
+        for sub_id in _subitem_board_ids(board)
+    }
+    subitem_boards = _load_boards(client, [i for i in parent_of if i not in boards])
+    failed.update(i for i in parent_of if i not in boards and i not in subitem_boards)
+    boards.update(subitem_boards)
+
+    # A board deleted or archived upstream, or no longer selected, takes all of
+    # its items with it. A board that failed to load is never forgotten.
     for board_id in list(saved):
-        if board_id not in boards or boards[board_id].get("state") != "active":
+        if _is_gone(board_id, saved[board_id], boards, selected, failed):
             yield from _forget_items(saved.pop(board_id).get("items", {}), stats)
 
+    synced = 0
     for board in _active(boards):
-        board_state = saved.setdefault(str(board["id"]), {})
-        yield from _sync_board(client, board, board_state, stats, full_refresh, boards)
+        board_id = str(board["id"])
+        board_state = saved.setdefault(board_id, {})
+        if board_id in parent_of:
+            board_state["parent"] = parent_of[board_id]
+        try:
+            yield from _sync_board(client, board, board_state, stats, full_refresh, boards)
+            synced += 1
+        except MondayAuthError:
+            raise
+        except (MondayAPIError, requests.RequestException) as error:
+            failed.add(board_id)
+            logger.warning(
+                "monday.com: a board failed to sync (%s); it keeps its state and is "
+                "retried on the next run.",
+                type(error).__name__,
+            )
+
+    if failed:
+        stats["failed"] = len(failed)
+    logger.info(
+        "monday.com: %d item(s) scanned, %d changed, %d forgotten, %d board(s) failed.",
+        stats.get("scanned", 0),
+        stats.get("changed", 0),
+        stats.get("deleted", 0),
+        len(failed),
+    )
+    if failed and not synced:
+        raise MondayAPIError(
+            f"No monday.com board could be synced: {len(failed)} board(s) were not found, "
+            "are not shared with this token, or failed. Nothing was forgotten."
+        )
+
+
+def _is_gone(board_id, board_state, boards, selected, failed) -> bool:
+    """Whether a previously synced board should now be forgotten."""
+    root = board_state.get("parent") or board_id
+    if board_id in failed or root in failed:
+        return False
+    if root not in selected:
+        return True
+    board = boards.get(board_id)
+    return board is None or board.get("state") != "active"
 
 
 def _active(boards: dict[str, dict]) -> list[dict]:
@@ -488,19 +560,17 @@ def _active(boards: dict[str, dict]) -> list[dict]:
 
 
 def _load_boards(client, board_ids: list[str]) -> dict[str, dict]:
-    """Board names, states and columns. A board the token cannot see raises:
-    monday.com leaves it out of the answer rather than returning an error, and
-    that must never be read as a board whose items were all deleted."""
+    """Board names, states and columns, for the boards monday.com returned.
+
+    A board the token cannot see is simply missing from the answer, and the
+    caller treats it as failed: that must never be read as a board whose items
+    were all deleted.
+    """
     if not board_ids:
         return {}
     found = client.query(_BOARDS_QUERY, {"ids": board_ids})["boards"] or []
     boards = {str(board["id"]): board for board in found}
-    missing = [board_id for board_id in board_ids if board_id not in boards]
-    if missing:
-        raise MondayAPIError(
-            f"{len(missing)} selected board(s) were not found or are not shared with this token."
-        )
-    return {board_id: boards[board_id] for board_id in board_ids}
+    return {board_id: boards[board_id] for board_id in board_ids if board_id in boards}
 
 
 def _subitem_board_ids(board: dict) -> list[str]:

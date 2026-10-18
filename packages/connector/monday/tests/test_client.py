@@ -253,3 +253,46 @@ def test_bad_tokens_are_refused(bad):
 
 def test_token_whitespace_is_stripped():
     assert _clean_token("  abc  \n") == "abc"
+
+
+# -- host authorization checkpoint -------------------------------------------
+
+
+def checked_client(*replies, check_active):
+    fake = FakeMonday(*replies)
+    session = _retrying_session(request_backoff_factor=0, request_max_retry_delay=0)
+    session.mount("https://", fake)
+    return _MondayClient(TOKEN, session=session, check_active=check_active), fake
+
+
+def test_check_active_runs_before_every_request_including_each_page():
+    checks = []
+    client, fake = checked_client(
+        ok({"x": 1}),
+        page("C1", "1"),
+        page("C2", "2"),
+        page(None, "3"),
+        check_active=lambda: checks.append(len(fake.sent)),
+    )
+
+    client.query("{ x }")
+    list(client.paginate(ITEMS_QUERY, {}, CURSOR_PATH, ITEMS_PATH))
+
+    # Each check saw the number of requests sent so far: one before each request.
+    assert checks[:4] == [0, 1, 2, 3]
+    assert len(fake.sent) == 4
+
+
+def test_a_revoked_host_stops_before_the_next_request():
+    class RevokedError(Exception):
+        pass
+
+    def check():
+        if len(fake.sent) >= 1:
+            raise RevokedError
+
+    client, fake = checked_client(page("C1", "1"), page(None, "2"), check_active=check)
+
+    with pytest.raises(RevokedError):
+        list(client.paginate(ITEMS_QUERY, {}, CURSOR_PATH, ITEMS_PATH))
+    assert len(fake.sent) == 1
