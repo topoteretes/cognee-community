@@ -10,6 +10,7 @@ from cognee_community_connector_twist.twist import (
     TwistError,
     TwistForbiddenError,
     TwistNotFoundError,
+    TwistRateLimitError,
 )
 
 TOKEN = "oauth2:test-token"
@@ -76,6 +77,58 @@ def test_429_waits_for_retry_after_then_succeeds():
     assert len(seen) == 2
 
 
+def test_long_retry_after_stops_instead_of_sleeping():
+    # cognee holds its dlt staging lock while a source runs.
+    client, seen, sleeps = _scripted(httpx.Response(429, headers={"retry-after": "3600"}))
+    with pytest.raises(TwistRateLimitError, match="asked to wait 3600s"):
+        client.request("v3/channels/get")
+    assert sleeps == []
+    assert len(seen) == 1
+
+
+def test_429_that_never_clears_is_a_rate_limit_error():
+    client, _, sleeps = _scripted(*[httpx.Response(429, headers={"retry-after": "1"})] * 5)
+    with pytest.raises(TwistRateLimitError, match="after 5 tries"):
+        client.request("v3/channels/get")
+    assert sleeps == [1.0] * 4
+
+
+def test_documented_error_shape_is_read_too():
+    # Twist's docs show {"error": [code, string]}; live answers use error_code.
+    client, _, _ = _scripted(
+        httpx.Response(403, json={"error": [200, "Invalid token"]}),
+        httpx.Response(403, json={"error": [109, "Forbidden"]}),
+    )
+    with pytest.raises(TwistAuthError, match="error 200: Invalid token"):
+        client.request("v3/channels/get")
+    with pytest.raises(TwistForbiddenError, match="error 109"):
+        client.request("v3/channels/get")
+
+
+def test_odd_200_bodies_stop_instead_of_reading_as_empty():
+    for body in (
+        httpx.Response(200, text="<html>maintenance</html>"),
+        httpx.Response(200, json={}),
+        httpx.Response(200, json={"threads": []}),
+    ):
+        client, _, _ = _scripted(body)
+        with pytest.raises(TwistError, match=r"unexpected body|not JSON"):
+            list(client.iter_threads(1))
+    client, _, _ = _scripted(httpx.Response(200, json=[]))
+    with pytest.raises(TwistError, match="unexpected body"):
+        client.get_workspace(1)
+
+
+def test_channels_include_archived_ones_either_way(seeded):
+    # Live: the plain call already returned the archived channel; the docs say
+    # only archived=true does. The client asks for both and merges them.
+    seeded.channels[852086]["archived"] = True
+    ids = sorted(c["id"] for c in _client(seeded).list_channels(seeded.workspace_id))
+    assert ids == [852086, 852087]
+    calls = [r for r in seeded.requests if r.url.path.endswith("channels/get")]
+    assert [r.url.params.get("archived") for r in calls] == [None, "true"]
+
+
 def test_5xx_and_network_errors_back_off_then_give_up():
     client, seen, sleeps = _scripted(
         httpx.ConnectError("down"),
@@ -110,13 +163,29 @@ def test_comments_are_read_in_order_across_windows(seeded, monkeypatch):
     for i in range(5):
         seeded.add_comment(thread["id"], f"reply {i}")
     thread = seeded.threads[thread["id"]]
-    comments = list(_client(seeded).iter_comments(thread["id"], thread["last_obj_index"]))
+    comments = list(_client(seeded).iter_comments(thread["id"], thread["comment_count"]))
     assert [c["content"] for c in comments] == [f"reply {i}" for i in range(5)]
+
+
+def test_comment_windows_go_on_while_full_or_below_the_count(seeded, monkeypatch):
+    monkeypatch.setattr(twist_module, "PAGE_LIMIT", 2)
+    thread = seeded.add_thread(852087, "Long discussion")
+    for i in range(4):
+        seeded.add_comment(thread["id"], f"reply {i}")
+    client = _client(seeded)
+    # Unknown count: read until a window comes back short.
+    assert len(list(client.iter_comments(thread["id"], None))) == 4
+    # A count larger than what comes back (older comments hidden on the free
+    # plan) still covers every window up to it.
+    seeded.requests.clear()
+    assert len(list(client.iter_comments(thread["id"], 7))) == 4
+    windows = [int(r.url.params["from_obj_index"]) for r in seeded.requests]
+    assert windows == [0, 2, 4, 6]
 
 
 def test_thread_without_comments_makes_no_comment_request(seeded):
     client = _client(seeded)
-    assert list(client.iter_comments(1, -1)) == []
+    assert list(client.iter_comments(1, 0)) == []
     assert not seeded.requests
 
 
@@ -124,7 +193,7 @@ def test_requests_never_ask_for_more_than_500(seeded):
     client = _client(seeded)
     for channel_id in (852087, 852086):
         for thread in client.iter_threads(channel_id):
-            list(client.iter_comments(thread["id"], thread["last_obj_index"]))
+            list(client.iter_comments(thread["id"], thread["comment_count"]))
     limits = [int(r.url.params["limit"]) for r in seeded.requests if "limit" in r.url.params]
     assert limits
     assert max(limits) == 500

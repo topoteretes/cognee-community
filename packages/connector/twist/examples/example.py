@@ -50,9 +50,15 @@ async def main() -> None:
         print(f"Set {', '.join(missing)} to run this example.")
         return
 
+    channels = [c.strip() for c in os.environ.get("TWIST_CHANNEL_IDS", "").split(",")]
+
     print("Syncing Twist into cognee ...")
     await cognee.remember(
-        twist_source(),
+        twist_source(
+            os.environ["TWIST_WORKSPACE_ID"],
+            access_token=os.environ["TWIST_ACCESS_TOKEN"],
+            channel_ids=[int(c) for c in channels if c] or None,
+        ),
         dataset_name=DATASET_NAME,
         # remember() defaults to "replace"; merge is what makes incremental sync
         # and the _deleted tombstones work.

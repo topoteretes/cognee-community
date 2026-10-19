@@ -1,8 +1,9 @@
-"""Forget-on-delete must remove a thread's cognified graph content, not just its
-Data record. Ingests Twist threads through cognee (LLM and embeddings mocked, no
-live credentials), then:
+"""Forget-on-delete must hard-delete a thread: its Data record and its graph
+content, rather than leaving an emptied document behind. Ingests Twist threads
+through cognee (LLM and embeddings mocked, no live credentials), then:
 
-* deletes a thread in Twist: the next sync must forget its graph entity;
+* deletes a thread in Twist: the next sync must drop its Data record and its
+  graph entity, and the other threads keep their Data ids;
 * deletes the only comment that mentions an entity: re-rendering the thread
   must forget that entity, while the thread itself stays.
 
@@ -19,6 +20,9 @@ from cognee.infrastructure.databases.vector.embeddings.LiteLLMEmbeddingEngine im
     LiteLLMEmbeddingEngine,
 )
 from cognee.infrastructure.llm import LLMGateway
+from cognee.modules.data.methods import get_authorized_existing_datasets
+from cognee.modules.data.methods.get_dataset_data import get_dataset_data
+from cognee.modules.users.methods import get_default_user
 
 from cognee_community_connector_twist import twist_source
 
@@ -89,7 +93,15 @@ async def clean_environment(tmp_path, monkeypatch):
     monkeypatch.setattr(LLMGateway, "acreate_structured_output", _mock_structured_output)
 
     async def _mock_embed_text(self, text):
-        return [[0.0] * self.get_vector_size() for _ in text]
+        vectors = [[0.0] * self.get_vector_size() for _ in text]
+        try:
+            # Newer cognee reads the token count off the result.
+            from cognee.infrastructure.databases.vector.embeddings.EmbeddingEngine import (
+                EmbeddingResult,
+            )
+        except ImportError:
+            return vectors
+        return EmbeddingResult(vectors, tokens=0)
 
     monkeypatch.setattr(LiteLLMEmbeddingEngine, "embed_text", _mock_embed_text)
 
@@ -98,6 +110,19 @@ async def clean_environment(tmp_path, monkeypatch):
     yield
     await cognee.prune.prune_data()
     await cognee.prune.prune_system(metadata=True)
+
+
+async def _documents() -> dict[str, object]:
+    """The dataset's Data records, by the row id the connector gave them."""
+    user = await get_default_user()
+    (dataset,) = await get_authorized_existing_datasets(
+        user=user, permission_type="read", datasets=[DATASET]
+    )
+    return {
+        data.system_metadata["external_id"]: data.id
+        for data in await get_dataset_data(dataset.id)
+        if isinstance(data.system_metadata, dict)
+    }
 
 
 async def _sync(fake):
@@ -127,10 +152,16 @@ async def test_deleted_thread_and_comment_are_forgotten_from_the_graph(clean_env
     await _sync(fake)
     for token in TOKENS:
         assert await _graph_has(token), f"{token} entity should be in the graph after ingest"
+    before = await _documents()
+    assert f"thread:{bravo['id']}" in before
 
     # 1. Thread deleted in Twist: the next sync forgets it.
     fake.delete_thread(bravo["id"])
     await _sync(fake)
+    survivors = {k: v for k, v in before.items() if k != f"thread:{bravo['id']}"}
+    assert await _documents() == survivors, (
+        "the deleted thread's Data record must go and the others must keep their ids"
+    )
     assert not await _graph_has(BRAVO), "deleted thread's entity must be removed from the graph"
     assert await _graph_has(ALPHA), "surviving thread's entity must remain"
 

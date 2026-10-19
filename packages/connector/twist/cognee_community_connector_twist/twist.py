@@ -7,7 +7,7 @@ order) and its channels into cognee, incrementally and with forget-on-delete::
     from cognee_community_connector_twist import twist_source
 
     await cognee.remember(
-        twist_source(workspace_id="254427"),
+        twist_source("254427", access_token="..."),
         dataset_name="twist",
         write_disposition="merge",  # required: remember() defaults to "replace"
     )
@@ -40,9 +40,10 @@ Design
   deleted thread answers 404 (checked live), and Twist's docs use the same
   error for an item the token can no longer see.
 * **Failure safety.** Any API error aborts the run before a tombstone is
-  written, and dlt commits the sync state only after a successful load. A run
-  that would forget more than half of what it knows stops instead, unless
-  ``allow_mass_delete=True``.
+  written, and dlt commits the sync state only after a successful load. When a
+  run finds more than half of what it knows gone, it holds those deletes back
+  until the next run sees the same items gone (``allow_mass_delete=True``
+  forgets them at once).
 
 Traps found on a live workspace
 -------------------------------
@@ -51,7 +52,8 @@ Traps found on a live workspace
 * Closed threads are hidden in the Twist UI but still returned by the API.
   They stay in memory, marked "closed".
 * Archived channels are still returned by ``channels/get`` (with
-  ``archived: true``); they are skipped unless asked for.
+  ``archived: true``). One that was never synced is skipped unless asked for;
+  one that was synced before stays synced, since archiving deletes nothing.
 * Title changes, moves and closes add system-message comments, and deleted
   comments stay in the list with ``deleted: true``. Neither is rendered.
 * ``threads/get`` sorts by ``last_updated_ts`` until ``before_id`` is given and
@@ -61,11 +63,10 @@ Traps found on a live workspace
 from __future__ import annotations
 
 import hashlib
-import os
 import re
 import time
 from collections.abc import Callable, Iterator
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -83,15 +84,21 @@ TWIST_SOURCE_NAME = "twist"
 API_BASE = "https://api.twist.com/api"
 APP_BASE = "https://twist.com"
 
+# Tries per request for 429, 5xx and network errors (waits 2, 4, 8 and 16s).
 MAX_ATTEMPTS = 5
+# A longer Retry-After stops the run instead of sleeping: cognee holds its dlt
+# staging lock while a source runs, and the next sync simply retries.
+MAX_RETRY_AFTER_SECONDS = 60.0
 # threads/get and comments/get both reject a limit above 500 (error 20).
 PAGE_LIMIT = 500
 # The first threads/get page also sends before_id, so every page is sorted by id.
 _FIRST_PAGE_BEFORE_ID = 2**53 - 1
 DEFAULT_FULL_SYNC_EVERY = 10
-# Stop a run that would forget more than this share of what it knows...
+# A run finding more than this share of the synced items gone, and at least
+# MASS_DELETE_MIN_ITEMS of them, holds the deletes back for one run. Our own
+# choice: small enough to catch a wrong workspace, channel list or token, large
+# enough that ordinary cleanups never wait.
 DEFAULT_MAX_DELETE_RATIO = 0.5
-# ...unless it is only a handful of items.
 MASS_DELETE_MIN_ITEMS = 10
 
 # Twist error_code for a rejected token (sent with HTTP 403, checked live).
@@ -120,8 +127,8 @@ class TwistNotFoundError(TwistError):
     """404: the item was deleted or the token can no longer see it. Never retried."""
 
 
-class TwistMassDeleteError(TwistError):
-    """The run would forget an unusually large share of the synced items."""
+class TwistRateLimitError(TwistError):
+    """429 that did not clear after retrying, or asked for too long a wait."""
 
 
 # ---------------------------------------------------------------------------
@@ -147,7 +154,9 @@ class TwistClient:
 
     def request(self, path: str, params: dict[str, Any] | None = None) -> Any:
         url = f"{API_BASE}/{path}"
-        for attempt in range(1, MAX_ATTEMPTS + 1):
+        attempt = 0
+        while True:
+            attempt += 1
             try:
                 response = self.http.get(url, params=params, headers=self._headers)
             except httpx.TransportError as exc:
@@ -160,9 +169,15 @@ class TwistClient:
 
             status = response.status_code
             if status == 429 or status >= 500:
+                error = TwistRateLimitError if status == 429 else TwistError
                 if attempt == MAX_ATTEMPTS:
-                    raise TwistError(f"Twist API returned {status} on {path} after {attempt} tries")
+                    raise error(f"Twist API returned {status} on {path} after {attempt} tries")
                 delay = _retry_delay(response, attempt)
+                if delay > MAX_RETRY_AFTER_SECONDS:
+                    raise error(
+                        f"Twist API returned {status} on {path} and asked to wait "
+                        f"{delay:.0f}s; stopping so the next sync can retry."
+                    )
                 logger.warning(
                     "Twist: %s on %s, retrying in %.1fs (%d/%d).",
                     status,
@@ -175,21 +190,49 @@ class TwistClient:
                 continue
             if status >= 400:
                 raise _error_for(response, path)
-            return response.json()
-        raise TwistError(f"Twist API request to {path} failed")  # pragma: no cover
+            try:
+                return response.json()
+            except ValueError:
+                raise TwistError(f"Twist API returned a body that is not JSON on {path}") from None
+
+    def _list(self, path: str, params: dict[str, Any]) -> list[dict]:
+        body = self.request(path, params)
+        if not isinstance(body, list):
+            # An odd 200 must never read as an empty listing: its missing items
+            # would be forgotten.
+            raise TwistError(
+                f"Twist API returned an unexpected body on {path}; nothing was synced or forgotten."
+            )
+        return body
 
     def get_workspace(self, workspace_id: int) -> dict:
-        return self.request("v3/workspaces/getone", {"id": workspace_id})
+        body = self.request("v3/workspaces/getone", {"id": workspace_id})
+        if not isinstance(body, dict):
+            raise TwistError("Twist API returned an unexpected body on v3/workspaces/getone")
+        return body
 
     def list_channels(self, workspace_id: int) -> list[dict]:
-        # Returns archived channels too, with "archived": true (checked live).
-        return self.request("v3/channels/get", {"workspace_id": workspace_id})
+        """Active and archived channels, merged by id.
+
+        Twist's docs say ``channels/get`` returns archived channels only with
+        ``archived`` set; on a live workspace the plain call returned them too
+        (flagged ``archived: true``), and ``archived=true`` returned only those.
+        Asking for both is right either way.
+        """
+        channels: dict[int, dict] = {}
+        for params in (
+            {"workspace_id": workspace_id},
+            {"workspace_id": workspace_id, "archived": "true"},
+        ):
+            for channel in self._list("v3/channels/get", params):
+                channels[int(channel["id"])] = channel
+        return list(channels.values())
 
     def iter_threads(self, channel_id: int) -> Iterator[dict]:
         """Every thread of a channel, closed ones included, newest id first."""
         before_id = _FIRST_PAGE_BEFORE_ID
         while True:
-            page = self.request(
+            page = self._list(
                 "v3/threads/get",
                 {"channel_id": channel_id, "limit": PAGE_LIMIT, "before_id": before_id},
             )
@@ -202,15 +245,20 @@ class TwistClient:
                 raise TwistError(f"Twist paging did not advance in channel {channel_id}")
             before_id = next_before_id
 
-    def iter_comments(self, thread_id: int, last_obj_index: int) -> Iterator[dict]:
+    def iter_comments(self, thread_id: int, comment_count: int | None) -> Iterator[dict]:
         """Every comment of a thread in order, read in fixed obj_index windows.
 
         Without a range, ``limit=N`` returns the last N comments, so the windows
-        are explicit up to the thread's ``last_obj_index`` from the listing.
+        are explicit. They cover at least the thread's ``comment_count`` and go on
+        while a window comes back full. The thread's ``last_obj_index`` is not
+        used: Twist's docs describe it as the reader's position ("-1 means the
+        whole thread is unread"), not the thread's length.
         """
+        if comment_count == 0:
+            return
         start = 0
-        while start <= last_obj_index:
-            yield from self.request(
+        while True:
+            page = self._list(
                 "v3/comments/get",
                 {
                     "thread_id": thread_id,
@@ -219,7 +267,10 @@ class TwistClient:
                     "limit": PAGE_LIMIT,
                 },
             )
+            yield from page
             start += PAGE_LIMIT
+            if len(page) < PAGE_LIMIT and (comment_count is None or start >= comment_count):
+                return
 
 
 def _retry_delay(response: httpx.Response, attempt: int) -> float:
@@ -237,8 +288,15 @@ def _error_for(response: httpx.Response, path: str) -> TwistError:
         body = response.json()
     except ValueError:
         body = {}
-    code = body.get("error_code") if isinstance(body, dict) else None
-    reason = body.get("error_string") if isinstance(body, dict) else None
+    code = reason = None
+    if isinstance(body, dict):
+        # Live responses use error_code / error_string; Twist's docs also show
+        # {"error": [code, string]}. Both are read.
+        code, reason = body.get("error_code"), body.get("error_string")
+        documented = body.get("error")
+        if code is None and isinstance(documented, list) and documented:
+            code = documented[0]
+            reason = documented[1] if len(documented) > 1 else None
     detail = f"Twist API returned {response.status_code} on {path}"
     if code is not None:
         detail += f" (error {code}: {reason})"
@@ -266,13 +324,14 @@ def clean_markdown(text: str | None) -> str:
 
 def _date(ts: Any) -> str:
     try:
-        return datetime.fromtimestamp(int(ts), tz=UTC).strftime("%Y-%m-%d")
+        return datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%d")
     except (TypeError, ValueError, OverflowError):
         return ""
 
 
 def _attachment_names(item: dict) -> list[str]:
-    """Attachment names with their link; the file itself is never downloaded."""
+    """Attachment names with their link, sorted so their API order does not
+    change the text. The file itself is never downloaded."""
     names = []
     for attachment in item.get("attachments") or []:
         if isinstance(attachment, dict):
@@ -280,7 +339,7 @@ def _attachment_names(item: dict) -> list[str]:
             if name:
                 url = attachment.get("url")
                 names.append(f"{name} ({url})" if url else str(name))
-    return names
+    return sorted(names)
 
 
 def _is_rendered_comment(comment: dict) -> bool:
@@ -362,17 +421,33 @@ def _digest(row: dict) -> str:
 # ---------------------------------------------------------------------------
 # Sync
 # ---------------------------------------------------------------------------
+def _reset_stats(stats: dict[str, int]) -> None:
+    stats.clear()
+    stats.update(
+        scanned=0,
+        changed=0,
+        unchanged=0,
+        deleted=0,
+        skipped=0,
+        held_back=0,
+        failed=0,
+        failed_auth=0,
+        failed_rate_limit=0,
+    )
+
+
 def _iter_rows(
     client: TwistClient,
+    *,
     workspace_id: int,
-    channel_ids: list[int] | None,
-    include_archived: bool,
-    full_sync: bool,
-    full_sync_every: int,
-    max_delete_ratio: float,
-    allow_mass_delete: bool,
     state: dict,
     stats: dict[str, int],
+    channel_ids: list[int] | None = None,
+    include_archived: bool = False,
+    full_sync: bool = False,
+    full_sync_every: int = DEFAULT_FULL_SYNC_EVERY,
+    max_delete_ratio: float = DEFAULT_MAX_DELETE_RATIO,
+    allow_mass_delete: bool = False,
     check_active: Callable[[], None] | None = None,
 ) -> Iterator[dict]:
     """Yield changed thread and channel rows, then tombstones for what vanished.
@@ -382,14 +457,12 @@ def _iter_rows(
     thread, ``["channel", digest]`` for a channel. Any API error propagates and
     aborts the run before a tombstone is yielded; dlt then keeps the old state.
     """
-    stats.clear()
-    stats.update(scanned=0, changed=0, unchanged=0, deleted=0, skipped=0)
-
+    _reset_stats(stats)
     previous: dict[str, list] = dict(state.get("items") or {})
     runs = int(state.get("runs", 0))
     sweep = full_sync or runs == 0 or (full_sync_every > 0 and runs % full_sync_every == 0)
 
-    workspace_name = (client.get_workspace(workspace_id) or {}).get("name") or ""
+    workspace_name = client.get_workspace(workspace_id).get("name") or ""
     channels = client.list_channels(workspace_id)
     by_id = {int(channel["id"]): channel for channel in channels}
     if channel_ids:
@@ -403,7 +476,13 @@ def _iter_rows(
             )
         selected = [by_id[cid] for cid in channel_ids]
     else:
-        selected = [c for c in channels if include_archived or not c.get("archived")]
+        # Archived channels are opt-in, but archiving deletes nothing: a channel
+        # that was synced before stays synced, and its document says "archived".
+        selected = [
+            c
+            for c in channels
+            if include_archived or not c.get("archived") or f"channel:{c['id']}" in previous
+        ]
 
     present: dict[str, list] = {}
     for channel in selected:
@@ -442,11 +521,9 @@ def _iter_rows(
                 continue
 
             try:
-                last_obj_index = thread.get("last_obj_index")
+                count = thread.get("comment_count")
                 comments = list(
-                    client.iter_comments(
-                        thread["id"], -1 if last_obj_index is None else int(last_obj_index)
-                    )
+                    client.iter_comments(thread["id"], None if count is None else int(count))
                 )
             except TwistNotFoundError:
                 # Deleted (or hidden) between the listing and this call. The next
@@ -473,17 +550,23 @@ def _iter_rows(
             yield row
 
     gone = sorted(set(previous) - set(present))
-    if (
-        gone
-        and not allow_mass_delete
-        and len(gone) >= MASS_DELETE_MIN_ITEMS
-        and len(gone) > max_delete_ratio * len(previous)
-    ):
-        raise TwistMassDeleteError(
-            f"This run would forget {len(gone)} of {len(previous)} synced Twist items. "
-            "That usually means a wrong workspace, channel selection or token, so nothing "
-            "was forgotten. Pass allow_mass_delete=True if the cleanup is intended."
+    large = len(gone) >= MASS_DELETE_MIN_ITEMS and len(gone) > max_delete_ratio * len(previous)
+    if large and not allow_mass_delete and gone != state.get("pending_delete"):
+        # A wrong workspace, channel list or token looks exactly like a mass
+        # delete. Hold the deletes back and forget them only when the next run
+        # sees the same items gone, so a scheduled sync never needs an override.
+        logger.warning(
+            "Twist: %d of %d synced items are gone; holding the deletes until the next "
+            "sync confirms them.",
+            len(gone),
+            len(previous),
         )
+        present.update({key: previous[key] for key in gone})
+        state["pending_delete"] = gone
+        stats["held_back"] = len(gone)
+        gone = []
+    else:
+        state.pop("pending_delete", None)
     for key in gone:
         stats["deleted"] += 1
         yield {"id": key, "_deleted": True}
@@ -491,34 +574,40 @@ def _iter_rows(
     state["items"] = present
     state["runs"] = runs + 1
     logger.info(
-        "Twist: scanned %d thread(s): %d changed, %d unchanged, %d skipped; %d deletion(s).",
+        "Twist: scanned %d thread(s): %d changed, %d unchanged, %d skipped; "
+        "%d deletion(s), %d held back.",
         stats["scanned"],
         stats["changed"],
         stats["unchanged"],
         stats["skipped"],
         stats["deleted"],
+        stats["held_back"],
     )
 
 
-def _int_list(values: Any) -> list[int] | None:
+def _int_list(
+    name: str, values: list[int | str] | tuple[int | str, ...] | None
+) -> list[int] | None:
     if values is None:
         return None
     if isinstance(values, str):
-        values = [v for v in values.split(",") if v.strip()]
+        # A bare string would be read one character at a time.
+        raise TypeError(f"{name} takes a list of ids, for example [{values!r}].")
     return [int(str(v).strip()) for v in values] or None
 
 
 def twist_source(
-    workspace_id: int | str | None = None,
+    workspace_id: int | str,
     *,
+    access_token: str,
     channel_ids: list[int | str] | None = None,
     include_archived: bool = False,
-    access_token: str | None = None,
     full_sync: bool = False,
-    full_sync_every: int | None = None,
+    full_sync_every: int = DEFAULT_FULL_SYNC_EVERY,
     max_delete_ratio: float = DEFAULT_MAX_DELETE_RATIO,
     allow_mass_delete: bool = False,
     resource_name: str | None = None,
+    service: httpx.Client | None = None,
     http_client: httpx.Client | None = None,
     check_active: Callable[[], None] | None = None,
 ):
@@ -529,27 +618,31 @@ def twist_source(
 
     Args:
         workspace_id: Twist workspace id (the number after ``/a/`` in a Twist
-            URL). Falls back to ``TWIST_WORKSPACE_ID``.
+            URL).
+        access_token: OAuth access token (or the integration's test token).
         channel_ids: Channels to sync. Default: every channel the token can see,
-            except archived ones. Falls back to ``TWIST_CHANNEL_IDS`` (comma
-            separated). A listed channel the token cannot see stops the sync.
+            except archived ones that were never synced. A listed channel the
+            token cannot see stops the sync.
         include_archived: Also sync archived channels when ``channel_ids`` is not
             given. Explicitly listed channels are always synced.
-        access_token: OAuth access token (or the integration's test token).
-            Falls back to ``TWIST_ACCESS_TOKEN``.
         full_sync: Re-read every thread's comments this run, to pick up edited
             comments right away.
         full_sync_every: Do that automatically every Nth run (default 10, and
-            always on the first run). ``0`` turns it off. Falls back to
-            ``TWIST_FULL_SYNC_EVERY``.
-        max_delete_ratio: A run that would forget more than this share of the
-            synced items (and at least 10 of them) stops instead.
-        allow_mass_delete: Skip that check, for an intended cleanup.
+            always on the first run). ``0`` turns it off.
+        max_delete_ratio: When a run finds more than this share of the synced
+            items gone (and at least 10 of them), it holds the deletes back until
+            the next run sees the same items gone.
+        allow_mass_delete: Forget such a batch at once, for an intended cleanup.
         resource_name: dlt resource name, also the staging table and the key of
             the sync state. Default ``twist_<workspace_id>``.
-        http_client: Pre-built ``httpx`` client, mainly for tests.
+        service: Pre-built ``httpx`` client (the name cognee's own connectors
+            use); ``http_client`` is the same thing. Mainly for tests.
         check_active: Optional callable a host uses to stop a running sync; it
             raises to abort.
+
+    ``cognee_sync_stats`` on the returned resource holds counts only: scanned,
+    changed, unchanged, deleted, skipped, held_back, and failed, failed_auth,
+    failed_rate_limit (set to 1 when a run stops on that kind of error).
     """
     import dlt
 
@@ -558,17 +651,16 @@ def twist_source(
             "The Twist connector needs a cognee build that reads per-row node sets "
             "(DOCUMENT_SYNC_VERSION >= 2, cognee 1.6.3 or later)."
         )
-
-    workspace = workspace_id or os.getenv("TWIST_WORKSPACE_ID")
-    if not workspace:
-        raise ValueError("workspace_id is required (or set TWIST_WORKSPACE_ID).")
-    resolved_workspace_id = int(str(workspace).strip())
-    token = access_token or os.getenv("TWIST_ACCESS_TOKEN")
-    if not token:
-        raise ValueError("An access token is required (or set TWIST_ACCESS_TOKEN).")
-    selected = _int_list(channel_ids if channel_ids is not None else os.getenv("TWIST_CHANNEL_IDS"))
-    if full_sync_every is None:
-        full_sync_every = int(os.getenv("TWIST_FULL_SYNC_EVERY", DEFAULT_FULL_SYNC_EVERY))
+    if workspace_id is None or not str(workspace_id).strip():
+        raise ValueError("workspace_id is required.")
+    resolved_workspace_id = int(str(workspace_id).strip())
+    if not isinstance(access_token, str) or not access_token.strip():
+        raise ValueError("An access token is required.")
+    token = access_token.strip()
+    if service is not None and http_client is not None and service is not http_client:
+        raise ValueError("Pass service or http_client, not both.")
+    injected = service or http_client
+    selected = _int_list("channel_ids", channel_ids)
     if full_sync_every < 0:
         raise ValueError("full_sync_every must be 0 or more.")
     if not 0 < max_delete_ratio <= 1:
@@ -576,6 +668,7 @@ def twist_source(
 
     name = resource_name or f"twist_{resolved_workspace_id}"
     stats: dict[str, int] = {}
+    _reset_stats(stats)
 
     @dlt.resource(
         name=name,
@@ -584,9 +677,10 @@ def twist_source(
         columns={"_deleted": {"data_type": "bool", "hard_delete": True}, **NODE_SET_COLUMN_HINT},
     )
     def twist_threads():
-        owned = None if http_client is not None else httpx.Client(timeout=30.0)
+        _reset_stats(stats)
+        owned = None if injected is not None else httpx.Client(timeout=30.0)
         try:
-            client = TwistClient(token, http_client=http_client or owned)
+            client = TwistClient(token, http_client=injected or owned)
             state = dlt.current.resource_state()
             known_workspace = state.get("workspace_id")
             if state.get("items") and known_workspace not in (None, resolved_workspace_id):
@@ -600,19 +694,27 @@ def twist_source(
             yield from dlt_utils.guarded_rows(
                 _iter_rows(
                     client,
-                    resolved_workspace_id,
-                    selected,
-                    include_archived,
-                    full_sync,
-                    full_sync_every,
-                    max_delete_ratio,
-                    allow_mass_delete,
-                    state,
-                    stats,
-                    check_active,
+                    workspace_id=resolved_workspace_id,
+                    state=state,
+                    stats=stats,
+                    channel_ids=selected,
+                    include_archived=include_archived,
+                    full_sync=full_sync,
+                    full_sync_every=full_sync_every,
+                    max_delete_ratio=max_delete_ratio,
+                    allow_mass_delete=allow_mass_delete,
+                    check_active=check_active,
                 ),
                 check_active,
             )
+        except Exception as exc:
+            # Categories only, never the message: a host shows these counts.
+            stats["failed"] = 1
+            if isinstance(exc, TwistAuthError):
+                stats["failed_auth"] = 1
+            elif isinstance(exc, TwistRateLimitError):
+                stats["failed_rate_limit"] = 1
+            raise
         finally:
             if owned is not None:
                 owned.close()

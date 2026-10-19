@@ -105,3 +105,11 @@ def test_channel_text():
     private = render_channel({"name": "admin", "public": False, "archived": True})
     assert "Visibility: private" in private
     assert "Status: archived" in private
+
+
+def test_attachment_order_does_not_change_the_text():
+    files = [{"title": "b.pdf", "url": "https://x/b"}, {"title": "a.png", "url": "https://x/a"}]
+    one = render_thread(_thread(attachments=files), [], CHANNEL)
+    two = render_thread(_thread(attachments=list(reversed(files))), [], CHANNEL)
+    assert one == two
+    assert one.index("Attachment: a.png") < one.index("Attachment: b.pdf")

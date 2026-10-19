@@ -9,7 +9,6 @@ import pytest
 from cognee_community_connector_twist.twist import (
     TwistClient,
     TwistForbiddenError,
-    TwistMassDeleteError,
     TwistNotFoundError,
     _iter_rows,
 )
@@ -17,23 +16,30 @@ from cognee_community_connector_twist.twist import (
 LAUNCH, DESIGN = 852087, 852086
 
 
-def run(fake, state, *, channel_ids=None, include_archived=False, full_sync=False, **kwargs):
+def run(fake, state, **kwargs):
     """One sync run; returns ({row id: row}, stats). ``state`` is updated in place."""
     stats: dict[str, int] = {}
-    rows = _iter_rows(
-        TwistClient(fake.token, http_client=fake.http_client()),
-        fake.workspace_id,
-        channel_ids,
-        include_archived,
-        full_sync,
-        kwargs.pop("full_sync_every", 0),
-        kwargs.pop("max_delete_ratio", 0.5),
-        kwargs.pop("allow_mass_delete", False),
-        state,
-        stats,
-        kwargs.pop("check_active", None),
-    )
+    kwargs.setdefault("full_sync_every", 0)
+    client = TwistClient(fake.token, http_client=fake.http_client())
+    rows = _iter_rows(client, workspace_id=fake.workspace_id, state=state, stats=stats, **kwargs)
     return {row["id"]: row for row in rows}, stats
+
+
+NO_COUNTS = {
+    "scanned": 0,
+    "changed": 0,
+    "unchanged": 0,
+    "deleted": 0,
+    "skipped": 0,
+    "held_back": 0,
+    "failed": 0,
+    "failed_auth": 0,
+    "failed_rate_limit": 0,
+}
+
+
+def counts(**values):
+    return {**NO_COUNTS, **values}
 
 
 def synced(fake):
@@ -52,7 +58,7 @@ def test_first_run_emits_every_thread_and_channel(seeded):
     assert "Agreed, let's go with option B." in checkout["content"]
     assert checkout["cognee_node_set"] == [f"twist:{seeded.workspace_id}:{LAUNCH}"]
     assert checkout["url"].startswith(f"https://twist.com/a/{seeded.workspace_id}/ch/{LAUNCH}/t/")
-    assert stats == {"scanned": 3, "changed": 3, "unchanged": 0, "deleted": 0, "skipped": 0}
+    assert stats == counts(scanned=3, changed=3)
 
 
 def test_unchanged_rerun_emits_nothing_and_reads_no_comments(seeded):
@@ -220,18 +226,58 @@ def test_thread_gone_mid_run_is_skipped_not_forgotten(seeded, thread_named):
     assert f"thread:{launch['id']}" in state["items"]
 
 
-def test_mass_delete_guard(fake):
+def _twelve_threads(fake):
     fake.add_channel(LAUNCH, "launch")
     for i in range(12):
         fake.add_thread(LAUNCH, f"Thread {i}")
+
+
+def test_mass_delete_is_held_back_until_the_next_run_confirms_it(fake):
+    _twelve_threads(fake)
     state = synced(fake)
     for thread_id in list(fake.threads)[:11]:
         fake.delete_thread(thread_id)
-    before = dict(state)
-    with pytest.raises(TwistMassDeleteError, match="allow_mass_delete"):
-        run(fake, state)
-    assert state == before
+    rows, stats = run(fake, state)
+    assert rows == {}  # no error: a scheduled sync keeps running
+    assert (stats["held_back"], stats["deleted"]) == (11, 0)
+    assert len(state["items"]) == 13  # still tracked, so the next run sees them gone
+    rows, stats = run(fake, state)
+    assert (stats["held_back"], stats["deleted"]) == (0, 11)
+    assert all(row["_deleted"] for row in rows.values())
+    assert "pending_delete" not in state
 
+
+def test_held_back_items_that_come_back_are_not_forgotten(fake):
+    # A wrong channel selection for one run, then the right one again.
+    _twelve_threads(fake)
+    fake.add_channel(852086, "design")
+    state = synced(fake)
+    _, stats = run(fake, state, channel_ids=[852086])
+    assert stats["held_back"] == 13
+    rows, stats = run(fake, state)
+    assert rows == {}
+    assert (stats["deleted"], stats["unchanged"]) == (0, 12)
+    assert "pending_delete" not in state
+
+
+def test_a_different_mass_delete_needs_its_own_confirmation(fake):
+    _twelve_threads(fake)
+    state = synced(fake)
+    ids = list(fake.threads)
+    for thread_id in ids[:10]:
+        fake.delete_thread(thread_id)
+    _, stats = run(fake, state)
+    assert stats["held_back"] == 10
+    fake.delete_thread(ids[10])
+    _, stats = run(fake, state)
+    assert (stats["held_back"], stats["deleted"]) == (11, 0)
+
+
+def test_allow_mass_delete_forgets_at_once(fake):
+    _twelve_threads(fake)
+    state = synced(fake)
+    for thread_id in list(fake.threads)[:11]:
+        fake.delete_thread(thread_id)
     rows, stats = run(fake, state, allow_mass_delete=True)
     assert stats["deleted"] == 11
     assert all(row["_deleted"] for row in rows.values())
@@ -255,11 +301,22 @@ def test_check_active_runs_even_when_nothing_changed(seeded):
     assert len(calls) >= 3 + 2  # every thread and every channel
 
 
-def test_thread_with_null_last_obj_index_has_no_comments_read(seeded, thread_named):
-    launch = thread_named("Launch date")
-    seeded.threads[launch["id"]]["last_obj_index"] = None
+def test_unread_thread_still_gets_all_its_comments(seeded, thread_named):
+    # Twist's docs: last_obj_index is the reader's position, -1 for a thread the
+    # token's user has not read. The comments must be read anyway.
+    checkout = thread_named("Checkout redesign")
+    seeded.unread_threads.add(checkout["id"])
     rows, _ = run(seeded, {})
-    assert "Target launch is 1 March." in rows[f"thread:{launch['id']}"]["content"]
+    content = rows[f"thread:{checkout['id']}"]["content"]
+    assert "Option B tested better with users." in content
+    assert "Agreed, let's go with option B." in content
+
+
+def test_thread_without_a_comment_count_still_gets_its_comments(seeded, thread_named):
+    checkout = thread_named("Checkout redesign")
+    seeded.threads[checkout["id"]]["comment_count"] = None
+    rows, _ = run(seeded, {})
+    assert "Agreed, let's go with option B." in rows[f"thread:{checkout['id']}"]["content"]
 
 
 def test_forbidden_channel_stops_the_run_and_forgets_nothing(seeded):
@@ -272,15 +329,17 @@ def test_forbidden_channel_stops_the_run_and_forgets_nothing(seeded):
     assert state == before
 
 
-def test_channel_archived_after_sync_is_forgotten_unless_kept(seeded, thread_named):
-    # Archived channels are opt-in: archiving one later drops its threads...
+def test_channel_archived_after_sync_is_kept_not_forgotten(seeded, thread_named):
+    # Archiving deletes nothing: a channel synced before stays synced, and its
+    # document says "archived". Its threads are kept.
     state = synced(seeded)
     logo = thread_named("Logo refresh")
     seeded.channels[DESIGN]["archived"] = True
-    rows, _ = run(seeded, dict(state))
-    assert rows[f"thread:{logo['id']}"] == {"id": f"thread:{logo['id']}", "_deleted": True}
-    assert rows[f"channel:{DESIGN}"]["_deleted"] is True
-    # ...unless archived channels are included or the channel is listed.
-    rows, _ = run(seeded, dict(state), include_archived=True)
+    rows, stats = run(seeded, state)
     assert f"thread:{logo['id']}" not in rows
     assert "Status: archived" in rows[f"channel:{DESIGN}"]["content"]
+    assert stats["deleted"] == 0
+    # And it keeps syncing: a new comment there is still picked up.
+    seeded.add_comment(logo["id"], "Final logo approved.")
+    rows, _ = run(seeded, state)
+    assert "Final logo approved." in rows[f"thread:{logo['id']}"]["content"]

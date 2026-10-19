@@ -3,7 +3,11 @@
 ``FakeTwist`` is an in-memory stand-in for the parts of the Twist v3 API the
 connector uses. Every behaviour below was observed on a live free workspace:
 
-* ``channels/get`` returns archived channels too, with ``archived: true``;
+* ``channels/get`` returns archived channels too, with ``archived: true``, and
+  with ``archived=true`` it returns only those;
+* a thread's ``last_obj_index`` is the reader's position (Twist's docs: "-1
+  means the whole thread is unread"); for the only user of a test workspace it
+  equals ``comment_count - 1``, and ``unread_threads`` simulates another reader;
 * ``threads/get`` sorts by ``last_updated_ts`` (newest first) until ``before_id``
   or ``after_id`` is given, and by id (highest first) after that; ``limit``
   above 500 is rejected with error 20;
@@ -55,6 +59,8 @@ class FakeTwist:
         self.fail_with: int | None = None
         self.hidden_comment_threads: set[int] = set()
         self.forbidden_channels: set[int] = set()
+        # Threads the token's user has not read: listed with last_obj_index -1.
+        self.unread_threads: set[int] = set()
 
     # -- data helpers -------------------------------------------------------
     def _tick(self) -> int:
@@ -209,7 +215,10 @@ class FakeTwist:
             return httpx.Response(200, json={"id": WORKSPACE_ID, "name": "Anand Test"})
 
         if path == "v3/channels/get":
-            return httpx.Response(200, json=list(self.channels.values()))
+            channels = list(self.channels.values())
+            if q.get("archived") == "true":
+                channels = [c for c in channels if c.get("archived")]
+            return httpx.Response(200, json=channels)
 
         if path == "v3/threads/get":
             channel_id = int(q["channel_id"])
@@ -226,6 +235,9 @@ class FakeTwist:
                     items = [t for t in items if t["id"] > int(q["after_id"])]
             else:
                 items.sort(key=lambda t: t["last_updated_ts"], reverse=True)
+            items = [
+                {**t, "last_obj_index": -1} if t["id"] in self.unread_threads else t for t in items
+            ]
             return httpx.Response(200, json=items[: int(q.get("limit", 20))])
 
         if path == "v3/comments/get":

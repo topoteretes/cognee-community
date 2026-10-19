@@ -3,8 +3,8 @@ from .twist import (
     TwistClient,
     TwistError,
     TwistForbiddenError,
-    TwistMassDeleteError,
     TwistNotFoundError,
+    TwistRateLimitError,
     twist_source,
 )
 
@@ -13,7 +13,7 @@ __all__ = [
     "TwistClient",
     "TwistError",
     "TwistForbiddenError",
-    "TwistMassDeleteError",
     "TwistNotFoundError",
+    "TwistRateLimitError",
     "twist_source",
 ]

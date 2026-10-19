@@ -11,8 +11,8 @@ we decide about the checkout redesign?" next to your other sources.
 
 ## Requirements
 
-- Python 3.11 to 3.13
-- cognee 1.6.3 (document mode plus the per-row node-set column)
+- Python 3.10 to 3.13
+- cognee 1.6.3 or later (document mode plus the per-row node-set column)
 - A Twist workspace (the free plan works) and a Twist integration for OAuth
 
 ## Install
@@ -26,15 +26,17 @@ cd packages/connector/twist && uv sync
 ## Usage
 
 ```python
+import os
+
 import cognee
 from cognee_community_connector_twist import twist_source
 
 await cognee.remember(
     twist_source(
-        workspace_id="254427",
-        access_token="...",
+        "254427",  # workspace id
+        access_token=os.environ["TWIST_ACCESS_TOKEN"],
         # optional:
-        # channel_ids=["852087"],     # default: every channel except archived ones
+        # channel_ids=[852087],       # default: every channel except archived ones
         # include_archived=True,      # also sync archived channels
     ),
     dataset_name="twist",
@@ -44,9 +46,8 @@ await cognee.remember(
 print(await cognee.recall("What did we decide about checkout?", datasets=["twist"]))
 ```
 
-Every argument can also come from the environment: `TWIST_WORKSPACE_ID`,
-`TWIST_ACCESS_TOKEN`, `TWIST_CHANNEL_IDS` (comma separated) and
-`TWIST_FULL_SYNC_EVERY`.
+The source reads no environment variables itself; pass everything as arguments
+(`channel_ids` takes a list).
 
 **Pass `write_disposition="merge"` to `remember()`.** `remember()` defaults to
 `"replace"`, which overrides the source's own setting and breaks both the
@@ -84,10 +85,10 @@ These rules come from testing the Twist API on a live workspace.
   system messages Twist adds for renames, moves and closes.
 - **Closed threads are kept.** The Twist app hides them, but they are not
   deleted; they stay in memory marked "closed".
-- **Archived channels are opt-in.** Twist still returns archived channels, so
-  this is a choice: when you sync all channels, an archived channel is skipped
-  and, if it was synced before, its threads are forgotten on the next sync. Pass
-  `include_archived=True`, or list the channel in `channel_ids`, to keep it.
+- **Archiving is not deleting.** When you sync all channels, an archived channel
+  that was never synced is skipped (pass `include_archived=True`, or list it in
+  `channel_ids`, to sync it). A channel archived after it was synced stays
+  synced: its threads are kept and its channel document says "archived".
 - **A 404 is never a delete.** A deleted thread answers 404 (error 110, checked
   live), and Twist's docs use the same error for an item the token can no
   longer see. So only a thread missing from a successful channel listing is
@@ -97,15 +98,22 @@ These rules come from testing the Twist API on a live workspace.
 - **A failed sync changes nothing.** Any API error stops the run. The sync state
   is only saved when the load succeeds, and cognee only forgets things after a
   successful run, so the next sync simply retries.
-- **Mass-delete guard.** A run that would forget more than half of what it has
-  synced (and at least 10 items) stops, because that usually means a wrong
-  workspace, channel list or token. Pass `allow_mass_delete=True` for an
-  intended cleanup, or tune `max_delete_ratio`.
-- **Own sync state per workspace.** Each workspace uses its own dlt pipeline
-  (`PIPELINE_SCOPE_ATTR`), so its state never mixes with other dlt sources. The
-  source also exposes `cognee_sync_stats` (counts only: scanned, changed,
-  unchanged, deleted, skipped) and accepts an optional `check_active` callable
-  that a host can use to stop a running sync.
+- **Mass deletes wait for a second run.** When a run finds more than half of
+  what it has synced gone (and at least 10 items), which is what a wrong
+  workspace, channel list or token looks like, it keeps those items and reports
+  them as `held_back`. The next run forgets them if the same items are still
+  gone; anything that came back is kept. No run ever stops on this, so a
+  scheduled sync needs no manual step. `allow_mass_delete=True` forgets such a
+  batch at once; `max_delete_ratio` tunes the threshold.
+- **Own sync state per workspace.** Each source uses its own dlt pipeline and
+  state, named after its `resource_name` (default `twist_<workspace_id>`,
+  through `PIPELINE_SCOPE_ATTR`), and a run refuses to continue if the stored
+  state belongs to another workspace.
+- **Host contract.** `cognee_sync_stats` holds counts only (scanned, changed,
+  unchanged, deleted, skipped, held_back, plus failed, failed_auth and
+  failed_rate_limit set to 1 when a run stops on that kind of error). `service`
+  takes a pre-built `httpx` client (`http_client` is the same thing), and an
+  optional `check_active` callable lets a host stop a running sync.
 
 ## Setup
 
@@ -150,7 +158,32 @@ and recall returns the matching passages.
   valid for ten years (`expires_in` 315360000). A revoked or rejected token stops
   the sync with `TwistAuthError`; run `examples/authorize.py` again for a new one.
 - No rate limits are documented. 429 and 5xx responses are retried using
-  `Retry-After` or exponential backoff.
+  `Retry-After` or exponential backoff; a `Retry-After` above 60 seconds stops
+  the run instead (cognee holds its dlt staging lock while a source runs), and
+  the next sync retries.
+- Anyone who can read the cognee dataset can read the synced threads. Keep Twist
+  data in its own dataset and share it as you would the workspace.
+
+## Behaviour seen live, not in Twist's docs
+
+The connector relies on these, all checked on a live workspace. If Twist
+changes one, this is where to look first.
+
+- A thread's `version`, `creator_name` and `closed`, and a comment's
+  `creator_name`, are returned by the API but not described in the documented
+  objects.
+- `version` moves on an opening-post edit, a rename, a new or deleted comment, a
+  move, a close and a bookmark; `last_updated_ts` only on new comments and
+  renames. Editing an earlier comment moves nothing on the thread.
+- `channels/get` already returns archived channels without `archived`
+  (documented as needed for them), so the connector asks both ways and merges.
+- A thread's `last_obj_index` is documented as the reader's position ("-1 means
+  the whole thread is unread"), so comments are read by `comment_count` and
+  window size, never by it.
+- Errors come back as `error_code` / `error_string` (documented as
+  `{"error": [code, string]}`); both are read. A rejected token is HTTP 403 with
+  error code 200, not 401.
+- A thread's `is_archived` is the reader's Inbox "done" state, not an archive.
 
 ## Testing
 
@@ -167,5 +200,6 @@ deletes and the guards, and a real dlt pipeline run including a failed run that
 must change nothing.
 
 `tests/test_twist_forget.py` goes through cognee itself (`add` + `cognify`, with
-the LLM and embeddings mocked): a deleted thread and a deleted comment must both
-disappear from the knowledge graph, not just from the staging table.
+the LLM and embeddings mocked): a deleted thread must lose its Data record and
+leave the knowledge graph while the others keep their Data ids, and a deleted
+comment's entity must leave the graph.

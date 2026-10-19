@@ -5,6 +5,7 @@ hard-delete, and whatever is no longer in that table is forgotten by cognee's
 orphan cleanup. So "gone from the table" here means "forgotten" in cognee.
 """
 
+import httpx
 import pytest
 
 from cognee_community_connector_twist import twist_source
@@ -30,8 +31,8 @@ def _pipeline(tmp_path):
     )
 
 
-def _rows(pipeline, fake):
-    table = f"twist_{fake.workspace_id}"
+def _rows(pipeline, fake, table=None):
+    table = table or f"twist_{fake.workspace_id}"
     with (
         pipeline.sql_client() as client,
         client.execute_query(f"SELECT id, title, content FROM {table}") as cursor,
@@ -63,22 +64,37 @@ def test_source_refuses_cognee_without_per_row_node_sets(monkeypatch):
         twist_source(1, access_token="t")
 
 
-def test_arguments_and_environment(monkeypatch):
-    for var in ("TWIST_WORKSPACE_ID", "TWIST_ACCESS_TOKEN", "TWIST_CHANNEL_IDS"):
-        monkeypatch.delenv(var, raising=False)
+def test_arguments(monkeypatch):
+    # Settings come only from the arguments; the factory never reads the environment.
+    monkeypatch.setenv("TWIST_WORKSPACE_ID", "254427")
+    monkeypatch.setenv("TWIST_ACCESS_TOKEN", "t")
+    with pytest.raises(TypeError):
+        twist_source()
     with pytest.raises(ValueError, match="workspace_id"):
-        twist_source(access_token="t")
+        twist_source("", access_token="t")
     with pytest.raises(ValueError, match="access token"):
-        twist_source(1)
+        twist_source(1, access_token="")
     with pytest.raises(ValueError, match="full_sync_every"):
         twist_source(1, access_token="t", full_sync_every=-1)
     with pytest.raises(ValueError, match="max_delete_ratio"):
         twist_source(1, access_token="t", max_delete_ratio=0)
+    with pytest.raises(TypeError, match="list of ids"):
+        twist_source(1, access_token="t", channel_ids="852087")
+    with pytest.raises(ValueError, match="not both"):
+        twist_source(1, access_token="t", service=httpx.Client(), http_client=httpx.Client())
+    assert twist_source("254427", access_token="t", channel_ids=["852087"]).name == "twist_254427"
 
-    monkeypatch.setenv("TWIST_WORKSPACE_ID", "254427")
-    monkeypatch.setenv("TWIST_ACCESS_TOKEN", "t")
-    monkeypatch.setenv("TWIST_CHANNEL_IDS", "852087, 852086")
-    assert twist_source().name == "twist_254427"
+
+def test_service_is_the_same_injection_point(seeded, tmp_path):
+    pipeline = _pipeline(tmp_path)
+    source = twist_source(
+        seeded.workspace_id,
+        access_token=seeded.token,
+        service=seeded.http_client(),
+        full_sync_every=0,
+    )
+    pipeline.run(source)
+    assert len(_rows(pipeline, seeded)) == 5
 
 
 def test_first_sync_loads_threads_and_channels(seeded, tmp_path):
@@ -100,6 +116,10 @@ def test_sync_stats_report_counts_only(seeded, tmp_path, thread_named):
         "unchanged": 0,
         "deleted": 0,
         "skipped": 0,
+        "held_back": 0,
+        "failed": 0,
+        "failed_auth": 0,
+        "failed_rate_limit": 0,
     }
     seeded.delete_thread(thread_named("Launch date")["id"])
     source = _source(seeded)
@@ -149,7 +169,7 @@ def test_failed_run_changes_nothing(seeded, tmp_path, thread_named, monkeypatch)
     assert f"thread:{launch['id']}" not in _rows(pipeline, seeded)
 
 
-def test_mass_delete_guard_leaves_the_table_alone(fake, tmp_path):
+def test_mass_delete_is_confirmed_by_the_next_run(fake, tmp_path):
     fake.add_channel(LAUNCH, "launch")
     for i in range(12):
         fake.add_thread(LAUNCH, f"Thread {i}")
@@ -157,12 +177,42 @@ def test_mass_delete_guard_leaves_the_table_alone(fake, tmp_path):
     pipeline.run(_source(fake))
     for thread_id in list(fake.threads)[:11]:
         fake.delete_thread(thread_id)
-    with pytest.raises(Exception) as err:
-        pipeline.run(_source(fake))
-    assert "allow_mass_delete" in str(err.value)
+    source = _source(fake)
+    pipeline.run(source)  # no error: a scheduled sync keeps running
+    assert source.cognee_sync_stats["held_back"] == 11
     assert len(_rows(pipeline, fake)) == 13
-    pipeline.run(_source(fake, allow_mass_delete=True))
+    # The held-back set lives in dlt state, so it survives into the next run.
+    pipeline.run(_source(fake))
     assert len(_rows(pipeline, fake)) == 2
+
+
+def test_failed_runs_report_a_category(seeded, tmp_path, monkeypatch):
+    monkeypatch.setattr("cognee_community_connector_twist.twist.time.sleep", lambda s: None)
+    source = twist_source(
+        seeded.workspace_id, access_token="oauth2:wrong", http_client=seeded.http_client()
+    )
+    with pytest.raises(Exception, match="Invalid token"):
+        _pipeline(tmp_path / "a").run(source)
+    assert (source.cognee_sync_stats["failed"], source.cognee_sync_stats["failed_auth"]) == (1, 1)
+
+    seeded.fail_with = 429
+    source = _source(seeded)
+    with pytest.raises(Exception, match="429"):
+        _pipeline(tmp_path / "b").run(source)
+    stats = source.cognee_sync_stats
+    assert (stats["failed"], stats["failed_rate_limit"], stats["failed_auth"]) == (1, 1, 0)
+
+
+def test_two_workspaces_with_their_own_resource_names_stay_apart(seeded, tmp_path, thread_named):
+    pipeline = _pipeline(tmp_path)
+    pipeline.run(_source(seeded, resource_name="twist_a", channel_ids=[LAUNCH]))
+    pipeline.run(_source(seeded, resource_name="twist_b", channel_ids=[852086]))
+    a_before = _rows(pipeline, seeded, "twist_a")
+    logo = thread_named("Logo refresh")
+    seeded.delete_thread(logo["id"])
+    pipeline.run(_source(seeded, resource_name="twist_b", channel_ids=[852086]))
+    assert f"thread:{logo['id']}" not in _rows(pipeline, seeded, "twist_b")
+    assert _rows(pipeline, seeded, "twist_a") == a_before
 
 
 def test_check_active_can_stop_a_sync(seeded, tmp_path):
