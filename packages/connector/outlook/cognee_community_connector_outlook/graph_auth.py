@@ -44,8 +44,8 @@ class GraphTokenProvider:
     ):
         if not access_token and not client_id and msal_app is None:
             raise ValueError(
-                "Microsoft Graph credentials are missing. Set OUTLOOK_CLIENT_ID to your "
-                "Entra app's client id, or OUTLOOK_ACCESS_TOKEN for a quick try."
+                "Microsoft Graph credentials are missing. Pass client_id, your Entra "
+                "app's client id, or access_token for a quick try."
             )
         self._access_token = access_token
         self._scopes = scopes or [USER_READ]

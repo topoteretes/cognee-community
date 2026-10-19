@@ -13,9 +13,9 @@ their meetings.
 
 ## Requirements
 
-- cognee **1.6.3** (pinned). The connector relies on table-scoped document cleanup
-  (`DOCUMENT_SYNC_VERSION`), `PIPELINE_SCOPE_ATTR` and `guarded_rows`.
-- Python 3.11 to 3.13.
+- cognee **1.6.3 or newer** (below 2). The connector relies on table-scoped document
+  cleanup (`DOCUMENT_SYNC_VERSION`), `PIPELINE_SCOPE_ATTR` and `guarded_rows`.
+- Python 3.10 to 3.13.
 - A Microsoft account: personal (Outlook.com, Hotmail) or work or school.
 
 ## Install
@@ -63,11 +63,17 @@ cd packages/connector/outlook && uv sync
 ## Usage
 
 ```python
+import os
+
 import cognee
 from cognee_community_connector_outlook import outlook_source
 
 await cognee.remember(
-    outlook_source(mail_folders=["inbox", "sentitems"]),  # OUTLOOK_* env vars for the rest
+    outlook_source(
+        mail_folders=["inbox", "sentitems"],
+        client_id=os.environ["OUTLOOK_CLIENT_ID"],
+        token_cache_path=os.environ["OUTLOOK_TOKEN_CACHE_PATH"],
+    ),
     dataset_name="my_outlook",
     primary_key="id",
     write_disposition="merge",  # required: incremental upserts and deletes
@@ -80,9 +86,10 @@ answer = await cognee.recall(
 ```
 
 Run the same `remember` call again whenever you want to sync. See `examples/example.py`
-for the full flow.
+for the full flow. `outlook_source()` takes everything as arguments; the example reads
+them from the `OUTLOOK_*` environment variables shown in the second column.
 
-| Argument | Env var | Default |
+| Argument | Example env var | Default |
 |---|---|---|
 | `mail_folders` | `OUTLOOK_MAIL_FOLDERS` (comma-separated) | `inbox`, `sentitems`; well-known names or folder ids |
 | `include_mail` / `include_calendar` | – | both on |
@@ -94,17 +101,22 @@ for the full flow.
 | `authority` | `OUTLOOK_AUTHORITY` | `https://login.microsoftonline.com/common` |
 | `token_cache_path` | `OUTLOOK_TOKEN_CACHE_PATH` | none: log in on every run |
 | `access_token` | `OUTLOOK_ACCESS_TOKEN` | for quick tries only |
-| `resource_name` | – | `outlook_items`; give each mailbox its own name when several sync into one dataset |
+| `resource_name` | – | `outlook_items`. Lowercase letters, digits and underscores, up to 64. **Two mailboxes in one dataset need different names**, or they would share one table and one sync state |
+| `check_active` | – | optional host callback, asked before every Graph request |
+| `service` | – | a pre-built Graph `RESTClient`, for hosts and tests |
 
-After a run, `source.cognee_sync_stats` holds counts only (mail changed and deleted,
-events changed, deleted and left the window, plus the `scanned` and `deleted` totals the
-other connectors publish), never subjects or content.
+After a run, `source.cognee_sync_stats` holds counts only, never subjects or content:
+mail changed and deleted; events changed, deleted, left the window and failed; the
+`scanned`, `deleted` and `failed` totals the other connectors publish; and `failed_auth`,
+`failed_rate_limit`, `failed_connection`, `failed_mail` and `failed_calendar`.
 
 ## How sync and forget-on-delete work
 
 - **HTTP** goes through dlt's `RESTClient`. Pages are followed through
-  `@odata.nextLink`; 429 throttling is retried after `Retry-After` and transient 5xx
-  errors are retried too.
+  `@odata.nextLink`, and a page link Graph sends twice stops that part instead of
+  looping. 429 throttling and transient 5xx errors are retried at most 3 times, waiting
+  `Retry-After` but never more than 60 seconds, since cognee holds its dlt staging lock
+  during a sync. After that the part stops and is retried next run.
 - **Mail:** one Graph delta query per selected folder
   (`mailFolders/{folder}/messages/delta`). The first run lists the folder; later runs
   get only what changed. The `@odata.deltaLink` only arrives on the last page, so it is
@@ -130,6 +142,11 @@ other connectors publish), never subjects or content.
   leaves the window. Before forgetting it, the connector looks the event up: a 404
   forgets it, otherwise it just left the window and is kept. Cancelled meetings are
   forgotten.
+- **One unreadable event never stops the calendar.** When the lookup of a single event
+  fails, with a 403 or a 5xx, the event is kept, counted in `events_failed`, and looked
+  up again next run, while every other event syncs as usual. The same goes for a series
+  master that fails to load. A 401, a 429 and a lost connection still end the run, since
+  every later request would fail the same way.
 - Deleted items are emitted as `{"id": ..., "_deleted": True}` with a `hard_delete`
   column. dlt removes them on `merge`, and cognee's orphan cleanup removes them from the
   graph and vector stores.
@@ -170,6 +187,7 @@ This connector reads personal data. Be clear about what it does:
   that matters to you.
 - dlt state stores the delta links, message and event ids and which synced folder each
   message is in. It does not store subjects or bodies.
+- Everyone who can read the cognee dataset can read the synced mail and events.
 - Logs, errors and `cognee_sync_stats` contain counts and HTTP statuses only: no message,
   event or folder ids, and not the request URL with its delta token that `requests` puts
   in its own error text.
@@ -211,13 +229,17 @@ folder and for the calendar and replays it through delta tokens.
   expired delta tokens, a deleted folder, dropping a folder from the config, auth and
   API errors that must not delete, throttling, the calendar window, a recurring series
   with its bare occurrences, events deleted versus moved out of the window, cancelled
-  meetings, window refresh, failed event lookups, all-day events ending on their last
-  day, a stable attendee order, mail and calendar failing separately without leaking a
+  meetings, window refresh, failed event lookups kept and checked again next run, one
+  unreadable event not stopping later runs, a series master retried, `Retry-After`
+  capped at a minute, a repeated page link, all-day events ending on their last day, a stable attendee order, mail and calendar failing separately without leaking a
   half-finished round, auth, throttling and a lost connection ending the run,
   `check_active` before every request, and no ids or delta tokens in logs or errors.
 - `test_outlook_source.py` covers the device-code login, the token cache file mode,
-  ready-made tokens, scopes per option, folder normalization and the resource markers.
+  ready-made tokens, scopes per option, folder normalization, settings as arguments only,
+  an unsafe `resource_name` refused, `service`, and the resource markers.
 - `test_outlook_forget.py` runs the real cognee pipeline (LLM and embeddings mocked,
   working with both cognee model variants, including the one used with Gemini) and
-  checks that a deleted message and a deleted meeting leave the graph while a message
-  moved between synced folders stays.
+  checks that a deleted message and a deleted meeting leave the graph and the dataset
+  while a message moved between synced folders stays, and that two mailboxes in one
+  dataset never touch each other's mail. It fails if the tombstone or the `hard_delete`
+  column is turned off.

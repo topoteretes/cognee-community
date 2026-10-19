@@ -7,7 +7,7 @@ name, which the mocked LLM turns into exactly one graph entity.
 """
 
 import importlib
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import cognee
 import pytest
@@ -18,11 +18,21 @@ from cognee.infrastructure.databases.vector.embeddings.LiteLLMEmbeddingEngine im
     LiteLLMEmbeddingEngine,
 )
 from cognee.infrastructure.llm import LLMGateway
-from fake_graph import BASE, FakeGraph
+from cognee.modules.data.methods import get_dataset_data, get_datasets_by_name
+from cognee.modules.users.methods import get_default_user
+from fake_graph import FakeGraph
 
 from cognee_community_connector_outlook import outlook_source
 
 add_data_points_module = importlib.import_module("cognee.tasks.storage.add_data_points")
+
+try:
+    # Newer cognee returns vectors plus a token count; 1.6.3 a plain list.
+    from cognee.infrastructure.databases.vector.embeddings.EmbeddingEngine import (
+        EmbeddingResult,
+    )
+except ImportError:
+    EmbeddingResult = None
 
 DATASET = "outlook_forget_test"
 ALPHA = "Alphacorp"
@@ -78,11 +88,22 @@ async def _graph_has(token: str) -> bool:
     )
 
 
+@pytest.fixture(scope="session")
+def cognee_root(tmp_path_factory):
+    # One root for the whole session: cognee caches its database engines per
+    # process, so a new root per test would leave later tests reading the
+    # first test's stores.  prune() below empties it between tests instead.
+    return tmp_path_factory.mktemp("cognee")
+
+
 @pytest_asyncio.fixture
-async def clean_environment(tmp_path, monkeypatch):
+async def clean_environment(cognee_root, tmp_path, monkeypatch):
     monkeypatch.setenv("COGNEE_SKIP_CONNECTION_TEST", "true")
-    cognee.config.data_root_directory(str(tmp_path / "data"))
-    cognee.config.system_root_directory(str(tmp_path / "system"))
+    # dlt keeps pipeline state under ~/.dlt, which cognee's prune never clears,
+    # so without this a second test run would start from the first run's tokens.
+    monkeypatch.setenv("DLT_DATA_DIR", str(tmp_path / "dlt"))
+    cognee.config.data_root_directory(str(cognee_root / "data"))
+    cognee.config.system_root_directory(str(cognee_root / "system"))
     cognee.config.set_relational_db_config({"db_provider": "sqlite"})
 
     async def _noop_index(*_a, **_k):
@@ -93,7 +114,8 @@ async def clean_environment(tmp_path, monkeypatch):
     monkeypatch.setattr(LLMGateway, "acreate_structured_output", _mock_structured_output)
 
     async def _mock_embed_text(self, text):
-        return [[0.0] * self.get_vector_size() for _ in text]
+        vectors = [[0.0] * self.get_vector_size() for _ in text]
+        return EmbeddingResult(vectors, tokens=0) if EmbeddingResult else vectors
 
     monkeypatch.setattr(LiteLLMEmbeddingEngine, "embed_text", _mock_embed_text)
 
@@ -104,14 +126,26 @@ async def clean_environment(tmp_path, monkeypatch):
     await cognee.prune.prune_system(metadata=True)
 
 
-async def _sync(graph):
+async def _stored_documents() -> int:
+    """How many data items the dataset holds.
+
+    A tombstone that only empties a row (hard_delete off) leaves an empty
+    document behind, which the graph checks alone would not notice.
+    """
+    user = await get_default_user()
+    datasets = await get_datasets_by_name([DATASET], user.id)
+    return len(await get_dataset_data(datasets[0].id))
+
+
+async def _sync(graph, resource_name="outlook_items"):
     with responses.RequestsMock(assert_all_requests_are_fired=False) as mock:
         graph.install(mock)
         await cognee.add(
             outlook_source(
                 mail_folders=["inbox", "archive"],
                 access_token="test-token",
-                base_url=BASE,
+                base_url=graph.base,
+                resource_name=resource_name,
             ),
             dataset_name=DATASET,
             primary_key="id",
@@ -123,7 +157,7 @@ async def _sync(graph):
 
 @pytest.mark.asyncio
 async def test_deleted_mail_and_event_are_forgotten_moved_mail_is_kept(clean_environment):
-    soon = datetime.now(UTC) + timedelta(days=2)
+    soon = datetime.now(timezone.utc) + timedelta(days=2)
     graph = FakeGraph()
     alpha = graph.put_message("inbox", "Logistics", f"{ALPHA} is a company in logistics.")
     bravo = graph.put_message("inbox", "Finance", f"{BRAVO} is a company in finance.")
@@ -134,6 +168,7 @@ async def test_deleted_mail_and_event_are_forgotten_moved_mail_is_kept(clean_env
     await _sync(graph)
     for token in TOKENS:
         assert await _graph_has(token), f"{token} should be in the graph after the first sync"
+    assert await _stored_documents() == 3
 
     graph.move_message(alpha, "inbox", "archive")  # a move between synced folders
     graph.delete_message(bravo, "inbox")  # Outlook moves it to Deleted Items
@@ -143,3 +178,26 @@ async def test_deleted_mail_and_event_are_forgotten_moved_mail_is_kept(clean_env
     assert await _graph_has(ALPHA), "a message moved between synced folders must stay"
     assert not await _graph_has(BRAVO), "a deleted message must be forgotten from the graph"
     assert not await _graph_has(CHARLIE), "a deleted meeting must be forgotten from the graph"
+    assert await _stored_documents() == 1, "deleted items must be removed, not left empty"
+
+
+@pytest.mark.asyncio
+async def test_two_mailboxes_in_one_dataset_stay_apart(clean_environment):
+    work = FakeGraph()
+    personal = FakeGraph(base="https://graph-personal.test/v1.0")
+    alpha = work.put_message("inbox", "Logistics", f"{ALPHA} is a company in logistics.")
+    personal.put_message("inbox", "Finance", f"{BRAVO} is a company in finance.")
+
+    # Each sync of one mailbox must leave the other mailbox's mail alone.
+    await _sync(work, "work_outlook")
+    await _sync(personal, "personal_outlook")
+    await _sync(work, "work_outlook")
+    assert await _graph_has(ALPHA) and await _graph_has(BRAVO)
+    assert await _stored_documents() == 2
+
+    work.delete_message(alpha, "inbox")
+    await _sync(work, "work_outlook")
+
+    assert not await _graph_has(ALPHA)
+    assert await _graph_has(BRAVO), "a delete in one mailbox must not touch the other"
+    assert await _stored_documents() == 1

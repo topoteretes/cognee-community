@@ -5,10 +5,14 @@ import stat
 
 import pytest
 from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR, PIPELINE_SCOPE_ATTR
+from fake_graph import BASE
 
 from cognee_community_connector_outlook import GraphTokenProvider, outlook_source
 from cognee_community_connector_outlook.graph_auth import GraphAuth
-from cognee_community_connector_outlook.outlook import _normalize_mail_folders
+from cognee_community_connector_outlook.outlook import (
+    _normalize_mail_folders,
+    build_graph_client,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -164,10 +168,33 @@ def test_scopes_follow_what_is_synced():
     assert scopes(include_mail=False) == ["User.Read", "Calendars.Read"]
 
 
-def test_folders_come_from_the_environment_and_are_normalized(monkeypatch):
-    monkeypatch.setenv("OUTLOOK_MAIL_FOLDERS", " Inbox , archive,AAMkCustomId,inbox ")
+def test_folders_are_normalized():
+    folders = [" Inbox ", "archive", "AAMkCustomId", "inbox"]
 
-    assert _normalize_mail_folders(None) == ("inbox", "archive", "AAMkCustomId")
+    assert _normalize_mail_folders(folders) == ("inbox", "archive", "AAMkCustomId")
+
+
+def test_environment_is_left_to_the_example(monkeypatch):
+    monkeypatch.setenv("OUTLOOK_ACCESS_TOKEN", "token")
+    monkeypatch.setenv("OUTLOOK_MAIL_FOLDERS", "archive")
+
+    assert _normalize_mail_folders(None) == ("inbox", "sentitems")
+    with pytest.raises(ValueError, match="credentials are missing"):
+        outlook_source()
+
+
+@pytest.mark.parametrize("name", ["", "x" * 65, "Work-Outlook", "work outlook", "1outlook"])
+def test_resource_name_that_would_lose_or_share_state_is_refused(name):
+    with pytest.raises(ValueError, match="resource_name"):
+        outlook_source(resource_name=name, access_token="token")
+
+
+def test_service_is_used_as_the_graph_client():
+    service = build_graph_client(None, BASE)
+
+    resource = outlook_source(service=service)
+
+    assert resource.name == "outlook_items"
 
 
 def test_default_folders_are_inbox_and_sent_items():

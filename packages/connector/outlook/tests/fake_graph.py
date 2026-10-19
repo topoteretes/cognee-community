@@ -15,13 +15,13 @@ what delta tokens replay, collapsed to the latest state per item like Graph.
 import itertools
 import json
 import re
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlparse
 
 import responses
 
 BASE = "https://graph.test/v1.0"
-NOW = datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC)
+NOW = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
 
 
 def _iso(moment: datetime) -> str:
@@ -29,8 +29,10 @@ def _iso(moment: datetime) -> str:
 
 
 class FakeGraph:
-    def __init__(self, page_size: int = 2):
+    def __init__(self, page_size: int = 2, base: str = BASE):
         self.page_size = page_size
+        # A second fake on another base URL stands in for a second mailbox.
+        self.base = base
         self.folders: dict[str, dict[str, dict]] = {"inbox": {}, "sentitems": {}, "archive": {}}
         self.mail_log: dict[str, list[tuple[str, str, dict | None]]] = {
             name: [] for name in self.folders
@@ -167,7 +169,10 @@ class FakeGraph:
     # HTTP
     # ------------------------------------------------------------------
     def install(self, mock: responses.RequestsMock) -> None:
-        mock.add_callback(responses.GET, re.compile(re.escape(BASE) + r"/.*"), self._handle)
+        # Looked up on every request, so a test can wrap _handle after install.
+        mock.add_callback(
+            responses.GET, re.compile(re.escape(self.base) + r"/.*"), lambda r: self._handle(r)
+        )
 
     def _handle(self, request):
         self.requests.append(request)
@@ -175,7 +180,7 @@ class FakeGraph:
             status, body, headers = self.fail_next.pop(0)
             return status, headers, json.dumps(body)
         url = urlparse(request.url)
-        path = url.path[len(urlparse(BASE).path) :]
+        path = url.path[len(urlparse(self.base).path) :]
         query = {k: v[0] for k, v in parse_qs(url.query).items()}
 
         if "$skiptoken" in query:
@@ -220,7 +225,9 @@ class FakeGraph:
                 m if "@removed" in m else {k: v for k, v in m.items() if k in fields} for m in items
             ]
         position = len(self.mail_log[folder])
-        final = f"{BASE}/me/mailFolders/{folder}/messages/delta?$deltatoken={folder}~{position}"
+        final = (
+            f"{self.base}/me/mailFolders/{folder}/messages/delta?$deltatoken={folder}~{position}"
+        )
         return self._page(items, final)
 
     def _collapse_mail(self, folder: str, position: int) -> list[dict]:
@@ -252,7 +259,9 @@ class FakeGraph:
                     items.append({"id": event_id, "@removed": {"reason": "deleted"}})
                 else:
                     items.append(self._public(event))
-        final = f"{BASE}/me/calendarView/delta?$deltatoken=cal~{len(self.event_log)}~{start}~{end}"
+        final = (
+            f"{self.base}/me/calendarView/delta?$deltatoken=cal~{len(self.event_log)}~{start}~{end}"
+        )
         return self._page(items, final)
 
     @staticmethod
@@ -270,7 +279,7 @@ class FakeGraph:
         if rest:
             token = f"skip{len(self._pages)}-{len(self.requests)}"
             self._pages[token] = (rest, final_link)
-            body["@odata.nextLink"] = f"{BASE}/next?$skiptoken={token}"
+            body["@odata.nextLink"] = f"{self.base}/next?$skiptoken={token}"
         else:
             body["@odata.deltaLink"] = final_link
         return 200, {}, json.dumps(body)

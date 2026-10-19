@@ -22,6 +22,7 @@ Run:
 """
 
 import asyncio
+import os
 import sys
 
 import cognee
@@ -32,7 +33,15 @@ DATASET = "outlook_demo"
 
 
 async def main():
-    source = outlook_source()  # reads OUTLOOK_* env vars
+    folders = [f for f in os.getenv("OUTLOOK_MAIL_FOLDERS", "").split(",") if f.strip()]
+    source = outlook_source(
+        folders or None,  # None means Inbox and Sent Items
+        client_id=os.getenv("OUTLOOK_CLIENT_ID"),
+        authority=os.getenv("OUTLOOK_AUTHORITY"),
+        token_cache_path=os.getenv("OUTLOOK_TOKEN_CACHE_PATH"),
+        access_token=os.getenv("OUTLOOK_ACCESS_TOKEN"),
+        mail_received_after=os.getenv("OUTLOOK_MAIL_RECEIVED_AFTER"),
+    )
 
     print("=== Sync ===")
     await cognee.remember(

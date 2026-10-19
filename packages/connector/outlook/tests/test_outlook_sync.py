@@ -493,11 +493,10 @@ def test_expired_calendar_token_resyncs(graph):
     assert set(upserts) == {event(keep)}
 
 
-def test_event_lookup_error_raises_instead_of_deleting(graph):
+def test_event_lookup_error_keeps_the_event_and_checks_again_next_run(graph):
     gone = graph.put_event("Gone", NOW + timedelta(days=3))
     state: dict = {}
     sync(state, make_config(**CAL))
-    before = {"calendar": dict(state["calendar"])}
 
     graph.delete_event(gone)
     # The delta round succeeds; the by-id lookup that would confirm the delete fails.
@@ -508,11 +507,68 @@ def test_event_lookup_error_raises_instead_of_deleting(graph):
         return original(query)
 
     graph._calendar_delta = delta_then_fail_lookup
-    with pytest.raises(OutlookError, match="HTTP 403"):
-        sync(state, make_config(**CAL))
+    _, deletes, stats = sync(state, make_config(**CAL))
 
-    assert state == before
+    assert deletes == [], "an unconfirmed removal never deletes"
     assert graph.requests[-1].url.endswith(f"/me/events/{gone}")
+    assert stats["events_failed"] == 1 and stats["failed_calendar"] == 0
+    assert state["calendar"]["recheck"] == [gone]
+
+    graph._calendar_delta = original
+    _, deletes, _ = sync(state, make_config(**CAL))
+
+    assert deletes == [event(gone)], "the next run confirms it with a 404"
+    assert state["calendar"]["recheck"] == []
+
+
+def test_one_unreadable_event_does_not_stop_the_calendar_on_later_runs(graph):
+    stuck = graph.put_event("Stuck", NOW + timedelta(days=1))
+    state: dict = {}
+    sync(state, make_config(**CAL))
+    graph.delete_event(stuck)
+    original = graph._handle
+
+    def forbidden_for_stuck(request):
+        if request.url.split("?")[0].endswith(f"/me/events/{stuck}"):
+            graph.requests.append(request)
+            return 403, {}, json.dumps({"error": {"code": "ErrorAccessDenied"}})
+        return original(request)
+
+    graph._handle = forbidden_for_stuck
+    for run in range(3):
+        new = graph.put_event(f"New meeting {run}", NOW + timedelta(days=2))
+        upserts, deletes, stats = sync(state, make_config(**CAL))
+
+        assert set(upserts) == {event(new)}, "new meetings keep arriving"
+        assert deletes == [] and stats["events_failed"] == 1
+        assert state["calendar"]["recheck"] == [stuck]
+
+
+def test_series_master_that_fails_to_load_is_fetched_next_run(graph):
+    master = graph.put_series("Standup", NOW - timedelta(days=60), days=90)
+    graph.hide_from_calendar_view(master)
+    original = graph._handle
+    broken = True
+
+    def server_error_for_master(request):
+        if broken and request.url.split("?")[0].endswith(f"/me/events/{master}"):
+            graph.requests.append(request)
+            return 500, {}, json.dumps({"error": {"code": "InternalServerError"}})
+        return original(request)
+
+    graph._handle = server_error_for_master
+    state: dict = {}
+    upserts, _, stats = sync(state, make_config(**CAL))
+
+    assert event(master) not in upserts
+    assert stats["events_failed"] == 1
+    assert state["calendar"]["retry_masters"] == [master]
+
+    broken = False
+    upserts, _, _ = sync(state, make_config(**CAL))
+
+    assert event(master) in upserts
+    assert state["calendar"]["retry_masters"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -573,7 +629,7 @@ def test_a_failing_mail_round_keeps_its_state_while_the_calendar_finishes(graph)
     assert stats["failed"] == 1 and stats["failed_mail"] == 1
 
 
-def test_a_failing_calendar_round_leaves_nothing_behind_while_mail_finishes(graph):
+def test_a_calendar_round_that_fails_leaves_nothing_behind_while_mail_finishes(graph):
     message_id = graph.put_message("inbox", "Hello")
     cancelled = graph.put_event("Cancelled later", NOW + timedelta(days=2))
     removed = graph.put_event("Deleted later", NOW + timedelta(days=3))
@@ -587,7 +643,7 @@ def test_a_failing_calendar_round_leaves_nothing_behind_while_mail_finishes(grap
     original = graph._calendar_delta
 
     def delta_then_fail_lookup(query):
-        graph.fail_next.append((403, {"error": {"code": "ErrorAccessDenied"}}, {}))
+        graph.fail_next.append((401, {"error": {"code": "InvalidAuthenticationToken"}}, {}))
         return original(query)
 
     graph._calendar_delta = delta_then_fail_lookup
@@ -598,7 +654,7 @@ def test_a_failing_calendar_round_leaves_nothing_behind_while_mail_finishes(grap
     assert deletes == []
     assert set(upserts) == {mail(message_id)}
     assert state["calendar"] == calendar_before
-    assert stats["failed_calendar"] == 1 and stats["events_deleted"] == 0
+    assert stats["failed_auth"] == 1 and stats["events_deleted"] == 0
 
 
 def test_mail_and_calendar_both_failing_raises_and_saves_nothing(graph):
@@ -628,6 +684,47 @@ def test_auth_and_throttling_end_the_run(graph, status, key, no_retry_wait):
 
     assert stats[key] == 1
     assert not any("calendarView" in r.url for r in graph.requests), "calendar not tried"
+
+
+def test_a_long_retry_after_is_capped_and_retried_only_a_few_times(graph, monkeypatch):
+    graph.put_message("inbox", "Hello")
+    waits: list[float] = []
+    monkeypatch.setattr("tenacity.nap.time.sleep", waits.append)
+    # Graph asks for a whole day; cognee holds its dlt staging lock meanwhile.
+    for _ in range(10):
+        graph.fail_next.append(
+            (429, {"error": {"code": "TooManyRequests"}}, {"Retry-After": "86400"})
+        )
+    stats: dict = {}
+
+    with pytest.raises(OutlookError, match="HTTP 429"):
+        sync({}, make_config(include_calendar=False, mail_folders=("inbox",)), stats=stats)
+
+    assert waits == [60, 60], "3 attempts, at most a minute apart"
+    assert stats["failed_rate_limit"] == 1
+
+
+def test_a_repeated_page_link_fails_its_part_instead_of_looping(graph):
+    graph.put_message("inbox", "One")
+    graph.put_message("inbox", "Two")
+    graph.put_message("inbox", "Three")  # page_size 2, so a second page exists
+    original = graph._page
+
+    def same_next_link_forever(items, final_link):
+        status, headers, body = original(items, final_link)
+        page = json.loads(body)
+        page.pop("@odata.deltaLink", None)
+        page["@odata.nextLink"] = f"{BASE}/next?$skiptoken=stuck"
+        graph._pages["stuck"] = (items, final_link)
+        return status, headers, json.dumps(page)
+
+    graph._page = same_next_link_forever
+    stats: dict = {}
+
+    with pytest.raises(OutlookError, match="same page twice"):
+        sync({}, make_config(include_calendar=False, mail_folders=("inbox",)), stats=stats)
+
+    assert len(graph.requests) < 10
 
 
 def test_a_lost_connection_is_a_clean_error_without_the_url(graph, no_retry_wait):
@@ -729,7 +826,7 @@ def test_a_round_without_a_delta_link_fails_its_part_without_the_url(graph):
 
     # Not a lost connection: only mail fails, and the calendar still finishes.
     assert set(upserts) == {event(meeting)}
-    assert stats["failed_mail"] == 1 and "failed_connection" not in stats
+    assert stats["failed_mail"] == 1 and stats["failed_connection"] == 0
     assert "mail" not in state
 
     # An incremental round requests the saved deltaLink, delta token and all.
@@ -769,7 +866,10 @@ def test_no_ids_or_delta_tokens_reach_logs_or_error_text(graph, caplog):
     sync(state, config)
     graph.delete_folder("AAMkSecretFolder")
     sync(state, config)
-    graph.fail_next.append((403, {"error": {"code": "ErrorAccessDenied"}}, {}))  # mail fails too
+    # Mail and the calendar round both fail, so nothing finishes and it raises.
+    graph.fail_next.append((403, {"error": {"code": "ErrorAccessDenied"}}, {}))
+    graph.fail_next.append((403, {"error": {"code": "ErrorAccessDenied"}}, {}))
+    graph._calendar_delta = original
     with pytest.raises(OutlookError) as error:
         sync(state, config)
 

@@ -8,72 +8,31 @@ resource produced here is handed directly to :func:`cognee.remember`::
     from cognee_community_connector_outlook import outlook_source
 
     await cognee.remember(
-        outlook_source(mail_folders=["inbox", "sentitems"]),
+        outlook_source(mail_folders=["inbox", "sentitems"], client_id=..., token_cache_path=...),
         dataset_name="my_outlook",
         primary_key="id",
         write_disposition="merge",   # incremental upsert by message and event id
         max_rows_per_table=0,        # 0 = no row cap (mailboxes exceed the default 50)
     )
 
-Design
-------
-* **Auth** — delegated Microsoft Graph sign-in through MSAL's device-code
-  flow, shared with the other Microsoft connectors (see ``graph_auth``).
-  Read-only scopes: ``Mail.Read`` (or ``Mail.ReadBasic`` without bodies) and
-  ``Calendars.Read``.
-* **HTTP** — dlt's ``RESTClient``, which retries 429 throttling after
-  ``Retry-After`` and transient 5xx errors.  Pages are followed through
-  ``@odata.nextLink``.
-* **Incremental cursor** — Graph delta queries: one ``deltaLink`` per mail
-  folder (``mailFolders/{id}/messages/delta``) and one for the calendar
-  window (``calendarView/delta``).  The ``deltaLink`` only arrives on the last
-  page, so it is saved in dlt resource state once the whole round finished.
-* **Immutable ids** — every request sends ``Prefer: IdType="ImmutableId"``, so
-  a message keeps its id when it moves between folders.
-* **Forget-on-delete** — mail: a message is forgotten once it is in none of the
-  synced folders, so a move between synced folders is an update, and a move to
-  Deleted Items (never synced) is a delete.  Calendar: Graph also reports an
-  event as removed when it leaves the date window, so a removed event is
-  looked up by id first; only a 404, or a cancelled meeting, forgets it.
-  Deletes are emitted with the ``_deleted`` hard-delete marker and removed by
-  cognee's ``orphan_cleanup``.
-* **Errors never delete** — an expired delta token (``410 Gone`` or
-  ``syncStateNotFound``) triggers a fresh round reconciled like a snapshot.
-  A missing folder is confirmed with a lookup before its mail is forgotten.
-* **Mail and calendar fail separately** — they share no state, so when one
-  fails with a Graph error the other still finishes and saves its state, and
-  the failed one keeps its previous state and is retried next run.  The run
-  raises only when nothing finished, since dlt rolls back the state of a
-  failed run.  A 401, a 429 after the retries, or a lost connection end the
-  run, because the other part would fail the same way.  Mail folders stay all
-  or nothing: a message moved between two synced folders would look deleted
-  if only one of them were read.
-* **Host checkpoint** — ``check_active`` runs before every Graph request, so a
-  revoked connection stops the sync between two calls.
-* **Privacy** — logs and errors carry counts and HTTP statuses only, never
-  message, event or folder ids, nor the request URL with its delta token that
-  requests puts in its own error text.
-* **Document path** — mail and events become text documents with sender,
-  recipients, organizer and attendees written into the content, so cognify
-  links one person across emails and meetings.
-
-Limitations
------------
-* Only the primary calendar: Graph v1.0 event delta covers that one.
-* An event that leaves the date window is kept in memory as it was last seen,
-  and is no longer tracked for changes.
-* Attachments are not ingested, only flagged.
+Microsoft Graph delta queries keep one ``deltaLink`` per mail folder and one for
+the calendar window.  A message is forgotten once it is in none of the synced
+folders, and a removed event is looked up by id first, since Graph also reports
+events that only left the window.  Mail and calendar fail separately, and errors
+never delete.  The README explains the sync model, the retry rules and the
+limitations.
 """
 
-import os
+import re
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from cognee.shared.logging_utils import get_logger
 from cognee.tasks.ingestion import dlt_utils
 from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
+from dlt.sources.helpers.requests import Client
 from dlt.sources.helpers.rest_client import RESTClient
 from dlt.sources.helpers.rest_client.paginators import BaseNextUrlPaginator
 from requests import HTTPError, RequestException
@@ -90,7 +49,17 @@ from .graph_auth import (
 
 logger = get_logger("outlook_connector")
 
+# datetime.UTC only exists from Python 3.11.
+UTC = timezone.utc
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
+# dlt's defaults sleep Retry-After up to 300 s for 5 attempts, while cognee
+# holds its dlt staging lock.  A minute and 3 attempts at most here; after that
+# the part stops with a rate-limit error and the next run picks it up.
+MAX_RETRY_WAIT_SECONDS = 60
+MAX_REQUEST_ATTEMPTS = 3
+# dlt uses the resource name as a table name and a state key, so it has to be
+# already normalized and short enough to be part of a file name.
+_RESOURCE_NAME = re.compile(r"[a-z][a-z0-9_]{0,63}")
 DEFAULT_MAIL_FOLDERS = ("inbox", "sentitems")
 WELL_KNOWN_FOLDER_NAMES = {
     "inbox": "Inbox",
@@ -142,8 +111,18 @@ class _OutlookConfig:
 class _ODataNextLinkPaginator(BaseNextUrlPaginator):
     """Follows Graph's ``@odata.nextLink`` until the round's last page."""
 
+    def __init__(self) -> None:
+        super().__init__()
+        self._seen: set[str] = set()
+
     def update_state(self, response, data=None) -> None:
-        self._next_reference = response.json().get("@odata.nextLink")
+        link = response.json().get("@odata.nextLink")
+        if link in self._seen:
+            # The link carries the delta token, so it stays out of the message.
+            raise OutlookError("Microsoft Graph returned the same page twice; stopping.")
+        if link:
+            self._seen.add(link)
+        self._next_reference = link
 
 
 class OutlookError(RuntimeError):
@@ -164,7 +143,12 @@ class OutlookError(RuntimeError):
 # Graph helpers
 # ---------------------------------------------------------------------------
 def build_graph_client(auth: Any, base_url: str = GRAPH_BASE_URL) -> RESTClient:
-    return RESTClient(base_url=base_url, auth=auth)
+    session = Client(
+        request_max_attempts=MAX_REQUEST_ATTEMPTS,
+        request_max_retry_delay=MAX_RETRY_WAIT_SECONDS,
+        raise_for_status=False,
+    ).session
+    return RESTClient(base_url=base_url, auth=auth, session=session)
 
 
 def _check(check_active: Callable[[], None] | None) -> None:
@@ -222,13 +206,33 @@ def _exists(client: RESTClient, path: str, check_active=None) -> dict | None:
     return response.json()
 
 
+# Returned by _lookup when one item could not be read.
+_FAILED = object()
+
+
+def _lookup(client: RESTClient, path: str, check_active=None) -> Any:
+    """Like _exists, but one unreadable item returns _FAILED instead of raising.
+
+    A 403 or a 5xx on a single event must not stop the whole calendar on every
+    run.  A 401, a 429 and a lost connection still raise: every later request
+    would fail the same way.
+    """
+    try:
+        return _exists(client, path, check_active)
+    except HTTPError as exc:
+        if _status(exc) in (401, 429):
+            raise
+        return _FAILED
+
+
 # ---------------------------------------------------------------------------
 # Sync state machine (pure given a client + state dict — unit-testable)
 # ---------------------------------------------------------------------------
 _PART_STATS = {
     "mail": ("mail_changed", "mail_deleted"),
-    "calendar": ("events_changed", "events_deleted", "events_left_window"),
+    "calendar": ("events_changed", "events_deleted", "events_left_window", "events_failed"),
 }
+_FAILURE_REASONS = ("auth", "rate_limit", "connection", "mail", "calendar")
 
 
 def _iter_rows(
@@ -256,8 +260,10 @@ def _iter_rows(
         events_changed=0,
         events_deleted=0,
         events_left_window=0,
+        events_failed=0,
         failed=0,
     )
+    stats.update({f"failed_{reason}": 0 for reason in _FAILURE_REASONS})
     now = now or datetime.now(UTC)
 
     parts = [p for p in ("mail", "calendar") if getattr(config, f"include_{p}")]
@@ -289,7 +295,7 @@ def _iter_rows(
             last_error = exc if isinstance(exc, OutlookError) else _graph_error(exc)
             reason = _failure_reason(last_error) or part
             stats["failed"] += 1
-            stats[f"failed_{reason}"] = stats.get(f"failed_{reason}", 0) + 1
+            stats[f"failed_{reason}"] += 1
             logger.warning(
                 "Outlook: the %s sync failed (HTTP %s); it keeps its state and is retried "
                 "on the next run.",
@@ -307,8 +313,10 @@ def _iter_rows(
         raise OutlookError(f"Outlook sync failed: {last_error}", last_error.status) from None
 
     # Totals under the keys the other connectors publish, for host dashboards.
+    # ``failed`` counts what the next run tries again: whole parts and events.
     stats["scanned"] = stats["mail_changed"] + stats["events_changed"]
     stats["deleted"] = stats["mail_deleted"] + stats["events_deleted"]
+    stats["failed"] += stats["events_failed"]
 
     for _state, _rows, deletes in finished.values():
         for row_id in deletes:
@@ -465,6 +473,10 @@ def _sync_calendar(
 ) -> dict:
     """One delta round over the date window. Returns the new calendar state."""
     known: set[str] = set(calendar_state.get("known", []))
+    # Events whose lookup failed last run: a removal still to confirm, and a
+    # series master still to fetch.  Delta rounds won't list them again.
+    recheck: set[str] = set(calendar_state.get("recheck", []))
+    retry_masters: set[str] = set(calendar_state.get("retry_masters", []))
     link = calendar_state.get("delta_link")
     window = {
         "days_back": config.calendar_days_back,
@@ -530,9 +542,13 @@ def _sync_calendar(
     # it, but Graph may not list its master. The occurrences prove the series
     # is alive, and a master missing from both this round and memory is
     # fetched by id so the meeting is not lost.
-    for master_id in sorted(series_ids - seen - set(changed) - known):
-        master = _exists(client, f"/me/events/{master_id}", check_active)
-        if master is not None and not master.get("isCancelled"):
+    next_masters: list[str] = []
+    for master_id in sorted((series_ids | retry_masters) - seen - set(changed) - known):
+        master = _lookup(client, f"/me/events/{master_id}", check_active)
+        if master is _FAILED:
+            next_masters.append(master_id)
+            stats["events_failed"] += 1
+        elif master is not None and not master.get("isCancelled"):
             changed[master_id] = master
     seen |= series_ids
 
@@ -540,12 +556,18 @@ def _sync_calendar(
         # Known events missing from the fresh listing were deleted or left
         # the window; the lookup below tells which.
         removed |= known - seen
+    removed |= recheck
 
+    next_recheck: list[str] = []
     for event_id in sorted(removed - seen):
         # Graph also reports an event that left the window as removed, so
         # check it before forgetting anything.
-        event = _exists(client, f"/me/events/{event_id}", check_active)
-        if event is None or event.get("isCancelled"):
+        event = _lookup(client, f"/me/events/{event_id}", check_active)
+        if event is _FAILED:
+            # Not confirmed either way: keep it, and ask again next run.
+            next_recheck.append(event_id)
+            stats["events_failed"] += 1
+        elif event is None or event.get("isCancelled"):
             _forget_event(event_id, known, deletes, stats)
         else:
             known.discard(event_id)
@@ -561,6 +583,8 @@ def _sync_calendar(
         "opened_at": opened_at,
         "window": window,
         "known": sorted(known),
+        "recheck": next_recheck,
+        "retry_masters": next_masters,
     }
 
 
@@ -662,15 +686,12 @@ def _iso(moment: datetime) -> str:
 
 
 def _normalize_mail_folders(mail_folders: list[str] | str | None) -> tuple[str, ...]:
-    """Folders from the argument or OUTLOOK_MAIL_FOLDERS, de-duplicated.
+    """Folders from the argument, or Inbox and Sent Items, de-duplicated.
 
     Well-known names like ``Inbox`` are case-insensitive; folder ids are not.
     """
     if mail_folders is None:
-        env_folders = os.getenv("OUTLOOK_MAIL_FOLDERS", "")
-        mail_folders = [f for f in env_folders.split(",") if f.strip()] or list(
-            DEFAULT_MAIL_FOLDERS
-        )
+        mail_folders = list(DEFAULT_MAIL_FOLDERS)
     elif isinstance(mail_folders, str):
         mail_folders = [mail_folders]
     cleaned = (f.strip() for f in mail_folders)
@@ -700,40 +721,44 @@ def outlook_source(
     check_active: Callable[[], None] | None = None,
     token_provider: GraphTokenProvider | None = None,
     base_url: str = GRAPH_BASE_URL,
+    service: RESTClient | None = None,
 ):
     """Return a ``dlt`` resource yielding Outlook mail and calendar documents.
 
-    Any argument left as ``None`` falls back to the matching ``OUTLOOK_*``
-    environment variable.  Hand the result to ``cognee.remember(...)`` with
-    ``write_disposition="merge"`` and ``primary_key="id"``.
+    Hand the result to ``cognee.remember(...)`` with ``write_disposition="merge"``
+    and ``primary_key="id"``.  Settings are taken as arguments only; the example
+    reads them from ``OUTLOOK_*`` environment variables.
 
     Args:
         mail_folders: Folders to sync, as well-known names like ``inbox``,
             ``sentitems`` and ``archive``, or folder ids.  Defaults to Inbox and
-            Sent Items; ``OUTLOOK_MAIL_FOLDERS`` takes a comma-separated list.
-            Deleted Items and Junk should not be synced: moving a message there
-            is how Outlook deletes it.
+            Sent Items.  Deleted Items and Junk should not be synced: moving a
+            message there is how Outlook deletes it.
         include_mail: Sync mail.  Turning it off keeps already-synced mail.
         include_calendar: Sync the primary calendar.
         include_mail_bodies: Ingest message bodies.  When False only headers
             are read, which needs only the ``Mail.ReadBasic`` permission.
         mail_received_after: Only mail received on or after this ISO date,
-            like ``2026-01-01T00:00:00Z``; ``OUTLOOK_MAIL_RECEIVED_AFTER``.
-            Graph keeps the filter inside the delta link.
+            like ``2026-01-01T00:00:00Z``.  Graph keeps the filter inside the
+            delta link.
         calendar_days_back / calendar_days_ahead: The calendar window.
         calendar_window_refresh_days: How often the window moves forward.
-        client_id: Entra app (client) id; ``OUTLOOK_CLIENT_ID``.
-        authority: Sign-in authority; ``OUTLOOK_AUTHORITY``.  Defaults to
-            ``common``, which accepts personal and work or school accounts.
+        client_id: Entra app (client) id.
+        authority: Sign-in authority.  Defaults to ``common``, which accepts
+            personal and work or school accounts.
         token_cache_path: Private file for MSAL's token cache, so the
-            device-code login happens once; ``OUTLOOK_TOKEN_CACHE_PATH``.
-        access_token: A ready-made Graph token for quick tries;
-            ``OUTLOOK_ACCESS_TOKEN``.  It is never refreshed.
-        resource_name: Stable dlt resource name. Give each mailbox its own name
+            device-code login happens once.
+        access_token: A ready-made Graph token for quick tries.  It is never
+            refreshed.
+        resource_name: Stable dlt resource name: lowercase letters, digits and
+            underscores, up to 64 characters.  Give each mailbox its own name
             when several sync into one dataset, so their state stays separate.
-        check_active: Optional host authorization checkpoint during extraction.
+        check_active: Optional host authorization checkpoint, asked before
+            every Graph request.
         token_provider: A pre-built ``GraphTokenProvider``, for hosts and tests.
         base_url: Graph endpoint, for tests and national clouds.
+        service: A pre-built Graph ``RESTClient``, for hosts and tests.  When
+            given, the auth arguments above are not used.
     """
     import dlt
 
@@ -741,6 +766,13 @@ def outlook_source(
         raise RuntimeError(
             "Outlook sync requires a Cognee build with table-scoped DLT document cleanup. "
             "Upgrade Cognee before syncing to avoid deleting another source's data."
+        )
+    if not isinstance(resource_name, str) or not _RESOURCE_NAME.fullmatch(resource_name):
+        # An empty name would silently drop the pipeline scope, and a name dlt
+        # normalizes differently would share a table with another mailbox.
+        raise ValueError(
+            "resource_name must be 1 to 64 lowercase letters, digits or underscores, "
+            'starting with a letter, like "work_outlook".'
         )
     if not (include_mail or include_calendar):
         raise ValueError("Nothing to sync: include_mail and include_calendar are both False.")
@@ -756,26 +788,29 @@ def outlook_source(
         include_mail=include_mail,
         mail_folders=mail_folders,
         include_mail_bodies=include_mail_bodies,
-        mail_received_after=mail_received_after or os.getenv("OUTLOOK_MAIL_RECEIVED_AFTER"),
+        mail_received_after=mail_received_after,
         include_calendar=include_calendar,
         calendar_days_back=calendar_days_back,
         calendar_days_ahead=calendar_days_ahead,
         calendar_window_refresh_days=calendar_window_refresh_days,
     )
 
-    scopes = [USER_READ]
-    if include_mail:
-        scopes.append(MAIL_READ if include_mail_bodies else MAIL_READ_BASIC)
-    if include_calendar:
-        scopes.append(CALENDARS_READ)
-    provider = token_provider or GraphTokenProvider(
-        client_id=client_id or os.getenv("OUTLOOK_CLIENT_ID"),
-        scopes=scopes,
-        authority=authority or os.getenv("OUTLOOK_AUTHORITY") or DEFAULT_AUTHORITY,
-        token_cache_path=token_cache_path or os.getenv("OUTLOOK_TOKEN_CACHE_PATH"),
-        access_token=access_token or os.getenv("OUTLOOK_ACCESS_TOKEN"),
-    )
-    client = build_graph_client(GraphAuth(provider), base_url)
+    if service is not None:
+        client = service
+    else:
+        scopes = [USER_READ]
+        if include_mail:
+            scopes.append(MAIL_READ if include_mail_bodies else MAIL_READ_BASIC)
+        if include_calendar:
+            scopes.append(CALENDARS_READ)
+        provider = token_provider or GraphTokenProvider(
+            client_id=client_id,
+            scopes=scopes,
+            authority=authority or DEFAULT_AUTHORITY,
+            token_cache_path=token_cache_path,
+            access_token=access_token,
+        )
+        client = build_graph_client(GraphAuth(provider), base_url)
 
     stats: dict[str, int] = {}
 
