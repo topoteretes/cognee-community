@@ -89,6 +89,9 @@ A run never sleeps on Apollo's rate limits. When the limit or `max_requests` is 
 cleanly, keeps its progress and reports it in `source.cognee_sync_stats`; the next run resumes.
 A record whose check or activity read fails is kept as it is, counted in `failed` and retried
 on the next run, and the rest of the sync goes on.
+A record that keeps failing (for example one Apollo answers with an unexpected error) has
+no backoff: it costs one request and keeps `failed` at 1 or more on every run, which is
+that record, not a broken sync.
 
 ## Limitations
 

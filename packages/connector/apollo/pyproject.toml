@@ -5,7 +5,7 @@ description = "Apollo.io data-source connector for cognee — sync your CRM cont
 readme = "README.md"
 requires-python = ">=3.10,<3.15"
 dependencies = [
-    # needs table-scoped dlt document cleanup (PIPELINE_SCOPE_ATTR), first shipped in cognee 1.6.1
+    # needs table-scoped dlt document cleanup (PIPELINE_SCOPE_ATTR) and dlt_utils.guarded_rows
     "cognee>=1.6.3,<2",
     # cognee pins the dlt range it supports
     "dlt[sqlalchemy]>=1.9.0,<2",

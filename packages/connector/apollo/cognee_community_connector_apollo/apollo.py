@@ -28,7 +28,9 @@ logger = get_logger("apollo_connector")
 
 BASE_URL = "https://api.apollo.io/api/v1"
 APP_URL = "https://app.apollo.io/#"
+# the first-party record types this source syncs; enrichment data stays out
 KINDS = ("contacts", "accounts", "sequences")
+# apollo's largest per_page on the search endpoints
 PAGE_SIZE = 100
 # apollo search stops at 500 pages of 100 records
 SEARCH_CAP = 50_000
@@ -38,7 +40,9 @@ DEFAULT_MAX_REQUESTS = 500
 _REQUESTS_RESERVE = 10
 # the activity feed has no paging, so a contact keeps at most its latest 50 events
 _ACTIVITY_LIMIT = 50
+# (connect, read) seconds; our own choice, apollo documents no expected latency
 _TIMEOUT = (10, 30)
+# attempts per request on 5xx or network errors, backing off 1s then 2s
 _RETRIES = 3
 _RATE_HEADERS = {
     "minute": "x-minute-requests-left",
@@ -46,9 +50,11 @@ _RATE_HEADERS = {
     "daily": "x-24-hour-requests-left",
 }
 # legacy 422 texts seen live for a deleted or unknown contact or account, matched whole
-# so a record name can't trip them; error_details.code replaces them on 16 feb 2027
-_GONE_MESSAGE = re.compile(r"^(oops! )?this (contact|account) (has been deleted|does not exist)")
-_GONE_REASONS = ("NOT_FOUND", "DELETED")
+# so a record name can't trip them; error_details.code replaces them on 16 feb 2027 but
+# apollo documents no deleted-record code yet, so until then only these and a 404 count
+_GONE_MESSAGE = re.compile(
+    r"(oops! )?this (contact|account) (has been deleted|does not exist in apollo)[.!]?"
+)
 
 
 class ApolloSourceError(RuntimeError):
@@ -86,14 +92,10 @@ def _is_gone(body: Any) -> bool:
     """Whether Apollo said the record is gone. Only matched, never echoed."""
     if not isinstance(body, dict):
         return False
-    details = body.get("error_details")
-    code = details.get("code") if isinstance(details, dict) else None
-    if isinstance(code, str) and code:
-        # codes read DOMAIN.CATEGORY.REASON; apollo documents no deleted-record code yet
-        reason = code.rsplit(".", 1)[-1].upper()
-        return any(marker in reason for marker in _GONE_REASONS)
     texts = (body.get("error"), body.get("message"))
-    return any(isinstance(text, str) and _GONE_MESSAGE.match(text.lower()) for text in texts)
+    return any(
+        isinstance(text, str) and _GONE_MESSAGE.fullmatch(text.strip().lower()) for text in texts
+    )
 
 
 def _endpoint(path: str) -> str:
@@ -177,7 +179,8 @@ class ApolloClient:
         if status != 200:
             raise ApolloAPIError(f"Apollo request failed: HTTP {status}")
         # every endpoint used answers with an object, except /labels with a list
-        if not isinstance(payload, dict | list):
+        expected = list if path == "/labels" else dict
+        if not isinstance(payload, expected):
             raise ApolloAPIError(f"Apollo sent an unreadable answer for {_endpoint(path)}")
         headers = response.headers
         self.rate_limit = {
@@ -423,9 +426,9 @@ class _Walker:
     def _all_sequences(self) -> Iterator[dict]:
         page = 1
         while True:
-            # the openapi lists these as query params, but apollo reads the json body too
+            # the docs list page and per_page as query params, with no request body
             data = self._call(
-                "POST", "/emailer_campaigns/search", body={"page": page, "per_page": PAGE_SIZE}
+                "POST", "/emailer_campaigns/search", params={"page": page, "per_page": PAGE_SIZE}
             )
             records = data.get("emailer_campaigns") or []
             total_pages = _total_pages(data)
@@ -456,6 +459,9 @@ class _Walker:
         # a page reached under other filters points into a different listing
         if walks.get(kind, {}).get("query") != query:
             walks[kind] = {"page": 1, "query": query}
+            # ids seen under the old query must not shield records the new one dropped
+            prefix = f"{_SEARCHES[kind][1]}:"
+            self.seen[:] = [row_id for row_id in self.seen if not row_id.startswith(prefix)]
         progress = walks[kind]
         if progress.get("done"):
             return
@@ -690,7 +696,7 @@ def apollo_source(
     import dlt
 
     if getattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 0) < 1:
-        raise RuntimeError("Apollo sync requires cognee>=1.6.1 (table-scoped document cleanup).")
+        raise RuntimeError("Apollo sync requires cognee>=1.6.3 (table-scoped document cleanup).")
     if not isinstance(resource_name, str) or not resource_name.strip():
         raise ValueError("apollo_source needs a resource_name, one per Apollo account")
     if service is None and not api_key:

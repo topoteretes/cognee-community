@@ -134,7 +134,8 @@ class FakeApollo:
         if path == "/fields":
             return {"fields": FIELDS, "field_groups": []}
         if path == "/emailer_campaigns/search":
-            return self._page(path, "emailer_campaigns", list(self.sequences.values()), body)
+            sequences = list(self.sequences.values())
+            return self._page(path, "emailer_campaigns", sequences, params or {})
         if path == "/contacts/search":
             return self._page(path, "contacts", self._search(self.contacts, "contact", body), body)
         if path == "/accounts/search":

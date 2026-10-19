@@ -73,16 +73,18 @@ def test_a_request_sends_the_key_header_and_json_body(monkeypatch):
         (422, {"error": "Page * per page number is over threshold."}, ApolloAPIError),
         # a record name in the message must not read as gone
         (422, {"error": "Account 'Not Found Logistics' could not be updated"}, ApolloAPIError),
-        (422, {"error_details": {"code": "CRM.CONTACT.NOT_FOUND"}}, ApolloNotFoundError),
-        (422, {"error_details": {"code": "CRM.ACCOUNT.RECORD_DELETED"}}, ApolloNotFoundError),
-        # the structured code wins over the legacy message
+        (422, {"error": "This contact does not exist in the stage you filtered"}, ApolloAPIError),
+        (422, {"error": "This contact has been deleted from the sequence"}, ApolloAPIError),
+        # apollo documents no deleted-record code, so no code alone reads as gone
+        (422, {"error_details": {"code": "SEARCH.FILTER.STAGE_NOT_FOUND"}}, ApolloAPIError),
+        (422, {"error_details": {"code": "CONTACTS.STATE.UNDELETED"}}, ApolloAPIError),
         (
             422,
             {
                 "error": "This contact has been deleted.",
                 "error_details": {"code": "REQUEST.VALIDATION.INVALID_PARAMETER"},
             },
-            ApolloAPIError,
+            ApolloNotFoundError,
         ),
         (400, {}, ApolloAPIError),
     ],
@@ -122,6 +124,16 @@ def test_a_200_without_a_json_object_is_an_error_not_an_empty_listing(monkeypatc
         client.request("POST", "/contacts/search", body={})
 
 
+def test_only_labels_may_answer_with_a_list(monkeypatch):
+    client, _, _ = _client(
+        monkeypatch, _Response(200, [{"id": "l1"}]), _Response(200, [{"id": "c1"}])
+    )
+
+    assert client.request("GET", "/labels") == [{"id": "l1"}]
+    with pytest.raises(ApolloAPIError, match="unreadable"):
+        client.request("POST", "/contacts/search", body={})
+
+
 def test_server_errors_and_network_failures_are_retried(monkeypatch):
     client, calls, sleeps = _client(
         monkeypatch,
@@ -130,7 +142,7 @@ def test_server_errors_and_network_failures_are_retried(monkeypatch):
         _Response(200, {"ok": True}),
     )
 
-    assert client.request("GET", "/labels") == {"ok": True}
+    assert client.request("GET", "/contact_stages") == {"ok": True}
     assert len(calls) == 3
     assert sleeps == [1, 2]
 
@@ -139,7 +151,7 @@ def test_a_persistent_network_failure_raises_without_the_key(monkeypatch):
     client, _, _ = _client(monkeypatch, *[requests.ConnectionError(KEY)] * 3)
 
     with pytest.raises(ApolloAPIError) as raised:
-        client.request("GET", "/labels")
+        client.request("GET", "/contact_stages")
 
     assert KEY not in str(raised.value)
     assert raised.value.__cause__ is None

@@ -349,7 +349,7 @@ def test_changing_the_filters_restarts_the_listing():
     fake, state = FakeApollo(), {}
     for n in range(PAGE_SIZE * 3):
         fake.add_contact(f"c{n:03d}", f"Person {n}", contact_stage_id="cs1" if n % 2 else "cs2")
-    _sync(
+    first, _ = _sync(
         fake, state, include=("contacts",), filters={"contact_stage_ids": ["cs1"]}, max_requests=6
     )
     assert state["walks"]["contacts"]["page"] == 2
@@ -359,6 +359,8 @@ def test_changing_the_filters_restarts_the_listing():
     assert stats["failed"] == 0
     emitted = {row["id"] for row in rows if not row["_deleted"]}
     assert emitted == {f"contact:c{n:03d}" for n in range(0, PAGE_SIZE * 3, 2)}
+    # the old filter's contacts leave in the same cycle, not one later
+    assert {row["id"] for row in rows if row["_deleted"]} == _ids(first)
 
 
 def test_an_activity_feed_failure_skips_only_that_contact_until_the_next_run():
