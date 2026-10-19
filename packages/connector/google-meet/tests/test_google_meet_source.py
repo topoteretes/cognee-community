@@ -190,6 +190,14 @@ def test_resource_opts_into_document_mode_and_pipeline_scope():
     assert resource.cognee_sync_stats == {}
 
 
+@pytest.mark.parametrize("name", ["", "x" * 65, "Work-Meet", "work meet", "1meet"])
+def test_resource_name_that_would_lose_or_share_state_is_refused(name):
+    services = MeetServices(meet=FakeMeet(), drive=FakeDrive())
+
+    with pytest.raises(ValueError, match="resource_name"):
+        google_meet_source(services=services, resource_name=name)
+
+
 def test_missing_credentials_fail_when_the_source_is_built():
     with pytest.raises(ValueError, match="credentials are missing"):
         google_meet_source()

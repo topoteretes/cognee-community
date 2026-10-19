@@ -16,53 +16,13 @@ handed directly to :func:`cognee.remember`::
         max_rows_per_table=0,        # 0 = no row cap
     )
 
-Design
-------
-* **Auth** — read-only ``meetings.space.readonly`` scope, plus
-  ``drive.meet.readonly`` (only Drive files Meet created) to see whether a
-  transcript Doc still exists.  Settings come from cognee's own Google OAuth
-  settings (``GoogleSettings``) under the ``GOOGLE_MEET_`` prefix.  Three ways
-  in: a refresh token plus client id and secret (headless), the installed-app
-  browser flow with a cached 0600 token file (local), or a ready-made access
-  token (hosts).
-* **Incremental cursor** — Meet has no change feed.  The start time of the
-  newest finished conference is kept in dlt resource state, and later runs list
-  conferences that started from one hour before it, skipping the ones already
-  done.  Conferences still running, or whose transcript is still being
-  written, wait in a pending list and are read again on the next run.
-* **Two kinds of rows** — one document per conference (meeting link,
-  participants and their join and leave times) and one per transcript.  They are
-  separate on purpose: deleting a transcript forgets the words but keeps the
-  attendance record.
-* **Forget-on-delete** — Meet keeps a transcript's record even after the user
-  deletes its Google Doc, so Drive is the delete signal: a trashed or missing Doc
-  is forgotten.  Deletes are emitted with the ``_deleted`` hard-delete marker and
-  removed by cognee's ``orphan_cleanup``.
-* **Expiry is not a delete** — Meet drops conference records 30 days after they
-  end.  The connector stops tracking them then, and what cognee learned stays.
-* **Errors never delete** — a conference that fails stays pending and is read
-  again on the next run; a Doc that cannot be checked stays watched.
-* **One bad conference does not block the others** — when Google answers with
-  an HTTP error, the other conferences finish and save their state.  The run
-  raises only when nothing finished: ``dlt`` rolls back the state of a failed
-  run, so raising after a partial success would throw the finished work away.
-  Failures are counted in ``cognee_sync_stats`` (``failed`` plus ``failed_auth``,
-  ``failed_rate_limit``, ``failed_conference``, ``failed_transcript_check`` or
-  ``failed_conference_list``).  A 401, a 429 and a 403 with a rate-limit reason
-  end the run, since every later call would fail the same way.  A failing
-  conference list always raises: nothing can be synced without it.
-* **Privacy** — logs and errors carry counts and HTTP statuses, never
-  conference, space or Doc ids, meeting codes or names, nor the request URLs
-  googleapiclient puts in its own error text.
-* **Document path** — rows become text documents.  The ``Meeting link`` line is
-  written exactly like the Google Calendar connector writes it, so cognify can
-  join a conference to its calendar event.
-
-Limitations
------------
-* Meet only lists conferences where the signed-in user was the organizer.
-* Signed-in participants come with a display name only, no email address.
-* Recordings are noted (yes or no), never downloaded.
+Meet has no change feed, so the newest finished conference's start time is the
+cursor, and conferences still running or with a transcript still being written
+wait in a pending list.  Each conference and each transcript is its own
+document, so deleting a transcript's Google Doc forgets the words but keeps the
+attendance.  Expiry at Meet is not a delete, errors never delete, and one bad
+conference never blocks the others.  The README explains the sync model, the
+failure counts in ``cognee_sync_stats`` and the limitations.
 """
 
 import json
@@ -70,7 +30,7 @@ import os
 import re
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from cognee.modules.integrations.google import GoogleAuthError, GoogleSettings
@@ -80,6 +40,14 @@ from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
 from pydantic_settings import SettingsConfigDict
 
 logger = get_logger("google_meet_connector")
+
+# datetime.UTC only exists from Python 3.11.
+UTC = timezone.utc
+# dlt uses the resource name as a table name and a state key, so it has to be
+# already normalized and short enough to be part of a file name.
+_RESOURCE_NAME = re.compile(r"[a-z][a-z0-9_]{0,63}")
+# Every failure reason _Failures can count, published as plain int counts.
+_FAILURE_REASONS = ("auth", "rate_limit", "conference", "transcript_check", "conference_list")
 
 MEET_READONLY_SCOPE = "https://www.googleapis.com/auth/meetings.space.readonly"
 DRIVE_MEET_READONLY_SCOPE = "https://www.googleapis.com/auth/drive.meet.readonly"
@@ -315,12 +283,16 @@ def _list_all(
     """
     items: list[dict] = []
     page_token = None
+    seen: set[str] = set()
     while True:
         response = _execute(list_call(pageToken=page_token, **params), check_active)
         items.extend(response.get(key, []))
         page_token = response.get("nextPageToken")
         if not page_token:
             return items
+        if page_token in seen:
+            raise GoogleMeetError("Google returned the same page token twice; stopping.")
+        seen.add(page_token)
 
 
 def _get_record(meet: Any, conference_id: str, check_active) -> dict | None:
@@ -369,7 +341,7 @@ class _Failures:
         self.last = error
         reason = _failure_reason(error) or kind
         self.stats["failed"] += 1
-        self.stats[f"failed_{reason}"] = self.stats.get(f"failed_{reason}", 0) + 1
+        self.stats[f"failed_{reason}"] += 1
         logger.warning(
             "Google Meet: a %s failed (HTTP %s); it is kept and retried on the next run.",
             kind.replace("_", " "),
@@ -406,6 +378,7 @@ def _iter_rows(
     """
     stats.clear()
     stats.update(conferences=0, transcripts=0, deleted=0, pending=0, failed=0)
+    stats.update({f"failed_{reason}": 0 for reason in _FAILURE_REASONS})
     now = now or datetime.now(UTC)
     meet = services.meet
 
@@ -798,7 +771,8 @@ def google_meet_source(
     and ``primary_key="id"``.
 
     Args:
-        resource_name: Stable dlt resource name. Give each account its own name
+        resource_name: Stable dlt resource name: lowercase letters, digits and
+            underscores, up to 64 characters.  Give each account its own name
             when several sync into one dataset, so their state stays separate.
         include_transcripts: Also sync transcripts. Turning it off later forgets
             the transcripts already synced.
@@ -818,6 +792,13 @@ def google_meet_source(
         raise RuntimeError(
             "Google Meet sync requires a Cognee build with table-scoped DLT document "
             "cleanup. Upgrade Cognee before syncing to avoid deleting another source's data."
+        )
+    if not isinstance(resource_name, str) or not _RESOURCE_NAME.fullmatch(resource_name):
+        # An empty name would silently drop the pipeline scope, and a name dlt
+        # normalizes differently would share a table with another account.
+        raise ValueError(
+            "resource_name must be 1 to 64 lowercase letters, digits or underscores, "
+            'starting with a letter, like "work_meet".'
         )
 
     config = _MeetConfig(

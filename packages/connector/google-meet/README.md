@@ -12,10 +12,10 @@ and its calendar event end up linked in the graph.
 
 ## Requirements
 
-- cognee **1.6.3** (pinned). The connector relies on table-scoped document cleanup
+- cognee **1.6.3 or newer** (below 2). The connector relies on table-scoped document cleanup
   (`DOCUMENT_SYNC_VERSION`), `PIPELINE_SCOPE_ATTR`, `guarded_rows`, and reuses cognee's
   Google OAuth settings (`cognee.modules.integrations.google.GoogleSettings`).
-- Python 3.11 to 3.13.
+- Python 3.10 to 3.13.
 - A Google account that **organizes** the meetings: Meet only lists conferences where the
   signed-in user was the organizer.
 - Transcripts need a Google Workspace edition that can transcribe. On a personal Gmail
@@ -88,12 +88,14 @@ the attendance from Meet, and the shared `Meeting link` line joins them.
 | `check_drive_deletes` | – | `True`; with `False` only the Meet scope is asked and deleted Docs are not noticed |
 | `settings` | `GOOGLE_MEET_CLIENT_ID`, `_CLIENT_SECRET`, `_REFRESH_TOKEN`, `_CREDENTIALS_PATH`, `_TOKEN_PATH` | read from the environment |
 | `access_token` | `GOOGLE_MEET_ACCESS_TOKEN` | for hosts and quick tries only |
-| `resource_name` | – | `google_meet`; give each account its own name when several sync into one dataset |
+| `resource_name` | – | `google_meet`. Lowercase letters, digits and underscores, up to 64. **Two Google accounts in one dataset need different names**, or they would share one table and one sync state |
 
 After a run, `source.cognee_sync_stats` holds counts only, never names or content:
 conferences, transcripts, deleted, pending and failed, plus `failed_auth`,
-`failed_rate_limit`, `failed_conference`, `failed_transcript_check` or
-`failed_conference_list` saying why.
+`failed_rate_limit`, `failed_conference`, `failed_transcript_check` and
+`failed_conference_list` saying why. All of them are present on every run, as 0 when
+nothing failed. A conference that keeps failing stays pending and costs one request per
+run until it succeeds or Meet expires it.
 
 ### What a conference looks like in memory
 
@@ -181,6 +183,7 @@ This connector reads personal data. Be clear about what it does:
   matters to you.
 - dlt state stores the cursor time, conference ids with their expiry time, and transcript
   ids with their Doc ids. It does not store names or text.
+- Everyone who can read the cognee dataset can read the synced attendance and transcripts.
 - Logs, errors and `cognee_sync_stats` contain counts and HTTP statuses only: no conference,
   space or Doc ids, meeting codes or names, and not the request URLs that googleapiclient
   puts in its own error text.
@@ -224,11 +227,14 @@ manual check: lists come newest first, an empty list is `{}`, and every list cal
   on a later page, a failing conference that stays pending while the others finish, auth and
   rate limits (also a 403 with a rate-limit reason) that end the run but keep what finished,
   `check_active` before every request, a participant order that does not depend on Google's,
-  no ids or names in logs or errors, no Drive calls when checks are off, and turning
-  transcripts off.
+  no ids or names in logs or errors, no Drive calls when checks are off, turning
+  transcripts off, failure counts present on every run, and a page token Google repeats
+  stopping instead of looping.
 - `test_google_meet_source.py` covers the settings inherited from cognee, the installed-app
   flow and its private token file, the scopes for each option, a cached token that lacks a
-  scope, the auth choices, and the resource markers.
+  scope, the auth choices, an unsafe `resource_name` refused, and the resource markers.
 - `test_google_meet_forget.py` runs the real cognee pipeline (LLM and embeddings mocked,
   working with both cognee model variants) and checks that a transcript whose Doc was
-  deleted leaves the graph, while the other transcript and the attendance record stay.
+  deleted leaves the graph and the dataset, while the other transcript and the attendance
+  record stay, and that two Google accounts in one dataset never touch each other's
+  meetings. It fails if the tombstone or the `hard_delete` column is turned off.

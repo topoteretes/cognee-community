@@ -7,7 +7,7 @@ for the next run.
 """
 
 import logging
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fake_meet import FakeDrive, FakeMeet, HttpError, install_google_errors
@@ -16,12 +16,13 @@ from cognee_community_connector_google_meet.google_meet import (
     GoogleMeetError,
     MeetServices,
     _iter_rows,
+    _list_all,
     _MeetConfig,
     _parse_time,
 )
 
 T0 = datetime(2026, 10, 17, 10, 0)
-NOW = datetime(2026, 10, 17, 12, 0, tzinfo=UTC)
+NOW = datetime(2026, 10, 17, 12, 0, tzinfo=timezone.utc)
 
 
 def at(minutes: int, seconds: int = 0) -> datetime:
@@ -103,7 +104,18 @@ def test_conference_row_shape_and_content(meet, drive):
         "url": "https://meet.google.com/abc-mnop-xyz",
         "_deleted": False,
     }
-    assert stats == {"conferences": 1, "transcripts": 0, "deleted": 0, "pending": 0, "failed": 0}
+    assert stats == {
+        "conferences": 1,
+        "transcripts": 0,
+        "deleted": 0,
+        "pending": 0,
+        "failed": 0,
+        "failed_auth": 0,
+        "failed_rate_limit": 0,
+        "failed_conference": 0,
+        "failed_transcript_check": 0,
+        "failed_conference_list": 0,
+    }
 
 
 def test_meeting_link_line_matches_the_google_calendar_connector():
@@ -665,7 +677,7 @@ def test_a_403_without_a_rate_limit_reason_fails_only_its_conference(meet, drive
     upserts, _, stats = sync(meet, drive, {})
 
     assert set(upserts) == {conf_id(fine)}
-    assert stats["failed_conference"] == 1 and "failed_rate_limit" not in stats
+    assert stats["failed_conference"] == 1 and stats["failed_rate_limit"] == 0
 
 
 def test_meet_404_on_a_listed_conference_is_a_failure_not_an_expiry(meet, drive):
@@ -689,7 +701,18 @@ def test_stats_start_every_run_with_zero_failures(meet, drive):
 
     list(_iter_rows(MeetServices(meet, drive), _MeetConfig(), {}, stats, now=NOW))
 
-    assert stats == {"conferences": 1, "transcripts": 0, "deleted": 0, "pending": 0, "failed": 0}
+    assert stats == {
+        "conferences": 1,
+        "transcripts": 0,
+        "deleted": 0,
+        "pending": 0,
+        "failed": 0,
+        "failed_auth": 0,
+        "failed_rate_limit": 0,
+        "failed_conference": 0,
+        "failed_transcript_check": 0,
+        "failed_conference_list": 0,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -769,9 +792,11 @@ def test_participant_order_from_google_does_not_change_the_content(drive):
 
 def test_timestamps_with_nanoseconds_and_offsets_are_read_as_utc():
     assert _parse_time("2026-10-17T10:02:00.123456789Z") == datetime(
-        2026, 10, 17, 10, 2, 0, 123456, tzinfo=UTC
+        2026, 10, 17, 10, 2, 0, 123456, tzinfo=timezone.utc
     )
-    assert _parse_time("2026-10-17T15:32:00+05:30") == datetime(2026, 10, 17, 10, 2, tzinfo=UTC)
+    assert _parse_time("2026-10-17T15:32:00+05:30") == datetime(
+        2026, 10, 17, 10, 2, tzinfo=timezone.utc
+    )
 
 
 def test_no_ids_or_names_reach_logs_or_error_text(meet, drive, caplog):
@@ -801,3 +826,17 @@ def test_no_ids_or_names_reach_logs_or_error_text(meet, drive, caplog):
     # The cause is chained for debugging and carries the same promise.
     chain = error.value.__cause__
     assert chain is not None and other not in str(chain) and "doc-secret-plan" not in str(chain)
+
+
+def test_a_repeated_page_token_raises_instead_of_looping():
+    calls: list = []
+
+    class _Stuck:
+        def execute(self, num_retries=0):
+            calls.append(1)
+            return {"conferenceRecords": [{"name": "conferenceRecords/x"}], "nextPageToken": "same"}
+
+    with pytest.raises(GoogleMeetError, match="same page token"):
+        _list_all(lambda **_params: _Stuck(), "conferenceRecords", None)
+
+    assert len(calls) == 2
