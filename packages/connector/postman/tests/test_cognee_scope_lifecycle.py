@@ -33,19 +33,16 @@ def test_forgetting_one_corpus_preserves_other_populated_corpus(tmp_path, monkey
         src = postman_source(
             client=client,
             workspace_id="w",
-            account_id="1",
-            corpus_owner=owner,
-            dataset_name=dataset,
+            resource_name=owner,
             collection_ids=selection,
         )
         configure_pipeline(src, dataset, runtime)
-        await cognee.add(
+        await cognee.remember(
             src,
             dataset_name=dataset,
             run_in_background=False,
             dlt_config={"write_disposition": "replace", "primary_key": "id"},
         )
-        await cognee.cognify(datasets=[dataset])
 
     async def run():
         await sync(left, "left")

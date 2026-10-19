@@ -64,9 +64,7 @@ async def main():
         source = postman_source(
             api_key=settings["POSTMAN_API_KEY"],
             workspace_id=settings["POSTMAN_WORKSPACE_ID"],
-            account_id=settings["POSTMAN_ACCOUNT_ID"],
-            corpus_owner="local_postman_lifecycle",
-            dataset_name=dataset,
+            resource_name="local_postman_lifecycle",
             collection_ids=selection,
         )
         configure_pipeline(source, dataset, runtime)

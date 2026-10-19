@@ -11,11 +11,13 @@ ruff format --check .
 uv build --wheel
 ```
 
-The clean validation environment uses Python 3.12.13, released Cognee 1.6.3,
-dlt 1.30.0 and httpx 0.28.1. Install the built wheel before validating it; source
+The original clean validation environment uses Python3.12.13, released Cognee1.6.3,
+dlt1.30.0 and httpx0.28.1. Additional isolated environments cover Python3.10.20 with
+Cognee1.6.3/dlt1.30.0 and dlt1.29.0, plus Python3.12.13 with Cognee1.6.5/dlt1.29.0. Install the built wheel before validating it; source
 checkout tests alone do not prove the installed artifact. The core capability guard
-requires document-sync support. Python 3.10, other minor Python versions, newer Cognee,
-and other dlt ranges are not validated by these receipts; pins remain deliberate.
+requires document-sync support. Other Python/core/backend combinations are not individually validated. The declared
+ranges now permit Python>=3.10, Cognee>=1.6.3,<2 and dlt>=1.29,<1.31. The dlt ceiling
+matches the current core's own requirement; allowing1.31 fails dependency resolution.
 
 The offline suite uses fake provider responses. It does exercise real dlt/SQLite
 replacement, Cognee staging read-back, interrupted-load recovery, source namespace
@@ -32,7 +34,7 @@ POSTMAN_MODEL_TEST=1 python -m pytest tests/test_cognee_scope_lifecycle.py -q
 ```
 
 This optional test populates two source scopes in one dataset, changes one selection
-to empty, verifies that its Data/graph/vectors disappear while the sibling remains
+to empty through `cognee.remember`, verifies that its Data/graph/vectors disappear while the sibling remains
 searchable, repeats the empty sync, then deletes the final upstream collection under
 the default policy. The provider is fake; stores and model inference are real.
 

@@ -565,9 +565,9 @@ def postman_source(
     workspace_id: str | None = None,
     collection_ids: Iterable[str] | None = None,
     *,
-    account_id: str,
-    corpus_owner: str,
-    dataset_name: str,
+    account_id: str | None = None,
+    corpus_owner: str | None = None,
+    dataset_name: str | None = None,
     confirmed_deleted: Iterable[str] = (),
     missing_collection_policy: str = "mirror_visibility",
     page_size: int = 100,
@@ -582,8 +582,9 @@ def postman_source(
 ) -> "DltSource":
     """Return a scoped dlt source for foreground Cognee replace ingestion.
 
-    ``account_id`` must match /me. Scope/owner/dataset/resource_name are immutable
-    namespace inputs; selection is mutable. Token rotation preserves identity.
+    Optional ``account_id`` must match /me; otherwise the first loaded account is
+    bound in durable state. Ownership fields/resource_name are stable namespace
+    inputs; selection is mutable. Token rotation preserves identity.
     ``confirmed_deleted``
     acknowledges collection deletion or intentional scope removal after access loss.
     """
@@ -597,9 +598,12 @@ def postman_source(
     client = service if service is not None else client
     if not all(
         isinstance(value, str) and value.strip() and value == value.strip()
-        for value in [workspace_id, account_id, corpus_owner, dataset_name]
+        for value in [
+            workspace_id,
+            *[value for value in (account_id, corpus_owner, dataset_name) if value is not None],
+        ]
     ):
-        raise ValueError("workspace_id, account_id, corpus_owner and dataset_name are required.")
+        raise ValueError("workspace_id and any explicit ownership fields must be nonempty text.")
     if client is None and not api_key:
         raise ValueError("Pass api_key or an injected service.")
     if (
@@ -662,16 +666,26 @@ def postman_source(
         reader = CheckedReader()
         try:
             user = reader.get("/me").get("user")
-            if not isinstance(user, dict) or str(user.get("id")) != account_id:
+            identity = user.get("id") if isinstance(user, dict) else None
+            if (
+                isinstance(identity, bool)
+                or not isinstance(identity, (str, int))
+                or not str(identity)
+            ):
+                raise PostmanAuthError("Postman account identity could not be verified.")
+            identity = str(identity)
+            if account_id is not None and identity != account_id:
                 raise PostmanAuthError("Postman account differs from configured namespace.")
             # dlt resets resource_state before every replace extraction. Source-level
             # state retains the collection cache and still participates in load commit.
             state = dlt.current.source_state().setdefault("postman_snapshot", {})
+            if state.get("account_id", identity) != identity:
+                raise PostmanAuthError("Postman account changed; use a separate resource identity.")
             rows, next_state = build_snapshot(
                 reader,
                 state,
                 workspace_id=workspace_id,
-                account_id=account_id,
+                account_id=identity,
                 namespace=namespace,
                 missing_collection_policy=missing_collection_policy,
                 collection_ids=selection,
@@ -683,6 +697,8 @@ def postman_source(
                 stats=stats,
                 include_endpoint_metadata=include_endpoint_metadata,
             )
+            if account_id is None:
+                next_state["account_id"] = identity
             # Empty list + explicit columns creates a zero-row replacement table.
             # The whole cache is re-emitted on rerun, including downstream retries.
             if check_active:

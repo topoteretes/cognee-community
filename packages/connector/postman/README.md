@@ -10,7 +10,6 @@ collections and described folders without requests produce overview documents.
 pip install '.[test]'
 # Configure Cognee stores, extraction and embedding models separately.
 export POSTMAN_API_KEY='your-key' POSTMAN_WORKSPACE_ID='your-workspace'
-export POSTMAN_ACCOUNT_ID='your-account-id'
 export POSTMAN_COLLECTION_UIDS='collection-uid-1,collection-uid-2'
 python examples/quickstart.py
 ```
@@ -48,12 +47,17 @@ await cognee.add(
 await cognee.cognify(datasets=["postman_docs"])
 ```
 
+The factory needs only key, workspace and selection. Account/owner/dataset arguments
+are optional advanced ownership constraints. If account_id is omitted, `/me` binds the
+first loaded account in durable state; later account changes abort until a separate
+resource identity is chosen. Credential rotation within the same account remains valid.
 The factory reads no environment variables. `service=` injects a reader for hosts/tests;
 `client=` remains its alias. `check_active=` is an optional synchronous authorization or
 cancellation callback, checked before reads/retries and before/after snapshot publication.
 Callback exceptions propagate and prevent the pending extraction from committing.
-Account, owner and dataset are explicit so credential rotation cannot accidentally rebind
-an existing corpus. The destination dataset must match `dataset_name`.
+Use a stable resource name for each independently managed connection. If dataset_name
+is explicitly supplied, keep it consistent with the destination. Without that argument,
+Cognee's own dataset-specific pipeline and destination isolate the source state.
 
 ## Sync, ownership and deletion
 
@@ -126,8 +130,11 @@ raising from add: verify actual stores and retry after repairing the failure.
 
 ## Compatibility and evidence
 
-Declared Python range: 3.11–3.13; tested interpreter: **3.12.13**. Dependencies deliberately
-remain pinned to tested Cognee **1.6.3**, dlt **1.30.x**, httpx **0.28.1** in validation.
-No broader Python/core/backend compatibility is claimed. Tree depth is bounded, but whole
+Declared Python range: 3.10–3.13; tested interpreters: **3.10.20 and 3.12.13**.
+Dependencies allow Cognee **>=1.6.3,<2** and dlt **>=1.29,<1.31**. The test matrix
+covers Cognee1.6.3/1.6.5 and dlt1.29/1.30; Cognee1.6.5 itself requires dlt<1.31,
+so that ceiling is retained. Future allowed releases are not individually prevalidated;
+the document-sync capability guard remains. Other Python/backend combinations are
+not claimed as tested. Tree depth is bounded, but whole
 response/snapshot memory is not byte-budgeted; select smaller scopes for large workspaces.
 See [exact validation scope and runnable checks](VALIDATION.md).

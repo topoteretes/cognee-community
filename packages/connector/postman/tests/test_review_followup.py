@@ -295,3 +295,32 @@ def test_typed_failure_statistics(status, field):
         assert all(type(value) is int for value in src.cognee_sync_stats.values())
     finally:
         client.close()
+
+
+def test_minimal_factory_binds_first_account_and_rejects_account_switch(tmp_path):
+    import dlt
+    from dlt.destinations import sqlalchemy
+    from dlt.pipeline.exceptions import PipelineStepFailed
+
+    client = FakeClient()
+    pipeline = dlt.pipeline(
+        pipeline_name="minimal_account",
+        pipelines_dir=str(tmp_path / "pipelines"),
+        destination=sqlalchemy(credentials=f"sqlite:///{tmp_path}/db.sqlite"),
+        dataset_name="chosen_dataset",
+    )
+
+    def minimal():
+        return postman_source(workspace_id="w", service=client, resource_name="connection")
+
+    src = minimal()
+    pipeline.run(src)
+    assert pipeline.state["sources"][src.name]["postman_snapshot"]["account_id"] == "1"
+    saved = copy.deepcopy(pipeline.state["sources"])
+    get = client.get
+    client.get = lambda path, **params: (
+        {"user": {"id": "other"}} if path == "/me" else get(path, **params)
+    )
+    with pytest.raises(PipelineStepFailed):
+        pipeline.run(minimal())
+    assert pipeline.state["sources"] == saved

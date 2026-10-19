@@ -13,19 +13,15 @@ async def main():
     source = postman_source(
         api_key=os.environ["POSTMAN_API_KEY"],
         workspace_id=os.environ["POSTMAN_WORKSPACE_ID"],
-        account_id=os.environ["POSTMAN_ACCOUNT_ID"],
-        corpus_owner="my_postman_connection",
-        dataset_name=dataset,
         resource_name="postman_docs",
         collection_ids=os.environ["POSTMAN_COLLECTION_UIDS"].split(","),
     )
-    await cognee.add(
+    await cognee.remember(
         source,
         dataset_name=dataset,
         run_in_background=False,
         dlt_config={"write_disposition": "replace", "primary_key": "id"},
     )
-    await cognee.cognify(datasets=[dataset])
 
 
 if __name__ == "__main__":
