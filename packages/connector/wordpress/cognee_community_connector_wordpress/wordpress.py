@@ -73,12 +73,11 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import html
-import os
 import re
 import time
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from typing import Any
@@ -95,9 +94,15 @@ DEFAULT_USER_AGENT = (
     "cognee-community-connector-wordpress/0.1.0 (+https://github.com/topoteretes/cognee-community)"
 )
 
-# The REST API caps per_page at 100.
+# The REST API caps per_page at 100 (WP_REST_Controller::get_collection_params).
 _PAGE_SIZE = 100
+# Attempts per request on 429 / 5xx / network errors: our choice, so an
+# overloaded site costs at most a few minutes before the run stops cleanly.
 _MAX_RETRIES = 5
+# Longest wait honoured for Retry-After. The sync runs while cognee holds its
+# process-wide dlt staging lock, so a site asking for more stops the run cleanly
+# (state untouched, retried next run) instead of sleeping inside the lock.
+_MAX_RETRY_AFTER_SECONDS = 60.0
 _TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S"
 _WPCOM_API = "https://public-api.wordpress.com"
 _ITEM_FIELDS = (
@@ -117,6 +122,10 @@ class WordPressAPIError(RuntimeError):
 
 class WordPressAuthError(WordPressAPIError):
     """The credentials were rejected. Never carries the password."""
+
+
+class WordPressRateLimitedError(WordPressAPIError):
+    """The site kept answering 429 beyond what a run waits."""
 
 
 # ---------------------------------------------------------------------------
@@ -193,8 +202,9 @@ class _WordPressClient:
 def _get(client: _WordPressClient, url: str, params: dict[str, Any]) -> tuple[Any, Any]:
     import httpx
 
-    for attempt in range(_MAX_RETRIES):
-        last_attempt = attempt == _MAX_RETRIES - 1
+    attempt = 0
+    while True:
+        last_attempt = attempt >= _MAX_RETRIES - 1
         client.requests += 1
         try:
             response = client._http.get(
@@ -203,17 +213,21 @@ def _get(client: _WordPressClient, url: str, params: dict[str, Any]) -> tuple[An
         except httpx.TransportError as exc:
             if last_attempt:
                 raise
-            _backoff(client, f"network error ({type(exc).__name__})", None, attempt)
+            _backoff(client, f"network error ({type(exc).__name__})", None, attempt, False)
+            attempt += 1
             continue
 
         if client.server_time is None and response.headers.get("date"):
             # The site's own clock is the cursor, never this machine's.
             with contextlib.suppress(TypeError, ValueError):
-                client.server_time = parsedate_to_datetime(response.headers["date"]).astimezone(UTC)
+                client.server_time = parsedate_to_datetime(response.headers["date"]).astimezone(
+                    timezone.utc
+                )
 
         status = response.status_code
         if (status == 429 or status >= 500) and not last_attempt:
-            _backoff(client, f"HTTP {status}", response.headers, attempt)
+            _backoff(client, f"HTTP {status}", response.headers, attempt, status == 429)
+            attempt += 1
             continue
         if status >= 400:
             try:
@@ -222,21 +236,33 @@ def _get(client: _WordPressClient, url: str, params: dict[str, Any]) -> tuple[An
                 error = {}
             code = str(error.get("code") or f"http_{status}") if isinstance(error, dict) else ""
             message = str(error.get("message") or "") if isinstance(error, dict) else ""
-            error_class = WordPressAuthError if status in (401, 403) else WordPressAPIError
+            if status in (401, 403):
+                error_class: type[WordPressAPIError] = WordPressAuthError
+            elif status == 429:
+                error_class = WordPressRateLimitedError
+            else:
+                error_class = WordPressAPIError
             raise error_class(code or f"http_{status}", status, message)
         try:
             return response.json(), response.headers
         except ValueError as exc:
             raise WordPressAPIError("invalid_json", status, "the response is not JSON") from exc
 
-    raise WordPressAPIError("retries_exhausted")  # pragma: no cover - loop always returns
 
-
-def _backoff(client: _WordPressClient, reason: str, headers: Any, attempt: int) -> None:
-    delay = float(2**attempt)
+def _backoff(
+    client: _WordPressClient, reason: str, headers: Any, attempt: int, rate_limit: bool
+) -> None:
+    delay = min(float(2**attempt), _MAX_RETRY_AFTER_SECONDS)
     if headers is not None:
         with contextlib.suppress(TypeError, ValueError):
             delay = max(float(headers.get("retry-after")), 0.0)
+    if delay > _MAX_RETRY_AFTER_SECONDS:
+        error_class = WordPressRateLimitedError if rate_limit else WordPressAPIError
+        raise error_class(
+            "retry_after_too_long",
+            None,
+            f"the site asked to wait {delay:.0f}s (more than {_MAX_RETRY_AFTER_SECONDS:.0f}s)",
+        )
     logger.warning(
         "WordPress: %s, retrying in %.1fs (%d/%d).", reason, delay, attempt + 1, _MAX_RETRIES
     )
@@ -643,9 +669,11 @@ def _render_row(
             if isinstance(term, dict) and term.get("name"):
                 taxonomy = term.get("taxonomy") or "terms"
                 terms.setdefault(taxonomy, []).append(html.unescape(term["name"]))
-    for taxonomy, names in terms.items():
+    # Sorted: the embedded term order is not guaranteed between requests, and a
+    # different order would change the content hash and re-extract the item.
+    for taxonomy in sorted(terms):
         label = scope.taxonomy_labels.get(taxonomy, taxonomy)
-        header.append(f"{label}: " + ", ".join(names))
+        header.append(f"{label}: " + ", ".join(sorted(terms[taxonomy])))
 
     body = html_to_text((item.get("content") or {}).get("rendered") or "")
     if not body:
@@ -684,11 +712,11 @@ def _tombstone(item_id: int | str) -> dict:
 # ---------------------------------------------------------------------------
 def _format_time(value: datetime) -> str:
     """UTC with an explicit offset: WordPress reads a naive time as site-local."""
-    return value.astimezone(UTC).strftime(_TIMESTAMP_FORMAT) + "+00:00"
+    return value.astimezone(timezone.utc).strftime(_TIMESTAMP_FORMAT) + "+00:00"
 
 
 def _parse_time(value: str) -> datetime:
-    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
 
 
 @dataclass
@@ -700,7 +728,7 @@ class _Run:
     previous: dict[int, dict]
     rerender: bool
     items: dict[int, dict] = field(default_factory=dict)
-    stats: dict[str, Any] = field(default_factory=dict)
+    stats: dict[str, int] = field(default_factory=dict)
 
     def seen(self, item: dict, post_type: _PostType, comments_hash: str | None) -> dict:
         return {
@@ -778,16 +806,7 @@ def _full_sync_reason(state: dict, settings: _Settings, now: datetime) -> str | 
     return None
 
 
-def sync_items(client: _WordPressClient, settings: _Settings, state: dict, stats: dict):
-    """Yield changed items and deletion tombstones, then advance ``state``.
-
-    ``state`` is only written after the last row was yielded, so a run that
-    raises part-way keeps the previous cursor (dlt also discards the state of
-    a failed load).
-    """
-    stats.clear()
-    stats.update(items_scanned=0, items_changed=0, items_unchanged=0, deleted=0)
-
+def _sync(client: _WordPressClient, settings: _Settings, state: dict, stats: dict[str, int]):
     if client.authenticated:
         # WordPress serves a request with rejected credentials as anonymous, so
         # a wrong password would otherwise surface as a confusing "status is
@@ -801,11 +820,12 @@ def sync_items(client: _WordPressClient, settings: _Settings, state: dict, stats
     scope = _resolve_scope(client, settings)
     # The first response carried the site's clock: anything modified from here
     # on is newer than this run's cursor.
-    now = client.server_time or datetime.now(UTC)
+    now = client.server_time or datetime.now(timezone.utc)
     previous = {int(item_id): seen for item_id, seen in (state.get("items") or {}).items()}
     reason = _full_sync_reason(state, settings, now)
-    stats["mode"] = "full" if reason else "incremental"
-    stats["full_sync_reason"] = reason
+    if reason:
+        stats["full_sync"] = 1
+        stats[f"full_sync_{reason}"] = 1
 
     run = _Run(
         client=client,
@@ -855,32 +875,74 @@ def sync_items(client: _WordPressClient, settings: _Settings, state: dict, stats
     if previous and not present:
         # An empty sweep while items were known is far more likely a revoked
         # password, a disabled REST route or an outage than a site that deleted
-        # everything. Forgetting the whole dataset would be permanent.
+        # everything. Forgetting the whole dataset would be permanent, and
+        # moving the cursor would skip the edits made before this run, so the
+        # run changes nothing and the next one retries.
         logger.warning(
             "WordPress: the scope listed 0 items but %d were synced before; "
-            "skipping deletions this run.",
+            "leaving the dataset and the sync state untouched.",
             len(previous),
         )
-        run.items.update(previous)
-    else:
-        yield from _emit_changes(run, present, fetched, comment_sets)
-        yield from _emit_deletions(run, present)
+        stats["failed"] = 1
+        stats["failed_empty_scope"] = 1
+        return
+    yield from _emit_changes(run, present, fetched, comment_sets)
+    yield from _emit_deletions(run, present)
 
+    # State is written only after the last row was yielded, so a run that
+    # raises part-way keeps the previous cursor (dlt also discards the state of
+    # a failed load).
     state["items"] = {str(item_id): seen for item_id, seen in sorted(run.items.items())}
     state["cursor"] = _format_time(now)
     state["scope"] = settings.scope_fingerprint()
     state["render"] = settings.render_fingerprint()
     if reason:
         state["last_full_sync"] = _format_time(now)
-    stats["requests"] = client.requests
     logger.info(
         "WordPress: %s sync, %d changed, %d unchanged, %d deleted, %d request(s).",
-        stats["mode"],
+        "full" if reason else "incremental",
         stats["items_changed"],
         stats["items_unchanged"],
         stats["deleted"],
         client.requests,
     )
+
+
+def sync_items(client: _WordPressClient, settings: _Settings, state: dict, stats: dict):
+    """Yield changed items and deletion tombstones, then advance ``state``.
+
+    ``stats`` receives plain int counters for the host: ``items_scanned``,
+    ``items_changed``, ``items_unchanged``, ``deleted``, ``fetched_by_id``,
+    ``requests``, ``full_sync`` (plus ``full_sync_<reason>``) and ``failed``
+    (plus ``failed_<reason>``: ``rate_limit``, ``auth``, ``empty_scope``).
+
+    A site that keeps rate-limiting the run stops it cleanly: what was yielded
+    stays, the state is not advanced, and the next run resumes from the same
+    cursor. Rejected credentials raise.
+    """
+    stats.clear()
+    stats.update(
+        items_scanned=0,
+        items_changed=0,
+        items_unchanged=0,
+        deleted=0,
+        fetched_by_id=0,
+        requests=0,
+        full_sync=0,
+        failed=0,
+    )
+    try:
+        yield from _sync(client, settings, state, stats)
+    except WordPressRateLimitedError as exc:
+        stats["failed"] = 1
+        stats["failed_rate_limit"] = 1
+        logger.warning("WordPress: rate limited (%s); the next run resumes from here.", exc.code)
+    except WordPressAuthError:
+        stats["failed"] = 1
+        stats["failed_auth"] = 1
+        raise
+    finally:
+        stats["requests"] = client.requests
 
 
 def _emit_changes(
@@ -997,12 +1059,8 @@ def _default_resource_name(site_url: str) -> str:
     return f"wordpress_{slug}"
 
 
-def _env_list(name: str) -> list[str]:
-    return [value.strip() for value in (os.getenv(name) or "").split(",") if value.strip()]
-
-
 def wordpress_source(
-    site_url: str | None = None,
+    site_url: str,
     *,
     post_types: list[str] | None = None,
     statuses: list[str] | None = None,
@@ -1014,23 +1072,24 @@ def wordpress_source(
     overlap_seconds: int = 300,
     reconcile_after_days: float | None = 7,
     full_sync: bool = False,
-    user_agent: str | None = None,
+    user_agent: str = DEFAULT_USER_AGENT,
     resource_name: str | None = None,
     check_active: Callable[[], None] | None = None,
+    service: Any = None,
     http_client: Any = None,
 ):
     """Return a ``dlt`` resource yielding one document row per in-scope item.
 
     Hand the result to ``cognee.remember(...)`` with
     ``write_disposition="merge"``, ``primary_key="id"`` and
-    ``max_rows_per_table=0``.
+    ``max_rows_per_table=0``. Configuration is passed explicitly; reading it
+    from the environment is left to the caller (see ``examples/example.py``).
 
     Args:
         site_url: The site's address, e.g. ``https://blog.example.com`` or
-            ``https://example.wordpress.com``. Falls back to ``WORDPRESS_URL``.
-        post_types: Post type slugs to sync. Defaults to ``["post", "page"]``
-            (or ``WORDPRESS_POST_TYPES``, comma-separated). Custom post types
-            work as long as the plugin exposes them over REST.
+            ``https://example.wordpress.com``.
+        post_types: Post type slugs to sync. Defaults to ``["post", "page"]``.
+            Custom post types work as long as the plugin exposes them over REST.
         statuses: Post statuses to sync. Defaults to ``["publish"]``; anything
             else (``private``, ``draft``, ...) needs an Application Password.
         categories: Category slugs. Types that have categories (posts) are
@@ -1038,22 +1097,23 @@ def wordpress_source(
         tags: Tag slugs, applied the same way.
         include_comments: Append each item's approved comments to its document.
         username: The WordPress user the Application Password belongs to.
-            Falls back to ``WORDPRESS_USERNAME``.
         application_password: An Application Password (Users → Profile →
-            Application Passwords). Falls back to ``WORDPRESS_APP_PASSWORD``.
-            WordPress only accepts it over HTTPS (or on a local development site).
+            Application Passwords). WordPress only accepts it over HTTPS (or on
+            a local development site).
         overlap_seconds: How far before the previous run's server time the
             ``modified_after`` feed is replayed.
         reconcile_after_days: Re-render every item at least this often, which
             picks up edited comment text (``None`` to disable).
         full_sync: Re-render every item on this run.
-        user_agent: User-Agent header. Falls back to ``WORDPRESS_USER_AGENT``.
+        user_agent: User-Agent header.
         resource_name: dlt resource / staging table name, also the key of the
             incremental state. Defaults to one derived from ``site_url``, so
             several sites can sync into one dataset. Two sources sharing a
             name share state, so each would forget the other's items.
         check_active: Optional host authorization checkpoint during extraction.
-        http_client: Pre-built ``httpx.Client`` (a test injection point).
+        service: Pre-built ``httpx.Client`` (a test injection point, or a client
+            that already carries a session).
+        http_client: Alias of ``service``.
     """
     import dlt
     import httpx
@@ -1064,19 +1124,24 @@ def wordpress_source(
             "sets (DOCUMENT_SYNC_VERSION >= 2, cognee 1.6.3+). Upgrade cognee."
         )
 
-    resolved_url = (site_url or os.getenv("WORDPRESS_URL") or "").strip()
+    if service is not None and http_client is not None and service is not http_client:
+        raise ValueError("Pass the pre-built client as service= or http_client=, not both.")
+    injected_client = service if service is not None else http_client
+
+    resolved_url = (site_url or "").strip()
     if urlparse(resolved_url).scheme not in ("http", "https") or not urlparse(resolved_url).netloc:
-        raise ValueError(
-            "wordpress_source needs the site's URL, e.g. https://blog.example.com "
-            "(pass site_url= or set WORDPRESS_URL)."
-        )
-    resolved_user = username or os.getenv("WORDPRESS_USERNAME")
-    resolved_password = application_password or os.getenv("WORDPRESS_APP_PASSWORD")
-    if bool(resolved_user) != bool(resolved_password):
+        raise ValueError("wordpress_source needs the site's URL, e.g. https://blog.example.com.")
+    if bool(username) != bool(application_password):
         raise ValueError("Pass both username and application_password, or neither.")
-    resolved_types = post_types or _env_list("WORDPRESS_POST_TYPES") or ["post", "page"]
+    if not user_agent or not user_agent.strip():
+        raise ValueError("user_agent must not be empty.")
+    resolved_types = post_types or ["post", "page"]
     resolved_statuses = statuses or ["publish"]
-    if set(resolved_statuses) - {"publish"} and not resolved_password and http_client is None:
+    if (
+        set(resolved_statuses) - {"publish"}
+        and not application_password
+        and injected_client is None
+    ):
         raise ValueError(
             f"Statuses {sorted(set(resolved_statuses) - {'publish'})} are only visible with "
             "an Application Password (pass username= and application_password=)."
@@ -1094,10 +1159,9 @@ def wordpress_source(
         reconcile_after_days=reconcile_after_days,
         full_sync=full_sync,
     )
-    resolved_agent = user_agent or os.getenv("WORDPRESS_USER_AGENT") or DEFAULT_USER_AGENT
-    auth = (resolved_user, resolved_password) if resolved_password else None
+    auth = (username, application_password) if username and application_password else None
     name = resource_name or _default_resource_name(resolved_url)
-    stats: dict[str, Any] = {}
+    stats: dict[str, int] = {}
 
     @dlt.resource(
         name=name,
@@ -1111,12 +1175,14 @@ def wordpress_source(
     )
     def wordpress_items():
         owned_client = (
-            None if http_client is not None else httpx.Client(timeout=30.0, follow_redirects=True)
+            None
+            if injected_client is not None
+            else httpx.Client(timeout=30.0, follow_redirects=True)
         )
         try:
-            http = http_client or owned_client
-            api = discover_api(http, resolved_url, resolved_agent)
-            client = _WordPressClient(http, api, resolved_agent, auth)
+            http = injected_client or owned_client
+            api = discover_api(http, resolved_url, user_agent)
+            client = _WordPressClient(http, api, user_agent, auth)
             state = dlt.current.resource_state()
             site_key = f"{api.flavor}:{api.root}"
             if state.get("items") and state.get("site") not in (None, site_key):
@@ -1143,6 +1209,6 @@ def wordpress_source(
     # Keep the incremental state per (dataset, resource), so syncing the same
     # site into another dataset does not reuse this one's cursor.
     setattr(resource, dlt_utils.PIPELINE_SCOPE_ATTR, name)
-    # Host-readable diagnostics: counts and the sync mode, never content.
+    # Host-readable diagnostics: int counters only, never content.
     resource.cognee_sync_stats = stats
     return resource

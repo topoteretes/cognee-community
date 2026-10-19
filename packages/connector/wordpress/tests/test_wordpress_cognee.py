@@ -128,7 +128,7 @@ async def test_deleting_a_post_upstream_forgets_its_graph_content(clean_environm
     wp.tick(3600)
 
     source = await _sync(wp)
-    assert source.cognee_sync_stats["mode"] == "full"
+    assert source.cognee_sync_stats["full_sync"] == 1
     assert await _graph_has(ALPHA) and await _graph_has(BRAVO)
     # Every item sits under the site's node set, so recall can be scoped to it.
     assert await _graph_has("wordpress:blog.example.com")
@@ -146,7 +146,7 @@ async def test_deleting_a_post_upstream_forgets_its_graph_content(clean_environm
     # Nothing changed upstream: same documents, no new ones.
     wp.tick(600)
     source = await _sync(wp)
-    assert source.cognee_sync_stats["mode"] == "incremental"
+    assert source.cognee_sync_stats["full_sync"] == 0
     assert source.cognee_sync_stats["items_changed"] == 0
     assert {d.id for d in await _documents()} == ids_before
 

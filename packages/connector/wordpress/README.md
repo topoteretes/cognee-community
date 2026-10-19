@@ -11,7 +11,7 @@ delete**.
 
 ## Requirements
 
-- cognee **1.6.3** or newer (document mode with per-row node sets).
+- Python 3.10+ and cognee **1.6.3** or newer, below 2 (document mode with per-row node sets).
 - A site with the REST API enabled (the default since WordPress 4.7; `modified_after` needs
   WordPress 5.7+).
 
@@ -55,8 +55,8 @@ Run it again with the same dataset to sync only what changed.
 2. **Private content** (`statuses=["private", "publish"]`, drafts, ...) needs an **Application
    Password**: in the WordPress admin go to *Users → Profile → Application Passwords*, enter a
    name (e.g. `cognee`) and click *Add New Application Password*. Pass the user name and the
-   generated password (spaces are fine) as `username=` / `application_password=`, or set
-   `WORDPRESS_USERNAME` / `WORDPRESS_APP_PASSWORD`. WordPress only accepts Application Passwords
+   generated password (spaces are fine) as `username=` / `application_password=`. WordPress
+   only accepts Application Passwords
    over HTTPS (or on a site whose `WP_ENVIRONMENT_TYPE` is `local`). The credentials are
    checked once at the start of every run, so a rejected password fails with
    `WordPressAuthError` instead of silently syncing public content only.
@@ -64,7 +64,8 @@ Run it again with the same dataset to sync only what changed.
    `public-api.wordpress.com` automatically. Application Passwords are a self-hosted feature, so
    WordPress.com sites sync their public content.
 
-The site URL falls back to `WORDPRESS_URL`.
+The source reads no environment variables; `examples/example.py` shows reading
+`WORDPRESS_URL`, `WORDPRESS_USERNAME` and `WORDPRESS_APP_PASSWORD` and passing them in.
 
 ### Choosing what to ingest
 
@@ -86,8 +87,10 @@ the run instead of syncing nothing.
 | `overlap_seconds` | `300` | how far the `modified_after` feed is replayed before the last run |
 | `reconcile_after_days` | `7` | re-render every item at least this often (`None` to disable) |
 | `full_sync` | `False` | re-render every item on this run |
-| `user_agent` | env / generic | `User-Agent` header (`WORDPRESS_USER_AGENT`) |
+| `user_agent` | generic | `User-Agent` header |
 | `resource_name` | from the URL | staging table and state key; unique per site, so several sites can share a dataset |
+| `check_active` | none | host authorization checkpoint, called while rows are produced |
+| `service` | none | a pre-built `httpx.Client` (alias: `http_client`) |
 
 ## What a document contains
 
@@ -127,13 +130,29 @@ Every item carries the `wordpress:<host>` node set (e.g. `wordpress:blog.example
 4. **Comments.** An id-only sweep of the approved comments **of the items in scope** (never
    site-wide) re-renders the items whose comment set changed: new, deleted or unapproved
    comments.
-5. **Safety.** A sweep that returns no items while items were synced before deletes nothing (a
-   revoked password or a disabled REST route cannot wipe the dataset). Every API error aborts the
-   run before its state is saved, so the next run retries. HTTP 429, 5xx and network errors are
-   retried, honouring `Retry-After`.
+5. **Safety.** A sweep that returns no items while items were synced before deletes nothing
+   and leaves the sync state untouched, so the cursor does not move (a revoked password or a
+   disabled REST route can neither wipe the dataset nor skip edits; the run reports
+   `failed_empty_scope`). Every API error aborts the run before its state is saved, so the
+   next run retries. HTTP 429, 5xx and network errors are retried, honouring `Retry-After` up
+   to 60 seconds; a site that keeps rate-limiting the run stops it cleanly instead (what was
+   synced stays, the state is not advanced, and the next run resumes).
 
 A scope or rendering change (different `post_types`, `statuses`, `categories`, `tags` or
 `include_comments`) reconciles everything: items that left the scope are forgotten.
+
+### Sync stats
+
+After a run, `source.cognee_sync_stats` holds plain int counters: `items_scanned`,
+`items_changed`, `items_unchanged`, `deleted`, `fetched_by_id`, `requests`, `full_sync` (with
+`full_sync_<reason>` for `initial`, `requested`, `scope_changed`, `render_changed` or
+`periodic`) and `failed` (with `failed_rate_limit`, `failed_auth` or `failed_empty_scope`).
+
+### Privacy
+
+With `include_comments=True` (the default), commenters' display names and their comment text
+go into memory along with the item. A comment that is later unapproved or deleted leaves the
+document on the next run. Pass `include_comments=False` to keep commenters out of memory.
 
 ### Limitations
 

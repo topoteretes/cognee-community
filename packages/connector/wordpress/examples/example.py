@@ -54,7 +54,14 @@ async def main() -> None:
     # Posts and pages by default; add custom post types with
     # post_types=["post", "page", "product"], or narrow posts with
     # categories=["news"] / tags=["release"].
-    source = wordpress_source(SITE_URL, **SCOPE)
+    # The source reads no environment itself; the example passes settings in.
+    # A private site: an Application Password (Users -> Profile).
+    source = wordpress_source(
+        SITE_URL,
+        username=os.environ.get("WORDPRESS_USERNAME") or None,
+        application_password=os.environ.get("WORDPRESS_APP_PASSWORD") or None,
+        **SCOPE,
+    )
 
     print(f"Syncing {SITE_URL} into cognee ...")
     await cognee.remember(
@@ -66,7 +73,8 @@ async def main() -> None:
     )
     stats = source.cognee_sync_stats
     print(
-        f"{stats['mode']} sync: {stats['items_changed']} item(s) ingested, "
+        f"{'full' if stats['full_sync'] else 'incremental'} sync: "
+        f"{stats['items_changed']} item(s) ingested, "
         f"{stats['items_unchanged']} unchanged, {stats['deleted']} forgotten."
     )
 

@@ -37,6 +37,9 @@ from cognee_community_connector_wordpress.wordpress import (
     WordPressAPIError,
     WordPressAuthError,
     _Api,
+    _PostType,
+    _render_row,
+    _Scope,
     _Settings,
     _WordPressClient,
     discover_api,
@@ -199,7 +202,7 @@ def test_initial_sync_emits_one_document_per_public_item(wp):
     # Private, password-protected and unselected types are not ingested.
     assert set(live) == _ids(wp, "Rockets &amp; Rust", "Bravo news", "About")
     assert deleted == set()
-    assert stats["mode"] == "full" and stats["full_sync_reason"] == "initial"
+    assert stats["full_sync"] == 1 and stats["full_sync_initial"] == 1
 
     row = live[str(_id(wp, "Rockets &amp; Rust"))]
     assert row["title"] == "Rockets & Rust"
@@ -255,7 +258,7 @@ def test_unchanged_site_yields_nothing_and_fetches_no_content(wp):
 
     live, deleted, stats = _sync(wp, state)
     assert live == {} and deleted == set()
-    assert stats["mode"] == "incremental" and stats["fetched_by_id"] == 0
+    assert stats["full_sync"] == 0 and stats["fetched_by_id"] == 0
     assert not [r for r in _requests(wp) if "include" in r]
 
 
@@ -459,7 +462,7 @@ def test_scope_change_reconciles_and_forgets_what_left_it(wp):
     state: dict = {}
     _sync(wp, state)
     live, deleted, stats = _sync(wp, state, post_types=("post",))
-    assert stats["full_sync_reason"] == "scope_changed"
+    assert stats["full_sync_scope_changed"] == 1
     assert live == {} and deleted == _ids(wp, "About")
 
 
@@ -467,11 +470,11 @@ def test_rendering_change_and_requested_full_sync_re_render_everything(wp):
     state: dict = {}
     _sync(wp, state)
     live, _, stats = _sync(wp, state, include_comments=False)
-    assert stats["full_sync_reason"] == "render_changed"
+    assert stats["full_sync_render_changed"] == 1
     assert set(live) == _ids(wp, "Rockets &amp; Rust", "Bravo news", "About")
 
     live, _, stats = _sync(wp, state, include_comments=False, full_sync=True)
-    assert stats["full_sync_reason"] == "requested" and len(live) == 3
+    assert stats["full_sync_requested"] == 1 and len(live) == 3
 
 
 def test_periodic_re_check_picks_up_edited_comment_text(wp):
@@ -485,18 +488,23 @@ def test_periodic_re_check_picks_up_edited_comment_text(wp):
 
     wp.tick(86400)
     live, _, stats = _sync(wp, state, reconcile_after_days=1)
-    assert stats["full_sync_reason"] == "periodic"
+    assert stats["full_sync_periodic"] == 1
     assert "Edited comment text." in live[str(comment.post)]["content"]
 
 
-def test_empty_sweep_never_mass_deletes(wp):
+def test_empty_sweep_never_mass_deletes_and_leaves_the_state_untouched(wp):
     state: dict = {}
     _sync(wp, state)
+    snapshot = copy.deepcopy(state)
+    wp.tick(600)
     for item in wp.items.values():
         item.status = "draft"
-    live, deleted, _ = _sync(wp, state)
+    live, deleted, stats = _sync(wp, state)
     assert live == {} and deleted == set()
-    assert len(state["items"]) >= 3
+    # Neither the cursor nor the reconcile clock may move: edits made before
+    # this run must still be replayed once the items are listed again.
+    assert state == snapshot
+    assert stats["failed"] == 1 and stats["failed_empty_scope"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -553,11 +561,14 @@ def test_resource_is_a_merge_document_source():
         ({"site_url": SITE_URL, "username": "only-user"}, "both username"),
         ({"site_url": SITE_URL, "statuses": ["private"]}, "Application Password"),
         ({"site_url": SITE_URL, "overlap_seconds": -1}, "negative"),
+        ({"site_url": ""}, "site's URL"),
+        ({"site_url": SITE_URL, "user_agent": " "}, "user_agent"),
     ],
 )
 def test_factory_validates_its_arguments(kwargs, message, monkeypatch):
-    for name in ("WORDPRESS_URL", "WORDPRESS_USERNAME", "WORDPRESS_APP_PASSWORD"):
-        monkeypatch.delenv(name, raising=False)
+    # The factory reads no environment: a set variable must not fill a gap.
+    monkeypatch.setenv("WORDPRESS_URL", SITE_URL)
+    monkeypatch.setenv("WORDPRESS_APP_PASSWORD", "from-env")
     with pytest.raises(ValueError, match=message):
         wordpress_source(**kwargs)
 
@@ -589,13 +600,13 @@ def test_forget_on_delete_end_to_end_through_a_real_dlt_merge(wp, tmp_path):
     source = run()
     table = source.name
     assert set(_staged(pipeline, table).values()) == {"Rockets & Rust", "Bravo news", "About"}
-    assert source.cognee_sync_stats["mode"] == "full"
+    assert source.cognee_sync_stats["full_sync"] == 1
 
     # The cursor persists in dlt's resource state: the next run is incremental.
     wp.delete(_id(wp, "About"))
     wp.edit(_id(wp, "Bravo news"), title="Bravo weekly")
     source = run()
-    assert source.cognee_sync_stats["mode"] == "incremental"
+    assert source.cognee_sync_stats["full_sync"] == 0
     assert set(_staged(pipeline, table).values()) == {"Rockets & Rust", "Bravo weekly"}
 
 
@@ -610,3 +621,74 @@ def test_one_resource_name_cannot_hold_two_sites(wp, tmp_path):
                 "https://other.example.com", http_client=other.client(), resource_name="items"
             )
         )
+
+
+# ---------------------------------------------------------------------------
+# Review checklist (same as the other connectors)
+# ---------------------------------------------------------------------------
+def test_term_order_does_not_change_the_document():
+    post_type = _PostType("post", "Posts", "wp/v2", "posts", ("category", "post_tag"))
+    scope = _Scope([post_type], {"category": "Categories", "post_tag": "Tags"}, [], [])
+
+    def item(groups):
+        return {
+            "id": 1,
+            "title": {"rendered": "T"},
+            "content": {"rendered": "<p>Body</p>"},
+            "_embedded": {"wp:term": groups},
+        }
+
+    cats = [
+        {"taxonomy": "category", "name": "News"},
+        {"taxonomy": "category", "name": "Alpha"},
+    ]
+    tags = [{"taxonomy": "post_tag", "name": "rust"}]
+    first = _render_row(item([cats, tags]), post_type, scope, [], "ns")
+    second = _render_row(item([tags, list(reversed(cats))]), post_type, scope, [], "ns")
+    assert first["content"] == second["content"]
+    assert "Categories: Alpha, News" in first["content"]
+
+
+def test_stats_are_plain_int_counters(wp):
+    _, _, stats = _sync(wp, {})
+    assert stats and all(type(value) is int for value in stats.values())
+
+
+def test_a_long_retry_after_stops_the_run_cleanly(wp):
+    state: dict = {}
+    _sync(wp, state)
+    snapshot = copy.deepcopy(state)
+    post_id = min(wp.items)
+    wp.edit(post_id, content="<p>Edited during an overload.</p>")
+    wp.failures = [("http", (429, "3600"))]
+
+    live, _, stats = _sync(wp, state)  # no exception, no hour-long sleep
+    assert live == {}
+    assert stats["failed"] == 1 and stats["failed_rate_limit"] == 1
+    assert state == snapshot
+
+    live, _, _ = _sync(wp, state)
+    assert str(post_id) in live, "the next run picks the edit up"
+
+
+def test_rejected_credentials_count_as_an_auth_failure(wp):
+    stats: dict = {}
+    http = wp.client()
+    api = discover_api(http, SITE_URL, "ua")
+    client = _WordPressClient(http, api, "ua", ("editor", "wrong"), sleep=lambda _s: None)
+    with pytest.raises(WordPressAuthError):
+        list(sync_items(client, _settings(), {}, stats))
+    assert stats["failed"] == 1 and stats["failed_auth"] == 1
+
+
+def test_a_non_json_answer_is_an_error_not_an_empty_site(wp):
+    wp.failures = [("html", None)]
+    with pytest.raises(WordPressAPIError, match="invalid_json"):
+        _sync(wp, {})
+
+
+def test_service_is_an_alias_of_http_client():
+    client = httpx.Client()
+    assert wordpress_source(SITE_URL, service=client).name == "wordpress_blog_example_com"
+    with pytest.raises(ValueError, match="not both"):
+        wordpress_source(SITE_URL, service=client, http_client=httpx.Client())

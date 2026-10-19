@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import base64
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
 
 import httpx
@@ -47,8 +47,8 @@ class Item:
     categories: list[int] = field(default_factory=list)
     tags: list[int] = field(default_factory=list)
     password: str = ""
-    date: datetime = field(default_factory=lambda: datetime(2026, 1, 1, tzinfo=UTC))
-    modified: datetime = field(default_factory=lambda: datetime(2026, 1, 1, tzinfo=UTC))
+    date: datetime = field(default_factory=lambda: datetime(2026, 1, 1, tzinfo=timezone.utc))
+    modified: datetime = field(default_factory=lambda: datetime(2026, 1, 1, tzinfo=timezone.utc))
 
 
 @dataclass
@@ -64,7 +64,7 @@ class Comment:
 
 class FakeWordPress:
     def __init__(self, *, username: str = "editor", password: str = "abcd efgh ijkl mnop"):
-        self.now = datetime(2026, 10, 1, 12, 0, 0, tzinfo=UTC)
+        self.now = datetime(2026, 10, 1, 12, 0, 0, tzinfo=timezone.utc)
         self.items: dict[int, Item] = {}
         self.trash: dict[int, Item] = {}
         self.comments: dict[int, Comment] = {}
@@ -85,7 +85,7 @@ class FakeWordPress:
             },
         }
         self.requests: list[httpx.Request] = []
-        self.failures: list[tuple[str, int]] = []
+        self.failures: list[tuple[str, object]] = []
         # Simulates offset pagination shifting under a concurrent deletion: the
         # first item of this sweep page is skipped once.
         self.drop_from_next_sweep: int | None = None
@@ -150,10 +150,13 @@ class FakeWordPress:
         path = request.url.path
         # Programmed failures hit API routes only, not discovery.
         if self.failures and path.startswith("/wp-json/wp/v2/"):
-            kind, status = self.failures.pop(0)
+            kind, value = self.failures.pop(0)
             if kind == "network":
                 raise httpx.ConnectError("boom", request=request)
-            return httpx.Response(status, headers={"Retry-After": "0"})
+            if kind == "html":
+                return httpx.Response(200, text="<html>Maintenance</html>")
+            status, retry_after = value if isinstance(value, tuple) else (value, "0")
+            return httpx.Response(status, headers={"Retry-After": retry_after})
 
         params = dict(request.url.params)
         if path == "/wp-json/":
@@ -209,7 +212,7 @@ class FakeWordPress:
             raw = params["modified_after"]
             after = datetime.fromisoformat(raw.replace("Z", "+00:00"))
             if after.tzinfo is None:  # naive: read in the site's timezone
-                after = after.replace(tzinfo=UTC) - SITE_OFFSET
+                after = after.replace(tzinfo=timezone.utc) - SITE_OFFSET
             items = [i for i in items if i.modified > after]
         by_modified = params.get("orderby") == "modified"
         items.sort(
