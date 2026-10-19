@@ -44,35 +44,11 @@ from typing import Any
 
 import requests
 from cognee.shared.logging_utils import get_logger
-from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
-
-try:
-    from cognee.tasks.ingestion.dlt_utils import PIPELINE_SCOPE_ATTR
-except ImportError:
-    PIPELINE_SCOPE_ATTR = "cognee_pipeline_scope"
-
-try:
-    from cognee.tasks.ingestion.dlt_utils import guarded_rows
-except ImportError:
-
-    def guarded_rows(
-        rows: Any,
-        check_active: Callable[[], Any] | None = None,
-    ) -> Iterator[Any]:
-        iterator = iter(rows)
-        while True:
-            if check_active is not None:
-                check_active()
-            try:
-                row = next(iterator)
-            except StopIteration:
-                if check_active is not None:
-                    check_active()
-                return
-            if check_active is not None:
-                check_active()
-            yield row
-
+from cognee.tasks.ingestion.dlt_utils import (
+    DOCUMENT_SOURCE_ATTR,
+    PIPELINE_SCOPE_ATTR,
+    guarded_rows,
+)
 
 logger = get_logger("clickup_connector")
 
@@ -84,10 +60,9 @@ DEFAULT_API_BASE = "https://api.clickup.com/api"
 _TASK_PAGE_SIZE = 100  # fixed by the API
 _COMMENT_PAGE_SIZE = 25  # fixed by the API
 _DOC_PAGE_SIZE = 100
-_MAX_TASK_PAGES = 500
 _MAX_RETRIES = 5
 _RETRY_STATUSES = (500, 502, 503, 504)
-_RESOURCE_NAME_RE = re.compile(r"^[a-zA-Z0-9_]{1,64}$")
+_RESOURCE_NAME_RE = re.compile(r"^[a-z_][a-z0-9_]{0,63}\Z")
 
 
 # ---------------------------------------------------------------------------
@@ -165,18 +140,18 @@ def _extract_retry_delay(headers: Any, attempt: int) -> float:
     return float(2**attempt)
 
 
-def _safe_int(val: Any, default: int = 0) -> int:
+def _safe_sort_number(val: Any, default: float = 0.0) -> float:
+    if val is None:
+        return default
     try:
-        return int(val)
+        return float(val)
     except (TypeError, ValueError):
         return default
 
 
 def _invoke_check_active(check_active: Callable[[], Any] | None) -> None:
     if check_active is not None:
-        res = check_active()
-        if res is False:
-            raise ClickUpError("Connector operation aborted: check_active returned False.")
+        check_active()
 
 
 def _interruptible_sleep(delay: float, check_active: Callable[[], Any] | None = None) -> None:
@@ -322,22 +297,26 @@ class _ClickUpAPI:
         self.stats = stats
 
     def v2(self, path: str, params: dict[str, Any] | None = None, **kwargs: Any) -> Any:
+        stats = kwargs.pop("stats", self.stats)
+        check_active = kwargs.pop("check_active", self.check_active)
         return _request(
             self.service,
             f"{self.base_url}/v2{path}",
             params,
-            check_active=self.check_active,
-            stats=self.stats,
+            check_active=check_active,
+            stats=stats,
             **kwargs,
         )
 
     def v3(self, path: str, params: dict[str, Any] | None = None, **kwargs: Any) -> Any:
+        stats = kwargs.pop("stats", self.stats)
+        check_active = kwargs.pop("check_active", self.check_active)
         return _request(
             self.service,
             f"{self.base_url}/v3{path}",
             params,
-            check_active=self.check_active,
-            stats=self.stats,
+            check_active=check_active,
+            stats=stats,
             **kwargs,
         )
 
@@ -542,7 +521,7 @@ def _render_task_markdown(
             f"- [{'x' if item.get('resolved') else ' '}] {item.get('name') or ''}"
             for item in sorted(
                 checklist.get("items") or [],
-                key=lambda i: (_safe_int(i.get("orderindex")), str(i.get("id") or "")),
+                key=lambda i: (_safe_sort_number(i.get("orderindex")), str(i.get("id") or "")),
             )
         ]
         checklist_blocks.append(f"### {checklist.get('name') or 'Checklist'}\n" + "\n".join(items))
@@ -560,7 +539,7 @@ def _render_pages(pages: list[dict[str, Any]], depth: int = 2) -> list[str]:
     """Flatten nested doc pages into Markdown sections, one heading level per depth."""
     blocks: list[str] = []
     for page in sorted(
-        pages, key=lambda p: (_safe_int(p.get("orderindex")), str(p.get("id") or ""))
+        pages, key=lambda p: (_safe_sort_number(p.get("orderindex")), str(p.get("id") or ""))
     ):
         if page.get("deleted") or page.get("archived"):
             continue
@@ -621,14 +600,14 @@ def _fetch_task_comments(
     params: dict[str, Any] = {}
     while True:
         try:
-            body = api.v2(f"/task/{task_id}/comment", params, allow_missing=True)
+            body = api.v2(f"/task/{task_id}/comment", params, allow_missing=True, stats=None)
         except ClickUpPermissionError:
             logger.warning(
                 "ClickUp: HTTP 403 reading comments for task %s; skipping comments.",
                 task_id,
             )
             if stats is not None:
-                stats["skipped"] = stats.get("skipped", 0) + 1
+                stats["failed_comments"] = stats.get("failed_comments", 0) + 1
             return None
         if body is None:  # the task was deleted while we were syncing
             return []
@@ -640,7 +619,9 @@ def _fetch_task_comments(
         params = {"start": page[-1].get("date"), "start_id": page[-1].get("id")}
 
     comments = []
-    for comment in sorted(raw, key=lambda c: (int(c.get("date") or 0), str(c.get("id") or ""))):
+    for comment in sorted(
+        raw, key=lambda c: (_safe_sort_number(c.get("date")), str(c.get("id") or ""))
+    ):
         text = (comment.get("comment_text") or "").strip()
         if text:
             comments.append(
@@ -662,6 +643,7 @@ def _paginate_team_tasks(
     list_ids: list[str] | None = None,
     date_updated_gt: int | None = None,
     include_closed: bool = True,
+    seen_ids: set[str] | None = None,
     stats: dict[str, int] | None = None,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Fetch tasks across the Workspace; returns (tasks, listing_complete).
@@ -687,10 +669,6 @@ def _paginate_team_tasks(
     page = 0
     seen_page_fingerprints: set[str] = set()
     while True:
-        if page >= _MAX_TASK_PAGES:
-            raise ClickUpError(
-                f"ClickUp task pagination exceeded maximum page limit ({_MAX_TASK_PAGES})."
-            )
         params["page"] = page
         body = api.v2(f"/team/{team_id}/task", params)
         if not isinstance(body, dict) or "tasks" not in body:
@@ -703,7 +681,12 @@ def _paginate_team_tasks(
             if page_fp in seen_page_fingerprints:
                 raise ClickUpError(f"ClickUp task pagination stuck on repeated page {page}.")
             seen_page_fingerprints.add(page_fp)
-            if stats is not None:
+            if seen_ids is not None:
+                for t in tasks:
+                    seen_ids.add(str(t.get("id")))
+                if stats is not None:
+                    stats["scanned"] = len(seen_ids)
+            elif stats is not None:
                 stats["scanned"] = stats.get("scanned", 0) + len(tasks)
         all_tasks.extend(tasks)
         if not tasks or body.get("last_page") is True:
@@ -764,6 +747,7 @@ def _sync_incremental_tasks(
     filters: dict[str, Any],
     hierarchy: _HierarchyTracker,
     hashes: dict[str, str],
+    seen_ids: set[str] | None = None,
     stats: dict[str, int] | None = None,
 ) -> tuple[list[dict[str, Any]], set[str], set[str], int, bool]:
     """Fetch changed tasks since cursor.
@@ -771,7 +755,7 @@ def _sync_incremental_tasks(
     Returns (rows, emitted_ids, listed_ids, newest_ms, listing_complete).
     """
     changed_tasks, listing_complete = _paginate_team_tasks(
-        api, team_id, date_updated_gt=cursor or None, stats=stats, **filters
+        api, team_id, date_updated_gt=cursor or None, seen_ids=seen_ids, stats=stats, **filters
     )
     rows: list[dict[str, Any]] = []
     emitted: set[str] = set()
@@ -790,6 +774,14 @@ def _sync_incremental_tasks(
             continue
         newest = max(newest, updated)
         comments = _fetch_task_comments(api, task_id, stats) if include_comments else None
+        if include_comments and comments is None:
+            # 403 or unreadable: keep stored document in destination, do not overwrite with empty
+            logger.warning(
+                "ClickUp: cannot read comments for task %s (HTTP 403); "
+                "skipping row emission to avoid wiping stored comments.",
+                task_id,
+            )
+            continue
         if comments is not None:
             hashes[task_id] = _comments_hash(comments)
         emitted.add(task_id)
@@ -806,15 +798,16 @@ def _sync_comment_refresh(
     hierarchy: _HierarchyTracker,
     hashes: dict[str, str],
     task_map: dict[str, dict[str, Any]] | None = None,
+    now: int = 0,
     stats: dict[str, int] | None = None,
-) -> tuple[list[dict[str, Any]], set[str], bool]:
+) -> tuple[list[dict[str, Any]], set[str], set[str], bool]:
     """Refresh comments for a bounded batch of known unchanged tasks.
 
     Uses a cursor over task IDs (comment_refresh_last_id) to ensure fair rotation across
-    syncs. Returns (rows, refreshed_ids, full_pass_completed).
+    syncs. Returns (rows, refreshed_ids, checked_ids, full_pass_completed).
     """
     if not candidates:
-        return [], set(), True
+        return [], set(), set(), True
 
     last_id = state.get("comment_refresh_last_id")
     remaining = [cid for cid in candidates if cid > last_id] if last_id else candidates
@@ -829,10 +822,16 @@ def _sync_comment_refresh(
     task_map = task_map or {}
     rows: list[dict[str, Any]] = []
     refreshed_ids: set[str] = set()
+    checked_ids: set[str] = set()
+    refreshed_at = state.setdefault("comments_refreshed_at", {})
+
     for task_id in batch:
         comments = _fetch_task_comments(api, task_id, stats)
         if comments is None:
+            # 403 or unreadable: do not advance clock for this task
             continue
+        checked_ids.add(task_id)
+        refreshed_at[task_id] = now
         if hashes.get(task_id) == _comments_hash(comments):
             if stats is not None:
                 stats["skipped"] = stats.get("skipped", 0) + 1
@@ -843,7 +842,7 @@ def _sync_comment_refresh(
             refreshed_ids.add(task_id)
             rows.append(hierarchy.build_row(task, comments))
 
-    return rows, refreshed_ids, full_pass_completed
+    return rows, refreshed_ids, checked_ids, full_pass_completed
 
 
 def _sync_deletion_sweep(
@@ -909,10 +908,20 @@ def sync_clickup(
     }
 
     hierarchy = _HierarchyTracker(api, team_id, cache)
+    seen_task_ids: set[str] = set()
 
     # 1. Incremental task listing
     task_rows, emitted, listed, newest, listing_complete = _sync_incremental_tasks(
-        api, team_id, cursor, known_ids, include_comments, filters, hierarchy, hashes, stats
+        api,
+        team_id,
+        cursor,
+        known_ids,
+        include_comments,
+        filters,
+        hierarchy,
+        hashes,
+        seen_ids=seen_task_ids,
+        stats=stats,
     )
     yield from task_rows
 
@@ -927,7 +936,7 @@ def sync_clickup(
     task_map: dict[str, dict[str, Any]] = {}
     if cursor and (detect_deletions or refresh_due) and known_ids:
         all_tasks, full_listing_complete = _paginate_team_tasks(
-            api, team_id, stats=stats, **filters
+            api, team_id, seen_ids=seen_task_ids, stats=stats, **filters
         )
         task_map = {str(t["id"]): t for t in all_tasks}
         live = set(task_map)
@@ -939,7 +948,7 @@ def sync_clickup(
     rerendered = 0
     if refresh_due:
         candidates = sorted(known_ids - emitted)
-        refresh_rows, refreshed_ids, full_pass_completed = _sync_comment_refresh(
+        refresh_rows, refreshed_ids, checked_ids, full_pass_completed = _sync_comment_refresh(
             api,
             state,
             candidates,
@@ -947,12 +956,13 @@ def sync_clickup(
             hierarchy,
             hashes,
             task_map,
-            stats,
+            now=now,
+            stats=stats,
         )
         yield from refresh_rows
         emitted |= refreshed_ids
         rerendered = len(refresh_rows)
-        if full_pass_completed:
+        if full_pass_completed and len(checked_ids) > 0:
             state["comments_refreshed_ms"] = now
 
     # 4. Deletion sweep
@@ -966,8 +976,13 @@ def sync_clickup(
     state["scope"] = scope
     state["last_updated_ms"] = newest
     state["known_ids"] = sorted((known_ids | emitted) - removed)
+    state.setdefault("comments_refreshed_ms", now)
     if include_comments:
         state["comment_hashes"] = {k: v for k, v in sorted(hashes.items()) if k not in removed}
+        refreshed_at = state.get("comments_refreshed_at") or {}
+        state["comments_refreshed_at"] = {
+            k: v for k, v in sorted(refreshed_at.items()) if k not in removed
+        }
 
     logger.info(
         "ClickUp: synced %d task(s) (%d for edited/deleted comments), %d deletion(s); %d known.",
@@ -1004,11 +1019,14 @@ def _paginate_docs(
 ) -> Iterator[dict[str, Any]]:
     """Yield live (not deleted, not archived) Docs in the Workspace (v3, cursor-paged)."""
     params: dict[str, Any] = {"limit": _DOC_PAGE_SIZE}
+    seen_doc_ids: set[str] = set()
     while True:
         body = api.v3(f"/workspaces/{team_id}/docs", params) or {}
         docs = body.get("docs") or []
+        for d in docs:
+            seen_doc_ids.add(str(d.get("id")))
         if stats is not None:
-            stats["scanned"] = stats.get("scanned", 0) + len(docs)
+            stats["scanned"] = len(seen_doc_ids)
         yield from docs
         next_cursor = body.get("next_cursor")
         if not next_cursor:
@@ -1030,9 +1048,10 @@ def sync_clickup_docs(
 ) -> Iterator[dict[str, Any]]:
     """Yield new or edited Docs and tombstones for Docs that disappeared.
 
-    ``state["versions"]`` maps doc id -> last ingested ``date_updated``; a doc's pages are
-    fetched only when that changes. ``container_ids`` limits the sync to docs whose parent
-    is one of the selected spaces, folders or lists.
+    ``state["versions"]`` maps doc id -> last ingested ``date_updated`` (or page content hash
+    when ``date_updated`` is missing); a doc's pages are fetched only when that changes.
+    ``container_ids`` limits the sync to docs whose parent is one of the selected spaces,
+    folders or lists.
     """
     versions: dict[str, Any] = dict(state.get("versions") or {})
     spaces = resolve_hierarchy_cache(api, team_id, cache)
@@ -1045,7 +1064,7 @@ def sync_clickup_docs(
     for doc in _paginate_docs(api, team_id, stats=stats):
         if doc.get("deleted") or doc.get("archived"):
             if stats is not None:
-                stats["skipped"] = stats.get("skipped", 0) + 1
+                stats["filtered"] = stats.get("filtered", 0) + 1
             continue
         parent_id = str((doc.get("parent") or {}).get("id") or "")
         doc_space = container_to_space.get(parent_id)
@@ -1055,11 +1074,12 @@ def sync_clickup_docs(
         if not is_wanted:
             skipped_unselected += 1
             if stats is not None:
-                stats["skipped"] = stats.get("skipped", 0) + 1
+                stats["filtered"] = stats.get("filtered", 0) + 1
             continue
         doc_id = str(doc["id"])
         live.add(doc_id)
-        if doc_id in versions and versions[doc_id] == doc.get("date_updated"):
+        updated_ms = doc.get("date_updated")
+        if updated_ms is not None and doc_id in versions and versions[doc_id] == updated_ms:
             if stats is not None:
                 stats["skipped"] = stats.get("skipped", 0) + 1
             continue
@@ -1075,12 +1095,24 @@ def sync_clickup_docs(
                 stats["skipped"] = stats.get("skipped", 0) + 1
             continue
         pages = body if isinstance(body, list) else body.get("pages") or []
-        changed[doc_id] = doc.get("date_updated")
+        rendered_content = _render_doc_markdown(doc, pages, spaces.get(parent_id, ""))
+
+        if updated_ms is not None:
+            changed[doc_id] = updated_ms
+        else:
+            content_hash = hashlib.sha256(rendered_content.encode()).hexdigest()[:16]
+            version_key = f"hash:{content_hash}"
+            if doc_id in versions and versions[doc_id] == version_key:
+                if stats is not None:
+                    stats["skipped"] = stats.get("skipped", 0) + 1
+                continue
+            changed[doc_id] = version_key
+
         yield {
             "id": f"clickup:doc:{doc_id}",
             "title": (doc.get("name") or "").strip() or "Untitled doc",
             "url": f"https://app.clickup.com/{team_id}/v/dc/{doc_id}",
-            "content": _render_doc_markdown(doc, pages, spaces.get(parent_id, "")),
+            "content": rendered_content,
             "_deleted": False,
         }
 
@@ -1166,11 +1198,12 @@ def clickup_source(
         ) from exc
 
     if resource_name is not None and (
-        not isinstance(resource_name, str) or not _RESOURCE_NAME_RE.match(resource_name)
+        not isinstance(resource_name, str) or not _RESOURCE_NAME_RE.fullmatch(resource_name)
     ):
         raise ValueError(
-            f"Invalid resource_name {resource_name!r}: must be 1-64 alphanumeric "
-            "characters or underscores (matching ^[a-zA-Z0-9_]{1,64}$)."
+            f"Invalid resource_name {resource_name!r}: must start with a lowercase letter or "
+            "underscore and contain only lowercase alphanumeric characters and underscores "
+            "(1-64 characters)."
         )
 
     resolved_service = service or session
@@ -1179,19 +1212,35 @@ def clickup_source(
             raise ValueError("ClickUp personal API token required: pass api_token=.")
         resolved_service = _make_session(api_token.strip())
 
-    sync_stats: dict[str, int] = {
-        "scanned": 0,
-        "skipped": 0,
-        "failed": 0,
-        "deleted": 0,
-        "failed_rate_limit": 0,
-    }
+    def _make_task_stats() -> dict[str, int]:
+        return {
+            "scanned": 0,
+            "skipped": 0,
+            "filtered": 0,
+            "failed": 0,
+            "deleted": 0,
+            "failed_rate_limit": 0,
+            "failed_comments": 0,
+        }
+
+    def _make_doc_stats() -> dict[str, int]:
+        return {
+            "scanned": 0,
+            "skipped": 0,
+            "filtered": 0,
+            "failed": 0,
+            "deleted": 0,
+            "failed_rate_limit": 0,
+        }
+
+    task_stats = _make_task_stats()
+    doc_stats = _make_doc_stats()
+    source_stats: dict[str, int] = {}
 
     api = _ClickUpAPI(
         resolved_service,
         base_url or DEFAULT_API_BASE,
         check_active=check_active,
-        stats=sync_stats,
     )
 
     # Resolved on first use, inside the pipeline, so building the source makes no requests.
@@ -1208,6 +1257,26 @@ def clickup_source(
     tasks_table_name = f"{resource_name}_tasks" if resource_name else CLICKUP_TABLE_NAME
     docs_table_name = f"{resource_name}_docs" if resource_name else CLICKUP_DOCS_TABLE_NAME
 
+    def _update_source_stats() -> None:
+        source_stats.clear()
+        source_stats.update(
+            {
+                "scanned": task_stats.get("scanned", 0)
+                + (doc_stats.get("scanned", 0) if include_docs else 0),
+                "skipped": task_stats.get("skipped", 0)
+                + (doc_stats.get("skipped", 0) if include_docs else 0),
+                "filtered": task_stats.get("filtered", 0)
+                + (doc_stats.get("filtered", 0) if include_docs else 0),
+                "failed": task_stats.get("failed", 0)
+                + (doc_stats.get("failed", 0) if include_docs else 0),
+                "deleted": task_stats.get("deleted", 0)
+                + (doc_stats.get("deleted", 0) if include_docs else 0),
+                "failed_rate_limit": task_stats.get("failed_rate_limit", 0)
+                + (doc_stats.get("failed_rate_limit", 0) if include_docs else 0),
+                "failed_comments": task_stats.get("failed_comments", 0),
+            }
+        )
+
     @dlt.resource(
         name=tasks_table_name,
         primary_key="id",
@@ -1215,26 +1284,32 @@ def clickup_source(
         columns={"_deleted": {"data_type": "bool", "hard_delete": True}},
     )
     def clickup_tasks() -> Iterator[dict[str, Any]]:
-        yield from guarded_rows(
-            sync_clickup(
-                api,
-                dlt.current.resource_state(),
-                hierarchy_cache(),
-                team_id=workspace(),
-                space_ids=space_ids,
-                folder_ids=folder_ids,
-                list_ids=list_ids,
-                include_comments=include_comments,
-                include_closed=include_closed,
-                detect_deletions=detect_deletions,
-                comment_refresh_hours=comment_refresh_hours,
-                comment_refresh_batch_size=comment_refresh_batch_size,
-                stats=sync_stats,
-            ),
-            check_active,
-        )
+        task_stats.clear()
+        task_stats.update(_make_task_stats())
+        api.stats = task_stats
+        try:
+            yield from guarded_rows(
+                sync_clickup(
+                    api,
+                    dlt.current.resource_state(),
+                    hierarchy_cache(),
+                    team_id=workspace(),
+                    space_ids=space_ids,
+                    folder_ids=folder_ids,
+                    list_ids=list_ids,
+                    include_comments=include_comments,
+                    include_closed=include_closed,
+                    detect_deletions=detect_deletions,
+                    comment_refresh_hours=comment_refresh_hours,
+                    comment_refresh_batch_size=comment_refresh_batch_size,
+                    stats=task_stats,
+                ),
+                check_active,
+            )
+        finally:
+            _update_source_stats()
 
-    clickup_tasks.cognee_sync_stats = sync_stats
+    clickup_tasks.cognee_sync_stats = task_stats
 
     @dlt.resource(
         name=docs_table_name,
@@ -1243,20 +1318,26 @@ def clickup_source(
         columns={"_deleted": {"data_type": "bool", "hard_delete": True}},
     )
     def clickup_docs() -> Iterator[dict[str, Any]]:
-        yield from guarded_rows(
-            sync_clickup_docs(
-                api,
-                dlt.current.resource_state(),
-                hierarchy_cache(),
-                team_id=workspace(),
-                container_ids=[*(space_ids or []), *(folder_ids or []), *(list_ids or [])],
-                detect_deletions=detect_deletions,
-                stats=sync_stats,
-            ),
-            check_active,
-        )
+        doc_stats.clear()
+        doc_stats.update(_make_doc_stats())
+        api.stats = doc_stats
+        try:
+            yield from guarded_rows(
+                sync_clickup_docs(
+                    api,
+                    dlt.current.resource_state(),
+                    hierarchy_cache(),
+                    team_id=workspace(),
+                    container_ids=[*(space_ids or []), *(folder_ids or []), *(list_ids or [])],
+                    detect_deletions=detect_deletions,
+                    stats=doc_stats,
+                ),
+                check_active,
+            )
+        finally:
+            _update_source_stats()
 
-    clickup_docs.cognee_sync_stats = sync_stats
+    clickup_docs.cognee_sync_stats = doc_stats
 
     resources: list[Callable[..., Any]] = [clickup_tasks]
     if include_docs:
@@ -1267,9 +1348,14 @@ def clickup_source(
         return resources
 
     source = _clickup()
+    # Attach stats references directly to the DltResource objects and source
+    source.resources[tasks_table_name].cognee_sync_stats = task_stats
+    if include_docs:
+        source.resources[docs_table_name].cognee_sync_stats = doc_stats
+    source.cognee_sync_stats = source_stats
+
     # Opt into document mode so rows route through cognify entity extraction
     setattr(source, DOCUMENT_SOURCE_ATTR, CLICKUP_SOURCE_NAME)
     setattr(source, PIPELINE_SCOPE_ATTR, resource_name or CLICKUP_SOURCE_NAME)
-    source.cognee_sync_stats = sync_stats
-    source.source_counts = sync_stats
+    _update_source_stats()
     return source

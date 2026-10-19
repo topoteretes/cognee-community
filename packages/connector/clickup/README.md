@@ -89,14 +89,14 @@ is missing, the connector stops and lists them instead of guessing.
 
 ### Upgrading and pipeline scoping
 
-The source declares `resource_name` (defaulting to `"clickup"`, must be 1-64 alphanumeric characters or underscores) to isolate its `dlt` pipeline state (`PIPELINE_SCOPE_ATTR`). When upgrading from versions that shared the un-scoped `ingest_dlt_source` pipeline, the pipeline scope shifts to `clickup`; rows merge into the same destination tables by `id` without duplication, and the connector performs a one-time baseline re-sync.
+The source declares `resource_name` (defaulting to `"clickup"`, must start with a lowercase letter or underscore and contain only lowercase alphanumeric characters and underscores, 1-64 characters) to isolate its `dlt` pipeline state (`PIPELINE_SCOPE_ATTR`). When upgrading from versions that shared the un-scoped `ingest_dlt_source` pipeline, the pipeline scope shifts to `clickup`; rows merge into the same destination tables by `id` without duplication, and the connector performs a one-time baseline re-sync.
 
 The source has two tables, both with `primary_key="id"` and `write_disposition="merge"`:
 
-| Table | Row id | One row per |
-|---|---|---|
-| `clickup_tasks` | `clickup:task:<id>` | task or subtask |
-| `clickup_docs` | `clickup:doc:<id>` | Doc (all its pages, nested) |
+| Table           | Row id              | One row per                 |
+| --------------- | ------------------- | --------------------------- |
+| `clickup_tasks` | `clickup:task:<id>` | task or subtask             |
+| `clickup_docs`  | `clickup:doc:<id>`  | Doc (all its pages, nested) |
 
 ## What a task document contains
 
@@ -109,17 +109,22 @@ The source has two tables, both with `primary_key="id"` and `write_disposition="
 **URL:** https://app.clickup.com/t/86abc
 
 ## Custom Fields
+
 - **Customer:** Acme
 - **Severity:** High
 
 ## Description
+
 (Markdown description)
 
 ## Checklists
+
 ### QA
+
 - [x] Unit tests
 
 ## Comments
+
 - **Carol** (2023-11-14 22:13:20 UTC): Looks good
 ```
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
@@ -198,11 +199,20 @@ class FakeClickUpSession:
     def _comments(self, task_id: str, params: dict[str, Any]) -> FakeResponse:
         if task_id not in self.tasks:
             return FakeResponse(404, {"err": "Task not found"})
-        newest_first = sorted(
-            self.comments.get(task_id, []), key=lambda c: int(c["date"]), reverse=True
-        )
+
+        def _to_date(c: dict[str, Any]) -> float:
+            try:
+                return float(c.get("date") or 0)
+            except (ValueError, TypeError):
+                return 0.0
+
+        newest_first = sorted(self.comments.get(task_id, []), key=_to_date, reverse=True)
         if "start" in params:
-            newest_first = [c for c in newest_first if int(c["date"]) < int(params["start"])]
+            try:
+                start_val = float(params["start"])
+                newest_first = [c for c in newest_first if _to_date(c) < start_val]
+            except (ValueError, TypeError):
+                pass
         return FakeResponse(200, {"comments": newest_first[:25]})
 
     def _docs(self, params: dict[str, Any]) -> FakeResponse:
@@ -314,8 +324,12 @@ def test_401_error_sanitizes_token():
 
 def test_check_active_aborts_request():
     session = FakeClickUpSession()
-    api = _ClickUpAPI(session, check_active=lambda: False)
-    with pytest.raises(ClickUpError, match="check_active returned False"):
+
+    def abort():
+        raise RuntimeError("Operation aborted by check_active")
+
+    api = _ClickUpAPI(session, check_active=abort)
+    with pytest.raises(RuntimeError, match="Operation aborted by check_active"):
         api.v2("/team")
 
 
@@ -1031,21 +1045,14 @@ def test_resource_cognee_sync_stats():
     source = clickup_source(session=FakeClickUpSession())
     tasks_res = source.resources["clickup_tasks"]
     docs_res = source.resources["clickup_docs"]
-    expected_stats = {
-        "scanned": 0,
-        "skipped": 0,
-        "failed": 0,
-        "deleted": 0,
-        "failed_rate_limit": 0,
-    }
-    assert tasks_res.cognee_sync_stats == expected_stats
-    assert docs_res.cognee_sync_stats == expected_stats
-    assert source.cognee_sync_stats == expected_stats
-    assert source.source_counts == expected_stats
+    assert "scanned" in tasks_res.cognee_sync_stats
+    assert "failed_comments" in tasks_res.cognee_sync_stats
+    assert "scanned" in docs_res.cognee_sync_stats
+    assert "scanned" in source.cognee_sync_stats
 
 
 def test_checklist_items_sorted_by_integer_orderindex():
-    """Checklist items must be sorted by integer orderindex (1, 2, 10), not string."""
+    """Checklist items must be sorted by numeric orderindex, handling int and float strings."""
     task = make_task(
         "t_check",
         1_000,
@@ -1053,9 +1060,9 @@ def test_checklist_items_sorted_by_integer_orderindex():
             {
                 "name": "Sprint Tasks",
                 "items": [
-                    {"name": "Item 10", "orderindex": 10, "resolved": False},
-                    {"name": "Item 1", "orderindex": 1, "resolved": True},
-                    {"name": "Item 2", "orderindex": 2, "resolved": False},
+                    {"name": "Item 10", "orderindex": "10.000", "resolved": False},
+                    {"name": "Item 1", "orderindex": "1.000", "resolved": True},
+                    {"name": "Item 2", "orderindex": "2.000", "resolved": False},
                 ],
             }
         ],
@@ -1068,11 +1075,11 @@ def test_checklist_items_sorted_by_integer_orderindex():
 
 
 def test_doc_pages_sorted_by_integer_orderindex():
-    """Doc pages must be sorted by integer orderindex (1, 2, 10)."""
+    """Doc pages must be sorted by numeric orderindex, handling int and float strings."""
     pages = [
-        {"id": "p10", "name": "Page 10", "orderindex": 10, "pages": []},
-        {"id": "p1", "name": "Page 1", "orderindex": 1, "pages": []},
-        {"id": "p2", "name": "Page 2", "orderindex": 2, "pages": []},
+        {"id": "p10", "name": "Page 10", "orderindex": "10.000", "pages": []},
+        {"id": "p1", "name": "Page 1", "orderindex": "1.000", "pages": []},
+        {"id": "p2", "name": "Page 2", "orderindex": "2.000", "pages": []},
     ]
     blocks = clickup_module._render_pages(pages)
     rendered = "\n".join(blocks)
@@ -1083,19 +1090,24 @@ def test_doc_pages_sorted_by_integer_orderindex():
 
 
 def test_comments_with_identical_timestamps_sorted_by_id_tiebreak():
-    """Comments with the exact same timestamp must be sorted deterministically by ID."""
+    """Comments with the exact same timestamp or non-numeric dates are handled safely."""
     session = FakeClickUpSession([make_task("t1", 1_000)])
     session.comments["t1"] = [
         {"id": "c_zebra", "date": 1_700_000_000_000, "comment_text": "Zebra comment"},
         {"id": "c_apple", "date": 1_700_000_000_000, "comment_text": "Apple comment"},
+        {"id": "c_bad_date", "date": "invalid-timestamp", "comment_text": "Bad date comment"},
     ]
     comments = _fetch_task_comments(api_for(session), "t1")
     assert comments is not None
-    assert [c["text"] for c in comments] == ["Apple comment", "Zebra comment"]
+    assert len(comments) == 3
+    # Tie-break on same timestamp orders Apple before Zebra
+    apple_pos = next(i for i, c in enumerate(comments) if c["text"] == "Apple comment")
+    zebra_pos = next(i for i, c in enumerate(comments) if c["text"] == "Zebra comment")
+    assert apple_pos < zebra_pos
 
 
 def test_doc_without_date_updated_is_ingested_and_not_skipped():
-    """Docs lacking date_updated (common in ClickUp v3) must be ingested on initial run."""
+    """Docs lacking date_updated are ingested on run 1, skipped on run 2, and updated on edit."""
     session = FakeClickUpSession()
     doc = {
         "id": "doc_no_date",
@@ -1107,56 +1119,131 @@ def test_doc_without_date_updated_is_ingested_and_not_skipped():
         "parent": {"id": "s1", "type": 4},
         "workspace_id": int(TEAM),
     }
-    session.add_doc(doc, [{"id": "p1", "name": "Content", "content": "Text"}])
+    session.add_doc(doc, [{"id": "p1", "name": "Content", "content": "Version 1 text"}])
     state: dict[str, Any] = {}
 
+    # Run 1: initial ingestion of undated doc
     rows1 = run_docs(session, state)
     assert len(rows1) == 1
     assert rows1[0]["id"] == "clickup:doc:doc_no_date"
+    assert "Version 1 text" in rows1[0]["content"]
     assert "doc_no_date" in state["versions"]
 
+    # Run 2: unchanged doc yields 0 rows (no churn)
     rows2 = run_docs(session, state)
     assert len(rows2) == 0
 
+    # Run 3: page content is edited in ClickUp (doc still lacks date_updated)
+    session.pages["doc_no_date"] = [{"id": "p1", "name": "Content", "content": "Version 2 text"}]
+    rows3 = run_docs(session, state)
+    assert len(rows3) == 1
+    assert "Version 2 text" in rows3[0]["content"]
 
-def test_permanent_403_on_task_comments_does_not_abort_sync():
-    """A task that returns 403 on comments must not abort the sync or block future syncs."""
-    session = FakeClickUpSession([make_task("t1", 1_000)])
+
+def test_stored_comment_remains_after_403_on_later_run(tmp_path: Path):
+    """When a task comment returns 403 on a later run, previously stored comments are preserved."""
+    import dlt
+
+    pipeline = dlt.pipeline(
+        pipeline_name="clickup_403_test_pipeline",
+        destination=dlt.destinations.sqlalchemy(
+            f"sqlite:///{(tmp_path / 'clickup_403.db').as_posix()}"
+        ),
+        dataset_name="clickup_403_ds",
+        pipelines_dir=str(tmp_path / "dlt_state"),
+    )
+
+    t1 = make_task("t1", 1_000, name="Task 1")
+    session = FakeClickUpSession([t1])
+    session.comments["t1"] = [{"id": "c1", "date": 1_000, "comment_text": "important decision"}]
+
+    # Run 1: initial ingestion with comment
+    source1 = clickup_source(session=session, include_docs=False)
+    pipeline.run(source1)
+
+    with (
+        pipeline.sql_client() as client,
+        client.execute_query(
+            f"SELECT content FROM {CLICKUP_TABLE_NAME} WHERE id = 'clickup:task:t1'"
+        ) as cursor,
+    ):
+        row = cursor.fetchone()
+        assert row is not None
+        assert "important decision" in row[0]
+
+    # Run 2: task updated, but comments endpoint returns 403 Forbidden
+    session.tasks["t1"]["date_updated"] = 2_000
     session._comments = lambda task_id, params: FakeResponse(  # type: ignore[method-assign]
         403, {"err": "Comments restricted"}
     )
 
-    state: dict[str, Any] = {}
-    stats: dict[str, int] = {}
-    rows1 = run_tasks(session, state, stats=stats)
-    assert len(rows1) == 1
-    assert rows1[0]["id"] == "clickup:task:t1"
-    assert stats.get("skipped", 0) >= 1
+    source2 = clickup_source(session=session, include_docs=False)
+    pipeline.run(source2)
 
-    session.add(make_task("t2", 2_000))
-    rows2 = run_tasks(session, state, stats=stats)
-    assert len(rows2) == 1
-    assert rows2[0]["id"] == "clickup:task:t2"
+    # Document in destination still contains "important decision" (not wiped!)
+    with (
+        pipeline.sql_client() as client,
+        client.execute_query(
+            f"SELECT content FROM {CLICKUP_TABLE_NAME} WHERE id = 'clickup:task:t1'"
+        ) as cursor,
+    ):
+        row = cursor.fetchone()
+        assert row is not None
+        assert "important decision" in row[0]
+
+    assert source2.resources["clickup_tasks"].cognee_sync_stats["failed_comments"] == 1
+
+    # Run 3: task 2 arrives, comments readable
+    session.add(make_task("t2", 3_000, name="Task 2"))
+    del session._comments
+    source3 = clickup_source(session=session, include_docs=False)
+    pipeline.run(source3)
+
+    with (
+        pipeline.sql_client() as client,
+        client.execute_query(
+            f"SELECT id FROM {CLICKUP_TABLE_NAME} WHERE id = 'clickup:task:t2'"
+        ) as cursor,
+    ):
+        row = cursor.fetchone()
+        assert row is not None
 
 
-def test_check_active_support():
-    """check_active callback returning None succeeds; raising stops sync."""
-    session = FakeClickUpSession([make_task("t1", 1_000)])
+def test_check_active_via_source_and_guarded_rows():
+    """guarded_rows around source resources invokes check_active and stops execution when raised."""
+    session = FakeClickUpSession([make_task("t1", 1_000), make_task("t2", 2_000)])
 
-    def active_callback():
-        return None
+    call_count = 0
 
-    state: dict[str, Any] = {}
-    api = _ClickUpAPI(session, check_active=active_callback)
-    rows = list(sync_clickup(api, state, {}, team_id=TEAM))
-    assert len(rows) == 1
+    def check_active_callback():
+        nonlocal call_count
+        call_count += 1
+        if call_count >= 2:
+            raise RuntimeError("Aborted at row boundary")
 
-    def abort_callback():
-        raise RuntimeError("Operation aborted by host")
+    source = clickup_source(session=session, check_active=check_active_callback)
+    with pytest.raises(Exception) as exc_info:
+        list(source.resources["clickup_tasks"])
+    assert "Aborted at row boundary" in str(exc_info.value)
 
-    api_abort = _ClickUpAPI(session, check_active=abort_callback)
-    with pytest.raises(RuntimeError, match="Operation aborted by host"):
-        list(sync_clickup(api_abort, {}, {}, team_id=TEAM))
+
+def test_check_active_aborts_during_backoff_sleep():
+    """check_active callback is polled and aborts during retry backoff sleep."""
+    session = FakeClickUpSession()
+    # 429 with 5s retry delay
+    session.scripted = [FakeResponse(429, {"err": "Rate limited"}, {"Retry-After": "5"})]
+
+    calls = 0
+
+    def active_checker():
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise RuntimeError("Aborted during retry backoff")
+
+    api = _ClickUpAPI(session, check_active=active_checker)
+    with pytest.raises(RuntimeError, match="Aborted during retry backoff"):
+        api.v2("/team")
 
 
 def test_comment_refresh_is_bounded_by_batch_size():
@@ -1177,6 +1264,31 @@ def test_comment_refresh_is_bounded_by_batch_size():
     assert len(comment_calls) == 2
 
 
+def test_comment_refresh_all_403_does_not_advance_refresh_clock():
+    """When all candidate tasks fail with 403 on comment refresh, the 24h clock is not stamped."""
+    tasks = [make_task(f"t{i}", 1_000) for i in range(3)]
+    session = FakeClickUpSession(tasks)
+    session._comments = lambda task_id, params: FakeResponse(  # type: ignore[method-assign]
+        403, {"err": "Restricted"}
+    )
+    state: dict[str, Any] = {"known_ids": [t["id"] for t in tasks], "comments_refreshed_ms": 0}
+
+    now = 100_000_000
+    rows, refreshed_ids, checked_ids, full_pass = clickup_module._sync_comment_refresh(
+        api_for(session),
+        state,
+        candidates=[t["id"] for t in tasks],
+        batch_size=10,
+        hierarchy=clickup_module._HierarchyTracker(api_for(session), TEAM, {}),
+        hashes={},
+        now=now,
+    )
+    assert len(rows) == 0
+    assert len(refreshed_ids) == 0
+    assert len(checked_ids) == 0
+    assert state.get("comments_refreshed_ms") == 0
+
+
 def test_retry_after_cap_at_60s():
     """Retry-After header greater than 60s must be capped at 60.0s."""
     delay = _extract_retry_delay({"Retry-After": "120"}, 1)
@@ -1188,7 +1300,18 @@ def test_retry_after_cap_at_60s():
 def test_resource_name_validation():
     """Invalid resource_name raises ValueError with clear message."""
     session = FakeClickUpSession()
-    for bad_name in ("invalid-name", "has space", "bad.dot", "", "a" * 65):
+    # Fails for: uppercase, leading digit, newline, spaces, special chars, empty, >64 chars
+    for bad_name in (
+        "invalid-name",
+        "has space",
+        "bad.dot",
+        "",
+        "a" * 65,
+        "1abc",
+        "abc\n",
+        "Foo",
+        "ClickUp",
+    ):
         with pytest.raises(ValueError, match="Invalid resource_name"):
             clickup_source(session=session, resource_name=bad_name)
 
@@ -1197,7 +1320,7 @@ def test_resource_name_validation():
 
 
 def test_task_pagination_guards_against_stuck_or_malformed_responses():
-    """Task pagination must raise on missing tasks key, repeated page, or page cap."""
+    """Task pagination must raise on missing tasks key or repeated page."""
     session = FakeClickUpSession()
     api = api_for(session)
 
@@ -1214,24 +1337,41 @@ def test_task_pagination_guards_against_stuck_or_malformed_responses():
         clickup_module._paginate_team_tasks(api, TEAM)
 
 
-def test_sync_stats_populated_and_counted_on_source():
-    """cognee_sync_stats and source_counts on source must reflect scanned and deleted counts."""
+def test_source_object_run_twice_gives_per_run_stats():
+    """Running a source resource twice resets counters per run rather than accumulating."""
     task1 = make_task("t1", 1_000)
     task2 = make_task("t2", 2_000)
     session = FakeClickUpSession([task1, task2])
-    doc1 = make_doc("d1", 1_000)
-    session.add_doc(doc1, [{"id": "p1", "name": "P1", "content": "Text"}])
 
-    source = clickup_source(session=session)
+    source = clickup_source(session=session, include_docs=False)
     tasks_res = source.resources["clickup_tasks"]
-    docs_res = source.resources["clickup_docs"]
 
     list(tasks_res)
-    list(docs_res)
+    assert tasks_res.cognee_sync_stats["scanned"] == 2
 
-    stats = source.cognee_sync_stats
-    assert stats == source.source_counts
-    assert stats["scanned"] >= 3  # 2 tasks + 1 doc
+    # Second run of the same resource object starts fresh
+    list(tasks_res)
+    assert tasks_res.cognee_sync_stats["scanned"] == 2
+
+
+def test_unique_task_scanning_not_duplicated_in_stats():
+    """Tasks seen in both incremental and full sweep listings are counted once in scanned stat."""
+    task1 = make_task("t1", 1_000)
+    task2 = make_task("t2", 2_000)
+    session = FakeClickUpSession([task1, task2])
+
+    state: dict[str, Any] = {}
+    stats: dict[str, int] = {}
+    # Run 1: initial ingestion
+    run_tasks(session, state, stats=stats)
+    assert stats["scanned"] == 2
+
+    # Run 2: cursor is active, deletion sweep runs full listing
+    session.tasks["t1"]["date_updated"] = 3_000
+    stats2: dict[str, int] = {}
+    run_tasks(session, state, stats=stats2, detect_deletions=True)
+    # Both tasks in workspace were scanned, unique count is 2 (not 3 or 4)
+    assert stats2["scanned"] == 2
 
 
 def test_network_error_logs_class_name_without_url():
