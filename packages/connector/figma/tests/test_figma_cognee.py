@@ -7,7 +7,8 @@ memory layer:
 * files and comment threads are ingested as documents (``source="figma"``)
   and cognified;
 * a re-sync keeps an unchanged file's data_id stable without fetching its
-  node tree again, so it is neither re-fetched nor re-ingested;
+  node tree again, so it is neither re-fetched nor re-ingested, and makes no
+  LLM call; only changed text is cognified again;
 * deleting a file or a comment upstream removes its extracted entity from
   the graph on the next sync (forget-on-delete), while the rest survives;
 * the OAuth integration lists folders for the picker, syncs the stored
@@ -53,6 +54,23 @@ BRAVO = "Bravocorp"
 CHARLIE = "Charliecorp"
 
 
+# Chunks the mocked LLM extracted a graph from, in call order.
+EXTRACTED: list[str] = []
+
+
+def _with_required(model, **values):
+    """Build a cognee data model, filling any other required text field.
+
+    cognee swaps in Node and KnowledgeGraph models with extra required fields
+    when the configured LLM provider is Gemini, so the mock must work with
+    both variants.
+    """
+    for field_name, field in model.model_fields.items():
+        if field.is_required() and field_name not in values:
+            values[field_name] = "mock"
+    return model(**values)
+
+
 async def _mock_structured_output(
     text_input=None, system_prompt=None, response_model=str, **_kwargs
 ):
@@ -65,9 +83,13 @@ async def _mock_structured_output(
     if response_model == SummarizedContent:
         return SummarizedContent(summary="Mock summary", description="Mock summary")
     if response_model == KnowledgeGraph:
+        EXTRACTED.append(text_input or "")
         names = [t for t in (ALPHA, BRAVO, CHARLIE) if text_input and t in text_input]
-        nodes = [KGNode(id=n, name=n, type="Company", description=f"{n} entity") for n in names]
-        return KnowledgeGraph(nodes=nodes, edges=[])
+        nodes = [
+            _with_required(KGNode, id=n, name=n, type="Company", description=f"{n} entity")
+            for n in names
+        ]
+        return _with_required(KnowledgeGraph, nodes=nodes, edges=[])
     return response_model()
 
 
@@ -119,6 +141,7 @@ async def clean_environment(tmp_path, monkeypatch):
 
     await cognee.prune.prune_data()
     await cognee.prune.prune_system(metadata=True)
+    EXTRACTED.clear()
     yield
     await cognee.prune.prune_data()
     await cognee.prune.prune_system(metadata=True)
@@ -180,6 +203,42 @@ async def test_files_and_comments_are_remembered_and_deletions_forgotten(clean_e
     assert await _graph_has(ALPHA), "surviving file's entity must remain"
     assert not await _graph_has(BRAVO), "deleted file's entity must be forgotten"
     assert not await _graph_has(CHARLIE), "deleted comment's entity must be forgotten"
+
+
+@pytest.mark.asyncio
+async def test_unchanged_resync_does_not_call_the_llm_again(clean_environment):
+    figma = _fake_figma()
+    root = figma.comment("file-a", f"Should {CHARLIE} co-brand the contract screen?")
+    await _sync(figma)
+    assert EXTRACTED, "the first sync should extract a graph"
+
+    EXTRACTED.clear()
+    await _sync(figma)
+    assert EXTRACTED == [], "unchanged files and threads must not be cognified again"
+
+    # A geometry-only save bumps last_modified: the file is fetched again, but
+    # its text is identical, so cognee's content hash skips the LLM.
+    figma.touch("file-a")
+    await _sync(figma)
+    assert EXTRACTED == [], "a file whose text did not change must not be cognified again"
+
+    # A new reply changes only that thread, not the file it lives in.
+    figma.comment("file-a", "Approved, ship it.", author="Bob", parent=root)
+    await _sync(figma)
+    assert len(EXTRACTED) == 1 and "Approved, ship it." in EXTRACTED[0]
+
+
+@pytest.mark.asyncio
+async def test_a_file_and_its_comments_share_a_node_set(clean_environment):
+    figma = _fake_figma()
+    figma.comment("file-a", f"Should {CHARLIE} co-brand the contract screen?")
+
+    await _sync(figma)
+
+    nodes, _ = await (await get_graph_engine()).get_graph_data()
+    node_sets = {props.get("name") for _id, props in nodes if props.get("type") == "NodeSet"}
+    assert "figma:Logistics portal (file-a)" in node_sets
+    assert "figma:Finance prospect (file-b)" in node_sets
 
 
 @pytest.mark.asyncio

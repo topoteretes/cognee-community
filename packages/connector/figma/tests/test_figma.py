@@ -120,11 +120,9 @@ def test_render_document_keeps_pages_frame_names_and_text_only():
         }
     )
 
-    content, locations = render_document(document, folder="Design")
+    content, locations = render_document(document)
 
     assert content == (
-        "Type: Figma design file\n"
-        "Folder: Design\n"
         "Pages: Checkout, Archive\n"
         "\n"
         "## Page: Checkout\n"
@@ -157,7 +155,6 @@ def test_render_document_reads_figjam_stickies_and_shapes():
 
     content, _ = render_document(document)
 
-    assert content.startswith("Type: FigJam board\n")
     assert content.endswith("## Page: Board\nShip the beta in May\nDecision")
 
 
@@ -215,6 +212,7 @@ def test_comment_threads_render_root_then_replies_with_authors_and_status():
                 "Reply from Bob (2026-01-01 09:05 UTC):\nAgreed, use the pill."
             ),
             "url": "https://www.figma.com/file/key",
+            "cognee_node_set": ["Checkout (key)"],
         }
     ]
 
@@ -252,6 +250,15 @@ def test_figma_source_declares_document_marker_and_pipeline_scope():
 
     assert document_source_tag(source) == "figma"
     assert getattr(source, PIPELINE_SCOPE_ATTR) == "figma"
+
+
+def test_source_refuses_a_cognee_without_node_set_support(monkeypatch):
+    from cognee.tasks.ingestion import dlt_utils
+
+    monkeypatch.setattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 1)
+
+    with pytest.raises(RuntimeError, match="DOCUMENT_SYNC_VERSION 2"):
+        figma_source(TOKEN, folder_ids=[DESIGN])
 
 
 def test_a_selection_is_required_but_may_be_explicitly_empty():
@@ -332,10 +339,13 @@ def test_first_sync_ingests_files_and_comment_threads(figma):
     onboarding = _files(tables)["file:file-a"]
     assert onboarding["title"] == "Onboarding"
     assert onboarding["url"] == "https://www.figma.com/file/file-a"
+    assert onboarding["content"].startswith("Type: Figma design file\nFolder: Design\nPages: Flows")
     assert "### Frame: Welcome\nCreate your account" in onboarding["content"]
     thread = _threads(tables)[f"comment:file-a:{root}"]
     assert "Pinned on: Flows / Welcome" in thread["content"]
     assert "Reply from Bob" in thread["content"]
+    # A file and its comment threads share a node set, so they search together.
+    assert onboarding["cognee_node_set"] == thread["cognee_node_set"] == ["Onboarding (file-a)"]
 
 
 def test_unchanged_files_come_from_the_cache_without_fetching_node_trees(figma):
@@ -349,6 +359,27 @@ def test_unchanged_files_come_from_the_cache_without_fetching_node_trees(figma):
     # Still a complete snapshot (replace needs every row), from the cache.
     assert second == first
     assert figma.file_requests() == []
+
+
+def test_rename_and_folder_rename_show_up_without_fetching_node_trees(figma):
+    state = {}
+    figma.comment("file-a", "Is this final?")
+    _sync(figma, state)
+    figma.rename("file-a", "Sign-up")
+    figma.rename_folder(DESIGN, "Product design")
+    figma.requests.clear()
+
+    tables = _sync(figma, state)
+
+    # Neither moved a stamp, yet title, folder and node set are current.
+    assert figma.file_requests() == []
+    renamed = _files(tables)["file:file-a"]
+    assert renamed["title"] == "Sign-up"
+    assert "Folder: Product design" in renamed["content"]
+    assert renamed["cognee_node_set"] == ["Sign-up (file-a)"]
+    (thread,) = _threads(tables).values()
+    assert 'file "Sign-up"' in thread["content"]
+    assert thread["cognee_node_set"] == ["Sign-up (file-a)"]
 
 
 def test_only_files_whose_stamp_moved_are_fetched_again(figma):
@@ -535,10 +566,10 @@ def _run(pipeline, figma, **source_kwargs):
     return pipeline.run(figma_source(TOKEN, session=figma.session(), **source_kwargs))
 
 
-def _read(pipeline, table):
+def _read(pipeline, table, column="content"):
     with (
         pipeline.sql_client() as client,
-        client.execute_query(f"SELECT id, content FROM {table}") as cursor,
+        client.execute_query(f"SELECT id, {column} FROM {table}") as cursor,
     ):
         return dict(cursor.fetchall())
 
@@ -549,6 +580,14 @@ def test_pipeline_replaces_the_snapshot_and_keeps_the_cache_across_runs(figma, t
     _run(pipeline, figma)
     assert set(_read(pipeline, FIGMA_TABLE_NAME)) == {"file:file-a", "file:file-b", "file:file-c"}
     assert set(_read(pipeline, FIGMA_COMMENTS_TABLE_NAME)) == {f"comment:file-a:{root}"}
+    # The node-set column is stored as json on both tables, not a child table.
+    for table in (FIGMA_TABLE_NAME, FIGMA_COMMENTS_TABLE_NAME):
+        assert (
+            "Onboarding (file-a)"
+            in _read(pipeline, table, "cognee_node_set")[
+                "file:file-a" if table == FIGMA_TABLE_NAME else f"comment:file-a:{root}"
+            ]
+        )
 
     figma.delete_file("file-b")
     figma.delete_comment("file-a", root)

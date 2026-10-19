@@ -12,6 +12,7 @@ It mirrors the Figma behaviour the connector relies on:
 * ``/v2/folders/:id/files`` lists only the files directly in a folder, with
   a ``last_modified`` stamp that moves on every edit (geometry included) but
   not when a comment is added;
+* renaming a file or folder does not move any file's ``last_modified`` stamp;
 * a deleted file or folder answers 404 and drops out of every listing;
 * comments are one flat list per file; replies point at their root through
   ``parent_id``.
@@ -100,6 +101,13 @@ class FakeFigma(BaseAdapter):
             file["name"] = name
         file["version"] = str(int(file["version"]) + 1)
         file["last_modified"] = self._tick()
+
+    def rename(self, key: str, name: str) -> None:
+        """Rename a file without moving its ``last_modified`` stamp."""
+        self.files[key]["name"] = name
+
+    def rename_folder(self, folder_id: str, name: str) -> None:
+        self.folders[folder_id]["name"] = name
 
     def touch(self, key: str) -> None:
         """A geometry-only edit (moving a layer): stamp moves, text does not."""

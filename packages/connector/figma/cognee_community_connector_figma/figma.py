@@ -24,7 +24,8 @@ Design
   so each design discussion stays together in context for cognify. The
   source declares ``cognee_document_source = "figma"``, so rows flow through
   the normal cognify entity-extraction pipeline instead of the relational
-  dlt-row path.
+  dlt-row path. A file and its comment threads share one node set
+  (``figma:<file name> (<file key>)``), so they can be searched together.
 * **Selection**: ``team_ids`` (every folder of the team), ``folder_ids``
   (formerly "projects"; subfolders included) and ``file_keys``. Listing
   folders needs the ``folders:read`` scope, which Figma grants to private
@@ -37,8 +38,11 @@ Design
   ``last_modified`` stamp moved since the last run are fetched again. An
   unchanged file is re-emitted from a render cache kept in dlt's *source*
   state (``replace`` resets resource state every run, source state
-  survives). Comments do not bump a file's stamp, so they are re-read every
-  run with one cheap request per file. Unchanged rows keep a stable
+  survives). The cache holds only what the node tree contributes; the
+  title and folder come from the fresh listing every run, so a rename or a
+  move shows up even if it does not move the stamp. Comments do not bump a
+  file's stamp, so they are re-read every run with one cheap request per
+  file. Unchanged rows keep a stable
   content-hash ``data_id``, so cognee does not re-ingest or re-cognify them.
 * **Forget-on-delete**: a deleted, trashed or moved-out file drops out of the
   listing (or answers 404), and a deleted comment drops out of its file's
@@ -57,7 +61,13 @@ from typing import Any
 
 import dlt
 from cognee.shared.logging_utils import get_logger
-from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR, PIPELINE_SCOPE_ATTR
+from cognee.tasks.ingestion import dlt_utils
+from cognee.tasks.ingestion.dlt_utils import (
+    DOCUMENT_SOURCE_ATTR,
+    NODE_SET_COLUMN,
+    NODE_SET_COLUMN_HINT,
+    PIPELINE_SCOPE_ATTR,
+)
 from dlt.sources.helpers.rest_client import RESTClient
 from dlt.sources.helpers.rest_client.auth import APIKeyAuth, BearerTokenAuth
 from dlt.sources.helpers.rest_client.paginators import SinglePagePaginator
@@ -199,6 +209,11 @@ def figma_source(
         ``write_disposition`` at its default ``"replace"``: the source is a
         full snapshot.
     """
+    if getattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 0) < 2:
+        raise RuntimeError(
+            "The Figma connector requires a cognee build with table-scoped document "
+            "cleanup and per-row node sets (DOCUMENT_SYNC_VERSION 2, cognee 1.6.4)."
+        )
     if team_ids is None and folder_ids is None and file_keys is None:
         raise ValueError(
             "Select what to ingest: pass team_ids=, folder_ids= or file_keys=. Figma "
@@ -208,7 +223,12 @@ def figma_source(
         access_token, personal_access_token=personal_access_token, session=session
     )
 
-    @dlt.resource(name=FIGMA_TABLE_NAME, primary_key="id", write_disposition="replace")
+    @dlt.resource(
+        name=FIGMA_TABLE_NAME,
+        primary_key="id",
+        write_disposition="replace",
+        columns=NODE_SET_COLUMN_HINT,
+    )
     def figma_files():
         files = list_files(client_config, team_ids, folder_ids, file_keys)
         rows = sync_files(
@@ -398,11 +418,13 @@ def sync_files(
     """Yield ``(table_name, row)`` for the full snapshot of ``files``.
 
     ``state["files"]`` maps a file key to its last ``modified`` stamp, its
-    ``version`` and the rows rendered from it. A file whose stamp did not move
-    is re-emitted from there without fetching its node tree. Entries for
-    files that left the listing (or answered 404) are dropped, so the cache
-    never outgrows the selection. ``state`` is only persisted by dlt when the
-    whole run loads, so a failed run leaves the cache as it was.
+    ``version``, and what its node tree rendered to (editor type, text and
+    comment locations). A file whose stamp did not move is re-emitted from
+    there without fetching its node tree; its title and folder still come
+    from ``files``, the fresh listing. Entries for files that left the
+    listing (or answered 404) are dropped, so the cache never outgrows the
+    selection. ``state`` is only persisted by dlt when the whole run loads,
+    so a failed run leaves the cache as it was.
     """
     if state.get("cache_version") != _CACHE_VERSION:
         state["files"] = {}
@@ -422,16 +444,12 @@ def sync_files(
         key = file["key"]
         if key in fetched:
             document = fetched[key]
-            content, locations = render_document(document, file.get("folder"))
+            body, locations = render_document(document)
             entries[key] = {
                 "modified": file.get("modified"),
                 "version": document.get("version"),
-                "row": {
-                    "id": _file_id(key),
-                    "title": document.get("name") or file["name"],
-                    "content": content,
-                    "url": FIGMA_FILE_URL.format(key=key),
-                },
+                "editor": document.get("editorType"),
+                "body": body,
                 "locations": locations,
             }
         elif key not in changed:
@@ -447,9 +465,9 @@ def sync_files(
         entry = entries.get(file["key"])
         if entry is None:
             continue
-        yield FIGMA_TABLE_NAME, dict(entry["row"])
+        yield FIGMA_TABLE_NAME, _file_row(file, entry)
         for row in comment_thread_rows(
-            file["key"], entry["row"]["title"], comments.get(file["key"], []), entry["locations"]
+            file["key"], file["name"], comments.get(file["key"], []), entry["locations"]
         ):
             threads += 1
             yield FIGMA_COMMENTS_TABLE_NAME, row
@@ -516,11 +534,13 @@ def _fetch_comments(client_config: dict[str, Any], keys: list[str]) -> dict[str,
 # ---------------------------------------------------------------------------
 
 
-def render_document(document: dict, folder: str | None = None) -> tuple[str, dict[str, str]]:
+def render_document(document: dict) -> tuple[str, dict[str, str]]:
     """Render a ``GET /v1/files/:key`` response to text.
 
-    Returns the document content and a map of page/container node ids to
-    their ``Page / Frame`` path, used to say where a comment is pinned.
+    Returns the page outline and the text of every page, and a map of
+    page/container node ids to their ``Page / Frame`` path, used to say where
+    a comment is pinned. The file's name, type and folder are not part of it:
+    they come from the listing, see :func:`_file_row`.
 
     Only names and text are kept, so a geometry-only edit (moving a frame,
     changing a colour) re-renders to the same content and does not churn
@@ -528,11 +548,6 @@ def render_document(document: dict, folder: str | None = None) -> tuple[str, dic
     the content for the same reason.
     """
     lines: list[str] = []
-    editor = _EDITOR_LABELS.get(document.get("editorType") or "", "Figma file")
-    lines.append(f"Type: {editor}")
-    if folder:
-        lines.append(f"Folder: {folder}")
-
     pages = [
         page
         for page in (document.get("document") or {}).get("children") or []
@@ -551,6 +566,21 @@ def render_document(document: dict, folder: str | None = None) -> tuple[str, dic
         lines.extend(_render_nodes(page.get("children") or [], page_name, locations))
 
     return "\n".join(lines).strip(), locations
+
+
+def _file_row(file: dict, entry: dict) -> dict[str, Any]:
+    """Build a file's document row from its listing entry and its cached rendering."""
+    editor = _EDITOR_LABELS.get(entry.get("editor") or "", "Figma file")
+    header = [f"Type: {editor}"]
+    if file.get("folder"):
+        header.append(f"Folder: {file['folder']}")
+    return {
+        "id": _file_id(file["key"]),
+        "title": file["name"],
+        "content": "\n".join([*header, entry["body"]]).strip(),
+        "url": FIGMA_FILE_URL.format(key=file["key"]),
+        NODE_SET_COLUMN: _node_set(file["key"], file["name"]),
+    }
 
 
 def _render_nodes(nodes: list[dict], page_name: str, locations: dict[str, str]) -> list[str]:
@@ -639,6 +669,7 @@ def _thread_to_row(
         "title": _thread_title(file_name, root),
         "content": "\n".join(header) + "\n\n" + "\n\n".join(messages),
         "url": FIGMA_FILE_URL.format(key=file_key),
+        NODE_SET_COLUMN: _node_set(file_key, file_name),
     }
 
 
@@ -668,6 +699,11 @@ def _thread_title(file_name: str, root: dict) -> str:
 
 def _file_id(file_key: str) -> str:
     return f"file:{file_key}"
+
+
+def _node_set(file_key: str, file_name: str) -> list[str]:
+    """The node set a file and its comment threads share (cognee adds the ``figma:`` prefix)."""
+    return [f"{file_name} ({file_key})"]
 
 
 def _parse_time(value: str | None) -> datetime | None:
