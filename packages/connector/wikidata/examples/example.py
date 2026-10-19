@@ -43,9 +43,11 @@ async def main() -> None:
 
     # Douglas Adams (Q42) plus his notable works (P800), one hop out.
     # sparql="SELECT ?item WHERE { ... } LIMIT 100" selects items by query instead.
+    # The source reads no environment itself; the example passes settings in.
     source = wikidata_source(
         items=["Q42"],
         expand_properties=["P800"],
+        api_url=os.environ.get("WIKIDATA_API_URL", "https://www.wikidata.org/w/api.php"),
         user_agent=os.environ.get(
             "WIKIDATA_USER_AGENT",
             "cognee-wikidata-example/0.1 (https://github.com/topoteretes/cognee-community)",
@@ -62,7 +64,8 @@ async def main() -> None:
     )
     stats = source.cognee_sync_stats
     print(
-        f"{stats['mode']} sync: {stats['items_changed']} item(s) ingested, "
+        f"{'full' if stats['full_sync'] else 'incremental'} sync: "
+        f"{stats['items_changed']} item(s) ingested, "
         f"{stats['items_unchanged']} unchanged, {stats['deleted']} forgotten."
     )
 

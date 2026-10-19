@@ -57,7 +57,6 @@ previous state and the next run retries.
 from __future__ import annotations
 
 import contextlib
-import os
 import re
 import time
 from collections.abc import Callable, Iterable, Iterator
@@ -78,10 +77,17 @@ DEFAULT_USER_AGENT = (
     "cognee-community-connector-wikidata/0.1.0 (+https://github.com/topoteretes/cognee-community)"
 )
 
-# wbgetentities accepts at most 50 ids per request for normal users.
+# wbgetentities accepts at most 50 ids per request for normal users
+# (ApiBase::LIMIT_SML1; bots get 500, which this connector does not rely on).
 _BATCH_SIZE = 50
+# Attempts per request on 429 / 5xx / maxlag / network errors: our choice, so a
+# lagging service costs at most a few minutes before the run stops cleanly.
 _MAX_RETRIES = 5
-_RETRYABLE_API_ERRORS = {"maxlag", "ratelimited"}
+# Longest wait honoured for Retry-After / maxlag. The sync runs while cognee holds
+# its process-wide dlt staging lock, so a service asking for more stops the run
+# cleanly (state untouched, retried next run) instead of sleeping inside the lock.
+_MAX_RETRY_AFTER_SECONDS = 60.0
+_RATE_LIMIT_API_ERRORS = {"maxlag", "ratelimited"}
 _ENTITY_ID_RE = re.compile(r"^[QP][1-9]\d*$")
 # Captures an id at the end of an entity URI or page URL, e.g.
 # http://www.wikidata.org/entity/Q42 or https://www.wikidata.org/wiki/Property:P31.
@@ -100,6 +106,18 @@ class WikidataAPIError(RuntimeError):
         self.code = code
         self.info = info
         self.entity_id = entity_id
+
+
+class WikidataRateLimitedError(WikidataAPIError):
+    """The service kept asking to slow down (429, maxlag) beyond what a run waits."""
+
+
+class WikidataAuthError(WikidataAPIError):
+    """The service refused access (HTTP 401/403, e.g. a blocked User-Agent)."""
+
+
+class WikidataScopeError(ValueError):
+    """A configured seed id does not exist (likely a typo)."""
 
 
 def normalize_entity_id(value: str) -> str:
@@ -139,8 +157,9 @@ class _WikibaseClient:
         import httpx
 
         headers = {"User-Agent": self._user_agent, "Accept": accept}
-        for attempt in range(_MAX_RETRIES):
-            last_attempt = attempt == _MAX_RETRIES - 1
+        attempt = 0
+        while True:
+            last_attempt = attempt >= _MAX_RETRIES - 1
             self.requests += 1
             try:
                 response = self._http.get(url, params=params, headers=headers)
@@ -148,19 +167,30 @@ class _WikibaseClient:
                 if last_attempt:
                     raise
                 self._backoff(f"network error ({type(exc).__name__})", None, attempt)
+                attempt += 1
                 continue
-            if response.status_code == 429 or response.status_code >= 500:
+            status = response.status_code
+            if status == 429 or status >= 500:
                 if last_attempt:
-                    raise WikidataAPIError(f"http_{response.status_code}")
-                self._backoff(f"HTTP {response.status_code}", response.headers, attempt)
+                    error_class = WikidataRateLimitedError if status == 429 else WikidataAPIError
+                    raise error_class(f"http_{status}")
+                self._backoff(f"HTTP {status}", response.headers, attempt, rate_limit=status == 429)
+                attempt += 1
                 continue
-            if response.status_code >= 400:
-                raise WikidataAPIError(f"http_{response.status_code}", response.text[:200])
+            if status in (401, 403):
+                raise WikidataAuthError(f"http_{status}")
+            if status >= 400:
+                raise WikidataAPIError(f"http_{status}", response.text[:200])
             return response
-        raise WikidataAPIError("retries_exhausted")  # pragma: no cover - loop always returns
 
-    def _backoff(self, reason: str, headers: Any, attempt: int) -> None:
+    def _backoff(self, reason: str, headers: Any, attempt: int, rate_limit: bool = False) -> None:
         delay = _retry_after(headers, attempt)
+        if delay > _MAX_RETRY_AFTER_SECONDS:
+            error_class = WikidataRateLimitedError if rate_limit else WikidataAPIError
+            raise error_class(
+                "retry_after_too_long",
+                f"asked to wait {delay:.0f}s (more than {_MAX_RETRY_AFTER_SECONDS:.0f}s)",
+            )
         logger.warning(
             "Wikidata: %s, retrying in %.1fs (%d/%d).", reason, delay, attempt + 1, _MAX_RETRIES
         )
@@ -170,18 +200,29 @@ class _WikibaseClient:
         full = {"format": "json", "formatversion": "2", **params}
         if self._maxlag is not None:
             full["maxlag"] = str(self._maxlag)
-        for attempt in range(_MAX_RETRIES):
+        attempt = 0
+        while True:
             response = self._send(self.api_url, full, "application/json")
-            payload = response.json()
-            error = payload.get("error") if isinstance(payload, dict) else None
+            try:
+                payload = response.json()
+            except ValueError:
+                # A proxy or maintenance page answering 200 with HTML: treat it as
+                # a failure, never as an empty result.
+                raise WikidataAPIError("invalid_response", "the API did not answer JSON") from None
+            if not isinstance(payload, dict):
+                raise WikidataAPIError("invalid_response", "the API did not answer an object")
+            error = payload.get("error")
             if not error:
                 return payload
             code = str(error.get("code") or "unknown")
-            if code in _RETRYABLE_API_ERRORS and attempt < _MAX_RETRIES - 1:
-                self._backoff(code, response.headers, attempt)
+            info = str(error.get("info") or "")
+            if code in _RATE_LIMIT_API_ERRORS:
+                if attempt >= _MAX_RETRIES - 1:
+                    raise WikidataRateLimitedError(code, info)
+                self._backoff(code, response.headers, attempt, rate_limit=True)
+                attempt += 1
                 continue
-            raise WikidataAPIError(code, str(error.get("info") or ""), error.get("id"))
-        raise WikidataAPIError("retries_exhausted")  # pragma: no cover - loop always returns
+            raise WikidataAPIError(code, info, error.get("id"))
 
     def sparql(self, query: str) -> list[dict]:
         if not self._sparql_url:
@@ -234,7 +275,7 @@ def _retry_after(headers: Any, attempt: int) -> float:
     try:
         return max(float(header), 0.0)
     except (TypeError, ValueError):
-        return float(2**attempt)
+        return min(float(2**attempt), _MAX_RETRY_AFTER_SECONDS)
 
 
 def _batched(values: Iterable[Any], size: int = _BATCH_SIZE) -> Iterator[list]:
@@ -635,16 +676,8 @@ def _select(
     return selection
 
 
-def sync_items(client: _WikibaseClient, settings: _Settings, state: dict, stats: dict):
-    """Yield changed item documents and deletion tombstones, then advance ``state``.
-
-    ``state`` is only written after the last row was yielded, so a run that
-    raises part-way keeps the previous state (dlt also discards the state of a
-    failed load).
-    """
+def _sync(client: _WikibaseClient, settings: _Settings, state: dict, stats: dict[str, int]):
     previous: dict[str, dict] = dict(state.get("items") or {})
-    stats.clear()
-    stats.update(items_selected=0, items_changed=0, items_unchanged=0, deleted=0, redirected=0)
 
     reason = None
     if not previous:
@@ -655,10 +688,24 @@ def sync_items(client: _WikibaseClient, settings: _Settings, state: dict, stats:
         reason = "render_changed"
     elif state.get("selection") != settings.selection_fingerprint():
         reason = "selection_changed"
-    stats["mode"] = "full" if reason else "incremental"
-    stats["full_sync_reason"] = reason
+    if reason:
+        stats["full_sync"] = 1
+        stats[f"full_sync_{reason}"] = 1
 
     selection = _select(client, settings, previous, refetch=reason is not None)
+
+    # A seed that does not exist is a typo when it was just added to the
+    # configuration; one synced before and deleted since is forgotten below.
+    previous_selection = state.get("selection")
+    known_seeds = (
+        set(previous_selection[0] or [])
+        if isinstance(previous_selection, list) and previous_selection
+        else set()
+    )
+    unknown = sorted(selection.missing & (set(settings.items) - known_seeds))
+    if unknown:
+        raise WikidataScopeError(f"These ids do not exist (deleted or never assigned): {unknown}")
+
     stats["items_selected"] = len(selection.revisions)
     stats["redirected"] = len(selection.redirected)
     if selection.truncated:
@@ -666,19 +713,23 @@ def sync_items(client: _WikibaseClient, settings: _Settings, state: dict, stats:
             "Wikidata: the selection reached max_items=%d; further items were skipped.",
             settings.max_items,
         )
-    stats["truncated"] = selection.truncated
+        stats["truncated"] = 1
 
-    if previous and not selection.revisions:
+    confirmed_gone = selection.missing | set(selection.redirected)
+    if previous and not selection.revisions and not previous.keys() <= confirmed_gone:
         # An empty selection while items were synced before is far more likely
         # a broken SPARQL query or an outage than every item vanishing at once.
-        # Forgetting the whole dataset would be permanent.
+        # Forgetting the whole dataset would be permanent, so the run changes
+        # nothing and the next one retries. When the API itself reported every
+        # synced item missing (deleted upstream), the deletions are real and go
+        # ahead.
         logger.warning(
             "Wikidata: the selection resolved to 0 items but %d were synced before; "
-            "skipping deletions this run.",
+            "leaving the dataset and the sync state untouched.",
             len(previous),
         )
-        state["items"] = previous
-        stats["requests"] = client.requests
+        stats["failed"] = 1
+        stats["failed_empty_scope"] = 1
         return
 
     labels = _Labels(client, settings.language)
@@ -712,18 +763,58 @@ def sync_items(client: _WikibaseClient, settings: _Settings, state: dict, stats:
         stats["deleted"] += 1
         yield _tombstone(entity_id)
 
+    # State is written only after the last row was yielded, so a run that raises
+    # part-way keeps the previous state (dlt also discards the state of a failed
+    # load).
     state["items"] = synced
     state["selection"] = settings.selection_fingerprint()
     state["render"] = settings.render_fingerprint()
-    stats["requests"] = client.requests
     logger.info(
         "Wikidata: %s sync, %d changed, %d unchanged, %d deleted, %d request(s).",
-        stats["mode"],
+        "full" if reason else "incremental",
         stats["items_changed"],
         stats["items_unchanged"],
         stats["deleted"],
         client.requests,
     )
+
+
+def sync_items(client: _WikibaseClient, settings: _Settings, state: dict, stats: dict):
+    """Yield changed item documents and deletion tombstones, then advance ``state``.
+
+    ``stats`` receives plain int counters for the host: ``items_selected``,
+    ``items_changed``, ``items_unchanged``, ``deleted``, ``redirected``,
+    ``truncated``, ``requests``, ``full_sync`` (plus ``full_sync_<reason>``) and
+    ``failed`` (plus ``failed_<reason>``: ``rate_limit``, ``auth``, ``empty_scope``).
+
+    A service that keeps rate-limiting the run stops it cleanly: what was yielded
+    stays, the state is not advanced, and the next run resumes. An access
+    failure raises.
+    """
+    stats.clear()
+    stats.update(
+        items_selected=0,
+        items_changed=0,
+        items_unchanged=0,
+        deleted=0,
+        redirected=0,
+        truncated=0,
+        requests=0,
+        full_sync=0,
+        failed=0,
+    )
+    try:
+        yield from _sync(client, settings, state, stats)
+    except WikidataRateLimitedError as exc:
+        stats["failed"] = 1
+        stats["failed_rate_limit"] = 1
+        logger.warning("Wikidata: rate limited (%s); the next run resumes from here.", exc.code)
+    except WikidataAuthError:
+        stats["failed"] = 1
+        stats["failed_auth"] = 1
+        raise
+    finally:
+        stats["requests"] = client.requests
 
 
 def _entity_url(api_url: str, entity: dict) -> str:
@@ -752,23 +843,26 @@ def wikidata_source(
     include_external_ids: bool = False,
     sitelinks: list[str] | None = None,
     full_sync: bool = False,
-    api_url: str | None = None,
+    api_url: str = DEFAULT_API_URL,
     sparql_url: str | None = None,
-    user_agent: str | None = None,
+    user_agent: str = DEFAULT_USER_AGENT,
     maxlag: int | None = 5,
     resource_name: str | None = None,
     check_active: Callable[[], None] | None = None,
+    service: Any = None,
     http_client: Any = None,
 ):
     """Return a ``dlt`` resource yielding one document row per selected item.
 
     Hand the result to ``cognee.remember(...)`` with
     ``write_disposition="merge"``, ``primary_key="id"`` and
-    ``max_rows_per_table=0``.
+    ``max_rows_per_table=0``. Configuration is passed explicitly; reading it
+    from the environment is left to the caller (see ``examples/example.py``).
 
     Args:
         items: Seed item or property ids (``"Q42"``), entity URIs or item page
-            URLs.
+            URLs. A seed that does not exist (deleted or never assigned) raises
+            ``WikidataScopeError`` when it is first configured.
         expand_properties: Property ids to follow from each selected item
             (e.g. ``["P800"]``, notable work). Their item values join the
             selection, up to ``expand_depth`` hops from the seeds.
@@ -787,22 +881,21 @@ def wikidata_source(
         sitelinks: Site ids whose links are kept (default: the ``language``
             Wikipedia, e.g. ``enwiki``); ``[]`` keeps none.
         full_sync: Re-fetch and re-render every selected item on this run.
-        api_url: The Wikibase ``api.php`` URL. Defaults to ``WIKIDATA_API_URL``,
-            then Wikidata's.
-        sparql_url: SPARQL endpoint for ``sparql``. Defaults to
-            ``WIKIDATA_SPARQL_URL``, then the Wikidata Query Service when
-            ``api_url`` is Wikidata's.
+        api_url: The Wikibase ``api.php`` URL (default: Wikidata's).
+        sparql_url: SPARQL endpoint for ``sparql``. Defaults to the Wikidata
+            Query Service when ``api_url`` is Wikidata's; required otherwise.
         user_agent: User-Agent header. Wikimedia asks for contact details, e.g.
-            ``"my-app/1.0 (me@example.com)"``. Falls back to
-            ``WIKIDATA_USER_AGENT``, then a generic connector agent.
+            ``"my-app/1.0 (me@example.com)"``.
         maxlag: The ``maxlag`` seconds sent with Action API requests (``None``
-            to omit it); "too busy" answers are retried.
+            to omit it); "too busy" answers are retried after the
+            ``Retry-After`` sent, up to 60 seconds.
         resource_name: dlt resource / staging table name, also the key of the
             incremental state. Defaults to one derived from ``api_url``. Two
             sources sharing a name share state, so each would forget the
             other's items.
         check_active: Optional host authorization checkpoint during extraction.
-        http_client: Pre-built ``httpx.Client`` (mainly a test injection point).
+        service: Pre-built ``httpx.Client`` (mainly a test injection point).
+        http_client: Alias of ``service``.
     """
     import dlt
     import httpx
@@ -813,13 +906,19 @@ def wikidata_source(
             "sets (DOCUMENT_SYNC_VERSION >= 2, cognee 1.6.3+). Upgrade cognee."
         )
 
-    resolved_api_url = (api_url or os.getenv("WIKIDATA_API_URL") or DEFAULT_API_URL).strip()
+    if service is not None and http_client is not None and service is not http_client:
+        raise ValueError("Pass the pre-built client as service= or http_client=, not both.")
+    injected_client = service if service is not None else http_client
+
+    resolved_api_url = (api_url or "").strip()
     parsed = urlparse(resolved_api_url)
     if parsed.scheme not in ("http", "https") or not parsed.path.endswith("api.php"):
         raise ValueError(
             "wikidata_source needs the Wikibase api.php URL, e.g. "
-            "https://www.wikidata.org/w/api.php (pass api_url= or set WIKIDATA_API_URL)."
+            "https://www.wikidata.org/w/api.php."
         )
+    if not user_agent or not user_agent.strip():
+        raise ValueError("user_agent must not be empty.")
     seeds = tuple(dict.fromkeys(normalize_entity_id(item) for item in items or []))
     if not seeds and not sparql:
         raise ValueError("Select something to sync: pass items=[...] and/or sparql=...")
@@ -831,11 +930,11 @@ def wikidata_source(
     if not re.fullmatch(r"[a-z]{2,3}(-[a-z0-9-]+)?", language):
         raise ValueError(f"language must be a language code such as 'en', got {language!r}.")
 
-    resolved_sparql_url = sparql_url or os.getenv("WIKIDATA_SPARQL_URL")
+    resolved_sparql_url = sparql_url
     if not resolved_sparql_url and parsed.netloc == urlparse(DEFAULT_API_URL).netloc:
         resolved_sparql_url = DEFAULT_SPARQL_URL
     if sparql and not resolved_sparql_url:
-        raise ValueError("sparql= needs sparql_url= (or WIKIDATA_SPARQL_URL) for this Wikibase.")
+        raise ValueError("sparql= needs sparql_url= for this Wikibase.")
 
     settings = _Settings(
         items=seeds,
@@ -849,9 +948,8 @@ def wikidata_source(
         sitelinks=tuple(sitelinks if sitelinks is not None else [f"{language}wiki"]),
         full_sync=full_sync,
     )
-    resolved_user_agent = user_agent or os.getenv("WIKIDATA_USER_AGENT") or DEFAULT_USER_AGENT
     name = resource_name or _default_resource_name(resolved_api_url)
-    stats: dict[str, Any] = {}
+    stats: dict[str, int] = {}
 
     @dlt.resource(
         name=name,
@@ -866,13 +964,15 @@ def wikidata_source(
     def wikidata_items():
         # The query service can take up to its 60 s limit to answer.
         owned_client = (
-            None if http_client is not None else httpx.Client(timeout=75.0, follow_redirects=True)
+            None
+            if injected_client is not None
+            else httpx.Client(timeout=75.0, follow_redirects=True)
         )
         try:
             client = _WikibaseClient(
-                http_client or owned_client,
+                injected_client or owned_client,
                 resolved_api_url,
-                resolved_user_agent,
+                user_agent,
                 maxlag,
                 sparql_url=resolved_sparql_url,
             )
@@ -901,6 +1001,6 @@ def wikidata_source(
     # Keep the incremental state per (dataset, resource), so syncing the same
     # selection into another dataset does not reuse this one's state.
     setattr(resource, dlt_utils.PIPELINE_SCOPE_ATTR, name)
-    # Host-readable diagnostics: counts and the sync mode, never item content.
+    # Host-readable diagnostics: int counters only, never item content.
     resource.cognee_sync_stats = stats
     return resource

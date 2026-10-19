@@ -134,7 +134,10 @@ class FakeWikibase:
         if self.failures:
             kind, value = self.failures.pop(0)
             if kind == "http":
-                return httpx.Response(value, headers={"Retry-After": "0"})
+                status, retry_after = value if isinstance(value, tuple) else (value, "0")
+                return httpx.Response(status, headers={"Retry-After": retry_after})
+            if kind == "html":
+                return httpx.Response(200, text="<html>Maintenance</html>")
             if kind == "api":
                 return httpx.Response(
                     200, headers={"Retry-After": "0"}, json={"error": {"code": value, "info": ""}}

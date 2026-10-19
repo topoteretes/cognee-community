@@ -127,7 +127,7 @@ async def test_deleting_an_item_upstream_forgets_its_graph_content(clean_environ
     wiki.create("Q2", BRAVO, descriptions={"en": "an unrelated company in the finance sector"})
 
     source = await _sync(wiki)
-    assert source.cognee_sync_stats["mode"] == "full"
+    assert source.cognee_sync_stats["full_sync"] == 1
     assert await _graph_has(ALPHA) and await _graph_has(BRAVO)
     # Every item sits under the Wikibase's node set, so recall can be scoped to it.
     assert await _graph_has("wikidata:www.wikidata.org")
@@ -144,7 +144,7 @@ async def test_deleting_an_item_upstream_forgets_its_graph_content(clean_environ
 
     # Nothing changed upstream: same documents, no new ones.
     source = await _sync(wiki)
-    assert source.cognee_sync_stats["mode"] == "incremental"
+    assert source.cognee_sync_stats["full_sync"] == 0
     assert source.cognee_sync_stats["items_changed"] == 0
     assert {d.id for d in await _documents()} == ids_before
 

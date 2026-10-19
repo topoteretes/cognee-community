@@ -12,7 +12,7 @@ cognify entity extraction, via cognee's document-mode marker. Sync is **incremen
 
 ## Requirements
 
-- cognee **1.6.3** or newer (document-mode with per-row node sets).
+- Python 3.10+ and cognee **1.6.3** or newer, below 2 (document-mode with per-row node sets).
 - No account or API key: Wikidata is public and its data is CC0.
 
 ## Install
@@ -71,11 +71,16 @@ service stops queries after 60 seconds: keep queries `LIMIT`-ed.
 | `include_external_ids` | `False` | also render external-identifier statements (VIAF, ISNI, …) |
 | `sitelinks` | `["<language>wiki"]` | site ids whose links are kept (`[]` for none) |
 | `full_sync` | `False` | re-fetch and re-render every selected item on this run |
-| `api_url` | Wikidata | another Wikibase's `api.php` (`WIKIDATA_API_URL`) |
-| `sparql_url` | WDQS | SPARQL endpoint; needed for `sparql` on another Wikibase (`WIKIDATA_SPARQL_URL`) |
-| `user_agent` | env / generic | User-Agent; Wikimedia asks for contact details (`WIKIDATA_USER_AGENT`) |
+| `api_url` | Wikidata | another Wikibase's `api.php` |
+| `sparql_url` | WDQS | SPARQL endpoint; needed for `sparql` on another Wikibase |
+| `user_agent` | generic | User-Agent; Wikimedia asks for contact details |
 | `maxlag` | `5` | `maxlag` sent with every Action API request; "too busy" answers are retried |
 | `resource_name` | from `api_url` | staging table and state key; one per Wikibase sharing a dataset |
+| `check_active` | none | host authorization checkpoint, called while rows are produced |
+| `service` | none | a pre-built `httpx.Client` (alias: `http_client`) |
+
+The source reads no environment variables; `examples/example.py` shows reading
+`WIKIDATA_API_URL` and `WIKIDATA_USER_AGENT` and passing them in.
 
 ## What a document contains
 
@@ -129,14 +134,29 @@ Every item carries the `wikidata:<server>` node set (e.g. `wikidata:www.wikidata
    is tombstoned and the target is synced in its place.
 4. **Items that left the selection** (a seed removed, a link removed upstream, a query
    result gone) are tombstoned too.
-5. **Ids that never existed** make Wikidata fail the whole request (`no-such-entity`).
-   The connector drops that id and retries the rest, so one typo cannot block a sync.
-6. A selection that comes back **empty** while items were synced before deletes nothing,
-   so a broken query or an outage cannot wipe the dataset.
+5. **Unknown seeds.** A seed id that does not exist (deleted, or never assigned: a typo)
+   raises `WikidataScopeError` when it is first configured, instead of quietly syncing
+   less. A seed that was synced and deleted later is forgotten as usual. Ids that never
+   existed also make Wikidata fail a whole `wbgetentities` request (`no-such-entity`);
+   the client drops that id and retries the rest of the batch.
+6. A selection that comes back **empty** while items were synced before deletes nothing
+   and leaves the sync state untouched (`failed_empty_scope`), so a broken query or an
+   outage cannot wipe the dataset. When the API itself confirms every synced item is
+   gone (deleted or merged), the deletions are real and go ahead.
 
 A change of `language`, `include_external_ids`, `sitelinks` or the selection re-renders
 everything once. Every API error aborts the run before its state is saved, so the next run
-retries.
+retries. A service that keeps rate-limiting the run (HTTP 429 or `maxlag` past the retries,
+or a `Retry-After` over 60 seconds) stops it cleanly instead: what was synced stays, the
+state is not advanced, and the next run resumes.
+
+### Sync stats
+
+After a run, `source.cognee_sync_stats` holds plain int counters: `items_selected`,
+`items_changed`, `items_unchanged`, `deleted`, `redirected`, `truncated`, `requests`,
+`full_sync` (with `full_sync_<reason>` for `initial`, `requested`, `render_changed` or
+`selection_changed`) and `failed` (with `failed_rate_limit`, `failed_auth` or
+`failed_empty_scope`).
 
 ### Limitations
 
@@ -146,10 +166,13 @@ retries.
 - Lexemes (`L…`) and other entity types are not supported; items and properties are.
 - References (sources of statements) are not rendered.
 
+Wikidata content is public and CC0. On a private Wikibase, the documents hold whatever the
+selected items contain, including any personal data recorded in their statements.
+
 ## API etiquette
 
 Requests are sequential, batch 50 ids, send `maxlag` and a descriptive User-Agent, and
-back off on `maxlag`, HTTP 429 and 5xx, honouring `Retry-After`. Set `user_agent` to
+back off on `maxlag`, HTTP 429 and 5xx, honouring `Retry-After` up to 60 seconds. Set `user_agent` to
 something with your contact details, as the
 [Wikimedia User-Agent policy](https://foundation.wikimedia.org/wiki/Policy:User-Agent_policy)
 asks.

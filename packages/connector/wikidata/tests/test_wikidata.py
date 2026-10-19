@@ -37,7 +37,12 @@ from fake_wikibase import (
     time_value,
 )
 
-from cognee_community_connector_wikidata import normalize_entity_id, wikidata_source
+from cognee_community_connector_wikidata import (
+    WikidataAuthError,
+    WikidataScopeError,
+    normalize_entity_id,
+    wikidata_source,
+)
 from cognee_community_connector_wikidata.wikidata import (
     WikidataAPIError,
     _Settings,
@@ -196,7 +201,7 @@ def test_initial_sync_renders_readable_documents(wiki):
     # The seed plus its notable works (one hop along P800).
     assert set(live) == {"Q42", "Q25169", "Q3107329"}
     assert deleted == set()
-    assert stats["mode"] == "full" and stats["full_sync_reason"] == "initial"
+    assert stats["full_sync"] == 1 and stats["full_sync_initial"] == 1
 
     row = live["Q42"]
     assert row["title"] == "Douglas Adams"  # resolved through the mul fallback
@@ -315,13 +320,32 @@ def test_expansion_is_bounded_by_depth(wiki):
 def test_max_items_caps_the_selection(wiki):
     live, _, stats = _sync(wiki, {}, max_items=2)
     assert set(live) == {"Q42", "Q25169"}
-    assert stats["truncated"] is True
+    assert stats["truncated"] == 1
 
 
-def test_a_never_assigned_seed_does_not_block_the_others(wiki):
-    live, _, stats = _sync(wiki, {}, items=["Q42", "Q999999999"], expand_properties=[])
-    assert set(live) == {"Q42"}
-    assert stats["items_selected"] == 1
+def test_a_misspelled_or_unknown_seed_raises_instead_of_syncing_less(wiki):
+    state: dict = {}
+    with pytest.raises(WikidataScopeError, match="Q999999999"):
+        _sync(wiki, state, items=["Q42", "Q999999999"], expand_properties=[])
+    assert state == {}
+
+
+def test_a_never_assigned_id_does_not_block_its_batch(wiki):
+    # Wikidata fails the whole wbgetentities request for an id that was never
+    # assigned; the client drops that id and retries the rest of the batch.
+    client = _WikibaseClient(wiki.client(), API_URL, "ua", None, sleep=lambda _s: None)
+    entities = client.get_entities(["Q42", "Q999999999"], {"props": "info"})
+    assert "missing" in entities["Q999999999"]
+    assert entities["Q42"]["id"] == "Q42"
+
+
+def test_a_seed_deleted_after_it_was_synced_is_forgotten_not_rejected(wiki):
+    state: dict = {}
+    _sync(wiki, state, items=["Q42", "Q25169"], expand_properties=[])
+    wiki.delete("Q25169")
+    live, deleted, stats = _sync(wiki, state, items=["Q42", "Q25169"], expand_properties=[])
+    assert live == {} and deleted == {"Q25169"}
+    assert stats["failed"] == 0
 
 
 def test_sparql_selects_items(wiki):
@@ -362,7 +386,7 @@ def test_unchanged_run_costs_only_revision_checks(wiki):
 
     live, deleted, stats = _sync(wiki, state)
     assert live == {} and deleted == set()
-    assert stats["mode"] == "incremental"
+    assert stats["full_sync"] == 0
     assert stats["items_unchanged"] == 3
     # Two levels of revision checks, no entity or label fetches.
     assert [r["props"] for r in wiki.requests] == ["info", "info"]
@@ -437,7 +461,7 @@ def test_render_change_re_renders_everything(wiki):
     state: dict = {}
     _sync(wiki, state)
     live, _, stats = _sync(wiki, state, include_external_ids=True)
-    assert stats["full_sync_reason"] == "render_changed"
+    assert stats["full_sync_render_changed"] == 1
     assert set(live) == {"Q42", "Q25169", "Q3107329"}
 
 
@@ -445,7 +469,7 @@ def test_full_sync_flag_re_renders_everything(wiki):
     state: dict = {}
     _sync(wiki, state)
     live, _, stats = _sync(wiki, state, full_sync=True)
-    assert stats["full_sync_reason"] == "requested"
+    assert stats["full_sync_requested"] == 1
     assert len(live) == 3
 
 
@@ -511,6 +535,8 @@ def test_resource_is_a_merge_document_source():
         ({"items": ["Q42"], "max_items": 0}, "max_items"),
         ({"items": ["Q42"], "language": "English"}, "language"),
         ({"items": ["Q42"], "api_url": "https://www.wikidata.org/wiki/Q42"}, "api.php"),
+        ({"items": ["Q42"], "api_url": ""}, "api.php"),
+        ({"items": ["Q42"], "user_agent": " "}, "user_agent"),
         (
             {"sparql": "SELECT ?item {}", "api_url": "https://example.wikibase.cloud/w/api.php"},
             "sparql_url",
@@ -518,8 +544,8 @@ def test_resource_is_a_merge_document_source():
     ],
 )
 def test_factory_validates_its_arguments(kwargs, message, monkeypatch):
-    for name in ("WIKIDATA_API_URL", "WIKIDATA_SPARQL_URL"):
-        monkeypatch.delenv(name, raising=False)
+    # The factory reads no environment: a set variable must not fill a gap.
+    monkeypatch.setenv("WIKIDATA_SPARQL_URL", SPARQL_URL)
     with pytest.raises(ValueError, match=message):
         wikidata_source(**kwargs)
 
@@ -555,13 +581,13 @@ def test_forget_on_delete_end_to_end_through_a_real_dlt_merge(wiki, tmp_path):
         "Q3107329": "The Hitchhiker's Guide to the Galaxy (radio series)",
         "Q42": "Douglas Adams",
     }
-    assert source.cognee_sync_stats["mode"] == "full"
+    assert source.cognee_sync_stats["full_sync"] == 1
 
     # The state persists in dlt's resource state: the next run is incremental.
     wiki.delete("Q3107329")
     wiki.edit("Q25169", labels={"en": "Hitchhiker's Guide"})
     source = run()
-    assert source.cognee_sync_stats["mode"] == "incremental"
+    assert source.cognee_sync_stats["full_sync"] == 0
     assert _staged(pipeline, table) == {"Q25169": "Hitchhiker's Guide", "Q42": "Douglas Adams"}
 
 
@@ -577,3 +603,91 @@ def test_one_resource_name_cannot_hold_two_wikibases(wiki, tmp_path):
                 ["Q42"], api_url=other_url, http_client=other.client(), resource_name="items"
             )
         )
+
+
+# ---------------------------------------------------------------------------
+# Hardening (same review checklist as the other connectors)
+# ---------------------------------------------------------------------------
+def test_stats_are_plain_int_counters(wiki):
+    _, _, stats = _sync(wiki, {})
+    assert stats and all(type(value) is int for value in stats.values())
+
+
+def test_a_long_retry_after_stops_the_run_cleanly(wiki):
+    state: dict = {}
+    _sync(wiki, state)
+    snapshot = copy.deepcopy(state)
+    wiki.edit("Q25169", descriptions={"en": "edited during an overload"})
+    wiki.failures = [("http", (429, "3600"))]
+
+    live, _, stats = _sync(wiki, state)  # no exception, no hour-long sleep
+    assert live == {}
+    assert stats["failed"] == 1 and stats["failed_rate_limit"] == 1
+    assert state == snapshot
+
+    live, _, _ = _sync(wiki, state)
+    assert set(live) == {"Q25169"}, "the next run picks the edit up"
+
+
+def test_an_empty_selection_reports_failure_and_keeps_the_state(wiki):
+    state: dict = {}
+    wiki.sparql_results = ["Q25169"]
+    _sync(wiki, state, items=[], expand_properties=[], sparql="SELECT ?item WHERE {}")
+    snapshot = copy.deepcopy(state)
+    wiki.sparql_results = []
+
+    _, _, stats = _sync(wiki, state, items=[], expand_properties=[], sparql="SELECT ?item {}")
+    assert stats["failed"] == 1 and stats["failed_empty_scope"] == 1
+    assert state == snapshot
+
+
+def test_a_refused_request_counts_as_an_auth_failure(wiki):
+    wiki.failures = [("http", (403, "0"))]
+    stats: dict = {}
+    client = _WikibaseClient(wiki.client(), API_URL, "ua", 5, sleep=lambda _s: None)
+    with pytest.raises(WikidataAuthError):
+        list(sync_items(client, _settings(), {}, stats))
+    assert stats["failed"] == 1 and stats["failed_auth"] == 1
+
+
+def test_a_non_json_answer_is_an_error_not_an_empty_result(wiki):
+    wiki.failures = [("html", None)]
+    with pytest.raises(WikidataAPIError, match="invalid_response"):
+        _sync(wiki, {})
+
+
+def test_service_is_an_alias_of_http_client():
+    client = httpx.Client()
+    assert wikidata_source(["Q42"], service=client).name == "wikidata_www_wikidata_org"
+    with pytest.raises(ValueError, match="not both"):
+        wikidata_source(["Q42"], service=client, http_client=httpx.Client())
+
+
+def test_two_wikibases_with_their_own_resource_names_share_a_dataset(wiki, tmp_path):
+    pipeline = _pipeline(tmp_path)
+    other = FakeWikibase()
+    other.create("Q1", "Local item")
+    other_url = "https://example.wikibase.cloud/w/api.php"
+
+    def run_both():
+        pipeline.run(wikidata_source(["Q42"], service=wiki.client(), resource_name="wd"))
+        pipeline.run(
+            wikidata_source(["Q1"], api_url=other_url, service=other.client(), resource_name="wb")
+        )
+
+    run_both()
+    other.delete("Q1")
+    run_both()
+    assert _staged(pipeline, "wd") == {"Q42": "Douglas Adams"}
+    # The other Wikibase's only item was confirmed deleted, so it is forgotten
+    # there, and the Wikidata source is untouched.
+    assert _staged(pipeline, "wb") == {}
+
+
+def test_deleting_the_only_selected_item_is_forgotten_not_guarded(wiki):
+    state: dict = {}
+    _sync(wiki, state, items=["Q3107329"], expand_properties=[])
+    wiki.delete("Q3107329")
+    live, deleted, stats = _sync(wiki, state, items=["Q3107329"], expand_properties=[])
+    assert live == {} and deleted == {"Q3107329"}
+    assert stats["failed"] == 0
