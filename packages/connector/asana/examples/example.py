@@ -51,8 +51,9 @@ async def main() -> None:
         return
 
     print(f"Syncing {len(project_gids)} Asana project(s) into cognee ...")
+    source = asana_source(project_gids=project_gids)
     await cognee.remember(
-        asana_source(project_gids=project_gids),
+        source,
         dataset_name=DATASET_NAME,
         primary_key="id",
         # Required: the default "replace" would drop every task that is not
@@ -61,6 +62,8 @@ async def main() -> None:
         # 0 = no row cap, so orphan cleanup compares against the whole corpus.
         max_rows_per_table=0,
     )
+    # scanned, skipped, failed, deleted, kept, given_up (+ failed_<reason> on an early stop)
+    print("Sync stats:", source.cognee_sync_stats)
 
     answer = await cognee.search(
         query_text="What are these Asana projects about, and what is still open?",

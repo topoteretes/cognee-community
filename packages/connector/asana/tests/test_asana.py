@@ -23,15 +23,16 @@ from types import SimpleNamespace
 from uuid import NAMESPACE_OID, uuid5
 
 import pytest
+import requests
 from cognee.tasks.ingestion.dlt_utils import document_source_tag, pipeline_name_for_source
 from cognee.tasks.ingestion.resolve_dlt_sources import _build_document_data_item
+from dlt.pipeline.exceptions import PipelineStepFailed
 
 from cognee_community_connector_asana import asana
 from cognee_community_connector_asana.asana import (
     ASANA_SOURCE_NAME,
     AsanaAPIError,
-    AsanaListingError,
-    AsanaUnavailableError,
+    AsanaResponseError,
     _documents_for,
     _event_task_gids,
     _get,
@@ -81,6 +82,7 @@ class FakeAsana:
         self.calls = []  # (path, params) of every request
         self._queued = []  # (path, predicate, response) answered once, in order
         self._token_counter = 0
+        self.events_page_size = 100  # events per /events page; more sets has_more
 
     # -- fixture builders ----------------------------------------------------
     def add_project(self, gid, name="Website launch", notes="Ship the new site."):
@@ -181,9 +183,14 @@ class FakeAsana:
             return _Resp(
                 412, {"errors": [{"message": "Sync token invalid or too old."}], "sync": fresh}
             )
-        delivered, self.events[project_gid] = self.events[project_gid], []
+        pending = self.events[project_gid]
+        delivered, self.events[project_gid] = (
+            pending[: self.events_page_size],
+            pending[self.events_page_size :],
+        )
         self.tokens[project_gid] = fresh
-        return _Resp(200, {"data": delivered, "sync": fresh, "has_more": False})
+        has_more = bool(self.events[project_gid])
+        return _Resp(200, {"data": delivered, "sync": fresh, "has_more": has_more})
 
     def _list_tasks(self, params):
         assert params.get("project") in self.projects, "listing needs a known project"
@@ -500,8 +507,9 @@ def test_second_sync_without_changes_fetches_no_tasks(fake):
 
     assert [r["id"] for r in rows] == ["project:P1"]  # only the project description
     assert not any(path.startswith("/tasks/") for path, _ in fake.calls)  # nothing re-fetched
-    # The listing asked only for what changed since just before the cursor (day 2).
-    assert fake.requested("/tasks")[1]["modified_since"] == "2026-10-01T23:59:00.000Z"
+    # One listing per project, with every task's modified_at.
+    listing = {"project": "P1", "opt_fields": "modified_at", "limit": 100}
+    assert fake.requested("/tasks") == [listing]
     assert state["known_ids"] == before["known_ids"]
     assert state["projects"]["P1"]["cursor"] == day(2)
 
@@ -799,7 +807,7 @@ def test_events_response_without_sync_token_is_an_error(fake):
     fake.queue("/events", _Resp(412, {"errors": [{"message": "no token here"}]}))
     state = {}
 
-    with pytest.raises(AsanaAPIError, match="no sync token"):
+    with pytest.raises(AsanaResponseError, match="no sync token"):
         run_sync(fake, state)
     assert state == {}
 
@@ -871,30 +879,225 @@ def _task_failure(status, gid):
     return [(f"/tasks/{gid}", _error(status, "nope")) for _ in range(asana._MAX_RETRIES)]
 
 
-@pytest.mark.parametrize("failure", ["401", "rate limit", "three in a row"])
-def test_systemic_task_failure_aborts_with_nothing_committed(fake, failure):
-    for gid in ("1", "2", "3", "4"):
-        fake.add_task(gid, modified_at=day(1))
+@pytest.mark.parametrize("failure", ["401", "rate limit", "long retry-after", "outage"])
+def test_systemic_task_failure_stops_cleanly_and_resumes(fake, failure, sleeps):
+    for gid in ("1", "2", "3", "4", "5"):
+        fake.add_task(gid, modified_at=day(1), notes="v1")
     state = {}
     run_sync(fake, state)
-    before = copy.deepcopy(state)
-    for gid in ("1", "2", "3", "4"):
-        fake.tasks[gid]["modified_at"] = day(4)
+    for gid in ("1", "2", "3", "4", "5"):
+        fake.tasks[gid].update(notes="v2", modified_at=day(4))
+    # Task 1 moves the cursor past the others' overlap window, so only pending
+    # (or the retry list) can bring tasks 2-4 back on the next run.
+    fake.tasks["1"]["modified_at"] = day(9)
+    del fake.tasks["5"]  # a real deletion waits for a run that finishes
 
     if failure == "401":
-        fake.queue("/tasks/2", _error(401, "Not Authorized"))
-        expected = AsanaAPIError
+        fake.queue("/tasks/3", _error(401, "Not Authorized"))
     elif failure == "rate limit":
-        for path, response in _task_failure(429, "2"):
+        for path, response in _task_failure(429, "3"):
             fake.queue(path, response)
-        expected = AsanaAPIError
+    elif failure == "long retry-after":
+        fake.queue("/tasks/3", _error(429, "Rate limited", headers={"Retry-After": "3600"}))
     else:
         for gid in ("2", "3", "4"):
             for path, response in _task_failure(500, gid):
                 fake.queue(path, response)
-        expected = AsanaUnavailableError
+    stats = {}
+    rows = run_sync(fake, state, stats=stats)
 
-    with pytest.raises(expected):
+    reasons = {"401": "auth", "rate limit": "rate_limit", "long retry-after": "rate_limit"}
+    reason = reasons.get(failure, "unavailable")
+    assert stats[f"failed_{reason}"] == 1 and stats["failed"] >= 1
+    assert all(wait <= asana._MAX_WAIT_SECONDS for wait in sleeps)
+    assert tombstones(rows) == []  # nothing deleted on a stopped run
+    if failure == "outage":
+        assert set(task_rows(rows)) == {"task:1"}
+        assert state["retry"] == ["2", "3", "4"] and state["pending"] == []
+    else:
+        assert set(task_rows(rows)) == {"task:1", "task:2"}
+        assert state["pending"] == ["3", "4"] and state["retry"] == []
+    assert "task:5" in state["known_ids"]
+
+    # Next run, with no upstream change: the rest is rendered and task 5 forgotten.
+    rows = run_sync(fake, state)
+    rest = {"task:2", "task:3", "task:4"} if failure == "outage" else {"task:3", "task:4"}
+    assert set(task_rows(rows)) == rest
+    assert all("v2" in row["content"] for row in task_rows(rows).values())
+    assert tombstones(rows) == [{"id": "task:5", "_deleted": True}]
+    assert state["pending"] == [] and state["retry"] == []
+
+
+def test_401_before_anything_was_rendered_raises(fake):
+    fake.add_task("1", modified_at=day(1))
+    state = {}
+    run_sync(fake, state)
+    before = copy.deepcopy(state)
+    fake.tasks["1"]["modified_at"] = day(4)
+    fake.queue("/tasks/1", _error(401, "Not Authorized"))
+
+    with pytest.raises(AsanaAPIError) as excinfo:
+        run_sync(fake, state)
+    assert excinfo.value.status == 401
+    assert state == before
+
+
+def test_rate_limit_while_listing_stops_cleanly_with_nothing_moved(fake):
+    fake.add_task("1", modified_at=day(1))
+    state = {}
+    run_sync(fake, state)
+    before = copy.deepcopy(state)
+    del fake.tasks["1"]
+    fake.queue("/tasks", _error(429, "Rate limited", headers={"Retry-After": "600"}))
+    stats = {}
+
+    assert run_sync(fake, state, stats=stats) == []
+    assert stats["failed_rate_limit"] == 1
+    assert state == before
+
+
+def test_three_unreadable_tasks_never_block_the_run_and_are_given_up(fake):
+    # Tasks 11, 12 and 13 always answer 404 while still listed, next to each other.
+    for gid in ("10", "11", "12", "13", "14"):
+        fake.add_task(gid, modified_at=day(1))
+    state = {}
+    run_sync(fake, state)
+    for gid in ("10", "11", "12", "13", "14"):
+        fake.tasks[gid]["modified_at"] = day(4)
+
+    def forbid():
+        for gid in ("11", "12", "13"):
+            fake.queue(f"/tasks/{gid}", _error(404, "Not found"))
+
+    for run in (1, 2):
+        forbid()
+        stats = {}
+        rows = run_sync(fake, state, stats=stats)
+        if run == 1:
+            assert set(task_rows(rows)) == {"task:10", "task:14"}  # the others went on
+        assert tombstones(rows) == []
+        assert state["retry"] == ["11", "12", "13"]
+        runs = {gid: entry["runs"] for gid, entry in state["unreadable"].items()}
+        assert runs == {"11": run, "12": run, "13": run}
+        assert stats["kept"] == 3 and "failed_unavailable" not in stats
+
+    # A task created upstream meanwhile is still ingested.
+    fake.add_task("15", modified_at=day(5))
+    forbid()
+    stats = {}
+    rows = run_sync(fake, state, stats=stats)
+    assert "task:15" in task_rows(rows)
+    # Third run at the same stamp: forgotten, and no longer asked about.
+    assert [r["id"] for r in tombstones(rows)] == ["task:11", "task:12", "task:13"]
+    assert stats["given_up"] == 3 and state["retry"] == [] and state["unreadable"] == {}
+    fake.calls.clear()
+    run_sync(fake, state)
+    assert not fake.requested("/tasks/11")
+
+    # Once a given-up task changes upstream, it is asked about (and ingested) again.
+    fake.tasks["12"]["modified_at"] = day(6)
+    rows = run_sync(fake, state)
+    assert set(task_rows(rows)) == {"task:12"}
+    assert "12" not in state["given_up"]
+
+
+def test_a_lost_permission_never_gives_anything_up(fake, caplog):
+    # Every task answers 403 (the token lost access): kept, never forgotten.
+    for gid in ("1", "2", "3"):
+        fake.add_task(gid, modified_at=day(1))
+    state = {}
+    run_sync(fake, state)
+    for gid in ("1", "2", "3"):
+        fake.tasks[gid]["modified_at"] = day(4)
+
+    for _ in range(4):
+        for gid in ("1", "2", "3"):
+            fake.queue(f"/tasks/{gid}", _error(403, "Forbidden"))
+        stats = {}
+        rows = run_sync(fake, state, stats=stats)
+        assert tombstones(rows) == []
+        assert stats["failed_permission"] == 3 and stats["given_up"] == 0
+        assert {entry["runs"] for entry in state["unreadable"].values()} == {0}
+    assert "task: every fetch answered 403 this run" in caplog.text
+    assert {"task:1", "task:2", "task:3"} <= set(state["known_ids"])
+
+
+def test_one_hidden_task_among_readable_ones_is_given_up(fake):
+    for gid in ("1", "2"):
+        fake.add_task(gid, modified_at=day(1))
+    state = {}
+    run_sync(fake, state)
+    for gid in ("1", "2"):
+        fake.tasks[gid]["modified_at"] = day(4)
+
+    for run in (1, 2, 3):
+        fake.queue("/tasks/2", _error(403, "Forbidden"))
+        if run > 1:
+            fake.tasks["1"]["modified_at"] = day(4 + run)  # task 1 keeps being fetched
+        stats = {}
+        rows = run_sync(fake, state, stats=stats)
+        assert "failed_permission" not in stats
+    assert [r["id"] for r in tombstones(rows)] == ["task:2"]
+
+
+def test_retries_go_last_and_never_count_toward_an_outage(fake):
+    for gid in ("1", "2", "3", "4", "5", "6", "7"):
+        fake.add_task(gid, modified_at=day(1))
+    state = {}
+    run_sync(fake, state)
+    for gid in ("2", "3", "4", "5", "6"):
+        fake.tasks[gid]["modified_at"] = day(4)
+    for gid in ("2", "4", "6"):  # kept after a 500, with successes between them
+        for path, response in _task_failure(500, gid):
+            fake.queue(path, response)
+    run_sync(fake, state)
+    assert state["retry"] == ["2", "4", "6"]
+
+    # Still failing next run, three in a row at the end, after a fresh task.
+    fake.tasks["7"]["modified_at"] = day(5)
+    for gid in ("2", "4", "6"):
+        for path, response in _task_failure(500, gid):
+            fake.queue(path, response)
+    fake.calls.clear()
+    stats = {}
+    rows = run_sync(fake, state, stats=stats)
+
+    tasks = [path for path, _ in fake.calls if path.count("/") == 2 and path.startswith("/tasks/")]
+    assert list(dict.fromkeys(tasks)) == ["/tasks/7", "/tasks/2", "/tasks/4", "/tasks/6"]
+    assert set(task_rows(rows)) == {"task:7"}
+    assert "failed_unavailable" not in stats and stats["failed"] == 3
+    assert state["retry"] == ["2", "4", "6"] and state["pending"] == []
+
+
+def test_a_success_between_server_errors_resets_the_outage_streak(fake):
+    for gid in ("1", "2", "3", "4", "5"):
+        fake.add_task(gid, modified_at=day(1))
+    state = {}
+    run_sync(fake, state)
+    for gid in ("1", "2", "3", "4", "5"):
+        fake.tasks[gid]["modified_at"] = day(4)
+    for gid in ("1", "2", "4", "5"):  # 3 succeeds in between
+        for path, response in _task_failure(500, gid):
+            fake.queue(path, response)
+    stats = {}
+
+    rows = run_sync(fake, state, stats=stats)
+
+    assert set(task_rows(rows)) == {"task:3"}
+    assert "failed_unavailable" not in stats
+    assert state["retry"] == ["1", "2", "4", "5"]
+
+
+def test_task_body_of_the_wrong_shape_aborts(fake):
+    fake.add_task("1", modified_at=day(1))
+    fake.add_task("2", modified_at=day(1))
+    state = {}
+    run_sync(fake, state)
+    before = copy.deepcopy(state)
+    fake.tasks["2"]["modified_at"] = day(4)
+    fake.queue("/tasks/2", _Resp(200, "<html>login</html>"))  # a login page with a 200
+
+    with pytest.raises(AsanaResponseError):
         run_sync(fake, state)
     assert state == before
 
@@ -937,9 +1140,9 @@ def test_listing_with_a_body_of_the_wrong_shape_raises(fake, body):
             raise ValueError("Expecting value")
 
         response.json = not_json
-    fake.queue("/tasks", response, when=lambda params: params["opt_fields"] == "gid")
+    fake.queue("/tasks", response)
 
-    with pytest.raises(AsanaListingError):
+    with pytest.raises(AsanaResponseError):
         run_sync(fake, state)
     assert state == before  # never read as an empty listing, nothing deleted
 
@@ -979,7 +1182,7 @@ def test_failed_listing_deletes_nothing_and_keeps_state(fake, failing_request):
             fake.queue(
                 "/tasks",
                 _error(500, "Server Error"),
-                when=lambda p: p["opt_fields"] == "gid" and ("offset" in p) == on_second_page,
+                when=lambda p: ("offset" in p) == on_second_page,
             )
 
     rows = []
@@ -1039,8 +1242,9 @@ def test_expired_offset_gives_up_after_the_restart_budget(fake):
 
 def test_bad_request_on_the_first_page_is_not_retried(fake):
     fake.queue("/tasks", _error(400, "project: Not a recognized ID"))
-    with pytest.raises(AsanaAPIError, match="Not a recognized ID"):
+    with pytest.raises(AsanaAPIError) as excinfo:
         _list_all(fake, "/tasks", {"project": "P1", "opt_fields": "gid"})
+    assert excinfo.value.detail == "project: Not a recognized ID"
     assert len(fake.requested("/tasks")) == 1
 
 
@@ -1060,7 +1264,7 @@ def test_server_and_network_errors_back_off_then_succeed(fake, sleeps):
         def get(self, url, params=None, timeout=None):
             if self.failures:
                 self.failures -= 1
-                raise ConnectionError("connection reset")  # an OSError, like requests'
+                raise requests.ConnectionError("connection reset")
             return super().get(url, params=params, timeout=timeout)
 
     session = Flaky()
@@ -1082,9 +1286,11 @@ def test_retries_are_capped(fake, sleeps):
 
 def test_permanent_errors_are_not_retried(fake, sleeps):
     fake.queue("/projects/P1", _error(401, "Not Authorized"))
-    with pytest.raises(AsanaAPIError, match="Not Authorized") as excinfo:
+    with pytest.raises(AsanaAPIError) as excinfo:
         _get(fake, "/projects/P1")
     assert excinfo.value.status == 401
+    assert str(excinfo.value) == "Asana /projects/P1: HTTP 401"
+    assert excinfo.value.detail == "Not Authorized"
     assert sleeps == []
 
 
@@ -1304,7 +1510,7 @@ def test_check_active_raising_stops_with_nothing_deleted_or_loaded(
         if len(fake.calls) >= stop_after_requests:
             raise AccessRevokedError
 
-    with pytest.raises(Exception) as excinfo:  # dlt wraps it in PipelineStepFailed
+    with pytest.raises(PipelineStepFailed) as excinfo:
         _run_pipeline(tmp_path, fake, project_gids=["P1"], check_active=check_active)
     assert any(isinstance(error, AccessRevokedError) for error in _chain(excinfo.value))
     assert _read_documents(_pipeline(tmp_path, _scope_name())) == before
@@ -1316,8 +1522,7 @@ def test_check_active_raising_stops_with_nothing_deleted_or_loaded(
 
 
 def test_check_active_raising_an_oserror_is_not_retried_or_swallowed(fake, tmp_path, sleeps):
-    # PermissionError is an OSError, like the network errors _get retries and
-    # the render step keeps; a host's check must still stop the sync.
+    # PermissionError is an OSError; only requests' own errors are retried.
     fake.add_task("1", modified_at=day(1))
     _run_pipeline(tmp_path, fake, project_gids=["P1"])
     before = _read_documents(_pipeline(tmp_path, _scope_name()))
@@ -1327,11 +1532,9 @@ def test_check_active_raising_an_oserror_is_not_retried_or_swallowed(fake, tmp_p
         if fake.requested("/tasks/1"):  # the task's own GET has been made
             raise PermissionError("access revoked")
 
-    with pytest.raises(Exception) as excinfo:  # dlt wraps it in PipelineStepFailed
+    with pytest.raises(PipelineStepFailed) as excinfo:
         _run_pipeline(tmp_path, fake, project_gids=["P1"], check_active=check_active)
-    chain = _chain(excinfo.value)
-    assert any(isinstance(error, asana.AsanaSyncStoppedError) for error in chain)
-    assert any(isinstance(error, PermissionError) for error in chain)
+    assert any(isinstance(error, PermissionError) for error in _chain(excinfo.value))
     assert sleeps == []  # not retried
     assert _read_documents(_pipeline(tmp_path, _scope_name())) == before
 
@@ -1358,23 +1561,33 @@ def test_pipeline_task_that_fails_on_its_own_is_kept_and_retried(fake, tmp_path)
     assert "v2" in documents["task:2"]
 
 
-def test_pipeline_abort_mid_render_leaves_destination_and_state_untouched(fake, tmp_path):
-    fake.add_task("1", modified_at=day(1), notes="v1")
-    fake.add_task("2", modified_at=day(1), notes="v1")
+def test_pipeline_401_mid_run_commits_progress_and_resumes(fake, tmp_path):
+    # A token that expires on task 3 of 5: tasks 1-2 are kept, 3-5 come next run.
+    for gid in ("1", "2", "3", "4", "5", "6"):
+        fake.add_task(gid, modified_at=day(1), notes="v1")
     _run_pipeline(tmp_path, fake, project_gids=["P1"])
-    before = _read_documents(_pipeline(tmp_path, _scope_name()))
+    for gid in ("1", "2", "3", "4", "5"):
+        fake.tasks[gid].update(notes="v2", modified_at=day(4))
+    fake.tasks["1"]["modified_at"] = day(9)  # past the others' overlap window
+    del fake.tasks["6"]
+    fake.queue("/tasks/3", _error(401, "Not Authorized"))
 
-    fake.tasks["1"].update(notes="v2", modified_at=day(4))
-    fake.tasks["2"].update(notes="v2", modified_at=day(4))
-    fake.queue("/tasks/2", _error(401, "Not Authorized"))
-    with pytest.raises(Exception):  # noqa: B017 - dlt wraps the source error in PipelineStepFailed
-        _run_pipeline(tmp_path, fake, project_gids=["P1"])
-
-    # Task 1 was yielded before the 401, but nothing of the run was loaded.
-    assert _read_documents(_pipeline(tmp_path, _scope_name())) == before
-
-    documents = _read_documents(_run_pipeline(tmp_path, fake, project_gids=["P1"]))
+    source = asana_source(session=fake, project_gids=["P1"])
+    pipeline = _pipeline(tmp_path, pipeline_name_for_source(source, "asana_ds"))
+    pipeline.run(source)
+    documents = _read_documents(pipeline)
+    assert source.cognee_sync_stats["failed_auth"] == 1
     assert "v2" in documents["task:1"] and "v2" in documents["task:2"]
+    assert "v1" in documents["task:3"]
+    assert "task:6" in documents  # no deletion on a stopped run
+
+    fake.calls.clear()  # no upstream change before the next run
+    documents = _read_documents(_run_pipeline(tmp_path, fake, project_gids=["P1"]))
+    fetched = {path for path, _ in fake.calls if path.count("/") == 2}
+    assert {"/tasks/3", "/tasks/4", "/tasks/5"} <= fetched
+    assert "/tasks/1" not in fetched
+    assert all("v2" in documents[f"task:{gid}"] for gid in ("1", "2", "3", "4", "5"))
+    assert "task:6" not in documents
 
 
 def test_pipeline_failure_leaves_destination_and_state_untouched(fake, tmp_path):
@@ -1384,9 +1597,219 @@ def test_pipeline_failure_leaves_destination_and_state_untouched(fake, tmp_path)
 
     del fake.tasks["2"]
     fake.queue("/tasks", _error(403, "Forbidden"))
-    with pytest.raises(Exception):  # noqa: B017 - dlt wraps the source error in PipelineStepFailed
+    with pytest.raises(PipelineStepFailed) as excinfo:
         _run_pipeline(tmp_path, fake, project_gids=["P1"])
+    assert any(
+        isinstance(error, AsanaAPIError) and error.status == 403 for error in _chain(excinfo.value)
+    )
 
     # The failed run deleted nothing; the following clean run forgets task 2.
     documents = _read_documents(_run_pipeline(tmp_path, fake, project_gids=["P1"]))
     assert set(documents) == {"task:1", "project:P1"}
+
+
+# ---------------------------------------------------------------------------
+# Review round 2: selection, paging, events, rendering, secrets, wiring
+# ---------------------------------------------------------------------------
+def test_empty_selection_raises_instead_of_forgetting_everything(fake, tmp_path):
+    fake.add_task("1", modified_at=day(1))
+    state = {}
+    run_sync(fake, state)
+    before = copy.deepcopy(state)
+
+    with pytest.raises(ValueError, match="No Asana project selected"):
+        run_sync(fake, state, project_gids=())
+    assert state == before
+
+    # A workspace whose project listing comes back empty does the same.
+    _run_pipeline(tmp_path, fake, workspace_gid="W1")
+    fake.projects.clear()
+    with pytest.raises(PipelineStepFailed) as excinfo:
+        _run_pipeline(tmp_path, fake, workspace_gid="W1")
+    assert any(isinstance(error, ValueError) for error in _chain(excinfo.value))
+    fake.add_project("P1")
+    documents = _read_documents(_run_pipeline(tmp_path, fake, workspace_gid="W1"))
+    assert "task:1" in documents  # nothing was forgotten
+
+
+def test_repeated_offset_stops_the_listing(fake):
+    fake.queue("/tasks", _Resp(200, {"data": [], "next_page": {"offset": "SAME"}}))
+    fake.queue("/tasks", _Resp(200, {"data": [], "next_page": {"offset": "SAME"}}))
+
+    with pytest.raises(AsanaResponseError, match="came back twice"):
+        _list_all(fake, "/tasks", {"project": "P1", "opt_fields": "gid"})
+    assert len(fake.requested("/tasks")) == 2
+
+
+def test_listing_stops_after_the_page_cap(fake, monkeypatch):
+    monkeypatch.setattr(asana, "_MAX_LIST_PAGES", 3)
+    fake.page_size = 1
+    for gid in ("1", "2", "3", "4", "5"):
+        fake.add_task(gid, modified_at=day(1))
+
+    with pytest.raises(AsanaResponseError, match="more than 3 pages"):
+        _list_all(fake, "/tasks", {"project": "P1", "opt_fields": "gid"})
+
+
+def test_events_are_followed_across_has_more_pages(fake):
+    for gid in ("1", "2", "3"):
+        fake.add_task(gid, modified_at=day(1))
+    state = {}
+    run_sync(fake, state)
+    fake.events_page_size = 1
+    for gid in ("1", "2", "3"):
+        fake.emit("P1", **comment_edited(f"s{gid}", gid))  # invisible to modified_at
+
+    rows = run_sync(fake, state)
+
+    assert set(task_rows(rows)) == {"task:1", "task:2", "task:3"}
+    assert len(fake.requested("/events")) == 1 + 3  # first run (a 412), then three pages
+
+
+def test_events_without_a_gid_are_skipped():
+    events = [
+        {"action": "changed", "resource": {"resource_type": "task"}},
+        {
+            "action": "added",
+            "resource": {"resource_type": "story"},
+            "parent": {"resource_type": "task"},
+        },
+        {"action": "changed", "resource": {"resource_type": "story", "target": None}},
+        task_changed("t1"),
+    ]
+    assert _event_task_gids(events) == {"t1"}
+
+
+def test_only_selected_projects_are_named_in_a_task(fake):
+    fake.add_project("P2", name="Other team")
+    fake.add_task("1", modified_at=day(1), projects=("P1", "P2"))
+
+    content = task_rows(run_sync(fake, {}, project_gids=("P1",)))["task:1"]["content"]
+
+    assert "Project: Website launch" in content
+    assert "Other team" not in content
+
+
+class _NoScan(dict):
+    """A subtask map that fails if anything walks all of it."""
+
+    def items(self):
+        raise AssertionError("full scan of the subtask map")
+
+    def __iter__(self):
+        raise AssertionError("full scan of the subtask map")
+
+
+def test_subtask_map_is_updated_without_scanning_it():
+    # 5,000 tasks with two subtasks each: replacing one task's entries must not
+    # walk the whole map, or a large first sync turns quadratic.
+    state = {"subtasks": {f"s{n}-{k}": f"t{n}" for n in range(5000) for k in (1, 2)}}
+    run = asana._Run(asana._Client(None), state, {})
+    run.subtask_parents = _NoScan(run.subtask_parents)
+
+    for n in range(5000):
+        run._remember_subtasks(f"t{n}", [{"gid": f"s{n}-1"}, {"gid": f"s{n}-new"}])
+
+    assert dict.__len__(run.subtask_parents) == 10000
+    assert dict.get(run.subtask_parents, "s7-new") == "t7"
+    assert dict.get(run.subtask_parents, "s7-2") is None
+
+
+SECRET = "SECRET-TOKEN-123"
+
+
+def test_token_with_a_trailing_newline_is_refused_without_echoing_it():
+    with pytest.raises(ValueError) as excinfo:
+        asana_source(token=SECRET + "\n", project_gids=["P1"])
+    assert SECRET not in str(excinfo.value)
+    assert "whitespace" in str(excinfo.value)
+
+
+def test_the_token_is_never_in_an_error_message_or_a_log_line(fake, caplog, sleeps):
+    fake.add_task("1", modified_at=day(1))
+
+    class Leaky(FakeAsana):
+        def get(self, url, params=None, timeout=None):
+            if url.endswith("/projects/P1"):
+                raise requests.exceptions.InvalidHeader(f"Invalid header value b'Bearer {SECRET}'")
+            return super().get(url, params=params, timeout=timeout)
+
+    leaky = Leaky()
+    leaky.add_project("P1")
+    with pytest.raises(AsanaAPIError) as excinfo:
+        _get(leaky, "/projects/P1")
+    assert SECRET not in str(excinfo.value) and excinfo.value.status == 0
+
+    # A 401 whose body echoes the token: neither the message nor the logs carry it.
+    fake.queue("/tasks", _Resp(401, f"<html>token={SECRET}</html>"))
+    with pytest.raises(AsanaAPIError) as excinfo:
+        run_sync(fake, {})
+    assert str(excinfo.value) == "Asana /tasks: HTTP 401"
+    assert SECRET not in str(excinfo.value) and SECRET not in excinfo.value.detail
+    assert SECRET not in caplog.text
+    assert "InvalidHeader" in caplog.text  # the retries were logged by type
+
+
+def test_waits_are_capped_and_ask_check_active_first(fake, sleeps):
+    checks = []
+    client = asana._Client(fake, lambda: checks.append(len(sleeps)))
+    fake.queue("/projects/P1", _error(429, "Rate limited", headers={"Retry-After": "30"}))
+    fake.queue("/projects/P1", _error(429, "Rate limited", headers={"Retry-After": "61"}))
+
+    with pytest.raises(AsanaAPIError) as excinfo:
+        _get(client, "/projects/P1")
+    assert excinfo.value.status == 429
+    assert sleeps == [30.0]  # the 61 s wait was not taken
+    assert checks == [0, 0, 1]  # before the request, before the wait, before the retry
+
+
+@pytest.mark.parametrize("name", ["", "Foo-Bar", "a" * 65, None])
+def test_resource_name_is_validated(fake, name):
+    with pytest.raises(ValueError, match="resource_name"):
+        asana_source(service=fake, project_gids=["P1"], resource_name=name)
+
+
+def test_service_is_the_injection_kwarg_and_session_its_alias(fake, tmp_path):
+    fake.add_task("1", modified_at=day(1))
+    assert list(asana_source(service=fake, project_gids=["P1"]))
+    assert list(asana_source(session=fake, project_gids=["P1"]))
+    with pytest.raises(ValueError, match="not both"):
+        asana_source(service=fake, session=fake, project_gids=["P1"])
+
+
+def test_session_is_built_per_run_and_closed(fake, monkeypatch):
+    fake.add_task("1", modified_at=day(1))
+    built = []
+
+    class Closing(FakeAsana):
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    def make_session(token):
+        session = Closing()
+        session.__dict__.update(copy.deepcopy(fake.__dict__))
+        built.append(session)
+        return session
+
+    monkeypatch.setattr(asana, "_make_session", make_session)
+    source = asana_source(token="test-token", project_gids=["P1"])
+    assert built == []  # nothing is opened before the run
+    assert list(source)
+    assert len(built) == 1 and built[0].closed
+
+
+def test_sync_stats_count_what_a_run_did(fake):
+    for gid in ("1", "2", "3"):
+        fake.add_task(gid, modified_at=day(1))
+    source = asana_source(service=fake, project_gids=["P1"])
+    list(source)
+    assert source.cognee_sync_stats == {
+        "scanned": 3,
+        "skipped": 0,
+        "failed": 0,
+        "deleted": 0,
+        "kept": 0,
+        "given_up": 0,
+    }

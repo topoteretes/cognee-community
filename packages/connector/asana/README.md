@@ -29,7 +29,12 @@ cleanup, `PIPELINE_SCOPE_ATTR` and `guarded_rows` all ship in cognee 1.6.2. The 
 3. Find the gid of each project to ingest: it is the number in the project URL,
    `https://app.asana.com/0/<project_gid>/...`.
 
-The connector is read-only. It only issues `GET` requests.
+The connector is read-only. It only issues `GET` requests. The token is checked before the
+first request: one with whitespace or control characters in it (a pasted newline, say) is
+refused with a `ValueError` that does not repeat it.
+
+Ingested text goes to the LLM configured for cognee: cognify sends each document to it for
+entity extraction.
 
 ## Usage
 
@@ -66,8 +71,12 @@ and forgets what was deleted. See `examples/example.py` for the full flow.
 | `workspace_gid="..."` | Ingest every project of the workspace. Used only when `project_gids` is omitted. |
 | `include_completed=False` | Only incomplete tasks. A task is forgotten once it is completed. Default `True`. |
 | `token="..."` | Access token. Defaults to the `ASANA_ACCESS_TOKEN` environment variable. |
-| `resource_name="asana_documents"` | The dlt table name, which also scopes the sync state. See below. |
-| `check_active=None` | Optional callable for a host: asked before every Asana request and around every row; raising stops the sync with nothing deleted. |
+| `resource_name="asana_documents"` | The dlt table name, which also scopes the sync state. Lowercase snake_case, at most 64 characters. See below. |
+| `check_active=None` | Optional callable for a host: asked before every Asana request and every wait, and around every row; raising stops the sync with nothing deleted. |
+| `service=None` | A pre-built `requests`-like session (mainly for tests); `session=` is accepted too. Without it, each run builds its own session and closes it. |
+
+An empty selection raises instead of syncing: `project_gids=[]`, or a workspace whose project
+listing comes back empty, would otherwise look like "every project was removed".
 
 A project gid that no longer exists (or that the token can no longer see) makes Asana
 answer with an error, and the run aborts without deleting anything. That is deliberate: a
@@ -116,21 +125,27 @@ the same task always renders the same text.
 
 Per project, two signals are kept in dlt resource state:
 
-- **A `modified_since` cursor.** `GET /tasks?project=...&modified_since=<cursor>` returns
-  tasks whose own fields changed, and tasks that gained or lost a comment. The listing
-  starts 60 seconds before the cursor so that a task stamped in the same millisecond as
-  the cursor, after the previous listing ran, is not missed. Tasks already seen inside that
-  window are remembered and skipped, so the overlap costs no extra task fetches.
+- **A `modified_at` cursor.** Every run lists the project's tasks with their `modified_at`
+  (`GET /tasks?project=...&opt_fields=modified_at`). A task whose own fields changed, or that
+  gained or lost a comment, has a `modified_at` past the cursor. The window starts 60 seconds
+  before the cursor so that a task stamped in the same millisecond as the cursor, after the
+  previous run listed it, is not missed. Tasks already seen inside that window are remembered
+  and skipped, so the overlap costs no extra task fetches.
 - **An Events API sync token.** Some changes do not move a task's `modified_at`: editing an
   existing comment, and changing or deleting a subtask. Those only show up in
   `GET /events`, so the connector polls it and re-renders the tasks the events point at.
+
+The listing decides which tasks changed; the events only add what `modified_at` cannot show
+(edited comments, subtask changes, and renames, below).
 
 Renaming the project or one of its sections changes no task, but every task document names
 its project and section. When the events report such a rename, the connector re-renders
 every task of that project on that run (same cost as below).
 
 Each changed task costs three requests (task, comments, subtasks). A run where nothing
-changed costs four requests per project and fetches no task.
+changed costs, per project, one events request, one listing request per 100 tasks and one
+request for the project description, and fetches no task. With `workspace_gid`, add one
+request per 100 projects for the project listing.
 
 ### Syncing less often than once a day
 
@@ -141,11 +156,11 @@ run re-renders every task of that project**, as a first sync does.
 
 What that costs, for a project with `N` tasks:
 
-- `3 x N` requests for the tasks, plus two listing requests per 100 tasks and two more per
+- `3 x N` requests for the tasks, plus one listing request per 100 tasks and two more per
   project. A 500-task project is about 1,500 requests.
 - On Asana's free plan (150 requests per minute) that is roughly 50 tasks per minute, so
-  about 10 minutes for 500 tasks. The connector waits out `429` responses, so the run gets
-  slower rather than failing.
+  about 10 minutes for 500 tasks. The connector waits out `429` responses of up to 60 seconds;
+  a longer one stops the run cleanly, and the next run carries on (see below).
 - No extra LLM cost: a task whose text did not change keeps its content hash and is not
   re-cognified.
 
@@ -161,15 +176,45 @@ the graph and vector stores.
 All listings are completed before the first row is emitted, and state is saved only after
 the last one. If a listing fails (after retries), or `check_active` raises, the run aborts:
 nothing is deleted and no cursor or token moves, so the next run starts from the same point.
-A listing that answers `200` with something other than a JSON object holding a `data` list
-also aborts the run; it is never read as an empty listing.
+An answer of `200` with something other than the expected JSON (an HTML login page, say)
+also aborts the run, whether it came from a listing or from one task; it is never read as an
+empty listing or a task to skip.
 
-Only the listing decides that a task is gone. A task that is still listed but fails on its
-own (its `GET`, comments or subtasks answer `403`, `404` or an error that outlasts the
-retries) keeps its previous document, is logged with the endpoint and status, and is fetched
-again on the next run; the rest of the run goes on. Failures that would hit every task the
-same way still abort with nothing saved: a `401`, a `429` that outlasts the retries, and three
-tasks failing in a row.
+## When Asana fails part of the way through
+
+Only the listing decides that a task is gone. A task that is still listed but fails on its own
+keeps its previous document and is fetched again on the next run; the rest of the run goes on:
+
+- **`403` or `404`** (hidden from this token, or a passing glitch): kept. If it answers that
+  way in three runs in a row at the same `modified_at`, its document is forgotten and the task
+  is not asked about again until its `modified_at` moves. A `403` only counts toward that when
+  another task was fetched in the same run: if every task answers `403`, the token has lost a
+  permission, nothing is forgotten, a warning says so, and the stats count it as
+  `failed_permission`.
+- **A server error or no answer** that outlasts the retries: kept. Three of these in a row on
+  fresh tasks means Asana itself is down, and the run stops cleanly (below).
+
+Tasks kept from an earlier run are fetched after the fresh ones and never count toward that
+streak, so tasks that keep failing cannot hold up the others.
+
+Some failures stop the run **cleanly** instead of aborting it: a `401` after at least one task
+was emitted (an expiring token on a long first sync), a rate limit that outlasts the retries or
+asks for a wait over 60 seconds, and the outage above. The run then ends normally: what it
+emitted is loaded, the tasks it did not reach are kept in state and fetched on the next run
+even if nothing changed upstream, and nothing is deleted. The cursors and sync tokens move
+forward, so the next run does not list everything again. A `401` before any task was emitted
+still raises, since that is a bad token.
+
+Error messages name the status and the endpoint only (`Asana /tasks/123: HTTP 403`). Asana's
+own explanation is on the exception's `detail`; a response body or the token never is.
+
+### Sync stats
+
+`resource.cognee_sync_stats` holds the counts of the last run, as plain ints: `scanned` (tasks
+listed), `skipped` (unchanged), `failed` (task failures), `deleted`, `kept` (tasks waiting for a
+retry) and `given_up`, plus `failed_auth`, `failed_rate_limit` or `failed_unavailable` when the
+run stopped early for that reason, and `failed_permission` (tasks answering `403` while no
+task could be read).
 
 ## Limits
 
@@ -185,7 +230,9 @@ tasks failing in a row.
 - Events can take a few seconds to appear in Asana's feed. A change made moments before a
   sync may be picked up by the following one.
 - A first sync, and a sync more than about a day after the previous one, fetch every task
-  (see "Syncing less often than once a day").
+  (see "Syncing less often than once a day"). Asana tokens issued through OAuth last an hour;
+  a first sync longer than that stops at the `401` and finishes over the next runs.
+- A task that answers `403` or `404` in three runs in a row is forgotten until it changes.
 - Deletions propagate on a foreground `remember(...)`. cognee skips orphan cleanup for
   `run_in_background=True`.
 
@@ -237,9 +284,11 @@ uv run pytest tests/ -q
 
 The tests mock the Asana API (no token, no network). They cover rendering (also from shuffled
 input), the cursor and its overlap, the events paths (edited comment, renamed and deleted
-subtask, 412), deletion, tasks that fail on their own (kept and retried, or aborting on a
-`401`, a `429` or three failures in a row), bodies of the wrong shape, pagination and retries,
-and the failure paths that must delete nothing. A real `dlt` pipeline into a temp sqlite
-destination checks edits and deletes across runs (the deleted row is gone from the table),
-two sources in one dataset staying apart, a task kept and retried, and `check_active` stopping
-a run with nothing loaded.
+subtask, 412, `has_more` paging), deletion, tasks that fail on their own (kept and retried,
+three unreadable ones not blocking a run and given up after three runs, retries going last),
+the clean stops (`401` mid-run, rate limit, long `Retry-After`, outage) and what the next run
+picks up, bodies of the wrong shape, an empty selection, pagination (expired and repeated
+offsets) and retries, the token never reaching a message or a log line, and the failure paths
+that must delete nothing. A real `dlt` pipeline into a temp sqlite destination checks edits
+and deletes across runs, two sources in one dataset staying apart, a task kept and retried, a
+`401` mid-run resuming on the next run, and `check_active` stopping a run with nothing loaded.
