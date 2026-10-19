@@ -17,6 +17,8 @@ Import **canonically included** [OpenSiro VSM Index](https://github.com/opensiro
 
 The package targets Python 3.11–3.13 and is verified with Cognee **1.6.4**. Clean Python 3.11 and Python 3.12 checks have been performed; Python 3.13 remains unverified.
 
+**Latest verification (B23, 2026-10-19):** [clean Python 3.11 installed-wheel CI — PASS](https://github.com/opensiro/cognee-community/actions/runs/39292809116) for the same source/test blobs as this upstream candidate: dependency installation and `pip check`, **43/43 unit tests**, pinned sharded Index validation (**583 included, 48 excluded, 12 proposed**), **3/3 real Cognee imports**, **60 graph nodes, 39 edges, 18 exact grades**, separate-process independent audit, native lexical search and pinned-source inspection, plus missing-dataset fail-closed verification. [Ruff lint and format — PASS](https://github.com/opensiro/cognee-community/actions/runs/39292816378). The validated review branch contains an OpenSiro-only workflow and evidence report; this upstream candidate contains the **same executable source and tests**, but intentionally omits those fork-specific artifacts. This is not a full-corpus Python 3.11 import or independent upstream maintainer CI.
+
 ```bash
 cd packages/connector/opensiro-vsm
 python -m pip install -e .
@@ -64,9 +66,10 @@ APIs used by this connector change unexpectedly. It can be run offline with the
 rest of the Python tests. These checks are API-shape checks, **not** a guarantee
 that internal Cognee APIs will remain stable in future versions.
 
-For a complete **clean Python 3.11 dependency-resolution check** (not yet
-verified by OpenSiro on the dev-alpha CPU host), use an actual Python 3.11
-interpreter and the built wheel in a brand-new virtual environment:
+To reproduce the **clean Python 3.11 dependency-resolution check** (already
+verified in a GitHub-hosted runner; the separate dev-alpha CPU host lacks
+Python 3.11), use an actual Python 3.11 interpreter and the built wheel
+in a brand-new virtual environment:
 
 ```bash
 python3.11 -m venv /tmp/opensiro-cognee-py311
@@ -86,7 +89,9 @@ successfully built the wheel, installed all declared dependencies in a new
 environment, passed `pip check`, ran **32/32 unit tests**, and completed real
 three-document ingestion and a separate-process audit (69 nodes, 48 edges,
 18 exact VSM function grades). B20 did not import the full corpus on Python
-3.11 or certify future Cognee versions.
+3.11 or certify future Cognee versions. The newer B23 verification above
+covers the sharded Index and 43 tests; B20 remains historical evidence for
+an earlier pinned source snapshot.
 
 ## Boundaries
 
@@ -149,8 +154,11 @@ function sections per assessment**; complete assessment Markdown is stored in
 Cognee but other prose is not full-body-searchable. No embeddings, hosted
 service, refresh sync, inference or performance ranking are implied.
 
-**Verification boundary:** The sharded-source import, native lexical search,
+**Verification boundary:** Sharded-source import, native lexical search,
 independent audit and original-source inspection have been exercised with
-Cognee 1.6.4 and Python 3.12 against a three-assessment local dataset.
-This is not a hosted-service, full-body-search, or production benchmark claim.
-See the OpenSiro fork's independent validation report for exact provenance.
+Cognee 1.6.4 and Python 3.12 locally **and Python 3.11 on GitHub Actions**
+against a three-assessment local dataset. Full Markdown is stored; only
+the six function sections are indexed for lexical retrieval. This is not a
+hosted-service, full-corpus Python 3.11 import, full-body-search, or
+production benchmark claim. See the OpenSiro fork's [bounded independent
+validation report](https://github.com/opensiro/cognee-community/blob/fix/opensiro-vsm-shards-dev-flow-20261019/packages/connector/opensiro-vsm/docs/review-validation-20261019.md) for provenance.
