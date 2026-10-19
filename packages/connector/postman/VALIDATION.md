@@ -47,8 +47,8 @@ Future versions within those ranges are not individually prevalidated.
 
 Offline means fake Postman responses, not fake dlt storage: tests use actual SQLite
 replacement, source cache, pending-load recovery, Cognee staging, sibling resources and
-empty snapshots. Tests exercise factory defaults, required resource names, account
-preflight identity, bulk-removal confirmation, redaction, typed and unexpected failures,
+empty snapshots. Tests exercise factory defaults, required resource names, lazy account
+verification, bulk-removal confirmation, specific best-effort filtering cases, typed and unexpected failures,
 authorization checkpoints and the three-call unchanged path. A model test is skipped by
 default; that skip must not be reported as a model-integration pass.
 
@@ -67,7 +67,7 @@ POSTMAN_MODEL_TEST=1 python -m pytest tests/test_cognee_scope_lifecycle.py -q
 
 Run in its own process. This uses `remember` with a fake provider and real
 SQLite/Ladybug/LanceDB stores: two resources populate one dataset; deselecting one
-preserves the sibling's Data/graph/vector/search content; final default deletion empties
+preserves the sibling's Data/graph/vector/search content; confirmed final deletion empties
 stores. Other models/backends require separate configuration and validation.
 
 ## Authenticated synthetic lifecycle (optional)
@@ -86,9 +86,9 @@ POSTMAN_TEST_CONFIG='/private/path/test-postman.json' \
 ```
 
 This creates/deletes only its own two synthetic collections, never executes requests,
-and runs eleven checks: initial/unchanged, visible selection removal/restoration, edit,
+and runs lifecycle checks: initial/unchanged, visible selection removal/restoration, edit,
 docs-only collection, final-request deletion/restoration, whole-collection removal with
-sibling preservation, final collection removal and empty replay. Fixture cleanup runs
+sibling preservation after explicit confirmation, final confirmed collection removal and empty replay. Fixture cleanup runs
 in `finally`; verify the workspace if provider errors prevent cleanup. It prints a fresh
 local runtime directory and retains local evidence; do not reuse that directory.
 
@@ -105,10 +105,12 @@ without raising, so search/exit code alone is not a forgetting proof.
 ## Limits
 
 Filtering is best effort, including secret-typed variables, declared/raw custom auth
-headers, known token patterns and short-value boundaries. Arbitrary secrets cannot be
-universally identified. A stable partial provider listing may still mean visibility
+headers, sensitive body/query fields and known token patterns. Values shorter than four
+characters are omitted from global prose replacement; explicit auth syntax is scrubbed.
+Arbitrary secrets cannot be universally identified. A stable partial provider listing may still mean visibility
 loss; the bulk guard limits automatic removals but does not prove physical deletion.
-Final-single-collection automatic removal is a deliberate next-sync acceptance choice.
+Empty inventories over populated caches and explicitly selected missing UIDs require confirmation.
+The automatic removal budget spans five minutes across successful syncs.
 
 No atomic provider snapshot, same-scope concurrent ingestion, full backend/Python matrix,
 every partial crash or byte-budgeted large response is claimed. Exact environment and

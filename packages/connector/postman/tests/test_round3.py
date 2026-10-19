@@ -24,16 +24,22 @@ def test_secret_variable_declared_auth_header_and_query_values_are_redacted():
     }
     request = tree["item"][0]["request"]
     request.update(
-        url="https://example.invalid/orders?key=KSECRET88&other=OTHERSECRET77",
+        url="https://example.invalid/orders?key=KSECRET88&other=AbCdEf1234567890GhIjKlMn567890",
         header=[
             {"key": "X-Custom-Access", "value": "AUTHSECRET99"},
             {"key": "X-Auth", "value": "zzSECRETzz"},
         ],
-        description="tok VARSEC11 AUTHSECRET99 KSECRET88 OTHERSECRET77 zzSECRETzz",
+        description="tok VARSEC11 AUTHSECRET99 KSECRET88 AbCdEf1234567890GhIjKlMn567890 zzSECRETzz",
     )
     rows = flatten_collection(tree, "1-c", "ns")
     text = json.dumps(rows)
-    for secret in ("VARSEC11", "AUTHSECRET99", "KSECRET88", "OTHERSECRET77", "zzSECRETzz"):
+    for secret in (
+        "VARSEC11",
+        "AUTHSECRET99",
+        "KSECRET88",
+        "AbCdEf1234567890GhIjKlMn567890",
+        "zzSECRETzz",
+    ):
         assert secret not in text
     assert "X-Custom-Access" in text and "X-Auth" in text
 
@@ -46,7 +52,7 @@ def test_short_secrets_do_not_corrupt_words_versions_or_counts():
     request["description"] = "Read Retry 10 times, version 1.2; standalone a and 1."
     text = json.dumps(flatten_collection(tree, "1-c", "ns"))
     assert "Read Retry 10 times, version 1.2" in text
-    assert "standalone a" not in text
+    assert "standalone a and 1." in text
 
 
 def test_benign_header_and_query_prose_survives():
@@ -63,6 +69,7 @@ def test_default_endpoint_scrubs_path_token_and_has_real_request_provenance():
     tree = collection()
     item = tree["item"][0]
     item["id"] = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+    item["uid"] = "12345678-" + item["id"]
     item["request"]["url"] = "{{baseUrl}}/v1/hook/sk_live_PATHSECRET?token=QUERYSECRET"
     rows = flatten_collection(tree, "12345678-c", "ns")
     row = next(row for row in rows if row["title"].endswith("Read"))
@@ -88,7 +95,7 @@ def test_consistent_empty_bulk_inventory_requires_confirmation():
     assert rows == []
 
 
-def test_real_dlt_factory_default_deletes_single_collection_and_guards_bulk(tmp_path):
+def test_real_dlt_factory_empty_inventory_preserves_rows_and_guards_bulk(tmp_path):
     import dlt
     from dlt.destinations import sqlalchemy
     from dlt.pipeline.exceptions import PipelineStepFailed
@@ -103,7 +110,11 @@ def test_real_dlt_factory_default_deletes_single_collection_and_guards_bulk(tmp_
     src = source(client)
     pipeline.run(src)
     client.inventory = {}
-    pipeline.run(source(client))  # Public factory default, not builder default.
+    with pytest.raises(PipelineStepFailed):
+        pipeline.run(source(client))  # Public factory default, not builder default.
+    with pipeline.sql_client() as sql:
+        assert len(sql.execute_sql(f'SELECT id FROM "{src.name}"')) == 2
+    pipeline.run(source(client, confirmed_deleted=["1-c"]))
     with pipeline.sql_client() as sql:
         assert sql.execute_sql(f'SELECT id FROM "{src.name}"') == []
     client.inventory = {f"1-{key}": {"updatedAt": "now", "owner": "1"} for key in "abc"}

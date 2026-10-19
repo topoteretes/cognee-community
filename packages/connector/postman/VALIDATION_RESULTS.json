@@ -1,69 +1,96 @@
 {
-  "recorded_date": "2026-10-19",
-  "tested_module_sha256": "d8416cc5114812034962b442b1dee121e778a51b4b7aa3639511fef048d9eb74",
-  "baseline_before_changes": "33d55ff2c2c8154f98e050fd74946a26046813e9",
+  "recorded_date": "2026-10-20",
+  "tested_module_sha256": "b0620b4755bf886c777eb2f058876e0ae5b55809d5d8e8c113fd5a4b958928a5",
+  "baseline_before_changes": "430b2d8f863cfac3222a471738c94e5a2ccb68c9",
   "offline_matrix": [
     {
       "python": "3.12.13",
       "cognee": "1.6.3",
       "dlt": "1.30.0",
       "httpx": "0.28.1",
-      "module_sha256": "d8416cc5114812034962b442b1dee121e778a51b4b7aa3639511fef048d9eb74",
+      "pytest": "9.1.1",
+      "module_sha256": "b0620b4755bf886c777eb2f058876e0ae5b55809d5d8e8c113fd5a4b958928a5",
       "result": "passed",
-      "pytest_summary": "103 passed, 1 skipped, 13 warnings in 14.47s",
-      "console_sha256": "89f5b721a6e42ddc0911cd878e9b1fd596d74a05215ab06e63ecbabe50c9bcbf",
-      "command": "COGNEE_LOG_FILE=false TELEMETRY_DISABLED=1 RUNTIME__DLTHUB_TELEMETRY=false python -m pytest tests -q"
+      "pytest_summary": "131 passed, 1 skipped, 13 warnings in 19.81s",
+      "console_sha256": "c6324c53160dba56d9e2a0f674712c0f6833130eaf9f76e85a2c8abe2b2ae18a",
+      "command": "COGNEE_LOG_FILE=false TELEMETRY_DISABLED=1 RUNTIME__DLTHUB_TELEMETRY=false python -m pytest tests -q",
+      "installation": "installed wheel"
     },
     {
       "python": "3.10.20",
       "cognee": "1.6.3",
       "dlt": "1.29.0",
       "httpx": "0.28.1",
-      "module_sha256": "d8416cc5114812034962b442b1dee121e778a51b4b7aa3639511fef048d9eb74",
+      "pytest": "9.1.1",
+      "module_sha256": "b0620b4755bf886c777eb2f058876e0ae5b55809d5d8e8c113fd5a4b958928a5",
       "result": "passed",
-      "pytest_summary": "103 passed, 1 skipped, 13 warnings in 19.13s",
-      "console_sha256": "4e97034c6a9f0f0fb05658200a504b4be93158e41b20c3014aff4c9f3eaf3beb",
-      "command": "COGNEE_LOG_FILE=false TELEMETRY_DISABLED=1 RUNTIME__DLTHUB_TELEMETRY=false python -m pytest tests -q"
+      "pytest_summary": "131 passed, 1 skipped, 13 warnings in 21.30s",
+      "console_sha256": "e8bfa5ee779595396d9c8beef754f0d4a9424b91b8eb112e2b8b01151bdb0d0d",
+      "command": "COGNEE_LOG_FILE=false TELEMETRY_DISABLED=1 RUNTIME__DLTHUB_TELEMETRY=false python -m pytest tests -q",
+      "installation": "installed wheel"
     },
     {
       "python": "3.14.8",
       "cognee": "1.6.5",
       "dlt": "1.30.0",
       "httpx": "0.28.1",
-      "module_sha256": "d8416cc5114812034962b442b1dee121e778a51b4b7aa3639511fef048d9eb74",
+      "pytest": "9.1.1",
+      "module_sha256": "b0620b4755bf886c777eb2f058876e0ae5b55809d5d8e8c113fd5a4b958928a5",
       "result": "passed",
-      "pytest_summary": "103 passed, 1 skipped, 13 warnings in 21.65s",
-      "console_sha256": "79d56e49eaafd9a33c584f5dbe53dd500ec39a4567e9421525dc1ef6fa631b10",
-      "command": "COGNEE_LOG_FILE=false TELEMETRY_DISABLED=1 RUNTIME__DLTHUB_TELEMETRY=false python -m pytest tests -q"
+      "pytest_summary": "131 passed, 1 skipped, 13 warnings in 21.23s",
+      "console_sha256": "4b528939c7f2b8be239a87f79e841f312decd4614ee3a1d7a18febe00ae50a2f",
+      "command": "COGNEE_LOG_FILE=false TELEMETRY_DISABLED=1 RUNTIME__DLTHUB_TELEMETRY=false python -m pytest tests -q",
+      "installation": "installed wheel"
     }
   ],
+  "locked_development_environment": {
+    "python": "3.12.13",
+    "cognee": "1.6.5",
+    "dlt": "1.30.0",
+    "httpx": "0.28.1",
+    "pytest": "9.1.1",
+    "module_sha256": "b0620b4755bf886c777eb2f058876e0ae5b55809d5d8e8c113fd5a4b958928a5",
+    "result": "passed",
+    "pytest_summary": "131 passed, 1 skipped, 13 warnings in 21.05s",
+    "console_sha256": "c3c49ef2e14f67da8a4a0c84a0124d41a1cbeef66ba0090ab0a8e57781249d62",
+    "command": "COGNEE_LOG_FILE=false TELEMETRY_DISABLED=1 RUNTIME__DLTHUB_TELEMETRY=false python -m pytest tests -q",
+    "installation": "editable locked development environment",
+    "uv": "0.11.23",
+    "uv_lock_sha256": "cfe83ac42eb6515bf1c15688ca381be990f07d9923bdddc3679a27355dbaddf4",
+    "install_command": "uv sync --locked --extra test --python 3.12",
+    "lock_check": "passed",
+    "ruff_check": "passed",
+    "ruff_format_check": "20 files already formatted",
+    "scope": "macOS ARM64 Python3.12; other lock branches not executed by this receipt."
+  },
   "model_integration": {
     "result": "passed",
-    "pytest_summary": "1 passed, 17 warnings in 17.86s",
+    "pytest_summary": "1 passed, 17 warnings in 18.67s",
     "cognee": "1.6.3",
     "python": "3.12.13",
     "provider": "fake",
     "stores": "real SQLite/Ladybug/LanceDB",
     "models": "cached GLiNER2.5 and bge-small",
+    "scope": "remember with sibling resource isolation, explicit missing refusal retaining actual stores, then confirmed final cleanup",
     "command": "POSTMAN_MODEL_TEST=1 python -m pytest tests/test_cognee_scope_lifecycle.py -q",
-    "console_sha256": "30ce9ec934c042f9981b0a043601811932d4cddcccb0b7c1153fb77ed1dfdc7e"
+    "console_sha256": "860a3866d370e28da843ecbf608dff5b03f505a557ea39925c8a52523e9677f6"
   },
   "authenticated_lifecycle": {
     "result": "passed",
+    "python": "3.12.13",
     "cognee": "1.6.3",
     "dlt": "1.30.0",
-    "python": "3.12.13",
     "command": "python tests/support/postman_lifecycle.py --allow-provider-writes",
-    "writes": "only two owned synthetic collections; saved requests never executed",
+    "writes": "Only two owned synthetic collections; saved requests never executed.",
     "steps": [
       {
         "step": "initial",
         "data_rows": 2,
         "graph_nodes": 20,
-        "graph_edges": 23,
+        "graph_edges": 24,
         "vector_rows": {
           "DocumentChunk_text": 2,
-          "EdgeType_relationship_name": 24,
+          "EdgeType_relationship_name": 25,
           "EntityType_name": 8,
           "Entity_name": 9,
           "TextDocument_name": 2,
@@ -74,10 +101,10 @@
         "step": "unchanged",
         "data_rows": 2,
         "graph_nodes": 20,
-        "graph_edges": 23,
+        "graph_edges": 24,
         "vector_rows": {
           "DocumentChunk_text": 2,
-          "EdgeType_relationship_name": 24,
+          "EdgeType_relationship_name": 25,
           "EntityType_name": 8,
           "Entity_name": 9,
           "TextDocument_name": 2,
@@ -88,10 +115,10 @@
         "step": "selection_deselected",
         "data_rows": 1,
         "graph_nodes": 12,
-        "graph_edges": 12,
+        "graph_edges": 13,
         "vector_rows": {
           "DocumentChunk_text": 1,
-          "EdgeType_relationship_name": 14,
+          "EdgeType_relationship_name": 15,
           "EntityType_name": 6,
           "Entity_name": 6,
           "TextDocument_name": 1,
@@ -102,10 +129,10 @@
         "step": "selection_restored",
         "data_rows": 2,
         "graph_nodes": 20,
-        "graph_edges": 23,
+        "graph_edges": 24,
         "vector_rows": {
           "DocumentChunk_text": 2,
-          "EdgeType_relationship_name": 24,
+          "EdgeType_relationship_name": 25,
           "EntityType_name": 8,
           "Entity_name": 9,
           "TextDocument_name": 2,
@@ -115,13 +142,13 @@
       {
         "step": "edited",
         "data_rows": 2,
-        "graph_nodes": 21,
-        "graph_edges": 24,
+        "graph_nodes": 20,
+        "graph_edges": 21,
         "vector_rows": {
           "DocumentChunk_text": 2,
-          "EdgeType_relationship_name": 25,
+          "EdgeType_relationship_name": 23,
           "EntityType_name": 8,
-          "Entity_name": 10,
+          "Entity_name": 9,
           "TextDocument_name": 2,
           "TextSummary_text": 2
         }
@@ -129,12 +156,12 @@
       {
         "step": "docs_only_collection",
         "data_rows": 2,
-        "graph_nodes": 19,
-        "graph_edges": 25,
+        "graph_nodes": 20,
+        "graph_edges": 28,
         "vector_rows": {
           "DocumentChunk_text": 2,
-          "EdgeType_relationship_name": 27,
-          "EntityType_name": 6,
+          "EdgeType_relationship_name": 29,
+          "EntityType_name": 7,
           "Entity_name": 10,
           "TextDocument_name": 2,
           "TextSummary_text": 2
@@ -144,10 +171,10 @@
         "step": "final_request_deleted",
         "data_rows": 1,
         "graph_nodes": 12,
-        "graph_edges": 12,
+        "graph_edges": 13,
         "vector_rows": {
           "DocumentChunk_text": 1,
-          "EdgeType_relationship_name": 14,
+          "EdgeType_relationship_name": 15,
           "EntityType_name": 6,
           "Entity_name": 6,
           "TextDocument_name": 1,
@@ -157,25 +184,39 @@
       {
         "step": "request_restored",
         "data_rows": 2,
-        "graph_nodes": 21,
-        "graph_edges": 24,
+        "graph_nodes": 20,
+        "graph_edges": 21,
         "vector_rows": {
           "DocumentChunk_text": 2,
-          "EdgeType_relationship_name": 25,
+          "EdgeType_relationship_name": 23,
           "EntityType_name": 8,
-          "Entity_name": 10,
+          "Entity_name": 9,
           "TextDocument_name": 2,
           "TextSummary_text": 2
         }
       },
       {
-        "step": "nonempty_collection_deleted_next_sync",
+        "step": "selected_missing_refused_stores_unchanged",
+        "data_rows": 2,
+        "graph_nodes": 20,
+        "graph_edges": 21,
+        "vector_rows": {
+          "DocumentChunk_text": 2,
+          "EdgeType_relationship_name": 23,
+          "EntityType_name": 8,
+          "Entity_name": 9,
+          "TextDocument_name": 2,
+          "TextSummary_text": 2
+        }
+      },
+      {
+        "step": "confirmed_collection_deleted_next_sync",
         "data_rows": 1,
         "graph_nodes": 12,
-        "graph_edges": 12,
+        "graph_edges": 13,
         "vector_rows": {
           "DocumentChunk_text": 1,
-          "EdgeType_relationship_name": 14,
+          "EdgeType_relationship_name": 15,
           "EntityType_name": 6,
           "Entity_name": 6,
           "TextDocument_name": 1,
@@ -183,7 +224,21 @@
         }
       },
       {
-        "step": "last_collection_deleted_next_sync",
+        "step": "final_missing_refused_stores_unchanged",
+        "data_rows": 1,
+        "graph_nodes": 12,
+        "graph_edges": 13,
+        "vector_rows": {
+          "DocumentChunk_text": 1,
+          "EdgeType_relationship_name": 15,
+          "EntityType_name": 6,
+          "Entity_name": 6,
+          "TextDocument_name": 1,
+          "TextSummary_text": 1
+        }
+      },
+      {
+        "step": "confirmed_last_collection_deleted",
         "data_rows": 0,
         "graph_nodes": 0,
         "graph_edges": 0,
@@ -211,43 +266,33 @@
         }
       }
     ],
-    "console_sha256": "07515f1e2e54d6a91ecb6e3f6fa4594c90cf6ca26aeb2b39ae387c91072a7975",
+    "console_sha256": "38733d68bada0aa2739229b1d31d21e259cc3fe4adc3c0b4bc527cb062050a7e",
     "postflight": {
       "remaining_collections": 1,
       "synthetic_collections": 0,
       "private_key_scan_passed": true
+    },
+    "scope": "13 steps: includes two explicit-missing refusals preserving real Data/graph/vector content, deliberate confirmation cleanup and empty replay. Earlier helper exception-wrapper error and provider ReadTimeout runs did not pass; their cleanup was verified before this fresh run.",
+    "independent_store_verifier": {
+      "result": "passed",
+      "console_sha256": "6a83d48a8786e2599b3c4f74e853e290a4f2c1dbf3b6a544ff4a10d144576cec",
+      "scope": "Standalone process inspected final actual Data, graph and all LanceDB tables; empty."
     }
   },
   "independent_review": {
     "model": "gpt-6-astra",
     "effort": "medium",
-    "final_targeted_passed": 12,
-    "verdict": "no remaining privacy or code blockers"
+    "verdict": "no actionable material findings",
+    "pytest_summary": "131 passed, 1 skipped, 13 warnings in 17.21s",
+    "additional_sql_check": "Passed: rolling-budget persistence, refusal rollback preserving SQL rows/source state, then confirmed recovery.",
+    "module_sha256": "b0620b4755bf886c777eb2f058876e0ae5b55809d5d8e8c113fd5a4b958928a5",
+    "scope": "Independently reviewed full connector and current deliverable diff, ran full locked offline suite and extra real-dlt/SQLite transition exercise, Ruff and whitespace checks; verified module, lock and all seven console receipt hashes. Installed-wheel matrix/model/provider/store verifier receipts were hash-checked, not independently rerun."
   },
   "limits": [
-    "Author-recorded receipts, not an exhaustive guarantee.",
-    "Optional local-model test skipped in offline matrix; model pass recorded separately.",
-    "Secret filtering is best effort.",
-    "Single missing collection can be mirrored; bulk removals guarded by budget.",
-    "No same-scope concurrent ingestion, atomic provider snapshot, byte budget or complete backend matrix claimed."
-  ],
-  "locked_development_environment": {
-    "python": "3.12.13",
-    "cognee": "1.6.5",
-    "dlt": "1.30.0",
-    "httpx": "0.28.1",
-    "pytest": "9.1.1",
-    "ruff": "0.17.1",
-    "uv": "0.11.23",
-    "uv_lock_sha256": "cfe83ac42eb6515bf1c15688ca381be990f07d9923bdddc3679a27355dbaddf4",
-    "module_sha256": "d8416cc5114812034962b442b1dee121e778a51b4b7aa3639511fef048d9eb74",
-    "install_command": "uv sync --locked --extra test --python 3.12",
-    "test_command": "COGNEE_LOG_FILE=false TELEMETRY_DISABLED=1 RUNTIME__DLTHUB_TELEMETRY=false uv run --locked --extra test pytest tests -q",
-    "pytest_summary": "103 passed, 1 skipped, 13 warnings in 26.09s",
-    "console_sha256": "145febb18f967b1f4c6b6c7df132c16781104e181857a33d1ed7d0b1c8d84ccf",
-    "lock_check": "passed",
-    "ruff_check": "passed",
-    "ruff_format_check": "19 files already formatted",
-    "scope": "Fresh macOS ARM64 Python 3.12 environment; editable development install. Optional model test skipped. Other lock branches not executed by this receipt."
-  }
+    "Execution receipts apply to listed versions and small synthetic fixtures, not an exhaustive guarantee.",
+    "Optional model test skipped in full suites; model pass recorded separately.",
+    "Filtering is best effort; short values below4 are not globally replaced.",
+    "Empty inventory and explicit missing selection require confirmation; rolling budget limits all-visible automatic removal, not proof of provider deletion.",
+    "Persistent pipeline state required for account binding and rolling budget; no same-scope concurrent ingestion, atomic provider snapshot, byte budget or full backend/platform matrix claimed."
+  ]
 }

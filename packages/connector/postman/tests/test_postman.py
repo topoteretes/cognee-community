@@ -596,12 +596,16 @@ def test_shorthand_url_credentials_are_redacted_from_inherited_documentation():
     assert "private-query" not in json.dumps(rows)
 
 
-def test_visibility_mirror_removes_known_collection_and_replays_empty():
+def test_confirmed_explicit_collection_removal_replays_empty():
     client = FakeClient()
     _, state = snapshot(client, collection_ids=["1-c"])
     client.inventory = {}
     rows, state = snapshot(
-        client, state, collection_ids=["1-c"], missing_collection_policy="mirror_visibility"
+        client,
+        state,
+        collection_ids=["1-c"],
+        missing_collection_policy="mirror_visibility",
+        confirmed_deleted=["1-c"],
     )
     assert rows == [] and state["removed_collections"] == ["1-c"]
     again, state = snapshot(

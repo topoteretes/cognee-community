@@ -40,11 +40,11 @@ def test_benign_values_survive_but_auth_and_explicit_values_do_not():
         assert secret not in rendered
 
 
-def test_default_deletion_and_explicit_deselection_even_after_access_loss():
+def test_confirmed_deletion_and_explicit_deselection_even_after_access_loss():
     client = FakeClient()
     _, state = snapshot(client)
     client.inventory = {}
-    rows, state = snapshot(client, state)
+    rows, state = snapshot(client, state, confirmed_deleted=["1-c"])
     assert rows == [] and not state["collections"]
     client = FakeClient()
     _, state = snapshot(client, collection_ids=["1-c"])
@@ -323,10 +323,14 @@ def test_minimal_and_explicit_account_factories_share_verified_identity(tmp_path
     assert src.name == minimal(account_id="1").name
     pipeline.run(src)
     assert pipeline.state["sources"][src.name]["postman_snapshot"]["account_id"] == "1"
-    with pytest.raises(PostmanAuthError):
-        minimal(account_id="other")
+    from dlt.pipeline.exceptions import PipelineStepFailed
+
+    with pytest.raises(PipelineStepFailed):
+        pipeline.run(minimal(account_id="other"))
     get = client.get
     client.get = lambda path, **params: (
         {"user": {"id": "other"}} if path == "/me" else get(path, **params)
     )
-    assert minimal().name != src.name
+    assert minimal().name == src.name
+    with pytest.raises(PipelineStepFailed):
+        pipeline.run(minimal())

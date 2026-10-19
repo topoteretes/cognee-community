@@ -41,8 +41,10 @@ await cognee.remember(
 
 `resource_name` is required so independent connections cannot silently share the default
 table. Keep it fixed when editing selection; choose different names for sibling sources.
-The factory verifies `/me` **during construction**, resolves the account before naming
-its source/table, and stores that identity for both minimal and explicit-account calls.
+The factory performs no provider reads or authorization callbacks. During extraction,
+`/me` verifies the account and binds it in transactional state. Minimal and explicit-account
+calls share the stable workspace/owner/dataset/resource namespace. A different account
+on an existing resource aborts; choose a distinct resource for another account.
 An optional `account_id` must match. Optional owner/dataset constraints remain available
 for advanced hosts. The factory reads no environment variables and changes no backend
 paths. `service=` injects a reader; `client=` remains an alias.
@@ -52,7 +54,7 @@ paths. `service=` injects a reader; `client=` remains an alias.
 `collection_ids=None` selects all visible collections, including subscriptions/forks;
 `[]` intentionally empties this resource. Changing selection replaces that resource's
 snapshot and retires deselected content without touching differently named siblings.
-Account/workspace/owner/dataset/resource identity binds document IDs, table and state;
+Workspace/owner/dataset/resource identity binds document IDs, table and state;
 changing those binding fields creates another corpus.
 
 Collection `updatedAt`, renderer version and redaction policy control tree fetching.
@@ -60,20 +62,24 @@ Use `force_refresh=True` for timestamp-silent edits. Every extraction emits the 
 retained snapshot** with `replace`, including cached rows and explicit empty replacements.
 Keep pipeline state persistent. Same-scope concurrent extraction is unsupported.
 
-Default `mirror_visibility` removes a previously observed missing collection on the
-next sync. Unsharing, moving or permission loss can also cause absence. **Bulk protection:**
-more than one unconfirmed missing collection aborts instead of publishing removals.
-Pass missing UIDs in `confirmed_deleted` after checking the workspace, or explicitly set
-`max_unconfirmed_removals`. Setting it to zero requires confirmation for every disappearance.
-The default still permits final-single-collection deletion automatically; it cannot prove
-whether one missing collection was physically deleted or became invisible. Explicit
-selection edits are intentional and bypass the provider-disappearance budget.
+Default `mirror_visibility` can remove a previously observed missing collection when
+selecting all visible collections (`collection_ids=None`). Explicitly selected missing
+UIDs require `confirmed_deleted`, even if other collections remain visible. Unsharing,
+moving or permission loss can also cause absence. **Removal safeguards:** an empty
+provider inventory never clears a populated cache without confirmation; more than one
+automatic removal within a rolling five-minute window also aborts by default. Successful
+automatic removals are recorded in transactional state across syncs. The refusal lists
+unconfirmed UIDs so callers can inspect and pass `confirmed_deleted` deliberately.
+`max_unconfirmed_removals` changes the rolling budget; zero requires confirmation for
+every disappearance. Confirmed removal and explicit selection edits (including `[]`)
+remain intentional. The guards limit risk, not proof of provider deletion: a partial
+listing may still remove one all-visible collection per window.
 
 Use `missing_collection_policy="require_confirmation"` for conservative handling of any
 visibility loss. Unknown selected UIDs, inaccessible workspace, API/quota faults and
 malformed/incomplete pagination abort. Confirmations cannot remove visible collections.
 
-An unchanged small workspace costs **three reads**: `/me` at construction, workspace
+An unchanged small workspace costs **three reads**: `/me` during extraction, workspace
 validation and one paginated inventory. Fetches or membership changes require a second
 matching inventory before publication. This reduces quota use while retaining checks on
 changed snapshots; it is not an atomic provider transaction. HTTP retries have finite
@@ -85,14 +91,18 @@ Longer retry hints/monthly exhaustion require a later sync. Allowance is account
 Endpoint templates and header/query names are included by default, with variables left
 unresolved and userinfo/query values/fragments removed. `include_endpoint_metadata=False`
 disables them. Known credential patterns in paths are redacted too. Request rows with
-valid Postman item UUIDs link to the request UI; missing/duplicate IDs fall back to the
-collection UI. Positional identity fallback changes on reorder/move.
+provider-supplied request UIDs link to the request UI; otherwise they link to the collection
+UI. The request creator is never inferred from the collection owner. Positional identity
+fallback changes on reorder/move.
 
-Auth, bodies, scripts, examples and raw header/query/variable values are omitted. Redaction
-recognizes secret-typed variables, sensitive names, auth-declared headers, credential-like
-query values, common token patterns and explicit `redact_values`. Short secrets use token
-boundaries so ordinary words, counts and versions are not corrupted. This is best-effort
-filtering, not universal secret detection: arbitrary prose, hosts, paths or unusual names
+Auth, bodies, scripts, examples and raw header/query/variable values are omitted. Best-effort
+filtering recognizes secret-typed variables, sensitive body fields (including JSON bodies),
+headers outside a small content/transport allowlist, sensitive query names, long mixed
+unstructured tokens, known credential patterns (including GitHub tokens and Slack webhook
+paths) and explicit `redact_values`. Sorts, dates and region/format enums remain prose.
+Values shorter than four characters are not globally replaced in prose or endpoint hosts;
+they cannot be distinguished from words. Explicit auth syntax is still scrubbed. Filtering
+is best effort, not universal secret detection: arbitrary prose, hosts, paths or unusual names
 can contain undiscoverable private values. Review documentation and use explicit values.
 Raw trees are not persisted; sanitized rows/cursors remain in local state and stores.
 
@@ -101,13 +111,14 @@ Raw trees are not persisted; sanitized rows/cursors remain in local state and st
 `check_active=` is a synchronous host authorization/cancellation callback. A single
 coordinator checks it before every HTTP attempt, including retries; publication has
 separate before/after checkpoints. Injected PostmanClient hooks are retained and identical
-callbacks are deduplicated. Callback exceptions abort; factory preflight errors raise
-before a source is returned.
+callbacks are deduplicated. Callback exceptions abort; account verification and provider
+errors are counted during extraction.
 
 `source.cognee_sync_stats` and its resource share integer extraction counters: `scanned`
 selected collections, `skipped` reused, `fetched`, `documents`, `failed`, and typed
 `failed_auth`/`failed_rate_limit`/`failed_data`. All extraction exceptions increment failed;
-a static Cognee warning omits private exception text. Typed errors inherit PostmanSyncError.
+a Cognee warning includes the exception class and omits private exception text. Typed errors
+inherit PostmanSyncError.
 Counters are not proof of committed ingestion or successful cleanup. Cognee can log orphan
 cleanup failure without raising: inspect actual Data/graph/vector stores and retry.
 

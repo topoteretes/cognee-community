@@ -29,12 +29,13 @@ def test_forgetting_one_corpus_preserves_other_populated_corpus(tmp_path, monkey
     left.tree["item"][0]["request"]["description"] = "Ravi lives in Calgary."
     right.tree["item"][0]["request"]["description"] = "Yuna lives in Kyoto."
 
-    async def sync(client, owner, selection=("1-c",)):
+    async def sync(client, owner, selection=("1-c",), confirmed=()):
         src = postman_source(
             client=client,
             workspace_id="w",
             resource_name=owner,
             collection_ids=selection,
+            confirmed_deleted=confirmed,
         )
         configure_pipeline(src, dataset, runtime)
         await cognee.remember(
@@ -63,7 +64,11 @@ def test_forgetting_one_corpus_preserves_other_populated_corpus(tmp_path, monkey
         stats, texts = await inspect_stores(dataset)
         assert_stores(stats, texts, expected_rows=1, expected=["Kyoto"], forbidden=["Calgary"])
         right.inventory = {}
-        await sync(right, "right")
+        with pytest.raises(Exception, match="Collection disappeared"):
+            await sync(right, "right")
+        stats, texts = await inspect_stores(dataset)
+        assert_stores(stats, texts, expected_rows=1, expected=["Kyoto"], forbidden=["Calgary"])
+        await sync(right, "right", confirmed=["1-c"])
         stats, texts = await inspect_stores(dataset)
         assert_stores(stats, texts, expect_empty=True)
 

@@ -60,12 +60,13 @@ async def main():
             raise RuntimeError(f"Postman lifecycle HTTP {response.status_code}; response withheld.")
         return response.json()
 
-    async def sync(label, rows, *, expected=(), forbidden=()):
+    async def sync(label, rows, *, expected=(), forbidden=(), confirmed=()):
         source = postman_source(
             api_key=settings["POSTMAN_API_KEY"],
             workspace_id=settings["POSTMAN_WORKSPACE_ID"],
             resource_name="local_postman_lifecycle",
             collection_ids=selection,
+            confirmed_deleted=confirmed,
         )
         configure_pipeline(source, dataset, runtime)
         await cognee.add(
@@ -95,6 +96,22 @@ async def main():
             rendered = json.dumps(results, default=str).casefold()
             if any(token.casefold() not in rendered for token in expected):
                 raise RuntimeError("Expected fixture content absent from chunk search.")
+        entry = {"step": label, **stats}
+        report.append(entry)
+        print(json.dumps(entry), flush=True)
+
+    async def assert_missing_refused(label, rows, expected):
+        from cognee.tasks.ingestion.exceptions.exceptions import DLTIngestionError
+
+        try:
+            await sync("unexpected_missing_success", rows)
+        except DLTIngestionError as exc:
+            if "Collection disappeared" not in str(exc):
+                raise
+        else:
+            raise RuntimeError("Explicit missing collection was not refused.")
+        stats, texts = await inspect_stores(dataset)
+        assert_stores(stats, texts, expected_rows=rows, expected=expected)
         entry = {"step": label, **stats}
         report.append(entry)
         print(json.dumps(entry), flush=True)
@@ -157,15 +174,25 @@ async def main():
         await sync("request_restored", 2, expected=["Lima", "Bergen"])
         request("DELETE", "/collections/" + selection[0])
         owned.remove(selection[0])
+        await assert_missing_refused(
+            "selected_missing_refused_stores_unchanged", 2, ["Lima", "Bergen"]
+        )
         await sync(
-            "nonempty_collection_deleted_next_sync",
+            "confirmed_collection_deleted_next_sync",
             1,
             expected=["Bergen"],
             forbidden=["Lima", "Oslo"],
+            confirmed=[selection[0]],
         )
         request("DELETE", "/collections/" + selection[1])
         owned.remove(selection[1])
-        await sync("last_collection_deleted_next_sync", 0, forbidden=["Lima", "Bergen"])
+        await assert_missing_refused("final_missing_refused_stores_unchanged", 1, ["Bergen"])
+        await sync(
+            "confirmed_last_collection_deleted",
+            0,
+            forbidden=["Lima", "Bergen"],
+            confirmed=list(selection),
+        )
         await sync("empty_replay", 0, forbidden=["Lima", "Bergen"])
         print("Synthetic lifecycle passed: search, edits, next-sync deletion and all-store checks.")
     finally:
