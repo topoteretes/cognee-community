@@ -51,6 +51,10 @@ ALPHA = "Alphacorp"
 BRAVO = "Bravocorp"
 
 
+# Texts the mocked LLM was asked to extract a graph from, one per call.
+LLM_EXTRACTIONS: list[str] = []
+
+
 async def _mock_structured_output(
     text_input=None, system_prompt=None, response_model=str, **_kwargs
 ):
@@ -63,6 +67,7 @@ async def _mock_structured_output(
     if response_model == SummarizedContent:
         return SummarizedContent(summary="Mock summary", description="Mock summary")
     if response_model == KnowledgeGraph:
+        LLM_EXTRACTIONS.append(text_input or "")
         names = [token for token in (ALPHA, BRAVO) if text_input and token in text_input]
         nodes = [KGNode(id=n, name=n, type="Company", description=f"{n} entity") for n in names]
         return KnowledgeGraph(nodes=nodes, edges=[])
@@ -133,6 +138,7 @@ async def clean_environment(tmp_path, monkeypatch):
 
     monkeypatch.setattr(LiteLLMEmbeddingEngine, "embed_text", _mock_embed_text)
 
+    LLM_EXTRACTIONS.clear()
     await cognee.prune.prune_data()
     await cognee.prune.prune_system(metadata=True)
     yield
@@ -238,6 +244,25 @@ async def test_billing_is_remembered_linked_and_forgotten(clean_environment):
     assert all(after[object_id] == documents[object_id] for object_id in after)
     assert await _graph_has(ALPHA), "surviving customer's entity must remain"
     assert not await _graph_has(BRAVO), "deleted customer's entity must be forgotten"
+
+
+@pytest.mark.asyncio
+async def test_unchanged_resync_makes_no_llm_call(clean_environment):
+    stripe, objects = _fake_stripe()
+    await _sync(stripe)
+    assert LLM_EXTRACTIONS, "the first sync should have cognified the documents"
+
+    stripe.tick(7200)
+    LLM_EXTRACTIONS.clear()
+    await _sync(stripe)
+    assert LLM_EXTRACTIONS == []
+
+    # An edit costs exactly the edited document, not the whole account.
+    stripe.tick(7200)
+    stripe.update("customers", objects["bravo"]["id"], description="Renewal call booked")
+    await _sync(stripe)
+    assert len(LLM_EXTRACTIONS) == 1
+    assert "Renewal call booked" in LLM_EXTRACTIONS[0]
 
 
 @pytest.mark.asyncio
