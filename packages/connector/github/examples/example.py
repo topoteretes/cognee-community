@@ -54,8 +54,9 @@ async def main() -> None:
 
     include_commits = os.environ.get("GITHUB_INCLUDE_COMMITS") == "1"
     print(f"Syncing {len(repos)} GitHub repo(s) into cognee ...")
+    source = github_source(repos=repos, include_commits=include_commits)
     await cognee.remember(
-        github_source(repos=repos, include_commits=include_commits),
+        source,
         dataset_name=DATASET_NAME,
         primary_key="id",
         # Required: the default "replace" would drop every issue that is not
@@ -64,6 +65,8 @@ async def main() -> None:
         # 0 = no row cap, so orphan cleanup compares against the whole corpus.
         max_rows_per_table=0,
     )
+    # scanned, skipped, failed, deleted, kept, given_up (+ failed_<reason> on an early stop)
+    print("Sync stats:", source.cognee_sync_stats)
 
     answer = await cognee.search(
         query_text="What is being worked on in these repositories, and what is still open?",

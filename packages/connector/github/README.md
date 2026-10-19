@@ -35,7 +35,12 @@ cleanup, `PIPELINE_SCOPE_ATTR` and `guarded_rows` all ship in cognee 1.6.2. The 
 2. Export it as `GITHUB_TOKEN` (or pass `token=...`), plus your `LLM_API_KEY` like any other
    cognee run.
 
-The connector is read-only. It only issues `GET` requests.
+The connector is read-only. It only issues `GET` requests. The token is checked before the
+first request: one with whitespace or control characters in it (a pasted newline, say) is
+refused with a `ValueError` that does not repeat it.
+
+Ingested text goes to the LLM configured for cognee: cognify sends each document to it for
+entity extraction.
 
 ## Usage
 
@@ -73,8 +78,9 @@ and forgets what was deleted. See `examples/example.py` for the full flow.
 | `include_bots=False` | Keep comments and reviews written by bots (Copilot's reviewer, github-actions, ...). Off by default: they are long and repetitive. Issues and pull requests opened by a bot are ingested either way. |
 | `include_readme=True` | Put the README text into the repository document. |
 | `token="..."` | Token. Defaults to the `GITHUB_TOKEN` environment variable. |
-| `resource_name="github_documents"` | The dlt table name, which also scopes the sync state. See below. |
-| `check_active=None` | Optional callable for a host: asked before every GitHub request and around every row; raising stops the sync with nothing deleted. |
+| `resource_name="github_documents"` | The dlt table name, which also scopes the sync state. Lowercase snake_case, at most 64 characters. See below. |
+| `check_active=None` | Optional callable for a host: asked before every GitHub request and every wait, and around every row; raising stops the sync with nothing deleted. |
+| `service=None` | A pre-built `requests`-like session (mainly for tests); `session=` is accepted too. Without it, each run builds its own session and closes it. |
 
 A repository that does not exist, or that the token cannot read, stops the run with an error
 and deletes nothing. To forget a repository, remove it from `repos` and sync again.
@@ -168,7 +174,9 @@ redirects:
 - **Anything else keeps the document**, including `404` (which GitHub also answers when the
   token has lost access), `200`, and an error that outlasts the retries. A warning names the
   endpoint and the status, the rest of the run goes on, and the next run asks again. One odd
-  issue can neither delete anything nor stall every sync.
+  issue can neither delete anything nor stall every sync. A number that keeps giving such a
+  clear but inconclusive answer (`404`, `403`, `200`, a `301` that is not a transfer) in three
+  runs in a row is forgotten; an error that outlasts the retries never counts toward that.
 
 Releases that vanish from the release list are forgotten too, and so is everything of a
 repository removed from `repos`. Forgotten ids are emitted with the `_deleted` hard-delete
@@ -177,21 +185,59 @@ graph and vector stores.
 
 All listings are completed before the first row is emitted, and state is saved only after the
 last one. If a listing fails (after retries), or `check_active` raises, the run aborts: nothing
-is deleted and no cursor or ETag moves, so the next run starts from the same point. A listing
-page that answers `200` with something other than a JSON list also aborts the run; it is never
-read as an empty listing.
+is deleted and no cursor or ETag moves, so the next run starts from the same point. An answer
+of `200` with something other than the expected JSON (an HTML login page, say) also aborts the
+run, whether it came from a listing or from one issue; it is never read as an empty listing or
+an issue to skip.
 
-An issue or pull request that fails on its own while it is rendered (an error that outlasts
-the retries on its comments, reviews or files) keeps its previous document, is logged with
-the endpoint and status, and is rendered again on the next run; the rest of the run goes on.
-Failures that would hit every issue the same way still abort with nothing saved: a `401`, a
-rate limit that outlasts the retries, and three issues failing in a row.
+## When GitHub fails part of the way through
+
+An issue or pull request that is still listed but fails on its own while it is rendered keeps
+its previous document and is rendered again on the next run; the rest of the run goes on:
+
+- **`403` or `404`** on its comments, reviews or files: kept. If it answers that way in three
+  runs in a row at the same `updated_at`, its document is forgotten and it is not asked about
+  again until its `updated_at` moves. A `403` counts toward that only if another item of the
+  same kind (issue, or pull request) was read in the same run. When every item of a kind
+  answers `403`, the token most likely lacks a permission (a fine-grained token without
+  "Pull requests: read" lists pull requests but cannot read them): the items are kept,
+  nothing is given up, the run counts them under `failed_permission`, and one warning per kind
+  says to check the token's permissions. A rate-limit `403` is not a permission `403`: it
+  stops the run cleanly (see Rate limits).
+- **A server error or no answer** that outlasts the retries: kept. Three of these in a row on
+  fresh issues means GitHub itself is down, and the run stops cleanly (below).
+
+Issues kept from an earlier run are rendered after the fresh ones and never count toward that
+streak, so issues that keep failing cannot hold up the others.
+
+Some failures stop the run **cleanly** instead of aborting it: a `401` after at least one
+issue was emitted (a token that expires during a long first sync), a rate limit that outlasts
+the retries or asks for a wait over 60 seconds (such as the hourly reset of the primary limit),
+and the outage above. The run then ends normally: what it emitted is loaded and nothing is
+deleted. A repository finished before the stop keeps its new state; for the others the cursor
+and ETags stay where they were, so the next run lists the same changes again (unchanged pages
+answer `304` and cost no quota) and renders only what this run did not reach. A `401` before
+any issue was emitted still raises, since that is a bad token.
+
+Error messages name the status and the endpoint only (`GitHub /repos/acme/site: HTTP 403`).
+GitHub's own message is on the exception's `detail`; a response body or the token never is.
+
+### Sync stats
+
+`resource.cognee_sync_stats` holds the counts of the last run, as plain ints: `scanned`
+(issues and pull requests listed), `skipped` (unchanged), `failed` (item failures), `deleted`,
+`kept` (issues waiting for a retry, and missing numbers not yet shown to be gone) and
+`given_up`, plus `failed_auth`, `failed_rate_limit` or `failed_unavailable` when the run stopped
+early for that reason, and `failed_permission` (how many items of a kind that could not be read
+at all answered `403`).
 
 ## Rate limits
 
 `429`, or `403` with `retry-after` or `x-ratelimit-remaining: 0`, is a rate limit: the
 connector waits `retry-after` seconds, or until `x-ratelimit-reset` measured against GitHub's
-`Date` header, and tries again. A `403` whose message says "secondary rate limit" but has
+`Date` header, and tries again. A single wait is at most 60 seconds, and `check_active` is
+asked before it; a longer one (the primary limit resets hourly) stops the run cleanly, and the
+next run carries on. A `403` whose message says "secondary rate limit" but has
 neither header is waited out for a minute, as GitHub advises. A `403` without those headers is a permission error and fails
 at once (verified live: it carries a non-zero remaining count and no `retry-after`). Server
 errors and network failures back off and retry, up to five attempts.
@@ -215,6 +261,7 @@ errors and network failures back off and retry, up to five attempts.
 - Comments on commits, discussions, projects, wikis and source files are not ingested. An issue
   converted to a discussion stays as a closed issue.
 - A comment by a deleted account is attributed to `ghost`.
+- An issue that cannot be read in three runs in a row is forgotten until it changes.
 - Deletions propagate on a foreground `remember(...)`. cognee skips orphan cleanup for
   `run_in_background=True`.
 
@@ -262,9 +309,11 @@ uv run pytest tests/ -q
 The tests mock the GitHub API (no token, no network). They cover rendering (also from
 shuffled input), the header fingerprint, Link pagination, ETags and `304`s, the cursor and its
 overlap, late timestamps, label and milestone renames, bot filtering, the pull request file
-cap, the README, commits, deleted and transferred issues, missing issues that are kept, issues that fail to render
-(kept and retried, or aborting on a `401`, a rate limit or three failures in a row), rate
-limits versus permission errors, bodies of the wrong shape, and the failure paths that must
-delete nothing. A real `dlt` pipeline into a temp sqlite destination checks edits and deletes
-across runs (the deleted row is gone from the table), two sources in one dataset staying apart,
-and `check_active` stopping a run with nothing loaded.
+cap, the README, commits, deleted and transferred issues, missing issues that are kept and
+given up, issues that fail to render (kept and retried, three unreadable ones not blocking a
+run and given up after three runs, retries going last), the clean stops (`401` mid-run, rate
+limit, an hour-long reset, outage) and what the next run picks up, rate limits versus
+permission errors, bodies of the wrong shape, the token never reaching a message or a log
+line, and the failure paths that must delete nothing. A real `dlt` pipeline into a temp sqlite
+destination checks edits and deletes across runs, two sources in one dataset staying apart, a
+`401` mid-run resuming on the next run, and `check_active` stopping a run with nothing loaded.

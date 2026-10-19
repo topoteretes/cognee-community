@@ -30,14 +30,16 @@ from urllib.parse import parse_qs, urlparse
 from uuid import NAMESPACE_OID, uuid5
 
 import pytest
+import requests
 from cognee.tasks.ingestion.dlt_utils import document_source_tag, pipeline_name_for_source
 from cognee.tasks.ingestion.resolve_dlt_sources import _build_document_data_item
+from dlt.pipeline.exceptions import PipelineStepFailed
 
 from cognee_community_connector_github import github
 from cognee_community_connector_github.github import (
     GITHUB_SOURCE_NAME,
     GitHubAPIError,
-    GitHubListingError,
+    GitHubResponseError,
     _fingerprint,
     _get,
     _header_lines,
@@ -556,7 +558,7 @@ def test_listing_with_a_body_of_the_wrong_shape_raises(seeded, body):
         body.json = lambda: json.loads(body.text)  # raises ValueError, like requests
     seeded.queue(body, when=lambda url: "sort=created" in url)
 
-    with pytest.raises(GitHubListingError):
+    with pytest.raises(GitHubResponseError):
         run_sync(seeded, state)
     assert state == before  # never read as an empty listing, nothing deleted
 
@@ -583,9 +585,11 @@ def test_rate_limit_waits_then_succeeds_and_permission_error_raises_at_once(fake
             {"X-RateLimit-Remaining": "4974"},
         )
     )
-    with pytest.raises(GitHubAPIError, match="not accessible") as excinfo:
+    with pytest.raises(GitHubAPIError) as excinfo:
         _get(fake, _url(f"/repos/{REPO}"))
     assert excinfo.value.status == 403
+    assert str(excinfo.value) == "GitHub /repos/acme/site: HTTP 403"
+    assert excinfo.value.detail == "Resource not accessible by personal access token"
     assert sleeps == [11.0]  # not retried
 
 
@@ -597,13 +601,18 @@ def test_secondary_rate_limit_without_headers_waits_a_minute(fake, sleeps):
     assert sleeps == [60.0]
 
 
-def test_rate_limit_that_outlasts_the_retries_is_not_reported_as_missing_access(fake):
+def test_rate_limit_that_outlasts_the_retries_stops_cleanly(fake):
     for _ in range(github._MAX_RETRIES):
         fake.queue(_error(403, "API rate limit exceeded", {"Retry-After": "1"}))
+    with pytest.raises(GitHubAPIError) as excinfo:
+        _get(fake, _url(f"/repos/{REPO}"))
+    assert excinfo.value.rate_limited and excinfo.value.status == 403
 
-    with pytest.raises(GitHubAPIError, match="API rate limit exceeded") as excinfo:
-        run_sync(fake, {})
-    assert excinfo.value.rate_limited
+    for _ in range(github._MAX_RETRIES):
+        fake.queue(_error(403, "API rate limit exceeded", {"Retry-After": "1"}))
+    state, stats = {}, {}
+    assert run_sync(fake, state, stats=stats) == []  # stopped while listing: nothing moved
+    assert stats["failed_rate_limit"] == 1 and state == {}
 
 
 def test_server_and_network_errors_back_off_then_succeed(sleeps):
@@ -613,7 +622,7 @@ def test_server_and_network_errors_back_off_then_succeed(sleeps):
         def get(self, url, **kwargs):
             if self.failures:
                 self.failures -= 1
-                raise ConnectionError("connection reset")  # an OSError, like requests'
+                raise requests.ConnectionError("connection reset")
             return super().get(url, **kwargs)
 
     session = Flaky()
@@ -951,10 +960,12 @@ def test_include_readme_false_never_asks_for_it(fake):
 
 
 def test_selected_repo_that_cannot_be_read_aborts_with_a_clear_message(fake):
-    with pytest.raises(
-        GitHubAPIError, match="acme/missing does not exist or the token cannot read it"
-    ):
+    with pytest.raises(GitHubAPIError) as excinfo:
         run_sync(fake, {}, repos=["acme/missing"])
+    assert excinfo.value.status == 404
+    assert (
+        excinfo.value.detail == "repository acme/missing does not exist or the token cannot read it"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1230,13 +1241,9 @@ def test_check_active_raising_stops_with_nothing_deleted_or_loaded(
         if len(seeded.calls) >= stop_after_requests:
             raise AccessRevokedError
 
-    with pytest.raises(Exception) as excinfo:  # dlt wraps it in PipelineStepFailed
+    with pytest.raises(PipelineStepFailed) as excinfo:
         _run_pipeline(tmp_path, seeded, check_active=check_active)
-    chain, error = [], excinfo.value
-    while error is not None:
-        chain.append(error)
-        error = error.__cause__ or error.__context__
-    assert any(isinstance(error, AccessRevokedError) for error in chain)
+    assert any(isinstance(error, AccessRevokedError) for error in _chain(excinfo.value))
     assert _read_documents(_pipeline(tmp_path, _scope_name())) == before
 
     # The state did not move: the next run does the deletion and the edit.
@@ -1246,8 +1253,7 @@ def test_check_active_raising_stops_with_nothing_deleted_or_loaded(
 
 
 def test_check_active_raising_an_oserror_is_not_retried_or_swallowed(seeded, tmp_path, sleeps):
-    # PermissionError is an OSError, like the network errors _get retries and
-    # the deletion check keeps; a host's check must still stop the sync.
+    # PermissionError is an OSError; only requests' own errors are retried.
     _run_pipeline(tmp_path, seeded)
     before = _read_documents(_pipeline(tmp_path, _scope_name()))
     del seeded.repos[REPO].issues[1]
@@ -1257,20 +1263,24 @@ def test_check_active_raising_an_oserror_is_not_retried_or_swallowed(seeded, tmp
         if seeded.requested("/issues/1"):  # the deletion check has been asked
             raise PermissionError("access revoked")
 
-    with pytest.raises(Exception) as excinfo:  # dlt wraps it in PipelineStepFailed
+    with pytest.raises(PipelineStepFailed) as excinfo:
         _run_pipeline(tmp_path, seeded, check_active=check_active)
-    chain, error = [], excinfo.value
-    while error is not None:
-        chain.append(error)
-        error = error.__cause__ or error.__context__
-    assert any(isinstance(error, github.GitHubSyncStoppedError) for error in chain)
-    assert any(isinstance(error, PermissionError) for error in chain)
+    assert any(isinstance(error, PermissionError) for error in _chain(excinfo.value))
     assert sleeps == []  # not retried
     assert len(seeded.requested("/issues/1")) == 1
     assert _read_documents(_pipeline(tmp_path, _scope_name())) == before
 
     documents = _read_documents(_run_pipeline(tmp_path, seeded))
     assert "issue:acme/site#1" not in documents  # state did not move
+
+
+def _chain(error):
+    """An exception and everything it was raised from (dlt wraps source errors)."""
+    chain = []
+    while error is not None:
+        chain.append(error)
+        error = error.__cause__ or error.__context__
+    return chain
 
 
 def _scope_name():
@@ -1343,35 +1353,311 @@ def _render_failure(status, headers=None):
     return [_error(status, "nope", headers) for _ in range(github._MAX_RETRIES)]
 
 
-@pytest.mark.parametrize("failure", ["401", "rate limit", "three in a row"])
-def test_systemic_render_failure_aborts_with_nothing_committed(seeded, failure):
-    for number in (3, 4):
+def _on(number):
+    return lambda url: f"/issues/{number}/comments" in url
+
+
+@pytest.mark.parametrize("failure", ["401", "rate limit", "long reset", "outage"])
+def test_systemic_render_failure_stops_cleanly_and_resumes(seeded, failure, sleeps):
+    for number in (3, 4, 5, 6):
         seeded.add_issue(number, updated_at=at(2))
     state = {}
     run_sync(seeded, state)
-    before = copy.deepcopy(state)
-    for number in (1, 2, 3, 4):
-        seeded.repos[REPO].issues[number]["updated_at"] = at(9)
-
-    def on(number):
-        return lambda url: f"/issues/{number}/comments" in url
+    for number in (1, 2, 3, 4, 5):
+        seeded.repos[REPO].issues[number].update(body="v2", updated_at=at(9))
+    del seeded.repos[REPO].issues[6]
+    seeded.repos[REPO].gone[6] = 410  # a real deletion waits for a run that finishes
 
     if failure == "401":
-        seeded.queue(_error(401, "Bad credentials"), when=on(2))
-        expected = GitHubAPIError
+        seeded.queue(_error(401, "Bad credentials"), when=_on(3))
     elif failure == "rate limit":
         for response in _render_failure(403, {"Retry-After": "1"}):
-            seeded.queue(response, when=on(2))
-        expected = GitHubAPIError
+            seeded.queue(response, when=_on(3))
+    elif failure == "long reset":
+        reset = {
+            "X-RateLimit-Remaining": "0",
+            "X-RateLimit-Reset": "1711587600",  # an hour after the Date
+            "Date": format_datetime(NOW, True),
+        }
+        seeded.queue(_error(403, "API rate limit exceeded", reset), when=_on(3))
     else:
         for number in (2, 3, 4):
             for response in _render_failure(500):
-                seeded.queue(response, when=on(number))
-        expected = github.GitHubUnavailableError
+                seeded.queue(response, when=_on(number))
+    stats = {}
+    rows = run_sync(seeded, state, stats=stats)
 
-    with pytest.raises(expected):
+    reasons = {"401": "auth", "rate limit": "rate_limit", "long reset": "rate_limit"}
+    reason = reasons.get(failure, "unavailable")
+    assert stats[f"failed_{reason}"] == 1 and stats["failed"] >= 1
+    assert all(wait <= github._MAX_WAIT_SECONDS for wait in sleeps)
+    assert tombstones(rows) == []  # nothing deleted on a stopped run
+    rendered = {r["id"] for r in rows if r["id"].startswith(("issue:", "pr:"))}
+    if failure == "outage":
+        assert rendered == {"issue:acme/site#1"}
+        assert state["retry"] == ["issue:acme/site#3", "issue:acme/site#4", "pr:acme/site#2"]
+    else:
+        assert rendered == {"issue:acme/site#1", "pr:acme/site#2"}
+        assert state["retry"] == []
+    assert "issue:acme/site#6" in state["known_ids"]
+
+    # Next run, with no upstream change: the rest is rendered and #6 forgotten.
+    rows = run_sync(seeded, state)
+    rest = {"pr:acme/site#2", "issue:acme/site#3", "issue:acme/site#4", "issue:acme/site#5"}
+    if failure != "outage":
+        rest -= {"pr:acme/site#2"}
+    assert {
+        r["id"] for r in rows if r["id"].startswith(("issue:", "pr:")) and not r["_deleted"]
+    } == rest
+    assert all("v2" in row["content"] for row in doc_rows(rows, "issue:").values())
+    assert tombstones(rows) == [{"id": "issue:acme/site#6", "_deleted": True}]
+    assert state["retry"] == []
+
+
+def test_401_before_anything_was_rendered_raises(seeded):
+    state = {}
+    run_sync(seeded, state)
+    before = copy.deepcopy(state)
+    seeded.repos[REPO].issues[1]["updated_at"] = at(9)
+    seeded.queue(_error(401, "Bad credentials"), when=_on(1))
+
+    with pytest.raises(GitHubAPIError) as excinfo:
+        run_sync(seeded, state)
+    assert excinfo.value.status == 401
+    assert state == before
+
+
+def test_three_unreadable_issues_never_block_the_run_and_are_given_up(seeded):
+    # Issues 11, 12 and 13 always answer 404 on their comments while still
+    # listed, next to each other.
+    for number in (10, 11, 12, 13, 14):
+        seeded.add_issue(number, updated_at=at(2))
+    state = {}
+    run_sync(seeded, state)
+    for number in (10, 11, 12, 13, 14):
+        seeded.repos[REPO].issues[number]["updated_at"] = at(9)
+
+    def forbid():
+        for number in (11, 12, 13):
+            seeded.queue(_error(404, "Not Found"), when=_on(number))
+
+    rows_of = {f"issue:acme/site#{n}" for n in (11, 12, 13)}
+    for run in (1, 2):
+        forbid()
+        stats = {}
+        rows = run_sync(seeded, state, stats=stats)
+        if run == 1:
+            assert set(doc_rows(rows, "issue:")) == {"issue:acme/site#10", "issue:acme/site#14"}
+        assert tombstones(rows) == []
+        assert set(state["retry"]) == rows_of
+        assert {row: e["runs"] for row, e in state["unreadable"].items()} == dict.fromkeys(
+            rows_of, run
+        )
+        assert stats["kept"] == 3 and "failed_unavailable" not in stats
+
+    seeded.add_issue(15, updated_at=at(9))  # created upstream meanwhile: still ingested
+    forbid()
+    stats = {}
+    rows = run_sync(seeded, state, stats=stats)
+    assert "issue:acme/site#15" in doc_rows(rows)
+    assert {r["id"] for r in tombstones(rows)} == rows_of  # third run: forgotten
+    assert stats["given_up"] == 3 and state["retry"] == [] and state["unreadable"] == {}
+    run_sync(seeded, state)
+    assert fetched_issues(seeded) == []  # no longer asked about
+
+    # Once a given-up issue changes upstream, it is asked about (and ingested) again.
+    seeded.repos[REPO].issues[12]["updated_at"] = at(20)
+    rows = run_sync(seeded, state)
+    assert set(doc_rows(rows, "issue:")) == {"issue:acme/site#12"}
+    assert "issue:acme/site#12" not in state["given_up"]
+
+
+def test_retries_go_last_and_never_count_toward_an_outage(seeded):
+    for number in (3, 4, 5, 6, 7, 8):
+        seeded.add_issue(number, updated_at=at(2))
+    state = {}
+    run_sync(seeded, state)
+    for number in (3, 4, 5, 6, 7):
+        seeded.repos[REPO].issues[number]["updated_at"] = at(9)
+    for number in (3, 5, 7):  # kept after a 500, with successes between them
+        for response in _render_failure(500):
+            seeded.queue(response, when=_on(number))
+    run_sync(seeded, state)
+    kept = ["issue:acme/site#3", "issue:acme/site#5", "issue:acme/site#7"]
+    assert state["retry"] == kept
+
+    # Still failing next run, three in a row at the end, after a fresh issue.
+    seeded.repos[REPO].issues[8]["updated_at"] = at(20)
+    for number in (3, 5, 7):
+        for response in _render_failure(500):
+            seeded.queue(response, when=_on(number))
+    stats = {}
+    rows = run_sync(seeded, state, stats=stats)
+
+    order = list(dict.fromkeys(fetched_issues_in_order(seeded)))
+    assert order == [8, 3, 5, 7]
+    assert set(doc_rows(rows, "issue:")) == {"issue:acme/site#8"}
+    assert "failed_unavailable" not in stats and stats["failed"] == 3
+    assert state["retry"] == kept
+
+
+def fetched_issues_in_order(session):
+    return [
+        int(url.split("/issues/")[1].split("/")[0])
+        for url in session.requested("/comments")
+        if "/issues/" in url
+    ]
+
+
+def test_kept_issue_on_an_unchanged_page_outside_the_window_is_retried(seeded):
+    # One issue per page: next run, issue 3's page answers 304 and its stamp is
+    # outside the change listing, so only the retry list can bring it back.
+    seeded.page_size = 1
+    seeded.add_issue(3, updated_at=at(2), body="v1")
+    seeded.add_issue(4, updated_at=at(2))
+    state = {}
+    run_sync(seeded, state)
+    seeded.repos[REPO].issues[3].update(body="v2", updated_at=at(9))
+    seeded.repos[REPO].issues[4]["updated_at"] = at(20)  # moves the cursor past #3
+    for response in _render_failure(500):
+        seeded.queue(response, when=_on(3))
+    run_sync(seeded, state)
+    assert state["retry"] == ["issue:acme/site#3"]
+
+    rows = run_sync(seeded, state)
+    assert "v2" in doc_rows(rows)["issue:acme/site#3"]["content"]
+    assert state["retry"] == []
+
+
+def test_first_sync_stopped_part_way_does_not_fetch_the_done_issues_again(seeded, tmp_path):
+    for number in (3, 4, 5):
+        seeded.add_issue(number, updated_at=at(2))
+    seeded.queue(_error(401, "Bad credentials"), when=_on(3))
+    state, stats = {}, {}
+    rows = run_sync(seeded, state, stats=stats)
+    assert stats["failed_auth"] == 1
+    assert {r["id"] for r in rows} == {"issue:acme/site#1", "pr:acme/site#2"}
+
+    rows = run_sync(seeded, state)
+    assert fetched_issues(seeded) == [3, 4, 5]
+    assert "repo:acme/site" in doc_rows(rows)
+
+
+def _pull_detail(number):
+    return lambda url: url.endswith(f"/pulls/{number}")
+
+
+def test_every_pull_request_answering_403_is_a_permission_problem_not_a_deletion(seeded, caplog):
+    # A fine-grained token without "Pull requests: read": the listing shows the
+    # pull requests, but every /pulls/N answers 403. Issues still read fine.
+    seeded.add_issue(3, updated_at=at(2), pr=True)
+    state = {}
+    run_sync(seeded, state)
+    seeded.repos[REPO].issues[1]["updated_at"] = at(9)
+    for number in (2, 3):
+        seeded.repos[REPO].issues[number]["updated_at"] = at(9)
+
+    for _ in range(4):
+        for number in (2, 3):
+            seeded.queue(_error(403, "Resource not accessible"), when=_pull_detail(number))
+        caplog.clear()
+        stats = {}
+        rows = run_sync(seeded, state, stats=stats)
+        assert tombstones(rows) == []
+        assert stats["failed_permission"] == 2
+        assert {row: e["runs"] for row, e in state["unreadable"].items()} == {
+            "pr:acme/site#2": 0,
+            "pr:acme/site#3": 0,
+        }
+        assert (
+            caplog.text.count(
+                "pull requests: every fetch answered 403 this run; check the token's permissions"
+            )
+            == 1
+        )
+    assert {"pr:acme/site#2", "pr:acme/site#3"} <= set(state["known_ids"])
+
+
+def test_one_pull_request_answering_403_while_others_read_is_given_up(seeded):
+    seeded.add_issue(3, updated_at=at(2), pr=True)
+    state = {}
+    run_sync(seeded, state)
+
+    for run in (1, 2, 3):
+        # #2 changes every run and reads fine; #3 stays hidden.
+        seeded.repos[REPO].issues[2]["updated_at"] = at(10 + run)
+        seeded.repos[REPO].issues[3]["updated_at"] = at(9)
+        seeded.queue(_error(403, "Resource not accessible"), when=_pull_detail(3))
+        stats = {}
+        rows = run_sync(seeded, state, stats=stats)
+        assert "failed_permission" not in stats
+        if run < 3:
+            assert tombstones(rows) == []
+            assert state["unreadable"]["pr:acme/site#3"]["runs"] == run
+    assert tombstones(rows) == [{"id": "pr:acme/site#3", "_deleted": True}]
+    assert stats["given_up"] == 1
+
+
+def test_a_success_between_server_errors_resets_the_outage_streak(seeded):
+    for number in (3, 4, 5):
+        seeded.add_issue(number, updated_at=at(2))
+    state = {}
+    run_sync(seeded, state)
+    for number in (1, 2, 3, 4, 5):
+        seeded.repos[REPO].issues[number]["updated_at"] = at(9)
+    for number in (1, 2, 4, 5):  # 3 succeeds in between
+        for response in _render_failure(500):
+            seeded.queue(response, when=_on(number))
+    stats = {}
+
+    rows = run_sync(seeded, state, stats=stats)
+
+    assert set(doc_rows(rows, "issue:") | doc_rows(rows, "pr:")) == {"issue:acme/site#3"}
+    assert "failed_unavailable" not in stats
+
+
+def test_issue_body_of_the_wrong_shape_aborts(seeded):
+    state = {}
+    run_sync(seeded, state)
+    before = copy.deepcopy(state)
+    seeded.repos[REPO].issues[1]["updated_at"] = at(9)
+    login_page = _Resp(200, None, text="<html>login</html>")
+    login_page.json = lambda: json.loads(login_page.text)  # raises ValueError, like requests
+    seeded.queue(login_page, when=_on(1))
+
+    with pytest.raises(GitHubResponseError):
         run_sync(seeded, state)
     assert state == before
+
+
+def test_missing_number_with_no_clear_answer_is_given_up_after_three_runs(seeded):
+    state = {}
+    run_sync(seeded, state)
+    seeded.repos[REPO].issues.pop(1)  # gone from the listing, answers 404
+
+    for run in (1, 2):
+        stats = {}
+        rows = run_sync(seeded, state, stats=stats)
+        assert tombstones(rows) == [] and stats["kept"] == 1
+        assert state["unreadable"]["issue:acme/site#1"] == {"stamp": "missing", "runs": run}
+    stats = {}
+    rows = run_sync(seeded, state, stats=stats)
+    assert tombstones(rows) == [{"id": "issue:acme/site#1", "_deleted": True}]
+    assert stats["given_up"] == 1 and state["unreadable"] == {}
+    run_sync(seeded, state)
+    assert seeded.requested("/issues/1") == []  # not asked again
+
+
+def test_missing_number_check_that_errors_does_not_count_toward_giving_up(seeded):
+    state = {}
+    run_sync(seeded, state)
+    seeded.repos[REPO].issues.pop(1)
+    for _ in range(4):
+        for response in _render_failure(500):
+            seeded.queue(response, when=lambda url: url.endswith("/issues/1"))
+        rows = run_sync(seeded, state)
+        assert tombstones(rows) == []
+    assert "issue:acme/site#1" not in state["unreadable"]
 
 
 def test_two_failures_in_a_row_are_kept_and_a_success_resets_the_streak(seeded):
@@ -1389,23 +1675,142 @@ def test_two_failures_in_a_row_are_kept_and_a_success_resets_the_streak(seeded):
 
     assert set(doc_rows(rows, "issue:") | doc_rows(rows, "pr:")) == {"issue:acme/site#3"}
     assert tombstones(rows) == []
-    prints = state["repos"][REPO]["fingerprints"]
-    assert {n: prints[n] for n in "1245"} == dict.fromkeys("1245", "")
+    kept = ["issue:acme/site#1", "issue:acme/site#4", "issue:acme/site#5", "pr:acme/site#2"]
+    assert state["retry"] == kept
 
 
-def test_pipeline_abort_mid_render_leaves_destination_and_state_untouched(seeded, tmp_path):
+def test_pipeline_401_mid_run_commits_progress_and_resumes(seeded, tmp_path):
+    # A token that expires on item 3 of 5: items 1-2 are kept, 3-5 come next run.
+    for number in (3, 4, 5, 6):
+        seeded.add_issue(number, updated_at=at(2), body="v1")
     _run_pipeline(tmp_path, seeded)
-    before = _read_documents(_pipeline(tmp_path, _scope_name()))
+    for number in (1, 2, 3, 4, 5):
+        seeded.repos[REPO].issues[number].update(body="v2", updated_at=at(9))
+    del seeded.repos[REPO].issues[6]
+    seeded.repos[REPO].gone[6] = 410
+    seeded.queue(_error(401, "Bad credentials"), when=_on(3))
 
-    seeded.repos[REPO].issues[1].update(body="v2", updated_at=at(9))
-    seeded.repos[REPO].issues[2].update(body="v2", updated_at=at(9))
-    seeded.queue(_error(401, "Bad credentials"), when=lambda url: "/pulls/2/reviews" in url)
-    with pytest.raises(Exception):  # noqa: B017 - dlt wraps the source error in PipelineStepFailed
-        _run_pipeline(tmp_path, seeded)
-
-    # Issue 1 was yielded before the 401, but nothing of the run was loaded.
-    assert _read_documents(_pipeline(tmp_path, _scope_name())) == before
-
-    documents = _read_documents(_run_pipeline(tmp_path, seeded))
-    assert fetched_issues(seeded) == [1, 2]
+    seeded.calls.clear()
+    source = github_source(session=seeded, repos=[REPO])
+    pipeline = _pipeline(tmp_path, pipeline_name_for_source(source, "github_ds"))
+    pipeline.run(source)
+    documents = _read_documents(pipeline)
+    assert source.cognee_sync_stats["failed_auth"] == 1
     assert "v2" in documents["issue:acme/site#1"] and "v2" in documents["pr:acme/site#2"]
+    assert "v1" in documents["issue:acme/site#3"]
+    assert "issue:acme/site#6" in documents  # no deletion on a stopped run
+
+    # No upstream change before the next run.
+    documents = _read_documents(_run_pipeline(tmp_path, seeded))
+    assert fetched_issues(seeded) == [3, 4, 5]
+    assert all(
+        "v2" in documents[row]
+        for row in ("issue:acme/site#1", "pr:acme/site#2", "issue:acme/site#3")
+    )
+    assert "v2" in documents["issue:acme/site#5"]
+    assert "issue:acme/site#6" not in documents
+
+
+# ---------------------------------------------------------------------------
+# Review round 2: secrets, waits, wiring, stats
+# ---------------------------------------------------------------------------
+SECRET = "ghp_SECRET123"
+
+
+def test_token_with_a_trailing_newline_is_refused_without_echoing_it():
+    with pytest.raises(ValueError) as excinfo:
+        github_source(token=SECRET + "\n", repos=[REPO])
+    assert SECRET not in str(excinfo.value)
+    assert "whitespace" in str(excinfo.value)
+
+
+def test_the_token_is_never_in_an_error_message_or_a_log_line(fake, caplog, sleeps):
+    class Leaky(FakeGitHub):
+        def get(self, url, **kwargs):
+            if url.endswith("/readme"):
+                raise requests.exceptions.InvalidHeader(f"Invalid header value b'Bearer {SECRET}'")
+            return super().get(url, **kwargs)
+
+    leaky = Leaky()
+    leaky.statuses = []
+    leaky.add_repo()
+    with pytest.raises(GitHubAPIError) as excinfo:
+        _get(leaky, _url(f"/repos/{REPO}/readme"))
+    assert SECRET not in str(excinfo.value) and excinfo.value.status == 0
+
+    # A 401 whose body echoes the token: neither the message nor the logs carry it.
+    fake.queue(_Resp(401, None, text=f"<html>token={SECRET}</html>"))
+    with pytest.raises(GitHubAPIError) as excinfo:
+        run_sync(fake, {})
+    assert str(excinfo.value) == "GitHub /repos/acme/site: HTTP 401"
+    assert SECRET not in str(excinfo.value) and SECRET not in excinfo.value.detail
+    assert SECRET not in caplog.text
+    assert "InvalidHeader" in caplog.text  # the retries were logged by type
+
+
+def test_waits_are_capped_and_ask_check_active_first(fake, sleeps):
+    checks = []
+    client = github._Client(fake, lambda: checks.append(len(sleeps)))
+    fake.queue(_error(429, "slow down", {"Retry-After": "30"}))
+    fake.queue(_error(429, "slow down", {"Retry-After": "61"}))
+
+    with pytest.raises(GitHubAPIError) as excinfo:
+        _get(client, _url(f"/repos/{REPO}"))
+    assert excinfo.value.rate_limited
+    assert sleeps == [30.0]  # the 61 s wait was not taken
+    assert checks == [0, 0, 1]  # before the request, before the wait, before the retry
+
+
+def test_empty_selection_raises(fake):
+    with pytest.raises(ValueError, match="No GitHub repository selected"):
+        run_sync(fake, {}, repos=())
+
+
+@pytest.mark.parametrize("name", ["", "Foo-Bar", "a" * 65, None])
+def test_resource_name_is_validated(fake, name):
+    with pytest.raises(ValueError, match="resource_name"):
+        github_source(service=fake, repos=[REPO], resource_name=name)
+
+
+def test_service_is_the_injection_kwarg_and_session_its_alias(seeded):
+    # Own resource names: outside a pipeline, dlt keeps resource state per name.
+    assert list(github_source(service=seeded, repos=[REPO], resource_name="github_alias_a"))
+    assert list(github_source(session=seeded, repos=[REPO], resource_name="github_alias_b"))
+    with pytest.raises(ValueError, match="not both"):
+        github_source(service=seeded, session=seeded, repos=[REPO])
+
+
+def test_session_is_built_per_run_and_closed(seeded, monkeypatch):
+    built = []
+
+    class Closing:
+        closed = False
+
+        def get(self, url, **kwargs):
+            return seeded.get(url, **kwargs)
+
+        def close(self):
+            self.closed = True
+
+    def make_session(token):
+        built.append(Closing())
+        return built[-1]
+
+    monkeypatch.setattr(github, "_make_session", make_session)
+    source = github_source(token="test-token", repos=[REPO], resource_name="github_closing")
+    assert built == []  # nothing is opened before the run
+    assert list(source)
+    assert len(built) == 1 and built[0].closed
+
+
+def test_sync_stats_count_what_a_run_did(seeded):
+    source = github_source(service=seeded, repos=[REPO], resource_name="github_stats")
+    list(source)
+    assert source.cognee_sync_stats == {
+        "scanned": 2,
+        "skipped": 0,
+        "failed": 0,
+        "deleted": 0,
+        "kept": 0,
+        "given_up": 0,
+    }
