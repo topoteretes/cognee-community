@@ -55,6 +55,10 @@ async def main() -> None:
         API_URL,
         titles=["Ada Lovelace", "Charles Babbage", "Analytical engine"],
         user_agent=USER_AGENT,
+        # A private wiki: a bot password from Special:BotPasswords. The source
+        # reads no environment itself, so the example passes them explicitly.
+        username=os.environ.get("MEDIAWIKI_USERNAME") or None,
+        password=os.environ.get("MEDIAWIKI_PASSWORD") or None,
     )
 
     print(f"Syncing pages from {API_URL} into cognee ...")
@@ -67,7 +71,8 @@ async def main() -> None:
     )
     stats = source.cognee_sync_stats
     print(
-        f"{stats['mode']} sync: {stats['pages_changed']} page(s) ingested, "
+        f"{'full' if stats['full_sync'] else 'incremental'} sync: "
+        f"{stats['pages_changed']} page(s) ingested, "
         f"{stats['pages_unchanged']} unchanged, {stats['deleted']} forgotten."
     )
 

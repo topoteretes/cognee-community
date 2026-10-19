@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import html
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qsl
 
 import httpx
@@ -21,7 +21,7 @@ PAGE_SIZE = 2  # continuation on every list with more than two entries
 
 
 def _ts(minutes: int) -> str:
-    base = datetime(2026, 10, 1, tzinfo=UTC)
+    base = datetime(2026, 10, 1, tzinfo=timezone.utc)
     return (base + timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
@@ -44,6 +44,8 @@ class Page:
     redirect_to: str | None = None
     contentmodel: str = "wikitext"
     revisions: list[dict] = field(default_factory=list)
+    # page_touched: bumped by every revision and by a re-render without one.
+    touched: str = ""
 
 
 class FakeWiki:
@@ -79,6 +81,7 @@ class FakeWiki:
             **extra,
         }
         page.revisions.insert(0, revision)
+        page.touched = revision["timestamp"]
         return revision
 
     def _feed(self, page: Page, kind: str, timestamp: str, **extra) -> None:
@@ -111,6 +114,12 @@ class FakeWiki:
             page.categories = list(categories)
         revision = self._revise(page, user, comment, **rev)
         self._feed(page, "edit", revision["timestamp"])
+
+    def rerender(self, pageid, text: str) -> None:
+        """A template change: new rendered text and ``touched``, no new revision."""
+        page = self.pages[pageid]
+        page.text = text
+        page.touched = self.tick()
 
     def delete(self, pageid) -> None:
         page = self.pages.pop(pageid)
@@ -168,7 +177,10 @@ class FakeWiki:
         if self.failures:
             kind, value = self.failures.pop(0)
             if kind == "http":
-                return httpx.Response(value, headers={"Retry-After": "0"})
+                status, retry_after = value if isinstance(value, tuple) else (value, "0")
+                return httpx.Response(status, headers={"Retry-After": retry_after})
+            if kind == "html":
+                return httpx.Response(200, text="<html>Maintenance</html>")
             if kind == "api":
                 return httpx.Response(
                     200, headers={"Retry-After": "0"}, json={"error": {"code": value, "info": ""}}
@@ -197,6 +209,8 @@ class FakeWiki:
             return self._json({"query": {"tokens": {"logintoken": "tok+\\"}}})
         if params.get("list") == "recentchanges":
             return self._json(self._recentchanges(params))
+        if params.get("list") == "logevents":
+            return self._json(self._logevents(params))
         return self._json(self._query_pages(params))
 
     @staticmethod
@@ -216,6 +230,9 @@ class FakeWiki:
         if params.get("rcstart"):
             entries = [e for e in entries if e["timestamp"] >= params["rcstart"]]
         entries = [e for e in entries if e["type"] in types]
+        if params.get("rcnamespace"):
+            namespaces = {int(n) for n in params["rcnamespace"].split("|")}
+            entries = [e for e in entries if e["ns"] in namespaces]
         limit = 1 if params.get("rclimit") == "1" else PAGE_SIZE
         offset = int(params.get("rccontinue") or 0)
         chunk = entries[offset : offset + limit]
@@ -223,6 +240,39 @@ class FakeWiki:
         if offset + limit < len(entries) and params.get("rclimit") != "1":
             response["continue"] = {"rccontinue": str(offset + limit), "continue": "-||"}
         return response
+
+    def _logevents(self, params: dict) -> dict:
+        """``list=logevents``: the log entries of the feed, in the log's own shape."""
+        entries = sorted(
+            (e for e in self.recentchanges if e["type"] == "log"),
+            key=lambda e: (e["timestamp"], e["rcid"]),
+        )
+        entries = [e for e in entries if e.get("logtype") == params.get("letype")]
+        if params.get("lestart"):
+            entries = [e for e in entries if e["timestamp"] >= params["lestart"]]
+        offset = int(params.get("lecontinue") or 0)
+        chunk = entries[offset : offset + PAGE_SIZE]
+        events = [
+            {
+                "logid": e["rcid"],
+                "ns": e["ns"],
+                "title": e["title"],
+                "pageid": e["pageid"],
+                "params": e.get("logparams") or {},
+                "type": e["logtype"],
+                "action": e["logaction"],
+                "timestamp": e["timestamp"],
+            }
+            for e in chunk
+        ]
+        response: dict = {"query": {"logevents": events}}
+        if offset + PAGE_SIZE < len(entries):
+            response["continue"] = {"lecontinue": str(offset + PAGE_SIZE), "continue": "-||"}
+        return response
+
+    def _category_size(self, title: str) -> int:
+        name = normalize(title).split(":", 1)[1]
+        return sum(name in p.categories + p.hidden_categories for p in self.pages.values())
 
     def _select(self, params: dict) -> tuple[list[dict], dict | None]:
         """Resolve the page set of a query; return (page stubs, continue)."""
@@ -277,13 +327,21 @@ class FakeWiki:
         for stub in stubs:
             page: Page | None = stub.get("page")
             if page is None:
-                pages.append({k: v for k, v in stub.items() if k != "page"})
+                out = {k: v for k, v in stub.items() if k != "page"}
+                # Like MediaWiki: a category with members but no description
+                # page is "missing" yet still reports its size.
+                if "categoryinfo" in props and out.get("ns") == 14:
+                    size = self._category_size(out["title"])
+                    if size:
+                        out["categoryinfo"] = {"size": size, "pages": size}
+                pages.append(out)
                 continue
             out = {"pageid": page.pageid, "ns": page.ns, "title": page.title}
             if "info" in props:
                 out.update(
                     contentmodel=page.contentmodel,
                     lastrevid=page.revisions[0]["revid"],
+                    touched=page.touched,
                     fullurl=f"https://wiki.example.org/wiki/{page.title.replace(' ', '_')}",
                 )
                 if page.redirect_to:

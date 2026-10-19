@@ -35,6 +35,7 @@ from cognee_community_connector_mediawiki import mediawiki_source
 from cognee_community_connector_mediawiki.mediawiki import (
     MediaWikiAPIError,
     MediaWikiAuthError,
+    MediaWikiScopeError,
     _MediaWikiClient,
     _Settings,
     extract_to_text,
@@ -131,7 +132,7 @@ def test_initial_sync_emits_one_document_per_prose_page(wiki):
     # Main namespace only: the user page (ns 2) and the CSS page are not selected.
     assert set(live) == {"1", "2", "3"}
     assert deleted == set()
-    assert stats["mode"] == "full" and stats["full_sync_reason"] == "initial"
+    assert stats["full_sync"] == 1 and stats["full_sync_initial"] == 1
 
     row = live["1"]
     assert row["title"] == "Ada Lovelace"
@@ -197,7 +198,7 @@ def test_unchanged_wiki_yields_nothing_and_does_not_enumerate(wiki):
 
     live, deleted, stats = _sync(wiki, state)
     assert live == {} and deleted == set()
-    assert stats["mode"] == "incremental"
+    assert stats["full_sync"] == 0
     assert not any(r.get("generator") == "allpages" for r in wiki.requests)
 
 
@@ -370,13 +371,37 @@ def test_title_scope_follows_a_rename_through_its_redirect(wiki):
     assert live["1"]["title"] == "Augusta Ada King"
 
 
-def test_selected_title_created_later_is_picked_up(wiki):
+def test_a_misspelled_title_or_category_raises_instead_of_syncing_nothing(wiki):
     state: dict = {}
-    live, _, _ = _sync(wiki, state, namespaces=(), titles=("Difference Engine",))
-    assert live == {}
-    wiki.create(6, "Difference Engine", "Now it exists.")
-    live, _, _ = _sync(wiki, state, namespaces=(), titles=("Difference Engine",))
-    assert set(live) == {"6"}
+    with pytest.raises(MediaWikiScopeError, match="Diference Engine"):
+        _sync(wiki, state, namespaces=(), titles=("Diference Engine",))
+    with pytest.raises(MediaWikiScopeError, match="Computting"):
+        _sync(wiki, state, namespaces=(), categories=("Computting",))
+    assert state == {}
+
+
+def test_a_category_with_members_but_no_page_is_not_a_typo(wiki):
+    # The fake has no category description pages at all, like many real wikis.
+    live, _, _ = _sync(wiki, {}, namespaces=(), categories=("Computing",))
+    assert set(live) == {"1", "2"}
+
+
+def test_a_selected_title_deleted_later_is_forgotten_not_rejected(wiki):
+    state: dict = {}
+    _sync(wiki, state, namespaces=(), titles=("Analytical Engine",))
+    wiki.delete(3)
+    live, deleted, stats = _sync(wiki, state, namespaces=(), titles=("Analytical Engine",))
+    assert live == {} and deleted == {"3"}
+    assert stats["failed"] == 0
+
+
+def test_a_selected_title_moved_into_place_is_picked_up(wiki):
+    state: dict = {}
+    _sync(wiki, state, namespaces=(), titles=("Analytical Engine",))
+    wiki.move(3, "Analytical Engine (machine)")
+    wiki.move(1, "Analytical Engine", leave_redirect=False)
+    live, _, _ = _sync(wiki, state, namespaces=(), titles=("Analytical Engine",))
+    assert "1" in live
 
 
 # ---------------------------------------------------------------------------
@@ -393,7 +418,7 @@ def test_pruned_feed_falls_back_to_a_full_reconcile(wiki):
     wiki.recentchanges = wiki.recentchanges[-1:]
 
     live, deleted, stats = _sync(wiki, state)
-    assert stats["full_sync_reason"] == "retention_gap"
+    assert stats["full_sync_retention_gap"] == 1
     assert set(live) == {"1", "2"} and deleted == {"3"}
 
 
@@ -401,7 +426,7 @@ def test_scope_change_reconciles_and_forgets_pages_that_left_it(wiki):
     state: dict = {}
     _sync(wiki, state)
     live, deleted, stats = _sync(wiki, state, namespaces=(), categories=("Computing",))
-    assert stats["full_sync_reason"] == "scope_changed"
+    assert stats["full_sync_scope_changed"] == 1
     assert live == {} and deleted == {"3"}
 
 
@@ -409,7 +434,7 @@ def test_rendering_change_re_renders_every_page(wiki):
     state: dict = {}
     _sync(wiki, state)
     live, _, stats = _sync(wiki, state, revision_history=0)
-    assert stats["full_sync_reason"] == "render_changed"
+    assert stats["full_sync_render_changed"] == 1
     assert set(live) == {"1", "2", "3"}
 
 
@@ -418,7 +443,7 @@ def test_periodic_reconcile(wiki):
     _sync(wiki, state, reconcile_after_days=1)
     wiki.tick(60 * 25)
     _, _, stats = _sync(wiki, state, reconcile_after_days=1)
-    assert stats["full_sync_reason"] == "periodic"
+    assert stats["full_sync_periodic"] == 1
 
 
 def test_empty_enumeration_never_mass_deletes(wiki):
@@ -508,11 +533,14 @@ def test_resource_is_a_merge_document_source():
         ({"api_url": API_URL, "content_format": "wikitext"}, "content_format"),
         ({"api_url": API_URL, "username": "only-user"}, "both username and password"),
         ({"api_url": API_URL, "revision_history": -1}, "negative"),
+        ({"api_url": ""}, "api.php"),
+        ({"api_url": API_URL, "user_agent": " "}, "user_agent"),
     ],
 )
 def test_factory_validates_its_arguments(kwargs, message, monkeypatch):
-    for name in ("MEDIAWIKI_API_URL", "MEDIAWIKI_USERNAME", "MEDIAWIKI_PASSWORD"):
-        monkeypatch.delenv(name, raising=False)
+    # The factory reads no environment: a set variable must not fill a gap.
+    monkeypatch.setenv("MEDIAWIKI_API_URL", API_URL)
+    monkeypatch.setenv("MEDIAWIKI_PASSWORD", "from-env")
     with pytest.raises(ValueError, match=message):
         mediawiki_source(**kwargs)
 
@@ -548,13 +576,13 @@ def test_forget_on_delete_end_to_end_through_a_real_dlt_merge(wiki, tmp_path):
         "2": "Charles Babbage",
         "3": "Analytical Engine",
     }
-    assert source.cognee_sync_stats["mode"] == "full"
+    assert source.cognee_sync_stats["full_sync"] == 1
 
     # The cursor persists in dlt's resource state: the next run is incremental.
     wiki.delete(2)
     wiki.move(1, "Augusta Ada King")
     source = run()
-    assert source.cognee_sync_stats["mode"] == "incremental"
+    assert source.cognee_sync_stats["full_sync"] == 0
     assert _staged(pipeline, table) == {"1": "Augusta Ada King", "3": "Analytical Engine"}
 
 
@@ -566,3 +594,192 @@ def test_one_resource_name_cannot_hold_two_wikis(wiki, tmp_path):
     other_url = "https://other.example.org/w/api.php"
     with pytest.raises(Exception, match="another wiki"):
         pipeline.run(mediawiki_source(other_url, http_client=other.client(), resource_name="pages"))
+
+
+# ---------------------------------------------------------------------------
+# Review follow-ups
+# ---------------------------------------------------------------------------
+def test_category_order_does_not_change_the_document(wiki):
+    state: dict = {}
+    _sync(wiki, state, namespaces=(), titles=("Ada Lovelace",))
+    wiki.pages[1].categories = ["Mathematicians", "Computing"]
+    wiki.edit(1, categories=["Mathematicians", "Computing"])
+    second, _, _ = _sync(wiki, state, namespaces=(), titles=("Ada Lovelace",), full_sync=True)
+    wiki.pages[1].categories = ["Computing", "Mathematicians"]
+    wiki.rerender(1, wiki.pages[1].text)
+    third, _, _ = _sync(wiki, state, namespaces=(), titles=("Ada Lovelace",), full_sync=True)
+    assert "Categories: Computing, Mathematicians" in second["1"]["content"]
+    assert second["1"]["content"] == third["1"]["content"]
+
+
+def test_an_empty_enumeration_leaves_the_whole_state_untouched(wiki):
+    state: dict = {}
+    _sync(wiki, state)
+    snapshot = copy.deepcopy(state)
+    wiki.tick(30)
+    for page_id in (1, 2, 3):
+        wiki.pages.pop(page_id)  # an outage or permissions change, not deletions
+
+    live, deleted, stats = _sync(wiki, state, full_sync=True)
+    assert live == {} and deleted == set()
+    assert state == snapshot, "neither the cursor nor last_full_sync may move"
+    assert stats["failed"] == 1 and stats["failed_empty_scope"] == 1
+
+
+def test_a_rerender_without_a_new_revision_is_caught_by_the_reconcile(wiki):
+    state: dict = {}
+    _sync(wiki, state)
+    wiki.rerender(2, "Babbage designed the engine. Infobox now says: born 1791.")
+
+    # The change feed has no entry for a template-driven re-render ...
+    live, _, _ = _sync(wiki, state)
+    assert live == {}
+    # ... but `touched` moved, so the periodic reconcile re-renders that page alone.
+    live, _, stats = _sync(wiki, state, reconcile_after_days=0)
+    assert set(live) == {"2"} and "born 1791" in live["2"]["content"]
+    assert stats["full_sync_periodic"] == 1
+
+
+def test_full_sync_true_re_renders_every_page(wiki):
+    state: dict = {}
+    _sync(wiki, state)
+    live, _, stats = _sync(wiki, state, full_sync=True)
+    assert set(live) == {"1", "2", "3"}
+    assert stats["full_sync_requested"] == 1
+
+
+def test_the_change_feed_is_filtered_to_the_namespaces_in_play(wiki):
+    state: dict = {}
+    _sync(wiki, state)
+    wiki.edit(4, "Sandbox churn")  # user namespace (2), not selected
+    wiki.edit(1, "Ada again.")
+    wiki.requests.clear()
+
+    live, _, _ = _sync(wiki, state)
+    assert set(live) == {"1"}
+    feed = [r for r in wiki.requests if r.get("list") == "recentchanges" and r.get("rcstart")]
+    assert feed and all(r["rcnamespace"] == "0" for r in feed)
+
+
+def test_a_draft_moved_into_the_articles_is_caught_by_the_move_log(wiki):
+    state: dict = {}
+    _sync(wiki, state)
+    wiki.create(7, "Draft:Jacquard loom", "Punched cards.", ns=118)
+    wiki.move(7, "Jacquard loom", new_ns=0, leave_redirect=False)
+
+    live, _, _ = _sync(wiki, state)
+    # The move's feed entry is logged under the draft namespace (118), which the
+    # namespace-filtered feed skips; the move log query catches it.
+    assert "7" in live and live["7"]["title"] == "Jacquard loom"
+
+
+def test_both_history_merge_log_shapes_name_the_other_page():
+    from cognee_community_connector_mediawiki.mediawiki import _named_titles
+
+    older = _named_titles({"title": "A", "ns": 0}, {"dest_title": "B", "dest_ns": 0})
+    newer = _named_titles({"title": "B", "ns": 0}, {"src_title": "A", "src_ns": 0})
+    assert {t for t, _ in older} == {t for t, _ in newer} == {"A", "B"}
+
+
+def test_a_long_retry_after_stops_the_run_cleanly(wiki):
+    state: dict = {}
+    _sync(wiki, state)
+    snapshot = copy.deepcopy(state)
+    wiki.edit(1, "Edited during an overload.")
+    wiki.failures = [("http", (429, "3600"))]
+
+    live, _, stats = _sync(wiki, state)  # no exception, no hour-long sleep
+    assert live == {}
+    assert stats["failed"] == 1 and stats["failed_rate_limit"] == 1
+    assert state == snapshot
+
+    live, _, _ = _sync(wiki, state)
+    assert set(live) == {"1"}, "the next run picks the edit up"
+
+
+def test_a_private_wiki_counts_as_an_auth_failure(wiki):
+    wiki.failures = [("api", "readapidenied")]
+    stats: dict = {}
+    client = _MediaWikiClient(wiki.client(), API_URL, "ua", 5, sleep=lambda _s: None)
+    with pytest.raises(MediaWikiAuthError):
+        list(sync_pages(client, _settings(), {}, stats))
+    assert stats["failed"] == 1 and stats["failed_auth"] == 1
+
+
+def test_a_non_json_answer_is_an_error_not_an_empty_wiki(wiki):
+    wiki.failures = [("html", None)]
+    with pytest.raises(MediaWikiAPIError, match="invalid_response"):
+        _sync(wiki, {})
+
+
+def test_stats_are_plain_int_counters(wiki):
+    _, _, stats = _sync(wiki, {})
+    assert stats and all(type(value) is int for value in stats.values())
+
+
+def test_a_continuation_that_does_not_advance_raises():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"continue": {"gapcontinue": "same", "continue": "-||"}, "query": {}}
+        )
+
+    client = _MediaWikiClient(
+        httpx.Client(transport=httpx.MockTransport(handler)), API_URL, "ua", None
+    )
+    with pytest.raises(MediaWikiAPIError, match="continuation_stalled"):
+        list(client.continued({"action": "query", "generator": "allpages"}))
+
+
+def test_login_errors_never_echo_the_response_body():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json={"query": {"tokens": {"logintoken": "t"}}})
+        return httpx.Response(200, json={"login": {"result": "Aborted", "token": "SECRET"}})
+
+    client = _MediaWikiClient(
+        httpx.Client(transport=httpx.MockTransport(handler)), API_URL, "ua", None
+    )
+    with pytest.raises(MediaWikiAuthError) as excinfo:
+        client.login("Reader@cognee", "pw")
+    assert "SECRET" not in str(excinfo.value) and "Aborted" in str(excinfo.value)
+
+
+def test_service_is_an_alias_of_http_client():
+    client = httpx.Client()
+    assert mediawiki_source(API_URL, service=client).name == "mediawiki_wiki_example_org_w"
+    with pytest.raises(ValueError, match="not both"):
+        mediawiki_source(API_URL, service=client, http_client=httpx.Client())
+
+
+def test_two_wikis_with_their_own_resource_names_share_a_dataset(wiki, tmp_path):
+    pipeline = _pipeline(tmp_path)
+    other = FakeWiki()
+    other.create(1, "Other page", "From the other wiki.")
+    other.tick(60)
+    other_url = "https://other.example.org/w/api.php"
+
+    def run_both():
+        pipeline.run(mediawiki_source(API_URL, service=wiki.client(), resource_name="wiki_a"))
+        pipeline.run(mediawiki_source(other_url, service=other.client(), resource_name="wiki_b"))
+
+    run_both()
+    wiki.delete(2)
+    run_both()
+    assert _staged(pipeline, "wiki_a") == {"1": "Ada Lovelace", "3": "Analytical Engine"}
+    assert _staged(pipeline, "wiki_b") == {"1": "Other page"}
+
+
+def test_a_title_or_category_scope_never_reads_the_change_feed(wiki):
+    state: dict = {}
+    _sync(wiki, state, namespaces=(), titles=("Ada Lovelace",), categories=("Computing",))
+    for minute in range(40):
+        wiki.edit(3, f"Busy wiki, edit {minute}.")  # unrelated churn
+    wiki.rerender(1, "Ada wrote the first program. A template changed this.")
+    wiki.requests.clear()
+
+    live, _, stats = _sync(
+        wiki, state, namespaces=(), titles=("Ada Lovelace",), categories=("Computing",)
+    )
+    assert set(live) == {"1"}, "the re-render is caught without waiting for a reconcile"
+    assert stats["changes_replayed"] == 0
+    assert not [r for r in wiki.requests if r.get("list") in ("recentchanges", "logevents")]

@@ -11,7 +11,7 @@ and **forgets on delete**.
 
 ## Requirements
 
-- cognee **1.6.3** or newer (document-mode with per-row node sets).
+- Python 3.10+ and cognee **1.6.3** or newer, below 2 (document-mode with per-row node sets).
 - A wiki with the Action API enabled (`api.php`), which is the default on every MediaWiki.
 
 ## Install
@@ -61,6 +61,12 @@ namespace is synced.
 | `categories=["Physics"]` | the direct member pages of these categories (`Category:` prefix optional) |
 | `titles=["Albert Einstein"]` | these pages; redirects are followed, so a renamed page stays selected |
 
+A category or title that does not exist (a typo) raises `MediaWikiScopeError` instead of
+quietly syncing nothing. A category counts as existing when it has a page *or* members, as
+many wikis have categories without a description page. Only names added to the
+configuration are checked, so a page that was synced and deleted later is forgotten as
+usual.
+
 Redirect pages and code pages (CSS, JavaScript, JSON, Lua modules) are never ingested.
 For a large public wiki such as Wikipedia, select categories or titles; a whole namespace
 there is millions of pages.
@@ -73,13 +79,17 @@ there is millions of pages.
 | `revision_history` | `5` | recent edits (time, author, summary) listed in each document; `0` for none |
 | `overlap_seconds` | `600` | how far the change feed is replayed before the last run |
 | `reconcile_after_days` | `7` | run a full enumeration at least this often (`None` to disable) |
-| `full_sync` | `False` | force a full enumeration on this run |
-| `username` / `password` | env | bot password for a private wiki (`MEDIAWIKI_USERNAME` / `MEDIAWIKI_PASSWORD`) |
-| `user_agent` | env / generic | User-Agent; Wikimedia asks for contact details (`MEDIAWIKI_USER_AGENT`) |
+| `full_sync` | `False` | force a full enumeration and re-render every page on this run |
+| `username` / `password` | none | bot password for a private wiki |
+| `user_agent` | generic | User-Agent; Wikimedia asks for contact details |
 | `maxlag` | `5` | `maxlag` sent with every request; "too busy" answers are retried |
 | `resource_name` | from `api_url` | staging table and state key; unique per wiki so several wikis can share a dataset |
+| `check_active` | none | host authorization checkpoint, called while rows are produced |
+| `service` | none | a pre-built `httpx.Client` (alias: `http_client`) |
 
-`api_url` falls back to `MEDIAWIKI_API_URL`.
+The source reads no environment variables; `examples/example.py` shows reading
+`MEDIAWIKI_API_URL`, `MEDIAWIKI_USER_AGENT`, `MEDIAWIKI_USERNAME` and `MEDIAWIKI_PASSWORD`
+and passing them in.
 
 ## What a document contains
 
@@ -96,6 +106,11 @@ the same document instead of forgetting one and adding another):
 - the latest `revision_history` edits: timestamp, author, edit summary and revision id.
   Authors and summaries the wiki has hidden (revision deletion) are left out.
 
+**Privacy:** the recent-edits section puts editor names (the IP address, for anonymous
+editors) and edit summaries into memory. Hiding them later with revision deletion does
+not update a document until its page is edited again or a full sync runs. Pass
+`revision_history=0` to keep editors and summaries out of memory entirely.
+
 Every page carries the `mediawiki:<server>` node set (e.g. `mediawiki:en.wikipedia.org`),
 so `recall` can be scoped to one wiki when several share a dataset.
 
@@ -107,9 +122,14 @@ so `recall` can be scoped to one wiki when several share a dataset.
    the previous run's server time minus `overlap_seconds`, because the feed can receive
    entries slightly out of timestamp order. Entries that cannot touch the synced pages
    (an edit to an unselected page elsewhere on the wiki) are skipped without a lookup.
-   Every page a remaining entry names (its page id, its title, a move's target, a history
-   merge's destination) is re-checked against the live wiki in batches of 50 and
-   re-rendered only if its revision or title changed. Replaying an entry twice therefore
+   The feed is only read for the selected `namespaces` and filtered to them
+   (`rcnamespace`); pages held in scope by `titles` or `categories` are re-checked
+   directly by page id instead (50 per request), so a narrow scope on a busy wiki never
+   pages through its feed: re-syncing one Wikipedia article takes 3 requests. A move is
+   logged under its *source* namespace, so moves and history merges are also read from
+   the move and merge logs, unfiltered: a draft moved into the articles is still caught. Every page a remaining entry names (its page id, its title, a move's
+   target, a history merge's other page) is re-checked against the live wiki in batches
+   of 50 and re-rendered only if its revision, title or `touched` timestamp changed. Replaying an entry twice therefore
    costs a lookup, never a duplicate document. Selected categories have their member lists
    diffed every run, so a page that joins or leaves a category through a template edit is
    caught too.
@@ -122,31 +142,46 @@ so `recall` can be scoped to one wiki when several share a dataset.
    entries may be lost, so the run does a full enumeration and diffs it against what was
    synced before. The same happens when the scope or rendering settings change, every
    `reconcile_after_days` (a safety net for entries delayed beyond the overlap), and with
-   `full_sync=True`. An enumeration that returns no pages
-   while pages were synced before deletes nothing, so a typo or an outage cannot wipe the
-   dataset.
+   `full_sync=True`. The full enumeration compares each page's `touched` timestamp too,
+   which MediaWiki bumps when a page is re-rendered without an edit (a template it uses
+   changed), so the periodic reconcile re-renders those pages; `full_sync=True` re-renders
+   every page. An enumeration that returns no pages while pages were synced before
+   deletes nothing and leaves the sync state untouched (the cursor does not move), so an
+   outage or a permissions change cannot wipe the dataset or skip edits.
 
 Every API error aborts the run before its state is saved, so the next run retries the same
-window.
+window. A wiki that keeps rate-limiting the run (HTTP 429 or `maxlag` past the retries, or a
+`Retry-After` over 60 seconds) stops it cleanly instead: what was synced stays, the state is
+not advanced, and the next run resumes.
+
+### Sync stats
+
+After a run, `source.cognee_sync_stats` holds plain int counters: `pages_scanned`,
+`pages_changed`, `pages_unchanged`, `deleted`, `changes_replayed`, `requests`, `full_sync`
+(with `full_sync_<reason>` for `initial`, `requested`, `scope_changed`, `render_changed`,
+`periodic` or `retention_gap`) and `failed` (with `failed_rate_limit`, `failed_auth` or
+`failed_empty_scope`).
 
 ### Limitations
 
 - A template edit changes the rendered text of pages that use it without editing them;
-  those pages are re-rendered when they are next edited or on a full sync
-  (`full_sync=True`, or a scope / rendering change).
+  pages selected by `titles` or `categories` pick that up on the next run (their
+  `touched` timestamp is re-checked every run); pages selected through `namespaces` pick
+  it up on the next periodic reconcile (`reconcile_after_days`) or with `full_sync=True`.
 - `categories` selects direct members, not subcategories.
 
 ## Private wikis
 
 Create a bot password at `Special:BotPasswords` (grant: *basic rights*), then pass
-`username="YourUser@botname"` and `password=...` (or set `MEDIAWIKI_USERNAME` /
-`MEDIAWIKI_PASSWORD`). The connector logs in once per run and only reads. For SSO-protected
-wikis, pass an `httpx.Client` that already carries the session as `http_client=`.
+`username="YourUser@botname"` and `password=...`. The connector logs in once per run and
+only reads. For SSO-protected wikis, pass an `httpx.Client` that already carries the
+session as `service=`.
 
 ## API etiquette
 
 Requests are sequential, batch up to 50 pages, send `maxlag` and a descriptive
-User-Agent, and back off on `maxlag`, HTTP 429 and 5xx, honouring `Retry-After`. Set
+User-Agent, and back off on `maxlag`, HTTP 429 and 5xx, honouring `Retry-After` up to
+60 seconds. Set
 `user_agent` to something with your contact details when syncing a Wikimedia wiki.
 
 ## Example
@@ -166,7 +201,11 @@ uv run pytest tests/
 
 The tests mock the Action API (no network) and cover the ingest path, HTML/extract
 rendering, the `recentchanges` cursor and its overlap window, edits, moves, deletions,
-restores, scope changes, the retention-gap fallback, the empty-enumeration guard, retries,
-and a real `dlt` merge that drops a tombstoned row. An end-to-end test runs the source
+restores, scope changes, the retention-gap fallback, the empty-enumeration guard (which
+must not move the cursor), template re-renders caught through `touched`, the
+namespace-filtered feed plus the move log, typo'd categories and titles, category order,
+a stalled continuation, retries (including a `Retry-After` past the cap), non-JSON answers,
+login errors, and real `dlt` merges: one that drops a tombstoned row, and two wikis with
+their own `resource_name` sharing a dataset. An end-to-end test runs the source
 through `cognee.add` + `cognify` (LLM and embeddings mocked) and checks that deleting a
 page upstream removes its entity from the graph.
