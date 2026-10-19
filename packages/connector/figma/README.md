@@ -25,14 +25,16 @@ can use:
 | One per file (`file:<key>`) | File name and type, folder, page names, frame / section / component names as headings, and the text of every text layer (plus FigJam stickies, shapes and connector labels) |
 | One per comment thread (`comment:<key>:<id>`) | The root comment and its replies in time order, each with author and timestamp, where the thread is pinned (`Page / Frame`), and whether it is resolved |
 
-Geometry, styles, images and vector data are never fetched. Hidden layers and Figma's default
+A file and its comment threads share one node set, `figma:<file name> (<file key>)`, so they can be
+searched together. Geometry, styles, images and vector data are never fetched. Hidden layers and Figma's default
 layer names ("Frame 12", "Group 3") are skipped as noise. Comments are usually the most valuable
 part: that is where design decisions get argued and settled.
 
 ## Requirements
 
-Requires cognee 1.6.2 or later: document-mode (`DOCUMENT_SOURCE_ATTR`, cognee 1.4.0) for the
-source, and the `OAuthIntegration` resource-picker contract for the optional integration.
+Requires cognee 1.6.4, which has the table-scoped document cleanup and per-row node sets
+(`DOCUMENT_SYNC_VERSION` 2) the source relies on. `figma_source` refuses to start on an older build.
+The optional integration also needs the `OAuthIntegration` resource-picker contract (cognee 1.6.2+).
 
 ## Install
 
@@ -161,8 +163,11 @@ apps** in Figma.
 - **Incremental fetch.** The expensive call is `GET /v1/files/:key` (the whole node tree, in
   Figma's strictest rate-limit tier). Each run lists the selection, and only files whose
   `last_modified` stamp moved since the last run are fetched again; the file's `version` is
-  recorded with it. Unchanged files are re-emitted from a render cache kept in dlt's **source**
-  state (`replace` resets resource state every run, source state survives). Comments do not move a
+  recorded with it. (Figma's listings carry the modification time, not the version number.)
+  Unchanged files are re-emitted from a render cache kept in dlt's **source** state (`replace` resets
+  resource state every run, source state survives). The cache holds only what the node tree
+  contributes; title and folder come from the fresh listing every run, so a rename or a folder move
+  shows up without a re-fetch. Comments do not move a
   file's stamp, so they are re-read every run with one request per file. Unchanged rows keep a
   stable content-hash `data_id`, so cognee does not re-ingest or re-cognify them, and an edit that
   only moves layers re-renders to the same text.
@@ -174,6 +179,14 @@ apps** in Figma.
   `429`/`5xx`, or a network failure. The run aborts before dlt commits the new snapshot and state,
   so nothing is forgotten and the next run starts over. Only `404` is treated as "gone".
 
+**Rate limits.** `GET /v1/files/:key` is in Figma's strictest tier (Tier 1), and the allowance
+depends on the seat of the user the token belongs to: Dev and Full seats get 10 to 20 requests a
+minute depending on the plan, while View and Collab seats get about 20 a month. Use a token from a
+Full or Dev seat. A first sync costs one request per file; later syncs cost one only for files that
+changed (plus one cheap comments request per file). `429` responses are retried, honouring
+`Retry-After`; if Figma's allowance is exhausted for longer than the retries wait, the run aborts
+without forgetting anything and the next run picks up from the cache.
+
 **Limitations.** Figma cannot list a user's teams, so team ids must be supplied. Text inside
 images, and text in components that live in another (library) file, is not ingested. Large files
 are fetched whole on change, since Figma cannot return only text layers.
@@ -181,7 +194,7 @@ are fetched whole on change, since Figma cannot return only text layers.
 ## Testing
 
 ```bash
-uv run --with pytest --with pytest-asyncio pytest tests/
+uv run pytest tests/
 ```
 
 The tests need no Figma account. Figma is served by an in-memory fake mounted as a `requests`
@@ -191,12 +204,12 @@ transport adapter, so the real dlt auth, `rest_api` and retry code runs. They co
   comment threads
 - selection by team (with nested folders), folder and file key, with both token types
 - the incremental cursor: unchanged files are not fetched, edited ones are, comments are read
-  every run
+  every run, and a rename or folder move shows up without a re-fetch
 - file, folder, comment and reply deletion, deselection, and files deleted mid-run
 - `Retry-After` handling, and safety on a failed run
 - a real `dlt` pipeline proving `replace` drops deleted rows while the cache survives in state
 - the OAuth integration: authorize URL, Basic-auth code exchange, installation parsing, folder
   picker, stored-selection sync and token refresh
 - an end-to-end `cognee.add` + `cognify` run (LLM mocked) where deleted files and comments leave
-  the graph
+  the graph, an unchanged re-sync makes no LLM call, and a file and its comments share a node set
 - a smoke run of the packaged `examples/example.py`
