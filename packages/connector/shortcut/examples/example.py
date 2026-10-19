@@ -60,8 +60,9 @@ async def main() -> None:
     group_ids = _ids("SHORTCUT_GROUP_IDS")
     scope = f"{len(epic_ids)} epic(s), {len(group_ids)} team(s)" if epic_ids or group_ids else "all"
     print(f"Syncing Shortcut into cognee (selection: {scope}) ...")
+    source = shortcut_source(epic_ids=epic_ids or None, group_ids=group_ids or None)
     await cognee.remember(
-        shortcut_source(epic_ids=epic_ids or None, group_ids=group_ids or None),
+        source,
         dataset_name=DATASET_NAME,
         primary_key="id",
         # Required: the default "replace" would drop every story that is not
@@ -70,6 +71,8 @@ async def main() -> None:
         # 0 = no row cap, so orphan cleanup compares against the whole corpus.
         max_rows_per_table=0,
     )
+    # scanned, skipped, failed, deleted, kept, given_up (+ failed_<reason> on an early stop)
+    print("Sync stats:", source.cognee_sync_stats)
 
     answer = await cognee.search(
         query_text="What is this team working on, and what is blocked or still open?",

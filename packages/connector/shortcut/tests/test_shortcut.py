@@ -31,14 +31,17 @@ from types import SimpleNamespace
 from uuid import NAMESPACE_OID, uuid5
 
 import pytest
+import requests
 from cognee.tasks.ingestion.dlt_utils import document_source_tag, pipeline_name_for_source
 from cognee.tasks.ingestion.resolve_dlt_sources import _build_document_data_item
+from dlt.pipeline.exceptions import PipelineStepFailed
 
 from cognee_community_connector_shortcut import shortcut
 from cognee_community_connector_shortcut.shortcut import (
     SHORTCUT_SOURCE_NAME,
     ShortcutAPIError,
     ShortcutListingError,
+    ShortcutResponseError,
     _fingerprint,
     _header_lines,
     _is_settled,
@@ -999,14 +1002,22 @@ def test_selection_filters_stories_epics_and_iterations(fake):
     fake.add_epic(8, name="Other team's epic", group_ids=["team-other"])
     fake.add_iteration(3, group_ids=[TEAM])
     fake.add_iteration(4, name="Other sprint", group_ids=["team-other"])
+    fake.add_iteration(5, name="Unplanned sprint", group_ids=[TEAM])
     fake.add_story(1, updated_at=at(1), group_id=TEAM, epic_id=7)
-    fake.add_story(2, updated_at=at(1), group_id="team-other", epic_id=8)
-    fake.add_story(3, updated_at=at(1), group_id=TEAM, epic_id=8)
+    fake.add_story(2, updated_at=at(1), group_id="team-other", epic_id=8, iteration_id=4)
+    fake.add_story(3, updated_at=at(1), group_id=TEAM, epic_id=8, iteration_id=3)
 
     by_team = run_sync(fake, {}, group_ids=[TEAM])
-    assert [r["id"] for r in by_team] == ["story:1", "story:3", "epic:7", "iteration:3"]
+    assert [r["id"] for r in by_team] == [
+        "story:1",
+        "story:3",
+        "epic:7",
+        "iteration:3",
+        "iteration:5",
+    ]
     assert fake.requested(SEARCH)[0]["group_ids"] == [TEAM]
 
+    # An epic selection takes only the iterations its stories are planned in.
     by_epic = run_sync(fake, {}, epic_ids=[8])
     assert [r["id"] for r in by_epic] == [
         "story:2",
@@ -1017,7 +1028,7 @@ def test_selection_filters_stories_epics_and_iterations(fake):
     ]
 
     # Both: AND. Epic 8 belongs to the other team, so it gets no document, but
-    # the one story of this team inside it is still in scope.
+    # the one story of this team inside it is still in scope, with its iteration.
     both = run_sync(fake, {}, group_ids=[TEAM], epic_ids=[8])
     assert [r["id"] for r in both] == ["story:3", "iteration:3"]
 
@@ -1117,29 +1128,213 @@ def test_listed_iteration_whose_get_fails_is_kept_and_retried(fake):
     assert rows[0]["content"].endswith("Rewritten.")
 
 
-@pytest.mark.parametrize("failure", ["401", "rate limit", "three in a row"])
-def test_systemic_item_failure_aborts_with_nothing_committed(fake, failure):
-    for story_id in (1, 2, 3, 4):
-        fake.add_story(story_id, updated_at=at(1))
+@pytest.mark.parametrize("failure", ["401", "rate limit", "long retry-after", "outage"])
+def test_systemic_item_failure_stops_cleanly_and_resumes(fake, failure, sleeps):
+    for story_id in (1, 2, 3, 4, 5):
+        fake.add_story(story_id, updated_at=at(1), description="v1")
     state = {}
     run_sync(fake, state)
-    before = copy.deepcopy(state)
-    for story_id in (1, 2, 3, 4):
-        fake.stories[story_id]["updated_at"] = at(5)
+    for story_id in (1, 2, 3, 4, 5):
+        fake.stories[story_id].update(description="v2", updated_at=at(5))
+    del fake.stories[5]  # a real deletion waits for a run that finishes
 
     if failure == "401":
-        _fail(fake, "/stories/2", status=401)
-        expected = ShortcutAPIError
+        fake.queue("/stories/3", _error(401, "Unauthorized"))
     elif failure == "rate limit":
         for _ in range(shortcut._MAX_RETRIES):
-            fake.queue("/stories/2", _error(429, "Too Many Requests"))
-        expected = ShortcutAPIError
+            fake.queue("/stories/3", _error(429, "Too Many Requests"))
+    elif failure == "long retry-after":
+        fake.queue("/stories/3", _error(429, "Too Many Requests", headers={"Retry-After": "120"}))
     else:
         for story_id in (2, 3, 4):
             _fail(fake, f"/stories/{story_id}")
-        expected = shortcut.ShortcutUnavailableError
+    stats = {}
+    rows = run_sync(fake, state, stats=stats)
 
-    with pytest.raises(expected):
+    reasons = {"401": "auth", "rate limit": "rate_limit", "long retry-after": "rate_limit"}
+    assert stats[f"failed_{reasons.get(failure, 'unavailable')}"] == 1
+    assert all(wait <= shortcut._MAX_WAIT_SECONDS for wait in sleeps)
+    assert tombstones(rows) == []  # nothing deleted on a stopped run
+    done = {"story:1"} if failure == "outage" else {"story:1", "story:2"}
+    assert set(story_rows(rows)) == done
+    assert "story:5" in state["known_ids"]
+    assert state["cursor"] == at(1)  # kept: the next run lists the same window again
+
+    # Next run, with no upstream change: the rest is rendered and story 5 forgotten.
+    fake.calls.clear()
+    rows = run_sync(fake, state)
+    rest = {"story:2", "story:3", "story:4"} if failure == "outage" else {"story:3", "story:4"}
+    assert set(story_rows(rows)) == rest
+    assert all("v2" in row["content"] for row in story_rows(rows).values())
+    assert tombstones(rows) == [{"id": "story:5", "_deleted": True}]
+    assert len(fake.requested(SEARCH)) == 2  # the sweep and one updated listing
+
+
+def test_first_sync_stopped_part_way_does_not_fetch_the_rendered_stories_again(fake):
+    for story_id in (1, 2, 3, 4, 5):
+        fake.add_story(story_id, updated_at=at(1))
+    state = {}
+    fake.queue("/stories/3", _error(401, "Unauthorized"))
+    rows = run_sync(fake, state)
+    assert set(story_rows(rows)) == {"story:1", "story:2"}
+
+    fake.calls.clear()
+    rows = run_sync(fake, state)
+    assert sorted(set(fake.fetched_stories())) == [3, 4, 5]
+    assert set(story_rows(rows)) == {"story:3", "story:4", "story:5"}
+
+
+def test_401_before_anything_was_rendered_raises(fake):
+    fake.add_story(1, updated_at=at(1))
+    state = {}
+    run_sync(fake, state)
+    before = copy.deepcopy(state)
+    fake.stories[1]["updated_at"] = at(5)
+    fake.queue("/stories/1", _error(401, "Unauthorized"))
+
+    with pytest.raises(ShortcutAPIError) as excinfo:
+        run_sync(fake, state)
+    assert excinfo.value.status == 401
+    assert state == before
+
+
+def test_three_unreadable_stories_never_block_the_run_and_are_given_up(fake):
+    # Stories 11, 12 and 13 always answer 404 while still listed, next to each other.
+    for story_id in (10, 11, 12, 13, 14):
+        fake.add_story(story_id, updated_at=at(1))
+    state = {}
+    run_sync(fake, state)
+    for story_id in (10, 11, 12, 13, 14):
+        fake.stories[story_id]["updated_at"] = at(5)
+
+    def forbid():
+        for story_id in (11, 12, 13):
+            fake.queue(f"/stories/{story_id}", _error(404, "Resource not found."))
+
+    for run in (1, 2):
+        forbid()
+        stats = {}
+        rows = run_sync(fake, state, stats=stats)
+        if run == 1:
+            assert set(story_rows(rows)) == {"story:10", "story:14"}  # the others went on
+        assert tombstones(rows) == []
+        assert state["retry"] == ["story:11", "story:12", "story:13"]
+        runs = {row_id: entry["runs"] for row_id, entry in state["unreadable"].items()}
+        assert runs == {"story:11": run, "story:12": run, "story:13": run}
+        assert stats["kept"] == 3 and "failed_unavailable" not in stats
+
+    # A story created upstream meanwhile still gets its first document.
+    fake.add_story(15, updated_at=at(6))
+    forbid()
+    stats = {}
+    rows = run_sync(fake, state, stats=stats)
+    assert "story:15" in story_rows(rows)
+    # Third run at the same stamp: forgotten, and no longer asked about.
+    assert [r["id"] for r in tombstones(rows)] == ["story:11", "story:12", "story:13"]
+    assert stats["given_up"] == 3 and state["retry"] == [] and state["unreadable"] == {}
+    fake.calls.clear()
+    run_sync(fake, state)
+    assert 11 not in fake.fetched_stories()
+
+    # Once a given-up story changes upstream, it is asked about (and ingested) again.
+    fake.stories[12]["updated_at"] = at(7)
+    rows = run_sync(fake, state)
+    assert set(story_rows(rows)) == {"story:12"}
+    assert "story:12" not in state["given_up"]
+
+
+def test_a_lost_permission_never_gives_anything_up(fake, caplog):
+    # Every story answers 403 (the token lost access to stories): kept, never forgotten.
+    for story_id in (1, 2, 3):
+        fake.add_story(story_id, updated_at=at(1))
+    state = {}
+    run_sync(fake, state)
+    for story_id in (1, 2, 3):
+        fake.stories[story_id]["updated_at"] = at(5)
+
+    for _ in range(4):
+        for story_id in (1, 2, 3):
+            fake.queue(f"/stories/{story_id}", _error(403, "Forbidden"))
+        stats = {}
+        rows = run_sync(fake, state, stats=stats)
+        assert tombstones(rows) == []
+        assert stats["failed_permission"] == 3 and stats["given_up"] == 0
+        assert {entry["runs"] for entry in state["unreadable"].values()} == {0}
+    assert "story: every fetch answered 403 this run" in caplog.text
+    assert {"story:1", "story:2", "story:3"} <= set(state["known_ids"])
+
+
+def test_one_hidden_story_among_readable_ones_is_given_up(fake):
+    for story_id in (1, 2):
+        fake.add_story(story_id, updated_at=at(1))
+    state = {}
+    run_sync(fake, state)
+    for story_id in (1, 2):
+        fake.stories[story_id]["updated_at"] = at(5)
+
+    for run in (1, 2, 3):
+        fake.queue("/stories/2", _error(403, "Forbidden"))
+        if run > 1:
+            fake.stories[1]["updated_at"] = at(5 + run)  # story 1 keeps being fetched
+        stats = {}
+        rows = run_sync(fake, state, stats=stats)
+        assert "failed_permission" not in stats
+    assert [r["id"] for r in tombstones(rows)] == ["story:2"]
+
+
+def test_retries_go_last_and_never_count_toward_an_outage(fake):
+    for story_id in (1, 2, 3, 4, 5, 6, 7):
+        fake.add_story(story_id, updated_at=at(1))
+    state = {}
+    run_sync(fake, state)
+    for story_id in (2, 3, 4, 5, 6):
+        fake.stories[story_id]["updated_at"] = at(5)
+    for story_id in (2, 4, 6):  # kept after a 500, with successes between them
+        _fail(fake, f"/stories/{story_id}")
+    run_sync(fake, state)
+    assert state["retry"] == ["story:2", "story:4", "story:6"]
+
+    # Still failing next run, three in a row at the end, after a fresh story.
+    fake.stories[7]["updated_at"] = at(6)
+    for story_id in (2, 4, 6):
+        _fail(fake, f"/stories/{story_id}")
+    fake.calls.clear()
+    stats = {}
+    rows = run_sync(fake, state, stats=stats)
+
+    assert list(dict.fromkeys(fake.fetched_stories())) == [7, 2, 4, 6]
+    assert set(story_rows(rows)) == {"story:7"}
+    assert "failed_unavailable" not in stats and stats["failed"] == 3
+
+
+def test_a_success_between_server_errors_resets_the_outage_streak(fake):
+    for story_id in (1, 2, 3, 4, 5):
+        fake.add_story(story_id, updated_at=at(1))
+    state = {}
+    run_sync(fake, state)
+    for story_id in (1, 2, 3, 4, 5):
+        fake.stories[story_id]["updated_at"] = at(5)
+    for story_id in (1, 2, 4, 5):  # 3 succeeds in between
+        _fail(fake, f"/stories/{story_id}")
+    stats = {}
+
+    rows = run_sync(fake, state, stats=stats)
+
+    assert set(story_rows(rows)) == {"story:3"}
+    assert "failed_unavailable" not in stats
+    assert state["retry"] == ["story:1", "story:2", "story:4", "story:5"]
+
+
+def test_story_body_of_the_wrong_shape_aborts(fake):
+    fake.add_story(1, updated_at=at(1))
+    fake.add_story(2, updated_at=at(1))
+    state = {}
+    run_sync(fake, state)
+    before = copy.deepcopy(state)
+    fake.stories[2]["updated_at"] = at(5)
+    fake.queue("/stories/2", _Resp(200, "<html>login</html>"))  # a login page with a 200
+
+    with pytest.raises(ShortcutResponseError):
         run_sync(fake, state)
     assert state == before
 
@@ -1188,13 +1383,13 @@ def test_story_listing_of_the_wrong_shape_raises(fake, monkeypatch, where, body)
         monkeypatch.setattr(shortcut, "_WINDOW_CAP", 3)
 
         def when(q):
-            return q.get("created_at_end") == _stamp(NOW + timedelta(1)) and q[
-                "created_at_start"
-            ] != _stamp(shortcut._EPOCH)
+            return q.get("created_at_end") == _stamp(NOW) and q["created_at_start"] != _stamp(
+                shortcut._EPOCH
+            )
 
     fake.queue(SEARCH, response, when=when)
 
-    with pytest.raises(shortcut.ShortcutListingError):
+    with pytest.raises(ShortcutResponseError):
         run_sync(fake, state)
     assert state == before
 
@@ -1228,7 +1423,7 @@ def test_failed_request_deletes_nothing_and_keeps_state(fake, failing_request, m
             fake,
             SEARCH,
             when=lambda q: (
-                q.get("created_at_end") == _stamp(NOW + timedelta(1))
+                q.get("created_at_end") == _stamp(NOW)
                 and q["created_at_start"] != _stamp(shortcut._EPOCH)
             ),
         )
@@ -1290,7 +1485,7 @@ def test_server_and_network_errors_back_off_then_succeed(sleeps):
         def request(self, method, url, **kwargs):
             if self.failures:
                 self.failures -= 1
-                raise ConnectionError("connection reset")  # an OSError, like requests'
+                raise requests.ConnectionError("connection reset")
             return super().request(method, url, **kwargs)
 
     session = Flaky()
@@ -1310,9 +1505,11 @@ def test_retries_are_capped(fake, sleeps):
 
 def test_permanent_errors_are_not_retried(fake, sleeps):
     fake.queue("/members", _Resp(401, {"message": "Unauthorized", "tag": "unauthorized"}))
-    with pytest.raises(ShortcutAPIError, match="Unauthorized") as excinfo:
+    with pytest.raises(ShortcutAPIError) as excinfo:
         _request(fake, "GET", "/members", list)
     assert excinfo.value.status == 401
+    assert str(excinfo.value) == "Shortcut /members: HTTP 401"
+    assert excinfo.value.detail == "Unauthorized"
     assert sleeps == []
 
 
@@ -1464,6 +1661,13 @@ def test_pipeline_two_sources_in_one_dataset_stay_apart(fake, tmp_path):
     assert set(site_docs) == {"story:1", "epic:7"}
     assert set(blog_docs) == {"story:2", "epic:8"}
 
+    # A deletion in one selection is forgotten there and leaves the other alone.
+    del fake.stories[1]
+    site_docs = _read_documents(_run_pipeline(tmp_path, fake, **site), "shortcut_site")
+    blog_docs = _read_documents(_run_pipeline(tmp_path, fake, **blog), "shortcut_blog")
+    assert set(site_docs) == {"epic:7"}
+    assert set(blog_docs) == {"story:2", "epic:8"}
+
 
 def test_check_active_is_asked_before_every_request(fake):
     fake.add_story(1, updated_at=at(1))
@@ -1495,7 +1699,7 @@ def test_check_active_raising_stops_with_nothing_deleted_or_loaded(
         if len(fake.calls) >= stop_after_requests:
             raise AccessRevokedError
 
-    with pytest.raises(Exception) as excinfo:  # dlt wraps it in PipelineStepFailed
+    with pytest.raises(PipelineStepFailed) as excinfo:
         _run_pipeline(tmp_path, fake, check_active=check_active)
     assert any(isinstance(error, AccessRevokedError) for error in _chain(excinfo.value))
     assert _read_documents(_pipeline(tmp_path, _scope_name())) == before
@@ -1507,8 +1711,7 @@ def test_check_active_raising_stops_with_nothing_deleted_or_loaded(
 
 
 def test_check_active_raising_an_oserror_is_not_retried_or_swallowed(fake, tmp_path, sleeps):
-    # PermissionError is an OSError, like the network errors _send retries and
-    # the render step keeps; a host's check must still stop the sync.
+    # PermissionError is an OSError; only requests' own errors are retried.
     fake.add_story(1, updated_at=at(1))
     _run_pipeline(tmp_path, fake)
     before = _read_documents(_pipeline(tmp_path, _scope_name()))
@@ -1519,11 +1722,9 @@ def test_check_active_raising_an_oserror_is_not_retried_or_swallowed(fake, tmp_p
         if fake.fetched_stories():  # the story's own GET has been made
             raise PermissionError("access revoked")
 
-    with pytest.raises(Exception) as excinfo:  # dlt wraps it in PipelineStepFailed
+    with pytest.raises(PipelineStepFailed) as excinfo:
         _run_pipeline(tmp_path, fake, check_active=check_active)
-    chain = _chain(excinfo.value)
-    assert any(isinstance(error, shortcut.ShortcutSyncStoppedError) for error in chain)
-    assert any(isinstance(error, PermissionError) for error in chain)
+    assert any(isinstance(error, PermissionError) for error in _chain(excinfo.value))
     assert sleeps == []  # not retried
     assert _read_documents(_pipeline(tmp_path, _scope_name())) == before
 
@@ -1582,31 +1783,30 @@ def test_pipeline_story_that_fails_on_its_own_is_kept_and_retried(fake, tmp_path
     assert "v2" in documents["story:2"]
 
 
-def test_pipeline_abort_mid_render_leaves_destination_and_state_untouched(fake, tmp_path):
-    fake.add_story(1, updated_at=at(1), description="v1")
-    fake.add_story(2, updated_at=at(1), description="v1")
-    fake.add_story(3, updated_at=at(1))
+def test_pipeline_401_mid_run_commits_progress_and_resumes(fake, tmp_path):
+    # A token that stops working on story 3 of 5: stories 1-2 are kept, 3-5 come next run.
+    for story_id in (1, 2, 3, 4, 5, 6):
+        fake.add_story(story_id, updated_at=at(1), description="v1")
     _run_pipeline(tmp_path, fake)
-    before = _read_documents(_pipeline(tmp_path, _scope_name()))
+    for story_id in (1, 2, 3, 4, 5):
+        fake.stories[story_id].update(description="v2", updated_at=at(5))
+    del fake.stories[6]
+    fake.queue("/stories/3", _error(401, "Unauthorized"))
 
-    # Stories 1 and 2 edited, story 3 deleted; story 2 answers 401 after
-    # story 1 was already fetched and yielded.
-    fake.stories[1].update(description="v2", updated_at=at(5))
-    fake.stories[2].update(description="v2", updated_at=at(5))
-    del fake.stories[3]
-    fake.queue("/stories/2", _error(401, "Unauthorized"))
-    with pytest.raises(Exception):  # noqa: B017 - dlt wraps the source error in PipelineStepFailed
-        _run_pipeline(tmp_path, fake)
-
-    # Not even the row that was yielded before the failure reached the destination.
-    assert _read_documents(_pipeline(tmp_path, _scope_name())) == before
-
-    # State was not advanced either: the clean run redoes all of it.
-    fake.calls.clear()
-    documents = _read_documents(_run_pipeline(tmp_path, fake))
-    assert fake.fetched_stories() == [1, 2]
-    assert set(documents) == {"story:1", "story:2"}
+    source = shortcut_source(session=fake)
+    pipeline = _pipeline(tmp_path, pipeline_name_for_source(source, "shortcut_ds"))
+    pipeline.run(source)
+    documents = _read_documents(pipeline)
+    assert source.cognee_sync_stats["failed_auth"] == 1
     assert "v2" in documents["story:1"] and "v2" in documents["story:2"]
+    assert "v1" in documents["story:3"]
+    assert "story:6" in documents  # no deletion on a stopped run
+
+    fake.calls.clear()  # no upstream change before the next run
+    documents = _read_documents(_run_pipeline(tmp_path, fake))
+    assert sorted(set(fake.fetched_stories())) == [3, 4, 5]
+    assert all("v2" in documents[f"story:{story_id}"] for story_id in (1, 2, 3, 4, 5))
+    assert "story:6" not in documents
 
 
 def test_pipeline_failure_leaves_destination_and_state_untouched(fake, tmp_path):
@@ -1616,9 +1816,145 @@ def test_pipeline_failure_leaves_destination_and_state_untouched(fake, tmp_path)
 
     del fake.stories[2]
     fake.queue(SEARCH, _error(403, "Forbidden"))
-    with pytest.raises(Exception):  # noqa: B017 - dlt wraps the source error in PipelineStepFailed
+    with pytest.raises(PipelineStepFailed) as excinfo:
         _run_pipeline(tmp_path, fake)
+    assert any(
+        isinstance(error, ShortcutAPIError) and error.status == 403
+        for error in _chain(excinfo.value)
+    )
 
     # The failed run deleted nothing; the following clean run forgets story 2.
     documents = _read_documents(_run_pipeline(tmp_path, fake))
     assert set(documents) == {"story:1"}
+
+
+# ---------------------------------------------------------------------------
+# Review round 2: clock, secrets, wiring
+# ---------------------------------------------------------------------------
+def test_sweep_ends_at_shortcuts_clock_not_the_local_one(fake, monkeypatch):
+    fake.add_story(1, updated_at=at(1))
+    state = {}
+    list(sync_stories(fake, state))
+    # The local clock runs two days behind Shortcut's: a story created since must
+    # still be in the sweep, and nothing known may look deleted.
+    monkeypatch.setattr(shortcut, "_local_now", lambda: NOW - timedelta(days=2))
+    fake.clock = NOW
+    fake.add_story(2, updated_at="2024-03-27T12:00:00Z")
+
+    rows = list(sync_stories(fake, state))
+
+    assert set(story_rows(rows)) == {"story:2"}
+    assert tombstones(rows) == []
+    assert fake.requested(SEARCH)[-2]["created_at_end"] == _stamp(NOW)
+
+
+def test_without_a_date_header_the_local_clock_ends_the_sweep_and_is_logged(
+    fake, monkeypatch, caplog
+):
+    fake.add_story(1, updated_at=at(1))
+    fake.clock = None
+    monkeypatch.setattr(shortcut, "_local_now", lambda: NOW)
+
+    rows = list(sync_stories(fake, {}))
+
+    assert set(story_rows(rows)) == {"story:1"}
+    assert "no Date header" in caplog.text
+
+
+SECRET = "SECRET-TOKEN-123"
+
+
+def test_token_with_a_trailing_newline_is_refused_without_echoing_it():
+    with pytest.raises(ValueError) as excinfo:
+        shortcut_source(token=SECRET + "\n")
+    assert SECRET not in str(excinfo.value)
+    assert "whitespace" in str(excinfo.value)
+
+
+def test_the_token_is_never_in_an_error_message_or_a_log_line(fake, caplog, sleeps):
+    class Leaky(FakeShortcut):
+        def request(self, method, url, **kwargs):
+            if url.endswith("/members"):
+                raise requests.exceptions.InvalidHeader(f"Invalid header value b'{SECRET}'")
+            return super().request(method, url, **kwargs)
+
+    with pytest.raises(ShortcutAPIError) as excinfo:
+        _request(Leaky(), "GET", "/members", list)
+    assert SECRET not in str(excinfo.value) and excinfo.value.status == 0
+
+    # A 401 whose body echoes the token: neither the message nor the logs carry it.
+    fake.queue("/epics", _Resp(401, {"message": f"bad token abcd-{SECRET}"}))
+    with pytest.raises(ShortcutAPIError) as excinfo:
+        run_sync(fake, {})
+    assert str(excinfo.value) == "Shortcut /epics: HTTP 401"
+    assert SECRET not in caplog.text
+    fake.queue("/epics", _Resp(401, f"<html>{SECRET}</html>"))
+    with pytest.raises(ShortcutAPIError) as excinfo:
+        run_sync(fake, {})
+    assert SECRET not in str(excinfo.value) and excinfo.value.detail == ""
+    assert "InvalidHeader" in caplog.text  # the retries were logged by type
+
+
+def test_waits_are_capped_and_ask_check_active_first(fake, sleeps):
+    checks = []
+    client = shortcut._Client(fake, lambda: checks.append(len(sleeps)))
+    fake.queue("/members", _error(429, "Too Many Requests", headers={"Retry-After": "30"}))
+    fake.queue("/members", _error(429, "Too Many Requests", headers={"Retry-After": "61"}))
+
+    with pytest.raises(ShortcutAPIError) as excinfo:
+        _request(client, "GET", "/members", list)
+    assert excinfo.value.status == 429
+    assert sleeps == [30.0]  # the 61 s wait was not taken
+    assert checks == [0, 0, 1]  # before the request, before the wait, before the retry
+
+
+@pytest.mark.parametrize("name", ["", "Foo-Bar", "a" * 65, None])
+def test_resource_name_is_validated(fake, name):
+    with pytest.raises(ValueError, match="resource_name"):
+        shortcut_source(service=fake, resource_name=name)
+
+
+def test_service_is_the_injection_kwarg_and_session_its_alias(fake):
+    fake.add_story(1, updated_at=at(1))
+    assert list(shortcut_source(service=fake, resource_name="alias_service"))
+    assert list(shortcut_source(session=fake, resource_name="alias_session"))
+    with pytest.raises(ValueError, match="not both"):
+        shortcut_source(service=fake, session=fake)
+
+
+def test_session_is_built_per_run_and_closed(fake, monkeypatch):
+    fake.add_story(1, updated_at=at(1))
+    built = []
+
+    class Closing(FakeShortcut):
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    def make_session(token):
+        session = Closing()
+        session.__dict__.update(copy.deepcopy(fake.__dict__))
+        built.append(session)
+        return session
+
+    monkeypatch.setattr(shortcut, "_make_session", make_session)
+    source = shortcut_source(token="test-token", resource_name="closed_session")
+    assert built == []  # nothing is opened before the run
+    assert list(source)
+    assert len(built) == 1 and built[0].closed
+
+
+def test_sync_stats_count_what_a_run_did(fake):
+    for story_id in (1, 2, 3):
+        fake.add_story(story_id, updated_at=at(1))
+    source = shortcut_source(service=fake, resource_name="stats_run")
+    list(source)
+    assert source.cognee_sync_stats == {
+        "scanned": 3,
+        "skipped": 0,
+        "failed": 0,
+        "deleted": 0,
+        "kept": 0,
+        "given_up": 0,
+    }
