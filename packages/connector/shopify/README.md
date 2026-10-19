@@ -43,7 +43,12 @@ The package needs `cognee>=1.6.2,<2`: document-mode routing, the table-scoped or
    A store that still has a static Admin API access token can set `SHOPIFY_ACCESS_TOKEN`
    instead of the client id and secret.
 
-The connector is read-only. It only sends GraphQL queries, never mutations.
+The connector is read-only. It only sends GraphQL queries, never mutations. The credentials
+are checked before the first request: one with whitespace or control characters in it (a
+pasted newline, say) is refused with a `ValueError` that does not repeat it.
+
+Ingested text goes to the LLM configured for cognee: cognify sends each document to it for
+entity extraction.
 
 ## Usage
 
@@ -80,8 +85,9 @@ deleted. See `examples/example.py` for the full flow.
 | `resources=("products", "collections")` | What to sync. Add `"customers"` and `"orders"` to include those; they hold personal data and are off by default. |
 | `client_id=`, `client_secret=` | App credentials, exchanged for a token at the start of every run. Default to `SHOPIFY_CLIENT_ID` and `SHOPIFY_CLIENT_SECRET`. |
 | `access_token=` | A static Admin API token, used instead. Defaults to `SHOPIFY_ACCESS_TOKEN`. |
-| `resource_name="shopify_documents"` | The dlt table name, which also scopes the sync state. See below. |
-| `check_active=None` | Optional callable for a host: asked before every Shopify request and around every row; raising stops the sync with nothing deleted. |
+| `resource_name="shopify_documents"` | The dlt table name, which also scopes the sync state. Lowercase snake_case, at most 64 characters. See below. |
+| `check_active=None` | Optional callable for a host: asked before every Shopify request and every wait, and around every row; raising stops the sync with nothing deleted. |
+| `service=None` | A pre-built `requests`-like session (mainly for tests); `session=` is accepted too. Without it, each run builds its own session and closes it. |
 
 **Several stores in one dataset.** Each `resource_name` has its own table and its own sync
 state, and a sync only ever forgets documents of its own table. Two stores (or two
@@ -171,14 +177,53 @@ Shopify ever records one.
 Forgotten ids are emitted with the `_deleted` hard-delete marker, dlt removes those rows on
 `merge`, and cognee's `orphan_cleanup` removes them from the graph and vector stores.
 
+An id missing from the sweep that still resolves in three runs in a row is forgotten as
+well: it is no longer listed, so it is no longer part of what the source syncs.
+
 All listings are completed before the first row is emitted, and state is saved only after the
 last one. If a listing fails (after retries), or `check_active` raises, the run aborts:
 nothing is deleted and no cursor moves. A `200` whose body is not JSON, has no `data`, or has
-a connection without `pageInfo` also aborts; it is never read as an empty listing. An item
-that fails on its own keeps its previous document, is logged with what failed, and is tried
-again next run. Failures that would hit every item the same way still abort with nothing
-saved: a `401` after one token refresh, a throttle that outlasts the retries, and three items
-failing in a row.
+a connection without `pageInfo` also aborts, whether it came from a listing or from one
+item; it is never read as an empty listing or an item to skip.
+
+## When Shopify fails part of the way through
+
+Only the sweep decides that an item is gone. An item that is still listed but fails on its
+own keeps its previous document and is fetched again on the next run; the rest of the run
+goes on:
+
+- **Unreadable** (`404`, or `null` for an item that is still listed, or `403` while other
+  items of its kind are read in the same run): kept. If it stays that way in three runs in a
+  row at the same `updatedAt`, its document is forgotten and the item is not asked about
+  again until its `updatedAt` moves. A `403` on every item of a kind is a permission problem:
+  kept, counted as `failed_permission`, and never moves toward forgetting.
+- **A GraphQL `ACCESS_DENIED`** on any query aborts the run before anything is saved, with an
+  error naming the field the app may not read.
+- **A server error or no answer** that outlasts the retries: kept. Three of these in a row on
+  fresh items means Shopify itself is down, and the run stops cleanly (below).
+
+Items kept from an earlier run are fetched after the fresh ones and never count toward that
+streak, so items that keep failing cannot hold up the others.
+
+Some failures stop the run **cleanly** instead of aborting it: a `401` after the one token
+refresh once at least one document was emitted, a throttle or `429` that outlasts the retries
+or asks for a wait over 60 seconds, and the outage above. The run then ends normally: what it
+emitted is loaded, and nothing is deleted. The order and destroy-event cursors do not move,
+so the next run lists those again; products and customers not reached keep their old stamp
+and collections are read every run, so the next run fetches the rest even if nothing changed
+upstream. A `401` before any document was emitted still raises, since the credentials are bad.
+
+Error messages name the status (or GraphQL code) and the operation only
+(`Shopify Product: HTTP 503`). Shopify's own explanation is on the exception's `detail`; a
+response body or a credential never is. Retry warnings name the error type only.
+
+### Sync stats
+
+`resource.cognee_sync_stats` holds the counts of the last run, as plain ints: `scanned` (items
+listed), `skipped` (unchanged), `failed` (item failures), `deleted`, `kept` (items waiting for a
+retry, and missing ids still resolving) and `given_up`, plus `failed_auth`,
+`failed_rate_limit` or `failed_unavailable` when the run stopped early for that reason, and
+`failed_permission` (how many items answered `403` in a kind where none could be read).
 
 ## Tokens and rate limits
 
@@ -192,9 +237,9 @@ with every answer and waits before a query the remaining budget cannot pay for. 
 stays under the 1,000-point limit for a single query (a test checks each one); if Shopify
 still refuses one as too costly (`MAX_COST_EXCEEDED`), the run stops with an error naming the
 query. The API version is pinned (`2026-10`); if Shopify answers from another one, a warning
-says so. A `THROTTLED`
-error or an HTTP `429` is waited out and retried, as are 5xx answers and network errors, up to
-five attempts.
+says so. A `THROTTLED` error or an HTTP `429` is waited out and retried, as are 5xx answers
+and network errors, up to five attempts. No single wait is longer than 60 seconds: cognee
+holds its staging lock during a sync, so a longer `Retry-After` stops the run cleanly instead.
 
 ## Limits
 
@@ -217,6 +262,12 @@ five attempts.
   makes 40 extra requests and waits for no throttle.
 - Bulk operations are not used, so a first sync of a large store takes one request per
   product. Webhooks are not used either: changes are picked up on the next sync.
+- An item that stays unreadable for three runs in a row (a `404`, a `null` while listed, or a
+  `403` while others of its kind are read) is forgotten until it changes. A GraphQL
+  `ACCESS_DENIED` on any query (a field or scope the app may not read) aborts the run with an
+  error naming the field instead: it is the app's access, not one item. When every fetch of a
+  kind answers `403` in a run, nothing moves toward forgetting; the run counts them as
+  `failed_permission` and logs one warning per kind.
 - Metafields, images, inventory, discounts, draft orders and blog content are not ingested.
 - Deletions propagate on a foreground `remember(...)`. cognee skips orphan cleanup for
   `run_in_background=True`.
@@ -273,11 +324,15 @@ uv run pytest tests/ -q
 ```
 
 The tests mock the GraphQL Admin API (no store, no network). They cover rendering (also from
-shuffled input), the shop name and URL guard, `errors` with HTTP 200, throttling and `429`,
-bodies of the wrong shape and a missing `pageInfo`, change detection, product renames
-re-rendering collections and orders, membership changes, deletion through events and
-`nodes()`, ids kept when not confirmed gone, orders ageing out versus deleted (with or
-without a destroy event), token refresh, the token never reaching state or logs, items kept
-and retried, and the aborts. A real `dlt` pipeline into a temp sqlite destination checks edits and deletes across runs (the
-deleted row is gone from the table), two sources in one dataset staying apart, and
-`check_active` stopping a run with nothing loaded.
+shuffled input), the shop name and URL guard, `errors` with HTTP 200, throttling and `429`
+(and a wait over 60 seconds not taken), bodies of the wrong shape and a missing `pageInfo`,
+change detection, product renames re-rendering collections and orders, membership changes,
+deletion through events and `nodes()`, ids kept when not confirmed gone and given up after
+three runs, orders ageing out versus deleted (with or without a destroy event), token
+refresh, the token never reaching state, logs or an error message, items kept and retried,
+three unreadable items not blocking a run and given up after three runs, retries going last,
+and the clean stops (`401` mid-run, throttle, long `Retry-After`, outage) with what the next
+run picks up. A real `dlt` pipeline into a temp sqlite destination checks edits and deletes
+across runs (the deleted row is gone from the table), two sources in one dataset staying
+apart, a `401` mid-run resuming on the next run, and `check_active` stopping a run with
+nothing loaded.

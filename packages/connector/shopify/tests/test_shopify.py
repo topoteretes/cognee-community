@@ -27,8 +27,10 @@ from types import SimpleNamespace
 from uuid import NAMESPACE_OID, uuid5
 
 import pytest
+import requests
 from cognee.tasks.ingestion.dlt_utils import document_source_tag, pipeline_name_for_source
 from cognee.tasks.ingestion.resolve_dlt_sources import _build_document_data_item
+from dlt.pipeline.exceptions import PipelineStepFailed
 
 from cognee_community_connector_shopify import shopify
 from cognee_community_connector_shopify.shopify import (
@@ -123,9 +125,10 @@ class FakeShopify:
             "updatedAt": updated_at,
         }
 
-    def add_collection(self, n, members=(), *, rules=None, **fields):
+    def add_collection(self, n, members=(), *, rules=None, updated_at=DAY1, **fields):
         self.collections[gid("Collection", n)] = {
             "id": gid("Collection", n),
+            "updatedAt": updated_at,
             "title": f"Collection {n}",
             "handle": f"collection-{n}",
             "description": "",
@@ -268,7 +271,10 @@ class FakeShopify:
             out["variantsCount"] = {"count": len(product["variants"])}
             return {"product": out}
         if operation == "CollectionSweep":
-            return {"collections": self._page([{"id": c} for c in self.collections], v)}
+            nodes = [
+                {"id": c["id"], "updatedAt": c["updatedAt"]} for c in self.collections.values()
+            ]
+            return {"collections": self._page(nodes, v)}
         if operation == "Collection":
             c = self.collections.get(v["id"])
             if c is None:
@@ -382,9 +388,13 @@ def client_for(fake, token="static"):
 
 
 def run_sync(fake, state, client=None, now=NOW, **kwargs):
+    return list(run_sync_iter(fake, state, client, now, **kwargs))
+
+
+def run_sync_iter(fake, state, client=None, now=NOW, **kwargs):
     fake.calls.clear()
     client = client or client_for(fake)
-    return list(sync_store(client, state, now=shopify.datetime.fromisoformat(now), **kwargs))
+    return sync_store(client, state, now=shopify.datetime.fromisoformat(now), **kwargs)
 
 
 def docs(rows, prefix=""):
@@ -545,9 +555,11 @@ def test_admin_url_stays_in_the_shop_admin():
 # ---------------------------------------------------------------------------
 def test_graphql_errors_with_http_200_raise(fake):
     fake.queue("ProductSweep", _Resp(200, {"errors": [{"message": "Field 'x' doesn't exist"}]}))
-    with pytest.raises(ShopifyAPIError, match="doesn't exist") as excinfo:
+    with pytest.raises(ShopifyAPIError) as excinfo:
         shopify._list_all(client_for(fake), shopify._PRODUCT_SWEEP, "products")
     assert excinfo.value.status == 200
+    assert str(excinfo.value) == "Shopify ProductSweep: GraphQL error"
+    assert excinfo.value.detail == "Field 'x' doesn't exist"
 
 
 def test_throttled_waits_from_the_reported_bucket_then_succeeds(fake, sleeps):
@@ -887,35 +899,252 @@ def test_collection_that_fails_is_kept_and_emitted_next_run(store):
     assert set(docs(run_sync(store, state))) == {"collection:10"}
 
 
-@pytest.mark.parametrize("failure", ["401", "throttle", "three in a row"])
-def test_systemic_failure_aborts_with_nothing_committed(store, failure):
+def _five_products(store):
+    for n in (4, 5):
+        store.add_product(n)
+    state = {}
+    run_sync(store, state)
+    for n in (1, 2, 3, 4, 5):
+        store.products[gid("Product", n)].update(description="v2", updatedAt=at(5))
+    return state
+
+
+def _on(n):
+    return lambda v: v.get("id", "").endswith(f"/{n}")
+
+
+@pytest.mark.parametrize("failure", ["401", "throttle", "long retry-after", "outage"])
+def test_systemic_failure_stops_cleanly_and_resumes(store, failure, sleeps):
+    state = _five_products(store)
+    store.destroy("Product", 1)  # a real deletion waits for a run that finishes
+    store.products.pop(gid("Product", 1), None)
+    client = client_for(store, token="grant")
+    if failure == "401":  # the refresh is tried once, then a second 401
+        store.queue("Product", _Resp(401, {"errors": "Invalid"}), when=_on(4))
+        store.queue("Product", _Resp(401, {"errors": "Invalid"}), when=_on(4))
+    elif failure == "throttle":
+        for _ in range(shopify._MAX_RETRIES):
+            store.queue("Product", _Resp(429, {}, {"Retry-After": "1"}), when=_on(4))
+    elif failure == "long retry-after":
+        store.queue("Product", _Resp(429, {}, {"Retry-After": "3600"}), when=_on(4))
+    else:
+        for n in (3, 4, 5):
+            _fail(store, "Product", n)
+    stats = {}
+    rows = run_sync(store, state, client=client, stats=stats)
+
+    reasons = {"401": "auth", "throttle": "rate_limit", "long retry-after": "rate_limit"}
+    assert stats[f"failed_{reasons.get(failure, 'unavailable')}"] == 1
+    assert all(wait <= shopify._MAX_WAIT_SECONDS for wait in sleeps)
+    assert tombstones(rows) == []  # nothing deleted on a stopped run
+    assert "product:1" in state["known_ids"]
+    if failure == "outage":
+        assert set(docs(rows, "product:")) == {"product:2"}
+        assert state["retry"] == ["product:3", "product:4", "product:5"]
+    else:
+        assert set(docs(rows, "product:")) == {"product:2", "product:3"}
+        assert state["retry"] == []
+    assert not docs(rows, "collection:")  # stopped before the collections
+
+    # Next run, nothing changed upstream: the rest arrives, and product 1 goes.
+    rows = run_sync(store, state, client=client)
+    rest = (
+        {"product:3", "product:4", "product:5"}
+        if failure == "outage"
+        else {"product:4", "product:5"}
+    )
+    assert set(docs(rows, "product:")) == rest
+    assert all("v2" in row["content"] for row in docs(rows, "product:").values())
+    assert tombstones(rows) == ["product:1"]
+    assert state["retry"] == []
+
+
+def test_401_before_anything_was_rendered_raises(store):
+    state = _five_products(store)
+    before = copy.deepcopy(state)
+    store.queue("Product", _Resp(401, {"errors": "Invalid"}), when=_on(1))
+
+    with pytest.raises(ShopifyAPIError) as excinfo:
+        run_sync(store, state)
+    assert excinfo.value.status == 401
+    assert state == before
+
+
+def test_rate_limit_while_listing_stops_cleanly_with_nothing_moved(store):
     state = {}
     run_sync(store, state)
     before = copy.deepcopy(state)
-    for n in (1, 2, 3):
+    store.destroy("Product", 2)
+    store.queue("ProductSweep", _Resp(429, {}, {"Retry-After": "600"}))
+    stats = {}
+
+    assert run_sync(store, state, stats=stats) == []
+    assert stats["failed_rate_limit"] == 1
+    assert state == before
+
+
+@pytest.mark.parametrize("refusal", ["403", "null"])
+def test_three_unreadable_items_never_block_the_run_and_are_given_up(store, refusal):
+    for n in (4, 5):
+        store.add_product(n)
+    state = {}
+    run_sync(store, state)
+    for n in (1, 2, 3, 4, 5):
         store.products[gid("Product", n)]["updatedAt"] = at(5)
 
-    client = client_for(store)
-    if failure == "401":
-        store.queue(
-            "Product", _Resp(401, {"errors": "Invalid"}), when=lambda v: v["id"].endswith("/2")
-        )
-        expected = ShopifyAPIError
-    elif failure == "throttle":
-        for _ in range(shopify._MAX_RETRIES):
-            store.queue(
-                "Product",
-                _Resp(429, {}, {"Retry-After": "1"}),
-                when=lambda v: v["id"].endswith("/2"),
-            )
-        expected = ShopifyAPIError
-    else:
-        for n in (1, 2, 3):
-            _fail(store, "Product", n)
-        expected = shopify.ShopifyUnavailableError
+    def refuse():
+        for n in (2, 3, 4):
+            if refusal == "403":  # counted: products 1 and 5 are read in the same run
+                response = _Resp(403, {"errors": "Forbidden"})
+            else:
+                response = _Resp(200, {"data": {"product": None}})
+            store.queue("Product", response, when=_on(n))
 
-    with pytest.raises(expected):
-        run_sync(store, state, client=client)
+    for run in (1, 2):
+        refuse()
+        # Another product is read in the same run, so a 403 counts toward give-up.
+        store.products[gid("Product", 1)]["updatedAt"] = at(10 + run)
+        stats = {}
+        rows = run_sync(store, state, stats=stats)
+        if run == 1:
+            assert set(docs(rows, "product:")) == {"product:1", "product:5"}
+        assert tombstones(rows) == []
+        assert state["retry"] == ["product:2", "product:3", "product:4"]
+        runs = {k: v["runs"] for k, v in state["unreadable"].items()}
+        assert runs == {"product:2": run, "product:3": run, "product:4": run}
+        assert stats["kept"] == 3 and "failed_unavailable" not in stats
+
+    store.add_product(6, updated_at=at(6))  # created meanwhile: still ingested
+    refuse()
+    stats = {}
+    rows = run_sync(store, state, stats=stats)
+    assert "product:6" in docs(rows)
+    assert tombstones(rows) == ["product:2", "product:3", "product:4"]
+    assert stats["given_up"] == 3 and state["retry"] == [] and state["unreadable"] == {}
+    run_sync(store, state)
+    assert store.fetched("Product") == []  # no longer asked about
+
+    store.products[gid("Product", 3)]["updatedAt"] = at(7)  # it changed: asked again
+    rows = run_sync(store, state)
+    assert set(docs(rows, "product:")) == {"product:3"}
+    assert "product:3" not in state["given_up"]
+
+
+def test_access_denied_on_one_item_aborts_with_the_field_access_error(store):
+    state = _five_products(store)
+    before = copy.deepcopy(state)
+    message = "This app is not approved to use the vendor field."
+    denied = {"message": message, "extensions": {"code": "ACCESS_DENIED"}}
+    store.queue("Product", _Resp(200, {"errors": [denied]}), when=_on(2))
+
+    rows = []
+    with pytest.raises(ShopifyAPIError) as excinfo:
+        for row in run_sync_iter(store, state):
+            rows.append(row)
+    assert "the app may not read the vendor field" in str(excinfo.value)
+    assert excinfo.value.code == "ACCESS_DENIED"
+    assert tombstones(rows) == [] and state == before
+
+
+def test_access_denied_on_a_listing_aborts_with_the_field_access_error(store):
+    denied = {"message": "Access denied", "extensions": {"code": "ACCESS_DENIED"}}
+    store.queue("ProductSweep", _Resp(200, {"errors": [denied]}))
+    state = {}
+    with pytest.raises(ShopifyAPIError, match="may not read a field this query asks for"):
+        run_sync(store, state)
+    assert state == {}
+
+
+def test_access_denied_on_a_deletion_check_aborts(store):
+    state = {}
+    run_sync(store, state)
+    before = copy.deepcopy(state)
+    store.destroy("Product", 2)
+    store.events.clear()  # no event: nodes() is asked
+    denied = {"message": "Access denied", "extensions": {"code": "ACCESS_DENIED"}}
+    store.queue("Nodes", _Resp(200, {"errors": [denied]}))
+
+    with pytest.raises(ShopifyAPIError, match="may not read"):
+        run_sync(store, state)
+    assert state == before
+
+
+def test_a_kind_whose_every_fetch_answers_403_never_moves_toward_give_up(store, caplog):
+    state = {}
+    run_sync(store, state)
+    for run in range(4):
+        for n in (1, 2, 3):
+            store.products[gid("Product", n)]["updatedAt"] = at(5 + run)
+            store.queue("Product", _Resp(403, {"errors": "Forbidden"}), when=_on(n))
+        stats = {}
+        rows = run_sync(store, state, stats=stats)
+        assert tombstones(rows) == []
+        assert stats["failed_permission"] == 3
+        assert state["unreadable"] == {}  # runs never moves
+        assert state["retry"] == ["product:1", "product:2", "product:3"]
+    assert "product: every fetch answered 403 this run" in caplog.text
+    assert {"product:1", "product:2", "product:3"} <= set(state["known_ids"])
+
+
+def test_missing_id_that_keeps_resolving_is_given_up_after_three_runs(store):
+    state = {}
+    run_sync(store, state)
+    store.unlisted.add(gid("Product", 2))  # out of the sweep, yet nodes() finds it
+
+    for _ in range(2):
+        stats = {}
+        assert tombstones(run_sync(store, state, stats=stats)) == []
+        assert stats["kept"] == 1
+    stats = {}
+    assert tombstones(run_sync(store, state, stats=stats)) == ["product:2"]
+    assert stats["given_up"] == 1
+    assert tombstones(run_sync(store, state)) == []
+
+
+def test_retries_go_last_and_never_count_toward_an_outage(store):
+    for n in (4, 5, 6, 7):
+        store.add_product(n)
+    state = {}
+    run_sync(store, state)
+    for n in (2, 3, 4, 5, 6):
+        store.products[gid("Product", n)]["updatedAt"] = at(5)
+    for n in (2, 4, 6):  # kept after a 500, with successes between them
+        _fail(store, "Product", n)
+    run_sync(store, state)
+    assert state["retry"] == ["product:2", "product:4", "product:6"]
+
+    store.products[gid("Product", 7)]["updatedAt"] = at(6)
+    for n in (2, 4, 6):  # still failing, three in a row at the end
+        _fail(store, "Product", n)
+    stats = {}
+    rows = run_sync(store, state, stats=stats)
+
+    order = list(dict.fromkeys(v["id"] for v in store.ops("Product")))
+    assert order == [gid("Product", n) for n in (7, 2, 4, 6)]
+    assert set(docs(rows, "product:")) == {"product:7"}
+    assert "failed_unavailable" not in stats and stats["failed"] == 3
+
+
+def test_a_success_between_server_errors_resets_the_outage_streak(store):
+    state = _five_products(store)
+    for n in (1, 2, 4, 5):  # 3 succeeds in between
+        _fail(store, "Product", n)
+    stats = {}
+
+    rows = run_sync(store, state, stats=stats)
+
+    assert set(docs(rows, "product:")) == {"product:3"}
+    assert "failed_unavailable" not in stats
+    assert state["retry"] == ["product:1", "product:2", "product:4", "product:5"]
+
+
+def test_item_body_of_the_wrong_shape_aborts(store):
+    state = _five_products(store)
+    before = copy.deepcopy(state)
+    store.queue("Product", _Resp(200, {"data": {"product": ["not", "an", "object"]}}), when=_on(2))
+
+    with pytest.raises(ShopifyResponseError):
+        run_sync(store, state)
     assert state == before
 
 
@@ -1114,8 +1343,9 @@ def test_customers_the_app_may_not_read_stop_the_run_with_a_clear_error(store):
         ),
     )
     state = {}
-    with pytest.raises(ShopifyAPIError, match="protected customer data"):
+    with pytest.raises(ShopifyAPIError, match="protected customer data") as excinfo:
         run_sync(store, state, resources=ALL)
+    assert "with the Name and Email fields" in str(excinfo.value)
     assert state == {}
 
 
@@ -1169,8 +1399,10 @@ def test_static_token_is_never_refreshed(store):
 
 def test_refused_grant_says_why_without_the_secret(store):
     client = _Client(store, SHOP, None, "app-id", "wrong-secret")
-    with pytest.raises(ShopifyAPIError, match="invalid_client") as excinfo:
+    with pytest.raises(ShopifyAPIError) as excinfo:
         run_sync(store, {}, client=client)
+    assert str(excinfo.value) == "Shopify oauth/access_token: HTTP 400"
+    assert excinfo.value.detail == "invalid_client"
     assert "wrong-secret" not in str(excinfo.value)
 
 
@@ -1357,7 +1589,7 @@ def test_check_active_raising_stops_with_nothing_loaded(store, tmp_path, stop_af
         if len(store.calls) >= stop_after:
             raise AccessRevokedError
 
-    with pytest.raises(Exception) as excinfo:  # dlt wraps it in PipelineStepFailed
+    with pytest.raises(PipelineStepFailed) as excinfo:
         _run_pipeline(tmp_path, store, check_active=check_active)
     assert any(isinstance(e, AccessRevokedError) for e in _chain(excinfo.value))
     assert _read(_pipeline(tmp_path, _scope())) == before
@@ -1374,11 +1606,10 @@ def test_check_active_raising_an_oserror_is_not_retried_or_swallowed(store, tmp_
         if store.ops("Product"):
             raise PermissionError("access revoked")
 
-    with pytest.raises(Exception) as excinfo:  # dlt wraps it in PipelineStepFailed
+    with pytest.raises(PipelineStepFailed) as excinfo:
         _run_pipeline(tmp_path, store, check_active=check_active)
-    chain = _chain(excinfo.value)
-    assert any(isinstance(e, shopify.ShopifySyncStoppedError) for e in chain)
-    assert any(isinstance(e, PermissionError) for e in chain)
+    # PermissionError is an OSError; only requests' own errors are retried.
+    assert any(isinstance(e, PermissionError) for e in _chain(excinfo.value))
     assert sleeps == []
     assert _read(_pipeline(tmp_path, _scope())) == before
 
@@ -1395,15 +1626,143 @@ def test_pipeline_product_that_fails_on_its_own_is_kept_and_retried(store, tmp_p
     assert store.fetched("Product") == [2] and "v2" in documents["product:2"]
 
 
-def test_pipeline_abort_mid_render_leaves_destination_and_state_untouched(store, tmp_path):
-    _run_pipeline(tmp_path, store)
-    before = _read(_pipeline(tmp_path, _scope()))
-    for n in (1, 2):
-        store.products[gid("Product", n)].update(description="v2", updatedAt=at(5))
-    store.queue("Product", _Resp(401, {"errors": "Invalid"}), when=lambda v: v["id"].endswith("/2"))
-    with pytest.raises(Exception):  # noqa: B017 - dlt wraps the source error
-        _run_pipeline(tmp_path, store)
-    assert _read(_pipeline(tmp_path, _scope())) == before  # product 1 was yielded, never loaded
+def test_pipeline_401_mid_run_commits_progress_and_resumes(store, tmp_path):
+    # A token refused on product 3 of 5 (after the one refresh): 1-2 are kept,
+    # 3-5 come next run with nothing changed upstream, and deletions wait.
+    for n in (4, 5, 6):
+        store.add_product(n)
 
-    documents = _read(_run_pipeline(tmp_path, store))
+    def source():
+        return shopify_source(SHOP, client_id="app-id", client_secret=CLIENT_SECRET, service=store)
+
+    def run():
+        store.calls.clear()
+        src = source()
+        pipeline = _pipeline(tmp_path, pipeline_name_for_source(src, "shop_ds"))
+        pipeline.run(src)
+        return src, _read(pipeline)
+
+    run()
+    for n in (1, 2, 3, 4, 5):
+        store.products[gid("Product", n)].update(description="v2", updatedAt=at(5))
+    store.destroy("Product", 6)
+    store.queue("Product", _Resp(401, {"errors": "Invalid"}), when=_on(3))
+    store.queue("Product", _Resp(401, {"errors": "Invalid"}), when=_on(3))
+
+    src, documents = run()
+    assert src.cognee_sync_stats["failed_auth"] == 1
     assert "v2" in documents["product:1"] and "v2" in documents["product:2"]
+    assert "v2" not in documents["product:3"]
+    assert "product:6" in documents  # no deletion on a stopped run
+
+    src, documents = run()
+    assert store.fetched("Product") == [3, 4, 5]
+    assert all("v2" in documents[f"product:{n}"] for n in (1, 2, 3, 4, 5))
+    assert "product:6" not in documents
+
+
+# ---------------------------------------------------------------------------
+# Review round 2: secrets, waits, wiring
+# ---------------------------------------------------------------------------
+def test_token_with_a_trailing_newline_is_refused_without_echoing_it():
+    for kwargs in (
+        {"access_token": "shpat_SECRET\n"},
+        {"client_id": "app-id", "client_secret": "shpss_SECRET\n"},
+    ):
+        with pytest.raises(ValueError) as excinfo:
+            shopify_source(SHOP, **kwargs)
+        assert "SECRET" not in str(excinfo.value) and "whitespace" in str(excinfo.value)
+
+
+def test_the_token_is_never_in_an_error_message_or_a_log_line(store, caplog, sleeps):
+    caplog.set_level(logging.DEBUG)
+    secret = "shpat_static"
+
+    class Leaky(FakeShopify):
+        def post(self, url, json=None, data=None, headers=None, timeout=None):
+            if json and "ProductSweep" in json["query"]:
+                raise requests.exceptions.InvalidHeader(f"Invalid header value b'{secret}'")
+            return super().post(url, json=json, data=data, headers=headers, timeout=timeout)
+
+    leaky = Leaky()
+    with pytest.raises(ShopifyAPIError) as excinfo:
+        run_sync(leaky, {})
+    assert secret not in str(excinfo.value) and excinfo.value.status == 0
+
+    # A 401 whose body echoes the token: neither the message nor the logs carry it.
+    store.queue("ProductSweep", _Resp(401, {"errors": f"bad token {secret}"}))
+    with pytest.raises(ShopifyAPIError) as excinfo:
+        run_sync(store, {})
+    assert str(excinfo.value) == "Shopify ProductSweep: HTTP 401"
+    assert secret not in str(excinfo.value) and secret not in excinfo.value.detail
+    assert secret not in caplog.text + " ".join(str(r.args) for r in caplog.records)
+    assert "InvalidHeader" in caplog.text  # the retries were logged by type
+
+
+def test_waits_are_capped_and_ask_check_active_first(fake, sleeps):
+    checks = []
+    fake.tokens.add("shpat_static")
+    client = _Client(fake, SHOP, "shpat_static", None, None, lambda: checks.append(len(sleeps)))
+    fake.queue("ProductSweep", _Resp(503, {}, {"Retry-After": "30"}))
+    fake.queue("ProductSweep", _Resp(429, {}, {"Retry-After": "61"}))
+
+    with pytest.raises(ShopifyAPIError) as excinfo:
+        shopify._list_all(client, shopify._PRODUCT_SWEEP, "products")
+    assert excinfo.value.status == 429 and excinfo.value.rate_limited
+    assert sleeps == [30.0]  # the 61 s wait was not taken
+    assert checks == [0, 0, 1]  # before the request, before the wait, before the retry
+
+
+@pytest.mark.parametrize("name", ["", "Foo-Bar", "a" * 65, None])
+def test_resource_name_is_validated(fake, name):
+    with pytest.raises(ValueError, match="resource_name"):
+        _source(fake, resource_name=name)
+
+
+def test_service_is_the_injection_kwarg_and_session_its_alias(store):
+    store.tokens.add("shpat_static")
+    assert list(shopify_source(SHOP, access_token="shpat_static", service=store))
+    assert list(shopify_source(SHOP, access_token="shpat_static", session=store))
+    with pytest.raises(ValueError, match="not both"):
+        shopify_source(SHOP, access_token="shpat_static", service=store, session=store)
+
+
+def test_session_is_built_per_run_and_closed(store, monkeypatch):
+    built = []
+
+    class Closing(FakeShopify):
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    def make_session():
+        session = Closing()
+        session.__dict__.update(copy.deepcopy(store.__dict__))
+        session.tokens.add("shpat_static")
+        built.append(session)
+        return session
+
+    monkeypatch.setattr(shopify, "_make_session", make_session)
+    source = shopify_source(SHOP, access_token="shpat_static")
+    assert built == []  # nothing is opened before the run
+    assert list(source)
+    assert len(built) == 1 and built[0].closed
+
+
+def test_sync_stats_count_what_a_run_did(store, tmp_path):
+    def run():
+        source = _source(store)
+        _pipeline(tmp_path, pipeline_name_for_source(source, "shop_ds")).run(source)
+        return source.cognee_sync_stats
+
+    assert run() == {
+        "scanned": 5,
+        "skipped": 0,
+        "failed": 0,
+        "deleted": 0,
+        "kept": 0,
+        "given_up": 0,
+    }
+    store.destroy("Product", 3)
+    assert run()["deleted"] == 1

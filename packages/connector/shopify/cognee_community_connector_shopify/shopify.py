@@ -1,54 +1,19 @@
 """Shopify connector for cognee: a ``dlt`` source that turns a Shopify store into memory.
 
-Pulls products and collections and, opt-in, customers and orders through the
-GraphQL Admin API, incrementally and with forget-on-delete. The source built
-here is handed directly to :func:`cognee.remember`::
-
-    import cognee
-    from cognee_community_connector_shopify import shopify_source
+Products and collections and, opt-in, customers and orders, read through the
+GraphQL Admin API, synced incrementally with forget-on-delete. Hand the source
+to :func:`cognee.remember`::
 
     await cognee.remember(
-        shopify_source(),               # SHOPIFY_SHOP + credentials from env
+        shopify_source(),  # SHOPIFY_SHOP + credentials from env
         dataset_name="shopify",
         primary_key="id",
-        write_disposition="merge",   # incremental upsert by row id
-        max_rows_per_table=0,        # 0 = no row cap
+        write_disposition="merge",
+        max_rows_per_table=0,
     )
 
-Design
-------
-* **Auth**: a static Admin API access token, or an app's client id and secret
-  exchanged for a token at the start of every run (the client credentials
-  grant). The token lives in memory only: never in dlt state, files or logs.
-  A ``401`` refreshes it once; a second ``401`` stops the run. The connector
-  only reads.
-* **One GraphQL client** (``_graphql``): every request goes to
-  ``https://<shop>.myshopify.com/admin/``, waits out throttling from the cost
-  Shopify reports, and raises on a body of the wrong shape or a missing
-  ``pageInfo``, so an odd answer is never read as an empty listing.
-* **Documents**: one per product (``product:<id>``), collection
-  (``collection:<id>``) and, opt-in, customer (``customer:<id>``) and order
-  (``order:<id>``). The source declares ``cognee_document_source = "shopify"``,
-  so every row goes through normal cognify. Texts carry no timestamps, counters
-  or inventory, and every list in them is sorted.
-* **Incremental sync**: the sweep (every id with its ``updatedAt``) tells which
-  products and customers changed; only those are fetched in full. A collection
-  shows its products by title, so each collection is read every run and emitted
-  only when its text changed. An order shows its customer and products by name,
-  so it is re-rendered when one of them is renamed.
-* **Forget-on-delete**: the sweep is the authority. A known id missing from it
-  is forgotten only when Shopify confirms it is gone: a ``destroy`` event for
-  it, or ``nodes(ids:)`` answering ``null``. Otherwise it is kept and asked
-  about again next run. Orders are never swept (only the last 60 days are
-  visible, and ageing out is not a deletion); an order is forgotten only on its
-  ``destroy`` event.
-* **Safety**: every listing is finished before the first row is yielded, and
-  state is written only after the last one. A failed listing deletes nothing
-  and moves no cursor. An item that fails on its own keeps its document and is
-  retried next run; a ``401``, an exhausted throttle or several failures in a
-  row abort.
-* **Several sources in one dataset**: ``resource_name`` names the dlt table and
-  the sync state. Give each store its own name.
+The README describes what is stored, how changes and deletions are found, and
+what a run does when Shopify fails part of the way through.
 """
 
 from __future__ import annotations
@@ -62,9 +27,12 @@ from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from typing import Any
 
+import dlt
+import requests
 from cognee.shared.logging_utils import get_logger
 from cognee.tasks.ingestion import dlt_utils
 from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
+from dlt.common.normalizers.naming.snake_case import NamingConvention
 
 logger = get_logger("shopify_connector")
 
@@ -96,10 +64,17 @@ _TRANSIENT_STATUSES = (500, 502, 503, 504)
 # Longest single wait for the throttle bucket to refill. The standard bucket
 # holds 1,000 points and refills at 50 a second, so 20 s refills it entirely.
 _MAX_THROTTLE_WAIT_SECONDS = 20.0
-# Abort when this many items in a row fail on their own. One bad item is kept
-# and retried next run, but a streak means Shopify itself is failing, and every
-# further item would spend five retries for nothing.
-_MAX_FAILURES_IN_A_ROW = 3
+# The longest single wait of any kind. cognee holds its dlt staging lock during
+# a sync, so a longer Retry-After stops the run cleanly instead (it resumes next run).
+_MAX_WAIT_SECONDS = 60
+# Fresh item failures in a row (5xx or no answer, after retries) that mean
+# Shopify itself is down: the run stops cleanly. Items kept from an earlier run
+# never count.
+_OUTAGE_STREAK = 3
+# Runs an item may stay unreadable (403, ACCESS_DENIED, or null while still
+# listed) at the same listing stamp before its document is forgotten. It is
+# asked again once its stamp moves.
+_GIVE_UP_RUNS = 3
 
 # A product document lists at most this many variants (one page of them),
 # a collection at most this many products, then says how many more there are.
@@ -133,48 +108,70 @@ _ORDER_CHECK_MARGIN = timedelta(days=7)
 
 _SHOP_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
+_STAT_KEYS = ("scanned", "skipped", "failed", "deleted", "kept", "given_up")
+
 
 class ShopifyAPIError(RuntimeError):
-    """A non-retryable (or retries-exhausted) error from the Shopify API.
+    """An error from the Shopify API on ``endpoint`` (an operation name, or the token grant).
 
-    ``status`` is the HTTP status; a GraphQL ``errors`` answer has status 200.
-    ``rate_limited`` is True when the retries ran out while Shopify was still
-    throttling.
+    ``status`` is the HTTP status: 200 for a GraphQL ``errors`` answer (whose
+    ``code`` is set, such as ``ACCESS_DENIED``), 0 for no answer at all.
+    ``rate_limited`` is True when Shopify was still throttling. The message
+    names only the status or code and the endpoint, plus the connector's own
+    advice where it has some; Shopify's explanation is on ``detail``. A
+    response body or a credential is never in either.
     """
 
     def __init__(
-        self, status: int, message: str, rate_limited: bool = False, code: str | None = None
+        self,
+        status: int,
+        endpoint: str,
+        detail: str = "",
+        *,
+        rate_limited: bool = False,
+        code: str | None = None,
+        hint: str = "",
     ):
-        super().__init__(f"Shopify API returned {status}: {message}")
+        if status == 0:
+            answer = "no answer"
+        elif status == 200:
+            answer = code or "GraphQL error"
+        else:
+            answer = f"HTTP {status}"
+        super().__init__(f"Shopify {endpoint}: {answer}" + (f"; {hint}" if hint else ""))
         self.status = status
+        self.endpoint = endpoint
+        self.detail = detail
         self.rate_limited = rate_limited
-        # The GraphQL error code (extensions.code), such as ACCESS_DENIED.
         self.code = code
+        self.hint = hint
 
 
 class ShopifyQueryCostError(RuntimeError):
     """A query asked for more than Shopify's per-query cost limit (MAX_COST_EXCEEDED).
 
     It fails the same way every time, so it is neither retried nor kept per
-    item: the query itself must be made smaller.
+    item: the query itself must be made smaller. Shopify's text is on ``detail``.
     """
+
+    def __init__(self, operation: str, detail: str = ""):
+        super().__init__(f"Shopify refused the {operation} query as too costly")
+        self.detail = detail
 
 
 class ShopifyResponseError(RuntimeError):
-    """Shopify answered with a body that is not JSON or not of the expected shape."""
+    """Shopify answered with a body that is not JSON or not of the expected shape.
 
-
-class ShopifyUnavailableError(RuntimeError):
-    """Too many items in a row failed: Shopify is failing, not one item."""
-
-
-class ShopifySyncStoppedError(RuntimeError):
-    """The host's ``check_active`` raised an ``OSError``; the sync must stop.
-
-    Network errors are ``OSError`` too and are retried, or kept per item, so an
-    ``OSError`` from the host's check is re-raised as this type, which nothing
-    in the connector catches. Other exceptions from the check pass unchanged.
+    Never read as an empty listing or an item to skip: it aborts the run.
     """
+
+
+class _CutShortError(Exception):
+    """Internal: stop the run cleanly, keeping what was rendered so far."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
 
 
 # ---------------------------------------------------------------------------
@@ -203,7 +200,7 @@ query Product($id: ID!) {
 _COLLECTION_SWEEP = """
 query CollectionSweep($after: String) {
   collections(first: 250, after: $after, sortKey: ID) {
-    nodes { id }
+    nodes { id updatedAt }
     pageInfo { hasNextPage endCursor }
   }
 }
@@ -362,23 +359,27 @@ def _row_id(kind: str, gid: str) -> str:
 # ---------------------------------------------------------------------------
 # Auth and the GraphQL client
 # ---------------------------------------------------------------------------
-def _make_session() -> Any:
+def _make_session() -> requests.Session:
     """A plain ``requests`` session. Credentials go per request, never on it."""
-    try:
-        import requests
-    except ImportError as exc:  # pragma: no cover - requests is a declared dependency
-        raise ImportError(
-            'The Shopify connector requires "requests". Install the package:\n'
-            "    pip install cognee-community-connector-shopify"
-        ) from exc
     return requests.Session()
+
+
+def _check_secret(value: str, what: str) -> None:
+    """Refuse a credential ``requests`` would reject, without ever echoing it.
+
+    A pasted token often ends in a newline; requests then raises an error whose
+    message holds the whole header, token included.
+    """
+    if any(char.isspace() or not char.isprintable() for char in value):
+        raise ValueError(f"The Shopify {what} contains whitespace or control characters")
 
 
 class _Client:
     """One run's connection to a shop: the token, the throttle state, the session.
 
     The token is held here and only here. It is never logged, never put in an
-    exception message and never written to state.
+    exception message and never written to state. ``check_active`` is asked
+    before every request and every wait.
     """
 
     def __init__(
@@ -388,6 +389,7 @@ class _Client:
         access_token: str | None,
         client_id: str | None,
         client_secret: str | None,
+        check_active: Callable[[], None] | None = None,
     ):
         self.session = session
         self.shop = shop
@@ -395,6 +397,7 @@ class _Client:
         self._client_id = client_id
         self._client_secret = client_secret
         self._token: str | None = access_token
+        self.check_active = check_active
         # The bucket as Shopify last reported it: (available, restore rate per s).
         self._bucket: tuple[float, float] | None = None
         # The API version Shopify said it served (X-Shopify-API-Version), and the
@@ -413,6 +416,14 @@ class _Client:
     def can_refresh(self) -> bool:
         return self._static_token is None
 
+    def check(self) -> None:
+        if self.check_active is not None:
+            self.check_active()
+
+    def wait(self, seconds: float) -> None:
+        self.check()
+        time.sleep(seconds)
+
     def token(self) -> str:
         if self._token is None:
             self._token = self._fetch_token()
@@ -423,21 +434,23 @@ class _Client:
 
     def _fetch_token(self) -> str:
         """The client credentials grant: exchange the app's id and secret for a token."""
-        response = self.session.post(
-            _admin_url(self.shop, "oauth/access_token"),
-            data={
-                "grant_type": "client_credentials",
-                "client_id": self._client_id,
-                "client_secret": self._client_secret,
-            },
-            headers={"Accept": "application/json"},
-            timeout=_TIMEOUT_SECONDS,
-        )
-        if response.status_code != 200:
-            raise ShopifyAPIError(
-                response.status_code,
-                f"the client credentials grant was refused ({_grant_error(response)})",
+        endpoint = "oauth/access_token"
+        self.check()
+        try:
+            response = self.session.post(
+                _admin_url(self.shop, endpoint),
+                data={
+                    "grant_type": "client_credentials",
+                    "client_id": self._client_id,
+                    "client_secret": self._client_secret,
+                },
+                headers={"Accept": "application/json"},
+                timeout=_TIMEOUT_SECONDS,
             )
+        except requests.RequestException as exc:
+            raise ShopifyAPIError(0, endpoint, type(exc).__name__) from None
+        if response.status_code != 200:
+            raise ShopifyAPIError(response.status_code, endpoint, _grant_error(response))
         token = _json_object(response).get("access_token")
         if not isinstance(token, str) or not token:
             raise ShopifyResponseError("the client credentials answer carried no access_token")
@@ -452,7 +465,7 @@ class _Client:
             return
         wait = min((cost - available) / rate, _MAX_THROTTLE_WAIT_SECONDS)
         logger.info("Shopify: waiting %.1fs for the query cost budget.", wait)
-        time.sleep(wait)
+        self.wait(wait)
         self._bucket = None
 
     def note_version(self, response: Any) -> None:
@@ -484,20 +497,21 @@ class _Client:
 
 
 def _grant_error(response: Any) -> str:
-    """Shopify's ``error`` code from a refused grant, never any credential."""
+    """Shopify's ``error`` code from a refused grant (``invalid_client``), or nothing."""
     try:
-        body = response.json()
-        return str(body.get("error") or body.get("errors") or "no detail")[:120]
+        error = response.json().get("error")
     except (ValueError, AttributeError):
-        return "no detail"
+        return ""
+    return error[:120] if isinstance(error, str) else ""
 
 
 def _json_object(response: Any) -> dict:
     """The JSON object of an answer; anything else raises."""
     try:
         body = response.json()
-    except ValueError as exc:
-        raise ShopifyResponseError(f"Shopify answered {response.status_code} without JSON") from exc
+    except ValueError:
+        status = response.status_code
+        raise ShopifyResponseError(f"Shopify answered {status} without JSON") from None
     if not isinstance(body, dict):
         raise ShopifyResponseError(
             f"Shopify answered {response.status_code} with a {type(body).__name__}, not an object"
@@ -526,15 +540,18 @@ def _graphql(client: _Client, query: str, variables: dict) -> tuple[dict, dateti
     Waits for the throttle bucket before sending. On ``401`` the token is
     refreshed once (client credentials only) and the query repeated; a second
     ``401`` raises. ``429``, a ``THROTTLED`` error, 5xx answers and network
-    errors are retried up to ``_MAX_RETRIES`` times. Any other ``errors`` entry
-    raises, even with HTTP 200, and so does a body without a ``data`` object.
+    errors are retried up to ``_MAX_RETRIES`` times; a wait over
+    ``_MAX_WAIT_SECONDS`` is not taken. Any other ``errors`` entry raises, even
+    with HTTP 200, and so does a body without a ``data`` object.
     """
+    operation = _operation(query)
     client.wait_for(_COSTS.get(query, 100))
     url = _admin_url(client.shop, f"api/{_API_VERSION}/graphql.json")
     refreshed = False
     attempt = 0
     while True:
         last_attempt = attempt >= _MAX_RETRIES - 1
+        client.check()
         try:
             response = client.session.post(
                 url,
@@ -546,13 +563,15 @@ def _graphql(client: _Client, query: str, variables: dict) -> tuple[dict, dateti
                 },
                 timeout=_TIMEOUT_SECONDS,
             )
-        except OSError as exc:
-            # requests' connection and timeout errors all derive from OSError.
+        except requests.RequestException as exc:
+            # Only the type: the message of some requests errors holds a header.
             if last_attempt:
-                raise
+                raise ShopifyAPIError(0, operation, type(exc).__name__) from None
             delay = float(2**attempt)
-            logger.warning("Shopify: %s; retrying in %.1fs.", type(exc).__name__, delay)
-            time.sleep(delay)
+            logger.warning(
+                "Shopify: %s on %s; retrying in %.0fs.", type(exc).__name__, operation, delay
+            )
+            client.wait(delay)
             attempt += 1
             continue
 
@@ -563,44 +582,47 @@ def _graphql(client: _Client, query: str, variables: dict) -> tuple[dict, dateti
                 client.refresh()
                 refreshed = True
                 continue
-            raise ShopifyAPIError(401, "the access token was refused")
+            raise ShopifyAPIError(401, operation)
         if status == 429 or status in _TRANSIENT_STATUSES:
             if last_attempt:
-                raise ShopifyAPIError(status, "still failing after retries", status == 429)
+                raise ShopifyAPIError(status, operation, rate_limited=status == 429)
             delay = _retry_after(response, attempt)
-            logger.warning("Shopify: HTTP %d; retrying in %.1fs.", status, delay)
-            time.sleep(delay)
+            if delay > _MAX_WAIT_SECONDS:
+                raise ShopifyAPIError(
+                    status, operation, f"asked to wait {delay:.0f}s", rate_limited=status == 429
+                )
+            logger.warning("Shopify: HTTP %d on %s; retrying in %.0fs.", status, operation, delay)
+            client.wait(delay)
             attempt += 1
             continue
         if status != 200:
-            raise ShopifyAPIError(status, _error_text(response))
+            raise ShopifyAPIError(status, operation, _error_text(response))
 
         body = _json_object(response)
         client.note_version(response)
         if client.server_now is None:
             client.server_now = _server_time(response)
-        client.note_cost(body.get("extensions"), _operation(query))
+        client.note_cost(body.get("extensions"), operation)
         errors = body.get("errors")
         if errors:
             if "MAX_COST_EXCEEDED" in _error_codes(errors):
-                raise ShopifyQueryCostError(
-                    f"Shopify refused the {_operation(query)} query as too costly; "
-                    f"{_errors_text(errors)}"
-                )
+                raise ShopifyQueryCostError(operation, _errors_text(errors))
             if _is_throttled(errors):
                 if last_attempt:
-                    raise ShopifyAPIError(200, "THROTTLED after retries", rate_limited=True)
+                    raise ShopifyAPIError(200, operation, rate_limited=True, code="THROTTLED")
                 if client.has_budget_figures:
                     client.wait_for(_COSTS.get(query, 100))
                 else:  # no budget figures to wait on: back off instead
-                    time.sleep(float(2**attempt))
+                    client.wait(float(2**attempt))
                 attempt += 1
                 continue
             codes = _error_codes(errors)
-            raise ShopifyAPIError(200, _errors_text(errors), code=codes[0] if codes else None)
+            raise ShopifyAPIError(
+                200, operation, _errors_text(errors), code=codes[0] if codes else None
+            )
         data = body.get("data")
         if not isinstance(data, dict):
-            raise ShopifyResponseError("Shopify's answer has no data object")
+            raise ShopifyResponseError(f"Shopify's answer to {operation} has no data object")
         return data, _server_time(response)
 
 
@@ -634,10 +656,12 @@ def _errors_text(errors: Any) -> str:
 
 
 def _error_text(response: Any) -> str:
+    """Shopify's ``errors`` of an error answer, or nothing. Never the raw body."""
     try:
-        return _errors_text(response.json().get("errors"))
+        errors = response.json().get("errors")
     except (ValueError, AttributeError):
-        return str(getattr(response, "text", ""))[:200]
+        return ""
+    return _errors_text(errors) if errors else ""
 
 
 def _connection(data: dict, field: str) -> tuple[list[dict], str | None]:
@@ -674,11 +698,14 @@ def _list_all(client: _Client, query: str, field: str, variables: dict | None = 
 
 
 def _single(client: _Client, query: str, field: str, gid: str) -> tuple[dict, datetime | None]:
-    """One object by id; ``null`` (gone between the sweep and now) raises like any failure."""
+    """One object by id. ``null`` raises a ``NOT_FOUND`` :class:`ShopifyAPIError`."""
     data, fetched_at = _graphql(client, query, {"id": gid})
     item = data.get(field)
+    if item is None:
+        # Still listed, yet not found: not proof it is gone (see _Run._failed).
+        raise ShopifyAPIError(200, _operation(query), f"no {field}", code="NOT_FOUND")
     if not isinstance(item, dict):
-        raise ShopifyResponseError(f"Shopify answered no {field} for {gid}")
+        raise ShopifyResponseError(f"Shopify answered a {field} that is not an object")
     return item, fetched_at
 
 
@@ -883,48 +910,6 @@ def _is_settled(updated_at: str, fetched_at: datetime | None) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Per-item failures
-# ---------------------------------------------------------------------------
-class _ItemFailures:
-    """The items of one run that failed on their own and are kept for a retry.
-
-    Only per-item failures are kept: a :class:`ShopifyAPIError`, a
-    :class:`ShopifyResponseError` or an ``OSError`` that outlasted the retries.
-    A ``401`` (after the one refresh) or an exhausted throttle would fail every
-    later item the same way, so it is re-raised, and so is the
-    ``_MAX_FAILURES_IN_A_ROW``-th failure in a row. Anything else
-    (``check_active``'s errors among them) is never caught in the first place.
-    """
-
-    def __init__(self) -> None:
-        self.in_a_row = 0
-        self.kept = 0
-
-    def keep(self, exc: Exception, what: str) -> None:
-        """Count a per-item failure and log it, or raise if it is systemic."""
-        if isinstance(exc, ShopifyAPIError) and (exc.status == 401 or exc.rate_limited):
-            raise exc
-        self.in_a_row += 1
-        if self.in_a_row >= _MAX_FAILURES_IN_A_ROW:
-            raise ShopifyUnavailableError(
-                f"{self.in_a_row} items in a row failed, the last {what}; stopping"
-            ) from exc
-        why = f"HTTP {exc.status}" if isinstance(exc, ShopifyAPIError) else type(exc).__name__
-        self.note_kept(what, why)
-
-    def note_kept(self, what: str, why: str) -> None:
-        self.kept += 1
-        logger.warning("Shopify: kept %s for a retry next run (%s).", what, why)
-
-    def succeeded(self) -> None:
-        self.in_a_row = 0
-
-
-# What a per-item request can fail with once the retries are spent.
-_ITEM_ERRORS = (ShopifyAPIError, ShopifyResponseError, OSError)
-
-
-# ---------------------------------------------------------------------------
 # Deletions
 # ---------------------------------------------------------------------------
 def _destroyed(client: _Client, cursor: str) -> tuple[dict[str, set[str]], str]:
@@ -938,13 +923,14 @@ def _destroyed(client: _Client, cursor: str) -> tuple[dict[str, set[str]], str]:
     try:
         return _read_destroyed(client, cursor)
     except ShopifyAPIError as exc:
+        # Unlike data queries, no answer here is read as content or as gone; events
+        # are only a hint, nodes() still confirms, so a denial is a warning, not an abort.
         if exc.status != 403 and exc.code != "ACCESS_DENIED":
             raise
         logger.warning(
-            "Shopify: the token may not read events (HTTP %d, %s); deletions are confirmed "
+            "Shopify: the token may not read events (%s); deletions are confirmed "
             "through nodes() only.",
-            exc.status,
-            exc.code or "no code",
+            exc,
         )
         return {}, cursor
 
@@ -967,265 +953,463 @@ def _read_destroyed(client: _Client, cursor: str) -> tuple[dict[str, set[str]], 
     return found, str(newest)
 
 
-def _confirm_gone(
-    client: _Client,
-    missing: list[str],
-    destroyed: set[str],
-    failures: _ItemFailures,
-) -> set[str]:
-    """Which of the ``missing`` row ids are confirmed gone: a destroy event or a null node.
+def _is_unreadable(exc: ShopifyAPIError) -> bool:
+    """A 404 or a null for an item that is still listed: kept, never proof of deletion."""
+    return exc.status == 404 or exc.code == "NOT_FOUND"
 
-    An id that still resolves, or that cannot be checked, is kept and asked
-    about again next run.
+
+def _raise_if_access_denied(exc: ShopifyAPIError) -> None:
+    """A GraphQL ACCESS_DENIED is the app's field access or scopes, never one item: abort.
+
+    Treating it per item would forget every item of that kind after a few runs.
     """
-    gone = {row_id for row_id in missing if row_id in destroyed}
-    unknown = [row_id for row_id in missing if row_id not in gone]
-    null, resolving = _null_nodes(client, unknown, failures)
-    for row_id in resolving:
-        failures.note_kept(row_id, "missing from the listing but still resolving")
-    return gone | null
-
-
-def _null_nodes(
-    client: _Client, row_ids: list[str], failures: _ItemFailures
-) -> tuple[set[str], list[str]]:
-    """Ask ``nodes(ids:)`` about ``row_ids``: those answering null, and those resolving.
-
-    A batch that fails is kept (in neither result) and asked about next run.
-    """
-    null: set[str] = set()
-    resolving: list[str] = []
-    for start in range(0, len(row_ids), _NODES_BATCH):
-        batch = row_ids[start : start + _NODES_BATCH]
-        gids = [_gid(*row_id.split(":", 1)) for row_id in batch]
-        try:
-            data, _ = _graphql(client, _NODES, {"ids": gids})
-            nodes = data.get("nodes")
-            if not isinstance(nodes, list) or len(nodes) != len(gids):
-                raise ShopifyResponseError("nodes(ids:) did not answer one entry per id")
-        except _ITEM_ERRORS as exc:
-            failures.keep(exc, f"{len(batch)} id(s) to check")
-            continue
-        failures.succeeded()
-        for row_id, node in zip(batch, nodes, strict=True):
-            if node is None:
-                null.add(row_id)
-            else:
-                resolving.append(row_id)
-    return null, resolving
+    if exc.code != "ACCESS_DENIED" or exc.hint:
+        return
+    field = re.search(r"use the (\w+) field", exc.detail or "")
+    what = f"the {field.group(1)} field" if field else "a field this query asks for"
+    raise ShopifyAPIError(
+        exc.status,
+        exc.endpoint,
+        exc.detail,
+        code=exc.code,
+        hint=f"the app may not read {what}; check the app's scopes and protected customer "
+        "data fields in the Dev Dashboard",
+    ) from None
 
 
 # ---------------------------------------------------------------------------
 # Sync (pure given a client + state dict, so it is unit-testable)
 # ---------------------------------------------------------------------------
+class _Run:
+    """One sync of the selected resources; ``state`` changes only at the end.
+
+    State: ``known_ids`` (row ids emitted and current), ``stamps`` (product or
+    customer row id -> ``updatedAt`` of its settled copy, ``""`` to fetch it
+    again), ``texts`` (collection or order row id -> hash of its last text),
+    ``orders`` (order row id -> the gids it shows by name and a hash of those
+    names), ``retry`` (items kept after a failure), ``unreadable`` (row id ->
+    ``{stamp, runs}``), ``given_up`` (row id -> the stamp at which an unreadable
+    item was forgotten), ``order_cursor`` and the destroy ``event_cursor``.
+    """
+
+    def __init__(
+        self,
+        client: _Client,
+        state: dict,
+        stats: dict[str, int],
+        selected: list[str],
+        now: datetime | None,
+    ):
+        self.client = client
+        self.state = state
+        self.stats = stats
+        self.selected = selected
+        self.now = now
+        self.known_ids: set[str] = set(state.get("known_ids", []))
+        self.stamps: dict[str, str] = dict(state.get("stamps", {}))
+        self.texts: dict[str, str] = dict(state.get("texts", {}))
+        self.order_refs: dict[str, dict] = dict(state.get("orders", {}))
+        self.retry: set[str] = set(state.get("retry", []))
+        self.unreadable: dict[str, dict] = {
+            row_id: dict(entry) for row_id, entry in state.get("unreadable", {}).items()
+        }
+        self.given_up: dict[str, str] = dict(state.get("given_up", {}))
+        self.event_cursor: str = state.get("event_cursor", "")
+        self.order_cursor: str = state.get("order_cursor", "")
+        self.titles: dict[str, str] = {}
+        self.names: dict[str, str] = {}
+        self.listing: dict[str, str] = {}  # row id -> its listing stamp this run
+        self.current_ids: set[str] = set()
+        self.order_rows: list[dict] = []
+        self.refetched: dict[str, dict] = {}
+        self.work: list[tuple[str, str, str]] = []  # (kind, row id, gid): fresh first
+        self.position = 0  # index in ``work`` of the next item to fetch
+        self.kept: set[str] = set()  # failed on its own this run
+        self.ambiguous: set[str] = set()  # missing from the sweep, still resolving
+        self.rendered: set[str] = set()
+        self.fetched_kinds: set[str] = set()  # kinds with a successful fetch this run
+        self.forbidden: dict[str, list[str]] = {}  # kind -> row ids answering HTTP 403
+        self.outage = 0
+        self.listed = False
+
+    # -- 1. List ---------------------------------------------------------------
+    def list(self) -> None:
+        selected = self.selected
+        # Products are swept whenever collections or orders need their titles.
+        need_products = {"products", "collections", "orders"} & set(selected)
+        products = _list_all(self.client, _PRODUCT_SWEEP, "products") if need_products else []
+        self.titles = {p["id"]: _text(p.get("title")) for p in products}
+        collections = (
+            _list_all(self.client, _COLLECTION_SWEEP, "collections")
+            if "collections" in selected
+            else []
+        )
+        customers = _customer_sweep(self.client) if "customers" in selected else []
+        self.names = {c["id"]: _text(c.get("displayName")) for c in customers}
+        destroyed, self.event_cursor = _destroyed(self.client, self.event_cursor)
+
+        swept: dict[str, list[dict]] = {
+            "product": products if "products" in selected else [],
+            "collection": collections,
+            "customer": customers,
+        }
+        for kind, items in swept.items():
+            for item in items:
+                self.listing[_row_id(kind, item["id"])] = _text(item.get("updatedAt"))
+        self.current_ids = set(self.listing)
+        swept_count = len(self.listing)
+        kinds_swept = {"product": "products", "collection": "collections", "customer": "customers"}
+        missing = sorted(
+            row_id
+            for row_id in self.known_ids - self.current_ids
+            if kinds_swept.get(row_id.split(":", 1)[0]) in selected
+        )
+        all_destroyed = set().union(*destroyed.values()) if destroyed else set()
+        self.current_ids |= set(missing) - self._confirm_gone(missing, all_destroyed)
+
+        renamed: list[str] = []
+        if "orders" in selected:
+            renamed = self._list_orders(destroyed.get("order", set()))
+
+        work: list[tuple[str, str, str]] = []
+        for kind in ("product", "customer", "collection"):
+            for item in swept[kind]:
+                row_id = _row_id(kind, item["id"])
+                unchanged = self.stamps.get(row_id) == item.get("updatedAt")
+                if kind != "collection" and unchanged and row_id in self.known_ids:
+                    continue
+                work.append((kind, row_id, item["id"]))
+        work += [("order", row_id, _gid(*row_id.split(":", 1))) for row_id in renamed]
+        # A forgotten unreadable item is asked again only once its stamp moves.
+        for row_id, stamp in list(self.given_up.items()):
+            if row_id not in self.listing:
+                del self.given_up[row_id]
+            elif self.listing[row_id] == stamp:
+                self.current_ids.discard(row_id)
+            else:
+                del self.given_up[row_id]
+        work = [w for w in work if w[1] not in self.given_up]
+        self.retry &= {row_id for _, row_id, _ in work}
+        self.work = [w for w in work if w[1] not in self.retry] + [
+            w for w in work if w[1] in self.retry
+        ]
+        self.stats["scanned"] = swept_count + len(self.order_rows)
+        self.listed = True
+
+    def _list_orders(self, destroyed: set[str]) -> list[str]:
+        """List changed orders, find deleted ones, and return the unlisted ones to re-fetch."""
+        self.now = self.now or _shop_now(self.client)
+        query = None
+        if self.order_cursor:
+            since = datetime.fromisoformat(self.order_cursor) - _ORDER_OVERLAP
+            query = f"updated_at:>='{_stamp(since)}'"
+        self.order_rows = _list_all(self.client, _ORDERS, "orders", {"query": query})
+        listed_ids = {_row_id("order", order["id"]) for order in self.order_rows}
+        # Orders are never swept: a known one stays current until confirmed deleted.
+        self.current_ids |= {row_id for row_id in self.known_ids if row_id.startswith("order:")}
+        self.current_ids |= listed_ids
+        self.current_ids -= destroyed
+        # Deleting an order leaves no destroy event (seen live), so each known
+        # order not listed this run is asked about by id while it is at least
+        # _ORDER_CHECK_MARGIN inside the window; a null answer means it was
+        # deleted. Older orders are kept: null could mean they aged out.
+        checkable = _stamp(self.now - _ORDER_WINDOW + _ORDER_CHECK_MARGIN)
+        unlisted = sorted(
+            row_id
+            for row_id, refs in self.order_refs.items()
+            if row_id in self.current_ids
+            and row_id not in listed_ids
+            and refs.get("created", "") >= checkable
+        )
+        deleted_orders, _ = self._null_nodes(unlisted)
+        self.current_ids -= deleted_orders
+        # An order shows its customer and products by name. One that was not
+        # listed this run (unchanged) is fetched again when a name it shows
+        # changed: its stored references are checked against this run's sweeps.
+        renamed = []
+        for row_id, refs in sorted(self.order_refs.items()):
+            names_now = _names_hash(refs.get("ids") or [], self.names, self.titles)
+            stale = refs.get("names") != names_now
+            if row_id in self.current_ids and row_id not in listed_ids and stale:
+                self.listing[row_id] = names_now
+                renamed.append(row_id)
+        return renamed
+
+    def _confirm_gone(self, missing: list[str], destroyed: set[str]) -> set[str]:
+        """Which ``missing`` row ids are confirmed gone: a destroy event or a null node.
+
+        One that still resolves is kept and asked about again next run; after
+        ``_GIVE_UP_RUNS`` runs in a row it is forgotten (it left the sweep).
+        """
+        gone = {row_id for row_id in missing if row_id in destroyed}
+        null, resolving = self._null_nodes([row_id for row_id in missing if row_id not in gone])
+        for row_id in resolving:
+            self.ambiguous.add(row_id)
+            self._count_unreadable(row_id, "missing")
+            logger.warning(
+                "Shopify: kept %s for a retry next run (missing from the listing but "
+                "still resolving).",
+                row_id,
+            )
+        return gone | null
+
+    def _null_nodes(self, row_ids: list[str]) -> tuple[set[str], list[str]]:
+        """Ask ``nodes(ids:)`` about ``row_ids``: those answering null, and those resolving.
+
+        A batch that fails is kept (in neither result) and asked about next run.
+        """
+        null: set[str] = set()
+        resolving: list[str] = []
+        for start in range(0, len(row_ids), _NODES_BATCH):
+            batch = row_ids[start : start + _NODES_BATCH]
+            gids = [_gid(*row_id.split(":", 1)) for row_id in batch]
+            try:
+                data, _ = _graphql(self.client, _NODES, {"ids": gids})
+            except ShopifyAPIError as exc:
+                self.stats["failed"] += 1
+                self.stop_if_systemic(exc)
+                _raise_if_access_denied(exc)
+                if exc.status == 401:
+                    raise
+                logger.warning("Shopify: could not check %d id(s) (%s).", len(batch), exc)
+                continue
+            nodes = data.get("nodes")
+            if not isinstance(nodes, list) or len(nodes) != len(gids):
+                raise ShopifyResponseError("nodes(ids:) did not answer one entry per id")
+            for row_id, node in zip(batch, nodes, strict=True):
+                if node is None:
+                    null.add(row_id)
+                else:
+                    resolving.append(row_id)
+        return null, resolving
+
+    # -- 2. Render -------------------------------------------------------------
+    def render(self) -> Iterator[dict[str, Any]]:
+        for index, (kind, row_id, gid) in enumerate(self.work):
+            self.position = index
+            try:
+                row = self._fetch(kind, row_id, gid)
+            except ShopifyAPIError as exc:
+                self._failed(kind, row_id, exc)
+                continue
+            if row_id not in self.retry:
+                self.outage = 0
+            self.unreadable.pop(row_id, None)
+            self.fetched_kinds.add(kind)
+            if row is not None:
+                self.rendered.add(row_id)
+                yield row
+        self.position = len(self.work)
+        if "orders" in self.selected:
+            yield from self._order_rows()
+
+    def _fetch(self, kind: str, row_id: str, gid: str) -> dict[str, Any] | None:
+        """Fetch one item in full and return its row (``None``: nothing to emit)."""
+        if kind in ("product", "customer"):
+            query = _PRODUCT if kind == "product" else _CUSTOMER
+            full, fetched_at = _single(self.client, query, kind, gid)
+            settled = _is_settled(_text(full.get("updatedAt")), fetched_at)
+            self.stamps[row_id] = _text(full.get("updatedAt")) if settled else ""
+            if kind == "product":
+                url, content = _text(full.get("onlineStoreUrl")), _render_product(full)
+                return _row(row_id, _text(full.get("title")), url, content)
+            return _row(row_id, _text(full.get("displayName")), "", _render_customer(full))
+        if kind == "collection":
+            # Read every run: its text shows its members by title, and neither a
+            # membership change nor a product rename shows in the listing.
+            full, _ = _single(self.client, _COLLECTION, "collection", gid)
+            content = _render_collection(full, self.titles)
+            if self.texts.get(row_id) == _hash(content) and row_id in self.known_ids:
+                return None
+            self.texts[row_id] = _hash(content)
+            return _row(row_id, _text(full.get("title")), "", content)
+        self.refetched[row_id], _ = _single(self.client, _ORDER, "order", gid)
+        return None
+
+    def _order_rows(self) -> Iterator[dict[str, Any]]:
+        listed = {_row_id("order", order["id"]): order for order in self.order_rows}
+        listed.update(self.refetched)
+        for row_id, order in sorted(listed.items()):
+            if row_id not in self.current_ids:
+                continue  # given up after being unreadable
+            content = _render_order(order, self.names, self.titles)
+            ids = _flat_refs(order)
+            self.order_refs[row_id] = {
+                "created": _text(order.get("createdAt")),
+                "ids": ids,
+                "names": _names_hash(ids, self.names, self.titles),
+            }
+            if self.texts.get(row_id) == _hash(content) and row_id in self.known_ids:
+                continue
+            self.texts[row_id] = _hash(content)
+            self.rendered.add(row_id)
+            yield _row(row_id, _text(order.get("name")), "", content)
+        if self.order_rows:
+            stamps = (_text(o.get("updatedAt")) for o in self.order_rows)
+            self.order_cursor = max([self.order_cursor, *stamps])
+        # References are kept only while the order can still be read again.
+        oldest = _stamp(self.now - _ORDER_WINDOW)
+        self.order_refs = {
+            k: v for k, v in self.order_refs.items() if v.get("created", "") >= oldest
+        }
+
+    def _failed(self, kind: str, row_id: str, exc: ShopifyAPIError) -> None:
+        """Keep an item that failed on its own, or stop if Shopify as a whole is failing."""
+        self.stats["failed"] += 1
+        self.stop_if_systemic(exc)
+        _raise_if_access_denied(exc)
+        if exc.status == 401:
+            raise exc  # nothing rendered yet: the credentials are bad
+        self.kept.add(row_id)
+        if kind in ("product", "customer"):
+            self.stamps[row_id] = ""  # the old document stays, and is fetched next run
+        elif kind == "collection":
+            self.texts[row_id] = ""
+        logger.warning("Shopify: kept %s for a retry next run (%s).", row_id, exc)
+        if exc.status == 403:
+            # Counted only once the run shows others of its kind can be read (_settle_403s).
+            self.forbidden.setdefault(kind, []).append(row_id)
+        elif _is_unreadable(exc):
+            self._count_unreadable(row_id, self.listing.get(row_id, ""))
+        elif row_id not in self.retry and (exc.status == 0 or exc.status in _TRANSIENT_STATUSES):
+            self.outage += 1
+            if self.outage >= _OUTAGE_STREAK:
+                raise _CutShortError("unavailable")
+
+    def _count_unreadable(self, row_id: str, stamp: str) -> None:
+        entry = self.unreadable.get(row_id) or {}
+        runs = entry.get("runs", 0) + 1 if entry.get("stamp") == stamp else 1
+        self.unreadable[row_id] = {"stamp": stamp, "runs": runs}
+
+    def _settle_403s(self) -> None:
+        """Count a 403 toward give-up only if another item of its kind was read this run.
+
+        When every fetch of a kind answered 403, the token lost a permission: nothing
+        moves toward forgetting, and one warning per kind says so.
+        """
+        for kind, row_ids in sorted(self.forbidden.items()):
+            if kind in self.fetched_kinds:
+                for row_id in row_ids:
+                    self._count_unreadable(row_id, self.listing.get(row_id, ""))
+                continue
+            self.stats["failed_permission"] = self.stats.get("failed_permission", 0) + len(row_ids)
+            logger.warning(
+                "Shopify: %s: every fetch answered 403 this run; check the token's permissions.",
+                kind,
+            )
+        self.forbidden = {}
+
+    def stop_if_systemic(self, exc: ShopifyAPIError) -> None:
+        if exc.rate_limited:
+            raise _CutShortError("rate_limit") from None
+        if exc.status == 401 and self.rendered:
+            raise _CutShortError("auth") from None
+
+    # -- 3. Delete and 4. Commit ------------------------------------------------
+    def finish(self) -> Iterator[dict[str, Any]]:
+        self._settle_403s()
+        for row_id, entry in self.unreadable.items():
+            if row_id in self.kept | self.ambiguous and entry["runs"] >= _GIVE_UP_RUNS:
+                logger.warning(
+                    "Shopify: %s stayed unreadable for %d runs; its document is forgotten "
+                    "until it changes.",
+                    row_id,
+                    entry["runs"],
+                )
+                if row_id in self.listing and entry["stamp"] != "missing":
+                    self.given_up[row_id] = entry["stamp"]
+                self.kept.discard(row_id)
+                self.ambiguous.discard(row_id)
+                self.current_ids.discard(row_id)
+                self.stats["given_up"] += 1
+        deleted = sorted(self.known_ids - self.current_ids)
+        for row_id in deleted:
+            yield _deleted_row(row_id)
+        self.stats["deleted"] = len(deleted)
+        self._commit(self.current_ids, self.kept)
+        self.state["event_cursor"] = self.event_cursor
+        self.state["order_cursor"] = self.order_cursor
+
+    def commit_progress(self) -> None:
+        """After a clean stop: keep what was rendered, delete nothing, move no cursor.
+
+        Products and customers not reached keep their old stamp and collections
+        are read every run, so the next run finds them again; orders and destroy
+        events are listed again from the unchanged cursors.
+        """
+        if not self.listed:
+            return  # stopped while listing: nothing moved
+        self._settle_403s()
+        rest = {row_id for _, row_id, _ in self.work[self.position :]}
+        self._commit(self.known_ids | self.rendered, self.kept | (self.retry & rest), rest)
+
+    def _commit(self, current_ids: set[str], retry: set[str], rest: Iterable[str] = ()) -> None:
+        unsettled = retry | self.ambiguous | set(rest)
+        self.state["known_ids"] = sorted(current_ids)
+        self.state["stamps"] = {k: v for k, v in sorted(self.stamps.items()) if k in current_ids}
+        self.state["texts"] = {k: v for k, v in sorted(self.texts.items()) if k in current_ids}
+        self.state["orders"] = {
+            k: v for k, v in sorted(self.order_refs.items()) if k in current_ids
+        }
+        self.state["retry"] = sorted(retry)
+        self.state["unreadable"] = {
+            k: v for k, v in sorted(self.unreadable.items()) if k in unsettled
+        }
+        self.state["given_up"] = dict(sorted(self.given_up.items()))
+        self.stats["kept"] = len(retry | self.ambiguous)
+        failed_items = len(self.kept)
+        self.stats["skipped"] = max(
+            0, self.stats["scanned"] - len(self.rendered) - failed_items - len(self.given_up)
+        )
+
+
 def sync_store(
     client: _Client,
     state: dict,
     *,
     resources: Iterable[str] = DEFAULT_RESOURCES,
     now: datetime | None = None,
+    stats: dict[str, int] | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Yield changed documents since the last run, plus hard-delete markers.
 
-    ``state`` holds ``known_ids`` (every row id emitted and still current), a
-    ``stamps`` map (product or customer row id -> the ``updatedAt`` of its
-    settled copy, or ``""`` to fetch it again), a ``texts`` map (collection or
-    order row id -> hash of its last text, ``""`` to emit it again), ``orders``
-    (order row id -> the gids it shows by name and a hash of those names, for
-    orders inside the 60-day window), the ``order_cursor`` and the destroy
-    ``event_cursor``. Never a token. ``now`` (for tests) defaults to Shopify's
-    clock, read from the run's first answer.
-
-    1. *List.* The sweeps (all products, collections and, if selected,
-       customers), the destroy events and, for orders, the change listing.
-       Missing ids are confirmed gone or kept. A failed listing propagates
-       before a single row is yielded.
-    2. *Render.* Each changed product and customer, every collection (emitted
-       when its text changed), each changed order. One that fails on its own
-       keeps its old document and is retried next run.
+    1. *List.* The sweeps, the destroy events and, for orders, the change
+       listing. Missing ids are confirmed gone or kept. A failure here
+       propagates before a single row.
+    2. *Render.* Each changed item (fresh first, then retries), then the orders.
     3. *Delete.* A hard-delete marker for every confirmed deletion.
-    4. *Commit.* Only now write the new state.
+    4. *Commit.* Only now is ``state`` written. ``now`` (for tests) defaults to
+       Shopify's clock, read from the run's first answer.
+
+    A run stopped cleanly (a ``401`` after progress, a rate limit, an outage)
+    keeps what it rendered and deletes nothing; the next run picks up the rest.
     """
     selected = [r for r in RESOURCES if r in set(resources)]
-    known_ids: set[str] = set(state.get("known_ids", []))
-    stamps: dict[str, str] = dict(state.get("stamps", {}))
-    texts: dict[str, str] = dict(state.get("texts", {}))
-    order_refs: dict[str, dict] = dict(state.get("orders", {}))
-    failures = _ItemFailures()
-
-    # --- 1. List ------------------------------------------------------------
-    # Products are swept whenever collections or orders need their titles.
-    need_products = {"products", "collections", "orders"} & set(selected)
-    products = _list_all(client, _PRODUCT_SWEEP, "products") if need_products else []
-    titles = {p["id"]: _text(p.get("title")) for p in products}
-    collections = (
-        _list_all(client, _COLLECTION_SWEEP, "collections") if "collections" in selected else []
-    )
-    customers = _customer_sweep(client) if "customers" in selected else []
-    names = {c["id"]: _text(c.get("displayName")) for c in customers}
-    destroyed, event_cursor = _destroyed(client, state.get("event_cursor", ""))
-
-    swept: dict[str, list[dict]] = {
-        "product": products if "products" in selected else [],
-        "collection": collections,
-        "customer": customers if "customers" in selected else [],
-    }
-    current_ids: set[str] = set()
-    for kind, items in swept.items():
-        current_ids |= {_row_id(kind, item["id"]) for item in items}
-    kinds_swept = {"product": "products", "collection": "collections", "customer": "customers"}
-    missing = sorted(
-        row_id
-        for row_id in known_ids - current_ids
-        if kinds_swept.get(row_id.split(":", 1)[0]) in selected
-    )
-    all_destroyed = set().union(*destroyed.values()) if destroyed else set()
-    gone = _confirm_gone(client, missing, all_destroyed, failures)
-    current_ids |= set(missing) - gone
-
-    order_rows: list[dict] = []
-    order_cursor = state.get("order_cursor", "")
-    if "orders" in selected:
-        now = now or _shop_now(client)
-        query = None
-        if order_cursor:
-            since = datetime.fromisoformat(order_cursor) - _ORDER_OVERLAP
-            query = f"updated_at:>='{_stamp(since)}'"
-        order_rows = _list_all(client, _ORDERS, "orders", {"query": query})
-        # Orders are never swept: a known one stays current until confirmed deleted.
-        current_ids |= {row_id for row_id in known_ids if row_id.startswith("order:")}
-        current_ids |= {_row_id("order", order["id"]) for order in order_rows}
-        current_ids -= destroyed.get("order", set())
-        # Deleting an order leaves no destroy event (seen live), so each known
-        # order not listed this run is asked about by id while it is at least
-        # _ORDER_CHECK_MARGIN inside the window; a null answer means it was
-        # deleted. Older orders are kept: null could mean they aged out.
-        listed_ids = {_row_id("order", order["id"]) for order in order_rows}
-        checkable = _stamp(now - _ORDER_WINDOW + _ORDER_CHECK_MARGIN)
-        unlisted = sorted(
-            row_id
-            for row_id, refs in order_refs.items()
-            if row_id in current_ids
-            and row_id not in listed_ids
-            and refs.get("created", "") >= checkable
-        )
-        deleted_orders, _ = _null_nodes(client, unlisted, failures)
-        current_ids -= deleted_orders
-
-    # --- 2. Render ----------------------------------------------------------
-    rendered = 0
-    for product in swept["product"]:
-        row_id = _row_id("product", product["id"])
-        if stamps.get(row_id) == product.get("updatedAt") and row_id in known_ids:
-            continue
+    stats = {} if stats is None else stats
+    for key in _STAT_KEYS:
+        stats.setdefault(key, 0)
+    run = _Run(client, state, stats, selected, now)
+    try:
         try:
-            full, fetched_at = _single(client, _PRODUCT, "product", product["id"])
-        except _ITEM_ERRORS as exc:
-            failures.keep(exc, row_id)
-            stamps[row_id] = ""  # no row: the old document stays, and is fetched next run
-            continue
-        failures.succeeded()
-        settled = _is_settled(_text(full.get("updatedAt")), fetched_at)
-        stamps[row_id] = _text(full.get("updatedAt")) if settled else ""
-        rendered += 1
-        yield _row(
-            row_id,
-            _text(full.get("title")),
-            _text(full.get("onlineStoreUrl")),
-            _render_product(full),
-        )
-
-    for customer in swept["customer"]:
-        row_id = _row_id("customer", customer["id"])
-        if stamps.get(row_id) == customer.get("updatedAt") and row_id in known_ids:
-            continue
-        try:
-            full, fetched_at = _single(client, _CUSTOMER, "customer", customer["id"])
-        except _ITEM_ERRORS as exc:
-            failures.keep(exc, row_id)
-            stamps[row_id] = ""
-            continue
-        failures.succeeded()
-        settled = _is_settled(_text(full.get("updatedAt")), fetched_at)
-        stamps[row_id] = _text(full.get("updatedAt")) if settled else ""
-        rendered += 1
-        yield _row(row_id, _text(full.get("displayName")), "", _render_customer(full))
-
-    for collection in swept["collection"]:
-        # A collection is read every run: its text shows its members by title,
-        # and neither a membership change nor a product rename is visible in the
-        # collection listing. Emitted only when the text changed.
-        row_id = _row_id("collection", collection["id"])
-        try:
-            full, _ = _single(client, _COLLECTION, "collection", collection["id"])
-        except _ITEM_ERRORS as exc:
-            failures.keep(exc, row_id)
-            texts[row_id] = ""
-            continue
-        failures.succeeded()
-        content = _render_collection(full, titles)
-        if texts.get(row_id) == _hash(content) and row_id in known_ids:
-            continue
-        texts[row_id] = _hash(content)
-        rendered += 1
-        yield _row(row_id, _text(full.get("title")), "", content)
-
-    if "orders" in selected:
-        listed = {_row_id("order", order["id"]): order for order in order_rows}
-        # An order shows its customer and products by name. One that was not
-        # listed this run (unchanged) is fetched again when a name it shows
-        # changed: its stored references are checked against this run's sweeps.
-        renamed = sorted(
-            row_id
-            for row_id, refs in order_refs.items()
-            if row_id not in listed
-            and row_id in current_ids
-            and refs.get("names") != _names_hash(refs.get("ids") or [], names, titles)
-        )
-        for row_id in renamed:
-            try:
-                listed[row_id], _ = _single(client, _ORDER, "order", _gid(*row_id.split(":", 1)))
-            except _ITEM_ERRORS as exc:
-                failures.keep(exc, row_id)
-                continue
-            failures.succeeded()
-        for row_id, order in sorted(listed.items()):
-            content = _render_order(order, names, titles)
-            ids = _flat_refs(order)
-            order_refs[row_id] = {
-                "created": _text(order.get("createdAt")),
-                "ids": ids,
-                "names": _names_hash(ids, names, titles),
-            }
-            if texts.get(row_id) == _hash(content) and row_id in known_ids:
-                continue
-            texts[row_id] = _hash(content)
-            rendered += 1
-            yield _row(row_id, _text(order.get("name")), "", content)
-        if order_rows:
-            order_cursor = max([order_cursor, *(_text(o.get("updatedAt")) for o in order_rows)])
-        # References are kept only while the order can still be read again.
-        oldest = _stamp(now - _ORDER_WINDOW)
-        order_refs = {k: v for k, v in order_refs.items() if v.get("created", "") >= oldest}
-
-    # --- 3. Delete ----------------------------------------------------------
-    deleted = known_ids - current_ids
-    for row_id in sorted(deleted):
-        yield _deleted_row(row_id)
-
-    # --- 4. Commit ----------------------------------------------------------
-    state["known_ids"] = sorted(current_ids)
-    state["stamps"] = {k: v for k, v in sorted(stamps.items()) if k in current_ids}
-    state["texts"] = {k: v for k, v in sorted(texts.items()) if k in current_ids}
-    state["orders"] = {k: v for k, v in sorted(order_refs.items()) if k in current_ids}
-    state["event_cursor"] = event_cursor
-    state["order_cursor"] = order_cursor
+            run.list()
+            yield from run.render()
+            yield from run.finish()
+        except ShopifyAPIError as exc:
+            run.stop_if_systemic(exc)  # also a rate limit while listing
+            _raise_if_access_denied(exc)
+            raise
+    except _CutShortError as cut:
+        run.commit_progress()
+        stats["failed"] = max(1, stats["failed"])
+        stats[f"failed_{cut.reason}"] = 1
+        logger.warning("Shopify sync stopped early (%s); it resumes on the next run.", cut.reason)
+        return
     logger.info(
         "Shopify: %d document(s) rendered, %d deletion(s) across %s; kept %d item(s) for retry.",
-        rendered,
-        len(deleted),
+        len(run.rendered),
+        stats["deleted"],
         ", ".join(selected),
-        failures.kept,
+        stats["kept"],
     )
 
 
@@ -1255,11 +1439,13 @@ def _customer_sweep(client: _Client) -> list[dict]:
             raise
         raise ShopifyAPIError(
             exc.status,
-            "the app may not read customers or their name and email (protected customer "
+            exc.endpoint,
+            exc.detail,
+            code=exc.code,
+            hint="the app may not read customers or their name and email (protected customer "
             "data); in the Dev Dashboard give the app customer access with the Name and Email "
             "fields, or leave 'customers' out of resources",
-            code=exc.code,
-        ) from exc
+        ) from None
 
 
 def _flat_refs(order: dict) -> list[str]:
@@ -1292,6 +1478,7 @@ def shopify_source(
     resources: Iterable[str] = DEFAULT_RESOURCES,
     resource_name: str = SHOPIFY_TABLE_NAME,
     check_active: Callable[[], None] | None = None,
+    service: Any = None,
     session: Any = None,
 ):
     """Return a ``dlt`` resource that yields Shopify documents for ``remember``.
@@ -1307,34 +1494,28 @@ def shopify_source(
         resources: What to sync: ``"products"``, ``"collections"`` (the
             default) and, opt-in because they hold personal data,
             ``"customers"`` and ``"orders"``.
-        resource_name: Stable dlt resource (table) name, which also scopes the
-            sync state. Give each store its own name when several sync into one
-            dataset; sharing a name would make each run forget the other's
-            documents.
-        check_active: Optional host authorization checkpoint. It is called
-            before every Shopify request and around every yielded row, and
-            stops the sync by raising; nothing is deleted and no state moves.
-        session: Pre-built ``requests`` session. Mainly an injection point for
-            tests; when omitted one is built.
+        resource_name: dlt resource (table) name, which also scopes the sync
+            state. Give each store its own name in a shared dataset.
+        check_active: Optional host authorization checkpoint, called before every
+            request and wait and around every row; it stops the sync by raising.
+        service: Pre-built ``requests``-like session, mainly for tests; when
+            omitted one is built for each run and closed after it. ``session``
+            is accepted as an alias.
 
     Returns:
-        A ``dlt`` resource (``resource_name``) configured with
-        ``primary_key="id"``, ``write_disposition="merge"`` and an ``_deleted``
-        hard-delete column. Hand it to ``cognee.remember(...)``.
+        A ``dlt`` resource with ``primary_key="id"``, ``write_disposition="merge"``
+        and a ``_deleted`` hard-delete column. ``resource.cognee_sync_stats``
+        holds the last run's counts.
     """
-    try:
-        import dlt
-    except ImportError as exc:  # pragma: no cover - dlt is a declared dependency
-        raise ImportError(
-            'The Shopify connector requires "dlt". Install the package:\n'
-            "    pip install cognee-community-connector-shopify"
-        ) from exc
-
-    if getattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 0) < 1:
+    if not (hasattr(dlt_utils, "PIPELINE_SCOPE_ATTR") and hasattr(dlt_utils, "guarded_rows")):
         raise RuntimeError(
-            "The Shopify connector requires a cognee build with table-scoped dlt document "
-            "cleanup (cognee>=1.6). Upgrade cognee so upstream deletions are forgotten."
+            "The Shopify connector needs cognee's dlt_utils.PIPELINE_SCOPE_ATTR and "
+            "guarded_rows (cognee>=1.6.2)."
         )
+    _check_resource_name(resource_name)
+    if service is not None and session is not None:
+        raise ValueError("Pass service= or session=, not both")
+    service = service if service is not None else session
 
     resolved_shop = normalize_shop(shop or os.environ.get("SHOPIFY_SHOP", ""))
     if isinstance(resources, str):
@@ -1353,57 +1534,56 @@ def shopify_source(
             "or client_id= and client_secret= (or set SHOPIFY_CLIENT_ID and "
             "SHOPIFY_CLIENT_SECRET)."
         )
+    for value, what in ((token, "access token"), (cid, "client id"), (secret, "client secret")):
+        if value:
+            _check_secret(value, what)
+    stats: dict[str, int] = {}
 
     @dlt.resource(
         name=resource_name,
         primary_key="id",
         write_disposition="merge",
-        # _deleted is a boolean hard-delete marker: rows where it is True are
-        # removed from the dlt destination on merge, which propagates the
-        # deletion through cognee's orphan_cleanup.
+        # Rows with _deleted=True are removed from the destination on merge,
+        # which propagates the deletion through cognee's orphan_cleanup.
         columns={"_deleted": {"data_type": "bool", "hard_delete": True}},
     )
     def shopify_documents():
-        http = session or _make_session()
-        check = _stop_on(check_active) if check_active is not None else None
-        if check is not None:
-            # The listing phase makes many requests before the first row.
-            http = _GuardedSession(http, check)
-        client = _Client(
-            http, resolved_shop, token, None if token else cid, None if token else secret
-        )
-        yield from dlt_utils.guarded_rows(
-            sync_store(client, dlt.current.resource_state(), resources=chosen), check
-        )
+        stats.clear()
+        http = service if service is not None else _make_session()
+        try:
+            client = _Client(
+                http,
+                resolved_shop,
+                token,
+                None if token else cid,
+                None if token else secret,
+                check_active,
+            )
+            rows = sync_store(client, dlt.current.resource_state(), resources=chosen, stats=stats)
+            yield from dlt_utils.guarded_rows(rows, check_active)
+        finally:
+            if service is None:
+                http.close()
 
     resource = shopify_documents()
     # Opt into the document ingestion path (row -> text document -> cognify).
-    # resolve_dlt_sources reads this marker; it never imports this connector.
     setattr(resource, DOCUMENT_SOURCE_ATTR, SHOPIFY_SOURCE_NAME)
-    # Give the incremental state its own dlt pipeline per dataset and name.
+    # Give the sync state its own dlt pipeline, apart from other sources.
     setattr(resource, dlt_utils.PIPELINE_SCOPE_ATTR, resource_name)
+    resource.cognee_sync_stats = stats
     return resource
 
 
-def _stop_on(check_active: Callable[[], None]) -> Callable[[], None]:
-    """``check_active``, turning an ``OSError`` it raises into ``ShopifySyncStoppedError``."""
+def _check_resource_name(name: Any) -> None:
+    """A non-empty name of at most 64 characters that dlt keeps as it is.
 
-    def check() -> None:
-        try:
-            check_active()
-        except OSError as exc:
-            raise ShopifySyncStoppedError(f"check_active stopped the sync: {exc!r}") from exc
-
-    return check
-
-
-class _GuardedSession:
-    """A session that asks the host's ``check_active`` before every request."""
-
-    def __init__(self, session: Any, check_active: Callable[[], None]):
-        self._session = session
-        self._check_active = check_active
-
-    def post(self, *args: Any, **kwargs: Any) -> Any:
-        self._check_active()
-        return self._session.post(*args, **kwargs)
+    It names the table and scopes the state: an empty name would lose that
+    scope, and two names dlt normalizes alike ("Foo-Bar", "foo_bar") would share
+    a table.
+    """
+    if not isinstance(name, str) or not name:
+        raise ValueError("resource_name must be a non-empty string")
+    if len(name) > 64:
+        raise ValueError("resource_name must be at most 64 characters")
+    if NamingConvention().normalize_table_identifier(name) != name:
+        raise ValueError("resource_name must be lowercase snake_case (letters, digits, _)")

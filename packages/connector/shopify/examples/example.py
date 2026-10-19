@@ -56,8 +56,9 @@ async def main() -> None:
     ]
 
     print(f"Syncing {', '.join(resources)} from Shopify into cognee ...")
+    source = shopify_source(resources=resources)
     await cognee.remember(
-        shopify_source(resources=resources),
+        source,
         dataset_name=DATASET_NAME,
         primary_key="id",
         # Required: the default "replace" would drop every product that is not
@@ -66,6 +67,8 @@ async def main() -> None:
         # 0 = no row cap, so orphan cleanup compares against the whole corpus.
         max_rows_per_table=0,
     )
+    # scanned, skipped, failed, deleted, kept, given_up (+ failed_<reason> on an early stop)
+    print("Sync stats:", source.cognee_sync_stats)
 
     answer = await cognee.search(
         query_text="Which products does the store sell, and how are they grouped?",
