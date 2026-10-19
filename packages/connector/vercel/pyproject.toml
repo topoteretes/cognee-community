@@ -3,11 +3,11 @@ name = "cognee-community-connector-vercel"
 version = "0.1.0"
 description = "Vercel data-source connector for cognee: projects, deployments and failed-build output (full snapshot + forget-on-delete)"
 readme = "README.md"
-requires-python = ">=3.11,<3.14"
+requires-python = ">=3.10,<3.14"
 dependencies = [
     # Orphan cleanup scoped per staging table first shipped in cognee 1.6.1. This
     # source loads three tables under one document tag, so it needs that scoping.
-    "cognee==1.6.1",
+    "cognee>=1.6.1,<2",
     "dlt[sqlalchemy]>=1.9.0,<2",
 ]
 
@@ -24,7 +24,7 @@ packages = ["cognee_community_connector_vercel"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "N", "B", "UP", "C4", "PGH", "SIM", "RUF"]

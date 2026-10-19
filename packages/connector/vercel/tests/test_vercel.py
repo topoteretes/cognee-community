@@ -394,6 +394,40 @@ def test_build_log_rows_keep_deployments_apart():
 # ---------------------------------------------------------------------------
 
 
+def test_a_team_gets_its_own_tables_and_state():
+    from cognee.tasks.ingestion.dlt_utils import PIPELINE_SCOPE_ATTR
+
+    source = vercel_source(token="test-token", team_id="team_AbC1")
+    assert set(source.resources.selected) == {
+        "vercel_team_abc1_projects",
+        "vercel_team_abc1_deployments",
+        "vercel_team_abc1_build_logs",
+    }
+    assert getattr(source, PIPELINE_SCOPE_ATTR) == "vercel_team_abc1"
+    named = vercel_source(token="test-token", team_id="team_AbC1", resource_name="vercel_main")
+    assert "vercel_main_projects" in named.resources.selected
+
+
+@pytest.mark.parametrize("bad", ["Vercel", "vercel-prod", "1vercel", "vercel prod"])
+def test_resource_name_must_fit_a_table_name(bad):
+    with pytest.raises(ValueError, match="resource_name"):
+        vercel_source(token="test-token", resource_name=bad)
+
+
+def test_rows_do_not_depend_on_the_order_of_fields():
+    # Vercel does not promise an order for object keys, meta entries or env lists.
+    project = _project("prj_web", "web")
+    shuffled = dict(reversed(list(project.items())))
+    shuffled["link"] = dict(reversed(list(project["link"].items())))
+    shuffled["env"] = list(reversed(project["env"]))
+    assert _project_row(shuffled) == _project_row(project)
+
+    deployment = _deployment("dpl_err", "web", state="ERROR")
+    shuffled = dict(reversed(list(deployment.items())))
+    shuffled["meta"] = dict(reversed(list(deployment["meta"].items())))
+    assert _deployment_row(shuffled) == _deployment_row(deployment)
+
+
 def test_vercel_source_keeps_its_state_per_dataset():
     # The empty-account guard lives in dlt state; without a scope every unscoped
     # dlt source in cognee would share one pipeline state.
@@ -821,6 +855,34 @@ def test_http_error_aborts_sync_and_keeps_previous_snapshot(dlt_mod, tmp_path, f
     assert {table: _read(after, table) for table in _TABLES} == before
 
 
+def test_check_active_is_called_for_every_page(dlt_mod, tmp_path):
+    fake = _fleet()
+    calls = []
+    _run_sync(dlt_mod, tmp_path, fake, check_active=lambda: calls.append(1))
+    assert len(calls) == len(fake.calls)
+
+
+def test_check_active_can_stop_a_sync(dlt_mod, tmp_path):
+    # The host revokes access mid-run: the run aborts and memory stays as it was.
+    fake = _fleet()
+    first = _run_sync(dlt_mod, tmp_path, fake)
+    before = {table: _read(first, table) for table in _TABLES}
+
+    calls = []
+
+    def revoked_after_two_pages():
+        calls.append(1)
+        if len(calls) > 2:
+            raise PermissionError("access revoked")
+
+    fake.deployments = fake.deployments[:1]
+    with pytest.raises(Exception, match="access revoked"):
+        _run_sync(dlt_mod, tmp_path, fake, check_active=revoked_after_two_pages)
+
+    pipeline = _pipeline(dlt_mod, tmp_path)
+    assert {table: _read(pipeline, table) for table in _TABLES} == before
+
+
 def test_list_without_pagination_aborts_sync(dlt_mod, tmp_path):
     # dlt's cursor paginator stops quietly when the cursor is missing, which would
     # keep only the first page and forget the rest.
@@ -843,8 +905,11 @@ def test_deployment_list_without_pagination_aborts_sync(dlt_mod, tmp_path):
     before = _read(first, VERCEL_DEPLOYMENTS_TABLE)
 
     fake.drop_pagination = {"/v7/deployments"}
-    with pytest.raises(Exception, match=r"pagination\.next"):
-        _run_sync(dlt_mod, tmp_path, fake)
+    with pytest.raises(Exception, match=r"pagination\.next") as raised:
+        _run_sync(dlt_mod, tmp_path, fake, project_ids=["web"])
+    # Status and endpoint only: the query (team id, project names) stays out of logs.
+    assert "/v7/deployments" in str(raised.value)
+    assert "projectId=" not in str(raised.value)
 
     assert _read(_pipeline(dlt_mod, tmp_path), VERCEL_DEPLOYMENTS_TABLE) == before
 
@@ -945,6 +1010,74 @@ async def _graph_has(token):
     )
 
 
+async def _fake_embed_text(self, text):
+    """Zero vectors in whichever shape the installed cognee returns.
+
+    cognee 1.6.x returns a list of vectors; later versions return an
+    ``EmbeddingResult`` (a list that also carries a token count).
+    """
+    vectors = [[0.0] * self.get_vector_size() for _ in text]
+    try:
+        from cognee.infrastructure.databases.vector.embeddings.EmbeddingEngine import (
+            EmbeddingResult,
+        )
+    except ImportError:
+        return vectors
+    return EmbeddingResult(vectors, tokens=0)
+
+
+def _cognee_offline(tmp_path, monkeypatch):
+    """Point cognee at tmp_path with no credentials, the way the graph test does."""
+    import cognee
+
+    monkeypatch.setenv("COGNEE_SKIP_CONNECTION_TEST", "true")
+    monkeypatch.setenv("ENABLE_BACKEND_ACCESS_CONTROL", "false")
+    monkeypatch.setenv("DLT_DATA_DIR", str(tmp_path / "dlt"))
+    monkeypatch.setenv("PIPELINES_DIR", str(tmp_path / "dlt" / "pipelines"))
+    cognee.config.data_root_directory(str(tmp_path / "data"))
+    cognee.config.system_root_directory(str(tmp_path / "system"))
+    cognee.config.set_relational_db_config({"db_provider": "sqlite"})
+    return cognee
+
+
+def test_two_teams_in_one_dataset_keep_their_documents(tmp_path, monkeypatch):
+    # Each team gets its own tables by default, so a sync of one team never
+    # replaces, and orphan-cleans, the other team's documents.
+    pytest.importorskip("dlt")
+    import asyncio
+
+    cognee = _cognee_offline(tmp_path, monkeypatch)
+    team_a = FakeVercel(
+        projects=[], deployments=[_deployment("dpl_a1", "alpha"), _deployment("dpl_a2", "alpha")]
+    )
+    team_b = FakeVercel(projects=[], deployments=[_deployment("dpl_b1", "bravo")])
+
+    async def sync(fake, team):
+        source = vercel_source(token="test-token", team_id=team, session=fake.session())
+        await cognee.add(source, dataset_name="vercel_teams")
+
+    async def count():
+        datasets = await cognee.datasets.list_datasets()
+        found = next(item for item in datasets if item.name == "vercel_teams")
+        return len(await cognee.datasets.list_data(found.id))
+
+    async def scenario():
+        await cognee.prune.prune_data()
+        await cognee.prune.prune_system(metadata=True)
+        try:
+            await sync(team_a, "team_A")
+            await sync(team_b, "team_B")
+            assert await count() == 3
+            team_a.deployments = team_a.deployments[:1]
+            await sync(team_a, "team_A")
+            assert await count() == 2, "only team A's deleted deployment may go"
+        finally:
+            await cognee.prune.prune_data()
+            await cognee.prune.prune_system(metadata=True)
+
+    asyncio.run(scenario())
+
+
 def test_deleted_deployment_is_forgotten_from_the_graph(tmp_path, monkeypatch):
     # Runs the source through cognee.add() + cognify() (LLM and embeddings mocked,
     # no credentials) to prove the document tag works on a rest_api source with
@@ -974,13 +1107,10 @@ def test_deleted_deployment_is_forgotten_from_the_graph(tmp_path, monkeypatch):
     async def _noop_index(*_args, **_kwargs):
         return None
 
-    async def _mock_embed_text(self, text):
-        return [[0.0] * self.get_vector_size() for _ in text]
-
     monkeypatch.setattr(add_data_points_module, "index_data_points", _noop_index)
     monkeypatch.setattr(add_data_points_module, "index_graph_edges", _noop_index)
     monkeypatch.setattr(LLMGateway, "acreate_structured_output", _mock_structured_output)
-    monkeypatch.setattr(LiteLLMEmbeddingEngine, "embed_text", _mock_embed_text)
+    monkeypatch.setattr(LiteLLMEmbeddingEngine, "embed_text", _fake_embed_text)
 
     fake = FakeVercel(
         projects=[],

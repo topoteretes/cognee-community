@@ -42,7 +42,8 @@ separate document keyed by the deployment id.
 
 import os
 import re
-from datetime import UTC, datetime, timedelta
+from collections.abc import Callable
+from datetime import datetime, timedelta, timezone
 from itertools import groupby
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
@@ -50,13 +51,16 @@ from urllib.parse import parse_qs, urlsplit
 from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR, PIPELINE_SCOPE_ATTR
 
 VERCEL_SOURCE_NAME = "vercel"
-# dlt resource / staging-table names. cognee scopes orphan cleanup by table, so
-# these are part of the contract: renaming one forgets and re-ingests its rows.
+# Staging-table names for the default resource name. cognee scopes orphan cleanup
+# by table, so they are part of the contract: renaming one forgets and re-ingests
+# its rows. Another resource name gives <resource_name>_projects and so on.
 VERCEL_PROJECTS_TABLE = "vercel_projects"
 VERCEL_DEPLOYMENTS_TABLE = "vercel_deployments"
 VERCEL_BUILD_LOGS_TABLE = "vercel_build_logs"
 
 _API_BASE = "https://api.vercel.com"
+# Page size. The deployments list returns at most 100 a page whatever is asked
+# (checked live), so asking for more would only hide that.
 _PAGE_SIZE = 100
 # The deployments list answers 400 when `projectIds` has more than this many items.
 _MAX_PROJECT_IDS = 20
@@ -68,8 +72,13 @@ _PARENT_UID = f"_{_FAILED_DEPLOYMENTS}_uid"
 _PARENT_NAME = f"_{_FAILED_DEPLOYMENTS}_name"
 _PARENT_URL = f"_{_FAILED_DEPLOYMENTS}_inspector_url"
 
+# Prefixes of the commit fields Vercel puts in a deployment's `meta`, for example
+# githubCommitSha or gitlabCommitRef, one per supported Git provider.
 _GIT_PROVIDERS = ("github", "gitlab", "bitbucket")
+# Put in front of a build log whose start was cut by `max_log_chars`.
 _TRUNCATED_MARKER = "[earlier output truncated]"
+# What a resource name may look like: it becomes part of the table names.
+_RESOURCE_NAME = re.compile(r"[a-z][a-z0-9_]*")
 
 _EXTRA_HINT = "The Vercel connector requires dlt: pip install 'dlt[sqlalchemy]>=1.9.0,<2'."
 
@@ -82,6 +91,8 @@ def vercel_source(
     include_build_logs: bool = True,
     max_log_chars: int | None = 20000,
     allow_empty: bool = False,
+    resource_name: str | None = None,
+    check_active: Callable[[], None] | None = None,
     session: Any = None,
 ):
     """Create a dlt source that yields Vercel projects, deployments and failed-build output.
@@ -105,6 +116,14 @@ def vercel_source(
             although an earlier sync listed some. Off by default, because that is
             what a token for the wrong team looks like, and it would forget
             everything. Turn it on once to forget a team that really is empty.
+        resource_name: Prefix of the staging tables and the key of this source's
+            dlt state. Defaults to ``vercel`` without a team and ``vercel_<team id>``
+            with one, so two teams synced into one dataset keep separate tables
+            instead of replacing each other's rows. Lowercase letters, digits and
+            underscores.
+        check_active: Called before every page is used. A host raises from it to
+            stop a sync whose access was revoked mid-run; the run then aborts and
+            memory stays as it was.
         session: ``requests.Session`` to send requests through (mainly a
             test-injection point). When omitted dlt's own session is used, which
             retries 429 and 5xx responses.
@@ -122,6 +141,16 @@ def vercel_source(
     if not resolved_token:
         raise ValueError("Vercel access token required: pass token= or set VERCEL_TOKEN.")
     resolved_team = team_id or os.environ.get("VERCEL_TEAM_ID")
+    name = resource_name or (
+        f"{VERCEL_SOURCE_NAME}_{resolved_team.lower()}" if resolved_team else VERCEL_SOURCE_NAME
+    )
+    if not _RESOURCE_NAME.fullmatch(name):
+        raise ValueError(
+            f"resource_name must be lowercase letters, digits and underscores, not {name!r}."
+        )
+    projects_table, deployments_table, logs_table = (
+        f"{name}_{kind}" for kind in ("projects", "deployments", "build_logs")
+    )
     wanted = set(project_ids or [])
     # Vercel resolves a project name case-insensitively, so match names the same way
     # here, or the rows it returns would all be dropped and then forgotten.
@@ -149,9 +178,10 @@ def vercel_source(
     # deployment that changed state or was deleted since the last run is seen.
     window: dict[str, Any] = {}
     if lookback_days is not None:
-        since = datetime.now(UTC) - timedelta(days=lookback_days)
+        since = datetime.now(timezone.utc) - timedelta(days=lookback_days)
         window["since"] = int(since.timestamp() * 1000)
     scope = {"teamId": resolved_team} if resolved_team else {}
+    active = [_still_active(check_active)] if check_active else []
 
     def listing(
         path: str, key: str, missing: list | None = None, guard: bool = False, **params: Any
@@ -166,7 +196,11 @@ def vercel_source(
                 "cursor_path": "pagination.next",
                 "cursor_param": "until",
             },
-            "response_actions": [*(missing or []), _require_list(key, guard, allow_empty)],
+            "response_actions": [
+                *active,
+                *(missing or []),
+                _require_list(key, guard, allow_empty),
+            ],
         }
 
     def wanted_project(project: dict) -> bool:
@@ -186,14 +220,14 @@ def vercel_source(
 
     resources: list[dict] = [
         {
-            "name": VERCEL_PROJECTS_TABLE,
+            "name": projects_table,
             "primary_key": "id",
             "write_disposition": "replace",
             "endpoint": listing("v10/projects", "projects", guard=True),
             "processing_steps": [{"filter": wanted_project}, {"map": _project_row}],
         },
         {
-            "name": VERCEL_DEPLOYMENTS_TABLE,
+            "name": deployments_table,
             "primary_key": "id",
             "write_disposition": "replace",
             "endpoint": listing("v7/deployments", "deployments", gone, **window, **on_server),
@@ -232,6 +266,7 @@ def vercel_source(
                     # The deployment was deleted between the two calls: no log to
                     # keep. Any other error aborts the run.
                     "response_actions": [
+                        *active,
                         {"status_code": 404, "action": "ignore"},
                         {"status_code": 410, "action": "ignore"},
                         _require_event_list,
@@ -251,13 +286,11 @@ def vercel_source(
         resource.name: resource
         for resource in rest_api_resources({"client": client, "resources": resources})
     }
-    loaded = [by_name[VERCEL_PROJECTS_TABLE], by_name[VERCEL_DEPLOYMENTS_TABLE]]
+    loaded = [by_name[projects_table], by_name[deployments_table]]
 
     if include_build_logs:
 
-        @dlt.transformer(
-            name=VERCEL_BUILD_LOGS_TABLE, primary_key="id", write_disposition="replace"
-        )
+        @dlt.transformer(name=logs_table, primary_key="id", write_disposition="replace")
         def vercel_build_logs(events):
             # rest_api yields one page per events request, so `events` holds every
             # log line of one failed deployment.
@@ -267,7 +300,7 @@ def vercel_source(
 
     # max_table_nesting=0: rows are flat already, and this keeps dlt from ever
     # unpacking a nested value into a child table that cognee would read back.
-    @dlt.source(name=VERCEL_SOURCE_NAME, max_table_nesting=0)
+    @dlt.source(name=name, max_table_nesting=0)
     def _vercel():
         return loaded
 
@@ -275,9 +308,9 @@ def vercel_source(
     # Opt into the document ingestion path (row -> text document -> cognify).
     # Set on the object that is returned: resolve_dlt_sources reads it from there.
     setattr(source, DOCUMENT_SOURCE_ATTR, VERCEL_SOURCE_NAME)
-    # Keep this source's dlt state (the empty-account guard) per dataset. Without
-    # a scope, every unscoped dlt source shares one pipeline and its state.
-    setattr(source, PIPELINE_SCOPE_ATTR, VERCEL_SOURCE_NAME)
+    # Keep this source's dlt state (the empty-account guard) per dataset and per
+    # resource name. Without a scope, every unscoped dlt source shares one state.
+    setattr(source, PIPELINE_SCOPE_ATTR, name)
     return source
 
 
@@ -306,13 +339,13 @@ def _require_list(key: str, guard: bool = False, allow_empty: bool = False):
         body = response.json()
         if not isinstance(body, dict) or not isinstance(body.get(key), list):
             raise ValueError(
-                f"Vercel: expected an object with a '{key}' list from {response.url}. "
+                f"Vercel: expected an object with a '{key}' list from {_where(response)}. "
                 "Aborting so a partial snapshot cannot forget live rows."
             )
         pagination = body.get("pagination")
         if not isinstance(pagination, dict) or "next" not in pagination:
             raise ValueError(
-                f"Vercel: expected a 'pagination.next' cursor from {response.url}. "
+                f"Vercel: expected a 'pagination.next' cursor from {_where(response)}. "
                 "Aborting so a partial snapshot cannot forget live rows."
             )
         if guard and "until" not in parse_qs(urlsplit(response.url).query):
@@ -330,13 +363,31 @@ def _require_list(key: str, guard: bool = False, allow_empty: bool = False):
     return check
 
 
+def _where(response) -> str:
+    """The endpoint a response came from, without its query string.
+
+    Error messages keep to the status and the path: the query carries the team id
+    and project names, which do not belong in logs.
+    """
+    return urlsplit(response.url).path
+
+
+def _still_active(check_active: Callable[[], None]):
+    """Build a response hook that runs the host's ``check_active`` before a page is used."""
+
+    def check(response, *args, **kwargs):
+        check_active()
+
+    return check
+
+
 def _require_event_list(response, *args, **kwargs):
     """Abort unless the events call returned a list of log lines."""
     if not response.ok:
         return  # 404/410 are ignored above; dlt raises for any other error status
     if not isinstance(response.json(), list):
         raise ValueError(
-            f"Vercel: expected a list of build events from {response.url}. "
+            f"Vercel: expected a list of build events from {_where(response)}. "
             "Aborting so a partial snapshot cannot forget live rows."
         )
 
@@ -490,7 +541,7 @@ def _timestamp(milliseconds: Any) -> str | None:
     """Render a Vercel millisecond timestamp as UTC text, the same way every time."""
     if not isinstance(milliseconds, (int, float)) or isinstance(milliseconds, bool):
         return None
-    moment = datetime.fromtimestamp(milliseconds / 1000, tz=UTC)
+    moment = datetime.fromtimestamp(milliseconds / 1000, tz=timezone.utc)
     return moment.strftime("%Y-%m-%d %H:%M UTC")
 
 

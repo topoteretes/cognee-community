@@ -43,6 +43,8 @@ answer = await cognee.search(
 | `lookback_days` | `30` | How far back deployments are read, in days (more than 0). `None` reads all of them. |
 | `include_build_logs` | `True` | Fetch build output for failed deployments. |
 | `allow_empty` | `False` | Let a sync through when the account lists no projects at all although an earlier sync listed some. |
+| `resource_name` | `vercel`, or `vercel_<team id>` | Prefix of the staging tables. Each team gets its own by default. |
+| `check_active` | none | Called before every page is used. Raise from it to stop a sync whose access was revoked. |
 | `max_log_chars` | `20000` | Keep only the end of a build log. Only the newest `max_log_chars // 10` lines (at least 100) are requested. `None` requests and keeps all of it. |
 
 See `examples/example.py` for the full flow.
@@ -88,8 +90,10 @@ source.
 - **Build logs are ingested as Vercel returns them.** Vercel redacts sensitive environment
   variables of 32 characters or more. Anything else a build prints stays in its log. Pass
   `include_build_logs=False` if your builds print secrets.
-- **One dataset per team or project selection.** Each sync is a full snapshot of what it was asked
-  for, so two different selections synced into one dataset would forget each other's documents.
+- **Teams can share a dataset, selections can't.** Each team gets its own tables by default
+  (`vercel_<team id>_projects` and so on), so syncing two teams into one dataset keeps both. Two
+  different `project_ids` selections of one team share tables, so give each its own
+  `resource_name` or its own dataset, or each sync forgets the other's documents.
 - **Projects page by last update.** With more than 100 projects, a project updated while a sync is
   paging can be missed by that one sync. It comes back, and is re-processed, on the next.
 - **dlt keeps its load files.** Each sync leaves a gzip copy of the loaded rows in dlt's
@@ -98,6 +102,9 @@ source.
 - **Auth is a token.** It is sent as a bearer token. That is also how a token from an
   integration install is used, but only a personal token was tested. The connector does not run
   an OAuth flow itself.
+- **Who can read it.** Build logs, commit messages and author names land in the dataset. Anyone
+  with read access to the dataset in cognee can read them, so keep it private if builds can print
+  secrets.
 - Tested live against one personal Vercel account in October 2026.
 
 ## Setup
