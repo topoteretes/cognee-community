@@ -6,6 +6,23 @@ counts. These are execution receipts, not proof of every environment or provider
 The complete test sources and synthetic lifecycle are in this repository. Historical
 counts in older reviews are superseded by the versioned results file.
 
+## Locked development environment
+
+From this package directory:
+
+```sh
+uv lock --check
+uv sync --locked --extra test --python 3.12
+COGNEE_LOG_FILE=false TELEMETRY_DISABLED=1 RUNTIME__DLTHUB_TELEMETRY=false \
+  uv run --locked --extra test pytest tests -q
+uv run --locked --extra test ruff check .
+uv run --locked --extra test ruff format --check .
+```
+
+This verifies the committed lock independently of the installed-wheel version matrix
+below. The lock fixes development versions while wheel metadata keeps compatibility
+ranges; changing the lock does not establish validation for every platform it describes.
+
 ## Installed-wheel offline suite
 
 From this package directory, with uv installed:

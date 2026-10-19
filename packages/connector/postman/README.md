@@ -14,6 +14,11 @@ export POSTMAN_COLLECTION_UIDS='collection-uid-1,collection-uid-2'
 python examples/quickstart.py
 ```
 
+For reproducible development installs, run `uv sync --locked --extra test` from this
+package directory, then `uv run --locked --extra test pytest tests -q`. The committed
+`uv.lock` pins the development dependency graph; package consumers still use the declared
+dependency ranges declared in `pyproject.toml`.
+
 Generate a user API key in Postman Account settings → API keys. Use the workspace ID
 from its settings/listing. Keep credentials outside Git and shell history. The account
 needs read access to `/me`, `/workspaces/{id}`, collection inventory and selected trees.

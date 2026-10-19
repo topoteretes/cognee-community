@@ -230,5 +230,24 @@
     "Secret filtering is best effort.",
     "Single missing collection can be mirrored; bulk removals guarded by budget.",
     "No same-scope concurrent ingestion, atomic provider snapshot, byte budget or complete backend matrix claimed."
-  ]
+  ],
+  "locked_development_environment": {
+    "python": "3.12.13",
+    "cognee": "1.6.5",
+    "dlt": "1.30.0",
+    "httpx": "0.28.1",
+    "pytest": "9.1.1",
+    "ruff": "0.17.1",
+    "uv": "0.11.23",
+    "uv_lock_sha256": "cfe83ac42eb6515bf1c15688ca381be990f07d9923bdddc3679a27355dbaddf4",
+    "module_sha256": "d8416cc5114812034962b442b1dee121e778a51b4b7aa3639511fef048d9eb74",
+    "install_command": "uv sync --locked --extra test --python 3.12",
+    "test_command": "COGNEE_LOG_FILE=false TELEMETRY_DISABLED=1 RUNTIME__DLTHUB_TELEMETRY=false uv run --locked --extra test pytest tests -q",
+    "pytest_summary": "103 passed, 1 skipped, 13 warnings in 26.09s",
+    "console_sha256": "145febb18f967b1f4c6b6c7df132c16781104e181857a33d1ed7d0b1c8d84ccf",
+    "lock_check": "passed",
+    "ruff_check": "passed",
+    "ruff_format_check": "19 files already formatted",
+    "scope": "Fresh macOS ARM64 Python 3.12 environment; editable development install. Optional model test skipped. Other lock branches not executed by this receipt."
+  }
 }
