@@ -53,9 +53,11 @@ See `examples/example.py` for the full flow.
 
 | Staging table | One document per | Source |
 |---|---|---|
-| `vercel_projects` | project | `GET /v10/projects` |
-| `vercel_deployments` | deployment: state, target, timing, author, commit, error | `GET /v7/deployments` |
-| `vercel_build_logs` | failed deployment that has build output | `GET /v3/deployments/{id}/events` |
+| `<resource_name>_projects` | project | `GET /v10/projects` |
+| `<resource_name>_deployments` | deployment: state, target, timing, author, commit, error | `GET /v7/deployments` |
+| `<resource_name>_build_logs` | failed deployment that has build output | `GET /v3/deployments/{id}/events` |
+
+`resource_name` is `vercel` without a team, so the tables are `vercel_projects` and so on.
 
 Build output is requested only for deployments in state `ERROR`.
 
