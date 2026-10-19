@@ -5,11 +5,11 @@ description = "Figma data-source connector for cognee — sync design files and 
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
 dependencies = [
-    # Needs cognee's "document-mode" (DOCUMENT_SOURCE_ATTR, cognee 1.4.0+) and,
-    # for the optional OAuth integration in register.py, the OAuthIntegration
-    # resource-picker contract (resource_selection_key/list_resources/sync_now),
-    # first shipped in cognee 1.6.2.
-    "cognee==1.6.3",
+    # Needs cognee's document-mode with table-scoped cleanup and per-row node
+    # sets (DOCUMENT_SYNC_VERSION 2, cognee_node_set), present in cognee 1.6.4.
+    # The optional OAuth integration also needs the OAuthIntegration
+    # resource-picker contract (cognee 1.6.2+).
+    "cognee==1.6.4",
     # dlt's rest_api source + RESTClient (bearer auth, Retry-After aware
     # retries) does all the Figma REST API I/O.
     "dlt[sqlalchemy]>=1.9.0,<2",
@@ -35,3 +35,9 @@ select = ["E", "W", "F", "I", "N", "B", "UP", "C4", "PGH", "SIM", "RUF"]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8,<9",
+    "pytest-asyncio>=0.23,<2",
+]
