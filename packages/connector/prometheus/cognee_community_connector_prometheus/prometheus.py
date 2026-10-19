@@ -39,23 +39,31 @@ Fail closed. Staging is authoritative under replace, so a short read would be
 forgotten as if it were a deletion. An HTTP error, a body that is not JSON, a
 ``status`` other than ``success`` or a missing ``data.groups`` list raises and
 aborts the run, which leaves memory untouched. An empty group list is accepted
-on a first sync, but refused after an earlier sync had rules: a URL pointing at
-the wrong server, or a filter that matches nothing, looks exactly like that.
-``allow_empty=True`` lets that sync through.
+on a first sync, but refused after an earlier sync had rules: a server whose
+rule files did not load, or a filter that matches nothing, looks exactly like
+that. ``allow_empty=True`` lets that sync through.
+
+One set of tables per server. The table names start with a resource name taken
+from the server's address, so two servers synced into one dataset keep their
+own rows instead of replacing each other's.
 """
 
 import hashlib
 import json
 import os
+import re
 from collections import Counter
+from collections.abc import Callable
 from typing import Any
 from urllib.parse import urlsplit
 
 from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR, PIPELINE_SCOPE_ATTR
 
 PROMETHEUS_SOURCE_NAME = "prometheus"
-# dlt resource / staging-table names. cognee scopes orphan cleanup by table, so
-# these are part of the contract: renaming one forgets and re-ingests its rows.
+# Staging-table names for resource_name="prometheus". cognee scopes orphan
+# cleanup by table, so they are part of the contract: renaming one forgets and
+# re-ingests its rows. By default the resource name comes from the server's
+# address, which gives prometheus_<host>_<port>_rules and so on.
 PROMETHEUS_RULES_TABLE = "prometheus_rules"
 PROMETHEUS_METRICS_TABLE = "prometheus_metrics"
 
@@ -63,7 +71,13 @@ PROMETHEUS_METRICS_TABLE = "prometheus_metrics"
 _RULE_GROUPS = "prometheus_rule_groups"
 _METADATA = "prometheus_metadata"
 
+# The values the rules API's `type` parameter accepts.
 _RULE_TYPES = ("alert", "record")
+# What a resource name may look like: it becomes part of the table names.
+_RESOURCE_NAME = re.compile(r"[a-z][a-z0-9_]*")
+# Longer derived names are cut and given a hash, so the table names stay under
+# the 63 characters Postgres allows for an identifier.
+_MAX_RESOURCE_NAME = 48
 # Annotations most rules carry, in the order a reader wants them. Any other
 # annotation follows in key order.
 _KNOWN_ANNOTATIONS = (
@@ -85,6 +99,8 @@ def prometheus_source(
     rule_groups: list[str] | None = None,
     include_metadata: bool = False,
     allow_empty: bool = False,
+    resource_name: str | None = None,
+    check_active: Callable[[], None] | None = None,
     session: Any = None,
 ):
     """Create a dlt source that yields Prometheus rules, and optionally metric metadata.
@@ -105,9 +121,17 @@ def prometheus_source(
             the server knows. Off by default: a server can know thousands.
         allow_empty: Let a sync through that finds no rules (or no metric
             metadata) although an earlier sync found some. Off by default,
-            because a wrong URL or a filter that matches nothing looks like that,
-            and it would forget everything. Turn it on once to forget rules that
-            really were all removed.
+            because a server whose rule files did not load, or a filter that
+            matches nothing, looks like that, and it would forget everything.
+            Turn it on once to forget rules that really were all removed.
+        resource_name: Prefix of the staging tables and the key of this source's
+            dlt state. Defaults to one taken from the server's address, such as
+            ``prometheus_localhost_9090``, so two servers synced into one dataset
+            keep separate tables. Pass one to keep the same tables when the
+            address changes. Lowercase letters, digits and underscores.
+        check_active: Called before every response is used. A host raises from
+            it to stop a sync whose access was revoked mid-run; the run then
+            aborts and memory stays as it was.
         session: ``requests.Session`` to send requests through (mainly a
             test-injection point). When omitted dlt's own session is used, which
             retries 429 and 5xx responses.
@@ -133,6 +157,13 @@ def prometheus_source(
         raise ValueError("Pass credentials as username/password or token, not in the URL.")
     if parts.path.rstrip("/").endswith("/api/v1"):
         raise ValueError("Pass the server URL without /api/v1: the connector adds the API path.")
+    name = resource_name or _default_resource_name(parts)
+    if not _RESOURCE_NAME.fullmatch(name):
+        raise ValueError(
+            f"resource_name must be lowercase letters, digits and underscores, not {name!r}."
+        )
+    rules_table, metrics_table = f"{name}_rules", f"{name}_metrics"
+    active = [_still_active(check_active)] if check_active else []
     if token is None and username is None and password is None:
         # Only when no credentials were passed, so an explicit choice is never
         # mixed with the other kind from the environment.
@@ -167,7 +198,7 @@ def prometheus_source(
                 "data_selector": "data.groups",
                 # The whole rule list comes back in one response.
                 "paginator": "single_page",
-                "response_actions": [_require_success("groups", allow_empty)],
+                "response_actions": [*active, _require_success("groups", allow_empty)],
             },
         }
     ]
@@ -181,7 +212,7 @@ def prometheus_source(
                     # empty and can tell a restart from a server without targets.
                     "data_selector": "$",
                     "paginator": "single_page",
-                    "response_actions": [_require_success(None)],
+                    "response_actions": [*active, _require_success(None)],
                 },
             }
         )
@@ -202,7 +233,7 @@ def prometheus_source(
         for resource in rest_api_resources({"client": client, "resources": resources})
     }
 
-    @dlt.transformer(name=PROMETHEUS_RULES_TABLE, primary_key="id", write_disposition="replace")
+    @dlt.transformer(name=rules_table, primary_key="id", write_disposition="replace")
     def prometheus_rules(groups):
         # A fresh counter per call: the rule list is one page, so this is called
         # once per run, and a source object that is run twice keeps its ids.
@@ -214,9 +245,7 @@ def prometheus_source(
 
     if include_metadata:
 
-        @dlt.transformer(
-            name=PROMETHEUS_METRICS_TABLE, primary_key="id", write_disposition="replace"
-        )
+        @dlt.transformer(name=metrics_table, primary_key="id", write_disposition="replace")
         def prometheus_metrics(bodies):
             # Prometheus builds metadata from live scrape targets, so right after a
             # restart it answers with an empty object for a while. Refuse that only
@@ -239,7 +268,7 @@ def prometheus_source(
 
     # max_table_nesting=0: rows are flat already, and this keeps dlt from ever
     # unpacking a nested value into a child table that cognee would read back.
-    @dlt.source(name=PROMETHEUS_SOURCE_NAME, max_table_nesting=0)
+    @dlt.source(name=name, max_table_nesting=0)
     def _prometheus():
         return loaded
 
@@ -249,13 +278,42 @@ def prometheus_source(
     setattr(source, DOCUMENT_SOURCE_ATTR, PROMETHEUS_SOURCE_NAME)
     # Keep this source's dlt state (the empty-snapshot flags) per dataset. Without
     # a scope, every unscoped dlt source shares one pipeline and its state.
-    setattr(source, PIPELINE_SCOPE_ATTR, PROMETHEUS_SOURCE_NAME)
+    setattr(source, PIPELINE_SCOPE_ATTR, name)
     return source
 
 
 # ---------------------------------------------------------------------------
 # Response guard and row builders (module-private)
 # ---------------------------------------------------------------------------
+
+
+def _default_resource_name(parts) -> str:
+    """Name a server's tables after its host, port and path prefix."""
+    where = f"{parts.hostname or ''}_{parts.port or ''}_{parts.path}".lower()
+    slug = re.sub(r"[^a-z0-9]+", "_", where).strip("_")
+    name = f"{PROMETHEUS_SOURCE_NAME}_{slug}" if slug else PROMETHEUS_SOURCE_NAME
+    if len(name) > _MAX_RESOURCE_NAME:
+        digest = hashlib.sha256(name.encode()).hexdigest()[:8]
+        name = f"{name[: _MAX_RESOURCE_NAME - 9]}_{digest}"
+    return name
+
+
+def _where(response) -> str:
+    """The endpoint a response came from, without its query string.
+
+    Error messages keep to the status and the path: the query carries the rule
+    group names a user filtered on.
+    """
+    return urlsplit(response.url).path
+
+
+def _still_active(check_active: Callable[[], None]):
+    """Build a response hook that runs the host's ``check_active`` before a page is used."""
+
+    def check(response, *args, **kwargs):
+        check_active()
+
+    return check
 
 
 def _require_success(key: str | None, allow_empty: bool = False):
@@ -279,7 +337,7 @@ def _require_success(key: str | None, allow_empty: bool = False):
             body = response.json()
         except ValueError as exc:
             raise ValueError(
-                f"Prometheus: the response from {response.url} is not JSON. "
+                f"Prometheus: the response from {_where(response)} is not JSON. "
                 "Aborting so a partial snapshot cannot forget live rows."
             ) from exc
         data = body.get("data") if isinstance(body, dict) else None
@@ -291,11 +349,11 @@ def _require_success(key: str | None, allow_empty: bool = False):
             expected = "an object under 'data'" if key is None else f"a 'data.{key}' list"
             raise ValueError(
                 f"Prometheus: expected status 'success' and {expected} from "
-                f"{response.url}. Aborting so a partial snapshot cannot forget live rows."
+                f"{_where(response)}. Aborting so a partial snapshot cannot forget live rows."
             )
         if body.get("warnings"):
             raise ValueError(
-                f"Prometheus: the response from {response.url} carries warnings, so it may "
+                f"Prometheus: the response from {_where(response)} carries warnings, so it may "
                 "be partial. Aborting so a partial snapshot cannot forget live rows."
             )
         if key == "groups":
@@ -304,10 +362,10 @@ def _require_success(key: str | None, allow_empty: bool = False):
             state = dlt.current.source_state()
             if not data[key] and state.get("had_rules") and not allow_empty:
                 raise ValueError(
-                    f"Prometheus: no rule groups from {response.url}, although an earlier "
-                    "sync found some. A wrong URL or a filter that matches nothing looks "
-                    "like this. Aborting so memory is not wiped; pass allow_empty=True "
-                    "if the rules really were all removed."
+                    f"Prometheus: no rule groups from {_where(response)}, although an "
+                    "earlier sync found some. Rule files that did not load, or a filter "
+                    "that matches nothing, look like this. Aborting so memory is not "
+                    "wiped; pass allow_empty=True if the rules really were all removed."
                 )
             state["had_rules"] = bool(data[key])
 

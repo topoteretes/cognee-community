@@ -45,6 +45,8 @@ answer = await cognee.search(
 | `rule_groups` | all groups | Read only these rule groups. Also applied after reading. |
 | `include_metadata` | `False` | Also read type, unit and help text for every metric the server knows. |
 | `allow_empty` | `False` | Let a sync through that finds no rules, or no metric metadata, although an earlier sync found some. |
+| `resource_name` | from the address, e.g. `prometheus_localhost_9090` | Prefix of the staging tables. Each server gets its own by default. |
+| `check_active` | none | Called before every response is used. Raise from it to stop a sync whose access was revoked. |
 
 See `examples/example.py` for the full flow.
 
@@ -52,8 +54,8 @@ See `examples/example.py` for the full flow.
 
 | Staging table | One document per | Source |
 |---|---|---|
-| `prometheus_rules` | alerting or recording rule | `GET /api/v1/rules` |
-| `prometheus_metrics` | metric, only with `include_metadata=True` | `GET /api/v1/metadata` |
+| `<resource_name>_rules` | alerting or recording rule | `GET /api/v1/rules` |
+| `<resource_name>_metrics` | metric, only with `include_metadata=True` | `GET /api/v1/metadata` |
 
 A rule document holds the rule's definition: type, name, group, file, evaluation interval,
 expression, `for`, `keep_firing_for`, labels and annotations. Annotations are stored as written,
@@ -83,7 +85,7 @@ Prometheus has no change feed for rules, but the whole rule list is one request.
   with a warning and only the reachable rulers' groups when one is down. A partial snapshot would
   otherwise be forgotten as if it were a deletion.
 - A server that suddenly has no rules at all, after an earlier sync found some, aborts the run too.
-  A URL pointing at the wrong server, or a filter that matches nothing, looks exactly like that.
+  Rule files that did not load, or a filter that matches nothing, look exactly like that.
   Pass `allow_empty=True` once to forget rules that really were all removed.
 
 Leave `write_disposition` at its default. Passing `merge` breaks forget-on-delete for a snapshot
@@ -94,7 +96,12 @@ source.
 - **Prometheus itself.** Tested against Prometheus 3.15.0 run locally, and read-only against
   the public demo server (3.13.0). Mimir, Thanos and VictoriaMetrics serve a compatible rules API
   with their own differences. They were not tested.
-- **One dataset per server.** Each sync is a full snapshot of one server.
+- **Servers can share a dataset.** Each server gets its own tables, named from its address, so
+  syncing two servers into one dataset keeps both. The name follows the address, so if a server
+  moves, pass the old `resource_name` to keep its tables. Two different filters on one server share
+  tables, so give each its own `resource_name` or dataset.
+- **Who can read it.** Rule expressions, labels and annotations, runbook links included, land in the
+  dataset. Anyone with read access to the dataset in cognee can read them.
 - **Metadata can be large.** A bare Prometheus 3.15.0 reported 265 metrics, and a real server can
   report thousands, each one a document to cognify. That is why it is off by default.
 - **Metadata needs live targets.** Prometheus builds it from its scrape caches, so right after a
