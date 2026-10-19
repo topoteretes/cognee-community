@@ -172,7 +172,7 @@ def test_nonconverging_membership_aborts():
         return result
 
     client.get = unstable
-    with pytest.raises(PostmanSyncError, match="converge"):
+    with pytest.raises(PostmanSyncError, match="during tree"):
         snapshot(client)
 
 
@@ -276,6 +276,7 @@ def test_monthly_exhaustion_stops_next_call():
 
 
 def source(client, **kwargs):
+    kwargs.setdefault("resource_name", "postman")
     return postman_source(
         client=client,
         workspace_id="w",
@@ -291,6 +292,7 @@ def test_namespace_isolation_and_rotation():
     first = source(client, api_key="old")
     assert first.name == source(client, api_key="new").name
     other = postman_source(
+        resource_name="postman",
         client=client,
         workspace_id="w",
         account_id="1",

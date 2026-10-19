@@ -1,0 +1,234 @@
+{
+  "recorded_date": "2026-10-19",
+  "tested_module_sha256": "d8416cc5114812034962b442b1dee121e778a51b4b7aa3639511fef048d9eb74",
+  "baseline_before_changes": "33d55ff2c2c8154f98e050fd74946a26046813e9",
+  "offline_matrix": [
+    {
+      "python": "3.12.13",
+      "cognee": "1.6.3",
+      "dlt": "1.30.0",
+      "httpx": "0.28.1",
+      "module_sha256": "d8416cc5114812034962b442b1dee121e778a51b4b7aa3639511fef048d9eb74",
+      "result": "passed",
+      "pytest_summary": "103 passed, 1 skipped, 13 warnings in 14.47s",
+      "console_sha256": "89f5b721a6e42ddc0911cd878e9b1fd596d74a05215ab06e63ecbabe50c9bcbf",
+      "command": "COGNEE_LOG_FILE=false TELEMETRY_DISABLED=1 RUNTIME__DLTHUB_TELEMETRY=false python -m pytest tests -q"
+    },
+    {
+      "python": "3.10.20",
+      "cognee": "1.6.3",
+      "dlt": "1.29.0",
+      "httpx": "0.28.1",
+      "module_sha256": "d8416cc5114812034962b442b1dee121e778a51b4b7aa3639511fef048d9eb74",
+      "result": "passed",
+      "pytest_summary": "103 passed, 1 skipped, 13 warnings in 19.13s",
+      "console_sha256": "4e97034c6a9f0f0fb05658200a504b4be93158e41b20c3014aff4c9f3eaf3beb",
+      "command": "COGNEE_LOG_FILE=false TELEMETRY_DISABLED=1 RUNTIME__DLTHUB_TELEMETRY=false python -m pytest tests -q"
+    },
+    {
+      "python": "3.14.8",
+      "cognee": "1.6.5",
+      "dlt": "1.30.0",
+      "httpx": "0.28.1",
+      "module_sha256": "d8416cc5114812034962b442b1dee121e778a51b4b7aa3639511fef048d9eb74",
+      "result": "passed",
+      "pytest_summary": "103 passed, 1 skipped, 13 warnings in 21.65s",
+      "console_sha256": "79d56e49eaafd9a33c584f5dbe53dd500ec39a4567e9421525dc1ef6fa631b10",
+      "command": "COGNEE_LOG_FILE=false TELEMETRY_DISABLED=1 RUNTIME__DLTHUB_TELEMETRY=false python -m pytest tests -q"
+    }
+  ],
+  "model_integration": {
+    "result": "passed",
+    "pytest_summary": "1 passed, 17 warnings in 17.86s",
+    "cognee": "1.6.3",
+    "python": "3.12.13",
+    "provider": "fake",
+    "stores": "real SQLite/Ladybug/LanceDB",
+    "models": "cached GLiNER2.5 and bge-small",
+    "command": "POSTMAN_MODEL_TEST=1 python -m pytest tests/test_cognee_scope_lifecycle.py -q",
+    "console_sha256": "30ce9ec934c042f9981b0a043601811932d4cddcccb0b7c1153fb77ed1dfdc7e"
+  },
+  "authenticated_lifecycle": {
+    "result": "passed",
+    "cognee": "1.6.3",
+    "dlt": "1.30.0",
+    "python": "3.12.13",
+    "command": "python tests/support/postman_lifecycle.py --allow-provider-writes",
+    "writes": "only two owned synthetic collections; saved requests never executed",
+    "steps": [
+      {
+        "step": "initial",
+        "data_rows": 2,
+        "graph_nodes": 20,
+        "graph_edges": 23,
+        "vector_rows": {
+          "DocumentChunk_text": 2,
+          "EdgeType_relationship_name": 24,
+          "EntityType_name": 8,
+          "Entity_name": 9,
+          "TextDocument_name": 2,
+          "TextSummary_text": 2
+        }
+      },
+      {
+        "step": "unchanged",
+        "data_rows": 2,
+        "graph_nodes": 20,
+        "graph_edges": 23,
+        "vector_rows": {
+          "DocumentChunk_text": 2,
+          "EdgeType_relationship_name": 24,
+          "EntityType_name": 8,
+          "Entity_name": 9,
+          "TextDocument_name": 2,
+          "TextSummary_text": 2
+        }
+      },
+      {
+        "step": "selection_deselected",
+        "data_rows": 1,
+        "graph_nodes": 12,
+        "graph_edges": 12,
+        "vector_rows": {
+          "DocumentChunk_text": 1,
+          "EdgeType_relationship_name": 14,
+          "EntityType_name": 6,
+          "Entity_name": 6,
+          "TextDocument_name": 1,
+          "TextSummary_text": 1
+        }
+      },
+      {
+        "step": "selection_restored",
+        "data_rows": 2,
+        "graph_nodes": 20,
+        "graph_edges": 23,
+        "vector_rows": {
+          "DocumentChunk_text": 2,
+          "EdgeType_relationship_name": 24,
+          "EntityType_name": 8,
+          "Entity_name": 9,
+          "TextDocument_name": 2,
+          "TextSummary_text": 2
+        }
+      },
+      {
+        "step": "edited",
+        "data_rows": 2,
+        "graph_nodes": 21,
+        "graph_edges": 24,
+        "vector_rows": {
+          "DocumentChunk_text": 2,
+          "EdgeType_relationship_name": 25,
+          "EntityType_name": 8,
+          "Entity_name": 10,
+          "TextDocument_name": 2,
+          "TextSummary_text": 2
+        }
+      },
+      {
+        "step": "docs_only_collection",
+        "data_rows": 2,
+        "graph_nodes": 19,
+        "graph_edges": 25,
+        "vector_rows": {
+          "DocumentChunk_text": 2,
+          "EdgeType_relationship_name": 27,
+          "EntityType_name": 6,
+          "Entity_name": 10,
+          "TextDocument_name": 2,
+          "TextSummary_text": 2
+        }
+      },
+      {
+        "step": "final_request_deleted",
+        "data_rows": 1,
+        "graph_nodes": 12,
+        "graph_edges": 12,
+        "vector_rows": {
+          "DocumentChunk_text": 1,
+          "EdgeType_relationship_name": 14,
+          "EntityType_name": 6,
+          "Entity_name": 6,
+          "TextDocument_name": 1,
+          "TextSummary_text": 1
+        }
+      },
+      {
+        "step": "request_restored",
+        "data_rows": 2,
+        "graph_nodes": 21,
+        "graph_edges": 24,
+        "vector_rows": {
+          "DocumentChunk_text": 2,
+          "EdgeType_relationship_name": 25,
+          "EntityType_name": 8,
+          "Entity_name": 10,
+          "TextDocument_name": 2,
+          "TextSummary_text": 2
+        }
+      },
+      {
+        "step": "nonempty_collection_deleted_next_sync",
+        "data_rows": 1,
+        "graph_nodes": 12,
+        "graph_edges": 12,
+        "vector_rows": {
+          "DocumentChunk_text": 1,
+          "EdgeType_relationship_name": 14,
+          "EntityType_name": 6,
+          "Entity_name": 6,
+          "TextDocument_name": 1,
+          "TextSummary_text": 1
+        }
+      },
+      {
+        "step": "last_collection_deleted_next_sync",
+        "data_rows": 0,
+        "graph_nodes": 0,
+        "graph_edges": 0,
+        "vector_rows": {
+          "DocumentChunk_text": 0,
+          "EdgeType_relationship_name": 0,
+          "EntityType_name": 0,
+          "Entity_name": 0,
+          "TextDocument_name": 0,
+          "TextSummary_text": 0
+        }
+      },
+      {
+        "step": "empty_replay",
+        "data_rows": 0,
+        "graph_nodes": 0,
+        "graph_edges": 0,
+        "vector_rows": {
+          "DocumentChunk_text": 0,
+          "EdgeType_relationship_name": 0,
+          "EntityType_name": 0,
+          "Entity_name": 0,
+          "TextDocument_name": 0,
+          "TextSummary_text": 0
+        }
+      }
+    ],
+    "console_sha256": "07515f1e2e54d6a91ecb6e3f6fa4594c90cf6ca26aeb2b39ae387c91072a7975",
+    "postflight": {
+      "remaining_collections": 1,
+      "synthetic_collections": 0,
+      "private_key_scan_passed": true
+    }
+  },
+  "independent_review": {
+    "model": "gpt-6-astra",
+    "effort": "medium",
+    "final_targeted_passed": 12,
+    "verdict": "no remaining privacy or code blockers"
+  },
+  "limits": [
+    "Author-recorded receipts, not an exhaustive guarantee.",
+    "Optional local-model test skipped in offline matrix; model pass recorded separately.",
+    "Secret filtering is best effort.",
+    "Single missing collection can be mirrored; bulk removals guarded by budget.",
+    "No same-scope concurrent ingestion, atomic provider snapshot, byte budget or complete backend matrix claimed."
+  ]
+}

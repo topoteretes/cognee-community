@@ -9,7 +9,11 @@ from pathlib import Path
 from local_runtime import configure_pipeline, configure_runtime
 from verify_stores import assert_stores, inspect_stores
 
-CONFIG = Path.home() / ".config/cognee-postman-4711/credentials.json"
+CONFIG = Path(
+    os.getenv(
+        "POSTMAN_TEST_CONFIG", str(Path.home() / ".config/cognee-postman-4711/credentials.json")
+    )
+)
 
 
 def load_config():
@@ -37,6 +41,7 @@ async def main():
 
     dataset = "postman_4711_demo"
     source = postman_source(
+        resource_name="postman_demo",
         api_key=settings["POSTMAN_API_KEY"],
         workspace_id=settings["POSTMAN_WORKSPACE_ID"],
         account_id=settings["POSTMAN_ACCOUNT_ID"],

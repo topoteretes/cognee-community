@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-EXAMPLES = Path(__file__).parents[1] / "examples"
+EXAMPLES = Path(__file__).parent / "support"
 
 
 def load_example(name):
@@ -66,8 +66,8 @@ from dlt.destinations import sqlalchemy
 from cognee.tasks.ingestion.dlt_utils import pipeline_name_for_source
 from cognee_community_connector_postman import postman_source
 from test_postman import FakeClient
-source = postman_source(client=FakeClient(), workspace_id='w', account_id='1',
-                        corpus_owner='owner', dataset_name='dataset')
+source = postman_source(resource_name='postman', client=FakeClient(), workspace_id='w',
+                        account_id='1', corpus_owner='owner', dataset_name='dataset')
 name = pipeline_name_for_source(source, 'dataset')
 from dlt.common.runtime import run_context
 from dlt.common.configuration.container import Container

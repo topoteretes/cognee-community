@@ -12,7 +12,7 @@ import pytest
     os.getenv("POSTMAN_MODEL_TEST") != "1", reason="Opt-in local-model Cognee integration test"
 )
 def test_forgetting_one_corpus_preserves_other_populated_corpus(tmp_path, monkeypatch):
-    monkeypatch.syspath_prepend(str(Path(__file__).parents[1] / "examples"))
+    monkeypatch.syspath_prepend(str(Path(__file__).parent / "support"))
     from local_runtime import configure_pipeline, configure_runtime
     from test_postman import FakeClient
     from verify_stores import assert_stores, inspect_stores

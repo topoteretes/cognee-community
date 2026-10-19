@@ -1,140 +1,126 @@
 # Postman connector
 
-Ingest selected saved requests, descriptions and inherited documentation into Cognee.
-Saved requests are never executed. Nested requests remain flat documents; documentation-only
-collections and described folders without requests produce overview documents.
+Sync selected requests and documentation into Cognee without executing saved requests.
+Nested requests become flat documents. Described request-free collections/folders also
+produce overview documents; populated branches retain inherited request documentation.
 
 ## Install and run
 
 ```sh
 pip install '.[test]'
-# Configure Cognee stores, extraction and embedding models separately.
+# Configure your Cognee stores and extraction/embedding models separately.
 export POSTMAN_API_KEY='your-key' POSTMAN_WORKSPACE_ID='your-workspace'
 export POSTMAN_COLLECTION_UIDS='collection-uid-1,collection-uid-2'
 python examples/quickstart.py
 ```
 
-Create an API key in Postman Account settings → API keys. `/me` returns its account ID;
-workspace settings/listing supplies the workspace ID. The account needs read access to
-`/me`, `/workspaces/{id}`, collection inventory and selected trees. A selection is not a
-permission boundary; the key may access other account resources. Keep keys outside Git.
-
-For hidden-prompt setup and a dedicated local runtime instead, use
-`python examples/configure_local.py`, then `python examples/postman_example.py`.
-These support scripts save private credentials outside Git (directory 700, file 600),
-force local SQLite/Ladybug/LanceDB and dlt paths, and inspect actual stores. They are
-optional; the short quickstart uses your Cognee configuration without changing directories.
-See [validation and support tooling](VALIDATION.md).
+Generate a user API key in Postman Account settings → API keys. Use the workspace ID
+from its settings/listing. Keep credentials outside Git and shell history. The account
+needs read access to `/me`, `/workspaces/{id}`, collection inventory and selected trees.
+Selections are not permission boundaries: the key may access other account resources.
 
 ```python
-from cognee_community_connector_postman import postman_source
-
 source = postman_source(
     api_key=api_key,
     workspace_id=workspace_id,
-    account_id=account_id,
-    corpus_owner="my_connection",  # stable owner/connection identity
-    dataset_name="postman_docs",
-    resource_name="api_docs",  # stable identity; distinct for independent siblings
+    resource_name="api_docs",  # required: stable, distinct identity for each connection
     collection_ids=[collection_uid],
 )
-await cognee.add(
+await cognee.remember(
     source,
     dataset_name="postman_docs",
     run_in_background=False,
     dlt_config={"write_disposition": "replace", "primary_key": "id"},
 )
-await cognee.cognify(datasets=["postman_docs"])
 ```
 
-The factory needs only key, workspace and selection. Account/owner/dataset arguments
-are optional advanced ownership constraints. If account_id is omitted, `/me` binds the
-first loaded account in durable state; later account changes abort until a separate
-resource identity is chosen. Credential rotation within the same account remains valid.
-The factory reads no environment variables. `service=` injects a reader for hosts/tests;
-`client=` remains its alias. `check_active=` is an optional synchronous authorization or
-cancellation callback, checked before reads/retries and before/after snapshot publication.
-Callback exceptions propagate and prevent the pending extraction from committing.
-Use a stable resource name for each independently managed connection. If dataset_name
-is explicitly supplied, keep it consistent with the destination. Without that argument,
-Cognee's own dataset-specific pipeline and destination isolate the source state.
+`resource_name` is required so independent connections cannot silently share the default
+table. Keep it fixed when editing selection; choose different names for sibling sources.
+The factory verifies `/me` **during construction**, resolves the account before naming
+its source/table, and stores that identity for both minimal and explicit-account calls.
+An optional `account_id` must match. Optional owner/dataset constraints remain available
+for advanced hosts. The factory reads no environment variables and changes no backend
+paths. `service=` injects a reader; `client=` remains an alias.
 
-## Sync, ownership and deletion
+## Incremental sync and deletion
 
 `collection_ids=None` selects all visible collections, including subscriptions/forks;
-`[]` explicitly empties this resource. Selection is mutable: reuse the same resource
-identity when adding/removing collections, and deselected documents retire on that sync.
-Account/workspace/owner/dataset/resource name bind the table, pipeline and document IDs.
-Different resource names isolate sibling corpora, even with overlapping selections.
-Changing those binding fields creates a new corpus; it does not retire the old one.
+`[]` intentionally empties this resource. Changing selection replaces that resource's
+snapshot and retires deselected content without touching differently named siblings.
+Account/workspace/owner/dataset/resource identity binds document IDs, table and state;
+changing those binding fields creates another corpus.
 
-Collection `updatedAt`, renderer version and redaction policy control tree refetches.
-All rendered names/descriptions/methods come from that tree, without external label caches.
-Use `force_refresh=True` to reconcile edits with unchanged timestamps. Every run emits a
-**complete retained snapshot** with `replace`, including unchanged rows and explicit empty
-replacements. No-change retries replay the corpus after ingestion/cleanup failure.
-Keep pipeline state persistent; concurrent runs of the same scope are unsupported.
+Collection `updatedAt`, renderer version and redaction policy control tree fetching.
+Use `force_refresh=True` for timestamp-silent edits. Every extraction emits the **complete
+retained snapshot** with `replace`, including cached rows and explicit empty replacements.
+Keep pipeline state persistent. Same-scope concurrent extraction is unsupported.
 
-**Default `mirror_visibility` removes previously observed collections absent from a stable,
-complete listing on the next sync.** Unsharing, unsubscribing or moving out of the workspace
-also counts as removal. Opt into `missing_collection_policy="require_confirmation"` to
-block ambiguous disappearance until the UID is supplied in `confirmed_deleted`.
-Never-observed selected UIDs, auth/API failures and incomplete/unstable inventory abort.
-Explicit deselection is intentional configuration and does not require confirmation.
+Default `mirror_visibility` removes a previously observed missing collection on the
+next sync. Unsharing, moving or permission loss can also cause absence. **Bulk protection:**
+more than one unconfirmed missing collection aborts instead of publishing removals.
+Pass missing UIDs in `confirmed_deleted` after checking the workspace, or explicitly set
+`max_unconfirmed_removals`. Setting it to zero requires confirmation for every disappearance.
+The default still permits final-single-collection deletion automatically; it cannot prove
+whether one missing collection was physically deleted or became invisible. Explicit
+selection edits are intentional and bypass the provider-disappearance budget.
 
-Two matching inventory passes converge within three attempts; fetched trees or membership
-changes require a final recheck. Workspace identity/access is checked before and after.
-An unchanged small workspace costs five calls including `/me`; changed/removal runs cost
-six plus changed-tree reads (paging/convergence adds calls). This is bounded validation,
-not an atomic provider transaction; timestamp-silent concurrent edits remain possible.
-Retries wait at most two seconds each and five seconds total per extraction, with bounded
-HTTP timeouts. Longer retry hints/monthly exhaustion require a later sync. API allowance
-is account-specific; do not assume free-plan quotas or schedule hourly by default.
+Use `missing_collection_policy="require_confirmation"` for conservative handling of any
+visibility loss. Unknown selected UIDs, inaccessible workspace, API/quota faults and
+malformed/incomplete pagination abort. Confirmations cannot remove visible collections.
 
-### Migrating the earlier experimental identity
+An unchanged small workspace costs **three reads**: `/me` at construction, workspace
+validation and one paginated inventory. Fetches or membership changes require a second
+matching inventory before publication. This reduces quota use while retaining checks on
+changed snapshots; it is not an atomic provider transaction. HTTP retries have finite
+attempts/timeouts and at most two seconds per sleep/five seconds per client phase.
+Longer retry hints/monthly exhaustion require a later sync. Allowance is account-specific.
 
-Versions before this review included selection in table identity. New identities do not
-silently delete those old tables. Before upgrading, retire each old scope using its old
-version/identity and validated removal, or explicitly forget its **dedicated** Cognee
-dataset before reingestion. Dataset-level forgetting also removes sibling corpora in that
-dataset: do not use it on a shared dataset. Shared-dataset migration needs deliberate
-host cleanup of the old owned scope. No broad Postman-tag cleanup or global dlt deletion
-is performed. Keep old state/backups until verifying Data, graph and vector stores.
+## Content and privacy
 
-## Content, privacy and diagnostics
+Endpoint templates and header/query names are included by default, with variables left
+unresolved and userinfo/query values/fragments removed. `include_endpoint_metadata=False`
+disables them. Known credential patterns in paths are redacted too. Request rows with
+valid Postman item UUIDs link to the request UI; missing/duplicate IDs fall back to the
+collection UI. Positional identity fallback changes on reorder/move.
 
-Unique request/folder IDs are stable across moves; missing/duplicate IDs use positional
-fallback and can change on reordering. Documentation is inherited by request documents;
-request-free documentation branches remain searchable as flat overview documents. Removing
-the last request does not remove independently retained overview documentation.
+Auth, bodies, scripts, examples and raw header/query/variable values are omitted. Redaction
+recognizes secret-typed variables, sensitive names, auth-declared headers, credential-like
+query values, common token patterns and explicit `redact_values`. Short secrets use token
+boundaries so ordinary words, counts and versions are not corrupted. This is best-effort
+filtering, not universal secret detection: arbitrary prose, hosts, paths or unusual names
+can contain undiscoverable private values. Review documentation and use explicit values.
+Raw trees are not persisted; sanitized rows/cursors remain in local state and stores.
 
-Auth, bodies, scripts, examples and header/query/variable values are omitted. Exact auth
-and sensitive-key values, explicit `redact_values` and common credential patterns are
-redacted from retained prose. Ordinary values such as `service` and `application/json`
-are preserved. Arbitrary secrets in prose/body samples cannot be universally detected.
+## Host hooks and diagnostics
 
-`include_endpoint_metadata=True` opts into unresolved endpoint host/path templates and
-header/query **names**, excluding userinfo, query values and fragments. It is off by default:
-hosts, paths and even names can themselves contain private identifiers/secrets. Review
-collections and use `redact_values` before opting in. Variables are never resolved.
-Each row's `url` is its authenticated Postman collection API provenance URL, not an
-invented public/request UI link. Only sanitized rows/cursors persist; protect local stores.
+`check_active=` is a synchronous host authorization/cancellation callback. A single
+coordinator checks it before every HTTP attempt, including retries; publication has
+separate before/after checkpoints. Injected PostmanClient hooks are retained and identical
+callbacks are deduplicated. Callback exceptions abort; factory preflight errors raise
+before a source is returned.
 
-`source.cognee_sync_stats` and its resource expose integer counters, reset per extraction:
-`scanned` selected collections, `skipped` reused collections, `fetched`, `documents`,
-`failed` failed syncs, and `failed_auth`, `failed_rate_limit`, `failed_data` subcounts.
-These describe extraction only, not committed ingestion or successful deletion cleanup.
-`PostmanAuthError`, `PostmanRateLimitError` and `PostmanDataError` inherit `PostmanSyncError`;
-messages exclude response bodies/credentials. Cognee can log cleanup failure without
-raising from add: verify actual stores and retry after repairing the failure.
+`source.cognee_sync_stats` and its resource share integer extraction counters: `scanned`
+selected collections, `skipped` reused, `fetched`, `documents`, `failed`, and typed
+`failed_auth`/`failed_rate_limit`/`failed_data`. All extraction exceptions increment failed;
+a static Cognee warning omits private exception text. Typed errors inherit PostmanSyncError.
+Counters are not proof of committed ingestion or successful cleanup. Cognee can log orphan
+cleanup failure without raising: inspect actual Data/graph/vector stores and retry.
 
-## Compatibility and evidence
+## Compatibility, migration and verification
 
-Declared Python range: 3.10–3.13; tested interpreters: **3.10.20 and 3.12.13**.
-Dependencies allow Cognee **>=1.6.3,<2** and dlt **>=1.29,<1.31**. The test matrix
-covers Cognee1.6.3/1.6.5 and dlt1.29/1.30; Cognee1.6.5 itself requires dlt<1.31,
-so that ceiling is retained. Future allowed releases are not individually prevalidated;
-the document-sync capability guard remains. Other Python/backend combinations are
-not claimed as tested. Tree depth is bounded, but whole
-response/snapshot memory is not byte-budgeted; select smaller scopes for large workspaces.
-See [exact validation scope and runnable checks](VALIDATION.md).
+Declared Python: **>=3.10,<3.15**, matching core; tested versions and exact dependency
+combinations/results are in [VALIDATION_RESULTS.json](VALIDATION_RESULTS.json).
+Dependencies: Cognee>=1.6.3,<2 and dlt>=1.29,<1.31. Current core also rejects dlt1.31;
+future allowed releases and unlisted backends are not individually validated.
+
+**Experimental upgrade:** earlier selection-based, default-name and unresolved-account
+identities may leave old tables/documents. Retire old owned scopes with the old version
+or deliberately forget a dedicated old dataset before reingesting. Dataset-level cleanup
+also deletes siblings: do not use it on shared datasets. No broad automatic cleanup occurs.
+See [CHANGELOG.md](CHANGELOG.md).
+
+The only public example is quickstart.py. Credential-writing/blog scripts are excluded.
+Optional isolated lifecycle/store inspection is test support under `tests/support/`,
+not imported by the connector or quickstart. [VALIDATION.md](VALIDATION.md) gives commands,
+model configuration and evidence boundaries. Depth is bounded; response/snapshot memory
+is not byte-budgeted. Select smaller scopes for large workspaces.

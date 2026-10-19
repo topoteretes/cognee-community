@@ -82,6 +82,7 @@ def test_cognee_scopes_other_owner_snapshot(ingestion):
 
     async def run(owner):
         src = postman_source(
+            resource_name="postman",
             client=client,
             workspace_id="w",
             account_id="1",

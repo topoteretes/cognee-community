@@ -92,7 +92,7 @@ def test_selection_edits_replace_same_table_keep_ids_and_sibling_table(tmp_path)
 def test_docs_only_collection_and_empty_folder_overviews_move_and_retire():
     tree = collection([])
     tree["item"] = [
-        {"id": "folder-id", "name": "Guide", "description": "Folder guide"},
+        {"id": "folder-id", "name": "Guide", "description": "Folder guide", "item": []},
         {"name": "Empty", "item": []},
     ]
     rows = flatten_collection(tree, "1-c", "ns")
@@ -107,7 +107,7 @@ def test_docs_only_collection_and_empty_folder_overviews_move_and_retire():
     assert flatten_collection(tree, "1-c", "ns") == []
 
 
-def test_endpoint_metadata_opt_in_and_provenance_exclude_values():
+def test_endpoint_metadata_default_and_provenance_exclude_values():
     tree = collection()
     req = tree["item"][0]["request"]
     req["url"] = {
@@ -115,7 +115,7 @@ def test_endpoint_metadata_opt_in_and_provenance_exclude_values():
         "query": [{"key": "token", "value": "query-private"}],
     }
     req["header"] = [{"key": "Accept", "value": "private-header-value"}]
-    default = flatten_collection(tree, "1-c", "ns")
+    default = flatten_collection(tree, "1-c", "ns", include_endpoint_metadata=False)
     assert "orders" not in json.dumps(default)
     rows = flatten_collection(tree, "1-c", "ns", include_endpoint_metadata=True)
     text = json.dumps(rows)
@@ -123,7 +123,7 @@ def test_endpoint_metadata_opt_in_and_provenance_exclude_values():
     assert "Header names: Accept" in text
     for secret in ("private-pass", "query-private", "fragment-private", "private-header-value"):
         assert secret not in text
-    assert rows[0]["url"] == "https://api.postman.com/collections/1-c"
+    assert rows[0]["url"] == "https://go.postman.co/collection/1-c"
     req["url"] = "{{baseUrl}}/v1/orders/:id?expand=private-query"
     assert "{{baseUrl}}/v1/orders/:id" in json.dumps(
         flatten_collection(tree, "1-c", "ns", include_endpoint_metadata=True)
@@ -146,7 +146,7 @@ def test_invalid_numeric_total_withholds_snapshot(total):
         snapshot(client)
 
 
-def test_integral_float_total_is_accepted_and_nochange_cost_is_five_calls():
+def test_integral_float_total_is_accepted_and_nochange_cost_is_three_calls():
     client = FakeClient()
     get = client.get
 
@@ -160,8 +160,8 @@ def test_integral_float_total_is_accepted_and_nochange_cost_is_five_calls():
     _, state = snapshot(client)
     client.calls.clear()
     snapshot(client, state)
-    # build_snapshot excludes /me: two inventory passes and two workspace checks.
-    assert len(client.calls) == 4
+    # build_snapshot excludes factory /me: one inventory and one workspace check.
+    assert len(client.calls) == 2
 
 
 def test_cancellation_before_requests_and_before_publish_does_not_commit(tmp_path):
@@ -185,7 +185,7 @@ def test_cancellation_before_requests_and_before_publish_does_not_commit(tmp_pat
     with pytest.raises(Exception, match="Synthetic cancellation"):
         pipeline.run(source(client, check_active=cancelled))
     assert not client.calls and pipeline.state["sources"] == saved
-    for cutoff in (6, 7):  # before yield, and after yield before cache mutation
+    for cutoff in (4, 5):  # before yield, and after yield before cache mutation
         checkpoints = 0
 
         def before_publish(stop=cutoff):
@@ -201,7 +201,12 @@ def test_cancellation_before_requests_and_before_publish_does_not_commit(tmp_pat
 
 def test_service_alias_and_typed_http_errors_and_global_wait_budget():
     src = postman_source(
-        service=FakeClient(), workspace_id="w", account_id="1", corpus_owner="o", dataset_name="d"
+        resource_name="postman",
+        service=FakeClient(),
+        workspace_id="w",
+        account_id="1",
+        corpus_owner="o",
+        dataset_name="d",
     )
     list(src)
     assert src.cognee_sync_stats["scanned"] == 1
@@ -279,12 +284,12 @@ def test_non_quota_retry_exhaustion_is_not_rate_limit(kind):
 def test_typed_failure_statistics(status, field):
     from dlt.extract.exceptions import ResourceExtractionError
 
-    client = PostmanClient(
-        "key",
-        transport=httpx.MockTransport(
-            lambda _: httpx.Response(status, headers={"Retry-After": "60"}, json=[])
-        ),
-    )
+    def handler(request):
+        if request.url.path == "/me":
+            return httpx.Response(200, json={"user": {"id": "1"}})
+        return httpx.Response(status, headers={"Retry-After": "60"}, json=[])
+
+    client = PostmanClient("key", transport=httpx.MockTransport(handler))
     src = source(client)
     try:
         with pytest.raises(ResourceExtractionError):
@@ -297,10 +302,9 @@ def test_typed_failure_statistics(status, field):
         client.close()
 
 
-def test_minimal_factory_binds_first_account_and_rejects_account_switch(tmp_path):
+def test_minimal_and_explicit_account_factories_share_verified_identity(tmp_path):
     import dlt
     from dlt.destinations import sqlalchemy
-    from dlt.pipeline.exceptions import PipelineStepFailed
 
     client = FakeClient()
     pipeline = dlt.pipeline(
@@ -310,17 +314,19 @@ def test_minimal_factory_binds_first_account_and_rejects_account_switch(tmp_path
         dataset_name="chosen_dataset",
     )
 
-    def minimal():
-        return postman_source(workspace_id="w", service=client, resource_name="connection")
+    def minimal(**kwargs):
+        return postman_source(
+            workspace_id="w", service=client, resource_name="connection", **kwargs
+        )
 
     src = minimal()
+    assert src.name == minimal(account_id="1").name
     pipeline.run(src)
     assert pipeline.state["sources"][src.name]["postman_snapshot"]["account_id"] == "1"
-    saved = copy.deepcopy(pipeline.state["sources"])
+    with pytest.raises(PostmanAuthError):
+        minimal(account_id="other")
     get = client.get
     client.get = lambda path, **params: (
         {"user": {"id": "other"}} if path == "/me" else get(path, **params)
     )
-    with pytest.raises(PipelineStepFailed):
-        pipeline.run(minimal())
-    assert pipeline.state["sources"] == saved
+    assert minimal().name != src.name

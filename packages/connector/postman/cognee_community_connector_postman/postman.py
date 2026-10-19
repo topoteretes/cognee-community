@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 
 # Bump when allowlisted rendering or identity semantics change, so old cached
 # rows cannot indefinitely bypass a new rendering policy on an unchanged tree.
-_RENDER_VERSION = 4
+_RENDER_VERSION = 5
 
 
 class DocumentRow(TypedDict):
@@ -83,17 +83,20 @@ class PostmanClient:
         if not 0 <= delay <= 2 or delay > self._wait_remaining:
             error = PostmanRateLimitError if rate_limit else PostmanSyncError
             raise error("Postman retry requires a later sync.")
-        if self._check_active:
-            self._check_active()
         self._wait_remaining -= delay
         self._sleep(delay)
 
     def get(self, path: str, **params: str | int) -> dict[str, Any]:
+        return self.get_checked(path, None, **params)
+
+    def get_checked(self, path, check_active, **params):
+        # One checkpoint coordinator, including retries; retain injected client hooks.
+        checks = list({id(cb): cb for cb in (self._check_active, check_active) if cb}.values())
         if self._monthly_exhausted:
             raise PostmanRateLimitError("Postman monthly API allowance exhausted.")
         for attempt in range(4):
-            if self._check_active:
-                self._check_active()
+            for checkpoint in checks:
+                checkpoint()
             try:
                 response = self._client.get(path, params=params)
             except httpx.TransportError:
@@ -151,7 +154,7 @@ def _secret_values(value: Any) -> set[str]:
     """Exact auth/sensitive-key values only; ordinary metadata is not secret."""
     secrets = set()
     sensitive = re.compile(
-        r"(?i)(authorization|cookie|password|secret|token|api[-_]?key|credential)"
+        r"(?i)(authorization|(?:^|[-_])auth(?:$|[-_])|cookie|password|secret|token|api[-_]?key|credential|^key$)"
     )
 
     def strings(part):
@@ -167,37 +170,88 @@ def _secret_values(value: Any) -> set[str]:
             for child in part:
                 strings(child)
 
+    auth_headers = set()
+
+    def find_auth(part):
+        if isinstance(part, dict):
+            auth = part.get("auth")
+            if isinstance(auth, dict) and isinstance(auth.get("apikey"), list):
+                fields = {
+                    entry.get("key"): entry.get("value")
+                    for entry in auth["apikey"]
+                    if isinstance(entry, dict) and isinstance(entry.get("key"), str)
+                }
+                if fields.get("in") == "header" and isinstance(fields.get("key"), str):
+                    auth_headers.add(fields["key"].strip().casefold())
+            for child in part.values():
+                find_auth(child)
+        elif isinstance(part, list):
+            for child in part:
+                find_auth(child)
+
+    find_auth(value)
+
     def walk(part, auth=False):
         if isinstance(part, dict):
             # Postman key/value entries in auth, headers, variables and query.
-            if "value" in part and (auth or sensitive.search(str(part.get("key", "")))):
+            field = str(part.get("key", ""))
+            if "value" in part and (
+                auth
+                or part.get("type") == "secret"
+                or sensitive.search(field)
+                or field.strip().casefold() in auth_headers
+            ):
                 strings(part["value"])
             for key, child in part.items():
                 if key == "auth":
                     if isinstance(child, dict):
                         for auth_key, auth_value in child.items():
                             if auth_key != "type":
-                                if isinstance(auth_value, (dict, list)):
+                                if isinstance(auth_value, list):
+                                    for entry in auth_value:
+                                        if isinstance(entry, dict) and entry.get("key") not in {
+                                            "key",
+                                            "in",
+                                        }:
+                                            strings(entry.get("value"))
+                                elif isinstance(auth_value, dict):
                                     walk(auth_value, True)
                                 else:
                                     strings(auth_value)
+                elif key == "query" and isinstance(child, list):
+                    for entry in child:
+                        if isinstance(entry, dict):
+                            field, val = str(entry.get("key", "")), entry.get("value")
+                            if sensitive.search(field) or (
+                                isinstance(val, str)
+                                and len(val) >= 8
+                                and re.search(r"[A-Z0-9_-]", val)
+                            ):
+                                strings(val)
                 elif key == "cookie":
                     walk(child, True)
                 elif key == "header" and isinstance(child, str):
                     for line in child.splitlines():
                         name, sep, val = line.partition(":")
-                        if sep and sensitive.search(name):
+                        if sep and (
+                            sensitive.search(name.strip())
+                            or name.strip().casefold() in auth_headers
+                        ):
                             strings(val.strip())
                 elif key in {"url", "request", "raw"} and isinstance(child, str):
                     try:
                         parsed = urlsplit(child)
                         strings(parsed.password)
                         for name, val in parse_qsl(parsed.query):
-                            if sensitive.search(name):
+                            if sensitive.search(name) or (
+                                len(val) >= 8 and re.search(r"[A-Z0-9_-]", val)
+                            ):
                                 strings(val)
                     except ValueError:
                         pass
-                elif sensitive.search(key) and isinstance(child, str):
+                elif (
+                    key not in {"key", "type"} and sensitive.search(key) and isinstance(child, str)
+                ):
                     strings(child)
                 else:
                     walk(child, auth)
@@ -215,12 +269,13 @@ def flatten_collection(
     namespace: str,
     *,
     redact_values: Iterable[str] = (),
-    include_endpoint_metadata: bool = False,
+    include_endpoint_metadata: bool = True,
 ) -> list[DocumentRow]:
     """Allowlist documentation. Missing/duplicate IDs use positional identities.
 
     Fallback identities change on reorder/move; replace removes their old rows.
-    URLs, auth, scripts, values, bodies and examples are never rendered.
+    Unresolved endpoint templates may be rendered; auth, scripts, header/query
+    values, bodies and examples are omitted. Redaction is best effort.
     """
     if not isinstance(collection, dict) or not isinstance(collection.get("info"), dict):
         raise PostmanDataError("Malformed collection info.")
@@ -229,7 +284,14 @@ def flatten_collection(
     def clean(value):
         text = _description(value)
         for secret in sorted(secrets, key=len, reverse=True):
-            text = text.replace(secret, "[REDACTED]")
+            if len(secret) < 4:
+                # Do not turn Read into Re[REDACTED]d or version1.2 into broken digits.
+                text = re.sub(
+                    r"(?<![\w.])" + re.escape(secret) + r"(?!\w|\.\d)", "[REDACTED]", text
+                )
+            else:
+                text = text.replace(secret, "[REDACTED]")
+        text = re.sub(r"\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9_-]+", "[REDACTED]", text)
         text = re.sub(r"(?i)\b(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]+", "[REDACTED]", text)
         text = re.sub(r"PMAK-[A-Za-z0-9-]+", "[REDACTED]", text)
         text = re.sub(
@@ -241,7 +303,7 @@ def flatten_collection(
 
     found = []
     overviews = []
-    provenance = "https://api.postman.com/collections/" + quote(uid, safe="")
+    provenance = "https://go.postman.co/collection/" + quote(uid, safe="")
 
     def endpoint(request):
         if not include_endpoint_metadata:
@@ -274,9 +336,10 @@ def flatten_collection(
             template = "[unsupported endpoint template]"
         names = []
         if isinstance(value, dict):
-            names.extend(
-                entry.get("key", "") for entry in value.get("query", []) if isinstance(entry, dict)
-            )
+            query = value.get("query", [])
+            if not isinstance(query, list) or any(not isinstance(entry, dict) for entry in query):
+                raise PostmanDataError("Malformed endpoint query list.")
+            names.extend(entry.get("key", "") for entry in query)
         else:
             try:
                 names.extend(name for name, _ in parse_qsl(urlsplit(raw).query))
@@ -317,7 +380,7 @@ def flatten_collection(
                 if not isinstance(request, dict):
                     raise PostmanDataError("Malformed request object; snapshot withheld.")
                 found.append((item, request, breadcrumb, position, docs))
-            elif "item" in item or isinstance(item.get("name"), str):
+            elif "item" in item:
                 before = len(found)
                 walk(
                     item.get("item", []),
@@ -393,7 +456,17 @@ def flatten_collection(
                 "id": _digest([namespace, uid, identity]),
                 "title": title,
                 "content": content,
-                "url": provenance,
+                "url": (
+                    "https://go.postman.co/request/"
+                    + quote(uid.split("-", 1)[0] + "-" + item_id, safe="")
+                    if item_id
+                    and ids[item_id] == 1
+                    and uid.split("-", 1)[0].isdigit()
+                    and re.fullmatch(
+                        r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", item_id
+                    )
+                    else provenance
+                ),
             }
         )
     return sorted(rows, key=lambda row: row["id"])
@@ -457,7 +530,8 @@ def build_snapshot(
     redact_values: Iterable[str] = (),
     force_refresh: bool = False,
     stats: dict[str, int] | None = None,
-    include_endpoint_metadata: bool = False,
+    max_unconfirmed_removals: int = 1,
+    include_endpoint_metadata: bool = True,
 ) -> tuple[list[DocumentRow], dict[str, Any]]:
     """Build privately, validating before yielding or modifying durable dlt state."""
 
@@ -469,16 +543,7 @@ def build_snapshot(
     redact_values = tuple(sorted(set(redact_values)))
     render_policy = _digest([_RENDER_VERSION, list(redact_values), include_endpoint_metadata])
     validate_workspace()
-    previous_inventory = None
-    inventory = None
-    for _ in range(3):
-        current = _inventory(client, workspace_id, page_size, max_pages)
-        if current == previous_inventory:
-            inventory = current
-            break
-        previous_inventory = current
-    if inventory is None:
-        raise PostmanSyncError("Inventory failed to converge; snapshot withheld.")
+    inventory = _inventory(client, workspace_id, page_size, max_pages)
     selected = set(inventory) if collection_ids is None else set(collection_ids)
     confirmed = set(confirmed_deleted)
     if confirmed & set(inventory):
@@ -494,6 +559,14 @@ def build_snapshot(
         raise PostmanSyncError(
             "Collection disappeared or lost access. "
             "Confirm deletion/removal explicitly before sync."
+        )
+    unconfirmed = (missing & set(cached)) - confirmed - acknowledged
+    if (
+        missing_collection_policy == "mirror_visibility"
+        and len(unconfirmed) > max_unconfirmed_removals
+    ):
+        raise PostmanSyncError(
+            "Bulk collection removal requires confirmed_deleted; snapshot withheld."
         )
     fresh = {}
     fetched = reused = 0
@@ -528,7 +601,6 @@ def build_snapshot(
         client, workspace_id, page_size, max_pages
     ) != inventory:
         raise PostmanSyncError("Inventory changed during tree fetch; retry sync.")
-    validate_workspace()
     rows = [row for uid in sorted(fresh) for row in fresh[uid]["rows"]]
     next_state = {"collections": fresh}
     removed = (acknowledged | (missing & allowed)) - set(inventory)
@@ -565,6 +637,7 @@ def postman_source(
     workspace_id: str | None = None,
     collection_ids: Iterable[str] | None = None,
     *,
+    resource_name: str,
     account_id: str | None = None,
     corpus_owner: str | None = None,
     dataset_name: str | None = None,
@@ -572,11 +645,11 @@ def postman_source(
     missing_collection_policy: str = "mirror_visibility",
     page_size: int = 100,
     max_pages: int = 100,
+    max_unconfirmed_removals: int = 1,
     client: PostmanReader | None = None,
     redact_values: Iterable[str] = (),
     force_refresh: bool = False,
-    resource_name: str = "postman",
-    include_endpoint_metadata: bool = False,
+    include_endpoint_metadata: bool = True,
     service: PostmanReader | None = None,
     check_active: Callable[[], None] | None = None,
 ) -> "DltSource":
@@ -613,6 +686,8 @@ def postman_source(
         or max_pages < 1
     ):
         raise ValueError("page_size must be 1..100 and max_pages positive.")
+    if type(max_unconfirmed_removals) is not int or max_unconfirmed_removals < 0:
+        raise ValueError("max_unconfirmed_removals must be a nonnegative integer.")
     if api_key is not None:
         _validate_api_key(api_key)
     if missing_collection_policy not in {"require_confirmation", "mirror_visibility"}:
@@ -634,6 +709,31 @@ def postman_source(
         r"[a-z][a-z0-9_]{0,62}", resource_name
     ):
         raise ValueError("resource_name must be a lowercase identifier (1..63 characters).")
+
+    class CheckedReader:
+        def __init__(self, provider):
+            self.provider = provider
+
+        def get(self, path, **params):
+            if isinstance(self.provider, PostmanClient):
+                return self.provider.get_checked(path, check_active, **params)
+            if check_active:
+                check_active()
+            return self.provider.get(path, **params)
+
+    preflight = client or PostmanClient(api_key)
+    try:
+        user = CheckedReader(preflight).get("/me").get("user")
+        identity = user.get("id") if isinstance(user, dict) else None
+        if isinstance(identity, bool) or not isinstance(identity, (str, int)) or not str(identity):
+            raise PostmanAuthError("Postman account identity could not be verified.")
+        identity = str(identity)
+        if account_id is not None and identity != account_id:
+            raise PostmanAuthError("Postman account differs from configured namespace.")
+    finally:
+        if client is None:
+            preflight.close()
+    account_id = identity
     namespace = _digest([account_id, workspace_id, corpus_owner, dataset_name, resource_name])
     stats = dict(
         scanned=0,
@@ -655,27 +755,9 @@ def postman_source(
     )
     def requests() -> Iterator[list[DocumentRow]]:
         stats.update({key: 0 for key in stats})
-        provider = client or PostmanClient(api_key, check_active=check_active)
-
-        class CheckedReader:
-            def get(self, path, **params):
-                if check_active:
-                    check_active()
-                return provider.get(path, **params)
-
-        reader = CheckedReader()
+        provider = client or PostmanClient(api_key)
+        reader = CheckedReader(provider)
         try:
-            user = reader.get("/me").get("user")
-            identity = user.get("id") if isinstance(user, dict) else None
-            if (
-                isinstance(identity, bool)
-                or not isinstance(identity, (str, int))
-                or not str(identity)
-            ):
-                raise PostmanAuthError("Postman account identity could not be verified.")
-            identity = str(identity)
-            if account_id is not None and identity != account_id:
-                raise PostmanAuthError("Postman account differs from configured namespace.")
             # dlt resets resource_state before every replace extraction. Source-level
             # state retains the collection cache and still participates in load commit.
             state = dlt.current.source_state().setdefault("postman_snapshot", {})
@@ -692,13 +774,13 @@ def postman_source(
                 confirmed_deleted=confirmed_deleted,
                 page_size=page_size,
                 max_pages=max_pages,
+                max_unconfirmed_removals=max_unconfirmed_removals,
                 redact_values=(*redact_values, api_key or ""),
                 force_refresh=force_refresh,
                 stats=stats,
                 include_endpoint_metadata=include_endpoint_metadata,
             )
-            if account_id is None:
-                next_state["account_id"] = identity
+            next_state["account_id"] = identity
             # Empty list + explicit columns creates a zero-row replacement table.
             # The whole cache is re-emitted on rerun, including downstream retries.
             if check_active:
@@ -708,8 +790,11 @@ def postman_source(
                 check_active()
             state.clear()
             state.update(next_state)
-        except PostmanSyncError as exc:
+        except Exception as exc:
+            from cognee.shared.logging_utils import get_logger
+
             stats["failed"] += 1
+            get_logger(__name__).warning("Postman extraction failed; snapshot withheld.")
             if isinstance(exc, PostmanAuthError):
                 stats["failed_auth"] += 1
             elif isinstance(exc, PostmanRateLimitError):
