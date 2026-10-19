@@ -1,9 +1,19 @@
 """Offline test of search-hit provenance and read-only source inspection."""
 
+import importlib.util
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
-from examples.search_and_inspect import result_hits, source_detail
+# The example is a source-tree script, not a module shipped in the wheel.
+# Load by its real path so a clean installed-wheel test run works from repo root.
+_example_path = Path(__file__).resolve().parents[1] / "examples" / "search_and_inspect.py"
+_spec = importlib.util.spec_from_file_location("opensiro_source_inspection_example", _example_path)
+assert _spec is not None and _spec.loader is not None
+_example = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_example)
+result_hits = _example.result_hits
+source_detail = _example.source_detail
 
 
 class DeveloperFlowTests(unittest.TestCase):
