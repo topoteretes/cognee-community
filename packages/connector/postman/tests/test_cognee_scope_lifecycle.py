@@ -29,15 +29,14 @@ def test_forgetting_one_corpus_preserves_other_populated_corpus(tmp_path, monkey
     left.tree["item"][0]["request"]["description"] = "Ravi lives in Calgary."
     right.tree["item"][0]["request"]["description"] = "Yuna lives in Kyoto."
 
-    async def sync(client, owner):
+    async def sync(client, owner, selection=("1-c",)):
         src = postman_source(
             client=client,
             workspace_id="w",
             account_id="1",
             corpus_owner=owner,
             dataset_name=dataset,
-            collection_ids=["1-c"],
-            missing_collection_policy="mirror_visibility",
+            collection_ids=selection,
         )
         configure_pipeline(src, dataset, runtime)
         await cognee.add(
@@ -53,8 +52,7 @@ def test_forgetting_one_corpus_preserves_other_populated_corpus(tmp_path, monkey
         await sync(right, "right")
         stats, texts = await inspect_stores(dataset)
         assert_stores(stats, texts, expected_rows=2, expected=["Calgary", "Kyoto"])
-        left.inventory = {}
-        await sync(left, "left")
+        await sync(left, "left", [])
         stats, texts = await inspect_stores(dataset)
         assert_stores(stats, texts, expected_rows=1, expected=["Kyoto"], forbidden=["Calgary"])
         assert stats["graph_nodes"] > 0
@@ -64,7 +62,7 @@ def test_forgetting_one_corpus_preserves_other_populated_corpus(tmp_path, monkey
             datasets=[dataset],
         )
         assert "Kyoto" in json.dumps(results, default=str)
-        await sync(left, "left")
+        await sync(left, "left", [])
         stats, texts = await inspect_stores(dataset)
         assert_stores(stats, texts, expected_rows=1, expected=["Kyoto"], forbidden=["Calgary"])
         right.inventory = {}

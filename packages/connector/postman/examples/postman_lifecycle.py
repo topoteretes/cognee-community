@@ -68,7 +68,6 @@ async def main():
             corpus_owner="local_postman_lifecycle",
             dataset_name=dataset,
             collection_ids=selection,
-            missing_collection_policy="mirror_visibility",
         )
         configure_pipeline(source, dataset, runtime)
         await cognee.add(
@@ -134,6 +133,11 @@ async def main():
             selection.append(uid)
         await sync("initial", 2, expected=["Oslo", "Bergen"])
         await sync("unchanged", 2, expected=["Oslo", "Bergen"])
+        original_selection = list(selection)
+        selection[:] = [original_selection[1]]
+        await sync("selection_deselected", 1, expected=["Bergen"], forbidden=["Oslo"])
+        selection[:] = original_selection
+        await sync("selection_restored", 2, expected=["Oslo", "Bergen"])
         first = request("GET", "/collections/" + selection[0])["collection"]
         first["item"][0]["request"]["description"] = "Aster lives in Lima."
         request("PUT", "/collections/" + selection[0], json={"collection": first})
@@ -141,6 +145,11 @@ async def main():
         await sync("edited", 2, expected=["Lima", "Bergen"], forbidden=["Oslo"])
         saved_items = first["item"]
         first["item"] = []
+        first["info"]["description"] = "Orion lives in Tallinn."
+        request("PUT", "/collections/" + selection[0], json={"collection": first})
+        await asyncio.sleep(4)
+        await sync("docs_only_collection", 2, expected=["Tallinn", "Bergen"], forbidden=["Lima"])
+        first["info"]["description"] = ""
         request("PUT", "/collections/" + selection[0], json={"collection": first})
         await asyncio.sleep(4)
         await sync("final_request_deleted", 1, expected=["Bergen"], forbidden=["Lima", "Oslo"])

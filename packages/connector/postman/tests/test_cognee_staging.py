@@ -66,6 +66,7 @@ def test_cognee_reads_retained_and_empty_snapshots(ingestion):
     assert [(row.primary_key_value, row.row_data["content"]) for row in replay] == original
     assert not any(path.startswith("/collections/") for path, _ in client.calls)
     client.tree["item"] = []
+    client.tree["info"]["description"] = ""
     client.inventory["1-c"]["updatedAt"] = "final-request-deleted"
     empty = asyncio.run(run())
     assert not empty

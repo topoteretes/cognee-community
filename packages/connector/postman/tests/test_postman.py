@@ -67,7 +67,7 @@ def snapshot(client, state=None, **kwargs):
     )
 
 
-def test_lifecycle_cursor_move_inherited_docs_and_request_delete():
+def test_cursor_move_and_inherited_documentation():
     client = FakeClient()
     rows, state = snapshot(client)
     assert len(rows) == 2
@@ -94,7 +94,7 @@ def test_collection_disappearance_requires_confirmation_and_final_empty():
     client.inventory = {}
     saved = copy.deepcopy(state)
     with pytest.raises(PostmanSyncError, match="disappeared"):
-        snapshot(client, state)
+        snapshot(client, state, missing_collection_policy="require_confirmation")
     assert state == saved
     rows, next_state = snapshot(client, state, confirmed_deleted=["1-c"])
     assert rows == [] and next_state == {"collections": {}, "removed_collections": ["1-c"]}
@@ -220,7 +220,7 @@ def test_redaction_in_rendered_rows_and_cached_state():
         "seed-auth-secret seed-header-secret seed-body-secret PMAK-abc-123 "
         "token=seed-query-secret Bearer examplecredential seed-explicit-secret"
     )
-    rows, state = snapshot(client, redact_values=["seed-explicit-secret"])
+    rows, state = snapshot(client, redact_values=["seed-explicit-secret", "seed-body-secret"])
     serialized = json.dumps([rows, state])
     for secret in [
         "seed-auth-secret",
@@ -252,7 +252,7 @@ def test_http_errors_have_bounded_retries_and_no_secret_output(status):
         with pytest.raises(PostmanSyncError) as error:
             client.get("/me")
         assert "secret" not in str(error.value)
-        assert len(calls) == (4 if status in (429, 500) else 1)
+        assert len(calls) == (3 if status in (429, 500) else 1)
         assert calls[0].headers["X-Api-Key"] == "secret-key"
     finally:
         client.close()
@@ -298,7 +298,8 @@ def test_namespace_isolation_and_rotation():
         dataset_name="dataset",
     )
     assert first.name != other.name
-    assert first.name != source(client, collection_ids=["1-c"]).name
+    assert first.name == source(client, collection_ids=["1-c"]).name
+    assert first.name != source(client, resource_name="sibling").name
     assert first.cognee_document_source == "postman"
 
 
@@ -336,6 +337,7 @@ def test_real_dlt_sqlite_lifecycle_empty_replace_and_replay(tmp_path):
     assert [row[0] for row in refreshed] == [row[0] for row in rows]
     assert all("Timestamp-independent refreshed docs" in row[1] for row in refreshed)
     client.tree["item"] = []
+    client.tree["info"]["description"] = ""
     client.inventory["1-c"]["updatedAt"] = "empty"
     run()
     with pipeline.sql_client() as sql:
@@ -494,7 +496,7 @@ def test_raw_headers_scripts_and_cookies_are_not_copied():
     request["description"] = "raw-header-secret script-secret cookie-secret"
     tree["event"] = [{"script": {"exec": ["script-secret"]}}]
     tree["cookie"] = [{"value": "cookie-secret"}]
-    serialized = json.dumps(flatten_collection(tree, "c", "ns"))
+    serialized = json.dumps(flatten_collection(tree, "c", "ns", redact_values=["script-secret"]))
     for secret in ["raw-header-secret", "script-secret", "cookie-secret"]:
         assert secret not in serialized
 
@@ -557,16 +559,18 @@ def test_selected_collection_scope_does_not_remove_unselected_cached_data():
     assert len(rows) == 2 and set(state["collections"]) == {"1-c"}
     client.inventory.pop("1-c")
     with pytest.raises(PostmanSyncError, match="disappeared"):
-        snapshot(client, state, collection_ids=["1-c"])
+        snapshot(
+            client, state, collection_ids=["1-c"], missing_collection_policy="require_confirmation"
+        )
 
 
 def test_redaction_preserves_metadata_words_but_removes_values():
     tree = collection()
-    tree["variable"] = [{"key": "customer", "type": "string", "value": "private-value"}]
+    tree["variable"] = [{"key": "customer_token", "type": "string", "value": "private-value"}]
     tree["response"] = [{"name": "customer", "status": "customer", "body": "private-body"}]
     tree["item"][0]["name"] = "customer"
     tree["item"][0]["request"]["description"] = "customer string private-value private-body"
-    rows = flatten_collection(tree, "1-c", "scope")
+    rows = flatten_collection(tree, "1-c", "scope", redact_values=["private-body"])
     row = next(row for row in rows if "customer" in row["title"])
     assert "customer string" in row["content"]
     assert "private-value" not in row["content"]
@@ -666,7 +670,9 @@ def test_real_dlt_reappearance_clears_removal_acknowledgement(tmp_path):
     saved = copy.deepcopy(pipeline.state)
     client.inventory = {}
     with pytest.raises(PipelineStepFailed):
-        pipeline.run(source(client, collection_ids=["1-c"]))
+        pipeline.run(
+            source(client, collection_ids=["1-c"], missing_collection_policy="require_confirmation")
+        )
     assert pipeline.state["sources"] == saved["sources"]
 
 
@@ -711,18 +717,21 @@ def test_rendered_dependencies_and_timestamp_refresh(field):
     assert changed == refreshed
 
 
-def test_snapshot_statistics_are_counts_only_and_not_cleanup_receipts(caplog):
-    caplog.set_level("INFO", logger="cognee_community_connector_postman.postman")
+def test_snapshot_statistics_are_counts_only_and_reset():
     client = FakeClient()
-    _, state = snapshot(client)
-    assert "selected=1 fetched=1 reused=0 documents=2" in caplog.text
-    assert "Cognee ingestion and cleanup are not yet verified" in caplog.text
-    caplog.clear()
-    snapshot(client, state)
-    assert "selected=1 fetched=0 reused=1 documents=2" in caplog.text
-    assert "1-c" not in caplog.text
-    caplog.clear()
-    client.inventory = {}
-    with pytest.raises(PostmanSyncError):
-        snapshot(client, state)
-    assert "snapshot prepared" not in caplog.text
+    src = source(client)
+    list(src)
+    assert src.cognee_sync_stats == dict(
+        scanned=1,
+        skipped=0,
+        fetched=1,
+        documents=2,
+        failed=0,
+        failed_auth=0,
+        failed_rate_limit=0,
+        failed_data=0,
+    )
+    assert all(type(value) is int for value in src.cognee_sync_stats.values())
+    assert all(
+        resource.cognee_sync_stats is src.cognee_sync_stats for resource in src.resources.values()
+    )

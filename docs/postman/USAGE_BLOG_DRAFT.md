@@ -1,3 +1,5 @@
+> Historical demonstration draft from 12 October 2026. Current behavior, including default visibility mirroring and mutable selection, is documented in `packages/connector/postman/README.md`; test counts below describe that earlier demonstration.
+
 # Turning Postman request documentation into Cognee memory
 
 Draft for the contributor to review, edit and understand before publication.

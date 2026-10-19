@@ -1,55 +1,31 @@
 # Postman connector
 
-Sync selected Postman collections as one Cognee document per request, including
-collection/folder documentation, method and breadcrumb. Saved requests are never executed.
+Ingest selected saved requests, descriptions and inherited documentation into Cognee.
+Saved requests are never executed. Nested requests remain flat documents; documentation-only
+collections and described folders without requests produce overview documents.
 
-## Install and connect
-
-Python 3.11–3.13; the demonstrated clean installation used Python 3.12.13,
-Cognee 1.6.3 and dlt 1.30.0. From this package directory:
+## Install and run
 
 ```sh
 pip install '.[test]'
-python examples/configure_local.py
+# Configure Cognee stores, extraction and embedding models separately.
+export POSTMAN_API_KEY='your-key' POSTMAN_WORKSPACE_ID='your-workspace'
+export POSTMAN_ACCOUNT_ID='your-account-id'
+export POSTMAN_COLLECTION_UIDS='collection-uid-1,collection-uid-2'
+python examples/quickstart.py
 ```
 
-Create a dedicated Postman test workspace. In Postman Account settings → API keys,
-generate a user API key. The helper accepts it through a hidden terminal prompt,
-verifies `/me`, lists workspaces and validates the selected workspace. It stores
-credentials outside Git in `~/.config/cognee-postman-4711/credentials.json`, with
-file permissions 600 and directory permissions 700. It blocks redirects and refuses
-to overwrite existing credentials. Never paste credentials into a chat, issue or PR.
+Create an API key in Postman Account settings → API keys. `/me` returns its account ID;
+workspace settings/listing supplies the workspace ID. The account needs read access to
+`/me`, `/workspaces/{id}`, collection inventory and selected trees. A selection is not a
+permission boundary; the key may access other account resources. Keep keys outside Git.
 
-Read access is needed to `/me`, `/workspaces/{id}`, collection inventory and selected
-collection trees. A user API key can access other resources available to that account;
-selection is not a permission boundary. Revoke the test key when finished.
-
-## Run with Cognee
-
-Configure Cognee's extraction and embedding models separately. The connector does
-not download models; Cognee may download them on first use. The demonstration used
-cached `fastino/gliner2.5-base-v1` and `BAAI/bge-small-en-v1.5`, with
-`GRAPH_EXTRACTOR=gliner_demo`, `GLINER_INFERENCE_THREADS=1` and offline model caches.
-That setup requires `pip install 'cognee[gliner]==1.6.3'`. Chunk search needs no chat LLM.
-
-```sh
-export POSTMAN_COLLECTION_UIDS='your-selected-collection-uid'
-python examples/postman_example.py
-```
-
-The example forces dedicated local SQLite/Ladybug/LanceDB stores under
-`~/.local/share/cognee-postman-4711`; `POSTMAN_RUNTIME_DIR` can choose a dedicated
-alternative. Inherited database paths/providers are overridden. Model configuration
-is retained. dlt's durable state and pending loads live under `runtime/dlt/pipelines`;
-inherited dlt directory overrides are replaced too. Configure the standalone runtime
-before importing Cognee/dlt. The same runtime and collection selection must be used
-for reruns. Previously created global dlt state is not automatically migrated or deleted.
-It performs foreground add, cognify and chunk search, then inspects the actual stores.
-Set `POSTMAN_FORBIDDEN_TEXT='obsolete fixture text'` to assert absence across Data,
-graph properties and vector payloads, or `POSTMAN_EXPECT_EMPTY=1` to assert zero rows,
-graph nodes/edges and vector rows. These checks raise on failure.
-
-The Python source API also supports your own Cognee dataset/backend configuration:
+For hidden-prompt setup and a dedicated local runtime instead, use
+`python examples/configure_local.py`, then `python examples/postman_example.py`.
+These support scripts save private credentials outside Git (directory 700, file 600),
+force local SQLite/Ladybug/LanceDB and dlt paths, and inspect actual stores. They are
+optional; the short quickstart uses your Cognee configuration without changing directories.
+See [validation and support tooling](VALIDATION.md).
 
 ```python
 from cognee_community_connector_postman import postman_source
@@ -58,10 +34,10 @@ source = postman_source(
     api_key=api_key,
     workspace_id=workspace_id,
     account_id=account_id,
-    corpus_owner="my_postman_corpus",
+    corpus_owner="my_connection",  # stable owner/connection identity
     dataset_name="postman_docs",
+    resource_name="api_docs",  # stable identity; distinct for independent siblings
     collection_ids=[collection_uid],
-    missing_collection_policy="mirror_visibility",
 )
 await cognee.add(
     source,
@@ -72,157 +48,86 @@ await cognee.add(
 await cognee.cognify(datasets=["postman_docs"])
 ```
 
-`collection_ids=None` selects all visible workspace collections, including subscriptions
-and forks; `[]` selects none. The example requires explicit nonempty selection.
+The factory reads no environment variables. `service=` injects a reader for hosts/tests;
+`client=` remains its alias. `check_active=` is an optional synchronous authorization or
+cancellation callback, checked before reads/retries and before/after snapshot publication.
+Callback exceptions propagate and prevent the pending extraction from committing.
+Account, owner and dataset are explicit so credential rotation cannot accidentally rebind
+an existing corpus. The destination dataset must match `dataset_name`.
 
-## Incremental sync and deletion
+## Sync, ownership and deletion
 
-Changed collection trees are fetched by `updatedAt`; unchanged sanitized documents
-are reused from dlt source state. Every run emits the **complete retained corpus**
-with `replace`. Sending only changed documents would erase unchanged staging rows.
-Explicit columns produce a zero-row replacement after the final request disappears.
-No-change reruns replay the full corpus after downstream ingestion/cleanup failures.
-Keep dlt's pipeline directory persistent; do not run the same namespace concurrently.
+`collection_ids=None` selects all visible collections, including subscriptions/forks;
+`[]` explicitly empties this resource. Selection is mutable: reuse the same resource
+identity when adding/removing collections, and deselected documents retire on that sync.
+Account/workspace/owner/dataset/resource name bind the table, pipeline and document IDs.
+Different resource names isolate sibling corpora, even with overlapping selections.
+Changing those binding fields creates a new corpus; it does not retire the old one.
 
-All rendered collection, folder and request names/descriptions, plus request methods,
-come from the fetched collection tree; no external display-label lookup is cached.
-Invalidation relies on inventory `updatedAt`, rendering version and redaction policy.
-If tree content changes without a timestamp change, ordinary sync reuses the prior
-snapshot. Pass `force_refresh=True` to `postman_source` to fetch every visible selected
-tree in the same scope and reconcile such changes. This preserves document identities,
-complete replacement, inventory validation and disappearance policy. It is not an
-atomic provider snapshot; edits without timestamp signals during a fetch cannot be
-excluded. Offline regressions cover each rendered dependency with advanced timestamps
-and with unchanged timestamps plus forced refresh.
+Collection `updatedAt`, renderer version and redaction policy control tree refetches.
+All rendered names/descriptions/methods come from that tree, without external label caches.
+Use `force_refresh=True` to reconcile edits with unchanged timestamps. Every run emits a
+**complete retained snapshot** with `replace`, including unchanged rows and explicit empty
+replacements. No-change retries replay the corpus after ingestion/cleanup failure.
+Keep pipeline state persistent; concurrent runs of the same scope are unsupported.
 
-The module's INFO logger reports only selected/fetched/reused collection counts and
-prepared document counts after snapshot validation. Configure Python logging to see
-these statistics. They describe extraction preparation, not successful dlt loading,
-Cognee ingestion or deletion cleanup; use the store verifier for those outcomes.
+**Default `mirror_visibility` removes previously observed collections absent from a stable,
+complete listing on the next sync.** Unsharing, unsubscribing or moving out of the workspace
+also counts as removal. Opt into `missing_collection_policy="require_confirmation"` to
+block ambiguous disappearance until the UID is supplied in `confirmed_deleted`.
+Never-observed selected UIDs, auth/API failures and incomplete/unstable inventory abort.
+Explicit deselection is intentional configuration and does not require confirmation.
 
+Two matching inventory passes converge within three attempts; fetched trees or membership
+changes require a final recheck. Workspace identity/access is checked before and after.
+An unchanged small workspace costs five calls including `/me`; changed/removal runs cost
+six plus changed-tree reads (paging/convergence adds calls). This is bounded validation,
+not an atomic provider transaction; timestamp-silent concurrent edits remain possible.
+Retries wait at most two seconds each and five seconds total per extraction, with bounded
+HTTP timeouts. Longer retry hints/monthly exhaustion require a later sync. API allowance
+is account-specific; do not assume free-plan quotas or schedule hourly by default.
 
-Inventory must have valid paging metadata, unique UIDs, complete totals and cursors.
-Two consecutive equal inventories converge within three attempts. Workspace access
-is checked before/after and inventory is rechecked after tree fetching. API errors,
-quota exhaustion, malformed trees or unstable/incomplete inventory abort before
-publishing rows. This validation is bounded, not a provider transaction.
+### Migrating the earlier experimental identity
 
-Deleting a request within a surviving collection removes it automatically. For whole
-collections there are two explicit policies:
+Versions before this review included selection in table identity. New identities do not
+silently delete those old tables. Before upgrading, retire each old scope using its old
+version/identity and validated removal, or explicitly forget its **dedicated** Cognee
+dataset before reingestion. Dataset-level forgetting also removes sibling corpora in that
+dataset: do not use it on a shared dataset. Shared-dataset migration needs deliberate
+host cleanup of the old owned scope. No broad Postman-tag cleanup or global dlt deletion
+is performed. Keep old state/backups until verifying Data, graph and vector stores.
 
-- `mirror_visibility`: remove previously observed collections absent from a complete,
-  stable, validated listing on the next sync. **Unsharing, unsubscribing or moving out
-  of the workspace also removes their local documents.** Unknown, never-observed
-  selected UIDs still fail instead of silently producing an empty corpus. This policy
-  is used by both runnable examples for automatic forget-on-delete.
-- `require_confirmation` (source API default): abort if an observed collection disappears
-  until its UID is passed in `confirmed_deleted`. This preserves records when visibility
-  loss is ambiguous. The example's optional `POSTMAN_CONFIRMED_DELETED_UIDS` supplies
-  explicit confirmation. A visible collection cannot be confirmed removed.
+## Content, privacy and diagnostics
 
-Acknowledged removals persist across reruns; reappearance refetches the collection and
-clears its acknowledgement. Account, workspace, corpus owner, dataset and selection
-namespace document IDs, table names and pipeline state. Rotating keys preserves identity.
-Changing selection/owner/dataset creates a new corpus and does not retire the old one.
-To retire the old scope, keep its original namespace/selection, remove or unshare its
-selected collections and sync using the matching policy; alternatively explicitly
-forget the old dedicated dataset through Cognee before migrating. Dataset-level forgetting
-also removes other corpora sharing that dataset, so use separate datasets for migration.
+Unique request/folder IDs are stable across moves; missing/duplicate IDs use positional
+fallback and can change on reordering. Documentation is inherited by request documents;
+request-free documentation branches remain searchable as flat overview documents. Removing
+the last request does not remove independently retained overview documentation.
 
-Cognee can log orphan cleanup failures without raising from add. Verify actual stores
-when checking forgetting; exit code/search alone is insufficient. Full replay allows a
-retry after cleanup is repaired.
+Auth, bodies, scripts, examples and header/query/variable values are omitted. Exact auth
+and sensitive-key values, explicit `redact_values` and common credential patterns are
+redacted from retained prose. Ordinary values such as `service` and `application/json`
+are preserved. Arbitrary secrets in prose/body samples cannot be universally detected.
 
-## Reproducible lifecycle and store checks
+`include_endpoint_metadata=True` opts into unresolved endpoint host/path templates and
+header/query **names**, excluding userinfo, query values and fragments. It is off by default:
+hosts, paths and even names can themselves contain private identifiers/secrets. Review
+collections and use `redact_values` before opting in. Variables are never resolved.
+Each row's `url` is its authenticated Postman collection API provenance URL, not an
+invented public/request UI link. Only sanitized rows/cursors persist; protect local stores.
 
-```sh
-# Requires a dedicated workspace and explicitly authorizes only synthetic fixture writes.
-python examples/postman_lifecycle.py --allow-provider-writes
-```
+`source.cognee_sync_stats` and its resource expose integer counters, reset per extraction:
+`scanned` selected collections, `skipped` reused collections, `fetched`, `documents`,
+`failed` failed syncs, and `failed_auth`, `failed_rate_limit`, `failed_data` subcounts.
+These describe extraction only, not committed ingestion or successful deletion cleanup.
+`PostmanAuthError`, `PostmanRateLimitError` and `PostmanDataError` inherit `PostmanSyncError`;
+messages exclude response bodies/credentials. Cognee can log cleanup failure without
+raising from add: verify actual stores and retry after repairing the failure.
 
-The lifecycle creates two synthetic collections and checks ingest/search, unchanged
-sync, edits, final-request removal, restoration, nonempty whole-collection removal
-while a sibling survives, final collection removal and empty replay. It inspects Data,
-actual graph properties and all LanceDB table rows/payloads. Its own provider fixtures
-are removed in `finally`; existing collections are never selected or modified.
-By default each lifecycle run creates a fresh local runtime and prints its path.
-If setting `POSTMAN_RUNTIME_DIR`, use a fresh directory for each run. Failed runs leave
-local evidence for diagnosis and are not automatically pruned.
+## Compatibility and evidence
 
-The verifier performs no Postman calls and imports no Cognee test helpers:
-
-```sh
-POSTMAN_RUNTIME_DIR='/path/printed/by/lifecycle' \
-  python examples/verify_stores.py --dataset postman_4711_lifecycle --expect-empty
-python examples/verify_stores.py --forbid-text 'obsolete fixture text'
-```
-
-It supports the example's pinned local backends. Other backends require their own
-store inspection; unsupported inspection must not be interpreted as empty storage.
-
-## Privacy, identity and quotas
-
-Unique item IDs remain stable across moves/renames; missing or duplicate IDs use
-positional fallback, which changes on reorder/move. Inherited documentation changes
-refresh every request in the changed collection. Postman assigned/normalized IDs in
-live tests; raw fallback behavior is covered offline.
-
-URLs, auth, scripts, headers/query/variable values, bodies and examples are omitted.
-Known exact sensitive values and explicit `redact_values` are removed from retained
-prose, alongside common credential patterns. Metadata labels are preserved. Arbitrary
-secrets embedded in prose are not universally detectable; ingest reviewed documentation.
-Raw trees are not retained in state. Sanitized docs and cursors remain in local state,
-staging and Cognee storage; protect those directories. Rendering policy changes force
-refetches so unchanged cached documents receive current redaction.
-
-Retries are bounded for transport, 429 and 5xx; numeric retry-after waits above 60s
-require a later sync. Monthly exhaustion stops further reads. A stable sync costs
-`/me`, two workspace checks, three inventory passes and one tree fetch per changed
-collection (convergence may need a fourth pass). A small unchanged workspace normally
-costs six calls. Budget against actual account headers; do not assume free-plan limits
-or schedule hourly by default.
-
-## Validation
-
-```sh
-RUNTIME__DLTHUB_TELEMETRY=false python -m pytest tests -q
-ruff check .
-ruff format --check .
-```
-
-70 offline tests pass; one local-model integration test is opt-in. Offline tests cover
-provider faults, cursor/cache behavior, redaction, namespace identity, real dlt/SQLite
-replacement, interrupted load recovery and actual Cognee staging/read-back.
-The two-runtime regression verifies distinct real dlt working directories, isolated
-cached documents/pending loads, and preserved state when returning to the same runtime.
-
-```sh
-# Configure local models first. Run in its own process.
-POSTMAN_MODEL_TEST=1 python -m pytest tests/test_cognee_scope_lifecycle.py -q
-```
-
-That integration test populates two independent source scopes in one dataset, forgets
-one, verifies the other in Data/graph/vectors/search, then verifies complete cleanup.
-A clean Python 3.12 installation from PyPI with Cognee 1.6.3 passed the offline suite,
-installed-wheel authenticated lifecycle and this scope test. Prior exact-release tests
-also injected ingestion and cleanup failures, then proved unchanged retry recovery.
-Validation receipts are distinct: the original installed-wheel authenticated lifecycle
-used small owned fixtures; later offline reruns use fake provider responses, and the
-separate local-model scope test uses real Cognee stores with a fake provider. The
-12 October follow-up reran the offline suite, local-model scope test, Ruff and wheel
-build; it did not repeat authenticated provider writes. The new forced-refresh and
-statistics behavior is covered offline, not by a new live-account lifecycle.
-
-Large collection trees have a depth limit but no configurable response-byte/document
-budget. State and replacement snapshots are materialized in memory; callers with very
-large workspaces should select smaller collection sets. Adding budgets would require
-fail-closed behavior and streaming response handling, not truncating a replacement
-snapshot. This is deferred hardening, not a verified defect in the tested fixtures.
-
-Small synthetic fixtures establish these behaviors; no full Python-version/backend
-matrix, every concurrent edit pattern or mid-transaction crash is claimed.
-
-Official references:
-- https://learning.postman.com/api-docs/api-reference/collections/get-collections
-- https://learning.postman.com/docs/reference/postman-api/authentication/
-- https://learning.postman.com/docs/reference/postman-api/postman-api-rate-limits/
+Declared Python range: 3.11–3.13; tested interpreter: **3.12.13**. Dependencies deliberately
+remain pinned to tested Cognee **1.6.3**, dlt **1.30.x**, httpx **0.28.1** in validation.
+No broader Python/core/backend compatibility is claimed. Tree depth is bounded, but whole
+response/snapshot memory is not byte-budgeted; select smaller scopes for large workspaces.
+See [exact validation scope and runnable checks](VALIDATION.md).
