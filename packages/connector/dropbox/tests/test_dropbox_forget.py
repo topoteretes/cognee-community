@@ -16,11 +16,21 @@ from cognee.infrastructure.databases.vector.embeddings.LiteLLMEmbeddingEngine im
     LiteLLMEmbeddingEngine,
 )
 from cognee.infrastructure.llm import LLMGateway
+from cognee.modules.data.methods import get_dataset_data, get_datasets_by_name
+from cognee.modules.users.methods import get_default_user
 from fake_dropbox import FakeDropbox
 
 from cognee_community_connector_dropbox import dropbox_source
 
 add_data_points_module = importlib.import_module("cognee.tasks.storage.add_data_points")
+
+try:
+    # Newer cognee returns vectors plus a token count; 1.6.3 a plain list.
+    from cognee.infrastructure.databases.vector.embeddings.EmbeddingEngine import (
+        EmbeddingResult,
+    )
+except ImportError:
+    EmbeddingResult = None
 
 DATASET = "dropbox_forget_test"
 ALPHA = "Alphacorp"
@@ -76,11 +86,22 @@ async def _graph_has(token: str) -> bool:
     )
 
 
+@pytest.fixture(scope="session")
+def cognee_root(tmp_path_factory):
+    # One root for the whole session: cognee caches its database engines per
+    # process, so a new root per test would leave later tests reading the
+    # first test's stores.  prune() below empties it between tests instead.
+    return tmp_path_factory.mktemp("cognee")
+
+
 @pytest_asyncio.fixture
-async def clean_environment(tmp_path, monkeypatch):
+async def clean_environment(cognee_root, tmp_path, monkeypatch):
     monkeypatch.setenv("COGNEE_SKIP_CONNECTION_TEST", "true")
-    cognee.config.data_root_directory(str(tmp_path / "data"))
-    cognee.config.system_root_directory(str(tmp_path / "system"))
+    # dlt keeps pipeline state under ~/.dlt, which cognee's prune never clears,
+    # so without this a second test run would start from the first run's cursors.
+    monkeypatch.setenv("DLT_DATA_DIR", str(tmp_path / "dlt"))
+    cognee.config.data_root_directory(str(cognee_root / "data"))
+    cognee.config.system_root_directory(str(cognee_root / "system"))
     cognee.config.set_relational_db_config({"db_provider": "sqlite"})
 
     async def _noop_index(*_a, **_k):
@@ -91,7 +112,8 @@ async def clean_environment(tmp_path, monkeypatch):
     monkeypatch.setattr(LLMGateway, "acreate_structured_output", _mock_structured_output)
 
     async def _mock_embed_text(self, text):
-        return [[0.0] * self.get_vector_size() for _ in text]
+        vectors = [[0.0] * self.get_vector_size() for _ in text]
+        return EmbeddingResult(vectors, tokens=0) if EmbeddingResult else vectors
 
     monkeypatch.setattr(LiteLLMEmbeddingEngine, "embed_text", _mock_embed_text)
 
@@ -102,9 +124,20 @@ async def clean_environment(tmp_path, monkeypatch):
     await cognee.prune.prune_system(metadata=True)
 
 
-async def _sync(fake):
+async def _stored_documents() -> int:
+    """How many data items the dataset holds.
+
+    A tombstone that only empties a row (hard_delete off) leaves an empty
+    document behind, which the graph checks alone would not notice.
+    """
+    user = await get_default_user()
+    datasets = await get_datasets_by_name([DATASET], user.id)
+    return len(await get_dataset_data(datasets[0].id))
+
+
+async def _sync(fake, resource_name="dropbox_files"):
     await cognee.add(
-        dropbox_source(client=fake),
+        dropbox_source(service=fake, resource_name=resource_name),
         dataset_name=DATASET,
         primary_key="id",
         write_disposition="merge",
@@ -123,6 +156,7 @@ async def test_deleted_file_and_folder_are_forgotten_moved_file_is_kept(clean_en
     await _sync(fake)
     for token in TOKENS:
         assert await _graph_has(token), f"{token} should be in the graph after the first sync"
+    assert await _stored_documents() == 3
 
     # Move alpha, delete bravo, delete the whole /Old folder.
     fake.move("/Notes/alpha.md", "/Archive/alpha.md")
@@ -133,3 +167,25 @@ async def test_deleted_file_and_folder_are_forgotten_moved_file_is_kept(clean_en
     assert await _graph_has(ALPHA), "a moved file must stay in memory"
     assert not await _graph_has(BRAVO), "a deleted file must be forgotten from the graph"
     assert not await _graph_has(CHARLIE), "files in a deleted folder must be forgotten"
+    assert await _stored_documents() == 1, "deleted files must be removed, not left empty"
+
+
+@pytest.mark.asyncio
+async def test_two_dropbox_sources_in_one_dataset_stay_apart(clean_environment):
+    work, personal = FakeDropbox(), FakeDropbox()
+    work.put("/Notes/alpha.md", f"{ALPHA} is a company in the logistics sector.")
+    personal.put("/Notes/bravo.md", f"{BRAVO} is an unrelated company in finance.")
+
+    # Each sync of one account must leave the other account's files alone.
+    await _sync(work, "work_dropbox")
+    await _sync(personal, "personal_dropbox")
+    await _sync(work, "work_dropbox")
+    assert await _graph_has(ALPHA) and await _graph_has(BRAVO)
+    assert await _stored_documents() == 2
+
+    work.delete("/Notes/alpha.md")
+    await _sync(work, "work_dropbox")
+
+    assert not await _graph_has(ALPHA)
+    assert await _graph_has(BRAVO), "a delete in one account must not touch the other"
+    assert await _stored_documents() == 1

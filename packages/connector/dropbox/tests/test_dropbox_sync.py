@@ -5,12 +5,15 @@ change (edit, move, delete, cursor reset, ...) and checks the rows the
 connector yields and the state it keeps for the next run.
 """
 
+import copy
 import logging
 
 import pytest
 from dropbox import files
+from dropbox.exceptions import AuthError, RateLimitError
 from fake_dropbox import FakeDropbox, api_error, make_pdf
 
+from cognee_community_connector_dropbox import dropbox as dropbox_module
 from cognee_community_connector_dropbox.dropbox import _DropboxConfig, _iter_rows
 
 
@@ -186,13 +189,13 @@ def test_file_added_and_deleted_in_the_same_round_is_never_downloaded(fake):
     assert deletes == [temp]
 
 
-def test_file_stored_by_a_failed_run_is_still_forgotten_on_replay(fake):
-    x = fake.put("/x.md", "stored during a run that later failed")
+def test_file_stored_next_to_a_failed_one_is_still_forgotten(fake):
+    x = fake.put("/x.md", "stored next to a file that failed")
     y = fake.put("/y.md", "fails to download")
     fake.download_errors[y] = ConnectionError("timeout")
     state: dict = {}
     upserts, _, _ = sync(fake, state)
-    assert x in upserts and "cursors" not in state  # x reached cognee, the cursor did not move
+    assert x in upserts and state["retry"] == [y]  # the cursor moved, y waits by id
 
     fake.delete("/x.md")
     del fake.download_errors[y]
@@ -202,7 +205,7 @@ def test_file_stored_by_a_failed_run_is_still_forgotten_on_replay(fake):
     assert set(upserts) == {y}
 
 
-def test_incremental_round_that_failed_replays_to_the_same_result(fake):
+def test_failed_file_is_fetched_again_by_id_without_replaying_the_round(fake):
     keep = fake.put("/keep.md", "keep")
     state: dict = {}
     sync(fake, state)
@@ -219,7 +222,7 @@ def test_incremental_round_that_failed_replays_to_the_same_result(fake):
     upserts, deletes, stats = sync(fake, state)
 
     assert stats["failed"] == 0
-    assert set(upserts) == {moved, flaky}  # the held-back round replays
+    assert set(upserts) == {flaky}  # only the failed file, not the whole round again
     assert deletes == [gone]
     assert state["index"] == {"/keep.md": keep, "/archive/a.md": moved, "/flaky.md": flaky}
 
@@ -289,7 +292,7 @@ def test_listing_errors_raise_and_never_delete(fake, error):
     fake.put("/a.md", "alpha")
     state: dict = {}
     sync(fake, state)
-    before = {"cursors": dict(state["cursors"]), "index": dict(state["index"])}
+    before = copy.deepcopy(state)
 
     fake.delete("/a.md")
     fake.continue_errors.append(error)
@@ -314,7 +317,7 @@ def test_path_error_other_than_not_found_raises(fake):
         sync(fake, state, ("/project",))
 
 
-def test_failed_download_keeps_state_so_the_file_is_retried(fake):
+def test_failed_download_is_kept_by_id_and_retried(fake):
     a = fake.put("/a.md", "alpha")
     b = fake.put("/b.md", "bravo")
     state: dict = {}
@@ -324,14 +327,150 @@ def test_failed_download_keeps_state_so_the_file_is_retried(fake):
 
     assert set(upserts) == {a}
     assert stats["failed"] == 1
-    assert "cursors" not in state  # the cursor is held back, so the round replays
+    assert state["retry"] == [b]
+    assert "cursors" in state  # the cursor moves on; b waits by id
 
     del fake.download_errors[b]
     upserts, _, stats = sync(fake, state)
 
-    assert set(upserts) == {a, b}
+    assert set(upserts) == {b}
     assert stats["failed"] == 0
+    assert state["retry"] == []
     assert set(state["index"].values()) == {a, b}
+
+
+def test_a_file_that_keeps_failing_does_not_grow_later_runs(fake):
+    state: dict = {}
+    sync(fake, state)
+    bad = fake.put("/bad.md", "never downloads")
+    fake.download_errors[bad] = ConnectionError("timeout")
+
+    downloads_per_run = []
+    for run in range(4):
+        fake.put(f"/new{run}.md", f"new file {run}")
+        fake.downloads.clear()
+        _, _, stats = sync(fake, state)
+        downloads_per_run.append(len(fake.downloads))
+        assert stats["failed"] == 1
+        assert state["retry"] == [bad]
+
+    # The new file plus one more try of the bad one, every run.
+    assert downloads_per_run == [2, 2, 2, 2]
+
+
+def test_retried_file_deleted_in_the_meantime_is_dropped(fake):
+    a = fake.put("/a.md", "alpha")
+    fake.download_errors[a] = ConnectionError("timeout")
+    state: dict = {}
+    sync(fake, state)
+    assert state["retry"] == [a]
+
+    fake.delete("/a.md")
+    upserts, deletes, _ = sync(fake, state)
+
+    assert upserts == {}
+    assert deletes == [a]
+    assert state["retry"] == []
+
+
+# ---------------------------------------------------------------------------
+# Rate limits and an expired token
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def waits(monkeypatch):
+    slept: list[float] = []
+    monkeypatch.setattr(dropbox_module, "_sleep", slept.append)
+    return slept
+
+
+def test_short_rate_limit_waits_and_retries_the_same_request(fake, waits):
+    a = fake.put("/a.md", "alpha")
+    fake.download_errors_once[a] = RateLimitError("request-id", None, 2)
+    checks: list[int] = []
+
+    upserts, _, stats = sync(fake, {}, check_active=lambda: checks.append(1))
+
+    assert set(upserts) == {a}
+    assert waits == [2]
+    assert stats["failed_rate_limit"] == 0
+    # Asked before the listing, the first download and the retried download.
+    assert len(checks) == 3
+
+
+def test_long_rate_limit_stops_cleanly_and_resumes_next_run(fake, waits):
+    a = fake.put("/a.md", "alpha")
+    b = fake.put("/b.md", "bravo")
+    c = fake.put("/c.md", "charlie")
+    fake.download_errors_once[b] = RateLimitError("request-id", None, 3600)
+    state: dict = {}
+
+    upserts, _, stats = sync(fake, state)
+
+    assert set(upserts) == {a}
+    assert waits == []  # an hour is never slept through
+    assert stats["failed_rate_limit"] == 2
+    assert state["retry"] == [b, c]
+
+    fake.downloads.clear()
+    upserts, _, stats = sync(fake, state)
+
+    assert set(upserts) == {b, c}
+    assert fake.downloads == [b, c]
+    assert state["retry"] == []
+
+
+def test_rate_limit_that_never_ends_gives_up_after_a_few_short_waits(fake, waits):
+    a = fake.put("/a.md", "alpha")
+    fake.download_errors[a] = RateLimitError("request-id", None, 1)
+    state: dict = {}
+
+    upserts, _, stats = sync(fake, state)
+
+    assert upserts == {}
+    assert waits == [1, 1, 1]
+    assert stats["failed_rate_limit"] == 1
+    assert state["retry"] == [a]
+
+
+def test_expired_token_mid_run_stops_keeps_progress_and_resumes(fake):
+    a = fake.put("/a.md", "alpha")
+    b = fake.put("/b.md", "bravo")
+    c = fake.put("/c.md", "charlie")
+    fake.download_errors_once[b] = AuthError("request-id", "expired_access_token")
+    state: dict = {}
+
+    upserts, _, stats = sync(fake, state)
+
+    assert set(upserts) == {a}
+    assert fake.downloads == [a, b], "no request after the 401"
+    assert stats["failed_auth"] == 2
+    assert state["retry"] == [b, c]
+
+    upserts, _, _ = sync(fake, state)
+
+    assert set(upserts) == {b, c}
+
+
+def test_bad_token_before_anything_was_stored_raises(fake):
+    a = fake.put("/a.md", "alpha")
+    fake.download_errors[a] = AuthError("request-id", "invalid_access_token")
+    state: dict = {}
+
+    with pytest.raises(AuthError):
+        sync(fake, state)
+
+    assert state == {}
+
+
+def test_repeated_cursor_raises_instead_of_looping(fake):
+    fake.put("/a.md", "alpha")
+    state: dict = {}
+    sync(fake, state)
+    stuck = files.ListFolderResult(entries=[], cursor=state["cursors"][""], has_more=True)
+    fake.files_list_folder_continue = lambda _cursor: stuck
+
+    with pytest.raises(RuntimeError, match="same cursor"):
+        sync(fake, state)
 
 
 def test_restricted_file_is_skipped_not_retried_forever(fake):
@@ -473,7 +612,7 @@ def test_check_active_also_guards_incremental_rounds(fake):
     fake.put("/a.md", "alpha")
     state: dict = {}
     sync(fake, state)
-    before = {"cursors": dict(state["cursors"]), "index": dict(state["index"])}
+    before = copy.deepcopy(state)
     fake.put("/b.md", "bravo")
     fake.api_calls.clear()
 

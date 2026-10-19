@@ -40,11 +40,31 @@ def test_refresh_token_without_app_key_fails():
         dropbox_source(refresh_token="token")
 
 
-def test_credentials_are_read_from_the_environment(monkeypatch):
+def test_refresh_token_and_app_key_build_a_client_without_a_network_call():
+    resource = dropbox_source(refresh_token="token", app_key="key")
+
+    assert resource.name == "dropbox_files"
+
+
+def test_environment_is_left_to_the_example(monkeypatch):
     monkeypatch.setenv("DROPBOX_REFRESH_TOKEN", "token")
     monkeypatch.setenv("DROPBOX_APP_KEY", "key")
 
-    dropbox_source()  # builds a client without any network call
+    with pytest.raises(ValueError, match="credentials are missing"):
+        dropbox_source()
+
+
+def test_service_is_the_injected_client_and_client_still_works():
+    fake = FakeDropbox()
+
+    assert dropbox_source(service=fake) is not None
+    assert dropbox_source(client=fake) is not None
+
+
+@pytest.mark.parametrize("name", ["", "x" * 65, "Work-Dropbox", "work dropbox", "1dropbox"])
+def test_resource_name_that_would_lose_or_share_state_is_refused(name):
+    with pytest.raises(ValueError, match="resource_name"):
+        dropbox_source(resource_name=name, service=FakeDropbox())
 
 
 def test_empty_folder_list_is_refused_instead_of_forgetting_everything():

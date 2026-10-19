@@ -21,9 +21,9 @@ folder, so the graph can relate files that live together.
 
 ## Requirements
 
-- cognee **1.6.3** (pinned). The connector relies on table-scoped document cleanup
-  (`DOCUMENT_SYNC_VERSION`), `PIPELINE_SCOPE_ATTR` and `guarded_rows`.
-- Python 3.11 to 3.13.
+- cognee **1.6.3 or newer** (below 2). The connector relies on table-scoped document
+  cleanup (`DOCUMENT_SYNC_VERSION`), `PIPELINE_SCOPE_ATTR` and `guarded_rows`.
+- Python 3.10 to 3.13.
 
 ## Install
 
@@ -47,7 +47,8 @@ cd packages/connector/dropbox && uv sync
 
    It uses the OAuth 2 PKCE flow with `token_access_type=offline`, so no app secret is
    needed and the refresh token does not expire.
-4. Set the environment, plus your `LLM_API_KEY` like any other cognee run:
+4. For `examples/example.py`, set the environment, plus your `LLM_API_KEY` like any
+   other cognee run:
 
    ```bash
    export DROPBOX_APP_KEY=<app key>
@@ -58,11 +59,17 @@ cd packages/connector/dropbox && uv sync
 ## Usage
 
 ```python
+import os
+
 import cognee
 from cognee_community_connector_dropbox import dropbox_source
 
 await cognee.remember(
-    dropbox_source(folder_paths=["/Notes"]),  # DROPBOX_* env vars for the rest
+    dropbox_source(
+        folder_paths=["/Notes"],
+        refresh_token=os.environ["DROPBOX_REFRESH_TOKEN"],
+        app_key=os.environ["DROPBOX_APP_KEY"],
+    ),
     dataset_name="my_dropbox",
     primary_key="id",
     write_disposition="merge",  # required: incremental upserts and deletes
@@ -73,19 +80,23 @@ answer = await cognee.recall("What are my notes about?", datasets=["my_dropbox"]
 ```
 
 Run the same `remember` call again whenever you want to sync. See
-`examples/example.py` for the full flow.
+`examples/example.py` for the full flow; it reads the `DROPBOX_*` environment variables.
+`dropbox_source()` itself takes everything as arguments.
 
-| Argument | Env var | Default |
-|---|---|---|
-| `folder_paths` | `DROPBOX_FOLDER_PATHS` (comma-separated) | whole Dropbox (the app folder for App folder apps) |
-| `refresh_token` + `app_key` | `DROPBOX_REFRESH_TOKEN`, `DROPBOX_APP_KEY` | – |
-| `app_secret` | `DROPBOX_APP_SECRET` | unset, not needed for PKCE tokens |
-| `access_token` | `DROPBOX_ACCESS_TOKEN` | short-lived, for quick tries only |
-| `max_file_size_mb` | `DROPBOX_MAX_FILE_SIZE_MB` | 25 |
-| `resource_name` | – | `dropbox_files`; give each source its own name when several sync into one dataset |
+| Argument | Default |
+|---|---|
+| `folder_paths` | whole Dropbox (the app folder for App folder apps) |
+| `refresh_token` + `app_key` | – |
+| `app_secret` | unset, not needed for PKCE tokens |
+| `access_token` | short-lived, for quick tries only |
+| `max_file_size_mb` | 25 |
+| `resource_name` | `dropbox_files`. Lowercase letters, digits and underscores, up to 64. **Two Dropbox accounts in one dataset need different names**, or they would share one table and one sync state |
+| `check_active` | optional host callback, asked before every Dropbox request |
+| `service` | a pre-built Dropbox client, mainly for tests (`client` still works) |
 
-After a run, `source.cognee_sync_stats` holds counts only (scanned, skipped by reason,
-failed, deleted), never file names or content.
+After a run, `source.cognee_sync_stats` holds counts only, never file names or content:
+`scanned`, `skipped` (plus `skipped_<reason>`), `failed`, `deleted`, and `failed_auth` /
+`failed_rate_limit` for files left for the next run because of a 401 or a rate limit.
 
 ## How sync and forget-on-delete work
 
@@ -103,11 +114,19 @@ failed, deleted), never file names or content.
   column. dlt removes them on `merge`, and cognee's orphan cleanup removes them from the
   graph and vector stores.
 - **Errors never delete.** Only a confirmed `not_found` removes data. A reset cursor
-  (`409 reset`) triggers a fresh listing reconciled against the index. Rate limits (429)
-  are retried by the Dropbox SDK after the `Retry-After` delay.
-- **Failed downloads are retried.** If a file fails to download, the cursor is held back,
-  so the same changes are replayed next run. Files that can never be downloaded, like
-  restricted content, are skipped instead of blocking the cursor.
+  (`409 reset`) triggers a fresh listing reconciled against the index.
+- **Failed downloads are retried by id.** The cursor always moves forward. A file that
+  failed to download (a 5xx or a network error) is kept in a `retry` list in dlt state and
+  fetched again by id next run, so one bad file never makes later runs replay everything.
+  A file that keeps failing costs one extra request per run and keeps `failed` at 1 or
+  more. Files that can never be downloaded, like restricted content, are skipped instead.
+- **Rate limits.** A 429 is waited out up to 60 seconds, at most 3 times, with
+  `check_active` asked again before each retry. A longer wait is never slept through,
+  since cognee holds its dlt staging lock during a sync: the run stops, keeps what it
+  stored, and the remaining files are fetched next run.
+- **An expired or revoked token mid-run** stops the run the same way, since every later
+  request would fail too. If nothing was stored yet, the error is raised: that is just a
+  bad token.
 - **One failing folder fails the run.** Folders are not independent here: a file moved
   from one synced folder into another shows up as a delete in the first. If the second
   folder could not be read, the move would look like a delete, so the run stops before
@@ -127,6 +146,7 @@ failed, deleted), never file names or content.
   kept locally; contents are not.
 - Logs and sync stats carry counts and skip reasons only: never file contents, names,
   paths or Dropbox ids.
+- Everyone who can read the cognee dataset can read the synced file contents.
 - Keep the refresh token out of your repo. Revoke it any time in Dropbox under
   **Settings → Connected apps**.
 
@@ -152,12 +172,16 @@ through cursors.
 - `test_dropbox_sync.py` covers first sync, pagination, edits, moves (within, between
   and out of synced folders), file and folder deletes, a path reused by a new file,
   cursor reset, a vanished folder, listing errors that must not delete, failed downloads
-  and their replay, restricted files, PDF and Paper export, skip reasons, folder
+  retried by id without growing later runs, short and long rate limits, an expired token
+  mid-run, a repeated cursor, restricted files, PDF and Paper export, skip reasons, folder
   configuration, `check_active` before every request (listing pages, incremental rounds and
   downloads) and never swallowed by the download error handling, and no file names, paths
   or ids in the logs.
-- `test_dropbox_source.py` covers `dropbox_source()` itself: credentials, refusing an empty
-  folder list, folder normalization and the document-mode and pipeline-scope markers.
+- `test_dropbox_source.py` covers `dropbox_source()` itself: credentials as arguments only,
+  refusing an empty folder list and an unsafe `resource_name`, folder normalization and
+  the document-mode and pipeline-scope markers.
 - `test_dropbox_forget.py` runs the real cognee pipeline (LLM and embeddings mocked,
   working with both cognee model variants, including the one used with Gemini) and checks
-  that a deleted file and a deleted folder leave the graph while a moved file stays.
+  that a deleted file and a deleted folder leave the graph and the dataset while a moved
+  file stays, and that two Dropbox sources in one dataset never touch each other's files.
+  It fails if the tombstone or the `hard_delete` column is turned off.

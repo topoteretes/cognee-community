@@ -23,6 +23,7 @@ Run:
 """
 
 import asyncio
+import os
 import sys
 
 import cognee
@@ -33,7 +34,14 @@ DATASET = "dropbox_demo"
 
 
 async def main():
-    source = dropbox_source()  # reads DROPBOX_* env vars
+    folders = [p for p in os.getenv("DROPBOX_FOLDER_PATHS", "").split(",") if p.strip()]
+    source = dropbox_source(
+        folders or None,  # None syncs the whole Dropbox
+        refresh_token=os.getenv("DROPBOX_REFRESH_TOKEN"),
+        app_key=os.getenv("DROPBOX_APP_KEY"),
+        app_secret=os.getenv("DROPBOX_APP_SECRET"),
+        access_token=os.getenv("DROPBOX_ACCESS_TOKEN"),
+    )
 
     print("=== Sync ===")
     await cognee.remember(

@@ -1,7 +1,8 @@
 """In-memory Dropbox for tests.
 
 Speaks the parts of the official SDK the connector uses (files_list_folder,
-files_list_folder_continue, files_download, files_export) and returns the SDK's
+files_list_folder_continue, files_download, files_export, files_get_metadata)
+and returns the SDK's
 own metadata, result and error types, so the connector code under test runs
 exactly as it would against the real API.  Every change made through the
 helpers (put / move / delete) is appended to a change log, which is what
@@ -42,6 +43,8 @@ class FakeDropbox:
         self.continue_errors: list[Exception] = []
         self.list_errors: list[Exception] = []
         self.download_errors: dict[str, Exception] = {}
+        # Raised once, by the next download of that file id.
+        self.download_errors_once: dict[str, Exception] = {}
         self.downloads: list[str] = []
         self.exports: list[tuple[str, str]] = []
         # Every SDK call the connector made, in order, by method name.
@@ -137,9 +140,18 @@ class FakeDropbox:
         self.api_calls.append("download")
         meta = self._by_id(path)
         self.downloads.append(path)
+        if path in self.download_errors_once:
+            raise self.download_errors_once.pop(path)
         if path in self.download_errors:
             raise self.download_errors[path]
         return meta, FakeResponse(self.content[meta.id])
+
+    def files_get_metadata(self, path):
+        self.api_calls.append("get_metadata")
+        for meta in self.files.values():
+            if meta.id == path:
+                return meta
+        raise api_error(files.GetMetadataError.path(files.LookupError.not_found))
 
     def files_export(self, path, export_format=None):
         self.api_calls.append("export")
