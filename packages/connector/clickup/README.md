@@ -71,6 +71,7 @@ See `examples/example.py` for a full runnable script.
 
 ```python
 source = clickup_source(
+    resource_name="clickup",  # optional prefix (default "clickup") for pipeline scoping
     team_id="9001",  # Workspace id; optional if the token sees exactly one
     space_ids=["90120001"],  # only these Spaces...
     folder_ids=["90130002"],  # ...or Folders...
@@ -85,6 +86,10 @@ source = clickup_source(
 
 Ids are in each item's URL in ClickUp. If the token can access several Workspaces and `team_id`
 is missing, the connector stops and lists them instead of guessing.
+
+### Upgrading and pipeline scoping
+
+The source declares `resource_name` (defaulting to `"clickup"`, must be 1-64 alphanumeric characters or underscores) to isolate its `dlt` pipeline state (`PIPELINE_SCOPE_ATTR`). When upgrading from versions that shared the un-scoped `ingest_dlt_source` pipeline, the pipeline scope shifts to `clickup`; rows merge into the same destination tables by `id` without duplication, and the connector performs a one-time baseline re-sync.
 
 The source has two tables, both with `primary_key="id"` and `write_disposition="merge"`:
 

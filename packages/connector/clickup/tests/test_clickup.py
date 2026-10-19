@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 from unittest.mock import patch
 
@@ -295,7 +296,7 @@ def test_invalid_token_raises_authentication_error():
 
 
 def test_401_error_sanitizes_token():
-    """Assert the secret token does NOT appear in the exception message on 401."""
+    """Assert the secret token and URL do NOT appear in the exception message on 401."""
     secret_token = "pk_super_secret_token_12345"
     session = FakeClickUpSession()
     session.scripted = [FakeResponse(401, {"err": "Unauthorized"})]
@@ -306,6 +307,8 @@ def test_401_error_sanitizes_token():
 
     msg = str(exc_info.value)
     assert secret_token not in msg
+    assert "/v2/team" not in msg
+    assert "api.clickup.com" not in msg
     assert exc_info.value.status_code == 401
 
 
@@ -1037,3 +1040,213 @@ def test_resource_cognee_sync_stats():
     }
     assert tasks_res.cognee_sync_stats == expected_stats
     assert docs_res.cognee_sync_stats == expected_stats
+    assert source.cognee_sync_stats == expected_stats
+    assert source.source_counts == expected_stats
+
+
+def test_checklist_items_sorted_by_integer_orderindex():
+    """Checklist items must be sorted by integer orderindex (1, 2, 10), not string."""
+    task = make_task(
+        "t_check",
+        1_000,
+        checklists=[
+            {
+                "name": "Sprint Tasks",
+                "items": [
+                    {"name": "Item 10", "orderindex": 10, "resolved": False},
+                    {"name": "Item 1", "orderindex": 1, "resolved": True},
+                    {"name": "Item 2", "orderindex": 2, "resolved": False},
+                ],
+            }
+        ],
+    )
+    md = _render_task_markdown(task, "Eng")
+    pos1 = md.find("Item 1")
+    pos2 = md.find("Item 2")
+    pos10 = md.find("Item 10")
+    assert pos1 < pos2 < pos10, f"Expected Item 1 < Item 2 < Item 10 in markdown:\n{md}"
+
+
+def test_doc_pages_sorted_by_integer_orderindex():
+    """Doc pages must be sorted by integer orderindex (1, 2, 10)."""
+    pages = [
+        {"id": "p10", "name": "Page 10", "orderindex": 10, "pages": []},
+        {"id": "p1", "name": "Page 1", "orderindex": 1, "pages": []},
+        {"id": "p2", "name": "Page 2", "orderindex": 2, "pages": []},
+    ]
+    blocks = clickup_module._render_pages(pages)
+    rendered = "\n".join(blocks)
+    pos1 = rendered.find("Page 1")
+    pos2 = rendered.find("Page 2")
+    pos10 = rendered.find("Page 10")
+    assert pos1 < pos2 < pos10
+
+
+def test_comments_with_identical_timestamps_sorted_by_id_tiebreak():
+    """Comments with the exact same timestamp must be sorted deterministically by ID."""
+    session = FakeClickUpSession([make_task("t1", 1_000)])
+    session.comments["t1"] = [
+        {"id": "c_zebra", "date": 1_700_000_000_000, "comment_text": "Zebra comment"},
+        {"id": "c_apple", "date": 1_700_000_000_000, "comment_text": "Apple comment"},
+    ]
+    comments = _fetch_task_comments(api_for(session), "t1")
+    assert comments is not None
+    assert [c["text"] for c in comments] == ["Apple comment", "Zebra comment"]
+
+
+def test_doc_without_date_updated_is_ingested_and_not_skipped():
+    """Docs lacking date_updated (common in ClickUp v3) must be ingested on initial run."""
+    session = FakeClickUpSession()
+    doc = {
+        "id": "doc_no_date",
+        "name": "Undated Doc",
+        "date_created": 1690000000000,
+        "date_updated": None,
+        "deleted": False,
+        "archived": False,
+        "parent": {"id": "s1", "type": 4},
+        "workspace_id": int(TEAM),
+    }
+    session.add_doc(doc, [{"id": "p1", "name": "Content", "content": "Text"}])
+    state: dict[str, Any] = {}
+
+    rows1 = run_docs(session, state)
+    assert len(rows1) == 1
+    assert rows1[0]["id"] == "clickup:doc:doc_no_date"
+    assert "doc_no_date" in state["versions"]
+
+    rows2 = run_docs(session, state)
+    assert len(rows2) == 0
+
+
+def test_permanent_403_on_task_comments_does_not_abort_sync():
+    """A task that returns 403 on comments must not abort the sync or block future syncs."""
+    session = FakeClickUpSession([make_task("t1", 1_000)])
+    session._comments = lambda task_id, params: FakeResponse(  # type: ignore[method-assign]
+        403, {"err": "Comments restricted"}
+    )
+
+    state: dict[str, Any] = {}
+    stats: dict[str, int] = {}
+    rows1 = run_tasks(session, state, stats=stats)
+    assert len(rows1) == 1
+    assert rows1[0]["id"] == "clickup:task:t1"
+    assert stats.get("skipped", 0) >= 1
+
+    session.add(make_task("t2", 2_000))
+    rows2 = run_tasks(session, state, stats=stats)
+    assert len(rows2) == 1
+    assert rows2[0]["id"] == "clickup:task:t2"
+
+
+def test_check_active_support():
+    """check_active callback returning None succeeds; raising stops sync."""
+    session = FakeClickUpSession([make_task("t1", 1_000)])
+
+    def active_callback():
+        return None
+
+    state: dict[str, Any] = {}
+    api = _ClickUpAPI(session, check_active=active_callback)
+    rows = list(sync_clickup(api, state, {}, team_id=TEAM))
+    assert len(rows) == 1
+
+    def abort_callback():
+        raise RuntimeError("Operation aborted by host")
+
+    api_abort = _ClickUpAPI(session, check_active=abort_callback)
+    with pytest.raises(RuntimeError, match="Operation aborted by host"):
+        list(sync_clickup(api_abort, {}, {}, team_id=TEAM))
+
+
+def test_comment_refresh_is_bounded_by_batch_size():
+    """Comment refresh must only refresh up to comment_refresh_batch_size tasks per run."""
+    tasks = [make_task(f"t{i}", 1_000) for i in range(5)]
+    session = FakeClickUpSession(tasks)
+    for t in tasks:
+        session.comments[t["id"]] = [{"id": f"c_{t['id']}", "date": 100, "comment_text": "text"}]
+
+    state: dict[str, Any] = {}
+    run_tasks(session, state)
+    assert len(state["known_ids"]) == 5
+
+    session.calls.clear()
+    now = int(time.time() * 1000) + 25 * 3_600_000
+    run_tasks(session, state, comment_refresh_batch_size=2, now_ms=now)
+    comment_calls = [p for p in session.paths("/v2/task/") if p.endswith("/comment")]
+    assert len(comment_calls) == 2
+
+
+def test_retry_after_cap_at_60s():
+    """Retry-After header greater than 60s must be capped at 60.0s."""
+    delay = _extract_retry_delay({"Retry-After": "120"}, 1)
+    assert delay == 60.0
+    delay_large = _extract_retry_delay({"Retry-After": "3600"}, 1)
+    assert delay_large == 60.0
+
+
+def test_resource_name_validation():
+    """Invalid resource_name raises ValueError with clear message."""
+    session = FakeClickUpSession()
+    for bad_name in ("invalid-name", "has space", "bad.dot", "", "a" * 65):
+        with pytest.raises(ValueError, match="Invalid resource_name"):
+            clickup_source(session=session, resource_name=bad_name)
+
+    source = clickup_source(session=session, resource_name="valid_name_123")
+    assert getattr(source, PIPELINE_SCOPE_ATTR) == "valid_name_123"
+
+
+def test_task_pagination_guards_against_stuck_or_malformed_responses():
+    """Task pagination must raise on missing tasks key, repeated page, or page cap."""
+    session = FakeClickUpSession()
+    api = api_for(session)
+
+    session.scripted = [FakeResponse(200, {"not_tasks": []})]
+    with pytest.raises(ClickUpError, match="missing 'tasks'"):
+        clickup_module._paginate_team_tasks(api, TEAM)
+
+    t = make_task("t1", 1_000)
+    session.scripted = [
+        FakeResponse(200, {"tasks": [t]}),
+        FakeResponse(200, {"tasks": [t]}),
+    ]
+    with pytest.raises(ClickUpError, match="repeated page"):
+        clickup_module._paginate_team_tasks(api, TEAM)
+
+
+def test_sync_stats_populated_and_counted_on_source():
+    """cognee_sync_stats and source_counts on source must reflect scanned and deleted counts."""
+    task1 = make_task("t1", 1_000)
+    task2 = make_task("t2", 2_000)
+    session = FakeClickUpSession([task1, task2])
+    doc1 = make_doc("d1", 1_000)
+    session.add_doc(doc1, [{"id": "p1", "name": "P1", "content": "Text"}])
+
+    source = clickup_source(session=session)
+    tasks_res = source.resources["clickup_tasks"]
+    docs_res = source.resources["clickup_docs"]
+
+    list(tasks_res)
+    list(docs_res)
+
+    stats = source.cognee_sync_stats
+    assert stats == source.source_counts
+    assert stats["scanned"] >= 3  # 2 tasks + 1 doc
+
+
+def test_network_error_logs_class_name_without_url():
+    """Transient network errors log the exception class name without exposing the URL/query."""
+    import requests
+
+    session = FakeClickUpSession()
+    session.scripted = [requests.exceptions.ConnectionError("Connection reset by peer")]
+
+    with patch.object(clickup_module.logger, "warning") as mock_warn:
+        _request(session, f"{BASE}/v2/team/{TEAM}/task", params={"space_ids": "s1"})
+
+    assert mock_warn.called
+    warning_args = mock_warn.call_args[0]
+    first_arg = warning_args[1]
+    assert "ConnectionError" in str(first_arg)
+    assert "space_ids" not in str(first_arg)
+    assert "/v2/team" not in str(first_arg)
