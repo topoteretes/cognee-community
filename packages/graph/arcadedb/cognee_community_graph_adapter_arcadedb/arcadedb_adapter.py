@@ -197,7 +197,16 @@ class ArcadeDBAdapter(GraphDBInterface):
             }
 
             results = await self.query(query, params)
-            return [result["edge_exists"] for result in results]
+            # cognee 1.6.x contract: return the subset of the input triples that
+            # exist, as (source_id, target_id, relationship_name) tuples —
+            # not booleans, and not a list aligned one-to-one with the input.
+            # The MATCH above only yields rows for existing edges, so the
+            # edge_exists filter is defensive.
+            return [
+                (result["from_node"], result["to_node"], result["relationship_name"])
+                for result in results
+                if result["edge_exists"]
+            ]
         except Neo4jError as error:
             logger.error("ArcadeDB query error: %s", error, exc_info=True)
             raise error
