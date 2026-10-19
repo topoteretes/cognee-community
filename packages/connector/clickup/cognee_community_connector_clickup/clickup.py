@@ -62,7 +62,9 @@ _COMMENT_PAGE_SIZE = 25  # fixed by the API
 _DOC_PAGE_SIZE = 100
 _MAX_RETRIES = 5
 _RETRY_STATUSES = (500, 502, 503, 504)
-_RESOURCE_NAME_RE = re.compile(r"^[a-z_][a-z0-9_]{0,63}\Z")
+_RESOURCE_NAME_RE = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
+_MAX_RESOURCE_NAME_LEN = 57
+_MAX_COMMENT_RETRIES_PER_RUN = 50
 
 
 # ---------------------------------------------------------------------------
@@ -460,8 +462,12 @@ def _render_task_markdown(
     breadcrumb: str,
     comments: list[dict[str, str]] | None = None,
 ) -> str:
-    """Render a task into Markdown (the title is added by cognee as the heading)."""
-    status = (task.get("status") or {}).get("status") or "unknown"
+    raw_status = task.get("status")
+    status = (
+        raw_status.get("status")
+        if isinstance(raw_status, dict)
+        else (raw_status if isinstance(raw_status, str) else None)
+    ) or "unknown"
     priority = (task.get("priority") or {}).get("priority")
     assignee_names = sorted(_username(a) for a in task.get("assignees") or [] if _username(a))
     assignees = ", ".join(assignee_names) or "Unassigned"
@@ -600,7 +606,7 @@ def _fetch_task_comments(
     params: dict[str, Any] = {}
     while True:
         try:
-            body = api.v2(f"/task/{task_id}/comment", params, allow_missing=True, stats=None)
+            body = api.v2(f"/task/{task_id}/comment", params, allow_missing=True, stats=stats)
         except ClickUpPermissionError:
             logger.warning(
                 "ClickUp: HTTP 403 reading comments for task %s; skipping comments.",
@@ -668,6 +674,7 @@ def _paginate_team_tasks(
     all_tasks: list[dict[str, Any]] = []
     page = 0
     seen_page_fingerprints: set[str] = set()
+    collected_page_ids: set[str] = set()
     while True:
         params["page"] = page
         body = api.v2(f"/team/{team_id}/task", params)
@@ -677,7 +684,13 @@ def _paginate_team_tasks(
         if tasks is None or not isinstance(tasks, list):
             raise ClickUpError("ClickUp task listing response missing 'tasks' list.")
         if tasks:
-            page_fp = hashlib.sha256(",".join(str(t.get("id")) for t in tasks).encode()).hexdigest()
+            page_ids = {str(t.get("id")) for t in tasks if t.get("id") is not None}
+            if page > 0 and page_ids.issubset(collected_page_ids):
+                raise ClickUpError(
+                    f"ClickUp task pagination stuck: page {page} contributed no new task IDs."
+                )
+            collected_page_ids.update(page_ids)
+            page_fp = hashlib.sha256(",".join(sorted(page_ids)).encode()).hexdigest()
             if page_fp in seen_page_fingerprints:
                 raise ClickUpError(f"ClickUp task pagination stuck on repeated page {page}.")
             seen_page_fingerprints.add(page_fp)
@@ -747,13 +760,20 @@ def _sync_incremental_tasks(
     filters: dict[str, Any],
     hierarchy: _HierarchyTracker,
     hashes: dict[str, str],
+    retry: dict[str, int],
+    refreshed_at: dict[str, int],
+    now: int = 0,
     seen_ids: set[str] | None = None,
     stats: dict[str, int] | None = None,
+    retried: dict[str, bool] | None = None,
 ) -> tuple[list[dict[str, Any]], set[str], set[str], int, bool]:
     """Fetch changed tasks since cursor.
 
-    Returns (rows, emitted_ids, listed_ids, newest_ms, listing_complete).
+    ``retried`` maps ids already handled by this run's comment retry to whether that
+    retry succeeded; those are not fetched again. Returns (rows, emitted_ids,
+    listed_ids, newest_ms, listing_complete).
     """
+    retried = retried or {}
     changed_tasks, listing_complete = _paginate_team_tasks(
         api, team_id, date_updated_gt=cursor or None, seen_ids=seen_ids, stats=stats, **filters
     )
@@ -772,18 +792,21 @@ def _sync_incremental_tasks(
             if stats is not None:
                 stats["skipped"] = stats.get("skipped", 0) + 1
             continue
-        newest = max(newest, updated)
+        if task_id in retried:
+            # Already re-read by id this run. Only a successful retry may move the cursor.
+            if retried[task_id]:
+                newest = max(newest, updated)
+            continue
         comments = _fetch_task_comments(api, task_id, stats) if include_comments else None
         if include_comments and comments is None:
-            # 403 or unreadable: keep stored document in destination, do not overwrite with empty
-            logger.warning(
-                "ClickUp: cannot read comments for task %s (HTTP 403); "
-                "skipping row emission to avoid wiping stored comments.",
-                task_id,
-            )
-            continue
+            if task_id in known_ids:
+                retry[task_id] = now  # stored document stays as it is
+                continue
+            hashes[task_id] = "unreadable"  # first time seen: ingest without comments
+        newest = max(newest, updated)
         if comments is not None:
             hashes[task_id] = _comments_hash(comments)
+            refreshed_at[task_id] = now
         emitted.add(task_id)
         rows.append(hierarchy.build_row(task, comments))
 
@@ -792,57 +815,50 @@ def _sync_incremental_tasks(
 
 def _sync_comment_refresh(
     api: _ClickUpAPI,
-    state: dict[str, Any],
     candidates: list[str],
-    batch_size: int,
     hierarchy: _HierarchyTracker,
     hashes: dict[str, str],
+    refreshed_at: dict[str, int],
     task_map: dict[str, dict[str, Any]] | None = None,
     now: int = 0,
     stats: dict[str, int] | None = None,
-) -> tuple[list[dict[str, Any]], set[str], set[str], bool]:
+) -> tuple[list[dict[str, Any]], set[str]]:
     """Refresh comments for a bounded batch of known unchanged tasks.
 
-    Uses a cursor over task IDs (comment_refresh_last_id) to ensure fair rotation across
-    syncs. Returns (rows, refreshed_ids, checked_ids, full_pass_completed).
+    Sets refreshed_at[task_id] = now for every candidate attempted so unreadable / 403
+    tasks do not hog the batch on subsequent runs. Returns (rows, refreshed_ids).
     """
     if not candidates:
-        return [], set(), set(), True
-
-    last_id = state.get("comment_refresh_last_id")
-    remaining = [cid for cid in candidates if cid > last_id] if last_id else candidates
-    if not remaining:
-        remaining = candidates
-        last_id = None
-
-    batch = remaining[:batch_size]
-    full_pass_completed = len(remaining) <= batch_size
-    state["comment_refresh_last_id"] = batch[-1] if not full_pass_completed else None
+        return [], set()
 
     task_map = task_map or {}
     rows: list[dict[str, Any]] = []
     refreshed_ids: set[str] = set()
-    checked_ids: set[str] = set()
-    refreshed_at = state.setdefault("comments_refreshed_at", {})
 
-    for task_id in batch:
+    for task_id in candidates:
+        refreshed_at[task_id] = now
         comments = _fetch_task_comments(api, task_id, stats)
         if comments is None:
-            # 403 or unreadable: do not advance clock for this task
+            # 403 or unreadable: retried in next window; stored content preserved
             continue
-        checked_ids.add(task_id)
-        refreshed_at[task_id] = now
         if hashes.get(task_id) == _comments_hash(comments):
             if stats is not None:
                 stats["skipped"] = stats.get("skipped", 0) + 1
             continue
-        task = task_map.get(task_id) or api.v2(f"/task/{task_id}", allow_missing=True)
+        task = task_map.get(task_id)
+        if task is None:
+            try:
+                task = api.v2(f"/task/{task_id}", allow_missing=True, stats=stats)
+            except ClickUpPermissionError:
+                # The task itself became unreadable: keep the stored document.
+                logger.warning("ClickUp: HTTP 403 reading task %s; keeping stored task.", task_id)
+                continue
         if task:
             hashes[task_id] = _comments_hash(comments)
             refreshed_ids.add(task_id)
             rows.append(hierarchy.build_row(task, comments))
 
-    return rows, refreshed_ids, checked_ids, full_pass_completed
+    return rows, refreshed_ids
 
 
 def _sync_deletion_sweep(
@@ -900,6 +916,10 @@ def sync_clickup(
     known_ids: set[str] = set(state.get("known_ids", []))
     cursor = int(state.get("last_updated_ms") or 0) if state.get("scope") == scope else 0
     hashes: dict[str, str] = dict(state.get("comment_hashes") or {})
+    refreshed_at: dict[str, int] = dict(state.get("comments_refreshed_at") or {})
+    comment_retry: dict[str, int] = dict(state.get("comment_retry") or {})
+    emitted: set[str] = set()
+
     filters = {
         "space_ids": space_ids,
         "folder_ids": folder_ids,
@@ -910,8 +930,40 @@ def sync_clickup(
     hierarchy = _HierarchyTracker(api, team_id, cache)
     seen_task_ids: set[str] = set()
 
+    # 0. Retry, by id, stored tasks whose comments were unreadable (HTTP 403) on an earlier
+    # run. Each retry costs two requests (task + comments), so at most
+    # _MAX_COMMENT_RETRIES_PER_RUN (50, the default refresh batch) are attempted per run,
+    # oldest attempt first, so a long tail of failing tasks cannot starve the rest.
+    retried: dict[str, bool] = {}
+    if comment_retry:
+        retry_candidates = sorted(comment_retry, key=lambda t: (comment_retry[t], t))
+        for rid in retry_candidates[:_MAX_COMMENT_RETRIES_PER_RUN]:
+            try:
+                task = api.v2(f"/task/{rid}", allow_missing=True, stats=stats)
+            except ClickUpPermissionError:
+                logger.warning("ClickUp: HTTP 403 reading task %s; will retry.", rid)
+                comment_retry[rid] = now
+                retried[rid] = False
+                continue
+            if task is None:
+                # 404: deleted in ClickUp. The deletion sweep tombstones it.
+                comment_retry.pop(rid, None)
+                continue
+            comments = _fetch_task_comments(api, rid, stats) if include_comments else None
+            if include_comments and comments is None:
+                comment_retry[rid] = now  # still unreadable: the stored document stays
+                retried[rid] = False
+                continue
+            yield hierarchy.build_row(task, comments)
+            comment_retry.pop(rid, None)
+            if comments is not None:
+                hashes[rid] = _comments_hash(comments)
+            refreshed_at[rid] = now
+            emitted.add(rid)
+            retried[rid] = True
+
     # 1. Incremental task listing
-    task_rows, emitted, listed, newest, listing_complete = _sync_incremental_tasks(
+    task_rows, inc_emitted, listed, newest, listing_complete = _sync_incremental_tasks(
         api,
         team_id,
         cursor,
@@ -920,52 +972,62 @@ def sync_clickup(
         filters,
         hierarchy,
         hashes,
+        retry=comment_retry,
+        refreshed_at=refreshed_at,
+        now=now,
         seen_ids=seen_task_ids,
         stats=stats,
+        retried=retried,
     )
     yield from task_rows
+    emitted |= inc_emitted
 
-    refresh_due = (
-        include_comments
-        and comment_refresh_hours is not None
-        and now - int(state.get("comments_refreshed_ms") or 0) >= comment_refresh_hours * 3_600_000
-    )
+    # 2. Select candidates for comment refresh
+    candidates: list[str] = []
+    if include_comments and comment_refresh_hours is not None and known_ids:
+        hours_ms = int(comment_refresh_hours * 3_600_000)
+        candidates = sorted(
+            (t for t in (known_ids - emitted) if now - refreshed_at.get(t, 0) >= hours_ms),
+            key=lambda t: (refreshed_at.get(t, 0), t),
+        )[:comment_refresh_batch_size]
 
-    # 2. Shared full listing for comment refresh and deletion sweep when cursor is active
+    # 3. Shared full listing for comment refresh and deletion sweep when cursor is active
     full_listing_complete = False
+    full_workspace_listed = False
     task_map: dict[str, dict[str, Any]] = {}
-    if cursor and (detect_deletions or refresh_due) and known_ids:
+    if cursor and (detect_deletions or candidates) and known_ids:
         all_tasks, full_listing_complete = _paginate_team_tasks(
             api, team_id, seen_ids=seen_task_ids, stats=stats, **filters
         )
         task_map = {str(t["id"]): t for t in all_tasks}
         live = set(task_map)
-    else:
+        full_workspace_listed = full_listing_complete
+    elif not cursor:
         live = listed
         full_listing_complete = listing_complete
+        full_workspace_listed = listing_complete
+    else:
+        live = listed
+        full_listing_complete = False
 
-    # 3. Bounded comment refresh
+    # 4. Bounded comment refresh
     rerendered = 0
-    if refresh_due:
-        candidates = sorted(known_ids - emitted)
-        refresh_rows, refreshed_ids, checked_ids, full_pass_completed = _sync_comment_refresh(
+    if candidates:
+        refresh_rows, refreshed_ids = _sync_comment_refresh(
             api,
-            state,
             candidates,
-            comment_refresh_batch_size,
             hierarchy,
             hashes,
-            task_map,
+            refreshed_at,
+            task_map=task_map,
             now=now,
             stats=stats,
         )
         yield from refresh_rows
         emitted |= refreshed_ids
         rerendered = len(refresh_rows)
-        if full_pass_completed and len(checked_ids) > 0:
-            state["comments_refreshed_ms"] = now
 
-    # 4. Deletion sweep
+    # 5. Deletion sweep
     removed = _sync_deletion_sweep(known_ids, live, full_listing_complete, detect_deletions)
     for task_id in sorted(removed):
         if stats is not None:
@@ -973,13 +1035,16 @@ def sync_clickup(
         yield _deleted_row(f"clickup:task:{task_id}")
 
     # Commit state
+    # Drop IDs no longer in live from comment_retry
+    if full_workspace_listed and live:
+        comment_retry = {k: v for k, v in comment_retry.items() if k in live}
+
     state["scope"] = scope
     state["last_updated_ms"] = newest
     state["known_ids"] = sorted((known_ids | emitted) - removed)
-    state.setdefault("comments_refreshed_ms", now)
+    state["comment_retry"] = {k: v for k, v in sorted(comment_retry.items()) if k not in removed}
     if include_comments:
         state["comment_hashes"] = {k: v for k, v in sorted(hashes.items()) if k not in removed}
-        refreshed_at = state.get("comments_refreshed_at") or {}
         state["comments_refreshed_at"] = {
             k: v for k, v in sorted(refreshed_at.items()) if k not in removed
         }
@@ -1084,23 +1149,56 @@ def sync_clickup_docs(
                 stats["skipped"] = stats.get("skipped", 0) + 1
             continue
 
-        body = api.v3(
-            f"/workspaces/{team_id}/docs/{doc_id}/pages",
-            {"max_page_depth": -1, "content_format": "text/md"},
-            allow_missing=True,
-        )
-        if body is None:  # deleted between listing and fetching
-            live.discard(doc_id)
+        try:
+            body = api.v3(
+                f"/workspaces/{team_id}/docs/{doc_id}/pages",
+                {"max_page_depth": -1, "content_format": "text/md"},
+                allow_missing=True,
+                stats=stats,
+            )
+        except ClickUpPermissionError:
+            logger.warning(
+                "ClickUp: HTTP 403 reading pages for doc %s; keeping stored document.",
+                doc_id,
+            )
             if stats is not None:
-                stats["skipped"] = stats.get("skipped", 0) + 1
+                stats["failed_docs"] = stats.get("failed_docs", 0) + 1
             continue
+
+        if body is None:
+            # 404: deleted between listing and fetching, or pages missing.
+            # Do NOT discard from live; only the doc listing can decide deletion.
+            logger.warning(
+                "ClickUp: HTTP 404 reading pages for doc %s; keeping stored document.",
+                doc_id,
+            )
+            if stats is not None:
+                stats["failed_docs"] = stats.get("failed_docs", 0) + 1
+            continue
+
+        if not isinstance(body, list) and (not isinstance(body, dict) or "pages" not in body):
+            # 200 with {} or malformed response: do not overwrite stored content with empty
+            logger.warning(
+                "ClickUp: invalid or empty pages response for doc %s; keeping stored document.",
+                doc_id,
+            )
+            if stats is not None:
+                stats["failed_docs"] = stats.get("failed_docs", 0) + 1
+            continue
+
         pages = body if isinstance(body, list) else body.get("pages") or []
+
+        # Undated docs lack date_updated, so we must fetch their pages every run to check for
+        # content or title edits. We hash the title and rendered markdown to avoid emitting
+        # unchanged rows.
+        doc_name = (doc.get("name") or "").strip()
         rendered_content = _render_doc_markdown(doc, pages, spaces.get(parent_id, ""))
 
         if updated_ms is not None:
             changed[doc_id] = updated_ms
         else:
-            content_hash = hashlib.sha256(rendered_content.encode()).hexdigest()[:16]
+            to_hash = f"{doc_name}\n{rendered_content}"
+            content_hash = hashlib.sha256(to_hash.encode("utf-8")).hexdigest()[:16]
             version_key = f"hash:{content_hash}"
             if doc_id in versions and versions[doc_id] == version_key:
                 if stats is not None:
@@ -1110,7 +1208,7 @@ def sync_clickup_docs(
 
         yield {
             "id": f"clickup:doc:{doc_id}",
-            "title": (doc.get("name") or "").strip() or "Untitled doc",
+            "title": doc_name or "Untitled doc",
             "url": f"https://app.clickup.com/{team_id}/v/dc/{doc_id}",
             "content": rendered_content,
             "_deleted": False,
@@ -1198,12 +1296,14 @@ def clickup_source(
         ) from exc
 
     if resource_name is not None and (
-        not isinstance(resource_name, str) or not _RESOURCE_NAME_RE.fullmatch(resource_name)
+        not isinstance(resource_name, str)
+        or len(resource_name) > _MAX_RESOURCE_NAME_LEN
+        or not _RESOURCE_NAME_RE.fullmatch(resource_name)
     ):
         raise ValueError(
-            f"Invalid resource_name {resource_name!r}: must start with a lowercase letter or "
-            "underscore and contain only lowercase alphanumeric characters and underscores "
-            "(1-64 characters)."
+            f"Invalid resource_name {resource_name!r}: must start with a lowercase letter, "
+            "contain only lowercase alphanumeric characters and single underscores, not end with "
+            "an underscore, and be 1-57 characters (matching ^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$)."
         )
 
     resolved_service = service or session
@@ -1231,6 +1331,7 @@ def clickup_source(
             "failed": 0,
             "deleted": 0,
             "failed_rate_limit": 0,
+            "failed_docs": 0,
         }
 
     task_stats = _make_task_stats()
@@ -1274,6 +1375,7 @@ def clickup_source(
                 "failed_rate_limit": task_stats.get("failed_rate_limit", 0)
                 + (doc_stats.get("failed_rate_limit", 0) if include_docs else 0),
                 "failed_comments": task_stats.get("failed_comments", 0),
+                "failed_docs": doc_stats.get("failed_docs", 0) if include_docs else 0,
             }
         )
 

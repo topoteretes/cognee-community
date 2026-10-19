@@ -89,7 +89,7 @@ is missing, the connector stops and lists them instead of guessing.
 
 ### Upgrading and pipeline scoping
 
-The source declares `resource_name` (defaulting to `"clickup"`, must start with a lowercase letter or underscore and contain only lowercase alphanumeric characters and underscores, 1-64 characters) to isolate its `dlt` pipeline state (`PIPELINE_SCOPE_ATTR`). When upgrading from versions that shared the un-scoped `ingest_dlt_source` pipeline, the pipeline scope shifts to `clickup`; rows merge into the same destination tables by `id` without duplication, and the connector performs a one-time baseline re-sync.
+The source declares `resource_name` (defaulting to `"clickup"`) to isolate its `dlt` pipeline state (`PIPELINE_SCOPE_ATTR`). Note: `resource_name` must start with a lowercase letter, contain only lowercase alphanumeric characters and single underscores, not end with an underscore, and be 1-57 characters (matching `^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$`). Earlier releases that permitted uppercase letters, leading digits, or leading underscores must update their configuration accordingly. When upgrading from versions that shared the un-scoped `ingest_dlt_source` pipeline, the pipeline scope shifts to `clickup`; rows merge into the same destination tables by `id` without duplication, and the connector performs a one-time baseline re-sync.
 
 The source has two tables, both with `primary_key="id"` and `write_disposition="merge"`:
 

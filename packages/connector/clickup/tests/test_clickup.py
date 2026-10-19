@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -135,6 +136,8 @@ class FakeClickUpSession:
         self.scripted: list[FakeResponse | Exception] = []
         # simulate a glitchy full (un-cursored) listing
         self.empty_full_listing = False
+        self._doc_pages: Callable[[str, dict[str, Any]], FakeResponse] | None = None
+        self.forbidden_tasks: set[str] = set()  # GET /task/{id} answers 403 for these
 
     def add(self, *tasks: dict[str, Any]) -> None:
         for task in tasks:
@@ -164,6 +167,8 @@ class FakeClickUpSession:
             return self._comments(path.split("/")[3], params)
         if path.startswith("/v2/task/") and not path.endswith("/comment"):
             task_id = path.split("/")[3]
+            if task_id in self.forbidden_tasks:
+                return FakeResponse(403, {"err": "Task restricted"})
             if task_id in self.tasks:
                 return FakeResponse(200, self.tasks[task_id])
             return FakeResponse(404, {"err": "Task not found"})
@@ -171,6 +176,10 @@ class FakeClickUpSession:
             return self._docs(params)
         if path.startswith(f"/v3/workspaces/{TEAM}/docs/") and path.endswith("/pages"):
             doc_id = path.split("/")[5]
+            if self._doc_pages is not None:
+                resp = self._doc_pages(doc_id, params)
+                if resp is not None:
+                    return resp
             if doc_id not in self.docs:
                 return FakeResponse(404, {"err": "Doc not found"})
             return FakeResponse(200, self.pages[doc_id])
@@ -738,7 +747,7 @@ def test_deleted_comment_is_dropped_on_the_next_comment_refresh():
     assert ids(rows) == ["clickup:task:t1"]
     assert "keep me" in rows[0]["content"]
     assert "delete me" not in rows[0]["content"]
-    assert state["comments_refreshed_ms"] == 25 * HOUR_MS
+    assert state["comments_refreshed_at"]["t1"] == 25 * HOUR_MS
 
 
 def test_edited_comment_is_picked_up_by_the_refresh():
@@ -1139,23 +1148,33 @@ def test_doc_without_date_updated_is_ingested_and_not_skipped():
     assert len(rows3) == 1
     assert "Version 2 text" in rows3[0]["content"]
 
+    # Run 4: doc title is renamed in ClickUp (doc still lacks date_updated)
+    session.docs["doc_no_date"]["name"] = "Renamed Undated Doc"
+    rows4 = run_docs(session, state)
+    assert len(rows4) == 1
+    assert rows4[0]["title"] == "Renamed Undated Doc"
 
-def test_stored_comment_remains_after_403_on_later_run(tmp_path: Path):
-    """When a task comment returns 403 on a later run, previously stored comments are preserved."""
+
+def test_stored_comment_remains_after_403_and_retries_on_next_run(tmp_path: Path):
+    """Task stored with comment, then renamed + status changed with 403 on comments:
+
+    Run 2 keeps stored comment and title/status stay the old ones, id in comment_retry.
+    Run 3 with comments readable: new title and status in table, comment_retry empty.
+    """
     import dlt
 
     pipeline = dlt.pipeline(
-        pipeline_name="clickup_403_test_pipeline",
+        pipeline_name="clickup_task_403_pipeline",
         destination=dlt.destinations.sqlalchemy(
-            f"sqlite:///{(tmp_path / 'clickup_403.db').as_posix()}"
+            f"sqlite:///{(tmp_path / 'clickup_t1_403.db').as_posix()}"
         ),
-        dataset_name="clickup_403_ds",
-        pipelines_dir=str(tmp_path / "dlt_state"),
+        dataset_name="clickup_ds",
+        pipelines_dir=str(tmp_path / "dlt_state_t1"),
     )
 
-    t1 = make_task("t1", 1_000, name="Task 1")
+    t1 = make_task("t1", 1_000, name="Old title", closed=False)
     session = FakeClickUpSession([t1])
-    session.comments["t1"] = [{"id": "c1", "date": 1_000, "comment_text": "important decision"}]
+    session.comments["t1"] = [{"id": "c1", "date": 1_000, "comment_text": "stored decision"}]
 
     # Run 1: initial ingestion with comment
     source1 = clickup_source(session=session, include_docs=False)
@@ -1164,67 +1183,431 @@ def test_stored_comment_remains_after_403_on_later_run(tmp_path: Path):
     with (
         pipeline.sql_client() as client,
         client.execute_query(
-            f"SELECT content FROM {CLICKUP_TABLE_NAME} WHERE id = 'clickup:task:t1'"
+            f"SELECT title, content FROM {CLICKUP_TABLE_NAME} WHERE id = 'clickup:task:t1'"
         ) as cursor,
     ):
         row = cursor.fetchone()
         assert row is not None
-        assert "important decision" in row[0]
+        assert row[0] == "Old title"
+        assert "**Status:** in progress" in row[1]
+        assert "stored decision" in row[1]
 
-    # Run 2: task updated, but comments endpoint returns 403 Forbidden
+    tasks_state1 = pipeline.state["sources"]["clickup"]["resources"]["clickup_tasks"]
+    assert tasks_state1["known_ids"] == ["t1"]
+    assert tasks_state1["comment_retry"] == {}
+
+    # Run 2: renamed + status changed, but comments endpoint returns 403 Forbidden
+    session.tasks["t1"]["name"] = "New title"
+    session.tasks["t1"]["status"] = {"status": "complete", "type": "closed"}
     session.tasks["t1"]["date_updated"] = 2_000
-    session._comments = lambda task_id, params: FakeResponse(  # type: ignore[method-assign]
-        403, {"err": "Comments restricted"}
+    # A newer task moves the cursor past t1, so only the retry-by-id can heal t1.
+    session.add(make_task("t_newer", 3_000, name="Newer task"))
+    original_comments = session._comments
+    session._comments = lambda task_id, params: (  # type: ignore[method-assign]
+        FakeResponse(403, {"err": "Comments restricted"})
+        if task_id == "t1"
+        else original_comments(task_id, params)
     )
 
     source2 = clickup_source(session=session, include_docs=False)
     pipeline.run(source2)
 
-    # Document in destination still contains "important decision" (not wiped!)
+    assert source2.resources["clickup_tasks"].cognee_sync_stats["failed_comments"] == 1
+
+    # Stored document stays as is: old title, old status, stored comments survive
     with (
         pipeline.sql_client() as client,
         client.execute_query(
-            f"SELECT content FROM {CLICKUP_TABLE_NAME} WHERE id = 'clickup:task:t1'"
+            f"SELECT title, content FROM {CLICKUP_TABLE_NAME} WHERE id = 'clickup:task:t1'"
         ) as cursor,
     ):
         row = cursor.fetchone()
         assert row is not None
-        assert "important decision" in row[0]
+        assert row[0] == "Old title"
+        assert "**Status:** in progress" in row[1]
+        assert "stored decision" in row[1]
 
-    assert source2.resources["clickup_tasks"].cognee_sync_stats["failed_comments"] == 1
+    tasks_state2 = pipeline.state["sources"]["clickup"]["resources"]["clickup_tasks"]
+    assert "t1" in tasks_state2["comment_retry"]
+    assert tasks_state2["known_ids"] == ["t1", "t_newer"]
+    assert tasks_state2["last_updated_ms"] == 3_000  # the cursor is now past t1
 
-    # Run 3: task 2 arrives, comments readable
-    session.add(make_task("t2", 3_000, name="Task 2"))
-    del session._comments
+    # Run 3: comments readable again
+    session._comments = original_comments  # type: ignore[method-assign]
     source3 = clickup_source(session=session, include_docs=False)
     pipeline.run(source3)
 
+    # In database: new title and complete status now updated, comment still present
     with (
         pipeline.sql_client() as client,
         client.execute_query(
-            f"SELECT id FROM {CLICKUP_TABLE_NAME} WHERE id = 'clickup:task:t2'"
+            f"SELECT title, content FROM {CLICKUP_TABLE_NAME} WHERE id = 'clickup:task:t1'"
         ) as cursor,
     ):
         row = cursor.fetchone()
         assert row is not None
+        assert row[0] == "New title"
+        assert "**Status:** complete" in row[1]
+        assert "stored decision" in row[1]
+
+    tasks_state3 = pipeline.state["sources"]["clickup"]["resources"]["clickup_tasks"]
+    assert tasks_state3["comment_retry"] == {}
+    assert tasks_state3["known_ids"] == ["t1", "t_newer"]
+    assert tasks_state3["last_updated_ms"] == 3_000
+
+
+def test_new_task_with_403_comments_ingested_without_comments_and_healed_later(tmp_path: Path):
+    """New task created while comments are 403, with newer task after it:
+
+    Task is in table (no comments, hash 'unreadable') and in known_ids;
+    when comments become readable the refresh adds them.
+    """
+    import dlt
+
+    pipeline = dlt.pipeline(
+        pipeline_name="clickup_new_task_403_pipeline",
+        destination=dlt.destinations.sqlalchemy(
+            f"sqlite:///{(tmp_path / 'clickup_new_403.db').as_posix()}"
+        ),
+        dataset_name="clickup_ds",
+        pipelines_dir=str(tmp_path / "dlt_state_new"),
+    )
+
+    t2 = make_task("t2", 1_000, name="Task Two")
+    t3 = make_task("t3", 2_000, name="Task Three")
+    session = FakeClickUpSession([t2, t3])
+
+    def comments_handler(task_id: str, params: Any) -> FakeResponse:
+        if task_id == "t2":
+            return FakeResponse(403, {"err": "Comments restricted"})
+        return FakeResponse(200, {"comments": [_comment(1, "comment on t3")]})
+
+    session._comments = comments_handler  # type: ignore[method-assign]
+
+    # Run 1: initial ingestion with t2 comments 403 and t3 comments 200
+    source1 = clickup_source(session=session, include_docs=False)
+    pipeline.run(source1)
+
+    with (
+        pipeline.sql_client() as client,
+        client.execute_query(
+            f"SELECT id, title, content FROM {CLICKUP_TABLE_NAME} ORDER BY id"
+        ) as cursor,
+    ):
+        rows = {row[0]: (row[1], row[2]) for row in cursor.fetchall()}
+        assert "clickup:task:t2" in rows
+        assert rows["clickup:task:t2"][0] == "Task Two"
+        assert "## Comments" not in rows["clickup:task:t2"][1]
+
+        assert "clickup:task:t3" in rows
+        assert rows["clickup:task:t3"][0] == "Task Three"
+        assert "comment on t3" in rows["clickup:task:t3"][1]
+
+    tasks_state1 = pipeline.state["sources"]["clickup"]["resources"]["clickup_tasks"]
+    assert tasks_state1["known_ids"] == ["t2", "t3"]
+    assert tasks_state1["last_updated_ms"] == 2_000
+    assert tasks_state1["comment_hashes"]["t2"] == "unreadable"
+    assert "t2" not in tasks_state1["comment_retry"]
+
+    # Run 2: comments readable again, refresh picks up t2 and heals comments
+    del session._comments
+    session.comments["t2"] = [_comment(2, "recovered comment for t2")]
+    session.comments["t3"] = [_comment(1, "comment on t3")]
+
+    source2 = clickup_source(session=session, include_docs=False, comment_refresh_hours=0.0)
+    pipeline.run(source2)
+
+    with (
+        pipeline.sql_client() as client,
+        client.execute_query(
+            f"SELECT content FROM {CLICKUP_TABLE_NAME} WHERE id = 'clickup:task:t2'"
+        ) as cursor,
+    ):
+        row = cursor.fetchone()
+        assert row is not None
+        assert "recovered comment for t2" in row[0]
+
+    tasks_state2 = pipeline.state["sources"]["clickup"]["resources"]["clickup_tasks"]
+    assert tasks_state2["comment_hashes"]["t2"] != "unreadable"
+    assert tasks_state2["known_ids"] == ["t2", "t3"]
+    assert tasks_state2["last_updated_ms"] == 2_000
+    assert tasks_state2["comment_retry"] == {}
+
+    # Run 3: nothing changed, comments still readable: the healed row stays as it is
+    pipeline.run(clickup_source(session=session, include_docs=False, comment_refresh_hours=0.0))
+    with (
+        pipeline.sql_client() as client,
+        client.execute_query(f"SELECT id, content FROM {CLICKUP_TABLE_NAME} ORDER BY id") as cursor,
+    ):
+        rows3 = dict(cursor.fetchall())
+    assert set(rows3) == {"clickup:task:t2", "clickup:task:t3"}
+    assert "recovered comment for t2" in rows3["clickup:task:t2"]
+    tasks_state3 = pipeline.state["sources"]["clickup"]["resources"]["clickup_tasks"]
+    assert tasks_state3["known_ids"] == ["t2", "t3"]
+    assert tasks_state3["comment_retry"] == {}
+
+
+def test_doc_pages_403_does_not_fail_pipeline_and_preserves_task(tmp_path: Path):
+    """A doc whose pages return 403 next to a healthy task:
+
+    The run completes, new task lands, doc and versions entry are unchanged, failed_docs == 1.
+    """
+    import dlt
+
+    pipeline = dlt.pipeline(
+        pipeline_name="clickup_doc_403_pipeline",
+        destination=dlt.destinations.sqlalchemy(
+            f"sqlite:///{(tmp_path / 'clickup_doc_403.db').as_posix()}"
+        ),
+        dataset_name="clickup_ds",
+        pipelines_dir=str(tmp_path / "dlt_state_doc_403"),
+    )
+
+    session = _doc_session()
+    # Initial run: doc d1 and d2 stored
+    pipeline.run(clickup_source(session=session))
+
+    docs_state1 = pipeline.state["sources"]["clickup"]["resources"]["clickup_docs"]
+    assert docs_state1["versions"]["d1"] == 1_000
+    assert docs_state1["versions"]["d2"] == 2_000
+
+    # Run 2: add healthy task t_new; doc d1 pages return 403 Forbidden
+    session.add(make_task("t_new", 5_000, name="Healthy Task"))
+    session.docs["d1"]["date_updated"] = 6_000
+    session._doc_pages = lambda doc_id, params: (
+        FakeResponse(  # type: ignore[method-assign]
+            403, {"err": "Doc pages restricted"}
+        )
+        if doc_id == "d1"
+        else None
+    )
+
+    source2 = clickup_source(session=session)
+    pipeline.run(source2)
+
+    assert source2.resources["clickup_docs"].cognee_sync_stats["failed_docs"] == 1
+
+    # New task landed
+    with (
+        pipeline.sql_client() as client,
+        client.execute_query(
+            f"SELECT id, title FROM {CLICKUP_TABLE_NAME} WHERE id = 'clickup:task:t_new'"
+        ) as cursor,
+    ):
+        row = cursor.fetchone()
+        assert row is not None
+        assert row[1] == "Healthy Task"
+
+    # Stored doc d1 content remains intact, versions unchanged (not bumped to 6_000)
+    with (
+        pipeline.sql_client() as client,
+        client.execute_query(
+            f"SELECT content FROM {CLICKUP_DOCS_TABLE_NAME} WHERE id = 'clickup:doc:d1'"
+        ) as cursor,
+    ):
+        row = cursor.fetchone()
+        assert row is not None
+        assert "We use **dlt**." in row[0]
+
+    docs_state2 = pipeline.state["sources"]["clickup"]["resources"]["clickup_docs"]
+    assert docs_state2["versions"]["d1"] == 1_000
+
+    # Run 3: pages readable again, so the doc catches up to the version it missed
+    session._doc_pages = None
+    session.pages["d1"] = [{"id": "p1", "name": "Architecture", "content": "Now on dlt 1.9."}]
+    source3 = clickup_source(session=session)
+    pipeline.run(source3)
+    assert source3.resources["clickup_docs"].cognee_sync_stats["failed_docs"] == 0
+    with (
+        pipeline.sql_client() as client,
+        client.execute_query(
+            f"SELECT content FROM {CLICKUP_DOCS_TABLE_NAME} WHERE id = 'clickup:doc:d1'"
+        ) as cursor,
+    ):
+        assert "Now on dlt 1.9." in cursor.fetchone()[0]
+    docs_state3 = pipeline.state["sources"]["clickup"]["resources"]["clickup_docs"]
+    assert docs_state3["versions"]["d1"] == 6_000
+
+
+def test_doc_pages_404_or_empty_body_does_not_tombstone(tmp_path: Path):
+    """Doc listed but 404 on pages is not tombstoned; {} body keeps stored content."""
+    import dlt
+
+    pipeline = dlt.pipeline(
+        pipeline_name="clickup_doc_404_pipeline",
+        destination=dlt.destinations.sqlalchemy(
+            f"sqlite:///{(tmp_path / 'clickup_doc_404.db').as_posix()}"
+        ),
+        dataset_name="clickup_ds",
+        pipelines_dir=str(tmp_path / "dlt_state_doc_404"),
+    )
+
+    session = _doc_session()
+    # Run 1: initial ingestion of doc d1 and d2
+    pipeline.run(clickup_source(session=session))
+
+    with (
+        pipeline.sql_client() as client,
+        client.execute_query(
+            f"SELECT content FROM {CLICKUP_DOCS_TABLE_NAME} WHERE id = 'clickup:doc:d1'"
+        ) as cursor,
+    ):
+        row = cursor.fetchone()
+        assert row is not None
+        assert "We use **dlt**." in row[0]
+
+    # Run 2: doc d1 updated, but pages return 404
+    session.docs["d1"]["date_updated"] = 2_000
+    session._doc_pages = lambda doc_id, params: (
+        FakeResponse(  # type: ignore[method-assign]
+            404, {"err": "Not found"}
+        )
+        if doc_id == "d1"
+        else None
+    )
+
+    pipeline.run(clickup_source(session=session))
+
+    # Doc d1 is NOT tombstoned, remains present with original content
+    with (
+        pipeline.sql_client() as client,
+        client.execute_query(
+            f"SELECT content, _deleted FROM {CLICKUP_DOCS_TABLE_NAME} WHERE id = 'clickup:doc:d1'"
+        ) as cursor,
+    ):
+        row = cursor.fetchone()
+        assert row is not None
+        assert "We use **dlt**." in row[0]
+        assert not row[1]
+    docs_state2 = pipeline.state["sources"]["clickup"]["resources"]["clickup_docs"]
+    assert docs_state2["versions"]["d1"] == 1_000
+
+    # Run 3: doc d1 updated again, but pages return 200 with {} (empty body)
+    session.docs["d1"]["date_updated"] = 3_000
+    session._doc_pages = lambda doc_id, params: (
+        FakeResponse(  # type: ignore[method-assign]
+            200, {}
+        )
+        if doc_id == "d1"
+        else None
+    )
+
+    source3 = clickup_source(session=session)
+    pipeline.run(source3)
+
+    assert source3.resources["clickup_docs"].cognee_sync_stats["failed_docs"] == 1
+
+    # Stored content unchanged (not overwritten with empty headers)
+    with (
+        pipeline.sql_client() as client,
+        client.execute_query(
+            f"SELECT content, _deleted FROM {CLICKUP_DOCS_TABLE_NAME} WHERE id = 'clickup:doc:d1'"
+        ) as cursor,
+    ):
+        row = cursor.fetchone()
+        assert row is not None
+        assert "We use **dlt**." in row[0]
+        assert not row[1]
+    docs_state3 = pipeline.state["sources"]["clickup"]["resources"]["clickup_docs"]
+    assert docs_state3["versions"]["d1"] == 1_000
+
+
+def test_refresh_records_refreshed_at_for_403_tasks_and_bounds_cost_unit():
+    """All candidates 403 for several runs: cost stays bounded and healthy tasks get refreshed."""
+    tasks = [make_task(f"t{i}", 100) for i in range(4)]
+    session = FakeClickUpSession(tasks)
+    state: dict[str, Any] = {}
+    cache: dict[str, Any] = {}
+
+    # Run 1: initial ingestion at now_ms = 0
+    run_tasks(session, state, cache=cache, now_ms=0)
+    assert set(state["known_ids"]) == {"t0", "t1", "t2", "t3"}
+
+    # t0 and t1 comments permanently return 403; t2 and t3 return 200 with new comments
+    def custom_comments(task_id: str, params: Any) -> FakeResponse:
+        if task_id in ("t0", "t1"):
+            return FakeResponse(403, {"err": "Restricted"})
+        return FakeResponse(200, {"comments": [_comment(1, f"updated for {task_id}")]})
+
+    session._comments = custom_comments  # type: ignore[method-assign]
+
+    # Run 2: at 25h, batch size 2. t0 and t1 are tried, return 403, and stamped with refreshed_at
+    session.calls.clear()
+    now_25h = 25 * HOUR_MS
+    run_tasks(
+        session,
+        state,
+        cache=cache,
+        now_ms=now_25h,
+        comment_refresh_batch_size=2,
+        detect_deletions=False,
+    )
+    assert state["comments_refreshed_at"]["t0"] == now_25h
+    assert state["comments_refreshed_at"]["t1"] == now_25h
+
+    # Run 3: immediate next run. t0 and t1 are NOT retried (within 24h window).
+    # Healthy tasks t2 and t3 are refreshed without starvation!
+    session.calls.clear()
+    now_run3 = now_25h + 1_000
+    rows3 = run_tasks(
+        session,
+        state,
+        cache=cache,
+        now_ms=now_run3,
+        comment_refresh_batch_size=2,
+        detect_deletions=False,
+    )
+    assert ids(rows3) == ["clickup:task:t2", "clickup:task:t3"]
+    assert state["comments_refreshed_at"]["t2"] == now_run3
+    assert state["comments_refreshed_at"]["t3"] == now_run3
+
+    # Run 4: next run within window. All tasks have been refreshed, candidates list is empty!
+    session.calls.clear()
+    now_run4 = now_25h + 2_000
+    rows4 = run_tasks(
+        session,
+        state,
+        cache=cache,
+        now_ms=now_run4,
+        comment_refresh_batch_size=2,
+        detect_deletions=False,
+    )
+    assert rows4 == []
+    # No full task listing is executed when candidates is empty (bounded cost per run)
+    full_listings = [
+        params
+        for p, params in session.calls
+        if p == f"/v2/team/{TEAM}/task" and "date_updated_gt" not in params
+    ]
+    assert len(full_listings) == 0
+    assert not [p for p, _ in session.calls if p.endswith("/comment")]
+    assert len(session.calls) == 1
 
 
 def test_check_active_via_source_and_guarded_rows():
-    """guarded_rows around source resources invokes check_active and stops execution when raised."""
+    """A source with guarded_rows removed must fail a test that raises between two rows."""
     session = FakeClickUpSession([make_task("t1", 1_000), make_task("t2", 2_000)])
 
-    call_count = 0
+    row_count = 0
 
-    def check_active_callback():
-        nonlocal call_count
-        call_count += 1
-        if call_count >= 2:
-            raise RuntimeError("Aborted at row boundary")
+    def active_checker():
+        nonlocal row_count
+        # During API requests (space hierarchy + tasks listing), len(session.calls) <= 2.
+        # Once the HTTP requests complete, rows are yielded. guarded_rows invokes
+        # check_active() for each row boundary, allowing us to abort between rows!
+        if len(session.calls) >= 2:
+            row_count += 1
+            if row_count >= 2:
+                raise RuntimeError("Aborted between rows by guarded_rows")
 
-    source = clickup_source(session=session, check_active=check_active_callback)
-    with pytest.raises(Exception) as exc_info:
+    source = clickup_source(
+        session=session,
+        check_active=active_checker,
+        include_comments=False,
+        include_docs=False,
+    )
+    with pytest.raises(Exception, match="Aborted between rows by guarded_rows"):
         list(source.resources["clickup_tasks"])
-    assert "Aborted at row boundary" in str(exc_info.value)
 
 
 def test_check_active_aborts_during_backoff_sleep():
@@ -1264,31 +1647,6 @@ def test_comment_refresh_is_bounded_by_batch_size():
     assert len(comment_calls) == 2
 
 
-def test_comment_refresh_all_403_does_not_advance_refresh_clock():
-    """When all candidate tasks fail with 403 on comment refresh, the 24h clock is not stamped."""
-    tasks = [make_task(f"t{i}", 1_000) for i in range(3)]
-    session = FakeClickUpSession(tasks)
-    session._comments = lambda task_id, params: FakeResponse(  # type: ignore[method-assign]
-        403, {"err": "Restricted"}
-    )
-    state: dict[str, Any] = {"known_ids": [t["id"] for t in tasks], "comments_refreshed_ms": 0}
-
-    now = 100_000_000
-    rows, refreshed_ids, checked_ids, full_pass = clickup_module._sync_comment_refresh(
-        api_for(session),
-        state,
-        candidates=[t["id"] for t in tasks],
-        batch_size=10,
-        hierarchy=clickup_module._HierarchyTracker(api_for(session), TEAM, {}),
-        hashes={},
-        now=now,
-    )
-    assert len(rows) == 0
-    assert len(refreshed_ids) == 0
-    assert len(checked_ids) == 0
-    assert state.get("comments_refreshed_ms") == 0
-
-
 def test_retry_after_cap_at_60s():
     """Retry-After header greater than 60s must be capped at 60.0s."""
     delay = _extract_retry_delay({"Retry-After": "120"}, 1)
@@ -1300,23 +1658,28 @@ def test_retry_after_cap_at_60s():
 def test_resource_name_validation():
     """Invalid resource_name raises ValueError with clear message."""
     session = FakeClickUpSession()
-    # Fails for: uppercase, leading digit, newline, spaces, special chars, empty, >64 chars
     for bad_name in (
+        "_leading",
+        "__x",
+        "trailing_",
+        "consecutive__underscores",
         "invalid-name",
         "has space",
         "bad.dot",
         "",
-        "a" * 65,
+        "a" * 58,
         "1abc",
         "abc\n",
         "Foo",
         "ClickUp",
     ):
-        with pytest.raises(ValueError, match="Invalid resource_name"):
+        with pytest.raises(ValueError, match=r"Invalid resource_name.*57 characters"):
             clickup_source(session=session, resource_name=bad_name)
 
     source = clickup_source(session=session, resource_name="valid_name_123")
     assert getattr(source, PIPELINE_SCOPE_ATTR) == "valid_name_123"
+    source_57 = clickup_source(session=session, resource_name="a" * 57)
+    assert getattr(source_57, PIPELINE_SCOPE_ATTR) == "a" * 57
 
 
 def test_task_pagination_guards_against_stuck_or_malformed_responses():
@@ -1333,7 +1696,7 @@ def test_task_pagination_guards_against_stuck_or_malformed_responses():
         FakeResponse(200, {"tasks": [t]}),
         FakeResponse(200, {"tasks": [t]}),
     ]
-    with pytest.raises(ClickUpError, match="repeated page"):
+    with pytest.raises(ClickUpError, match=r"(repeated page|stuck)"):
         clickup_module._paginate_team_tasks(api, TEAM)
 
 
@@ -1390,3 +1753,154 @@ def test_network_error_logs_class_name_without_url():
     assert "ConnectionError" in str(first_arg)
     assert "space_ids" not in str(first_arg)
     assert "/v2/team" not in str(first_arg)
+
+
+def test_refresh_records_refreshed_at_for_403_tasks_and_bounds_cost(tmp_path: Path):
+    """Through dlt: permanently unreadable comments cannot starve healthy tasks or grow cost."""
+    import dlt
+
+    pipeline = dlt.pipeline(
+        pipeline_name="clickup_refresh_pipeline",
+        destination=dlt.destinations.sqlalchemy(
+            f"sqlite:///{(tmp_path / 'clickup_refresh.db').as_posix()}"
+        ),
+        dataset_name="clickup_ds",
+        pipelines_dir=str(tmp_path / "dlt_state_refresh"),
+    )
+    session = FakeClickUpSession([make_task(f"t{i}", 100 + i) for i in range(4)])
+    pipeline.run(clickup_source(session=session, include_docs=False))
+
+    def comments(task_id: str, params: Any) -> FakeResponse:
+        if task_id in ("t0", "t1"):
+            return FakeResponse(403, {"err": "Restricted"})
+        return FakeResponse(200, {"comments": [_comment(1, f"updated for {task_id}")]})
+
+    session._comments = comments  # type: ignore[method-assign]
+
+    def run() -> tuple[Any, list[str]]:
+        session.calls.clear()
+        source = clickup_source(
+            session=session,
+            include_docs=False,
+            comment_refresh_hours=0.0,
+            comment_refresh_batch_size=2,
+        )
+        pipeline.run(source)
+        state = pipeline.state["sources"]["clickup"]["resources"]["clickup_tasks"]
+        return source, [p for p, _ in session.calls if p.endswith("/comment")], state
+
+    # Run 2: the two least recently refreshed (t0, t1) are tried, fail, and are stamped.
+    source2, comment_calls, state2 = run()
+    assert sorted(comment_calls) == ["/v2/task/t0/comment", "/v2/task/t1/comment"]
+    assert source2.resources["clickup_tasks"].cognee_sync_stats["failed_comments"] == 2
+    stamp = state2["comments_refreshed_at"]["t0"]
+    assert state2["comments_refreshed_at"]["t1"] == stamp
+
+    # Run 3: t0/t1 now have the newest stamps, so the healthy tasks get the batch.
+    _, comment_calls, _ = run()
+    assert sorted(comment_calls) == ["/v2/task/t2/comment", "/v2/task/t3/comment"]
+    with (
+        pipeline.sql_client() as client,
+        client.execute_query(f"SELECT id, content FROM {CLICKUP_TABLE_NAME} ORDER BY id") as cursor,
+    ):
+        rows = dict(cursor.fetchall())
+    assert "updated for t2" in rows["clickup:task:t2"]
+    assert "updated for t3" in rows["clickup:task:t3"]
+    assert "## Comments" not in rows["clickup:task:t0"]  # stored doc of a 403 task untouched
+
+    # Run 4: rotation continues; cost per run stays at batch_size comment requests.
+    _, comment_calls, state4 = run()
+    assert len(comment_calls) == 2
+    assert state4["known_ids"] == ["t0", "t1", "t2", "t3"]
+    assert state4["comment_retry"] == {}
+    assert state4["last_updated_ms"] == 103
+
+
+def test_retry_survives_403_on_the_task_itself(tmp_path: Path):
+    """A retry whose GET /task/{id} is 403 keeps the stored task instead of failing the run."""
+    import dlt
+
+    pipeline = dlt.pipeline(
+        pipeline_name="clickup_retry_task_403",
+        destination=dlt.destinations.sqlalchemy(
+            f"sqlite:///{(tmp_path / 'clickup_retry.db').as_posix()}"
+        ),
+        dataset_name="clickup_ds",
+        pipelines_dir=str(tmp_path / "dlt_state_retry"),
+    )
+    session = FakeClickUpSession([make_task("t1", 1_000, name="Stored title")])
+    session.comments["t1"] = [_comment(1, "stored decision")]
+    pipeline.run(clickup_source(session=session, include_docs=False))
+
+    # Run 2: t1 edited while its comments are forbidden -> queued for retry.
+    session.tasks["t1"]["name"] = "Edited title"
+    session.tasks["t1"]["date_updated"] = 2_000
+    original_comments = session._comments
+    session._comments = lambda task_id, params: FakeResponse(  # type: ignore[method-assign]
+        403, {"err": "Comments restricted"}
+    )
+    pipeline.run(clickup_source(session=session, include_docs=False))
+
+    # Run 3: the task itself is now forbidden too. The run must still complete.
+    session.forbidden_tasks.add("t1")
+    session.add(make_task("t2", 3_000, name="Other task"))
+    pipeline.run(clickup_source(session=session, include_docs=False))
+    state3 = pipeline.state["sources"]["clickup"]["resources"]["clickup_tasks"]
+    assert "t1" in state3["comment_retry"]
+    with (
+        pipeline.sql_client() as client,
+        client.execute_query(f"SELECT id, title, content FROM {CLICKUP_TABLE_NAME}") as cursor,
+    ):
+        rows = {r[0]: (r[1], r[2]) for r in cursor.fetchall()}
+    assert rows["clickup:task:t1"][0] == "Stored title"
+    assert "stored decision" in rows["clickup:task:t1"][1]
+    assert rows["clickup:task:t2"][0] == "Other task"
+
+    # Run 4: everything readable again -> t1 healed, retry queue empty.
+    session.forbidden_tasks.clear()
+    session._comments = original_comments  # type: ignore[method-assign]
+    pipeline.run(clickup_source(session=session, include_docs=False))
+    state4 = pipeline.state["sources"]["clickup"]["resources"]["clickup_tasks"]
+    assert state4["comment_retry"] == {}
+    with (
+        pipeline.sql_client() as client,
+        client.execute_query(
+            f"SELECT title FROM {CLICKUP_TABLE_NAME} WHERE id = 'clickup:task:t1'"
+        ) as cursor,
+    ):
+        assert cursor.fetchone()[0] == "Edited title"
+
+
+def test_comment_retry_takes_the_oldest_attempts_first(monkeypatch):
+    """With more failing tasks than the per-run cap, every task still gets retried in turn."""
+    monkeypatch.setattr(clickup_module, "_MAX_COMMENT_RETRIES_PER_RUN", 2)
+    session = FakeClickUpSession([make_task(t, 100) for t in ("a", "b", "c")])
+    state: dict[str, Any] = {}
+    run_tasks(session, state, now_ms=0)  # all three stored normally
+    session._comments = lambda task_id, params: FakeResponse(  # type: ignore[method-assign]
+        403, {"err": "Restricted"}
+    )
+    state["comment_retry"] = {"a": 300, "b": 100, "c": 200}
+
+    def retried_ids(now: int) -> list[str]:
+        session.calls.clear()
+        run_tasks(session, state, now_ms=now, comment_refresh_hours=None, detect_deletions=False)
+        return [p.split("/")[3] for p, _ in session.calls if p.endswith("/comment")]
+
+    assert retried_ids(1_000) == ["b", "c"]  # the two oldest attempts
+    assert retried_ids(2_000) == ["a", "b"]  # a now oldest; b/c were stamped 1_000
+
+
+def test_shuffled_repeat_page_is_detected_on_the_first_repeat():
+    """The same ids in a different order must stop paging at once, not after many pages."""
+    session = FakeClickUpSession([make_task(f"t{i}", 100 + i) for i in range(3)])
+    rotations = [["t0", "t1", "t2"], ["t1", "t2", "t0"], ["t2", "t0", "t1"], ["t0", "t2", "t1"]]
+
+    def endless_shuffle(params: dict[str, Any]) -> FakeResponse:
+        order = rotations[int(params.get("page", 0)) % len(rotations)]
+        return FakeResponse(200, {"tasks": [session.tasks[t] for t in order], "last_page": False})
+
+    session._tasks = endless_shuffle  # type: ignore[method-assign]
+    with pytest.raises(clickup_module.ClickUpError, match="stuck"):
+        run_tasks(session, {})
+    assert len(session.task_listings()) == 2  # page 0, then the first (shuffled) repeat
