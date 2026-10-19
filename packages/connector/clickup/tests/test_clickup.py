@@ -9,10 +9,20 @@ from unittest.mock import patch
 import pytest
 from cognee.tasks.ingestion.dlt_utils import document_source_tag
 
+try:
+    from cognee.tasks.ingestion.dlt_utils import PIPELINE_SCOPE_ATTR
+except ImportError:
+    PIPELINE_SCOPE_ATTR = "cognee_pipeline_scope"
+
 from cognee_community_connector_clickup import (
     CLICKUP_DOCS_TABLE_NAME,
     CLICKUP_SOURCE_NAME,
     CLICKUP_TABLE_NAME,
+    ClickUpAuthenticationError,
+    ClickUpError,
+    ClickUpNotFoundError,
+    ClickUpPermissionError,
+    ClickUpRateLimitError,
     clickup_source,
     sync_clickup,
     sync_clickup_docs,
@@ -121,7 +131,8 @@ class FakeClickUpSession:
         self.pages: dict[str, list[dict[str, Any]]] = {}
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.scripted: list[FakeResponse | Exception] = []
-        self.empty_full_listing = False  # simulate a glitchy full (un-cursored) listing
+        # simulate a glitchy full (un-cursored) listing
+        self.empty_full_listing = False
 
     def add(self, *tasks: dict[str, Any]) -> None:
         for task in tasks:
@@ -149,6 +160,11 @@ class FakeClickUpSession:
             return self._tasks(params)
         if path.startswith("/v2/task/") and path.endswith("/comment"):
             return self._comments(path.split("/")[3], params)
+        if path.startswith("/v2/task/") and not path.endswith("/comment"):
+            task_id = path.split("/")[3]
+            if task_id in self.tasks:
+                return FakeResponse(200, self.tasks[task_id])
+            return FakeResponse(404, {"err": "Task not found"})
         if path == f"/v3/workspaces/{TEAM}/docs":
             return self._docs(params)
         if path.startswith(f"/v3/workspaces/{TEAM}/docs/") and path.endswith("/pages"):
@@ -190,7 +206,10 @@ class FakeClickUpSession:
 
     def _docs(self, params: dict[str, Any]) -> FakeResponse:
         docs = sorted(self.docs.values(), key=lambda d: d["id"])
-        offset = int(params.get("cursor") or 0)
+        try:
+            offset = int(params.get("cursor") or 0)
+        except (ValueError, TypeError):
+            offset = 0
         limit = int(params["limit"])
         page = docs[offset : offset + limit]
         next_cursor = str(offset + limit) if offset + limit < len(docs) else None
@@ -237,17 +256,16 @@ def test_personal_token_is_sent_raw_in_the_authorization_header():
     assert session.headers["Authorization"] == "pk_123_ABC"
 
 
-def test_source_reads_the_token_from_the_environment(monkeypatch):
+def test_source_passes_explicit_api_token(monkeypatch):
     seen = {}
-    monkeypatch.setenv("CLICKUP_API_TOKEN", "pk_env")
     monkeypatch.setattr(clickup_module, "_make_session", lambda token: seen.setdefault("t", token))
-    clickup_source()
-    assert seen["t"] == "pk_env"
+    clickup_source(api_token="pk_explicit_123")
+    assert seen["t"] == "pk_explicit_123"
 
 
 def test_source_requires_a_token(monkeypatch):
     monkeypatch.delenv("CLICKUP_API_TOKEN", raising=False)
-    with pytest.raises(ValueError, match="CLICKUP_API_TOKEN"):
+    with pytest.raises(ValueError, match="pass api_token="):
         clickup_source()
 
 
@@ -262,16 +280,68 @@ def test_single_workspace_is_picked_automatically_and_several_must_be_chosen():
     assert _resolve_team_id(api_for(session)) == TEAM
 
     session.teams.append({"id": "42", "name": "Side project"})
-    with pytest.raises(ValueError, match="pass team_id="):
+    with pytest.raises(ClickUpError, match="pass team_id="):
         _resolve_team_id(api_for(session))
     assert _resolve_team_id(api_for(session), "42") == "42"
 
 
-def test_invalid_token_raises_permission_error():
+def test_invalid_token_raises_authentication_error():
     session = FakeClickUpSession()
     session.scripted = [FakeResponse(401, {"err": "Token invalid"})]
-    with pytest.raises(PermissionError, match="CLICKUP_API_TOKEN"):
+    with pytest.raises(ClickUpAuthenticationError) as exc_info:
         run_tasks(session, {})
+    assert exc_info.value.status_code == 401
+    assert isinstance(exc_info.value, PermissionError)
+
+
+def test_401_error_sanitizes_token():
+    """Assert the secret token does NOT appear in the exception message on 401."""
+    secret_token = "pk_super_secret_token_12345"
+    session = FakeClickUpSession()
+    session.scripted = [FakeResponse(401, {"err": "Unauthorized"})]
+
+    with pytest.raises(ClickUpAuthenticationError) as exc_info:
+        api = _ClickUpAPI(session)
+        api.v2("/team")
+
+    msg = str(exc_info.value)
+    assert secret_token not in msg
+    assert exc_info.value.status_code == 401
+
+
+def test_check_active_aborts_request():
+    session = FakeClickUpSession()
+    api = _ClickUpAPI(session, check_active=lambda: False)
+    with pytest.raises(ClickUpError, match="check_active returned False"):
+        api.v2("/team")
+
+
+def test_403_forbidden_raises_permission_error():
+    session = FakeClickUpSession()
+    session.scripted = [FakeResponse(403, {"err": "Forbidden"})]
+    with pytest.raises(ClickUpPermissionError) as exc_info:
+        api = _ClickUpAPI(session)
+        api.v2("/team")
+    assert exc_info.value.status_code == 403
+    assert isinstance(exc_info.value, PermissionError)
+
+
+def test_404_not_found_raises_not_found_error():
+    session = FakeClickUpSession()
+    session.scripted = [FakeResponse(404, {"err": "Not found"})]
+    with pytest.raises(ClickUpNotFoundError) as exc_info:
+        api = _ClickUpAPI(session)
+        api.v2("/team")
+    assert exc_info.value.status_code == 404
+
+
+def test_429_exhausted_retries_raises_rate_limit_error():
+    session = FakeClickUpSession()
+    session.scripted = [FakeResponse(429, headers={"Retry-After": "1"})] * 5
+    with pytest.raises(ClickUpRateLimitError) as exc_info:
+        api = _ClickUpAPI(session)
+        api.v2("/team")
+    assert exc_info.value.status_code == 429
 
 
 # ---------------------------------------------------------------------------
@@ -305,7 +375,7 @@ def test_dropped_connections_are_retried_and_give_up_eventually():
     assert _request(session, f"{BASE}/v2/team")["teams"]
 
     session.scripted = [FakeResponse(502)] * 10
-    with pytest.raises(requests.exceptions.HTTPError):
+    with pytest.raises((ClickUpError, requests.exceptions.HTTPError)):
         _request(session, f"{BASE}/v2/team")
 
 
@@ -335,7 +405,8 @@ def test_task_markdown_includes_every_field_without_a_title_heading():
     assert "**Subtask of:** t0" in md
     assert "**Creator:** Alice" in md
     assert "**Due:** 2023-11-15 22:13:20 UTC" in md
-    assert "## Description\nDescription of **t1**." in md  # markdown preferred over plain text
+    # markdown preferred over plain text
+    assert "## Description\nDescription of **t1**." in md
     assert "### QA\n- [x] Unit tests\n- [ ] Docs" in md
     assert "## Comments\n- **Carol** (2023-11-14 22:13:20 UTC): Looks good" in md
     assert not md.startswith("#")
@@ -498,12 +569,10 @@ def test_rows_carry_document_fields():
     assert row["id"] == "clickup:task:t1"
     assert row["title"] == "Ship v2"
     assert row["url"] == "https://app.clickup.com/t/t1"
-    assert (row["status"], row["list"], row["date_updated"], row["_deleted"]) == (
-        "in progress",
-        "Sprint 42",
-        5,
-        False,
-    )
+    assert row["_deleted"] is False
+    assert "status" not in row
+    assert "list" not in row
+    assert "date_updated" not in row
 
 
 def test_incremental_sync_uses_date_updated_gt_and_yields_only_changes():
@@ -538,7 +607,8 @@ def test_new_task_sharing_the_cursor_millisecond_is_not_skipped():
     state: dict[str, Any] = {}
     run_tasks(session, state)
 
-    session.add(make_task("t2", 500))  # same date_updated as the task that set the cursor
+    # same date_updated as the task that set the cursor
+    session.add(make_task("t2", 500))
     assert ids(run_tasks(session, state)) == ["clickup:task:t2"]
     assert run_tasks(session, state) == []
 
@@ -586,11 +656,13 @@ def test_empty_listing_skips_the_sweep_but_keeps_newly_emitted_ids():
     run_tasks(session, state)
 
     session.add(make_task("t2", 200))
-    session.empty_full_listing = True  # the un-cursored sweep glitches and returns nothing
+    # the un-cursored sweep glitches and returns nothing
+    session.empty_full_listing = True
     rows = run_tasks(session, state)
 
     assert ids(rows) == ["clickup:task:t2"]
-    assert state["known_ids"] == ["t1", "t2"]  # t2 is tracked, so a later delete is noticed
+    # t2 is tracked, so a later delete is noticed
+    assert state["known_ids"] == ["t1", "t2"]
 
     session.empty_full_listing = False
     del session.tasks["t2"]
@@ -672,7 +744,8 @@ def test_refresh_with_unchanged_comments_yields_nothing():
 
     assert run_tasks(session, state, now_ms=30 * HOUR_MS) == []
     assert sorted(session.paths("/v2/task/")) == ["/v2/task/t1/comment", "/v2/task/t2/comment"]
-    assert len(session.task_listings()) == 2  # incremental + one shared full listing
+    # incremental + one shared full listing
+    assert len(session.task_listings()) == 2
 
 
 def test_comment_refresh_can_be_disabled():
@@ -749,7 +822,8 @@ def test_unchanged_docs_are_not_refetched_and_edited_ones_are():
 
 def test_deleted_and_archived_docs_become_tombstones():
     session = _doc_session()
-    session.add_doc(make_doc("d3", 3_000), [])  # stays, so the listing is not empty
+    # stays, so the listing is not empty
+    session.add_doc(make_doc("d3", 3_000), [])
     state: dict[str, Any] = {}
     run_docs(session, state)
 
@@ -774,7 +848,8 @@ def test_docs_listing_pages_through_the_cursor():
         session.add_doc(make_doc(f"d{i:03d}", 1), [])
     rows = run_docs(session, {})
     assert len(rows) == 130
-    assert len(session.paths(f"/v3/workspaces/{TEAM}/docs")) == 2 + 130  # 2 listings + pages
+    # 2 listings + pages
+    assert len(session.paths(f"/v3/workspaces/{TEAM}/docs")) == 2 + 130
 
 
 def test_empty_doc_listing_skips_the_sweep():
@@ -845,3 +920,120 @@ def test_dlt_pipeline_merge_purges_deleted_tasks_and_docs(tmp_path):
     # Cursor and hierarchy cache both survived in dlt state.
     assert session.task_listings()[0]["date_updated_gt"] == "200"
     assert not session.paths(f"/v2/team/{TEAM}/space")
+
+
+def test_shuffled_collections_produce_identical_markdown():
+    """Shuffled assignees, tags, custom fields, checklists produce identical markdown."""
+    task1 = make_task(
+        "t1",
+        1_000,
+        assignees=[{"id": 2, "username": "Bob"}, {"id": 1, "username": "Alice"}],
+        tags=[{"name": "urgent"}, {"name": "backend"}],
+        custom_fields=[
+            {"id": "cf2", "name": "Priority Code", "type": "short_text", "value": "P1"},
+            {"id": "cf1", "name": "Estimated Hours", "type": "short_text", "value": "8"},
+        ],
+        checklists=[
+            {
+                "id": "chk2",
+                "name": "Testing",
+                "items": [{"id": "i2", "name": "Integration", "orderindex": 1}],
+            },
+            {
+                "id": "chk1",
+                "name": "Design",
+                "items": [{"id": "i1", "name": "Mockup", "orderindex": 0}],
+            },
+        ],
+    )
+    task2 = make_task(
+        "t1",
+        1_000,
+        assignees=[{"id": 1, "username": "Alice"}, {"id": 2, "username": "Bob"}],
+        tags=[{"name": "backend"}, {"name": "urgent"}],
+        custom_fields=[
+            {"id": "cf1", "name": "Estimated Hours", "type": "short_text", "value": "8"},
+            {"id": "cf2", "name": "Priority Code", "type": "short_text", "value": "P1"},
+        ],
+        checklists=[
+            {
+                "id": "chk1",
+                "name": "Design",
+                "items": [{"id": "i1", "name": "Mockup", "orderindex": 0}],
+            },
+            {
+                "id": "chk2",
+                "name": "Testing",
+                "items": [{"id": "i2", "name": "Integration", "orderindex": 1}],
+            },
+        ],
+    )
+    md1 = _render_task_markdown(task1, "Engineering / Sprint 1")
+    md2 = _render_task_markdown(task2, "Engineering / Sprint 1")
+    assert md1 == md2
+
+
+def test_short_page_does_not_stop_pagination_or_tombstone():
+    """A short page in the middle of pagination does not stop paging or cause false tombstones."""
+    # 150 tasks total: page 0 returns 99 tasks with last_page: False,
+    # page 1 returns 51 tasks with last_page: True
+    tasks = [make_task(f"t{i:03d}", 1000 + i) for i in range(150)]
+    session = FakeClickUpSession(tasks)
+
+    # Custom _tasks handler to simulate short page on page 0
+    def scripted_tasks(params: dict[str, Any]) -> FakeResponse:
+        page = int(params.get("page", 0))
+        if page == 0:
+            return FakeResponse(200, {"tasks": tasks[:99], "last_page": False})
+        elif page == 1:
+            return FakeResponse(200, {"tasks": tasks[99:], "last_page": True})
+        return FakeResponse(200, {"tasks": [], "last_page": True})
+
+    session._tasks = scripted_tasks  # type: ignore[method-assign]
+    state: dict[str, Any] = {}
+    rows = run_tasks(session, state, include_comments=False)
+
+    assert len(rows) == 150
+    assert not any(r.get("_deleted") for r in rows)
+    assert len(state["known_ids"]) == 150
+
+
+def test_stuck_docs_cursor_raises_clickup_error():
+    """When /workspaces/{id}/docs returns the same next_cursor, ClickUpError is raised."""
+    session = FakeClickUpSession()
+    doc = make_doc("d1", 1_000)
+
+    # Return same cursor repeatedly
+    session.scripted = [
+        FakeResponse(200, {"docs": [doc], "next_cursor": "cursor_stuck"}),
+        FakeResponse(200, {"docs": [], "next_cursor": "cursor_stuck"}),
+    ]
+
+    with pytest.raises(ClickUpError, match="stuck on cursor"):
+        list(clickup_module._paginate_docs(api_for(session), TEAM))
+
+
+def test_two_sources_with_different_resource_names():
+    """Two sources with different resource_name produce distinct tables and scope."""
+    s1 = clickup_source(session=FakeClickUpSession(), resource_name="marketing")
+    s2 = clickup_source(session=FakeClickUpSession(), resource_name="engineering")
+
+    assert getattr(s1, PIPELINE_SCOPE_ATTR) == "marketing"
+    assert getattr(s2, PIPELINE_SCOPE_ATTR) == "engineering"
+    assert sorted(s1.resources) == ["marketing_docs", "marketing_tasks"]
+    assert sorted(s2.resources) == ["engineering_docs", "engineering_tasks"]
+
+
+def test_resource_cognee_sync_stats():
+    source = clickup_source(session=FakeClickUpSession())
+    tasks_res = source.resources["clickup_tasks"]
+    docs_res = source.resources["clickup_docs"]
+    expected_stats = {
+        "scanned": 0,
+        "skipped": 0,
+        "failed": 0,
+        "deleted": 0,
+        "failed_rate_limit": 0,
+    }
+    assert tasks_res.cognee_sync_stats == expected_stats
+    assert docs_res.cognee_sync_stats == expected_stats
