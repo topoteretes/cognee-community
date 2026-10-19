@@ -8,6 +8,7 @@ import pytest
 
 from cognee_community_connector_twist.twist import (
     TwistClient,
+    TwistError,
     TwistForbiddenError,
     TwistNotFoundError,
     _iter_rows,
@@ -260,7 +261,28 @@ def test_held_back_items_that_come_back_are_not_forgotten(fake):
     assert "pending_delete" not in state
 
 
-def test_a_different_mass_delete_needs_its_own_confirmation(fake):
+def test_a_rolling_mass_delete_is_forgotten_not_held_forever(fake):
+    # Review case: 16 of 30 deleted, then one more before every run. An exact
+    # match on the held set would hold 16, 17, 18, ... and never forget.
+    fake.add_channel(LAUNCH, "launch")
+    for i in range(29):
+        fake.add_thread(LAUNCH, f"Thread {i}")
+    state = synced(fake)  # 29 threads + 1 channel = 30 items
+    ids = list(fake.threads)
+    for thread_id in ids[:16]:
+        fake.delete_thread(thread_id)
+    _, stats = run(fake, state)
+    assert (stats["held_back"], stats["deleted"]) == (16, 0)
+    for n in range(16, 20):
+        fake.delete_thread(ids[n])
+        _, stats = run(fake, state)
+        # The ones still gone are confirmed; the single new one is ordinary.
+        expected = 17 if n == 16 else 1
+        assert (stats["held_back"], stats["deleted"]) == (0, expected)
+    assert len(state["items"]) == 30 - 20
+
+
+def test_an_ordinary_delete_after_a_mass_delete_is_not_held(fake):
     _twelve_threads(fake)
     state = synced(fake)
     ids = list(fake.threads)
@@ -270,7 +292,45 @@ def test_a_different_mass_delete_needs_its_own_confirmation(fake):
     assert stats["held_back"] == 10
     fake.delete_thread(ids[10])
     _, stats = run(fake, state)
-    assert (stats["held_back"], stats["deleted"]) == (11, 0)
+    assert (stats["held_back"], stats["deleted"]) == (0, 11)
+    assert "pending_delete" not in state
+
+
+def test_confirmed_deletes_go_through_while_a_new_batch_is_held(fake):
+    # With a lower threshold a second batch can be large on its own: the first
+    # batch is confirmed and forgotten in the same run the second is held.
+    fake.add_channel(LAUNCH, "launch")
+    for i in range(29):
+        fake.add_thread(LAUNCH, f"Thread {i}")
+    state = synced(fake)  # 30 items
+    ids = list(fake.threads)
+    for thread_id in ids[:10]:
+        fake.delete_thread(thread_id)
+    _, stats = run(fake, state, max_delete_ratio=0.3)
+    assert stats["held_back"] == 10
+    for thread_id in ids[10:20]:
+        fake.delete_thread(thread_id)
+    rows, stats = run(fake, state, max_delete_ratio=0.3)
+    assert (stats["deleted"], stats["held_back"]) == (10, 10)
+    assert sorted(rows) == sorted(f"thread:{t}" for t in ids[:10])
+
+
+def test_held_items_partly_back_are_kept_and_the_rest_forgotten(fake):
+    # A glitch that clears for some items: those come back unchanged, the ones
+    # still gone in the second run are forgotten.
+    _twelve_threads(fake)
+    state = synced(fake)
+    ids = list(fake.threads)
+    hidden = {thread_id: fake.threads[thread_id] for thread_id in ids[:12]}
+    for thread_id in ids[:12]:
+        fake.threads.pop(thread_id)
+    _, stats = run(fake, state)
+    assert stats["held_back"] == 12
+    for thread_id in ids[:6]:  # six come back
+        fake.threads[thread_id] = hidden[thread_id]
+    rows, stats = run(fake, state)
+    assert (stats["deleted"], stats["held_back"], stats["unchanged"]) == (6, 0, 6)
+    assert sorted(rows) == sorted(f"thread:{t}" for t in ids[6:12])
 
 
 def test_allow_mass_delete_forgets_at_once(fake):
@@ -312,6 +372,14 @@ def test_unread_thread_still_gets_all_its_comments(seeded, thread_named):
     assert "Agreed, let's go with option B." in content
 
 
+def test_stale_zero_comment_count_still_gets_the_comments(seeded, thread_named):
+    # Review case: a thread listed with comment_count 0 that has a comment.
+    checkout = thread_named("Checkout redesign")
+    seeded.threads[checkout["id"]]["comment_count"] = 0
+    rows, _ = run(seeded, {})
+    assert "Agreed, let's go with option B." in rows[f"thread:{checkout['id']}"]["content"]
+
+
 def test_thread_without_a_comment_count_still_gets_its_comments(seeded, thread_named):
     checkout = thread_named("Checkout redesign")
     seeded.threads[checkout["id"]]["comment_count"] = None
@@ -325,6 +393,36 @@ def test_forbidden_channel_stops_the_run_and_forgets_nothing(seeded):
     before = dict(state)
     seeded.forbidden_channels.add(DESIGN)
     with pytest.raises(TwistForbiddenError):
+        run(seeded, state)
+    assert state == before
+
+
+def test_archived_channel_synced_only_on_request_is_dropped_afterwards(seeded, thread_named):
+    # Review case: kept-after-archiving must not keep a channel that was only
+    # synced because it was included or listed.
+    seeded.channels[DESIGN]["archived"] = True
+    logo = thread_named("Logo refresh")
+    for opt_in in ({"include_archived": True}, {"channel_ids": [DESIGN]}):
+        state: dict = {}
+        rows, _ = run(seeded, state, **opt_in)
+        assert f"thread:{logo['id']}" in rows
+        rows, _ = run(seeded, state)  # back to the default selection
+        assert rows[f"thread:{logo['id']}"] == {"id": f"thread:{logo['id']}", "_deleted": True}
+
+
+def test_a_failed_archived_listing_never_forgets_a_known_channel(seeded):
+    # Twist's docs: the plain channels/get leaves archived channels out.
+    seeded.plain_hides_archived = True
+    state = synced(seeded)
+    seeded.fail_archived_listing = 400
+    _, stats = run(seeded, state)  # every synced channel is still listed
+    assert stats["deleted"] == 0
+    seeded.fail_archived_listing = None
+    seeded.channels[DESIGN]["archived"] = True  # kept: synced while active
+    run(seeded, state)
+    seeded.fail_archived_listing = 400
+    before = dict(state)
+    with pytest.raises(TwistError, match="archived=true failed"):
         run(seeded, state)
     assert state == before
 

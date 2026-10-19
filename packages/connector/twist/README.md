@@ -87,8 +87,10 @@ These rules come from testing the Twist API on a live workspace.
   deleted; they stay in memory marked "closed".
 - **Archiving is not deleting.** When you sync all channels, an archived channel
   that was never synced is skipped (pass `include_archived=True`, or list it in
-  `channel_ids`, to sync it). A channel archived after it was synced stays
-  synced: its threads are kept and its channel document says "archived".
+  `channel_ids`, to sync it). A channel that was synced while it was active
+  stays synced after it is archived: its threads are kept and its channel
+  document says "archived". A channel synced only because it was listed or
+  `include_archived` was on is dropped once that is no longer the case.
 - **A 404 is never a delete.** A deleted thread answers 404 (error 110, checked
   live), and Twist's docs use the same error for an item the token can no
   longer see. So only a thread missing from a successful channel listing is
@@ -99,21 +101,24 @@ These rules come from testing the Twist API on a live workspace.
   is only saved when the load succeeds, and cognee only forgets things after a
   successful run, so the next sync simply retries.
 - **Mass deletes wait for a second run.** When a run finds more than half of
-  what it has synced gone (and at least 10 items), which is what a wrong
+  what it has synced newly gone (and at least 10 items), which is what a wrong
   workspace, channel list or token looks like, it keeps those items and reports
-  them as `held_back`. The next run forgets them if the same items are still
-  gone; anything that came back is kept. No run ever stops on this, so a
-  scheduled sync needs no manual step. `allow_mass_delete=True` forgets such a
-  batch at once; `max_delete_ratio` tunes the threshold.
+  them as `held_back`. The next run forgets every held item that is still gone
+  and keeps the ones that came back; anything gone for the first time in that
+  run is judged on its own, so ordinary deletes alongside a held batch are not
+  delayed. No run ever stops on this, so a scheduled sync needs no manual step.
+  `allow_mass_delete=True` forgets such a batch at once; `max_delete_ratio`
+  tunes the threshold. A wrong selection that lasts two runs does forget the
+  items; when it is fixed they come back as new and are ingested again.
 - **Own sync state per workspace.** Each source uses its own dlt pipeline and
   state, named after its `resource_name` (default `twist_<workspace_id>`,
   through `PIPELINE_SCOPE_ATTR`), and a run refuses to continue if the stored
   state belongs to another workspace.
 - **Host contract.** `cognee_sync_stats` holds counts only (scanned, changed,
   unchanged, deleted, skipped, held_back, plus failed, failed_auth and
-  failed_rate_limit set to 1 when a run stops on that kind of error). `service`
-  takes a pre-built `httpx` client (`http_client` is the same thing), and an
-  optional `check_active` callable lets a host stop a running sync.
+  failed_rate_limit set to 1 when a run stops on that kind of error).
+  `http_client` takes a pre-built `httpx` client, and an optional
+  `check_active` callable lets a host stop a running sync.
 
 ## Setup
 
@@ -177,9 +182,15 @@ changes one, this is where to look first.
   renames. Editing an earlier comment moves nothing on the thread.
 - `channels/get` already returns archived channels without `archived`
   (documented as needed for them), so the connector asks both ways and merges.
+  If the `archived=true` call fails, the plain listing is used, unless a channel
+  that was synced before is missing from it; then the run stops, since an
+  archived channel cannot be told from a deleted one.
 - A thread's `last_obj_index` is documented as the reader's position ("-1 means
-  the whole thread is unread"), so comments are read by `comment_count` and
-  window size, never by it.
+  the whole thread is unread"), so it is never used. Comments are read in
+  windows of 500: the first window always, the next one while a window comes
+  back full or `comment_count` says there are more, and never past an empty
+  window. (On a live workspace `last_obj_index` stayed at the last comment's
+  index for a thread marked unread.)
 - Errors come back as `error_code` / `error_string` (documented as
   `{"error": [code, string]}`); both are read. A rejected token is HTTP 403 with
   error code 200, not 401.

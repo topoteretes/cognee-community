@@ -61,6 +61,10 @@ class FakeTwist:
         self.forbidden_channels: set[int] = set()
         # Threads the token's user has not read: listed with last_obj_index -1.
         self.unread_threads: set[int] = set()
+        # channels/get?archived=true answers with this status instead (e.g. 400).
+        self.fail_archived_listing: int | None = None
+        # The documented behaviour: the plain channels/get leaves archived out.
+        self.plain_hides_archived = False
 
     # -- data helpers -------------------------------------------------------
     def _tick(self) -> int:
@@ -217,7 +221,11 @@ class FakeTwist:
         if path == "v3/channels/get":
             channels = list(self.channels.values())
             if q.get("archived") == "true":
+                if self.fail_archived_listing is not None:
+                    return _error(self.fail_archived_listing, 20, "Invalid argument value")
                 channels = [c for c in channels if c.get("archived")]
+            elif self.plain_hides_archived:
+                channels = [c for c in channels if not c.get("archived")]
             return httpx.Response(200, json=channels)
 
         if path == "v3/threads/get":

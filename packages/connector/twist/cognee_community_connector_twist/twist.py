@@ -41,8 +41,8 @@ Design
   error for an item the token can no longer see.
 * **Failure safety.** Any API error aborts the run before a tombstone is
   written, and dlt commits the sync state only after a successful load. When a
-  run finds more than half of what it knows gone, it holds those deletes back
-  until the next run sees the same items gone (``allow_mass_delete=True``
+  run finds more than half of what it knows newly gone, it holds those back
+  and forgets the ones the next run also finds gone (``allow_mass_delete=True``
   forgets them at once).
 
 Traps found on a live workspace
@@ -53,7 +53,8 @@ Traps found on a live workspace
   They stay in memory, marked "closed".
 * Archived channels are still returned by ``channels/get`` (with
   ``archived: true``). One that was never synced is skipped unless asked for;
-  one that was synced before stays synced, since archiving deletes nothing.
+  one that was synced while active stays synced, since archiving deletes
+  nothing.
 * Title changes, moves and closes add system-message comments, and deleted
   comments stay in the list with ``deleted: true``. Neither is rendered.
 * ``threads/get`` sorts by ``last_updated_ts`` until ``before_id`` is given and
@@ -63,6 +64,7 @@ Traps found on a live workspace
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 import time
 from collections.abc import Callable, Iterator
@@ -95,10 +97,13 @@ PAGE_LIMIT = 500
 _FIRST_PAGE_BEFORE_ID = 2**53 - 1
 DEFAULT_FULL_SYNC_EVERY = 10
 # A run finding more than this share of the synced items gone, and at least
-# MASS_DELETE_MIN_ITEMS of them, holds the deletes back for one run. Our own
-# choice: small enough to catch a wrong workspace, channel list or token, large
-# enough that ordinary cleanups never wait.
+# MASS_DELETE_MIN_ITEMS of them, holds those deletes back for one run. Our own
+# choice: half catches a wrong workspace, channel list or token, which makes
+# most of what was synced vanish at once.
 DEFAULT_MAX_DELETE_RATIO = 0.5
+# Below 10 the ratio alone would hold back ordinary cleanups in small
+# workspaces (deleting 2 of 3 threads is two thirds), and a wrong selection
+# there costs little to re-sync.
 MASS_DELETE_MIN_ITEMS = 10
 
 # Twist error_code for a rejected token (sent with HTTP 403, checked live).
@@ -174,7 +179,8 @@ class TwistClient:
                     raise error(f"Twist API returned {status} on {path} after {attempt} tries")
                 delay = _retry_delay(response, attempt)
                 if delay > MAX_RETRY_AFTER_SECONDS:
-                    raise error(
+                    # Being told to wait this long is rate limiting, whatever the status.
+                    raise TwistRateLimitError(
                         f"Twist API returned {status} on {path} and asked to wait "
                         f"{delay:.0f}s; stopping so the next sync can retry."
                     )
@@ -211,22 +217,31 @@ class TwistClient:
             raise TwistError("Twist API returned an unexpected body on v3/workspaces/getone")
         return body
 
-    def list_channels(self, workspace_id: int) -> list[dict]:
-        """Active and archived channels, merged by id.
+    def list_channels(self, workspace_id: int) -> tuple[list[dict], bool]:
+        """Active and archived channels merged by id, and whether the archived
+        listing succeeded.
 
         Twist's docs say ``channels/get`` returns archived channels only with
         ``archived`` set; on a live workspace the plain call returned them too
         (flagged ``archived: true``), and ``archived=true`` returned only those.
-        Asking for both is right either way.
+        Asking for both is right either way. The second call is optional: if it
+        fails, the caller decides whether the plain listing is enough.
         """
-        channels: dict[int, dict] = {}
-        for params in (
-            {"workspace_id": workspace_id},
-            {"workspace_id": workspace_id, "archived": "true"},
-        ):
-            for channel in self._list("v3/channels/get", params):
-                channels[int(channel["id"])] = channel
-        return list(channels.values())
+        params = {"workspace_id": workspace_id}
+        channels = {int(c["id"]): c for c in self._list("v3/channels/get", params)}
+        try:
+            archived = self._list("v3/channels/get", {**params, "archived": "true"})
+        except TwistAuthError:
+            raise
+        except TwistError as exc:
+            logger.warning(
+                "Twist: channels/get with archived=true failed (%s); using the plain listing.",
+                type(exc).__name__,
+            )
+            return list(channels.values()), False
+        for channel in archived:
+            channels[int(channel["id"])] = channel
+        return list(channels.values()), True
 
     def iter_threads(self, channel_id: int) -> Iterator[dict]:
         """Every thread of a channel, closed ones included, newest id first."""
@@ -249,13 +264,15 @@ class TwistClient:
         """Every comment of a thread in order, read in fixed obj_index windows.
 
         Without a range, ``limit=N`` returns the last N comments, so the windows
-        are explicit. They cover at least the thread's ``comment_count`` and go on
-        while a window comes back full. The thread's ``last_obj_index`` is not
-        used: Twist's docs describe it as the reader's position ("-1 means the
-        whole thread is unread"), not the thread's length.
+        are explicit. The first window is always read (a stale ``comment_count``
+        of 0 must not hide real comments). After that the next window is read
+        when the last one came back full (``comment_count`` too low) or when it
+        had comments and ``comment_count`` says there are more. An empty window
+        always ends it, so an inflated ``comment_count`` costs one extra request,
+        not thousands. The thread's ``last_obj_index`` is not used: Twist's docs
+        describe it as the reader's position ("-1 means the whole thread is
+        unread").
         """
-        if comment_count == 0:
-            return
         start = 0
         while True:
             page = self._list(
@@ -269,6 +286,8 @@ class TwistClient:
             )
             yield from page
             start += PAGE_LIMIT
+            if not page:
+                return
             if len(page) < PAGE_LIMIT and (comment_count is None or start >= comment_count):
                 return
 
@@ -277,9 +296,12 @@ def _retry_delay(response: httpx.Response, attempt: int) -> float:
     retry_after = response.headers.get("retry-after")
     if retry_after:
         try:
-            return max(float(retry_after), 0.0)
+            delay = float(retry_after)
         except ValueError:
-            pass
+            delay = math.nan
+        # "nan" and "inf" parse as floats but are no delay; fall back to backoff.
+        if math.isfinite(delay):
+            return max(delay, 0.0)
     return float(2**attempt)
 
 
@@ -463,8 +485,20 @@ def _iter_rows(
     sweep = full_sync or runs == 0 or (full_sync_every > 0 and runs % full_sync_every == 0)
 
     workspace_name = client.get_workspace(workspace_id).get("name") or ""
-    channels = client.list_channels(workspace_id)
+    channels, archived_listed = client.list_channels(workspace_id)
     by_id = {int(channel["id"]): channel for channel in channels}
+    # Channels synced while they were active (kept after being archived).
+    synced_active = set(state.get("active_channels") or [])
+    if not archived_listed:
+        unseen = [k for k in previous if k.startswith("channel:") and int(k[8:]) not in by_id]
+        if unseen:
+            # Without the archived listing a channel we synced may only be
+            # missing from the plain one, so nothing can be forgotten safely.
+            raise TwistError(
+                "Twist channels/get with archived=true failed and a synced channel is not in "
+                "the plain listing, so archived channels cannot be told from deleted ones. "
+                "Nothing was synced or forgotten."
+            )
     if channel_ids:
         missing = [cid for cid in channel_ids if cid not in by_id]
         if missing:
@@ -477,12 +511,17 @@ def _iter_rows(
         selected = [by_id[cid] for cid in channel_ids]
     else:
         # Archived channels are opt-in, but archiving deletes nothing: a channel
-        # that was synced before stays synced, and its document says "archived".
+        # that was synced while it was active stays synced after it is archived,
+        # and its document says "archived". One that was synced only because it
+        # was listed or include_archived was on is not kept that way.
         selected = [
             c
             for c in channels
-            if include_archived or not c.get("archived") or f"channel:{c['id']}" in previous
+            if include_archived or not c.get("archived") or int(c["id"]) in synced_active
         ]
+    active_channels = [
+        int(c["id"]) for c in selected if not c.get("archived") or int(c["id"]) in synced_active
+    ]
 
     present: dict[str, list] = {}
     for channel in selected:
@@ -550,21 +589,26 @@ def _iter_rows(
             yield row
 
     gone = sorted(set(previous) - set(present))
-    large = len(gone) >= MASS_DELETE_MIN_ITEMS and len(gone) > max_delete_ratio * len(previous)
-    if large and not allow_mass_delete and gone != state.get("pending_delete"):
+    # Items held back last run and still gone are confirmed. What is newly gone
+    # is judged on its own: held back if it alone looks like a mass delete.
+    pending = set(state.get("pending_delete") or [])
+    confirmed = [key for key in gone if key in pending]
+    fresh = [key for key in gone if key not in pending]
+    large = len(fresh) >= MASS_DELETE_MIN_ITEMS and len(fresh) > max_delete_ratio * len(previous)
+    if large and not allow_mass_delete:
         # A wrong workspace, channel list or token looks exactly like a mass
-        # delete. Hold the deletes back and forget them only when the next run
-        # sees the same items gone, so a scheduled sync never needs an override.
+        # delete. Hold these back and forget them when the next run sees them
+        # gone too, so a scheduled sync never needs an override.
         logger.warning(
-            "Twist: %d of %d synced items are gone; holding the deletes until the next "
+            "Twist: %d of %d synced items are newly gone; holding them until the next "
             "sync confirms them.",
-            len(gone),
+            len(fresh),
             len(previous),
         )
-        present.update({key: previous[key] for key in gone})
-        state["pending_delete"] = gone
-        stats["held_back"] = len(gone)
-        gone = []
+        present.update({key: previous[key] for key in fresh})
+        state["pending_delete"] = fresh
+        stats["held_back"] = len(fresh)
+        gone = confirmed
     else:
         state.pop("pending_delete", None)
     for key in gone:
@@ -572,6 +616,7 @@ def _iter_rows(
         yield {"id": key, "_deleted": True}
 
     state["items"] = present
+    state["active_channels"] = active_channels
     state["runs"] = runs + 1
     logger.info(
         "Twist: scanned %d thread(s): %d changed, %d unchanged, %d skipped; "
@@ -607,7 +652,6 @@ def twist_source(
     max_delete_ratio: float = DEFAULT_MAX_DELETE_RATIO,
     allow_mass_delete: bool = False,
     resource_name: str | None = None,
-    service: httpx.Client | None = None,
     http_client: httpx.Client | None = None,
     check_active: Callable[[], None] | None = None,
 ):
@@ -624,19 +668,22 @@ def twist_source(
             except archived ones that were never synced. A listed channel the
             token cannot see stops the sync.
         include_archived: Also sync archived channels when ``channel_ids`` is not
-            given. Explicitly listed channels are always synced.
+            given. Explicitly listed channels are always synced. Without either,
+            an archived channel is synced only if it was synced while it was
+            active (archiving deletes nothing); one synced only because it was
+            listed or included is dropped once it no longer is.
         full_sync: Re-read every thread's comments this run, to pick up edited
             comments right away.
         full_sync_every: Do that automatically every Nth run (default 10, and
             always on the first run). ``0`` turns it off.
         max_delete_ratio: When a run finds more than this share of the synced
-            items gone (and at least 10 of them), it holds the deletes back until
-            the next run sees the same items gone.
+            items newly gone (and at least 10 of them), it holds those back and
+            forgets the ones the next run also finds gone.
         allow_mass_delete: Forget such a batch at once, for an intended cleanup.
         resource_name: dlt resource name, also the staging table and the key of
             the sync state. Default ``twist_<workspace_id>``.
-        service: Pre-built ``httpx`` client (the name cognee's own connectors
-            use); ``http_client`` is the same thing. Mainly for tests.
+        http_client: Pre-built ``httpx`` client, for a host that manages its
+            own connections, and for tests.
         check_active: Optional callable a host uses to stop a running sync; it
             raises to abort.
 
@@ -646,20 +693,12 @@ def twist_source(
     """
     import dlt
 
-    if getattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 0) < 2:
-        raise RuntimeError(
-            "The Twist connector needs a cognee build that reads per-row node sets "
-            "(DOCUMENT_SYNC_VERSION >= 2, cognee 1.6.3 or later)."
-        )
     if workspace_id is None or not str(workspace_id).strip():
         raise ValueError("workspace_id is required.")
     resolved_workspace_id = int(str(workspace_id).strip())
     if not isinstance(access_token, str) or not access_token.strip():
         raise ValueError("An access token is required.")
     token = access_token.strip()
-    if service is not None and http_client is not None and service is not http_client:
-        raise ValueError("Pass service or http_client, not both.")
-    injected = service or http_client
     selected = _int_list("channel_ids", channel_ids)
     if full_sync_every < 0:
         raise ValueError("full_sync_every must be 0 or more.")
@@ -677,10 +716,9 @@ def twist_source(
         columns={"_deleted": {"data_type": "bool", "hard_delete": True}, **NODE_SET_COLUMN_HINT},
     )
     def twist_threads():
-        _reset_stats(stats)
-        owned = None if injected is not None else httpx.Client(timeout=30.0)
+        owned = None if http_client is not None else httpx.Client(timeout=30.0)
         try:
-            client = TwistClient(token, http_client=injected or owned)
+            client = TwistClient(token, http_client=http_client or owned)
             state = dlt.current.resource_state()
             known_workspace = state.get("workspace_id")
             if state.get("items") and known_workspace not in (None, resolved_workspace_id):

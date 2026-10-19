@@ -5,7 +5,6 @@ hard-delete, and whatever is no longer in that table is forgotten by cognee's
 orphan cleanup. So "gone from the table" here means "forgotten" in cognee.
 """
 
-import httpx
 import pytest
 
 from cognee_community_connector_twist import twist_source
@@ -56,14 +55,6 @@ def test_source_declares_document_marker_and_its_own_pipeline(fake):
     assert pipeline_name_for_source(a, "ds") != pipeline_name_for_source(b, "ds")
 
 
-def test_source_refuses_cognee_without_per_row_node_sets(monkeypatch):
-    from cognee.tasks.ingestion import dlt_utils
-
-    monkeypatch.setattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 1)
-    with pytest.raises(RuntimeError, match="DOCUMENT_SYNC_VERSION"):
-        twist_source(1, access_token="t")
-
-
 def test_arguments(monkeypatch):
     # Settings come only from the arguments; the factory never reads the environment.
     monkeypatch.setenv("TWIST_WORKSPACE_ID", "254427")
@@ -80,21 +71,7 @@ def test_arguments(monkeypatch):
         twist_source(1, access_token="t", max_delete_ratio=0)
     with pytest.raises(TypeError, match="list of ids"):
         twist_source(1, access_token="t", channel_ids="852087")
-    with pytest.raises(ValueError, match="not both"):
-        twist_source(1, access_token="t", service=httpx.Client(), http_client=httpx.Client())
     assert twist_source("254427", access_token="t", channel_ids=["852087"]).name == "twist_254427"
-
-
-def test_service_is_the_same_injection_point(seeded, tmp_path):
-    pipeline = _pipeline(tmp_path)
-    source = twist_source(
-        seeded.workspace_id,
-        access_token=seeded.token,
-        service=seeded.http_client(),
-        full_sync_every=0,
-    )
-    pipeline.run(source)
-    assert len(_rows(pipeline, seeded)) == 5
 
 
 def test_first_sync_loads_threads_and_channels(seeded, tmp_path):

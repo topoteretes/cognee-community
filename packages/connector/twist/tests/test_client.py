@@ -93,6 +93,24 @@ def test_429_that_never_clears_is_a_rate_limit_error():
     assert sleeps == [1.0] * 4
 
 
+def test_non_finite_retry_after_falls_back_to_backoff():
+    # float("nan") parses, and max(nan, 0.0) is nan, which time.sleep rejects.
+    for value in ("nan", "inf", "-inf"):
+        client, _, sleeps = _scripted(
+            httpx.Response(429, headers={"retry-after": value}),
+            httpx.Response(200, json={"ok": True}),
+        )
+        assert client.request("v3/channels/get") == {"ok": True}
+        assert sleeps == [2.0]
+
+
+def test_long_wait_on_a_5xx_is_a_rate_limit_too():
+    client, _, sleeps = _scripted(httpx.Response(503, headers={"retry-after": "600"}))
+    with pytest.raises(TwistRateLimitError, match="asked to wait 600s"):
+        client.request("v3/channels/get")
+    assert sleeps == []
+
+
 def test_documented_error_shape_is_read_too():
     # Twist's docs show {"error": [code, string]}; live answers use error_code.
     client, _, _ = _scripted(
@@ -123,10 +141,29 @@ def test_channels_include_archived_ones_either_way(seeded):
     # Live: the plain call already returned the archived channel; the docs say
     # only archived=true does. The client asks for both and merges them.
     seeded.channels[852086]["archived"] = True
-    ids = sorted(c["id"] for c in _client(seeded).list_channels(seeded.workspace_id))
-    assert ids == [852086, 852087]
+    channels, complete = _client(seeded).list_channels(seeded.workspace_id)
+    assert sorted(c["id"] for c in channels) == [852086, 852087]
+    assert complete
     calls = [r for r in seeded.requests if r.url.path.endswith("channels/get")]
     assert [r.url.params.get("archived") for r in calls] == [None, "true"]
+    # The documented behaviour (plain call without archived ones) works too.
+    seeded.plain_hides_archived = True
+    channels, _ = _client(seeded).list_channels(seeded.workspace_id)
+    assert sorted(c["id"] for c in channels) == [852086, 852087]
+
+
+def test_a_failing_archived_listing_is_reported_not_raised(seeded):
+    seeded.fail_archived_listing = 400
+    channels, complete = _client(seeded).list_channels(seeded.workspace_id)
+    assert sorted(c["id"] for c in channels) == [852086, 852087]
+    assert not complete
+    # A rejected token on the archived call itself is never swallowed.
+    client, _, _ = _scripted(
+        httpx.Response(200, json=[{"id": 1, "name": "general"}]),
+        httpx.Response(403, json={"error_code": 200, "error_string": "Invalid token"}),
+    )
+    with pytest.raises(TwistAuthError):
+        client.list_channels(1)
 
 
 def test_5xx_and_network_errors_back_off_then_give_up():
@@ -167,26 +204,45 @@ def test_comments_are_read_in_order_across_windows(seeded, monkeypatch):
     assert [c["content"] for c in comments] == [f"reply {i}" for i in range(5)]
 
 
-def test_comment_windows_go_on_while_full_or_below_the_count(seeded, monkeypatch):
+def _windows(fake):
+    return [int(r.url.params["from_obj_index"]) for r in fake.requests]
+
+
+def test_comment_windows_cover_a_low_count_and_stop_at_an_empty_one(seeded, monkeypatch):
     monkeypatch.setattr(twist_module, "PAGE_LIMIT", 2)
     thread = seeded.add_thread(852087, "Long discussion")
-    for i in range(4):
+    for i in range(5):
         seeded.add_comment(thread["id"], f"reply {i}")
     client = _client(seeded)
-    # Unknown count: read until a window comes back short.
-    assert len(list(client.iter_comments(thread["id"], None))) == 4
-    # A count larger than what comes back (older comments hidden on the free
-    # plan) still covers every window up to it.
+    for count in (None, 1, 5):  # unknown, too low, right
+        seeded.requests.clear()
+        assert len(list(client.iter_comments(thread["id"], count))) == 5
+        assert _windows(seeded) == [0, 2, 4]
+
+
+def test_an_inflated_comment_count_costs_one_extra_request(seeded, monkeypatch):
+    monkeypatch.setattr(twist_module, "PAGE_LIMIT", 2)
+    thread = seeded.add_thread(852087, "Short")
+    for i in range(4):
+        seeded.add_comment(thread["id"], f"reply {i}")
     seeded.requests.clear()
-    assert len(list(client.iter_comments(thread["id"], 7))) == 4
-    windows = [int(r.url.params["from_obj_index"]) for r in seeded.requests]
-    assert windows == [0, 2, 4, 6]
+    original = seeded.handler
+
+    def budget(request):
+        # A regression here would mean millions of requests; fail fast instead.
+        assert len(seeded.requests) < 20, "request storm on an inflated comment_count"
+        return original(request)
+
+    seeded.handler = budget
+    assert len(list(_client(seeded).iter_comments(thread["id"], 10**9))) == 4
+    assert _windows(seeded) == [0, 2, 4]  # the empty window ends it
 
 
-def test_thread_without_comments_makes_no_comment_request(seeded):
-    client = _client(seeded)
-    assert list(client.iter_comments(1, 0)) == []
-    assert not seeded.requests
+def test_a_stale_zero_count_still_reads_the_first_window(seeded):
+    checkout = next(t for t in seeded.threads.values() if t["title"] == "Checkout redesign")
+    seeded.requests.clear()
+    assert len(list(_client(seeded).iter_comments(checkout["id"], 0))) == 2
+    assert _windows(seeded) == [0]
 
 
 def test_requests_never_ask_for_more_than_500(seeded):
