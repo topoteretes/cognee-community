@@ -367,6 +367,9 @@ def test_a_server_error_on_one_listing_skips_that_kind_without_forgetting_it():
     assert rows == {"monitor:2": {"id": "monitor:2", "_deleted": True}}
     assert stats["failed_error_slos"] == 1
     assert "slo:slo1" in state["rows"], "a failed listing proves nothing deleted"
+    assert not [c for c in fake.calls if c.startswith("GET /api/v1/slo/")], (
+        "nothing of a failed listing is even re-checked"
+    )
 
 
 def test_a_rejected_api_key_fails_the_run():
