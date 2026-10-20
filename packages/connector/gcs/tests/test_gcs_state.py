@@ -226,7 +226,7 @@ def test_supported_text_extensions_are_downloaded_case_insensitively(
         "htm",
         "rst",
     }
-    assert TEXT_EXTENSIONS == extensions
+    assert extensions == TEXT_EXTENSIONS
     blobs = [make_blob(f"docs/file.{extension.upper()}") for extension in sorted(extensions)]
     client.list_blobs.return_value = blobs
     run_sync(pipeline())

@@ -84,9 +84,11 @@ def run_sync(client):
 @pytest.fixture
 def rows():
     def read_rows(pipeline):
-        with pipeline.sql_client() as sql_client:
-            with sql_client.execute_query("SELECT id, content FROM gcs_documents") as cursor:
-                return dict(cursor.fetchall())
+        with (
+            pipeline.sql_client() as sql_client,
+            sql_client.execute_query("SELECT id, content FROM gcs_documents") as cursor,
+        ):
+            return dict(cursor.fetchall())
 
     return read_rows
 
