@@ -138,6 +138,9 @@ for the manifest format.
 - **Forget-on-delete.** The resource loads with `merge` and has an `_deleted` hard-delete
   column:
   - A deleted root message (Graph keeps it with `deletedDateTime` set) tombstones its thread.
+  - Deleting a root post forgets its replies too, even though Teams keeps showing them under
+    a "this message was deleted" placeholder: the thread is the unit of memory, and a reply
+    without its post has little meaning on its own.
   - A deleted reply only re-renders the thread without it.
   - A channel or team that is deleted, or dropped from `team_ids`/`channel_ids`, has every
     thread it contributed tombstoned.
