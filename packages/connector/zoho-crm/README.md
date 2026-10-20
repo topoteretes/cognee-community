@@ -147,8 +147,12 @@ returned twice, raises instead of ending the listing quietly.
 * Every `reconcile_every` runs, each module's ids are listed and every id that vanished is re-checked
   with a single `GET` before it is forgotten (`204` = gone; a lead with `Converted__s` = converted).
   This catches **converted leads**, which leave `Leads` without appearing as deleted, and records whose
-  delete event is older than the deleted feed keeps. More than 200 at once is treated as a broken
-  listing and forgets nothing.
+  delete event is older than the deleted feed keeps. At most 200 ids are confirmed per module and run;
+  the rest wait for the next run, which reconciles at once (not after `reconcile_every`). Ids
+  confirmed alive stay out of the batch for the rest of that cycle, so live records that the id
+  listing never shows cannot make every run pay for a full check. When nothing is left, the
+  `reconcile_every` schedule resumes and the next reconcile checks all ids again. A listing that
+  repeats an id or page token forgets nothing that run (`reconcile_skipped`).
 * A module removed from `modules` is forgotten, with its notes and attachments. A module added later
   is backfilled, including its older notes and attachments.
 
@@ -162,7 +166,8 @@ a re-listed record are forgotten.
 **Failures.** `5xx` and network errors are retried with backoff. A `Retry-After` up to
 `max_rate_limit_wait` is slept; a longer one stops all interleaved resources before their next API
 request. The stopped resource moves no cursor; already completed resources keep theirs, and completed
-attachment-parent checkpoints are saved so a large first run resumes instead of restarting. A
+attachment-parent checkpoints and reconcile results (forgotten and confirmed-alive ids) are saved,
+so a large first run resumes and a stopped reconcile does not repeat its checks. A
 checkpoint includes the parent's `Modified_Time`, so a parent changed while waiting is processed again.
 Any other error aborts the run. Errors carry the HTTP status and Zoho's error code, never response bodies.
 
@@ -185,7 +190,9 @@ Any other error aborts the run. Errors carry the HTTP status and Zoho's error co
   (`304` list + `304` deleted feed) plus field metadata. A reconcile adds one request per 200 records.
   Attachment sync fans out to one list request per changed parent record, plus one download per kept file.
   Reconciliation also uses one confirming GET per candidate that vanished from the id listing (up to 200
-  per run); its rotating checkpoint prevents repeatedly-live low ids from starving later candidates.
+  per run); ids confirmed alive are remembered until the backlog cycle ends, so repeatedly-live ids
+  cannot starve later candidates. If the listing hides many live records, a cycle needs about
+  `hidden / 200` runs, and with `reconcile_every=1` each new cycle starts at the next run.
 
 ## Privacy
 

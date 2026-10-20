@@ -67,6 +67,7 @@ import re
 import time
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
+from dataclasses import field as dc_field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -642,20 +643,42 @@ def _module_fields(api: _Api, module: str, redact: bool) -> list[_Field]:
     return [_Field("id", "ID"), *chosen]
 
 
+@dataclass
+class _Verified:
+    """Outcome of one module's reconcile, updated as each id is confirmed so a
+    clean rate-limit stop can still save what was learned."""
+
+    gone: set[str] = dc_field(default_factory=set)
+    live: set[str] = dc_field(default_factory=set)  # confirmed alive in this cycle
+    backlog: int = 0  # candidates still unchecked after this run
+
+
 def _sync_records(
     api: _Api, state: dict, options: _Options, stats: dict[str, int]
 ) -> Iterator[dict]:
     cursors: dict = dict(state.get("cursors") or {})
     known: dict[str, list[str]] = {m: list(v) for m, v in (state.get("known") or {}).items()}
-    reconcile_positions: dict[str, int] = {
-        m: int(v) for m, v in (state.get("reconcile_positions") or {}).items()
+    # Ids confirmed alive during the current backlog cycle, so they are not
+    # re-checked until every other candidate has been seen.
+    live: dict[str, set[str]] = {
+        m: {str(i) for i in v}
+        for m, v in (state.get("reconcile_live") or {}).items()
+        if isinstance(v, list) and v
     }
+    state.pop("reconcile_positions", None)  # older checkpoint format
     config = {"redact": options.redact_contact_details}
     if state.get("config") not in (None, config):
         cursors = {}  # rendering changed: re-read everything
     first_run = not cursors  # a full listing already reconciles
+    if first_run:
+        live = {}
     runs = int(state.get("runs_since_reconcile") or 0) + 1
     do_reconcile = options.reconcile and not first_run and runs >= options.reconcile_every
+
+    def save_partial() -> None:
+        # Never moves cursors: a stopped run is repeated from the old ones.
+        state["known"] = known
+        state["reconcile_live"] = {m: sorted(v) for m, v in live.items() if v}
 
     # A module dropped from `modules` is forgotten.
     for module in sorted(set(known) - set(options.modules)):
@@ -663,48 +686,53 @@ def _sync_records(
             _count(stats, "records_forgotten")
             yield _tombstone(module, record_id)
         cursors.pop(module, None)
-        reconcile_positions.pop(module, None)
+        live.pop(module, None)
 
+    backlog = 0
     for module in options.modules:
         ids = set(known.get(module) or [])
-        cursor = cursors.get(module) or options.modified_since
-        fields = _module_fields(api, module, options.redact_contact_details)
-        params = {"fields": ",".join(f.api_name for f in fields)}
-        emitted: set[str] = set()
-        for record in _iter_pages(api, module, params, _since_header(cursor)):
-            record_id = str(record["id"])
-            emitted.add(record_id)
-            ids.add(record_id)
-            _count(stats, "records_synced")
-            yield _record_row(module, record, fields, options.web_base)
         gone: set[str] = set()
-        if module in cursors:  # deletions only matter once something was loaded
-            gone.update(i for i in _iter_deleted(api, module, cursors[module]) if i in ids)
-            if do_reconcile:
-                verified_gone, next_position = _vanished(
-                    api,
-                    module,
-                    ids - emitted - gone,
-                    stats,
-                    reconcile_positions.get(module, 0),
-                )
-                gone.update(verified_gone)
-                if next_position is None:
-                    reconcile_positions.pop(module, None)
-                else:
-                    reconcile_positions[module] = next_position
+        verify = _Verified(live=live.get(module, set()))
+        try:
+            cursor = cursors.get(module) or options.modified_since
+            fields = _module_fields(api, module, options.redact_contact_details)
+            params = {"fields": ",".join(f.api_name for f in fields)}
+            emitted: set[str] = set()
+            for record in _iter_pages(api, module, params, _since_header(cursor)):
+                record_id = str(record["id"])
+                emitted.add(record_id)
+                ids.add(record_id)
+                _count(stats, "records_synced")
+                yield _record_row(module, record, fields, options.web_base)
+            if module in cursors:  # deletions only matter once something was loaded
+                gone.update(i for i in _iter_deleted(api, module, cursors[module]) if i in ids)
+                if do_reconcile:
+                    _vanished(api, module, ids - emitted - gone, stats, verify)
+                    gone.update(verify.gone)
+                    backlog += verify.backlog
+        except (RateLimitedError, _RunStoppedError):
+            # Keep what this run already loaded or confirmed, so a rerun does not
+            # repeat it; the cursors stay where they were.
+            gone.update(verify.gone)
+            for record_id in sorted(gone):
+                _count(stats, "records_forgotten")
+                yield _tombstone(module, record_id)
+            known[module] = sorted(ids - gone)
+            live[module] = verify.live
+            save_partial()
+            raise
         for record_id in sorted(gone):
             _count(stats, "records_forgotten")
             yield _tombstone(module, record_id)
         known[module] = sorted(ids - gone)
+        live[module] = verify.live
 
     # Reached only when every module finished: all cursors move together.
     cursor_now = _new_cursor(api)
     state["cursors"] = dict.fromkeys(options.modules, cursor_now)
-    state["known"] = known
-    state["reconcile_positions"] = reconcile_positions
+    save_partial()
     state["config"] = config
-    backlog = stats.pop("_reconcile_backlog", 0)
+    # Unchecked candidates are verified next run, not after `reconcile_every`.
     state["runs_since_reconcile"] = (
         options.reconcile_every if backlog else (0 if (do_reconcile or first_run) else runs)
     )
@@ -715,11 +743,17 @@ def _vanished(
     module: str,
     candidates: set[str],
     stats: dict[str, int],
-    position: int = 0,
-) -> tuple[set[str], int | None]:
-    """Confirm one rotating batch of ids missing from a full id listing."""
+    out: _Verified,
+) -> None:
+    """Confirm one batch of ids missing from a full id listing.
+
+    Ids already confirmed alive in this cycle (``out.live``) are skipped, so
+    live records the listing never shows cannot starve the rest. The cycle ends,
+    and ``out.live`` is cleared, once nothing is left to check.
+    """
     if not candidates:
-        return set(), None
+        out.live = set()
+        return
     try:
         present = {
             str(r["id"])
@@ -730,27 +764,21 @@ def _vanished(
     except _UnstableListingError as exc:
         _count(stats, "reconcile_skipped")
         logger.warning("Zoho CRM: %s Nothing is forgotten this run.", exc)
-        return set(), position
+        return  # cycle memory is kept as it was
     missing = sorted(candidates - present)
-    next_position: int | None = None
-    if len(missing) > MAX_VERIFY:
-        position %= len(missing)
-        rotated = missing[position:] + missing[:position]
-        batch = rotated[:MAX_VERIFY]
-        next_position = (position + MAX_VERIFY) % len(missing)
-        deferred = len(missing) - MAX_VERIFY
-        stats["_reconcile_backlog"] = stats.get("_reconcile_backlog", 0) + deferred
+    out.live &= set(missing)
+    pending = [i for i in missing if i not in out.live]
+    batch = pending[:MAX_VERIFY]
+    out.backlog = len(pending) - len(batch)
+    if out.backlog:
         logger.warning(
-            "Zoho CRM: verifying a rotating batch of %d from %d vanished %s records; "
+            "Zoho CRM: verifying a batch of %d of %d unchecked vanished %s records; "
             "the remaining %d continue next run.",
-            MAX_VERIFY,
-            len(missing),
+            len(batch),
+            len(pending),
             module,
-            deferred,
+            out.backlog,
         )
-    else:
-        batch = missing
-    gone = set()
     for record_id in batch:
         record = (
             api.get(f"{module}/{record_id}", {"fields": "id,Converted__s"})
@@ -759,8 +787,11 @@ def _vanished(
         )
         data = (record or {}).get("data") or []
         if not data or data[0].get("Converted__s") is True:  # 204 = gone; converted lead
-            gone.add(record_id)
-    return gone, next_position
+            out.gone.add(record_id)
+        else:
+            out.live.add(record_id)
+    if not out.backlog:
+        out.live = set()  # cycle complete; the next reconcile checks everything again
 
 
 def _record_row(module: str, record: dict, fields: list[_Field], web_base: str) -> dict:
@@ -911,7 +942,9 @@ def _sync_attachments(
     # A clean rate-limit stop commits dlt state. Checkpoint completed parents so
     # a large first run resumes its N+1 attachment fan-out instead of starting
     # from the first parent forever. The record list is cheap and is repeated;
-    # only per-parent attachment calls are skipped.
+    # only per-parent attachment calls are skipped. The checkpoint dict is shared
+    # with `state`, so it is updated in place (no per-parent copy or sort); dlt
+    # reads state only after the resource stops or finishes.
     progress = state.get("progress") or {}
     if (
         progress.get("modules") != modules
@@ -920,7 +953,13 @@ def _sync_attachments(
         or any(not isinstance(items, dict) for items in progress.get("processed", {}).values())
     ):
         progress = {"modules": modules, "since": since, "processed": {}}
-    processed = {m: dict(items) for m, items in progress["processed"].items()}
+    processed: dict[str, dict[str, Any]] = progress["processed"]
+    state["owners"] = owners
+    state["progress"] = progress
+    # (module, parent id) -> attachment ids, so removals need no scan of `owners`.
+    by_parent: dict[tuple[str, str], set[str]] = {}
+    for att_id, (m, r) in owners.items():
+        by_parent.setdefault((m, r), set()).add(att_id)
 
     for module in options.modules:
         done = processed.setdefault(module, {})
@@ -950,6 +989,7 @@ def _sync_attachments(
                     _count(stats, "attachments_skipped")
                     continue
                 owners[att_id] = [module, record_id]
+                by_parent.setdefault((module, record_id), set()).add(att_id)
                 _count(stats, "attachments_synced")
                 text = raw.decode("utf-8", errors="replace").strip()
                 yield {
@@ -961,22 +1001,13 @@ def _sync_attachments(
                     "_deleted": False,
                 }
             # Attachment removals are observable only when the parent is listed.
-            removed = {
-                a
-                for a, (m, r) in owners.items()
-                if m == module and r == record_id and a not in listed
-            }
-            for att_id in sorted(removed):
+            siblings = by_parent.get((module, record_id), set())
+            for att_id in sorted(siblings - listed):
+                siblings.discard(att_id)
                 owners.pop(att_id, None)
                 _count(stats, "attachments_forgotten")
                 yield {"id": f"Attachments:{att_id}", "_deleted": True}
-            done[record_id] = modified
-            state["owners"] = owners
-            state["progress"] = {
-                "modules": modules,
-                "since": since,
-                "processed": {m: dict(sorted(items.items())) for m, items in processed.items()},
-            }
+            done[record_id] = modified  # after the parent's rows were yielded
 
     if cursor:
         dead = _deleted_parents(api, options.modules, cursor)

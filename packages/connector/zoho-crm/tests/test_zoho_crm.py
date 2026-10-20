@@ -8,6 +8,7 @@ attachments are listed per record, a deleted record's ``GET`` answers ``204``,
 responses carry a ``Date`` header, and a wrong region answers ``invalid_client``.
 """
 
+import time
 from datetime import datetime, timezone
 from email.utils import format_datetime
 from types import SimpleNamespace
@@ -564,7 +565,8 @@ def test_reconcile_rotates_past_live_ids_to_reach_converted_backlog(tmp_path):
     fake._page = hide_first_two_hundred
     pipeline, _ = _run(tmp_path, fake)
     assert len(_rows(pipeline)) == 260  # first rotating batch was alive
-    assert _state(pipeline)["reconcile_positions"]["Leads"] == 200
+    assert len(_state(pipeline)["reconcile_live"]["Leads"]) == 200  # remembered alive
+    assert "reconcile_positions" not in _state(pipeline)
 
     pipeline, _ = _run(tmp_path, fake)
     rows = _rows(pipeline)
@@ -787,3 +789,207 @@ def test_two_sources_in_one_dataset_keep_separate_state(tmp_path):
     pipeline.run(_src(globex, resource_name="zoho_globex"))
     assert set(_rows(pipeline, "zoho_acme_records")) == {"Leads:1"}
     assert set(_rows(pipeline, "zoho_globex_records")) == {"Leads:7"}
+
+
+# ---------------------------------------------------------------------------
+# Reconcile backlog, checkpoints and state consistency
+# ---------------------------------------------------------------------------
+
+
+def _hide_from_id_listing(fake, hidden):
+    """The ``sort_by=id`` listing omits ``hidden`` ids that are still alive."""
+    real_page = fake._page
+
+    def page(items, params, use_token):
+        if params.get("sort_by") == "id":
+            items = [i for i in items if i["id"] not in hidden]
+        return real_page(items, params, use_token)
+
+    fake._page = page
+
+
+def _id_listings(fake):
+    return [c for c in fake.calls if c[0] == "Leads" and c[1].get("sort_by") == "id"]
+
+
+def _single_gets(fake, module="Leads"):
+    return [
+        p
+        for p, _, _ in fake.calls
+        if p.startswith(f"{module}/") and p.count("/") == 1 and not p.endswith("/deleted")
+    ]
+
+
+def test_rate_stop_during_reconcile_keeps_verified_ids_and_hides_private_keys(tmp_path):
+    fake = FakeZoho({"Leads": [_lead(f"{i:03d}") for i in range(251)], "Deals": []}, page_size=200)
+    _run(tmp_path, fake)
+    for lead in fake.records["Leads"][:250]:
+        lead["Converted__s"] = True
+    cursors = dict(_state(_pipeline(tmp_path))["cursors"])
+    real_get = fake.get
+    singles = []
+
+    def limited(url, params=None, headers=None):
+        path = urlsplit(url).path.split(f"/crm/{zc.API_VERSION}/", 1)[1]
+        if path.startswith("Leads/") and path.count("/") == 1 and path != "Leads/deleted":
+            singles.append(path)
+            if len(singles) == 50:
+                return FakeResponse(429, headers={"Retry-After": "900"})
+        return real_get(url, params, headers)
+
+    fake.get = limited
+    pipeline, source = _run(tmp_path, fake)
+    stats = source.cognee_sync_stats
+    assert stats["failed_rate_limit"] == 1 and stats["records_forgotten"] == 49
+    assert not [k for k in stats if k.startswith("_")]
+    state = _state(pipeline)
+    assert state["cursors"] == cursors  # nothing else moves
+    assert len(state["known"]["Leads"]) == 251 - 49
+    assert len(_rows(pipeline)) == 251 - 49
+
+    fake.get = real_get
+    fake.calls.clear()
+    pipeline, source = _run(tmp_path, fake)
+    done = {f"Leads/{i:03d}" for i in range(49)}
+    assert not done & set(_single_gets(fake))  # not verified twice
+    assert source.cognee_sync_stats["records_forgotten"] == 200
+    pipeline, _ = _run(tmp_path, fake)
+    assert set(_rows(pipeline)) == {"Leads:250"}
+
+
+def test_live_ids_missing_from_listing_end_the_forced_backlog_cycle(tmp_path, monkeypatch):
+    monkeypatch.setattr(zc, "MAX_VERIFY", 3)
+    fake = FakeZoho({"Leads": [_lead(f"{i:02d}") for i in range(12)], "Deals": []}, page_size=50)
+    _run(tmp_path, fake, reconcile_every=3)
+    for lead in fake.records["Leads"][8:10]:
+        lead["Converted__s"] = True
+    _hide_from_id_listing(fake, {f"{i:02d}" for i in range(8)})  # alive, never listed
+    _run(tmp_path, fake, reconcile_every=3)  # run 2 of 3: no id listing
+    pipeline, _ = _run(tmp_path, fake, reconcile_every=3)
+    assert not _id_listings(fake)
+
+    gets_per_run = []
+    for _ in range(4):  # one cycle: 10 missing ids, 3 per run
+        fake.calls.clear()
+        pipeline, source = _run(tmp_path, fake, reconcile_every=3)
+        assert len(_id_listings(fake)) == 1  # forced even though reconcile_every=3
+        assert not [k for k in source.cognee_sync_stats if k.startswith("_")]
+        gets_per_run.append(_single_gets(fake))
+        if len(gets_per_run) == 1:
+            assert sorted(_state(pipeline)["reconcile_live"]["Leads"]) == ["00", "01", "02"]
+    assert gets_per_run == [
+        ["Leads/00", "Leads/01", "Leads/02"],
+        ["Leads/03", "Leads/04", "Leads/05"],
+        ["Leads/06", "Leads/07", "Leads/08"],
+        ["Leads/09"],
+    ]
+    assert set(_rows(pipeline)) == {f"Leads:{i:02d}" for i in range(8)} | {"Leads:10", "Leads:11"}
+    assert "reconcile_live" not in _state(pipeline) or not _state(pipeline)["reconcile_live"]
+
+    fake.calls.clear()  # cycle done: back to the configured cadence
+    _run(tmp_path, fake, reconcile_every=3)
+    _run(tmp_path, fake, reconcile_every=3)
+    assert not _id_listings(fake)
+    _run(tmp_path, fake, reconcile_every=3)
+    assert len(_id_listings(fake)) == 1  # regular reconcile checks the live ids again
+    assert _single_gets(fake) == ["Leads/00", "Leads/01", "Leads/02"]  # new cycle
+
+
+def test_unstable_listing_keeps_the_backlog_cycle_memory(tmp_path, monkeypatch):
+    monkeypatch.setattr(zc, "MAX_VERIFY", 2)
+    fake = FakeZoho({"Leads": [_lead(f"{i:02d}") for i in range(6)], "Deals": []}, page_size=50)
+    _run(tmp_path, fake)
+    base_page = fake._page
+    _hide_from_id_listing(fake, {f"{i:02d}" for i in range(6)})
+    pipeline, _ = _run(tmp_path, fake)
+    live = list(_state(pipeline)["reconcile_live"]["Leads"])
+    assert live == ["00", "01"]
+
+    def repeated(items, params, use_token):
+        if params.get("sort_by") == "id":
+            items = [_lead("02"), _lead("02")]
+        return base_page(items, params, use_token)
+
+    fake._page = repeated
+    fake.calls.clear()
+    pipeline, source = _run(tmp_path, fake)
+    assert source.cognee_sync_stats["reconcile_skipped"] == 1
+    assert _single_gets(fake) == []
+    assert _state(pipeline)["reconcile_live"]["Leads"] == live
+
+
+def test_removed_module_drops_its_reconcile_checkpoint(tmp_path, monkeypatch):
+    monkeypatch.setattr(zc, "MAX_VERIFY", 2)
+    deals = [_deal(f"d{i}") for i in range(5)]
+    fake = FakeZoho({"Leads": [_lead("1")], "Deals": deals}, page_size=50)
+    _run(tmp_path, fake)
+    _hide_from_id_listing(fake, {f"d{i}" for i in range(5)})
+    pipeline, _ = _run(tmp_path, fake)
+    assert set(_state(pipeline)["reconcile_live"]) == {"Deals"}
+    pipeline, _ = _run(tmp_path, fake, modules=["Leads"])
+    assert "Deals" not in _state(pipeline).get("reconcile_live", {})
+    assert set(_rows(pipeline)) == {"Leads:1"}
+
+
+def _attachment_options():
+    return zc._Options(modules=("Deals",))
+
+
+def test_legacy_attachment_checkpoint_is_discarded_not_crashed_on(tmp_path):
+    fake = FakeZoho({"Leads": [], "Deals": [_deal("0"), _deal("1")]}, page_size=10)
+    state = {"progress": {"modules": ["Deals"], "since": None, "processed": {"Deals": ["0", "1"]}}}
+    list(zc._sync_attachments(_api(fake), state, _attachment_options(), {}))
+    assert len(fake.paths("Deals/0/Attachments")) == 1  # old list format: nothing skipped
+    assert len(fake.paths("Deals/1/Attachments")) == 1
+    assert "progress" not in state
+
+
+def test_attachment_checkpoint_is_updated_in_place_and_scales(monkeypatch):
+    parents = [{"id": str(i), "Modified_Time": OLD} for i in range(20_000)]
+
+    def pages(api, path, params, headers=None):
+        if path.endswith("/Attachments"):
+            return iter(())
+        return iter(parents)
+
+    monkeypatch.setattr(zc, "_iter_pages", pages)
+    state: dict = {}
+    api = SimpleNamespace(server_time=None)
+    monkeypatch.setattr(zc, "_new_cursor", lambda _api: "cursor")
+    started = time.monotonic()
+    list(zc._sync_attachments(api, state, _attachment_options(), {}))  # no stop: all done
+    assert time.monotonic() - started < 5  # per-parent sorting took ~18 s here
+    assert "progress" not in state and state["cursor"] == "cursor"
+
+    # A stop part-way leaves one shared checkpoint whose entries are complete.
+    def stopping(api, path, params, headers=None):
+        if path.endswith("/Attachments"):
+            if path == "Deals/3/Attachments":
+                raise zc.RateLimitedError("stop")
+            return iter(())
+        return iter(parents[:10])
+
+    monkeypatch.setattr(zc, "_iter_pages", stopping)
+    state = {}
+    with pytest.raises(zc.RateLimitedError):
+        list(zc._sync_attachments(api, state, _attachment_options(), {}))
+    assert state["progress"]["processed"]["Deals"] == {"0": OLD, "1": OLD, "2": OLD}
+
+
+def test_attachment_removal_does_not_scan_every_owner(tmp_path):
+    fake = FakeZoho(
+        {"Leads": [], "Deals": [_deal("d1"), _deal("d2")]},
+        attachments={
+            ("Deals", "d1"): [_att("t1", "a.txt", b"one"), _att("t2", "b.txt", b"two")],
+            ("Deals", "d2"): [_att("t3", "c.txt", b"three")],
+        },
+    )
+    _run(tmp_path, fake, include_attachments=True)
+    fake.attachments[("Deals", "d1")] = [_att("t1", "a.txt", b"one")]
+    fake.records["Deals"][0]["Modified_Time"] = "2999-01-01"
+    pipeline, _ = _run(tmp_path, fake, include_attachments=True)
+    assert set(_rows(pipeline, "zoho_crm_attachments")) == {"Attachments:t1", "Attachments:t3"}
+    assert _state(pipeline, "zoho_crm_attachments")["owners"] == {
+        "t1": ["Deals", "d1"],
+        "t3": ["Deals", "d2"],
+    }
