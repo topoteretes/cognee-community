@@ -275,7 +275,14 @@ def _query(conn, sql: str, params: Any = None) -> list[dict]:
 
 
 def _friendly_error(error: Exception, key_fingerprint: str = "") -> Exception:
-    """Map Snowflake's error codes, checked on a real account, to the usual fix."""
+    """Map Snowflake's error codes to the usual fix, keeping the code as ``errno``."""
+    friendly = _translate_error(error, key_fingerprint)
+    friendly.errno = getattr(error, "errno", None)
+    return friendly
+
+
+def _translate_error(error: Exception, key_fingerprint: str) -> Exception:
+    """The fix for each code, as checked on a real account."""
     errno = getattr(error, "errno", None)
     message = str(getattr(error, "msg", None) or error)
 
@@ -671,6 +678,24 @@ def _sync_table(run, fetch, info, saved, stats, keys, full_refresh):
         stats["unchanged"] = stats.get("unchanged", 0) + 1
         return
 
+    # Taken before reading, so a change made during the read shows up again next
+    # time rather than being missed. Runs without a warehouse.
+    now = str(run("SELECT CURRENT_TIMESTAMP()::STRING AS NOW")[0]["NOW"])
+    known = set(before.get("keys", []))
+
+    if info.change_tracking and before.get("since") and not full_refresh:
+        changes = _read_changes(fetch, ref, before["since"])
+        if changes is not None:
+            stats["from_changes"] = stats.get("from_changes", 0) + 1
+            yield from _apply_changes(info, key_columns, changes, known, stats)
+            saved[ref.fqn] = {
+                "last_change": last_change,
+                "key_columns": key_columns,
+                "since": now,
+                "keys": sorted(known),
+            }
+            return
+
     order = ", ".join(_quote(column) for column in key_columns)
     seen: set[str] = set()
     for row in fetch(f"SELECT * FROM {ref.sql} ORDER BY {order}"):
@@ -682,11 +707,64 @@ def _sync_table(run, fetch, info, saved, stats, keys, full_refresh):
         yield _render_row(info, row, key)
 
     # Only after the whole table was read: what was there before and is not now.
-    for key in sorted(set(before.get("keys", [])) - seen):
+    for key in sorted(known - seen):
         stats["deleted"] = stats.get("deleted", 0) + 1
         yield {"id": _row_id(ref.fqn, key), "_deleted": True}
 
-    saved[ref.fqn] = {"last_change": last_change, "key_columns": key_columns, "keys": sorted(seen)}
+    saved[ref.fqn] = {
+        "last_change": last_change,
+        "key_columns": key_columns,
+        "since": now,
+        "keys": sorted(seen),
+    }
+
+
+# Snowflake's answers when the change history no longer reaches back far enough:
+# 000707 the time is outside the retention period (1 day by default) or before
+# the table existed, 091930 change tracking was off for part of that time.
+_HISTORY_GONE = {707, 91930}
+
+
+def _read_changes(fetch, ref: _TableRef, since: str) -> list[dict] | None:
+    """The net changes since a moment, or None when the history is gone.
+
+    CHANGES(INFORMATION => DEFAULT) returns the net delta: an insert as INSERT, a
+    delete as DELETE, an update as a DELETE and INSERT pair, and nothing for a
+    row that was added and removed again in between.
+    """
+    literal = since.replace("'", "''")
+    sql = (
+        f"SELECT * FROM {ref.sql} CHANGES(INFORMATION => DEFAULT) "
+        f"AT(TIMESTAMP => '{literal}'::TIMESTAMP_LTZ)"
+    )
+    try:
+        return list(fetch(sql))
+    except SnowflakeConnectorError as error:
+        if getattr(error, "errno", None) in _HISTORY_GONE:
+            logger.info("Snowflake: the change history no longer reaches back; reading the table.")
+            return None
+        raise
+
+
+def _apply_changes(info, key_columns, changes, known: set[str], stats):
+    """Documents for inserted and updated rows, ``_deleted`` rows for removed ones."""
+    inserted: dict[str, dict] = {}
+    removed: set[str] = set()
+    for row in changes:
+        key = _row_key(key_columns, row)
+        if row.get("METADATA$ACTION") == "INSERT":
+            inserted[key] = row
+        elif row.get("METADATA$ACTION") == "DELETE":
+            removed.add(key)
+    for key in sorted(inserted):
+        known.add(key)
+        stats["rows"] = stats.get("rows", 0) + 1
+        yield _render_row(info, inserted[key], key)
+    # The DELETE half of an update comes with an INSERT for the same key.
+    for key in sorted(removed - set(inserted)):
+        known.discard(key)
+        stats["deleted"] = stats.get("deleted", 0) + 1
+        yield {"id": _row_id(info.ref.fqn, key), "_deleted": True}
 
 
 def _forget_table(fqn: str, table_state: dict, stats: dict):

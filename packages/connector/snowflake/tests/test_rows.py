@@ -10,6 +10,7 @@ from snowflake.connector.errors import DatabaseError, ProgrammingError
 from cognee_community_connector_snowflake.snowflake import (
     SnowflakeAuthError,
     SnowflakeConnectorError,
+    SnowflakeWarehouseError,
     _format_value,
     _friendly_error,
     _iter_rows,
@@ -112,14 +113,15 @@ def test_an_unchanged_table_is_not_read_at_all(account):
 
 
 def test_only_the_changed_table_is_read_again(account):
+    # CUSTOMERS has no change tracking, so a change means reading the table.
     state = {}
     sync(account, state)
-    account.update("ORDERS", (101,), STATUS="refunded")
+    account.update("CUSTOMERS", (1,), NAME="Contoso Ltd")
 
     docs, stats = sync(account, state)
 
-    assert reads(account) == ['SELECT * FROM "SALES_DB"."SALES"."ORDERS" ORDER BY "ORDER_ID"']
-    assert "STATUS: refunded" in rows_of(docs)["ORDERS 101"]["content"]
+    assert reads(account) == ['SELECT * FROM "SALES_DB"."SALES"."CUSTOMERS" ORDER BY "CUSTOMER_ID"']
+    assert "NAME: Contoso Ltd" in rows_of(docs)["CUSTOMERS 1"]["content"]
     assert stats["unchanged"] == 1
 
 
@@ -312,3 +314,117 @@ def test_composite_keys_escape_the_separator(account):
 )
 def test_values_render_the_same_way_every_time(value, expected):
     assert _format_value(value) == expected
+
+
+# -- change tracking (ORDERS has it on, CUSTOMERS does not) --------------------
+
+
+def changes_reads(account):
+    return [sql for sql in account.sql if " CHANGES(" in sql]
+
+
+def test_a_tracked_table_reads_only_its_changes(account):
+    state = {}
+    sync(account, state)
+    account.update("ORDERS", (101,), STATUS="refunded")
+
+    docs, stats = sync(account, state)
+
+    assert [sql for sql in reads(account) if " CHANGES(" not in sql] == []
+    assert len(changes_reads(account)) == 1
+    # Only the changed row comes back, not the whole table.
+    assert sorted(rows_of(docs)) == ["ORDERS 101"]
+    assert "STATUS: refunded" in rows_of(docs)["ORDERS 101"]["content"]
+    assert stats == {"unchanged": 1, "from_changes": 1, "rows": 1}
+
+
+def test_a_delete_from_the_change_feed_is_forgotten(account):
+    state = {}
+    sync(account, state)
+    account.delete("ORDERS", (102,))
+
+    docs, stats = sync(account, state)
+
+    assert forgotten(docs) == ["snowflake:row:SALES_DB.SALES.ORDERS:102"]
+    assert stats["deleted"] == 1
+    assert rows_of(docs) == {}
+    assert state["tables"]["SALES_DB.SALES.ORDERS"]["keys"] == ["101"]
+
+
+def test_an_insert_from_the_change_feed_is_added_and_remembered(account):
+    state = {}
+    sync(account, state)
+    account.insert("ORDERS", ORDER_ID=103, CUSTOMER_ID=1, STATUS="open", UPDATED_AT=WHEN)
+
+    docs, _ = sync(account, state)
+
+    assert sorted(rows_of(docs)) == ["ORDERS 103"]
+    assert state["tables"]["SALES_DB.SALES.ORDERS"]["keys"] == ["101", "102", "103"]
+
+
+def test_a_row_added_and_removed_between_syncs_leaves_no_trace(account):
+    state = {}
+    sync(account, state)
+    account.insert("ORDERS", ORDER_ID=109, CUSTOMER_ID=1, STATUS="open", UPDATED_AT=WHEN)
+    account.delete("ORDERS", (109,))
+
+    docs, _ = sync(account, state)
+
+    assert rows_of(docs) == {} and forgotten(docs) == []
+
+
+def test_the_change_window_starts_before_the_read(account):
+    state = {}
+    sync(account, state)
+    since = state["tables"]["SALES_DB.SALES.ORDERS"]["since"]
+    account.update("ORDERS", (101,), STATUS="refunded")
+
+    sync(account, state)
+
+    assert f"'{since}'" in changes_reads(account)[0]
+
+
+@pytest.mark.parametrize(
+    ("errno", "text"),
+    [
+        (707, "Time travel data is not available for table ORDERS."),
+        (91930, "Change tracking is not enabled or has been missing for the time range."),
+    ],
+)
+def test_lost_change_history_falls_back_to_reading_the_table(account, errno, text):
+    state = {}
+    sync(account, state)
+    account.delete("ORDERS", (102,))
+    account.history_errors["ORDERS"] = query_error(errno, text)
+
+    docs, stats = sync(account, state)
+
+    assert reads(account)[-1] == 'SELECT * FROM "SALES_DB"."SALES"."ORDERS" ORDER BY "ORDER_ID"'
+    # The key comparison still finds the delete.
+    assert forgotten(docs) == ["snowflake:row:SALES_DB.SALES.ORDERS:102"]
+    assert "from_changes" not in stats
+
+
+def test_other_change_feed_errors_fail_the_table_instead_of_falling_back(account):
+    state = {}
+    sync(account, state)
+    account.update("ORDERS", (101,), STATUS="refunded")
+    account.update("CUSTOMERS", (1,), NAME="Contoso Ltd")
+    account.history_errors["ORDERS"] = query_error(608, "Warehouse 'WH' is suspended.")
+
+    docs, stats = sync(account, state)
+
+    assert stats["failed"] == 1
+    assert "ORDERS 101" not in rows_of(docs)
+    assert isinstance(account.history_errors["ORDERS"], SnowflakeWarehouseError)
+
+
+def test_first_sync_and_full_refresh_read_the_whole_tracked_table(account):
+    state = {}
+    sync(account, state)
+    assert changes_reads(account) == []
+
+    docs, _ = sync(account, state, full_refresh=True)
+
+    assert changes_reads(account) == []
+    assert len(rows_of(docs)) == 4

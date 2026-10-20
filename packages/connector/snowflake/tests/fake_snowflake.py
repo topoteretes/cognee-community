@@ -4,7 +4,9 @@ The SHOW outputs below have the same columns and value shapes a real trial
 account returned (connector 4.8), trimmed to what the connector reads.
 """
 
+import copy
 import json
+import re
 
 
 class FakeCursor:
@@ -157,6 +159,10 @@ class FakeAccount:
         self.sql: list[str] = []
         self.failing: dict[str, Exception] = {}
         self._clock = 100
+        # (clock, rows) after every commit, to answer CHANGES like Snowflake does.
+        self.snapshots: dict[str, list] = {table: [(0, {})] for table in self.rows}
+        # Errors CHANGES raises for a table, like a lapsed retention period.
+        self.history_errors: dict[str, Exception] = {}
 
     # -- building and changing data ------------------------------------------
     def key_of(self, table):
@@ -165,6 +171,7 @@ class FakeAccount:
     def _commit(self, table):
         self._clock += 1
         self.commits[table] = self._clock
+        self.snapshots[table].append((self._clock, copy.deepcopy(self.rows[table])))
 
     def insert(self, table, **row):
         key = tuple(row.get(column) for column in self.key_of(table) or sorted(row))
@@ -186,6 +193,8 @@ class FakeAccount:
     # -- the two query functions the sync takes --------------------------------
     def run(self, sql, params=None):
         self.sql.append(sql)
+        if sql.startswith("SELECT CURRENT_TIMESTAMP()"):
+            return [{"NOW": f"T{self._clock}"}]
         if sql.startswith("SELECT SYSTEM$LAST_CHANGE_COMMIT_TIME"):
             table = params[0].split(".")[-1].strip('"')
             return [{"LAST_CHANGE": self.commits[table]}]
@@ -196,5 +205,24 @@ class FakeAccount:
         table = sql.split(" FROM ")[1].split(" ")[0].split(".")[-1].strip('"')
         if table in self.failing:
             raise self.failing[table]
+        if " CHANGES(" in sql:
+            yield from self._changes(table, int(re.search(r"'T(\d+)'", sql).group(1)))
+            return
         rows = [dict(row) for _, row in sorted(self.rows[table].items(), key=lambda kv: str(kv[0]))]
         yield from rows
+
+    def _changes(self, table, since):
+        """Net changes since a moment, shaped like CHANGES(INFORMATION => DEFAULT)."""
+        if table in self.history_errors:
+            raise self.history_errors[table]
+        before = [rows for clock, rows in self.snapshots[table] if clock <= since][-1]
+        now = self.rows[table]
+        for key in sorted(set(before) | set(now), key=str):
+            old, new = before.get(key), now.get(key)
+            if old == new:
+                continue
+            update = old is not None and new is not None
+            if old is not None:
+                yield {**old, "METADATA$ACTION": "DELETE", "METADATA$ISUPDATE": update}
+            if new is not None:
+                yield {**new, "METADATA$ACTION": "INSERT", "METADATA$ISUPDATE": update}
