@@ -165,19 +165,24 @@ asyncio.run(main())
 
 ## Sync behavior and limitations
 
+- Storage reads use the Google SDK's transient-error retry policy with an explicit
+  120-second retry budget per request. Permission and generation-precondition errors
+  are not retried by that policy. Downloads retain their generation precondition.
+  A confirmed not-found during download is skipped; if that key exists again,
+  extraction aborts for a retry rather than deleting a live document.
 - Each run lists the complete prefix. The standard GCS listing API has no
   updated-since filter; the saving is in downloads and content processing.
 - dlt resource state stores each eligible object's `updated`, `generation`, and
   `metageneration`, scoped by bucket and prefix. Merge runs download only new or
   changed content generations. Metadata-only changes update state without
   downloading content or emitting document metadata updates.
-- Stable `gs://bucket/object` IDs identify documents. Confirmed missing objects
+- Stable `gs://bucket/object` IDs identify documents and avoid cross-bucket collisions. Confirmed missing objects
   and previously ingested oversized objects produce hard-delete markers in
   merge mode. GCS objects themselves are never deleted by this connector.
 - Keep `write_disposition="merge"` on `remember()` / `add()` for incremental
   loading. Other dispositions use a full-download snapshot fallback; `replace`
   replaces staging, while `append` does not provide deletion synchronization.
-- Failed listings, downloads, decoding, or generation checks abort extraction.
+- Failed listings, downloads, or generation checks abort extraction.
   Rerun after resolving the failure. dlt persists inventories with successful
   loads; a successful dlt load does not guarantee subsequent Cognee graph
   processing succeeded.
@@ -188,8 +193,9 @@ asyncio.run(main())
   even when their contents are text. They still count toward `max_objects`.
   Previously ingested objects excluded by this filter are removed on merge sync.
 - Supported files must contain UTF-8 text, with an optional BOM. UTF-8 is the
-  encoding, not a file format. Invalid UTF-8 in a supported extension still aborts
-  extraction. No OCR, PDF/DOCX extraction, or image/audio/video processing is provided.
+  encoding, not a file format. Invalid UTF-8 bytes in supported files are replaced
+  with the Unicode replacement character. No OCR, PDF/DOCX extraction, or
+  image/audio/video processing is provided.
 - Preserve dlt's pipeline state between runs. Losing it loses the previous
   inventory, so previously deleted objects cannot be inferred from it.
 - Use independent dlt pipelines for separate accounts or destination datasets.

@@ -5,11 +5,12 @@ import unittest
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, call, create_autospec, patch
+from unittest.mock import ANY, MagicMock, call, create_autospec, patch
 
 import dlt
 from cognee_community_connector_gcs.gcs import TEXT_EXTENSIONS, _scope, gcs_source
 from dlt.pipeline.exceptions import PipelineStepFailed
+from google.api_core.exceptions import Forbidden, NotFound, PreconditionFailed
 from google.cloud import storage
 
 
@@ -72,7 +73,7 @@ class GcsStateTests(unittest.TestCase):
         added = self.blob("docs/c.txt")
         self.client.list_blobs.return_value = [changed, b, added]
         self.run_sync(self.pipeline())
-        changed.download_as_bytes.assert_called_once_with(if_generation_match=654321)
+        changed.download_as_bytes.assert_called_once_with(if_generation_match=654321, retry=ANY)
         added.download_as_bytes.assert_called_once()
         b.download_as_bytes.assert_not_called()
         self.assertEqual(len(self.rows(self.pipeline())), 3)
@@ -97,7 +98,8 @@ class GcsStateTests(unittest.TestCase):
         self.run_sync(self.pipeline())
         self.assertEqual(self.rows(self.pipeline()), {})
         self.assertEqual(
-            self.bucket.get_blob.call_args_list, [call("docs/a.txt"), call("docs/b.txt")]
+            self.bucket.get_blob.call_args_list,
+            [call("docs/a.txt", retry=ANY), call("docs/b.txt", retry=ANY)],
         )
 
     def test_replace_downloads_unchanged_rows_instead_of_losing_them(self):
@@ -298,14 +300,72 @@ class GcsStateTests(unittest.TestCase):
             self.inventories(self.pipeline())["company-documents/docs/"],
         )
 
-    def test_invalid_utf8_in_supported_file_preserves_previous_state(self):
+    def test_invalid_utf8_in_supported_file_is_replaced(self):
+        self.client.list_blobs.return_value = [self.blob()]
+        self.run_sync(self.pipeline())
+        changed = self.blob(generation="654321")
+        changed.download_as_bytes.return_value = b"\xef\xbb\xbfhello\xff"
+        self.client.list_blobs.return_value = [changed]
+        self.run_sync(self.pipeline())
+        self.assertEqual(
+            self.rows(self.pipeline()), {"gs://company-documents/docs/a.txt": "hello\ufffd"}
+        )
+        self.assertEqual(
+            self.inventories(self.pipeline())["company-documents/docs/"][
+                "gs://company-documents/docs/a.txt"
+            ]["generation"],
+            "654321",
+        )
+
+    def test_object_missing_during_download_is_removed_while_other_rows_load(self):
+        self.client.list_blobs.return_value = [self.blob()]
+        self.run_sync(self.pipeline())
+        missing = self.blob(generation="654321")
+        missing.download_as_bytes.side_effect = NotFound("removed")
+        added = self.blob("docs/new.txt")
+        self.client.list_blobs.return_value = [missing, added]
+        self.run_sync(self.pipeline())
+        self.assertEqual(
+            self.rows(self.pipeline()), {"gs://company-documents/docs/new.txt": "hello"}
+        )
+        self.assertNotIn(
+            "gs://company-documents/docs/a.txt",
+            self.inventories(self.pipeline())["company-documents/docs/"],
+        )
+        self.bucket.get_blob.assert_called_once_with("docs/a.txt", retry=ANY)
+
+    def test_new_object_missing_during_download_is_skipped(self):
+        missing = self.blob("docs/new.txt")
+        missing.download_as_bytes.side_effect = NotFound("removed")
+        self.client.list_blobs.return_value = [self.blob(), missing]
+        self.run_sync(self.pipeline())
+        self.assertEqual(self.rows(self.pipeline()), {"gs://company-documents/docs/a.txt": "hello"})
+
+    def test_missing_download_with_reappearing_key_aborts(self):
         self.client.list_blobs.return_value = [self.blob()]
         self.run_sync(self.pipeline())
         previous = self.inventories(self.pipeline())
         changed = self.blob(generation="654321")
-        changed.download_as_bytes.return_value = b"\xff\xfe"
+        changed.download_as_bytes.side_effect = NotFound("generation unavailable")
         self.client.list_blobs.return_value = [changed]
-        with self.assertRaises(PipelineStepFailed):
+        self.bucket.get_blob.return_value = changed
+        with self.assertRaisesRegex(PipelineStepFailed, "inventory changed"):
             self.run_sync(self.pipeline())
         self.assertEqual(self.inventories(self.pipeline()), previous)
         self.assertEqual(self.rows(self.pipeline()), {"gs://company-documents/docs/a.txt": "hello"})
+
+    def test_permission_and_generation_errors_preserve_state(self):
+        self.client.list_blobs.return_value = [self.blob()]
+        self.run_sync(self.pipeline())
+        previous = self.inventories(self.pipeline())
+        for error in (Forbidden("denied"), PreconditionFailed("overwritten")):
+            with self.subTest(error=type(error).__name__):
+                changed = self.blob(generation="654321")
+                changed.download_as_bytes.side_effect = error
+                self.client.list_blobs.return_value = [changed]
+                with self.assertRaises(PipelineStepFailed):
+                    self.run_sync(self.pipeline())
+                self.assertEqual(self.inventories(self.pipeline()), previous)
+                self.assertEqual(
+                    self.rows(self.pipeline()), {"gs://company-documents/docs/a.txt": "hello"}
+                )
