@@ -22,7 +22,6 @@ the connector emits the markers that drive it, and that dlt acts on them.
 import re
 
 import pytest
-
 from cognee_community_connector_confluence.confluence import (
     _clean_html,
     _version_when,
