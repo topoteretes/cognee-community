@@ -1,79 +1,26 @@
-"""MediaWiki connector for cognee, a ``dlt`` source that turns a wiki into memory.
+"""MediaWiki connector for cognee: a ``dlt`` source that turns a wiki into memory.
 
-Sync pages from any MediaWiki (Wikipedia, Fandom, an internal company wiki)
-into cognee, incrementally and with forget-on-deletion::
-
-    import cognee
-    from cognee_community_connector_mediawiki import mediawiki_source
+Syncs the pages of any MediaWiki (Wikipedia, Fandom, an internal wiki) selected
+by namespace, category or title, one document per page keyed by page id, with
+the text rendered by the wiki itself. Later runs only fetch what changed and
+forget what was deleted or left the selection::
 
     await cognee.remember(
-        mediawiki_source(
-            "https://en.wikipedia.org/w/api.php",
-            categories=["Nobel laureates in Physics"],
-        ),
+        mediawiki_source("https://en.wikipedia.org/w/api.php", categories=["Physics"]),
         dataset_name="wiki",
         primary_key="id",
         write_disposition="merge",
         max_rows_per_table=0,
     )
 
-Design
-------
-* **Transport**: the MediaWiki Action API (``api.php``) over plain ``httpx``
-  (a core cognee dependency), so the connector adds no new dependency. Public
-  wikis need no credentials; a private wiki takes a bot password
-  (``Special:BotPasswords``) or an injected, already authenticated
-  ``http_client``. Requests are sequential, carry a descriptive User-Agent and
-  ``maxlag``, and are retried on maxlag, HTTP 429 and 5xx, as the API
-  etiquette asks of bots.
-* **Scope**: ``namespaces`` (numeric ids, default the main namespace),
-  ``categories`` (direct members) and explicit ``titles`` (redirects are
-  followed, so a selected page that is later renamed stays selected). The
-  union of the three is synced. Redirect pages and code pages (CSS, JS, JSON,
-  Lua modules) are never ingested.
-* **One document per page**, keyed by the page id, not the title: a move keeps
-  the page's identity, so a rename updates the same document instead of
-  forgetting one and ingesting another. The text is rendered by the wiki
-  itself, so templates, transclusions and parser functions are expanded and
-  no wikitext is parsed here: through the TextExtracts extension when the wiki
-  has it (Wikipedia and most large wikis), otherwise from ``action=parse``
-  HTML reduced to text. Categories, the current revision and the latest
-  edits (timestamp, author, summary) are part of the document; fields the
-  wiki has hidden (revision deletion) are left out. Each page carries the
-  ``mediawiki:<server>`` node set, so ``recall`` can be scoped to one wiki.
-* **Incremental**: the first run captures the server time, then enumerates
-  the scope. Later runs replay ``list=recentchanges`` (edits, page creations
-  and log events) from that time minus an overlap window, because the API
-  documents that changes can enter the feed slightly out of timestamp order.
-  Only entries that can touch the synced set are kept (a synced or selected
-  page, or a title in a selected namespace); every page such an entry names
-  (its page id, its title, a move's target, a merge's destination) is
-  re-checked against the live wiki in batches of 50 and re-rendered only when
-  its revision or title changed, so replaying an entry twice is harmless and
-  the overlap needs no bookkeeping. Selected categories have their member
-  lists diffed every run instead, which also catches membership that changed
-  through a template.
-* **Forget-on-delete**: a page the re-check reports missing (deleted), or that
-  left the scope (moved out of a namespace, removed from a category, turned
-  into a redirect), is emitted as a ``_deleted`` tombstone. dlt drops it on
-  ``merge`` and cognee's ``orphan_cleanup`` removes it from the graph, vector
-  and relational stores.
-* **Reconciliation**: ``recentchanges`` is pruned (``$wgRCMaxAge``, 90 days by
-  default, 30 on Wikimedia wikis). When the oldest retained entry is newer
-  than the replay window, entries may be gone, so the run falls back to a full
-  enumeration diffed against the pages synced before. The same happens when
-  the scope or rendering settings change, every ``reconcile_after_days`` (a
-  safety net for feed entries delayed beyond the overlap), and on
-  ``full_sync=True``. An enumeration that comes
-  back empty while pages were known deletes nothing, so a typo or a transient
-  outage cannot wipe the dataset.
-
-Every API failure raises before the run's state is saved, so dlt keeps the
-previous cursor and a later run retries the same window.
+How changes are detected, when a full reconcile runs, how deletions, rate limits
+and empty scopes are handled, and what ``cognee_sync_stats`` reports: see the
+README.
 """
 
 from __future__ import annotations
 
+import hashlib
 import re
 import time
 from collections.abc import Callable, Iterable, Iterator
@@ -303,11 +250,36 @@ def _retry_after(headers: Any, attempt: int) -> float:
 # ---------------------------------------------------------------------------
 # Site and scope
 # ---------------------------------------------------------------------------
+_CATEGORY_NS = 14
+
+
+@dataclass(frozen=True)
+class _Namespaces:
+    """The wiki's namespace names, so localized prefixes (``Kategorie:``) work."""
+
+    ids: dict[str, int] = field(default_factory=dict)  # lower-cased name / alias -> id
+    case_sensitive: frozenset[int] = frozenset()
+
+    def split(self, title: str) -> tuple[int, str]:
+        """``(namespace id, normalized title without prefix)`` for any spelling."""
+        title = title.replace("_", " ").strip()
+        namespace = 0
+        if ":" in title:
+            prefix, rest = title.split(":", 1)
+            key = prefix.strip().lower()
+            if key in self.ids:
+                namespace, title = self.ids[key], rest.strip()
+        if namespace not in self.case_sensitive:
+            title = title[:1].upper() + title[1:]
+        return namespace, title
+
+
 @dataclass(frozen=True)
 class _Site:
     server_time: str
     server_name: str
     has_text_extracts: bool
+    namespaces: _Namespaces = field(default_factory=_Namespaces)
 
 
 @dataclass(frozen=True)
@@ -334,12 +306,18 @@ class _Scope:
 
     namespaces: frozenset[int]
     category_titles: frozenset[str]
-    title_page_ids: frozenset[int]
+    # The selected titles' current pages (``prop=info``), keyed by page id. Read
+    # on every run anyway (to follow renames), so they double as change checks.
+    title_pages: dict[int, dict] = field(default_factory=dict)
+
+    @property
+    def title_page_ids(self) -> frozenset[int]:
+        return frozenset(self.title_pages)
 
     def contains(self, page: dict) -> bool:
         if page.get("redirect") or page.get("contentmodel") in _NON_PROSE_CONTENT_MODELS:
             return False
-        if page.get("ns") in self.namespaces or page.get("pageid") in self.title_page_ids:
+        if page.get("ns") in self.namespaces or page.get("pageid") in self.title_pages:
             return True
         return any(
             category.get("title") in self.category_titles
@@ -352,7 +330,7 @@ def _site_info(client: _MediaWikiClient) -> _Site:
         {
             "action": "query",
             "meta": "siteinfo",
-            "siprop": "general|extensions",
+            "siprop": "general|extensions|namespaces|namespacealiases",
             "curtimestamp": "1",
         }
     )
@@ -362,10 +340,27 @@ def _site_info(client: _MediaWikiClient) -> _Site:
     server_time = response.get("curtimestamp")
     if not server_time:
         raise MediaWikiAPIError("no_server_time", "siteinfo returned no curtimestamp")
+
+    ids: dict[str, int] = {}
+    case_sensitive: set[int] = set()
+    namespaces = query.get("namespaces") or {}
+    for spec in namespaces.values() if isinstance(namespaces, dict) else namespaces:
+        namespace = int(spec.get("id", 0))
+        for name in (spec.get("name"), spec.get("canonical")):
+            if name:
+                ids[name.lower()] = namespace
+        if spec.get("case") == "case-sensitive":
+            case_sensitive.add(namespace)
+    for alias in query.get("namespacealiases") or []:
+        if alias.get("alias"):
+            ids[alias["alias"].lower()] = int(alias.get("id", 0))
+    ids.setdefault("category", _CATEGORY_NS)  # canonical, accepted by every wiki
+
     return _Site(
         server_time=server_time,
         server_name=general.get("servername") or urlparse(client._api_url).netloc,
         has_text_extracts="TextExtracts" in extensions,
+        namespaces=_Namespaces(ids, frozenset(case_sensitive)),
     )
 
 
@@ -380,33 +375,45 @@ def _batched(values: Iterable[Any], size: int = _BATCH_SIZE) -> Iterator[list]:
         yield batch
 
 
-def _category_title(name: str) -> str:
-    return name if name.lower().startswith("category:") else f"Category:{name}"
+def _category_title(name: str, namespaces: _Namespaces) -> str:
+    """``Category:<name>`` for a bare or prefixed name, in any of the wiki's spellings.
+
+    ``Kategorie:Physik`` on a German wiki is recognised as the category itself, not
+    sent as ``Category:Kategorie:Physik``. ``Category:`` is the canonical prefix
+    every wiki accepts; the API answers with its localized title.
+    """
+    namespace, rest = namespaces.split(name)
+    if namespace != _CATEGORY_NS:
+        rest = namespaces.split(f"Category:{name}")[1]
+    return f"Category:{rest}"
 
 
 def _resolve_category_titles(
-    client: _MediaWikiClient, categories: Iterable[str], new: frozenset[str]
+    client: _MediaWikiClient, categories: Iterable[str], new: frozenset[str], site: _Site
 ) -> set[str]:
-    """Normalize category names to the wiki's own ``Category:Name`` titles.
+    """Normalize category names to the wiki's own (localized) category titles.
 
-    ``Category:`` is the canonical prefix every wiki accepts; the API answers
-    with the localized title (``Kategorie:...``) that ``prop=categories`` uses.
     A category can have members without a description page, so a name counts as
     unknown only when its page is missing *and* it has no members. Only names
     added to the configuration since the last run are checked: one synced before
     and emptied since is a deletion to propagate, not a typo.
     """
+    namespaces = site.namespaces
     resolved: set[str] = set()
     unknown: list[str] = []
-    for batch in _batched(sorted({name.strip() for name in categories if name.strip()})):
+    wanted = sorted({name.strip() for name in categories if name.strip()})
+    new_keys = {namespaces.split(_category_title(name, namespaces)) for name in new}
+    for batch in _batched(wanted):
         pages = client.query_pages(
-            {"titles": "|".join(_category_title(name) for name in batch), "prop": "categoryinfo"}
+            {
+                "titles": "|".join(_category_title(name, namespaces) for name in batch),
+                "prop": "categoryinfo",
+            }
         )
-        new_titles = {_category_title(name) for name in batch if name in new}
         for page in pages:
             resolved.add(page["title"])
             members = (page.get("categoryinfo") or {}).get("size") or 0
-            if page.get("missing") and not members and _looks_new(page["title"], new_titles):
+            if page.get("missing") and not members and namespaces.split(page["title"]) in new_keys:
                 unknown.append(page["title"])
     if unknown:
         raise MediaWikiScopeError(
@@ -415,43 +422,36 @@ def _resolve_category_titles(
     return resolved
 
 
-def _resolve_title_page_ids(
-    client: _MediaWikiClient, titles: Iterable[str], new: frozenset[str]
-) -> set[int]:
-    """Resolve explicit titles to page ids, following redirects (renames).
+def _resolve_title_pages(
+    client: _MediaWikiClient, titles: Iterable[str], new: frozenset[str], site: _Site
+) -> dict[int, dict]:
+    """Resolve explicit titles to their current pages, following redirects (renames).
 
-    A title newly added to the configuration that does not exist raises; one
-    synced before and deleted since is left to forget-on-delete.
+    Returns ``prop=info`` for each, which the incremental run compares instead of
+    fetching the page again. A title newly added to the configuration that does
+    not exist raises; one synced before and deleted since is left to
+    forget-on-delete.
     """
-    page_ids: set[int] = set()
+    namespaces = site.namespaces
+    pages_by_id: dict[int, dict] = {}
     unknown: list[str] = []
+    new_keys = {namespaces.split(title) for title in new}
     for batch in _batched(sorted({title.strip() for title in titles if title.strip()})):
-        new_titles = {title for title in batch if title in new}
-        for page in client.query_pages({"titles": "|".join(batch), "redirects": "1"}):
+        for page in client.query_pages(
+            {"titles": "|".join(batch), "redirects": "1", **_INFO_PARAMS}
+        ):
             if page.get("pageid") and not page.get("missing"):
-                page_ids.add(page["pageid"])
-            elif page.get("missing") and _looks_new(page.get("title") or "", new_titles):
+                pages_by_id.update(_ingestible([page]))
+            elif page.get("missing") and namespaces.split(page.get("title") or "") in new_keys:
                 unknown.append(page.get("title") or "")
     if unknown:
         raise MediaWikiScopeError(f"These titles do not exist on the wiki: {sorted(unknown)}")
-    return page_ids
+    return pages_by_id
 
 
-def _normalize_title(title: str) -> str:
-    """MediaWiki's case-insensitive-first-letter, underscore-free title form."""
-    title = title.replace("_", " ").strip()
-    if ":" in title:
-        prefix, rest = title.split(":", 1)
-        return f"{prefix[:1].upper()}{prefix[1:]}:{rest[:1].upper()}{rest[1:]}"
-    return title[:1].upper() + title[1:]
-
-
-def _looks_new(answered_title: str, new_titles: set[str]) -> bool:
-    """Whether a title the wiki answered with is one of the newly configured ones."""
-    return _normalize_title(answered_title) in {_normalize_title(t) for t in new_titles}
-
-
-def _resolve_scope(client: _MediaWikiClient, settings: _Settings, previous_scope: Any) -> _Scope:
+def _resolve_scope(
+    client: _MediaWikiClient, settings: _Settings, previous_scope: Any, site: _Site
+) -> _Scope:
     known_categories: set[str] = set()
     known_titles: set[str] = set()
     if isinstance(previous_scope, list) and len(previous_scope) == 3:
@@ -461,13 +461,14 @@ def _resolve_scope(client: _MediaWikiClient, settings: _Settings, previous_scope
         namespaces=frozenset(settings.namespaces),
         category_titles=frozenset(
             _resolve_category_titles(
-                client, settings.categories, frozenset(settings.categories) - known_categories
+                client,
+                settings.categories,
+                frozenset(settings.categories) - known_categories,
+                site,
             )
         ),
-        title_page_ids=frozenset(
-            _resolve_title_page_ids(
-                client, settings.titles, frozenset(settings.titles) - known_titles
-            )
+        title_pages=_resolve_title_pages(
+            client, settings.titles, frozenset(settings.titles) - known_titles, site
         ),
     )
 
@@ -525,10 +526,7 @@ def _enumerate_scope(client: _MediaWikiClient, scope: _Scope) -> dict[int, dict]
             )
         )
     pages.update(_category_members(client, scope))
-    for batch in _batched(sorted(scope.title_page_ids)):
-        pages.update(
-            _ingestible(client.query_pages({"pageids": "|".join(map(str, batch)), **_INFO_PARAMS}))
-        )
+    pages.update(scope.title_pages)  # already read with prop=info this run
     return pages
 
 
@@ -822,18 +820,32 @@ def _render_row(
 
 
 def _seen(page: dict) -> dict:
-    """What was synced for a page; any difference means it must be re-rendered.
-
-    ``touched`` is bumped by MediaWiki when a page is re-rendered without a new
-    revision (a template or transcluded page changed), so comparing it lets a
-    reconcile catch those pages too.
-    """
+    """What a page looked like when synced: the fields that signal a change."""
     return {
         "revid": page.get("lastrevid"),
         "title": page.get("title"),
         "ns": page.get("ns"),
         "touched": page.get("touched"),
     }
+
+
+def _same(before: dict | None, now: dict) -> bool:
+    """Whether a synced page is unchanged.
+
+    ``touched`` moves when a template or transcluded page re-renders the page
+    without an edit, so it is compared too. State written before it was tracked
+    has no ``touched``; those pages are compared on the rest, so upgrading does
+    not re-render everything.
+    """
+    if not before:
+        return False
+    keys = ("revid", "title", "ns", "touched") if "touched" in before else ("revid", "title", "ns")
+    return all(before.get(key) == now.get(key) for key in keys)
+
+
+def _row_hash(row: dict) -> str:
+    text = "\x1f".join((row.get("title") or "", row.get("url") or "", row.get("content") or ""))
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
 def _tombstone(page_id: int | str) -> dict:
@@ -843,6 +855,12 @@ def _tombstone(page_id: int | str) -> dict:
 # ---------------------------------------------------------------------------
 # Sync (pure given a client + state dict — unit-testable)
 # ---------------------------------------------------------------------------
+# A namespace that enumerates empty twice in a row is taken at its word: the
+# first time could be an outage or a permissions change, a second consecutive
+# one almost never is, and the old pages must not stay in memory forever.
+_EMPTY_RUNS_BEFORE_FORGET = 2
+
+
 @dataclass
 class _Run:
     client: _MediaWikiClient
@@ -853,30 +871,68 @@ class _Run:
     previous: dict[int, dict]
     stats: dict[str, int]
     rerender: bool = False
+    # Re-yield even an identical rendering (``full_sync=True`` asks for that).
+    force_yield: bool = False
+    # Pages already re-rendered by an earlier, rate-limited attempt at the same
+    # re-render; they are compared as usual instead of rendered again.
+    rerendered_before: frozenset[int] = frozenset()
     keep_state: bool = False
+    empty_runs: int = 0
     pages: dict[int, dict] = field(default_factory=dict)
+    rendered: set[int] = field(default_factory=set)
+    forgotten: set[int] = field(default_factory=set)
+
+    def needs_render(self, page_id: int, seen: dict) -> bool:
+        if self.rerender and page_id not in self.rerendered_before:
+            return True
+        return not _same(self.previous.get(page_id), seen)
+
+    def keep(self, page_id: int) -> None:
+        if page_id in self.pages:
+            return  # reached twice (listed and named by the feed): count it once
+        self.pages[page_id] = self.previous[page_id]
+        self.stats["pages_unchanged"] += 1
 
     def emit(self, page: dict) -> Iterator[dict]:
         """Render a page if it is new or changed; tombstone it if it vanished."""
         page_id = page["pageid"]
         seen = _seen(page)
-        if self.previous.get(page_id) == seen and not self.rerender:
-            self.pages[page_id] = seen
-            self.stats["pages_unchanged"] += 1
+        if not self.needs_render(page_id, seen):
+            self.keep(page_id)
             return
         row = _render_row(self.client, page, self.settings, self.use_extracts, self.node_set)
         if row is None:
             yield from self.forget(page_id)
             return
+        seen["hash"] = _row_hash(row)
         self.pages[page_id] = seen
+        self.rendered.add(page_id)
+        before = self.previous.get(page_id) or {}
+        if before.get("hash") == seen["hash"] and not self.force_yield:
+            # ``touched`` also moves on purges, cache updates and link changes;
+            # an identical rendering is not a change, so nothing is re-ingested.
+            self.stats["pages_unchanged"] += 1
+            self.stats["pages_rendered_unchanged"] += 1
+            return
         self.stats["pages_changed"] += 1
         yield row
 
     def forget(self, page_id: int) -> Iterator[dict]:
         self.pages.pop(page_id, None)
+        self.forgotten.add(page_id)
         if page_id in self.previous:
             self.stats["deleted"] += 1
             yield _tombstone(page_id)
+
+    def progress(self) -> dict[str, dict]:
+        """The pages state after a partial run: previous, updated by what was done."""
+        pages = {
+            page_id: seen
+            for page_id, seen in self.previous.items()
+            if page_id not in self.forgotten
+        }
+        pages.update(self.pages)
+        return {str(page_id): seen for page_id, seen in sorted(pages.items())}
 
 
 def _parse_time(value: str) -> datetime:
@@ -907,8 +963,7 @@ def _full_sync_reason(state: dict, settings: _Settings, site: _Site) -> str | No
 
 
 # Reasons that re-render every page: the output format changed, or the caller
-# asked for it (e.g. to pick up template changes on wikis that do not bump
-# ``touched``).
+# asked for it.
 _RERENDER_REASONS = {"render_changed", "requested"}
 
 
@@ -934,32 +989,40 @@ def _retention_gap(client: _MediaWikiClient, start: str) -> bool:
     return _parse_time(entries[0]["timestamp"]) > _parse_time(start)
 
 
-def _full_sync(run: _Run) -> Iterator[dict]:
+def _full_sync(run: _Run, reason: str, state: dict) -> Iterator[dict]:
     current = _enumerate_scope(run.client, run.scope)
     run.stats["pages_scanned"] = len(current)
 
     if run.previous and not current:
-        # An empty enumeration while pages were known is far more likely a
-        # permissions change or an outage than a wiki that deleted everything.
-        # Forgetting the whole dataset would be permanent, and moving the
-        # cursor would lose the edits made before this run, so the run changes
-        # nothing and the next one retries.
+        empty_runs = int(state.get("empty_runs") or 0) + 1
+        # Title and category scopes are confirmed empty by the API itself (the
+        # titles are reported missing, the categories have no members); so is a
+        # scope the caller just changed. A namespace that lists nothing could be
+        # an outage, so it is only believed the second time in a row.
+        confirmed = (
+            not run.scope.namespaces
+            or reason == "scope_changed"
+            or empty_runs >= _EMPTY_RUNS_BEFORE_FORGET
+        )
+        if not confirmed:
+            logger.warning(
+                "MediaWiki: the scope enumerated 0 pages but %d were synced before; "
+                "keeping them for now (forgotten if the next full sync is empty too).",
+                len(run.previous),
+            )
+            run.keep_state = True
+            run.empty_runs = empty_runs
+            return
         logger.warning(
-            "MediaWiki: the scope enumerated 0 pages but %d were synced before; "
-            "leaving the dataset and the sync state untouched.",
+            "MediaWiki: the scope is empty; forgetting the %d pages synced before.",
             len(run.previous),
         )
-        run.keep_state = True
-        return
 
     changed = [
-        page_id
-        for page_id, page in current.items()
-        if run.rerender or run.previous.get(page_id) != _seen(page)
+        page_id for page_id, page in current.items() if run.needs_render(page_id, _seen(page))
     ]
     for page_id in current.keys() - set(changed):
-        run.pages[page_id] = run.previous[page_id]
-        run.stats["pages_unchanged"] += 1
+        run.keep(page_id)
 
     # Enumeration already proved these pages are in scope; a page deleted
     # since then comes back missing and is forgotten.
@@ -986,7 +1049,8 @@ def _named_titles(entry: dict, params: dict) -> list[tuple[str | None, int | Non
     return named
 
 
-def _incremental_sync(run: _Run, start: str) -> Iterator[dict]:
+def _read_feed(run: _Run, start: str) -> tuple[set[int], set[str]]:
+    """Pages the change feed names since ``start``, for the selected namespaces."""
     scope = run.scope
     known_titles = {seen.get("title"): page_id for page_id, seen in run.previous.items()}
     page_ids: set[int] = set()
@@ -995,12 +1059,10 @@ def _incremental_sync(run: _Run, start: str) -> Iterator[dict]:
 
     def consider(entry: dict, params: dict) -> None:
         # Only entries that can touch the synced set matter: a page already
-        # synced or selected by title, or a title in a selected namespace.
-        # Category members are diffed below instead, which also catches
-        # membership that changed through a template.
+        # synced, or a title in a selected namespace.
         named = _named_titles(entry, params)
         page_id = entry.get("pageid") or 0
-        relevant = page_id in run.previous or page_id in scope.title_page_ids
+        relevant = page_id in run.previous
         for title, namespace in named:
             if title in known_titles:
                 page_ids.add(known_titles[title])
@@ -1013,31 +1075,25 @@ def _incremental_sync(run: _Run, start: str) -> Iterator[dict]:
             page_ids.add(page_id)
         titles.update(title for title, _ in named if title)
 
-    # The feed is only needed to discover pages in the selected namespaces. Pages
-    # held in scope by a title or a category are re-checked directly by id below
-    # (50 per request), so a title- or category-only scope never pages through a
-    # busy wiki's feed, and catches template re-renders (``touched``) every run.
-    namespaces = sorted(scope.namespaces)
-    if namespaces:
-        for response in run.client.continued(
-            {
-                "action": "query",
-                "list": "recentchanges",
-                "rcstart": start,
-                "rcdir": "newer",
-                "rctype": "edit|new|log",
-                "rcnamespace": "|".join(map(str, namespaces)),
-                "rcprop": "ids|title|timestamp|loginfo",
-                "rclimit": "max",
-            }
-        ):
-            for entry in (response.get("query") or {}).get("recentchanges") or []:
-                entries += 1
-                consider(entry, entry.get("logparams") or {})
+    for response in run.client.continued(
+        {
+            "action": "query",
+            "list": "recentchanges",
+            "rcstart": start,
+            "rcdir": "newer",
+            "rctype": "edit|new|log",
+            "rcnamespace": "|".join(map(str, sorted(scope.namespaces))),
+            "rcprop": "ids|title|timestamp|loginfo",
+            "rclimit": "max",
+        }
+    ):
+        for entry in (response.get("query") or {}).get("recentchanges") or []:
+            entries += 1
+            consider(entry, entry.get("logparams") or {})
     # The feed above is filtered by the namespace an entry is logged under, which
     # for a move is the *source* namespace: a draft moved into the articles would
     # be missed. Moves and history merges are rare, so read them unfiltered.
-    for log_type in ("move", "merge") if namespaces else ():
+    for log_type in ("move", "merge"):
         for response in run.client.continued(
             {
                 "action": "query",
@@ -1052,30 +1108,42 @@ def _incremental_sync(run: _Run, start: str) -> Iterator[dict]:
             for entry in (response.get("query") or {}).get("logevents") or []:
                 entries += 1
                 consider(entry, entry.get("params") or {})
-
+    run.stats["feed_read"] = 1
     run.stats["changes_replayed"] = entries
-    # Pages outside the selected namespaces are not in the feed read above.
-    page_ids |= {
-        page_id for page_id, seen in run.previous.items() if seen.get("ns") not in scope.namespaces
-    }
-    # A selected title that was created or renamed into place since the last
-    # run: its id is resolved fresh every run.
-    page_ids |= scope.title_page_ids - run.previous.keys()
+    return page_ids, titles
+
+
+def _incremental_sync(run: _Run, start: str) -> Iterator[dict]:
+    scope = run.scope
+    page_ids: set[int] = set()
+    titles: set[str] = set()
+    # The feed is only needed to discover pages in the selected namespaces.
+    if scope.namespaces:
+        page_ids, titles = _read_feed(run, start)
+
+    # Pages held in scope by a title or a category are compared against listings
+    # this run reads anyway (the titles are resolved every run to follow renames,
+    # the category member lists are diffed), so only the ones that differ are
+    # fetched: an unchanged 10,000 page category costs ~20 listing requests.
+    listed: dict[int, dict] = dict(scope.title_pages)
     if scope.category_titles:
-        members = _category_members(run.client, scope)
-        # New members, and synced pages that left every category and are not
-        # held in scope by a namespace or title, are re-checked.
-        page_ids |= members.keys() - run.previous.keys()
-        page_ids |= {
-            page_id
-            for page_id, seen in run.previous.items()
-            if page_id not in members
-            and page_id not in scope.title_page_ids
-            and seen.get("ns") not in scope.namespaces
-        }
+        listed.update(_category_members(run.client, scope))
+    run.stats["pages_scanned"] = len(listed)
+    for page_id, page in listed.items():
+        if run.needs_render(page_id, _seen(page)):
+            page_ids.add(page_id)
+        else:
+            run.keep(page_id)
+    # A synced page outside the selected namespaces that is no longer listed has
+    # left its category, lost its title, or was deleted: re-check it.
+    page_ids |= {
+        page_id
+        for page_id, seen in run.previous.items()
+        if seen.get("ns") not in scope.namespaces and page_id not in listed
+    }
 
     present, missing = _fetch_meta(run.client, page_ids=page_ids, titles=titles)
-    run.pages.update(run.previous)
+    run.stats["pages_scanned"] += len(present.keys() - listed.keys())
     for page_id in sorted(present):
         page = present[page_id]
         if scope.contains(page):
@@ -1084,9 +1152,18 @@ def _incremental_sync(run: _Run, start: str) -> Iterator[dict]:
             yield from run.forget(page_id)
     for page_id in sorted(missing):
         yield from run.forget(page_id)
+    # Everything not looked at this run is unchanged.
+    for page_id in run.previous.keys() - run.pages.keys() - run.forgotten:
+        run.pages[page_id] = run.previous[page_id]
 
 
-def _sync(client: _MediaWikiClient, settings: _Settings, state: dict, stats: dict[str, int]):
+def _sync(
+    client: _MediaWikiClient,
+    settings: _Settings,
+    state: dict,
+    stats: dict[str, int],
+    holder: dict,
+):
     site = _site_info(client)
     use_extracts = settings.content_format == "extracts" or (
         settings.content_format == "auto" and site.has_text_extracts
@@ -1097,32 +1174,43 @@ def _sync(client: _MediaWikiClient, settings: _Settings, state: dict, stats: dic
     start = None
     if reason is None:
         start = _replay_start(state, settings)
-        # Only namespace scopes rely on the feed; the others re-check pages by id.
+        # Only namespace scopes rely on the feed; the others are compared directly.
         if settings.namespaces and _retention_gap(client, start):
             reason = "retention_gap"
     if reason:
         stats["full_sync"] = 1
         stats[f"full_sync_{reason}"] = 1
 
+    rerender = reason in _RERENDER_REASONS
+    progress = state.get("rerender_progress") or {}
+    rerendered_before = frozenset(
+        int(page_id)
+        for page_id in progress.get("ids") or []
+        if rerender and progress.get("for") == [reason, settings.render_fingerprint()]
+    )
     run = _Run(
         client=client,
         settings=settings,
-        scope=_resolve_scope(client, settings, state.get("scope")),
+        scope=_resolve_scope(client, settings, state.get("scope"), site),
         use_extracts=use_extracts,
         node_set=f"{SOURCE_TAG}:{site.server_name}",
         previous=previous,
         stats=stats,
-        rerender=reason in _RERENDER_REASONS,
+        rerender=rerender,
+        force_yield=reason == "requested",
+        rerendered_before=rerendered_before,
     )
+    holder.update(run=run, reason=reason)
     if reason:
         logger.info("MediaWiki: full sync (%s).", reason)
-        yield from _full_sync(run)
+        yield from _full_sync(run, reason, state)
     else:
         yield from _incremental_sync(run, start)
 
     if run.keep_state:
         stats["failed"] = 1
         stats["failed_empty_scope"] = 1
+        state["empty_runs"] = run.empty_runs
         return
     # State is written only after the last row was yielded, so a run that
     # raises part-way keeps the previous cursor (dlt also discards the state of
@@ -1133,6 +1221,8 @@ def _sync(client: _MediaWikiClient, settings: _Settings, state: dict, stats: dic
     state["render"] = settings.render_fingerprint()
     if reason:
         state["last_full_sync"] = site.server_time
+    state.pop("empty_runs", None)
+    state.pop("rerender_progress", None)
     logger.info(
         "MediaWiki: %s sync, %d changed, %d unchanged, %d deleted, %d request(s).",
         "full" if reason else "incremental",
@@ -1143,38 +1233,81 @@ def _sync(client: _MediaWikiClient, settings: _Settings, state: dict, stats: dic
     )
 
 
+def _save_progress(state: dict, settings: _Settings, holder: dict) -> None:
+    """After a rate-limited stop: keep what was done, so the next run continues.
+
+    The cursor, scope and render settings are left alone (the next run replays
+    the same window and repeats the same full sync if one was due), but the
+    pages already compared, rendered or forgotten are recorded, so it does not
+    start over from page 0.
+    """
+    run: _Run | None = holder.get("run")
+    if run is None or run.keep_state:
+        return
+    state["pages"] = run.progress()
+    if run.rerender:
+        done = run.rendered | set(run.rerendered_before)
+        state["rerender_progress"] = {
+            "for": [holder.get("reason"), settings.render_fingerprint()],
+            "ids": sorted(done),
+        }
+
+
 def sync_pages(client: _MediaWikiClient, settings: _Settings, state: dict, stats: dict):
     """Yield changed pages and deletion tombstones, then advance ``state``.
 
-    ``stats`` receives plain int counters for the host: ``pages_scanned``,
-    ``pages_changed``, ``pages_unchanged``, ``deleted``, ``changes_replayed``,
-    ``requests``, ``full_sync`` (plus ``full_sync_<reason>``) and ``failed``
-    (plus ``failed_<reason>``: ``rate_limit``, ``auth``, ``empty_scope``).
+    ``stats`` receives plain int counters for the host (all present on every run):
+
+    - ``pages_scanned``: pages whose metadata was compared this run;
+    - ``pages_changed`` / ``pages_unchanged`` / ``deleted``: what happened to them
+      (``pages_rendered_unchanged`` counts re-renders that produced the same text);
+    - ``feed_read`` (0/1) and ``changes_replayed``: whether the change feed was
+      read and how many entries it returned (title and category scopes never
+      read it);
+    - ``requests``; ``full_sync`` (0/1, plus ``full_sync_<reason>``);
+    - ``failed`` (0/1, plus ``failed_<reason>``: ``rate_limit``, ``auth``,
+      ``empty_scope``, ``scope``, ``api`` or ``error``). Every failure sets it,
+      including the ones that raise.
 
     A wiki that keeps rate-limiting the run stops it cleanly: what was yielded
-    stays, the state is not advanced, and the next run resumes from the same
-    cursor. An authentication failure raises.
+    stays, the work done is recorded, and the next run continues from there.
     """
     stats.clear()
     stats.update(
         pages_scanned=0,
         pages_changed=0,
         pages_unchanged=0,
+        pages_rendered_unchanged=0,
         deleted=0,
+        feed_read=0,
         changes_replayed=0,
         requests=0,
         full_sync=0,
         failed=0,
     )
+    holder: dict = {}
+
+    def failed(reason: str) -> None:
+        stats["failed"] = 1
+        stats[f"failed_{reason}"] = 1
+
     try:
-        yield from _sync(client, settings, state, stats)
+        yield from _sync(client, settings, state, stats, holder)
     except MediaWikiRateLimitedError as exc:
-        stats["failed"] = 1
-        stats["failed_rate_limit"] = 1
-        logger.warning("MediaWiki: rate limited (%s); the next run resumes from here.", exc.code)
+        failed("rate_limit")
+        _save_progress(state, settings, holder)
+        logger.warning("MediaWiki: rate limited (%s); the next run continues from here.", exc.code)
     except MediaWikiAuthError:
-        stats["failed"] = 1
-        stats["failed_auth"] = 1
+        failed("auth")
+        raise
+    except MediaWikiScopeError:
+        failed("scope")
+        raise
+    except MediaWikiAPIError:
+        failed("api")
+        raise
+    except Exception:
+        failed("error")
         raise
     finally:
         stats["requests"] = client.requests
@@ -1208,7 +1341,6 @@ def mediawiki_source(
     resource_name: str | None = None,
     check_active: Callable[[], None] | None = None,
     service: Any = None,
-    http_client: Any = None,
 ):
     """Return a ``dlt`` resource yielding one document row per in-scope wiki page.
 
@@ -1253,7 +1385,6 @@ def mediawiki_source(
         check_active: Optional host authorization checkpoint during extraction.
         service: Pre-built ``httpx.Client`` (a test injection point, or a
             client that already carries a private wiki's session cookie).
-        http_client: Alias of ``service``.
     """
     import dlt
     import httpx
@@ -1263,10 +1394,6 @@ def mediawiki_source(
             "The MediaWiki connector requires a cognee build that reads per-row node "
             "sets (DOCUMENT_SYNC_VERSION >= 2, cognee 1.6.3+). Upgrade cognee."
         )
-    if service is not None and http_client is not None and service is not http_client:
-        raise ValueError("Pass the pre-built client as service= or http_client=, not both.")
-    injected_client = service if service is not None else http_client
-
     resolved_api_url = (api_url or "").strip()
     parsed = urlparse(resolved_api_url)
     if parsed.scheme not in ("http", "https") or not parsed.path.endswith("api.php"):
@@ -1311,14 +1438,10 @@ def mediawiki_source(
     )
     def mediawiki_pages():
         owned_client = (
-            None
-            if injected_client is not None
-            else httpx.Client(timeout=30.0, follow_redirects=True)
+            None if service is not None else httpx.Client(timeout=30.0, follow_redirects=True)
         )
         try:
-            client = _MediaWikiClient(
-                injected_client or owned_client, resolved_api_url, user_agent, maxlag
-            )
+            client = _MediaWikiClient(service or owned_client, resolved_api_url, user_agent, maxlag)
             if username:
                 try:
                     client.login(username, password or "")

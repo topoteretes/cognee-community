@@ -446,17 +446,6 @@ def test_periodic_reconcile(wiki):
     assert stats["full_sync_periodic"] == 1
 
 
-def test_empty_enumeration_never_mass_deletes(wiki):
-    state: dict = {}
-    _sync(wiki, state, namespaces=(), categories=("Computing",))
-    for page in wiki.pages.values():
-        page.categories = []
-
-    live, deleted, _ = _sync(wiki, state, namespaces=(), categories=("Computing",), full_sync=True)
-    assert live == {} and deleted == set()
-    assert set(state["pages"]) == {"1", "2"}
-
-
 # ---------------------------------------------------------------------------
 # Transport
 # ---------------------------------------------------------------------------
@@ -515,7 +504,7 @@ def test_bot_password_login(wiki):
 # dlt resource
 # ---------------------------------------------------------------------------
 def test_resource_is_a_merge_document_source():
-    resource = mediawiki_source(API_URL, http_client=httpx.Client())
+    resource = mediawiki_source(API_URL, service=httpx.Client())
     assert resource.name == "mediawiki_wiki_example_org_w"
     assert resource.write_disposition == "merge"
     columns = resource.columns
@@ -565,7 +554,7 @@ def test_forget_on_delete_end_to_end_through_a_real_dlt_merge(wiki, tmp_path):
     pipeline = _pipeline(tmp_path)
 
     def run():
-        source = mediawiki_source(API_URL, http_client=wiki.client(), revision_history=0)
+        source = mediawiki_source(API_URL, service=wiki.client(), revision_history=0)
         pipeline.run(source)
         return source
 
@@ -588,12 +577,12 @@ def test_forget_on_delete_end_to_end_through_a_real_dlt_merge(wiki, tmp_path):
 
 def test_one_resource_name_cannot_hold_two_wikis(wiki, tmp_path):
     pipeline = _pipeline(tmp_path)
-    pipeline.run(mediawiki_source(API_URL, http_client=wiki.client(), resource_name="pages"))
+    pipeline.run(mediawiki_source(API_URL, service=wiki.client(), resource_name="pages"))
 
     other = FakeWiki()
     other_url = "https://other.example.org/w/api.php"
     with pytest.raises(Exception, match="another wiki"):
-        pipeline.run(mediawiki_source(other_url, http_client=other.client(), resource_name="pages"))
+        pipeline.run(mediawiki_source(other_url, service=other.client(), resource_name="pages"))
 
 
 # ---------------------------------------------------------------------------
@@ -622,7 +611,10 @@ def test_an_empty_enumeration_leaves_the_whole_state_untouched(wiki):
 
     live, deleted, stats = _sync(wiki, state, full_sync=True)
     assert live == {} and deleted == set()
-    assert state == snapshot, "neither the cursor nor last_full_sync may move"
+    # Only the empty-run counter is recorded; neither the cursor nor
+    # last_full_sync may move.
+    assert state.pop("empty_runs") == 1
+    assert state == snapshot
     assert stats["failed"] == 1 and stats["failed_empty_scope"] == 1
 
 
@@ -744,11 +736,16 @@ def test_login_errors_never_echo_the_response_body():
     assert "SECRET" not in str(excinfo.value) and "Aborted" in str(excinfo.value)
 
 
-def test_service_is_an_alias_of_http_client():
-    client = httpx.Client()
-    assert mediawiki_source(API_URL, service=client).name == "mediawiki_wiki_example_org_w"
-    with pytest.raises(ValueError, match="not both"):
-        mediawiki_source(API_URL, service=client, http_client=httpx.Client())
+def test_the_injected_service_is_the_client_that_extracts(wiki, tmp_path):
+    pipeline = _pipeline(tmp_path)
+    source = mediawiki_source(API_URL, service=wiki.client(), revision_history=0)
+    pipeline.run(source)
+    assert _staged(pipeline, source.name) == {
+        "1": "Ada Lovelace",
+        "2": "Charles Babbage",
+        "3": "Analytical Engine",
+    }
+    assert wiki.requests, "every request went through the injected client"
 
 
 def test_two_wikis_with_their_own_resource_names_share_a_dataset(wiki, tmp_path):
@@ -783,3 +780,141 @@ def test_a_title_or_category_scope_never_reads_the_change_feed(wiki):
     assert set(live) == {"1"}, "the re-render is caught without waiting for a reconcile"
     assert stats["changes_replayed"] == 0
     assert not [r for r in wiki.requests if r.get("list") in ("recentchanges", "logevents")]
+
+
+# ---------------------------------------------------------------------------
+# Review round 2
+# ---------------------------------------------------------------------------
+def test_an_emptied_namespace_is_forgotten_on_the_second_empty_full_sync(wiki):
+    state: dict = {}
+    _sync(wiki, state)
+    for page_id in (1, 2, 3):
+        wiki.delete(page_id)
+
+    _, deleted, stats = _sync(wiki, state, full_sync=True)
+    assert deleted == set() and stats["failed_empty_scope"] == 1  # could be an outage
+    _, deleted, stats = _sync(wiki, state, full_sync=True)
+    assert deleted == {"1", "2", "3"}, "a second empty listing is believed"
+    assert stats["failed"] == 0 and state["pages"] == {}
+
+
+def test_an_emptied_category_is_forgotten_right_away(wiki):
+    state: dict = {}
+    _sync(wiki, state, namespaces=(), categories=("Computing",))
+    for page_id in (1, 2):
+        wiki.edit(page_id, categories=[])
+
+    _, deleted, stats = _sync(wiki, state, namespaces=(), categories=("Computing",), full_sync=True)
+    assert deleted == {"1", "2"} and stats["failed"] == 0
+
+
+def test_switching_to_an_empty_category_forgets_the_old_pages(wiki):
+    state: dict = {}
+    wiki.create(40, "Category:Empty", "An empty category.", ns=14)
+    _sync(wiki, state, namespaces=(), categories=("Computing",))
+
+    _, deleted, stats = _sync(wiki, state, namespaces=(), categories=("Empty",))
+    assert stats["full_sync_scope_changed"] == 1
+    assert deleted == {"1", "2"} and stats["failed"] == 0
+    assert state["scope"] == [[], ["Empty"], []], "the new scope is recorded"
+
+
+def test_a_rate_limited_run_makes_progress_across_runs():
+    wiki = FakeWiki()
+    for page_id in range(1, 9):
+        wiki.create(page_id, f"Page {page_id}", f"Text {page_id}.")
+    wiki.tick(60)
+    # Let the first few requests through, then the wiki asks for an hour.
+    wiki.failures = [("pass", None)] * 8 + [("http", (429, "3600"))]
+
+    state: dict = {}
+    _, _, first = _sync(wiki, state, revision_history=0)
+    assert first["failed_rate_limit"] == 1 and 0 < first["pages_changed"] < 8
+
+    _, _, second = _sync(wiki, state, revision_history=0)
+    assert second["failed"] == 0
+    assert first["pages_changed"] + second["pages_changed"] == 8, "nothing rendered twice"
+
+
+def test_a_localized_category_prefix_is_understood():
+    wiki = FakeWiki(category_ns="Kategorie")
+    wiki.create(1, "Ada Lovelace", "Programm.", categories=["Rechnen"])
+    wiki.create(2, "Grace Hopper", "Compiler.", categories=["Rechnen"])
+    wiki.tick(60)
+
+    for spelling in ("Rechnen", "Kategorie:Rechnen", "Category:Rechnen", "kategorie:rechnen"):
+        live, _, _ = _sync(wiki, {}, namespaces=(), categories=(spelling,))
+        assert set(live) == {"1", "2"}, spelling
+    with pytest.raises(MediaWikiScopeError, match="Rechnenn"):
+        _sync(wiki, {}, namespaces=(), categories=("Kategorie:Rechnenn",))
+
+
+def test_a_touched_only_change_with_the_same_text_is_not_reingested(wiki):
+    state: dict = {}
+    _sync(wiki, state, namespaces=(), titles=("Ada Lovelace",))
+    wiki.rerender(1, wiki.pages[1].text)  # a purge or a link update: same text
+
+    live, _, stats = _sync(wiki, state, namespaces=(), titles=("Ada Lovelace",))
+    assert live == {}
+    assert stats["pages_rendered_unchanged"] == 1 and stats["pages_changed"] == 0
+
+
+def test_state_from_before_touched_was_tracked_does_not_rerender_everything(wiki):
+    state: dict = {}
+    _sync(wiki, state, namespaces=(), categories=("Computing",))
+    for seen in state["pages"].values():
+        seen.pop("touched")
+        seen.pop("hash")
+
+    live, _, stats = _sync(wiki, state, namespaces=(), categories=("Computing",))
+    assert live == {} and stats["pages_unchanged"] == 2
+
+
+def test_an_unchanged_category_is_compared_from_its_member_listing():
+    wiki = FakeWiki()
+    for page_id in range(1, 151):
+        wiki.create(page_id, f"Page {page_id}", "Text.", categories=["Big"])
+    wiki.tick(60)
+    state: dict = {}
+    _sync(wiki, state, namespaces=(), categories=("Big",), revision_history=0)
+    wiki.requests.clear()
+
+    live, _, stats = _sync(wiki, state, namespaces=(), categories=("Big",), revision_history=0)
+    assert live == {} and stats["pages_unchanged"] == 150 and stats["pages_scanned"] == 150
+    per_page = [r for r in wiki.requests if "revisions" in (r.get("prop") or "")]
+    assert per_page == [], "no page was fetched individually"
+
+
+@pytest.mark.parametrize(
+    ("setup", "reason", "error"),
+    [
+        (lambda w: None, "scope", MediaWikiScopeError),
+        (
+            lambda w: w.failures.append(("api", "internal_api_error_DBQueryError")),
+            "api",
+            MediaWikiAPIError,
+        ),
+    ],
+)
+def test_every_failure_sets_failed(wiki, setup, reason, error):
+    setup(wiki)
+    stats: dict = {}
+    client = _MediaWikiClient(wiki.client(), API_URL, "ua", 5, sleep=lambda _s: None)
+    settings = (
+        _settings(namespaces=(), titles=("No such page",)) if reason == "scope" else (_settings())
+    )
+    with pytest.raises(error):
+        list(sync_pages(client, settings, {}, stats))
+    assert stats["failed"] == 1 and stats[f"failed_{reason}"] == 1
+
+
+def test_stats_say_whether_the_feed_was_read(wiki):
+    state: dict = {}
+    _sync(wiki, state, namespaces=(), titles=("Ada Lovelace",))
+    _, _, stats = _sync(wiki, state, namespaces=(), titles=("Ada Lovelace",))
+    assert stats["feed_read"] == 0 and stats["pages_scanned"] == 1
+
+    state = {}
+    _sync(wiki, state)
+    _, _, stats = _sync(wiki, state)
+    assert stats["feed_read"] == 1

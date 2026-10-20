@@ -108,7 +108,7 @@ async def clean_environment(tmp_path, monkeypatch):
 
 
 async def _sync(wiki: FakeWiki):
-    source = mediawiki_source(API_URL, http_client=wiki.client(), revision_history=0)
+    source = mediawiki_source(API_URL, service=wiki.client(), revision_history=0)
     await cognee.add(
         source,
         dataset_name=DATASET,
@@ -176,7 +176,7 @@ async def test_example_runs_without_live_credentials(clean_environment, monkeypa
     spec.loader.exec_module(example)
 
     def offline_source(*args, **kwargs):
-        return mediawiki_source(*args, **kwargs, http_client=wiki.client())
+        return mediawiki_source(*args, **kwargs, service=wiki.client())
 
     # recall() searches the vector index, so index for real. Embeddings stay
     # mocked, as a constant non-zero vector so every chunk is a match.

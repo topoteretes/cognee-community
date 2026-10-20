@@ -49,7 +49,10 @@ class Page:
 
 
 class FakeWiki:
-    def __init__(self, *, text_extracts: bool = True):
+    def __init__(self, *, text_extracts: bool = True, category_ns: str = "Category"):
+        # The localized name of namespace 14 ("Kategorie" on a German wiki);
+        # "Category:" is accepted as well, like on a real wiki.
+        self.category_ns = category_ns
         self.text_extracts = text_extracts
         self.pages: dict[int, Page] = {}
         self.recentchanges: list[dict] = []
@@ -156,6 +159,16 @@ class FakeWiki:
             self._revise(redirect, "Carol", "redirect")
             self.pages[redirect.pageid] = redirect
 
+    def category_title(self, raw: str) -> str | None:
+        """The localized title for ``Category:X`` / ``Kategorie:X``, else None."""
+        if ":" not in raw:
+            return None
+        prefix, rest = raw.replace("_", " ").split(":", 1)
+        if prefix.strip().lower() not in ("category", self.category_ns.lower()):
+            return None
+        rest = rest.strip()
+        return f"{self.category_ns}:{rest[:1].upper()}{rest[1:]}"
+
     def find(self, title: str) -> Page | None:
         title = normalize(title)
         return next((p for p in self.pages.values() if p.title == title), None)
@@ -187,6 +200,8 @@ class FakeWiki:
                 )
             if kind == "network":
                 raise httpx.ConnectError("boom", request=request)
+            if kind == "pass":  # let this request through; fail a later one
+                kind = None
 
         action = params.get("action")
         if action == "login":
@@ -202,6 +217,34 @@ class FakeWiki:
                     "query": {
                         "general": {"wikiid": "examplewiki", "servername": "wiki.example.org"},
                         "extensions": [{"name": "TextExtracts"}] if self.text_extracts else [],
+                        "namespaces": {
+                            "0": {"id": 0, "case": "first-letter", "name": ""},
+                            "2": {
+                                "id": 2,
+                                "case": "first-letter",
+                                "name": "User",
+                                "canonical": "User",
+                            },
+                            "8": {
+                                "id": 8,
+                                "case": "first-letter",
+                                "name": "MediaWiki",
+                                "canonical": "MediaWiki",
+                            },
+                            "14": {
+                                "id": 14,
+                                "case": "first-letter",
+                                "name": self.category_ns,
+                                "canonical": "Category",
+                            },
+                            "118": {
+                                "id": 118,
+                                "case": "first-letter",
+                                "name": "Draft",
+                                "canonical": "Draft",
+                            },
+                        },
+                        "namespacealiases": [],
                     },
                 }
             )
@@ -309,14 +352,14 @@ class FakeWiki:
             return stubs, None
         stubs = []
         for raw in params.get("titles", "").split("|"):
-            title = normalize(raw)
+            title = self.category_title(raw) or normalize(raw)
             page = self.find(title)
             if page and page.redirect_to and params.get("redirects"):
                 page = self.find(page.redirect_to)
             if page:
                 stubs.append({"page": page})
             else:
-                ns = 14 if title.startswith("Category:") else 0
+                ns = 14 if title.startswith(f"{self.category_ns}:") else 0
                 stubs.append({"ns": ns, "title": title, "missing": True})
         return stubs, None
 
@@ -350,9 +393,9 @@ class FakeWiki:
                 limit = int(params.get("rvlimit") or 1)
                 out["revisions"] = [dict(r) for r in page.revisions[:limit]]
             if "categories" in props:
-                cats = [{"ns": 14, "title": f"Category:{c}"} for c in page.categories]
+                cats = [{"ns": 14, "title": f"{self.category_ns}:{c}"} for c in page.categories]
                 cats += [
-                    {"ns": 14, "title": f"Category:{c}", "hidden": True}
+                    {"ns": 14, "title": f"{self.category_ns}:{c}", "hidden": True}
                     for c in page.hidden_categories
                 ]
                 if cats:
