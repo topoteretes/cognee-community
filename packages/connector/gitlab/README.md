@@ -23,7 +23,7 @@ the package's `.venv`.
 
 1. Sign in to GitLab with an account that can read the projects you want to sync.
 2. Open your avatar → **Edit profile** → **Access tokens** (personal access
-   tokens), then **Add new token**.
+   tokens), then add a new **legacy** token, not a fine-grained one.
 3. Give it a name and an expiration date, select the **`read_api`** scope, and
    create it. Copy the token; GitLab shows it only once.
 4. Export it, plus the instance URL if you are not on gitlab.com:
@@ -36,6 +36,20 @@ export GITLAB_BASE_URL="https://gitlab.example.com"   # optional; defaults to gi
 `read_api` is enough; the broader `api` scope is accepted but not needed. The
 connector only reads. Keep the token out of Git and logs. See GitLab's
 [personal access token guide](https://docs.gitlab.com/user/profile/personal_access_tokens/).
+
+### Why a legacy token
+
+The connector supports and recommends legacy personal access tokens. One
+`read_api` scope gives read access to everything the token's user can see:
+every project, with its issues, merge requests, comments, and wiki.
+
+Fine-grained tokens are not supported or tested. They grant access per project
+and per resource, so a working sync would need read permission set separately
+for every selected project and for issues, merge requests, notes (comments), and
+wiki pages. Any permission left out makes that part of the sync fail or come back
+incomplete. The connector's token check also expects the `read_api` scope, so a
+fine-grained token may be rejected before the sync starts. Supporting them would
+mean testing each permission combination; that is left as a follow-up.
 
 ## Run the example
 
@@ -93,12 +107,12 @@ use a dedicated dataset. Create a new source for each sync.
 
 | Argument | Default | Meaning |
 | --- | --- | --- |
-| `token` | Required | Personal access token with `read_api`. |
+| `token` | Required | Legacy personal access token with `read_api` (fine-grained tokens are not supported). |
 | `resource_types` | Required | Non-empty selection of `issues`, `merge_requests`, `comments`, `wiki`. `comments` requires `issues` or `merge_requests`. |
 | `base_url` | `https://gitlab.com` | Instance URL, without credentials or query string. |
 | `project_ids` | `None` | Numeric IDs or `group/project` paths. `None` syncs every project the token owner is a member of. |
 
-`gitlab_source()` validates the token immediately (active, with `read_api` or
+`gitlab_source()` validates the legacy token immediately (active, with `read_api` or
 `api`) using `GET /personal_access_tokens/self`, so a bad token fails before any
 sync starts. Very old self-managed releases without that endpoint are not supported.
 

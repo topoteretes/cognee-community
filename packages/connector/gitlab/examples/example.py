@@ -3,7 +3,7 @@
 Run from this package directory:
     uv run python examples/example.py --help
 
-Set GITLAB_TOKEN (a personal access token with read_api) and your Cognee model
+Set GITLAB_TOKEN (a legacy personal access token with read_api) and your Cognee model
 credentials first. Run the same command again to sync later changes and deletions.
 """
 
@@ -36,7 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--question", default="Summarize the open issues and their discussion.")
     args = parser.parse_args()
     if not os.getenv("GITLAB_TOKEN", "").strip():
-        parser.error("set GITLAB_TOKEN to a personal access token with read_api")
+        parser.error("set GITLAB_TOKEN to a legacy personal access token with read_api")
     args.resources = [name.strip() for name in args.resources.split(",") if name.strip()]
     if args.projects:
         refs = [ref.strip() for ref in args.projects.split(",") if ref.strip()]
