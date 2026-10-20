@@ -44,6 +44,8 @@ class FakeDropbox:
         self.reset_cursors: set[str] = set()
         self.continue_errors: list[Exception] = []
         self.list_errors: list[Exception] = []
+        # A LookupError every listing of that folder raises, by path_lower.
+        self.folder_errors: dict[str, files.LookupError] = {}
         self.download_errors: dict[str, Exception] = {}
         # Raised once, by the next download of that file id.
         self.download_errors_once: dict[str, Exception] = {}
@@ -119,6 +121,8 @@ class FakeDropbox:
             raise self.list_errors.pop(0)
         assert recursive, "the connector always lists recursively"
         path = path.lower()
+        if path in self.folder_errors:
+            raise api_error(files.ListFolderError.path(self.folder_errors[path]))
         if path and path not in self.folders:
             raise api_error(files.ListFolderError.path(files.LookupError.not_found))
         entries = [
@@ -139,6 +143,8 @@ class FakeDropbox:
         if cursor in self.reset_cursors:
             raise api_error(files.ListFolderContinueError.reset)
         path, position = cursor.rsplit("|", 1)
+        if path in self.folder_errors:
+            raise api_error(files.ListFolderContinueError.path(self.folder_errors[path]))
         if path and path not in self.folders:
             raise api_error(files.ListFolderContinueError.path(files.LookupError.not_found))
         entries = [

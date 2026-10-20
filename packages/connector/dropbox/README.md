@@ -115,12 +115,20 @@ After a run, `source.cognee_sync_stats` holds counts only, never file names or c
 - Deleted files are emitted as `{"id": ..., "_deleted": True}` with a `hard_delete`
   column. dlt removes them on `merge`, and cognee's orphan cleanup removes them from the
   graph and vector stores.
-- **Errors never delete.** Only a confirmed `not_found` removes data. A reset cursor
-  (`409 reset`) triggers a fresh listing reconciled against the index. A configured folder
-  that was never listed raises `DropboxFolderNotFoundError`, since it is most likely a
-  typo. A folder that was synced and disappears later is forgotten like a delete, and
-  later runs keep syncing the other folders: the state remembers which folders were
-  listed at least once.
+- **A passing error never deletes.** Data is removed when Dropbox reports a file or
+  folder gone, when a file leaves the synced folders, or when a file that was stored
+  turns unreadable for good: skipped now, or given up after 3 failed runs, so its old
+  text does not stay in memory as if it were current. A network error, a 5xx, a rate
+  limit or a bad token removes nothing. A reset cursor (`409 reset`) triggers a fresh
+  listing reconciled against the index.
+- **Folders.** A configured folder that was never listed raises
+  `DropboxFolderNotFoundError`, since it is most likely a typo or not a folder you can
+  read. A folder that was synced and can no longer be listed later, because it was
+  deleted, replaced by a file or restricted, is forgotten like a delete, and later runs
+  keep syncing the other folders: the state remembers which folders were listed at least
+  once. State saved by the first version, which kept only the index after a run with a
+  failed download, is migrated: folders with files in the index count as listed, and
+  files of a type that is never read, or still waiting in retry, count as not stored.
 - **Failed downloads are retried by id.** The cursor always moves forward. A file that
   failed to download (a 5xx or a network error) is kept in a `retry` map in dlt state with
   its number of attempts, and fetched again by id next run, which costs two requests:
@@ -142,10 +150,12 @@ After a run, `source.cognee_sync_stats` holds counts only, never file names or c
 - **An expired or revoked token mid-run** stops the run the same way, since every later
   request would fail too. If nothing was emitted yet, including during listing, the error
   is raised and counted in `failed_auth`: that is just a bad token.
-- **One failing folder fails the run.** Folders are not independent here: a file moved
-  from one synced folder into another shows up as a delete in the first. If the second
-  folder could not be read, the move would look like a delete, so the run stops before
-  anything is emitted and dlt keeps the previous state.
+- **A passing listing error stops the whole run.** Folders are not independent here: a
+  file moved from one synced folder into another shows up as a delete in the first. If
+  the second folder could not be read, the move would look like a delete, so on a network
+  error, a 5xx or a rate limit while listing the run stops before anything is emitted and
+  the previous state stays. That is retried next run; a folder that can no longer be
+  listed at all is forgotten, as above, so it never blocks the others for good.
 - **Host checkpoint:** `check_active` runs before every Dropbox request, outside any error
   handling, so a revoked connection stops the sync between two calls and is never counted
   as a failed file.

@@ -306,16 +306,21 @@ def _iter_rows(
 
     old_cursors: dict[str, str] = dict(state.get("cursors", {}))
     index: dict[str, str] = dict(state.get("index", {}))
-    # Skipped and failed files are indexed too, so the index alone can't say
-    # what is in cognee.  Older state has no ``stored``: assume all indexed.
-    stored: set[str] = set(state.get("stored", index.values()))
-    # A folder listed once and gone later is forgotten like a delete; only one
-    # that was never listed is taken for a typo.
-    synced_folders: set[str] = set(state.get("synced_folders", old_cursors))
     saved_retry = state.get("retry", {})
     # Before attempts were counted, retry was a plain list of ids.
     retry: dict[str, int] = (
         dict.fromkeys(saved_retry, 1) if isinstance(saved_retry, list) else dict(saved_retry)
+    )
+    # Skipped and failed files are indexed too, so the index alone can't say
+    # what is in cognee, and a folder listed once and gone later is forgotten
+    # like a delete while one never listed is taken for a typo.  State saved
+    # before these keys existed is migrated by _migrated_stored and
+    # _migrated_synced_folders.
+    stored: set[str] = set(state["stored"]) if "stored" in state else _migrated_stored(index, retry)
+    synced_folders: set[str] = (
+        set(state["synced_folders"])
+        if "synced_folders" in state
+        else _migrated_synced_folders(index, old_cursors, config.folder_paths)
     )
     new_cursors: dict[str, str] = {}
     # Ids whose path went away this round. Held until every folder is read,
@@ -350,12 +355,13 @@ def _iter_rows(
             removed_ids.add(index.pop(path))
 
     def list_all() -> None:
-        # Folders dropped from the config: forget the files only they covered.
-        # A folder still covered by a configured parent is re-listed below, and
-        # its files reappear instead of being deleted.
-        for folder in old_cursors:
-            if folder not in config.folder_paths:
-                forget(folder)
+        # Files no configured folder covers any more: their folder was dropped
+        # from the config.  Walking the index rather than the saved cursors
+        # also catches a folder whose cursor was never saved.  A folder still
+        # covered by a configured parent is re-listed below, and its files
+        # reappear instead of being deleted.
+        for path in [p for p in index if not any(_is_under(p, f) for f in config.folder_paths)]:
+            removed_ids.add(index.pop(path))
 
         for folder in config.folder_paths:
             cursor = old_cursors.get(folder)
@@ -380,15 +386,19 @@ def _iter_rows(
             try:
                 entries, new_cursors[folder] = _list_folder(session, folder)
             except ApiError as exc:
-                if not _is_not_found(exc):
+                if _path_lookup_error(exc) is None:
                     raise
                 if folder not in synced_folders:
                     # Never listed: most likely a typo in folder_paths, which
                     # would otherwise just produce an empty dataset.
                     raise DropboxFolderNotFoundError(
-                        "A configured Dropbox folder was not found. Check folder_paths."
+                        "A configured Dropbox folder was not found, or is not a folder "
+                        "you can read. Check folder_paths."
                     ) from None
-                logger.warning("Dropbox: a synced folder was not found; forgetting its files.")
+                # Synced before and now gone, replaced by a file, or restricted:
+                # none of these comes back by retrying, and raising would stop
+                # every other folder on every run, so forget it like a delete.
+                logger.warning("Dropbox: a synced folder can no longer be listed; forgetting it.")
                 forget(folder)
                 continue
             synced_folders.add(folder)
@@ -409,11 +419,18 @@ def _iter_rows(
         stats["failed_auth"] += 1
         raise
 
+    rows_stored = 0
+
     def tombstone(file_id: str) -> dict:
         if file_id in stored:
             stored.discard(file_id)
             stats["deleted"] += 1
         return {"id": file_id, "_deleted": True}
+
+    def work_done() -> int:
+        # Rows and real deletes only: a tombstone for an id that was never
+        # stored changes nothing, so it must not hide a bad token.
+        return rows_stored + stats["deleted"]
 
     present_ids = set(index.values())
     # This also tombstones a file added and deleted within the round. That is
@@ -421,7 +438,6 @@ def _iter_rows(
     # stored without the state being saved, and must not be left behind.
     for file_id in sorted(removed_ids - present_ids):
         yield tombstone(file_id)
-    emitted = len(removed_ids - present_ids)
 
     # Files changed this round, then files that failed before and did not
     # change since (None: their metadata is fetched again by id).  Added and
@@ -462,7 +478,7 @@ def _iter_rows(
             stats["failed"] += len(remaining)
             if isinstance(exc, AuthError):
                 stats["failed_auth"] += len(remaining)
-                if not emitted:
+                if not work_done():
                     # Nothing done yet: that's just a bad token, say so.
                     raise
             else:
@@ -480,16 +496,14 @@ def _iter_rows(
         if row is _RETRY:
             if failed(file_id) and file_id in stored:
                 # Given up: its stored text is no longer current, so it goes.
-                emitted += 1
                 yield tombstone(file_id)
         elif row is not None:
             stored.add(file_id)
-            emitted += 1
+            rows_stored += 1
             yield row
         elif file_id in stored:
             # Stored before but skipped now (emptied, too large, renamed to an
             # unsupported type): its old text must not stay in memory.
-            emitted += 1
             yield tombstone(file_id)
 
     # The cursors always move forward: files that failed are kept by id in
@@ -503,6 +517,34 @@ def _iter_rows(
     if next_retry:
         logger.warning("Dropbox: %d file(s) failed and will be retried next run.", len(next_retry))
     logger.info("Dropbox: sync stats %s", stats)
+
+
+def _migrated_stored(index: dict[str, str], retry: dict[str, int]) -> set[str]:
+    """What state saved before ``stored`` existed most likely had in cognee.
+
+    That state only has the index, which also holds files that were skipped
+    or failed.  Those with a type we never read, and those still waiting in
+    retry, were not stored; the rest is the best that can be told.
+    """
+    readable = TEXT_EXTENSIONS | {PDF_EXTENSION}
+    return {
+        file_id
+        for path, file_id in index.items()
+        if posixpath.splitext(path)[1] in readable and file_id not in retry
+    }
+
+
+def _migrated_synced_folders(
+    index: dict[str, str], old_cursors: dict[str, str], folder_paths: Iterable[str]
+) -> set[str]:
+    """Folders that state saved before ``synced_folders`` existed had listed.
+
+    The first version saved no cursors after a run with a failed download, so
+    a folder counts as listed when it has a cursor or any file in the index.
+    """
+    return set(old_cursors) | {
+        folder for folder in folder_paths if any(_is_under(path, folder) for path in index)
+    }
 
 
 # ---------------------------------------------------------------------------

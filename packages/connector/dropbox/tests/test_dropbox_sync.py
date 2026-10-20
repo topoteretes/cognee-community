@@ -309,19 +309,35 @@ def test_listing_errors_raise_and_never_delete(fake, error):
     assert state == before
 
 
-def test_path_error_other_than_not_found_raises(fake):
-    fake.put("/Project/a.md", "alpha")
+@pytest.mark.parametrize(
+    "lookup", [files.LookupError.restricted_content, files.LookupError.not_folder]
+)
+def test_a_synced_folder_that_can_no_longer_be_listed_is_forgotten(fake, lookup):
+    a = fake.put("/Project/a.md", "alpha")
+    other = fake.put("/Other/b.md", "beta")
     state: dict = {}
-    sync(fake, state, ("/project",))
+    sync(fake, state, ("/project", "/other"))
 
-    fake.continue_errors.append(
-        api_error(files.ListFolderContinueError.path(files.LookupError.restricted_content))
-    )
-    fake.list_errors.append(
-        api_error(files.ListFolderError.path(files.LookupError.restricted_content))
-    )
-    with pytest.raises(Exception, match="restricted_content"):
-        sync(fake, state, ("/project",))
+    # Every run from now on, like a folder replaced by a file or restricted.
+    fake.folder_errors["/project"] = lookup
+    _, deletes, _ = sync(fake, state, ("/project", "/other"))
+    assert deletes == [a]
+
+    # The other folder keeps syncing instead of the run failing forever.
+    new = fake.put("/Other/c.md", "gamma")
+    upserts, _, _ = sync(fake, state, ("/project", "/other"))
+    assert set(upserts) == {new} and other in state["index"].values()
+
+
+@pytest.mark.parametrize(
+    "lookup", [files.LookupError.restricted_content, files.LookupError.not_folder]
+)
+def test_a_folder_never_listed_that_cannot_be_read_says_what_to_change(fake, lookup):
+    fake.put("/Project/a.md", "alpha")
+    fake.list_errors.append(api_error(files.ListFolderError.path(lookup)))
+
+    with pytest.raises(DropboxFolderNotFoundError, match="folder_paths"):
+        sync(fake, {}, ("/project",))
 
 
 def test_failed_download_is_kept_by_id_and_retried(fake):
@@ -1013,3 +1029,109 @@ def test_a_paper_doc_that_only_exports_html_is_skipped(fake):
     assert upserts == {}
     assert stats["skipped_unsupported_type"] == 1
     assert fake.exports == []
+
+
+# ---------------------------------------------------------------------------
+# Review round 5: state saved by the first commit (bed0270)
+# ---------------------------------------------------------------------------
+# bed0270 saved ``index`` on every run, ``cursors`` only when no download
+# failed, and none of ``stored``, ``synced_folders`` or ``retry``.  These tests
+# write that state by hand, the way an install of the first commit left it.
+def test_upgrading_with_a_failed_run_and_a_deleted_folder_keeps_syncing(fake):
+    n = fake.put("/N/a.md", "in N")
+    b = fake.put("/M/b.md", "in M")
+    flaky = fake.put("/M/flaky.md", "failed under the first commit")
+    state = {"index": {"/n/a.md": n, "/m/b.md": b, "/m/flaky.md": flaky}}  # no cursors
+
+    fake.delete("/N")
+    for run in range(3):
+        upserts, deletes, _ = sync(fake, state, ("/n", "/m"))
+        if run == 0:
+            assert deletes == [n]
+            assert set(upserts) == {b, flaky}
+    new = fake.put("/M/new.md", "still syncing")
+    upserts, _, _ = sync(fake, state, ("/n", "/m"))
+    assert set(upserts) == {new}
+
+
+def test_upgrading_with_a_folder_dropped_from_the_config_forgets_it(fake):
+    n = fake.put("/N/a.md", "in N")
+    b = fake.put("/M/b.md", "in M")
+    state = {"index": {"/n/a.md": n, "/m/b.md": b}}  # no cursors after a failed run
+
+    _, deletes, stats = sync(fake, state, ("/m",))
+
+    assert deletes == [n]
+    assert stats["deleted"] == 1
+    assert "/n/a.md" not in state["index"] and n not in state["stored"]
+
+
+def test_upgrading_does_not_take_skipped_or_failed_files_for_stored_ones(fake):
+    photo = fake.put("/photo.png", b"\x89PNG")
+    flaky = fake.put("/flaky.md", "waiting in retry")
+    a = fake.put("/a.md", "alpha")
+    sync(fake, {})
+    state = {"index": {"/photo.png": photo, "/flaky.md": flaky, "/a.md": a}, "retry": [flaky]}
+    state["cursors"] = {"": fake._cursor("")}
+
+    fake.put("/photo.png", b"\x89PNG, edited")  # still skipped: was never stored
+    fake.put("/a.md", "   ")  # emptied: was stored, so it must go
+    _, deletes, stats = sync(fake, state)
+
+    assert deletes == [a]
+    assert stats["deleted"] == 1
+    assert photo not in state["stored"]
+
+
+def test_an_older_state_without_synced_folders_forgets_a_deleted_folder(fake):
+    n = fake.put("/N/a.md", "in N")
+    fake.put("/M/b.md", "in M")
+    state: dict = {}
+    sync(fake, state, ("/n", "/m"))
+    del state["synced_folders"]  # saved by 87c3964 or earlier
+
+    fake.delete("/N")
+    _, deletes, _ = sync(fake, state, ("/n", "/m"))
+    assert deletes == [n]
+    sync(fake, state, ("/n", "/m"))  # and the run after does not raise
+    assert n not in state["index"].values()
+
+
+def test_deleted_counts_only_files_that_were_stored(fake):
+    fake.put("/e.md", "   ")  # never stored
+    state: dict = {}
+    sync(fake, state)
+
+    fake.delete("/e.md")
+    _, deletes, stats = sync(fake, state)
+
+    assert len(deletes) == 1, "the tombstone is still sent, it is harmless"
+    assert stats["deleted"] == 0
+
+
+def test_a_bad_token_is_raised_after_deleting_a_file_that_was_never_stored(fake):
+    fake.put("/e.md", "   ")
+    g = fake.put("/g.md", "gamma")
+    state: dict = {}
+    sync(fake, state)
+
+    fake.delete("/e.md")
+    fake.put("/g.md", "gamma, edited")
+    fake.download_errors[g] = AuthError("request-id", "invalid_access_token")
+    with pytest.raises(AuthError):
+        sync(fake, state)
+
+
+def test_a_bad_token_after_a_real_delete_stops_without_raising(fake):
+    a = fake.put("/a.md", "alpha")
+    g = fake.put("/g.md", "gamma")
+    state: dict = {}
+    sync(fake, state)
+
+    fake.delete("/a.md")
+    fake.put("/g.md", "gamma, edited")
+    fake.download_errors[g] = AuthError("request-id", "expired_access_token")
+    _, deletes, stats = sync(fake, state)
+
+    assert deletes == [a], "the delete is kept"
+    assert stats["failed_auth"] == 1 and list(state["retry"]) == [g]
