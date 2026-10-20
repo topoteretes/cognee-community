@@ -155,13 +155,17 @@ context manager from the initial scaffold.
   are checked directly. Only `BlobNotFound` emits a deletion marker. A blob that
   still exists retains its prior document and inventory entry until the next sync.
   Other lookup errors and listing failures abort without advancing the inventory.
+- A `BlobNotFound` during download skips that blob, as S3 skips `NoSuchKey`;
+  it is omitted from the inventory. Previously imported blobs still go through
+  the deletion confirmation above. Container, authorization, and other errors abort.
 - Standard SDK retries handle retryable HTTP/network failures. Exhausted retries,
-  invalid UTF-8, unreadable archive-tier blobs, and failed version checks propagate
+  unreadable archive-tier blobs and failed version checks propagate
   to dlt, leaving the prior loaded rows and inventory intact. Archived blobs are
   not automatically rehydrated or treated as deleted.
 - Supported extensions (case-insensitive): `.txt`, `.md`, `.markdown`, `.json`,
   `.csv`, `.xml`, `.yaml`, `.yml`, `.log`, `.html`, `.htm`, `.rst`. Extraction decodes
-  UTF-8 with an optional BOM; HTML/CSV/JSON remain text. PDFs, DOCX, images, audio,
+  UTF-8 with an optional BOM, replacing invalid bytes with `\ufffd` as S3 does;
+  HTML/CSV/JSON remain text. PDFs, DOCX, images, audio,
   archives, and extensionless blobs are skipped before download. No OCR or binary
   document extraction is provided, matching the GCS/S3 text-only boundary.
 - Unsupported and oversized blobs count toward `max_objects`. Empty folder
@@ -181,6 +185,21 @@ context manager from the initial scaffold.
   cleanup. A successful dlt load does not guarantee subsequent Cognee graph
   processing succeeded; inspect the returned Cognee status and retry failures.
 
+## Alignment with S3
+
+The connector follows [S3 PR #209](https://github.com/topoteretes/cognee-community/pull/209)
+with separate `_build_client`, `_list_objects`, `_is_eligible`, `_read_object`,
+`_decode`, `_object_to_row`, and `_stamp` helpers. Text eligibility and decoding
+reuse its helper implementations from commit
+`8cce7395668dd6ddbe9fe465e5beb4cd676a7209`, adapted for Azure logging. The S3 PR
+currently defines these functions privately in `s3.py`, so this is a local port,
+not a runtime import or a shared module consumed by both packages. A shared
+extraction-module dependency remains a coordination point with the S3 work.
+
+Azure retains ETag-conditioned downloads and the explicit deletion confirmation
+above. Account/container/blob identity, dataset-scoped pipeline state, and the
+Cognee dependency pin also remain Azure-specific.
+
 ## Tests and verification
 
 ```bash
@@ -191,8 +210,9 @@ uv run --locked ruff format --check .
 
 Tests use mocked Azure SDK clients with real temporary SQLite dlt destinations.
 They cover credential precedence, client ownership, updates, unchanged reruns,
-listing pagination/failures, ETag races, deletion confirmation and reappearance, final-row staging
-cleanup, limits, encoding, persistent inventories, and account/dataset scoping.
+listing pagination/failures, ETag races, blobs disappearing during download, deletion
+confirmation and reappearance, final-row staging cleanup, limits, replacement decoding,
+persistent inventories, and account/dataset scoping.
 They need no Azure credentials or model API calls. These tests verify connector
 and staging behavior; they do not constitute live Azure or end-to-end graph/vector
 validation.

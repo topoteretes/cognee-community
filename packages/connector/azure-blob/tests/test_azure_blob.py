@@ -356,21 +356,18 @@ def test_incomplete_paginated_listing_cannot_advance_state_or_delete(sync):
     assert sync.rows() == {sync.uri(): "hello"}
 
 
-@pytest.mark.parametrize("failure", ["overwrite", "expired-sas", "archive-tier", "invalid-utf8"])
+@pytest.mark.parametrize("failure", ["overwrite", "expired-sas", "archive-tier"])
 def test_failed_download_preserves_persisted_state_and_rows(sync, failure):
     sync.listed = [sync.blob()]
     sync.run()
     previous = sync.inventories()
     sync.listed = [sync.blob(etag='"new"')]
-    if failure == "invalid-utf8":
-        sync.blob_client("docs/a.txt").download_blob.return_value.readall.return_value = b"\xff"
-    else:
-        error = (
-            ResourceModifiedError("ETag mismatch")
-            if failure == "overwrite"
-            else HttpResponseError(failure)
-        )
-        sync.downloads().side_effect = error
+    error = (
+        ResourceModifiedError("ETag mismatch")
+        if failure == "overwrite"
+        else HttpResponseError(failure)
+    )
+    sync.downloads().side_effect = error
     with pytest.raises(PipelineStepFailed):
         sync.run()
     assert sync.inventories() == previous
@@ -503,3 +500,51 @@ def test_sas_not_stored_in_rows_or_inventory_and_blob_names_are_escaped(sync):
     assert rows == {sync.uri(name): "hello"}
     assert "SECRET" not in json.dumps(sync.inventories())
     assert "SECRET" not in json.dumps(rows)
+
+
+@pytest.mark.parametrize("payload", [b"hello \xff", b"\xef\xbb\xbfhello \xff"])
+def test_invalid_utf8_is_replaced_like_s3(sync, payload):
+    sync.listed = [sync.blob(payload=payload)]
+    sync.run()
+    assert sync.rows() == {sync.uri(): "hello \ufffd"}
+    sync.downloads().reset_mock()
+    sync.run()
+    sync.downloads().assert_not_called()
+
+
+@pytest.mark.parametrize("stage", ["request", "readall"])
+@pytest.mark.parametrize("previously_imported", [True, False])
+def test_blob_disappearing_during_download_does_not_abort_sync(sync, stage, previously_imported):
+    sync.listed = [sync.blob("docs/keep.txt")]
+    if previously_imported:
+        sync.listed.append(sync.blob())
+    sync.run()
+    sync.listed = [
+        sync.blob("docs/keep.txt"),
+        sync.blob(etag='"new"'),
+        sync.blob("docs/new.txt", payload=b"new document"),
+    ]
+    downloader = sync.downloads()
+    if stage == "request":
+        downloader.side_effect = not_found()
+    else:
+        downloader.return_value.readall.side_effect = not_found()
+    sync.run()
+    assert sync.rows() == {
+        sync.uri("docs/keep.txt"): "hello",
+        sync.uri("docs/new.txt"): "new document",
+    }
+    assert sync.uri() not in sync.inventories()[_scope(ACCOUNT_URL, "documents", "docs/")]
+
+
+@pytest.mark.parametrize("code", ["ContainerNotFound", None, "AuthorizationFailure"])
+def test_other_not_found_errors_during_download_preserve_state(sync, code):
+    sync.listed = [sync.blob()]
+    sync.run()
+    previous = sync.inventories()
+    sync.listed = [sync.blob(etag='"new"')]
+    sync.downloads().side_effect = not_found(code)
+    with pytest.raises(PipelineStepFailed):
+        sync.run()
+    assert sync.inventories() == previous
+    assert sync.rows() == {sync.uri(): "hello"}
