@@ -9,7 +9,8 @@ documents whose source was deleted upstream. Implements
 
 ## Install
 
-Requires Python 3.11–3.13. From this repository's root:
+Requires Python 3.11–3.13 (Cognee 1.6.5 does not support 3.14) and GitLab 15.5 or
+later. From this repository's root:
 
 ```bash
 cd packages/connector/gitlab
@@ -47,8 +48,10 @@ Fine-grained tokens are not supported or tested. They grant access per project
 and per resource, so a working sync would need read permission set separately
 for every selected project and for issues, merge requests, notes (comments), and
 wiki pages. Any permission left out makes that part of the sync fail or come back
-incomplete. The connector's token check also expects the `read_api` scope, so a
-fine-grained token may be rejected before the sync starts. Supporting them would
+incomplete. The connector's token check also expects the `read_api` scope in the token's
+`scopes` field, while GitLab reports fine-grained permissions in a separate
+`granular_scopes` field, so a fine-grained token is likely rejected before the
+sync starts. Supporting them would
 mean testing each permission combination; that is left as a follow-up.
 
 ## Run the example
@@ -105,6 +108,22 @@ inventory used for deletion checks). Use foreground ingestion
 (`run_in_background=False`) so Cognee's orphan cleanup runs after deletions, and
 use a dedicated dataset. Create a new source for each sync.
 
+### Signature
+
+```python
+def gitlab_source(
+    token: str,
+    *,
+    resource_types: Sequence[Literal["issues", "merge_requests", "comments", "wiki"]],
+    base_url: str = "https://gitlab.com",
+    project_ids: Sequence[int | str] | None = None,
+) -> DltSource
+```
+
+Everything after `token` is keyword-only. The return value is a document-mode dlt
+source to pass straight to `cognee.remember()`; the GitLab content is fetched when
+Cognee runs it, not when the source is created.
+
 | Argument | Default | Meaning |
 | --- | --- | --- |
 | `token` | Required | Legacy personal access token with `read_api` (fine-grained tokens are not supported). |
@@ -114,7 +133,21 @@ use a dedicated dataset. Create a new source for each sync.
 
 `gitlab_source()` validates the legacy token immediately (active, with `read_api` or
 `api`) using `GET /personal_access_tokens/self`, so a bad token fails before any
-sync starts. Very old self-managed releases without that endpoint are not supported.
+sync starts. That endpoint first shipped in GitLab 15.5, so older self-managed
+releases are not supported. It checks the token again when the sync runs and stops
+if the token now belongs to a different user.
+
+It raises:
+
+- `ValueError` for invalid arguments: an empty token, an unknown or empty
+  `resource_types`, `comments` without `issues` or `merge_requests`, a `base_url`
+  with credentials, a query string or a non-HTTP(S) scheme, or an empty or invalid
+  `project_ids` entry.
+- `GitLabAPIError` (a `RuntimeError`, importable from
+  `cognee_community_connector_gitlab.gitlab`) when GitLab rejects the token, the
+  token is inactive or lacks `read_api`, or a request fails (network error,
+  timeout, 403, 429, 5xx, or invalid JSON).
+- `RuntimeError` when the installed Cognee lacks document sync support.
 
 ## What gets ingested
 
@@ -128,8 +161,9 @@ Cognee processes:
 | Merge request | The same, with `!iid` and source/target branches |
 | Wiki page | Project, format, source URL, and the page's original markup |
 
-MR commits, diffs, attachments, and repository files are not ingested. Wiki
-markup is kept as-is, not converted to Markdown.
+MR commits, diffs, attachments, and repository files are not ingested. Only
+project-level content is read: group wikis, epics, snippets, releases, and CI/CD
+data are out of scope. Wiki markup is kept as-is, not converted to Markdown.
 
 ### Comments
 
