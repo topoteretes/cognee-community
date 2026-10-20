@@ -10,6 +10,7 @@ import pytest
 import snowflake.connector
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
+from fake_snowflake import FakeConnection
 from snowflake.connector.errors import DatabaseError, ProgrammingError
 
 import cognee_community_connector_snowflake.snowflake as module
@@ -274,43 +275,6 @@ def test_the_driver_banner_is_quieted_only_when_nobody_configured_it(monkeypatch
 
 
 # -- queries and the connection check ------------------------------------------
-
-
-class FakeCursor:
-    def __init__(self, conn):
-        self.conn = conn
-        self.description = None
-        self.rows = []
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
-
-    def execute(self, sql, params=None):
-        self.conn.sql.append(sql)
-        answer = self.conn.answers(sql)
-        if isinstance(answer, Exception):
-            raise answer
-        self.rows = answer
-        self.description = [("column",)]
-
-    def fetchall(self):
-        return self.rows
-
-
-class FakeConnection:
-    def __init__(self, answers):
-        self.answers = answers
-        self.sql = []
-        self.closed = False
-
-    def cursor(self, cursor_class=None):
-        return FakeCursor(self)
-
-    def close(self):
-        self.closed = True
 
 
 def session(warehouse="WH", state="STARTED", auto_resume="true", visible=True):

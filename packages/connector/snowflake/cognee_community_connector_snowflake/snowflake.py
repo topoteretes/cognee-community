@@ -30,6 +30,7 @@ and does not map Snowflake's TIMESTAMP_NTZ type.
 
 import base64
 import hashlib
+import json
 import logging
 import os
 import re
@@ -340,3 +341,189 @@ def _warehouse_problems(conn, report: dict) -> list[str]:
             "AUTO_RESUME = TRUE."
         ]
     return []
+
+
+# ---------------------------------------------------------------------------
+# Table descriptions: one document per table, read without a warehouse.
+#
+# SHOW TABLES, SHOW COLUMNS, SHOW PRIMARY KEYS and SHOW IMPORTED KEYS run in
+# Snowflake's cloud services layer, so describing a whole schema takes four
+# calls and never wakes the warehouse. Only text people wrote and the table's
+# shape go into the document, never row counts, sizes or dates, so a table
+# whose comments and columns did not change renders to the same text.
+# ---------------------------------------------------------------------------
+
+ID_PREFIX = "snowflake:"
+
+
+@dataclass(frozen=True, order=True)
+class _TableRef:
+    database: str
+    schema: str
+    name: str
+
+    @property
+    def fqn(self) -> str:
+        return f"{self.database}.{self.schema}.{self.name}"
+
+    @property
+    def sql(self) -> str:
+        return ".".join(_quote(part) for part in (self.database, self.schema, self.name))
+
+
+def _quote(identifier: str) -> str:
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def _parse_table(reference: str) -> _TableRef:
+    """``DB.SCHEMA.TABLE`` as a user would type it in SQL.
+
+    Unquoted parts are upper-cased, as Snowflake does; parts in double quotes
+    are kept exactly, so lowercase or dotted names still work.
+    """
+    parts, current, quoted, index = [], "", False, 0
+    text = reference.strip()
+    while index < len(text):
+        character = text[index]
+        if character == '"':
+            if quoted and text[index + 1 : index + 2] == '"':
+                current += '"'
+                index += 1
+            else:
+                quoted = not quoted
+                current += "\0" if quoted else ""
+        elif character == "." and not quoted:
+            parts.append(current)
+            current = ""
+        else:
+            current += character
+        index += 1
+    parts.append(current)
+
+    names = []
+    for part in parts:
+        if part.startswith("\0"):
+            names.append(part[1:])
+        else:
+            names.append(part.strip().upper())
+    if quoted or len(names) != 3 or not all(names):
+        raise ValueError(
+            f"Tables are written DATABASE.SCHEMA.TABLE, like SALES_DB.PUBLIC.ORDERS: {reference!r}"
+        )
+    return _TableRef(*names)
+
+
+def _describe_tables(conn, refs: list[_TableRef]) -> tuple[list[dict], list[_TableRef]]:
+    """Description rows for the tables that exist, and the refs that do not.
+
+    A ref is only reported missing when its schema was listed completely;
+    an error listing a schema raises, so it can never look like a dropped table.
+    """
+    rows, missing = [], []
+    schema_comments: dict[str, dict[str, str]] = {}
+    for database, schema in sorted({(ref.database, ref.schema) for ref in refs}):
+        if database not in schema_comments:
+            schema_comments[database] = {
+                row["name"]: row.get("comment") or ""
+                for row in _query(conn, f"SHOW SCHEMAS IN DATABASE {_quote(database)}")
+            }
+        meta = _schema_metadata(conn, database, schema)
+        for ref in sorted(r for r in refs if (r.database, r.schema) == (database, schema)):
+            if ref.name not in meta["tables"]:
+                missing.append(ref)
+                continue
+            rows.append(
+                _render_table(
+                    ref,
+                    meta["tables"][ref.name],
+                    schema_comments[database].get(schema, ""),
+                    meta["columns"].get(ref.name, []),
+                    meta["primary_keys"].get(ref.name, []),
+                    meta["foreign_keys"].get(ref.name, []),
+                )
+            )
+    return rows, missing
+
+
+def _schema_metadata(conn, database: str, schema: str) -> dict:
+    """Tables, columns and declared keys of one schema, four SHOW calls."""
+    where = f"{_quote(database)}.{_quote(schema)}"
+    columns: dict[str, list[dict]] = {}
+    for row in _query(conn, f"SHOW COLUMNS IN SCHEMA {where}"):
+        columns.setdefault(row["table_name"], []).append(row)
+    primary_keys: dict[str, list[dict]] = {}
+    for row in _query(conn, f"SHOW PRIMARY KEYS IN SCHEMA {where}"):
+        primary_keys.setdefault(row["table_name"], []).append(row)
+    foreign_keys: dict[str, list[dict]] = {}
+    for row in _query(conn, f"SHOW IMPORTED KEYS IN SCHEMA {where}"):
+        foreign_keys.setdefault(row["fk_table_name"], []).append(row)
+    return {
+        "tables": {row["name"]: row for row in _query(conn, f"SHOW TABLES IN SCHEMA {where}")},
+        "columns": columns,
+        "primary_keys": {
+            table: [r["column_name"] for r in sorted(keys, key=lambda r: int(r["key_sequence"]))]
+            for table, keys in primary_keys.items()
+        },
+        "foreign_keys": foreign_keys,
+    }
+
+
+def _render_table(ref, table, schema_comment, columns, primary_key, foreign_keys) -> dict:
+    """One document describing what a table holds and how it links to others."""
+    lines = [f"Snowflake table {ref.fqn}"]
+    comment = " ".join(str(table.get("comment") or "").split())
+    if comment:
+        lines.append(comment)
+    if schema_comment:
+        lines.append(f"Schema {ref.database}.{ref.schema}: {' '.join(schema_comment.split())}")
+    if primary_key:
+        lines.extend(["", "Primary key: " + ", ".join(primary_key)])
+
+    lines.extend(["", "Columns:"])
+    for column in columns:
+        line = f"{column['column_name']} ({_column_type(column.get('data_type'))}"
+        line += ", required)" if column.get("null?") == "NOT_NULL" else ")"
+        column_comment = " ".join(str(column.get("comment") or "").split())
+        lines.append(f"{line}: {column_comment}" if column_comment else line)
+
+    links = _foreign_key_lines(foreign_keys)
+    if links:
+        lines.extend(["", "References:", *links])
+
+    return {
+        "id": f"{ID_PREFIX}table:{ref.fqn}",
+        "title": ref.fqn,
+        "content": "\n".join(lines),
+        "_deleted": False,
+    }
+
+
+def _foreign_key_lines(foreign_keys: list[dict]) -> list[str]:
+    """``ORDERS.CUSTOMER_ID -> CUSTOMERS.CUSTOMER_ID``, one line per constraint."""
+    by_constraint: dict[str, list[dict]] = {}
+    for row in foreign_keys:
+        by_constraint.setdefault(row.get("fk_name") or "", []).append(row)
+    lines = []
+    for _, parts in sorted(by_constraint.items()):
+        parts = sorted(parts, key=lambda r: int(r.get("key_sequence") or 0))
+        first = parts[0]
+        target = f"{first['pk_database_name']}.{first['pk_schema_name']}.{first['pk_table_name']}"
+        own = ", ".join(p["fk_column_name"] for p in parts)
+        theirs = ", ".join(p["pk_column_name"] for p in parts)
+        lines.append(f"{own} references {target} ({theirs})")
+    return lines
+
+
+def _column_type(data_type: Any) -> str:
+    """Readable SQL type from SHOW COLUMNS' JSON, like NUMBER(12,2) or VARCHAR(20)."""
+    try:
+        info = json.loads(data_type) if isinstance(data_type, str) else dict(data_type or {})
+    except (TypeError, ValueError):
+        return str(data_type or "unknown")
+    kind = str(info.get("type") or "unknown")
+    if kind == "FIXED":
+        return f"NUMBER({info.get('precision', 38)},{info.get('scale', 0)})"
+    if kind == "TEXT":
+        length = info.get("length")
+        return f"VARCHAR({length})" if length and length < 16777216 else "VARCHAR"
+    return {"REAL": "FLOAT"}.get(kind, kind)
