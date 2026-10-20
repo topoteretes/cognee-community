@@ -45,16 +45,19 @@ Design (behaviour checked against a live Zoho CRM v8 account, India DC)
   after every module finished. Paging follows ``next_page_token`` and falls back
   to ``page`` numbers when a list does not return one.
 * **Forget-on-delete** - the Deleted Records API (``/{module}/deleted``, sent with
-  ``If-Modified-Since``) tombstones deleted records, notes and attachments, and
-  notes / attachments of a deleted record. Every ``reconcile_every`` runs, the
+  ``If-Modified-Since``) tombstones deleted records and notes, plus notes and
+  attachments of a deleted parent. An attachment removed by itself is noticed
+  only when its parent record is modified and re-listed. Every ``reconcile_every`` runs, the
   ids of each module are listed and every id that vanished is re-checked one by
   one before it is forgotten; this also catches converted leads, which leave
   ``Leads`` without showing up as deleted. A module removed from ``modules`` is
   forgotten with its notes and attachments.
 * **Safe failure** - ``5xx`` and network errors are retried; a rate-limit wait
-  longer than ``max_rate_limit_wait`` stops the run cleanly (nothing moves,
-  nothing is forgotten, ``failed_rate_limit`` is counted); any other error
-  aborts the run. Errors carry the status and Zoho's error code, never bodies.
+  longer than ``max_rate_limit_wait`` stops all interleaved resources before
+  their next request. The stopped resource moves no cursor; a resource that
+  already finished keeps its cursor. Attachment parent checkpoints are kept so
+  a large fan-out can resume. Any other error aborts the run. Errors carry the
+  status and Zoho's error code, never bodies.
 """
 
 from __future__ import annotations
@@ -163,6 +166,10 @@ class _UnstableListingError(Exception):
     pass
 
 
+class _RunStoppedError(Exception):
+    """Another interleaved resource already stopped this extraction."""
+
+
 @dataclass(frozen=True)
 class _Options:
     modules: tuple[str, ...] = DEFAULT_MODULES
@@ -229,11 +236,13 @@ def zoho_crm_source(
     """
     import dlt
 
-    if getattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 0) < 1:
+    if getattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 0) < 1 or not hasattr(
+        dlt_utils, "PIPELINE_SCOPE_ATTR"
+    ):
         raise RuntimeError(
             "The Zoho CRM connector needs a cognee build with table-scoped DLT document "
-            "cleanup (cognee >= 1.6.1). Upgrade cognee before syncing, so a sync cannot "
-            "delete another source's data."
+            "cleanup and PIPELINE_SCOPE_ATTR (cognee >= 1.6.1). Upgrade cognee before "
+            "syncing, so a sync cannot delete another source's data."
         )
     if not isinstance(resource_name, str) or not _RESOURCE_NAME_RE.match(resource_name):
         raise ValueError(
@@ -247,6 +256,8 @@ def zoho_crm_source(
         raise ValueError(f"Unknown Zoho region {region!r}. Use one of: {sorted(REGIONS)}.")
     if service is not None and client is not None and service is not client:
         raise ValueError("Pass either service= or client=, not both.")
+    if isinstance(modules, str):
+        raise TypeError("modules must be an iterable of module names, not a string.")
     if not isinstance(reconcile_every, int) or reconcile_every < 1:
         raise ValueError("reconcile_every must be a positive integer.")
     http = service if service is not None else client
@@ -338,12 +349,14 @@ def _count(stats: dict[str, int], key: str, amount: int = 1) -> None:
 
 
 def _stop_cleanly(rows: Iterator[dict], stats: dict[str, int]) -> Iterator[dict]:
-    """End the run without error on a long rate limit; state stays untouched."""
+    """End cleanly on a long limit; cursors stay put, resume checkpoints may persist."""
     try:
         yield from rows
     except RateLimitedError as exc:
         _count(stats, "failed_rate_limit")
         logger.warning("Zoho CRM: %s Stopping this run; the next run continues.", exc)
+    except _RunStoppedError:
+        return  # another interleaved resource already hit a long rate limit
 
 
 # ---------------------------------------------------------------------------
@@ -421,6 +434,8 @@ class _Api:
             raise
 
     def _send_once(self, path: str, params: dict | None, headers: dict | None) -> Any:
+        if self._stats.get("failed_rate_limit"):
+            raise _RunStoppedError
         if self._token.access_token is None:
             self._token.refresh()
         refreshed = False
@@ -673,7 +688,10 @@ def _sync_records(
     state["cursors"] = dict.fromkeys(options.modules, cursor_now)
     state["known"] = known
     state["config"] = config
-    state["runs_since_reconcile"] = 0 if (do_reconcile or first_run) else runs
+    backlog = stats.pop("_reconcile_backlog", 0)
+    state["runs_since_reconcile"] = (
+        options.reconcile_every if backlog else (0 if (do_reconcile or first_run) else runs)
+    )
 
 
 def _vanished(api: _Api, module: str, candidates: set[str], stats: dict[str, int]) -> set[str]:
@@ -693,13 +711,17 @@ def _vanished(api: _Api, module: str, candidates: set[str], stats: dict[str, int
         return set()
     missing = sorted(candidates - present)
     if len(missing) > MAX_VERIFY:
-        _count(stats, "reconcile_skipped")
+        deferred = len(missing) - MAX_VERIFY
+        missing = missing[:MAX_VERIFY]
+        stats["_reconcile_backlog"] = stats.get("_reconcile_backlog", 0) + deferred
         logger.warning(
-            "Zoho CRM: %d %s records look vanished at once; treating the listing as broken.",
-            len(missing),
+            "Zoho CRM: verifying the first %d of %d vanished %s records; "
+            "the remaining %d continue next run.",
+            MAX_VERIFY,
+            MAX_VERIFY + deferred,
             module,
+            deferred,
         )
-        return set()
     gone = set()
     for record_id in missing:
         record = (
@@ -779,8 +801,9 @@ def _deleted_parents(api: _Api, modules: Iterable[str], since: str) -> set[str]:
 
 def _sync_notes(api: _Api, state: dict, options: _Options, stats: dict[str, int]) -> Iterator[dict]:
     modules = sorted(options.modules)
-    cursor = state.get("cursor") if state.get("modules") == modules else None
-    since = cursor or options.modified_since
+    cursor = state.get("cursor")
+    same_modules = state.get("modules") == modules
+    since = cursor if same_modules else options.modified_since
     # note id -> [parent module, parent id]
     parents: dict[str, list[str]] = {k: list(v) for k, v in (state.get("parents") or {}).items()}
     gone: set[str] = set()
@@ -847,8 +870,9 @@ def _sync_attachments(
     api: _Api, state: dict, options: _Options, stats: dict[str, int]
 ) -> Iterator[dict]:
     modules = sorted(options.modules)
-    cursor = state.get("cursor") if state.get("modules") == modules else None
-    since = cursor or options.modified_since
+    cursor = state.get("cursor")
+    same_modules = state.get("modules") == modules
+    since = cursor if same_modules else options.modified_since
     # attachment id -> [parent module, parent id]
     owners: dict[str, list[str]] = {k: list(v) for k, v in (state.get("owners") or {}).items()}
     gone: set[str] = set()
@@ -856,10 +880,26 @@ def _sync_attachments(
         if module not in options.modules:
             gone.add(att_id)
 
+    # A clean rate-limit stop commits dlt state. Checkpoint completed parents so
+    # a large first run resumes its N+1 attachment fan-out instead of starting
+    # from the first parent forever. The record list is cheap and is repeated;
+    # only per-parent attachment calls are skipped.
+    progress = state.get("progress") or {}
+    if (
+        progress.get("modules") != modules
+        or progress.get("since") != since
+        or not isinstance(progress.get("processed"), dict)
+    ):
+        progress = {"modules": modules, "since": since, "processed": {}}
+    processed = {m: set(ids) for m, ids in progress["processed"].items()}
+
     for module in options.modules:
+        done = processed.setdefault(module, set())
         # Records changed since the cursor (all on a first run) are re-listed.
         for record in _iter_pages(api, module, {"fields": "id"}, _since_header(since)):
             record_id = str(record["id"])
+            if record_id in done:
+                continue
             listed: set[str] = set()
             path = f"{module}/{record_id}/Attachments"
             for item in _iter_pages(api, path, {"fields": _ATTACHMENT_FIELDS}):
@@ -887,12 +927,23 @@ def _sync_attachments(
                     "url": f"{options.web_base}/crm/tab/{module}/{record_id}",
                     "_deleted": False,
                 }
-            # Attachments removed from a re-listed record are forgotten.
-            gone.update(
+            # Attachment removals are observable only when the parent is listed.
+            removed = {
                 a
                 for a, (m, r) in owners.items()
                 if m == module and r == record_id and a not in listed
-            )
+            }
+            for att_id in sorted(removed):
+                owners.pop(att_id, None)
+                _count(stats, "attachments_forgotten")
+                yield {"id": f"Attachments:{att_id}", "_deleted": True}
+            done.add(record_id)
+            state["owners"] = owners
+            state["progress"] = {
+                "modules": modules,
+                "since": since,
+                "processed": {m: sorted(ids) for m, ids in processed.items()},
+            }
 
     if cursor:
         dead = _deleted_parents(api, options.modules, cursor)
@@ -905,6 +956,7 @@ def _sync_attachments(
     state["cursor"] = _new_cursor(api)
     state["modules"] = modules
     state["owners"] = owners
+    state.pop("progress", None)
 
 
 def _to_int(value: Any) -> int | None:

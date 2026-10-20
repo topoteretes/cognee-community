@@ -371,14 +371,38 @@ def test_notes_paged_by_page_number_as_documented():
     assert [q.get("page") for _, q, _ in fake.paths("Notes")] == [None, 2, 3]
 
 
-def test_repeated_page_token_raises():
+def test_repeated_page_token_raises_before_any_duplicate_id():
     class Api:
-        def get(self, path, params=None, headers=None):
-            n = len(params.get("page_token", ""))
-            return {"data": [{"id": n}], "info": {"more_records": True, "next_page_token": "same"}}
+        calls = 0
 
-    with pytest.raises(_UnstableListingError):
+        def get(self, path, params=None, headers=None):
+            self.calls += 1
+            return {
+                "data": [{"id": self.calls}],  # unique: only the repeated token can fail
+                "info": {"more_records": True, "next_page_token": "same"},
+            }
+
+    with pytest.raises(_UnstableListingError, match="repeated a page token"):
         list(_iter_pages(Api(), "Leads", {"fields": "id"}))
+
+
+def test_check_active_runs_before_each_request_and_can_abort():
+    fake = FakeZoho()
+    checks = []
+    token = zc._Token(fake, "https://accounts.zoho.eu", "c", "s", "r")
+    api = zc._Api(fake, token, {}, lambda: checks.append("checked"), 120)
+    api.get("settings/fields", {"module": "Leads"})
+    api.get("settings/fields", {"module": "Deals"})
+    assert len(checks) == 2
+
+    def inactive():
+        raise PermissionError("inactive")
+
+    stopped = zc._Api(fake, token, {}, inactive, 120)
+    before = len(fake.calls)
+    with pytest.raises(PermissionError, match="inactive"):
+        stopped.get("settings/fields", {"module": "Leads"})
+    assert len(fake.calls) == before  # checkpoint is before the HTTP request
 
 
 def test_source_configuration_and_validation():
@@ -404,11 +428,20 @@ def test_source_configuration_and_validation():
         _src(fake, region="mars")
     with pytest.raises(ValueError, match="resource_name"):
         _src(fake, resource_name="Bad Name")
+    with pytest.raises(TypeError, match="not a string"):
+        _src(fake, modules="Leads")
 
 
 def test_old_cognee_core_is_refused(monkeypatch):
     monkeypatch.setattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 0)
     with pytest.raises(RuntimeError, match=r"1\.6\.1"):
+        _src(FakeZoho())
+
+
+def test_core_without_pipeline_scope_attr_is_refused(monkeypatch):
+    monkeypatch.setattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 1)
+    monkeypatch.delattr(dlt_utils, "PIPELINE_SCOPE_ATTR")
+    with pytest.raises(RuntimeError, match="PIPELINE_SCOPE_ATTR"):
         _src(FakeZoho())
 
 
@@ -500,6 +533,20 @@ def test_converted_lead_is_forgotten_by_reconcile(tmp_path):
     assert set(_rows(pipeline)) == {"Leads:2", "Deals:d1"}
 
 
+def test_more_than_max_verify_converted_leads_make_progress(tmp_path):
+    leads = [_lead(str(i)) for i in range(251)]
+    fake = FakeZoho({"Leads": leads, "Deals": []}, page_size=200)
+    _run(tmp_path, fake)
+    for lead in fake.records["Leads"][:250]:
+        lead["Converted__s"] = True
+
+    pipeline, source = _run(tmp_path, fake)
+    assert len(_rows(pipeline)) == 51  # 200 confirmed and forgotten this run
+    assert source.cognee_sync_stats.get("reconcile_skipped", 0) == 0
+    pipeline, _ = _run(tmp_path, fake)
+    assert set(_rows(pipeline)) == {"Leads:250"}
+
+
 def test_live_record_missing_from_listing_is_kept_after_recheck(tmp_path):
     fake = FakeZoho({"Leads": [_lead("1"), _lead("2")], "Deals": [_deal()]})
     _run(tmp_path, fake)
@@ -533,9 +580,13 @@ def test_module_removed_is_forgotten_and_module_added_backfills_notes(tmp_path):
     pipeline, _ = _run(tmp_path, fake, modules=["Leads"])
     assert set(_rows(pipeline)) == {"Leads:1"}
     assert set(_rows(pipeline, "zoho_crm_notes")) == {"Notes:n1"}
-    pipeline, _ = _run(tmp_path, fake, modules=["Leads", "Deals"])  # add Deals later
+    # Change modules while a note deletion is pending. Listing must backfill the
+    # added module, while the deleted feed must still use the old cursor.
+    fake.notes = [_note("n2", "d1", module="Deals")]
+    fake.deleted["Notes"] = [{"id": "n1", "deleted_time": "2999-01-01T00:00:00+00:00"}]
+    pipeline, _ = _run(tmp_path, fake, modules=["Leads", "Deals"])
     assert set(_rows(pipeline)) == {"Leads:1", "Deals:d1"}
-    assert set(_rows(pipeline, "zoho_crm_notes")) == {"Notes:n1", "Notes:n2"}  # old note too
+    assert set(_rows(pipeline, "zoho_crm_notes")) == {"Notes:n2"}
     pipeline, _ = _run(tmp_path, fake, modules=["Deals"])  # drop Leads
     assert set(_rows(pipeline)) == {"Deals:d1"}
     assert set(_rows(pipeline, "zoho_crm_notes")) == {"Notes:n2"}
@@ -606,26 +657,92 @@ def test_attachment_removed_or_parent_deleted_is_forgotten(tmp_path):
     assert set(_rows(pipeline, "zoho_crm_attachments")) == {"Attachments:t1"}
 
 
-def test_long_rate_limit_stops_cleanly_and_moves_no_cursor(tmp_path, monkeypatch):
-    """A clean stop keeps dlt state, so no cursor may move before every module is done."""
-    fake = FakeZoho({"Leads": [_lead("1")], "Deals": [_deal()]})
+def test_long_rate_limit_stops_interleaved_resources_per_request(tmp_path, monkeypatch):
+    """A page-3 stop halts Notes before its next request; neither cursor moves."""
+    fake = FakeZoho(
+        {"Leads": [_lead(str(i)) for i in range(4)], "Deals": []},
+        notes=[_note(f"n{i}", str(i)) for i in range(4)],
+        page_size=1,
+    )
     pipeline, _ = _run(tmp_path, fake)
     cursors = dict(_state(pipeline)["cursors"])
     notes_cursor = _state(pipeline, "zoho_crm_notes")["cursor"]
     later = datetime(2026, 10, 21, 9, 0, 0, tzinfo=timezone.utc)
-    monkeypatch.setitem(globals(), "SERVER_NOW", later)  # Zoho's clock moved on
+    monkeypatch.setitem(globals(), "SERVER_NOW", later)
+    for lead in fake.records["Leads"]:
+        lead["Modified_Time"] = "2999-01-01T00:00:00+00:00"
+    for note in fake.notes:
+        note["Modified_Time"] = "2999-01-01T00:00:00+00:00"
     real_get = fake.get
+    stopped_at = []
 
     def limited(url, params=None, headers=None):
-        if "/Deals" in url and "settings" not in url:  # Leads finishes, Deals is limited
+        path = urlsplit(url).path
+        if path.endswith("/Leads") and (params or {}).get("page_token") == "2":
+            stopped_at.append(len(fake.calls))
             return FakeResponse(429, headers={"Retry-After": "900"})
         return real_get(url, params, headers)
 
     fake.get = limited
-    pipeline, source = _run(tmp_path, fake)  # no exception
-    assert source.cognee_sync_stats["failed_rate_limit"] == 1  # notes step skipped
-    assert _state(pipeline)["cursors"] == cursors  # not even the finished Leads cursor
+    pipeline, source = _run(tmp_path, fake)
+    assert source.cognee_sync_stats["failed_rate_limit"] == 1
+    assert _state(pipeline)["cursors"] == cursors
     assert _state(pipeline, "zoho_crm_notes")["cursor"] == notes_cursor
+    assert stopped_at
+    # _Api checks the shared flag before calling the fake again.
+    assert not any(path == "Notes" for path, _, _ in fake.calls[stopped_at[0] :])
+
+
+def test_attachment_fanout_resumes_completed_parents(tmp_path):
+    deals = [_deal(str(i)) for i in range(10)]
+    fake = FakeZoho({"Leads": [], "Deals": deals}, page_size=10)
+    real_get = fake.get
+    attachment_calls = []
+
+    def limited(url, params=None, headers=None):
+        path = urlsplit(url).path.split(f"/crm/{zc.API_VERSION}/", 1)[1]
+        if path.endswith("/Attachments"):
+            attachment_calls.append(path)
+            if len(attachment_calls) == 4:
+                return FakeResponse(429, headers={"Retry-After": "900"})
+        return real_get(url, params, headers)
+
+    fake.get = limited
+    pipeline, source = _run(tmp_path, fake, include_attachments=True)
+    state = _state(pipeline, "zoho_crm_attachments")
+    assert source.cognee_sync_stats["failed_rate_limit"] == 1
+    assert "cursor" not in state
+    assert len(state["progress"]["processed"]["Deals"]) == 3
+
+    fake.get = real_get
+    fake.calls.clear()
+    pipeline, _ = _run(tmp_path, fake, include_attachments=True)
+    calls = [p for p, _, _ in fake.calls if p.endswith("/Attachments")]
+    assert len(calls) == 7  # the first three completed parent calls were checkpointed
+    assert "progress" not in _state(pipeline, "zoho_crm_attachments")
+
+
+def test_attachment_removed_without_parent_change_is_documented_gap(tmp_path):
+    fake = FakeZoho(
+        {"Leads": [], "Deals": [_deal()]},
+        attachments={("Deals", "d1"): [_att("t1", "a.txt", b"one")]},
+    )
+    _run(tmp_path, fake, include_attachments=True)
+    fake.attachments[("Deals", "d1")] = []  # parent Modified_Time is unchanged
+    pipeline, _ = _run(tmp_path, fake, include_attachments=True)
+    assert set(_rows(pipeline, "zoho_crm_attachments")) == {"Attachments:t1"}
+
+
+def test_attachment_dead_parent_checked_when_modules_change(tmp_path):
+    fake = FakeZoho(
+        {"Leads": [_lead("1")], "Deals": [_deal()]},
+        attachments={("Leads", "1"): [_att("t1", "a.txt", b"one")]},
+    )
+    _run(tmp_path, fake, modules=["Leads"], include_attachments=True)
+    fake.records["Leads"] = []
+    fake.deleted["Leads"] = [{"id": "1", "deleted_time": "2999-01-01T00:00:00+00:00"}]
+    pipeline, _ = _run(tmp_path, fake, modules=["Leads", "Deals"], include_attachments=True)
+    assert _rows(pipeline, "zoho_crm_attachments") == {}
 
 
 def test_two_sources_in_one_dataset_keep_separate_state(tmp_path):

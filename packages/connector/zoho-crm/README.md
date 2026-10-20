@@ -130,7 +130,9 @@ Leads module has 55). The connector asks for at most 50 (see Known gaps).
 Modified` when nothing changed. The filter is inclusive, so a record changed at the cursor time is
 read again; `merge` makes that harmless. Cursors come from **Zoho's clock** (the `Date` header of the
 run's first response) minus a 5-minute overlap, so a local clock that runs ahead cannot hide changes.
-**All cursors move together**, only after every module finished; a failed or stopped run moves none.
+The record-module cursors move together only after every module finishes. Records, notes and
+attachments are separate dlt resources: a resource stopped by a long rate limit moves no cursor,
+while a resource that already finished keeps its cursor.
 
 **Paging.** Record lists follow `next_page_token`, so there is no 2,000-record ceiling. `GET /Notes` is
 documented with `page` / `per_page` only (a live v8 account also returns a token); the connector follows
@@ -158,9 +160,10 @@ for every record changed since the last run (all records on the first run). Atta
 a re-listed record are forgotten.
 
 **Failures.** `5xx` and network errors are retried with backoff. A `Retry-After` up to
-`max_rate_limit_wait` is slept; a longer one **stops the run cleanly** (what was read is kept, no
-cursor moves, nothing is forgotten, `failed_rate_limit` is counted). Any other error aborts the run.
-Errors carry the HTTP status and Zoho's error code, never response bodies.
+`max_rate_limit_wait` is slept; a longer one stops all interleaved resources before their next API
+request. The stopped resource moves no cursor; already completed resources keep theirs, and completed
+attachment-parent checkpoints are saved so a large first run resumes instead of restarting. Any other
+error aborts the run. Errors carry the HTTP status and Zoho's error code, never response bodies.
 
 ## Known gaps
 
@@ -172,13 +175,14 @@ Errors carry the HTTP status and Zoho's error code, never response bodies.
 * **`GET /Notes` needs an admin profile.** With a non-admin token, set `include_notes=False`.
 * **More than 49 usable fields.** A module whose usable fields still exceed 49 is cut to the first 49
   (Zoho's limit is 50 including `id`); a warning is logged.
-* **Attachments added without editing the record.** Attachments are re-listed for records that
-  changed; if adding a file does not bump the record's modified time in your org, it is picked up the
-  next time the record changes.
+* **Attachment changes without editing the record.** Attachments are re-listed for records that
+  changed. If adding or removing a file does not bump the record's modified time in your org, that
+  change is noticed only the next time the parent record changes.
 * **State lives in dlt.** Cursors and known ids are in the dlt pipeline state; if it is lost, the next
   run is a full backfill.
 * **Credits.** Zoho meters API use in credits per day. A quiet run costs about two requests per module
-  (`304` list + `304` deleted feed) plus the field metadata; a reconcile adds one request per 200 records.
+  (`304` list + `304` deleted feed) plus field metadata. A reconcile adds one request per 200 records.
+  Attachment sync fans out to one list request per changed parent record, plus one download per kept file.
 
 ## Privacy
 
