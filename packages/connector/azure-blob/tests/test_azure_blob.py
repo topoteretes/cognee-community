@@ -1,11 +1,17 @@
-"""Azure SDK doubles with real SQLite dlt loads and persistent resource state."""
+"""Azure connector tests organized like S3's helper and dlt-pipeline suites.
+
+Helper tests exercise listing, extraction, row building and document routing.
+Sync tests use Azure SDK doubles with real temporary SQLite dlt destinations
+and persistent resource state; they make no live Azure or model API calls.
+"""
 
 import copy
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from urllib.parse import quote
+from uuid import NAMESPACE_OID, uuid5
 
 import dlt
 import pytest
@@ -17,7 +23,19 @@ from cognee.tasks.ingestion.dlt_utils import (
     pipeline_name_for_source,
 )
 from cognee_community_connector_azure_blob import azure_blob_source
-from cognee_community_connector_azure_blob.azure_blob import TEXT_EXTENSIONS, _scope
+from cognee_community_connector_azure_blob.azure_blob import (
+    AZURE_BLOB_SOURCE_NAME,
+    AZURE_BLOB_TABLE_NAME,
+    TEXT_EXTENSIONS,
+    _build_client,
+    _decode,
+    _is_eligible,
+    _list_objects,
+    _object_to_row,
+    _read_object,
+    _scope,
+    _stamp,
+)
 from dlt.pipeline.exceptions import PipelineStepFailed
 
 ACCOUNT_URL = "https://example.blob.core.windows.net"
@@ -29,15 +47,9 @@ def not_found(code="BlobNotFound"):
     return error
 
 
-@pytest.fixture(autouse=True)
-def clear_azure_credentials(monkeypatch):
-    monkeypatch.setenv("RUNTIME__DLTHUB_TELEMETRY", "false")
-    for name in (
-        "AZURE_STORAGE_ACCOUNT_URL",
-        "AZURE_STORAGE_SAS_TOKEN",
-        "AZURE_STORAGE_KEY",
-    ):
-        monkeypatch.delenv(name, raising=False)
+# ---------------------------------------------------------------------------
+# Fixtures / fakes
+# ---------------------------------------------------------------------------
 
 
 class AzureSync:
@@ -113,6 +125,140 @@ def sync(tmp_path):
     return AzureSync(tmp_path)
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def test_list_objects_scopes_to_prefix_and_skips_directories(sync):
+    sync.listed = [
+        sync.blob(),
+        sync.blob("docs/sub/b.md"),
+        sync.blob("docs/sub/", payload=b""),
+        sync.blob("other/c.txt"),
+    ]
+    assert set(_list_objects(sync.container, "docs/", 10)) == {"docs/a.txt", "docs/sub/b.md"}
+
+
+def test_list_objects_follows_pagination(sync):
+    from azure.core.paging import ItemPaged
+
+    a, b = sync.blob(), sync.blob("docs/b.txt")
+    pages = MagicMock(side_effect=[([a], "next"), ([b], None)])
+    sync.container.list_blobs.return_value = ItemPaged(
+        pages, lambda response: (response[1], response[0])
+    )
+    sync.container.list_blobs.side_effect = None
+    assert set(_list_objects(sync.container, "docs/", 10)) == {"docs/a.txt", "docs/b.txt"}
+    assert pages.call_count == 2
+
+
+def test_list_objects_aborts_over_max_objects(sync):
+    sync.listed = [sync.blob(), sync.blob("docs/b.txt")]
+    assert len(_list_objects(sync.container, "docs/", 2)) == 2
+    with pytest.raises(ValueError, match="max_objects"):
+        _list_objects(sync.container, "docs/", 1)
+
+
+def test_is_eligible_filters_type_and_size():
+    assert _is_eligible("docs/a.md", 10, 100)
+    assert _is_eligible("docs/A.TXT", 100, 100)
+    assert not _is_eligible("docs/a.pdf", 10, 100)
+    assert not _is_eligible("docs/README", 10, 100)
+    assert not _is_eligible("docs.v2/README", 10, 100)
+    assert not _is_eligible("docs/big.txt", 101, 100)
+
+
+def test_decode_strips_bom_and_replaces_invalid_bytes():
+    assert _decode("\ufeffhello".encode()) == "hello"
+    assert _decode(b"ok \xff") == "ok \ufffd"
+    assert _decode(b"") == ""
+
+
+def test_read_object_returns_text_or_none_when_blob_vanished(sync):
+    blob = sync.blob(payload=b"\xef\xbb\xbfbody")
+    assert _read_object(sync.container, blob) == "body"
+    sync.downloads().assert_called_once_with(
+        etag=blob.etag, match_condition=MatchConditions.IfNotModified
+    )
+    sync.downloads().side_effect = not_found()
+    assert _read_object(sync.container, blob) is None
+
+
+def test_object_to_row_keeps_only_stable_fields():
+    uri = f"{ACCOUNT_URL}/documents/docs/a.txt"
+    assert _object_to_row(uri, "docs/a.txt", "body") == {
+        "id": uri,
+        "url": uri,
+        "title": "docs/a.txt",
+        "content": "body",
+    }
+
+
+def test_build_document_data_item_tags_source():
+    from cognee.tasks.ingestion.resolve_dlt_sources import _build_document_data_item
+
+    uri = f"{ACCOUNT_URL}/documents/docs/a.txt"
+    row = SimpleNamespace(
+        row_data=_object_to_row(uri, "docs/a.txt", "body"),
+        table_name=AZURE_BLOB_TABLE_NAME,
+    )
+    data_id = uuid5(NAMESPACE_OID, uri)
+    item = _build_document_data_item(row, data_id, AZURE_BLOB_SOURCE_NAME)
+    # Cognee 1.6.5 stores trusted source/provenance in system_metadata.
+    assert item.system_metadata["source"] == "azure_blob"
+    assert item.system_metadata["url"] == uri
+    assert item.system_metadata["external_id"] == uri
+    assert item.data_id == data_id
+    assert item.literal_text is True
+    assert "body" in item.data
+
+
+@pytest.mark.parametrize("credential", ["test-account-key", "sv=2023-11-03&sp=rl&sr=c&sig=fake"])
+def test_build_client_accepts_account_key_or_sas(credential):
+    # Construct real SDK clients without sending requests or using real credentials.
+    with _build_client(ACCOUNT_URL, credential) as client:
+        assert isinstance(client, BlobServiceClient)
+        assert client.url.split("?", 1)[0].rstrip("/") == ACCOUNT_URL
+        container = client.get_container_client("documents")
+        assert container.url.split("?", 1)[0] == f"{ACCOUNT_URL}/documents"
+
+
+def test_stamp_normalizes_utc_and_preserves_etag(sync):
+    blob = sync.blob(
+        etag='"version-0"',
+        modified=datetime(2026, 10, 20, 15, 30, tzinfo=timezone(timedelta(hours=5, minutes=30))),
+    )
+    assert _stamp(blob) == {
+        "last_modified": "2026-10-20T10:00:00Z",
+        "etag": '"version-0"',
+    }
+
+
+@pytest.mark.parametrize("field", ["etag", "last_modified"])
+def test_stamp_rejects_missing_change_metadata(sync, field):
+    blob = sync.blob()
+    setattr(blob, field, None)
+    with pytest.raises(ValueError, match="missing ETag or Last-Modified"):
+        _stamp(blob)
+
+
+def test_document_routing_and_cognee_pipeline_namespace(sync):
+    source = sync.source()
+    assert getattr(source, DOCUMENT_SOURCE_ATTR) == "azure_blob"
+    same = sync.source()
+    other_prefix = sync.source(prefix="notes/")
+    assert pipeline_name_for_source(source, "a") == pipeline_name_for_source(same, "a")
+    names = {
+        pipeline_name_for_source(source, "a"),
+        pipeline_name_for_source(source, "b"),
+        pipeline_name_for_source(other_prefix, "a"),
+    }
+    assert len(names) == 3
+    sync.client.url = "https://other.blob.core.windows.net"
+    assert pipeline_name_for_source(sync.source(), "a") not in names
+
+
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [
@@ -136,6 +282,11 @@ def test_rejects_invalid_configuration(sync, kwargs, message):
 def test_missing_configuration_has_helpful_error(account_url, credentials, message):
     with pytest.raises(ValueError, match=message):
         azure_blob_source("documents", "docs/", account_url=account_url, credentials=credentials)
+
+
+# ---------------------------------------------------------------------------
+# dlt pipeline: ingest, incremental cursor, forget-on-delete
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -246,6 +397,23 @@ def test_nonmerge_downloads_unchanged_content_as_snapshot(sync, disposition):
     sync.run(disposition=disposition)
     sync.downloads().assert_called_once()
     assert sync.rows() == {sync.uri(): "hello"}
+
+
+def test_merge_after_replace_uses_recorded_cursor(sync):
+    sync.listed = [sync.blob(), sync.blob("docs/b.txt")]
+    sync.run(disposition="replace")
+    previous = sync.inventories()
+    for name in ("docs/a.txt", "docs/b.txt"):
+        sync.downloads(name).reset_mock()
+    sync.listed = [sync.blob("docs/b.txt")]
+    sync.run(disposition="merge")
+    sync.downloads().assert_not_called()
+    sync.downloads("docs/b.txt").assert_not_called()
+    assert sync.rows() == {sync.uri("docs/b.txt"): "hello"}
+    scope = _scope(ACCOUNT_URL, "documents", "docs/")
+    assert sync.inventories()[scope] == {
+        sync.uri("docs/b.txt"): previous[scope][sync.uri("docs/b.txt")]
+    }
 
 
 @pytest.mark.parametrize("disposition", ["merge", "replace"])
@@ -473,22 +641,6 @@ def test_inventory_survives_restart_and_scopes_do_not_collide(sync):
     assert len(inventories) == 3
     for scope, inventory in previous.items():
         assert inventories[scope] == inventory
-
-
-def test_document_routing_and_cognee_pipeline_namespace(sync):
-    source = sync.source()
-    assert getattr(source, DOCUMENT_SOURCE_ATTR) == "azure_blob"
-    same = sync.source()
-    other_prefix = sync.source(prefix="notes/")
-    assert pipeline_name_for_source(source, "a") == pipeline_name_for_source(same, "a")
-    names = {
-        pipeline_name_for_source(source, "a"),
-        pipeline_name_for_source(source, "b"),
-        pipeline_name_for_source(other_prefix, "a"),
-    }
-    assert len(names) == 3
-    sync.client.url = "https://other.blob.core.windows.net"
-    assert pipeline_name_for_source(sync.source(), "a") not in names
 
 
 def test_sas_not_stored_in_rows_or_inventory_and_blob_names_are_escaped(sync):

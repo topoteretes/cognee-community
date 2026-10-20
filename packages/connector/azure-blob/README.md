@@ -208,8 +208,12 @@ uv run --locked ruff check .
 uv run --locked ruff format --check .
 ```
 
-Tests use mocked Azure SDK clients with real temporary SQLite dlt destinations.
-They cover credential precedence, client ownership, updates, unchanged reruns,
+Tests follow S3's two-layer layout: direct helper tests for listing, filtering,
+decoding, downloads, row construction, client creation, and document routing;
+then sync tests with mocked Azure SDK clients and real temporary SQLite dlt
+destinations. `tests/conftest.py` isolates environment credentials for both layers.
+The sync cases include the `replace`-to-`merge` cursor transition. They cover
+credential precedence, client ownership, updates, unchanged reruns,
 listing pagination/failures, ETag races, blobs disappearing during download, deletion
 confirmation and reappearance, final-row staging cleanup, limits, replacement decoding,
 persistent inventories, and account/dataset scoping.
