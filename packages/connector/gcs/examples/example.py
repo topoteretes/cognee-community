@@ -32,6 +32,7 @@ def parse_args() -> argparse.Namespace:
 
 async def main(args: argparse.Namespace) -> None:
     import cognee
+    from cognee.modules.retrieval.exceptions.exceptions import NoDataError
     from cognee_community_connector_gcs import gcs_source
 
     source = gcs_source(
@@ -52,17 +53,17 @@ async def main(args: argparse.Namespace) -> None:
     if result.status != "completed":
         raise RuntimeError(result.error or f"Sync did not complete: {result.status}")
     print("Sync completed. Searching the dataset ...")
-    answer = await cognee.search(
-        query_text=args.question,
-        query_type=cognee.SearchType.GRAPH_COMPLETION,
-        datasets=[args.dataset],
-    )
-    print(answer)
-    print(
-        "Edit or delete a test object and run the same command again to sync changes. "
-        "Cognee 1.4.0 does not clean up graph memory after the final document is removed; "
-        "see README.md for limitations."
-    )
+    try:
+        answer = await cognee.search(
+            query_text=args.question,
+            query_type=cognee.SearchType.GRAPH_COMPLETION,
+            datasets=[args.dataset],
+        )
+    except NoDataError:
+        print("No searchable documents remain in this dataset.")
+    else:
+        print(answer)
+    print("Edit or delete a test object and run the same command again to sync changes.")
 
 
 if __name__ == "__main__":

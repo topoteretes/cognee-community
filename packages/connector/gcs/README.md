@@ -70,18 +70,10 @@ and [service-account impersonation instructions](https://docs.cloud.google.com/s
 
 ### If key creation is blocked
 
-Ask an organization administrator with **Organization Policy Administrator**
-(`roles/orgpolicy.policyAdmin`) access to check both constraints:
-
-- `iam.disableServiceAccountKeyCreation` (legacy)
-- `iam.managed.disableServiceAccountKeyCreation`
-
-For an approved test-project exception, select that project under
-**IAM & Admin → Organization policies**, open each enforced constraint, and use
-**Manage policy → Override parent's policy → Add a rule → Enforcement: Off →
-Set policy**. Confirm the effective status is **Not enforced** for both; leave
-the organization-wide restriction in place. Changes can take up to 15 minutes
-to propagate before key creation succeeds. See Google's
+Some organizations block service-account key creation through the
+`iam.disableServiceAccountKeyCreation` policy constraints. Prefer the impersonation
+or attached-service-account options above, or ask an administrator for an approved
+exception on a test project. See Google's
 [organization policy instructions](https://docs.cloud.google.com/resource-manager/docs/manage-baseline-constraints).
 
 ## Run the example
@@ -208,6 +200,63 @@ asyncio.run(main())
   if you need end-to-end deletion synchronization. Use foreground ingestion
   (`run_in_background=False`) so core orphan cleanup can run.
 
+## Live validation
+
+The connector was validated against a private GCS bucket with a service-account
+key, a DeepSeek model, local `BAAI/bge-small-en-v1.5` embeddings, SQLite staging,
+a Ladybug graph and LanceDB vectors, using `max_object_size=1024` and small
+`max_objects` limits. The scenarios were: initial sync with a size boundary
+(1,023 and 1,024 bytes accepted, 1,025 skipped), unchanged rerun, content update,
+upstream deletion, a new object plus an existing object growing past the limit,
+a metadata-only change (metageneration changes, no download), prefix exclusion
+with fresh state, and the object-count guard. That matrix ran on Cognee 1.4.0;
+the final-document deletion check was rerun in isolation on Cognee 1.6.5 and
+left no staging rows, Data records, graph nodes/edges or vectors. The full
+matrix was not repeated on 1.6.5, and default-scale volume was not tested.
+
+## Design notes for maintainers
+
+`gcs.py` keeps one public function, `gcs_source()`, and small private helpers:
+
+| Helper | Role |
+| --- | --- |
+| `_build_client()` | Builds a Storage client from an explicit service-account path or ADC. |
+| `_list_objects()` | Lists the whole prefix, skips empty folder placeholders and enforces `max_objects` before any download. |
+| `_is_eligible()` | Applies the text-extension allowlist (`TEXT_EXTENSIONS`) and the size limit. |
+| `_read_object()` | Downloads with `if_generation_match`, retries transient errors, treats a confirmed not-found as skipped. |
+| `_decode()` | UTF-8 with optional BOM; invalid bytes are replaced. |
+| `_object_to_row()` | Builds the `id`/`url`/`title`/`content` row with a `gs://bucket/object` ID. |
+| `_stamp()` | Records `updated`, `generation` and `metageneration`. |
+| `_confirm_deleted()` | Rechecks a missing object directly; raises if it exists again. |
+| `_scope()` | Namespaces dlt state and Cognee's pipeline scope by bucket and prefix. |
+
+Invariants to preserve when changing the sync loop:
+
+- Finish the full listing before downloading or emitting any deletion marker, so a
+  failed page can never look like a deletion.
+- Pin every download to the listed generation so an overwrite mid-sync fails
+  instead of returning mixed content.
+- Confirm a missing object with a direct lookup before emitting `{"id", "deleted": True}`.
+- Write the new inventory to dlt state only after extraction completes; dlt
+  commits it with a successful load.
+- Keep row `id` values stable (`gs://bucket/object`); they are the merge and
+  hard-delete key.
+
+Stored state: `resource_state()["inventories"][f"{bucket}/{prefix}"]` maps each
+`gs://` URI to `{"updated", "generation", "metageneration"}`. Changing this shape
+breaks existing users' saved state, so treat it as a migration.
+
+To support another file type, add its extension to `TEXT_EXTENSIONS` only if it is
+plain text that UTF-8 decoding handles. The set matches the S3 connector's
+allowlist; keep the object-store connectors consistent. Binary formats need an
+extraction step the connector does not have.
+
+Test layout: `tests/test_gcs_helpers.py` covers each helper in isolation;
+`tests/test_gcs_state.py` runs the source into temporary SQLite dlt destinations
+to check incremental behavior, deletions, failures and persisted state;
+`tests/conftest.py` holds the shared fakes and blocks credential discovery and
+network access.
+
 ## Verify changes
 
 1. Run the example with two text documents in the selected prefix and search for
@@ -224,6 +273,8 @@ asyncio.run(main())
 
 ```bash
 uv run --locked pytest tests/
+uv run --locked ruff check .
+uv run --locked ruff format --check .
 ```
 
 Tests use pytest with shared fixtures, mocked GCS clients, and temporary SQLite
