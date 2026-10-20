@@ -138,6 +138,8 @@ class FakeWikibase:
                 return httpx.Response(status, headers={"Retry-After": retry_after})
             if kind == "html":
                 return httpx.Response(200, text="<html>Maintenance</html>")
+            if kind == "pass":  # let this request through, to fail a later one
+                kind = None
             if kind == "api":
                 return httpx.Response(
                     200, headers={"Retry-After": "0"}, json={"error": {"code": value, "info": ""}}

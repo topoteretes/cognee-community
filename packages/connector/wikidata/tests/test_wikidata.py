@@ -299,11 +299,15 @@ def test_external_ids_can_be_included(wiki):
     assert "- VIAF ID: 113230702" in live["Q42"]["content"]
 
 
-def test_labels_are_resolved_in_batches(wiki):
+def test_labels_are_resolved_in_batches_and_never_twice(wiki):
     _sync(wiki, {})
     label_requests = [r for r in wiki.requests if r.get("props") == "labels"]
-    assert len(label_requests) == 1
-    assert label_requests[0]["languagefallback"] == "1"
+    # One request per batch of rendered items at most (here: the seed's level and
+    # its notable works' level), each with language fallback for `mul` labels.
+    assert 1 <= len(label_requests) <= 2
+    assert all(r["languagefallback"] == "1" for r in label_requests)
+    asked = [entity_id for r in label_requests for entity_id in r["ids"].split("|")]
+    assert len(asked) == len(set(asked)), "the label cache spans the whole run"
 
 
 # ---------------------------------------------------------------------------
@@ -517,7 +521,7 @@ def test_retries_give_up_eventually(wiki):
 # dlt resource
 # ---------------------------------------------------------------------------
 def test_resource_is_a_merge_document_source():
-    resource = wikidata_source(["Q42"], http_client=httpx.Client())
+    resource = wikidata_source(["Q42"], service=httpx.Client())
     assert resource.name == "wikidata_www_wikidata_org"
     assert resource.write_disposition == "merge"
     assert resource.columns["_deleted"]["hard_delete"] is True
@@ -570,7 +574,7 @@ def test_forget_on_delete_end_to_end_through_a_real_dlt_merge(wiki, tmp_path):
     pipeline = _pipeline(tmp_path)
 
     def run():
-        source = wikidata_source(["Q42"], expand_properties=["P800"], http_client=wiki.client())
+        source = wikidata_source(["Q42"], expand_properties=["P800"], service=wiki.client())
         pipeline.run(source)
         return source
 
@@ -593,14 +597,14 @@ def test_forget_on_delete_end_to_end_through_a_real_dlt_merge(wiki, tmp_path):
 
 def test_one_resource_name_cannot_hold_two_wikibases(wiki, tmp_path):
     pipeline = _pipeline(tmp_path)
-    pipeline.run(wikidata_source(["Q42"], http_client=wiki.client(), resource_name="items"))
+    pipeline.run(wikidata_source(["Q42"], service=wiki.client(), resource_name="items"))
 
     other = FakeWikibase()
     other_url = "https://example.wikibase.cloud/w/api.php"
     with pytest.raises(Exception, match="another Wikibase"):
         pipeline.run(
             wikidata_source(
-                ["Q42"], api_url=other_url, http_client=other.client(), resource_name="items"
+                ["Q42"], api_url=other_url, service=other.client(), resource_name="items"
             )
         )
 
@@ -636,8 +640,10 @@ def test_an_empty_selection_reports_failure_and_keeps_the_state(wiki):
     snapshot = copy.deepcopy(state)
     wiki.sparql_results = []
 
-    _, _, stats = _sync(wiki, state, items=[], expand_properties=[], sparql="SELECT ?item {}")
+    _, _, stats = _sync(wiki, state, items=[], expand_properties=[], sparql="SELECT ?item WHERE {}")
     assert stats["failed"] == 1 and stats["failed_empty_scope"] == 1
+    # Only the empty-run counter is recorded.
+    assert state.pop("empty_runs") == 1
     assert state == snapshot
 
 
@@ -656,11 +662,12 @@ def test_a_non_json_answer_is_an_error_not_an_empty_result(wiki):
         _sync(wiki, {})
 
 
-def test_service_is_an_alias_of_http_client():
-    client = httpx.Client()
-    assert wikidata_source(["Q42"], service=client).name == "wikidata_www_wikidata_org"
-    with pytest.raises(ValueError, match="not both"):
-        wikidata_source(["Q42"], service=client, http_client=httpx.Client())
+def test_the_injected_service_is_the_client_that_extracts(wiki, tmp_path):
+    pipeline = _pipeline(tmp_path)
+    source = wikidata_source(["Q42"], service=wiki.client())
+    pipeline.run(source)
+    assert _staged(pipeline, source.name) == {"Q42": "Douglas Adams"}
+    assert wiki.requests, "every request went through the injected client"
 
 
 def test_two_wikibases_with_their_own_resource_names_share_a_dataset(wiki, tmp_path):
@@ -691,3 +698,74 @@ def test_deleting_the_only_selected_item_is_forgotten_not_guarded(wiki):
     live, deleted, stats = _sync(wiki, state, items=["Q3107329"], expand_properties=[])
     assert live == {} and deleted == {"Q3107329"}
     assert stats["failed"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Review round 2 (same points as the MediaWiki connector)
+# ---------------------------------------------------------------------------
+def test_an_empty_query_result_is_forgotten_on_the_second_empty_run(wiki):
+    state: dict = {}
+    query = "SELECT ?item WHERE {}"
+    wiki.sparql_results = ["Q25169", "Q3107329"]
+    _sync(wiki, state, items=[], expand_properties=[], sparql=query)
+    wiki.sparql_results = []
+
+    _, deleted, stats = _sync(wiki, state, items=[], expand_properties=[], sparql=query)
+    assert deleted == set() and stats["failed_empty_scope"] == 1  # could be an outage
+    _, deleted, stats = _sync(wiki, state, items=[], expand_properties=[], sparql=query)
+    assert deleted == {"Q25169", "Q3107329"}, "a second empty run is believed"
+    assert stats["failed"] == 0 and state["items"] == {}
+
+
+def test_switching_to_an_empty_query_forgets_the_old_items(wiki):
+    state: dict = {}
+    wiki.sparql_results = ["Q25169"]
+    _sync(wiki, state, items=[], expand_properties=[], sparql="SELECT ?item WHERE { a }")
+    wiki.sparql_results = []
+
+    _, deleted, stats = _sync(
+        wiki, state, items=[], expand_properties=[], sparql="SELECT ?item WHERE { b }"
+    )
+    assert stats["full_sync_selection_changed"] == 1
+    assert deleted == {"Q25169"} and stats["failed"] == 0
+
+
+def test_a_rate_limited_run_makes_progress_across_runs(monkeypatch):
+    import cognee_community_connector_wikidata.wikidata as module
+
+    monkeypatch.setattr(module, "_BATCH_SIZE", 2)  # small batches, so a stop is mid-run
+    wiki = FakeWikibase()
+    seeds = [f"Q{100 + number}" for number in range(8)]
+    for number, entity_id in enumerate(seeds):
+        wiki.create(entity_id, f"Item {number}")
+    # The revision check and two batches go through, then the API asks for an hour.
+    wiki.failures = [("pass", None)] * 3 + [("http", (429, "3600"))]
+
+    state: dict = {}
+    _, _, first = _sync(wiki, state, items=seeds, expand_properties=[])
+    assert first["failed_rate_limit"] == 1 and 0 < first["items_changed"] < 8
+
+    _, _, second = _sync(wiki, state, items=seeds, expand_properties=[])
+    assert second["failed"] == 0
+    assert first["items_changed"] + second["items_changed"] == 8, "nothing fetched twice"
+
+
+@pytest.mark.parametrize(
+    ("overrides", "failures", "reason", "error"),
+    [
+        (
+            {"items": ["Q42", "Q999999999"], "expand_properties": []},
+            [],
+            "scope",
+            WikidataScopeError,
+        ),
+        ({}, [("api", "internal_api_error_DBQueryError")], "api", WikidataAPIError),
+    ],
+)
+def test_every_failure_sets_failed(wiki, overrides, failures, reason, error):
+    wiki.failures = list(failures)
+    stats: dict = {}
+    client = _WikibaseClient(wiki.client(), API_URL, "ua", 5, sleep=lambda _s: None)
+    with pytest.raises(error):
+        list(sync_items(client, _settings(**overrides), {}, stats))
+    assert stats["failed"] == 1 and stats[f"failed_{reason}"] == 1

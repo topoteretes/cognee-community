@@ -77,7 +77,7 @@ service stops queries after 60 seconds: keep queries `LIMIT`-ed.
 | `maxlag` | `5` | `maxlag` sent with every Action API request; "too busy" answers are retried |
 | `resource_name` | from `api_url` | staging table and state key; one per Wikibase sharing a dataset |
 | `check_active` | none | host authorization checkpoint, called while rows are produced |
-| `service` | none | a pre-built `httpx.Client` (alias: `http_client`) |
+| `service` | none | a pre-built `httpx.Client` |
 
 The source reads no environment variables; `examples/example.py` shows reading
 `WIKIDATA_API_URL` and `WIKIDATA_USER_AGENT` and passing them in.
@@ -125,8 +125,10 @@ Every item carries the `wikidata:<server>` node set (e.g. `wikidata:www.wikidata
 
 1. **Every run** resolves the selection and asks `wbgetentities` for each item's
    `lastrevid`, 50 ids per request. Only items whose revision moved (or that are new)
-   are fetched in full and re-rendered. An unchanged selection of 500 items costs about
-   ten requests and no rendering. Expansion reuses the links stored for unchanged items.
+   are fetched in full and re-rendered, 50 at a time: each batch is fetched, labelled,
+   rendered and yielded before the next one. An unchanged selection of 500 items costs
+   about ten requests and no rendering. Expansion reuses the links stored for unchanged
+   items.
 2. **Deleted items** come back `missing` and are emitted as `_deleted` tombstones. dlt
    removes them on `merge`, and cognee's `orphan_cleanup` deletes them from the graph,
    vector and relational stores.
@@ -139,24 +141,33 @@ Every item carries the `wikidata:<server>` node set (e.g. `wikidata:www.wikidata
    less. A seed that was synced and deleted later is forgotten as usual. Ids that never
    existed also make Wikidata fail a whole `wbgetentities` request (`no-such-entity`);
    the client drops that id and retries the rest of the batch.
-6. A selection that comes back **empty** while items were synced before deletes nothing
-   and leaves the sync state untouched (`failed_empty_scope`), so a broken query or an
-   outage cannot wipe the dataset. When the API itself confirms every synced item is
-   gone (deleted or merged), the deletions are real and go ahead.
+6. **Empty selections.** A selection that comes back empty while items were synced before
+   could be a broken query or an outage, so the first one deletes nothing and leaves the
+   state alone (`failed_empty_scope`). It is believed, and the old items forgotten, when
+   the API itself reports every synced item gone (deleted or merged), right after the
+   selection was changed (switching to a query that returns nothing), or on the second
+   consecutive empty run.
 
 A change of `language`, `include_external_ids`, `sitelinks` or the selection re-renders
 everything once. Every API error aborts the run before its state is saved, so the next run
 retries. A service that keeps rate-limiting the run (HTTP 429 or `maxlag` past the retries,
-or a `Retry-After` over 60 seconds) stops it cleanly instead: what was synced stays, the
-state is not advanced, and the next run resumes.
+or a `Retry-After` over 60 seconds) stops it cleanly instead: what was synced stays, and the
+items already fetched are recorded with their revisions, so the next run continues from
+there instead of starting over.
 
 ### Sync stats
 
-After a run, `source.cognee_sync_stats` holds plain int counters: `items_selected`,
-`items_changed`, `items_unchanged`, `deleted`, `redirected`, `truncated`, `requests`,
-`full_sync` (with `full_sync_<reason>` for `initial`, `requested`, `render_changed` or
-`selection_changed`) and `failed` (with `failed_rate_limit`, `failed_auth` or
-`failed_empty_scope`).
+After a run, `source.cognee_sync_stats` holds plain int counters, all present on every run:
+
+| Counter | Meaning |
+| --- | --- |
+| `items_selected` | items in the resolved selection |
+| `items_changed` / `items_unchanged` / `deleted` | what happened to them |
+| `redirected` | selected ids that turned out to be merged into another item |
+| `truncated` | 1 when `max_items` cut the selection short |
+| `requests` | API requests made |
+| `full_sync` | 1 for a full sync, with `full_sync_<reason>`: `initial`, `requested`, `render_changed` or `selection_changed` |
+| `failed` | 1 when the run failed or stopped early, with `failed_<reason>`: `rate_limit`, `empty_scope` (both finish the run), or `auth`, `scope`, `api`, `error` (these also raise) |
 
 ### Limitations
 

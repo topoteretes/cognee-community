@@ -596,70 +596,137 @@ def _sparql_items(client: _WikibaseClient, settings: _Settings) -> list[str]:
     return found
 
 
-@dataclass
-class _Selection:
-    """The items selected this run: canonical id -> (revision, entity or None)."""
+# An empty selection twice in a row is taken at its word: the first time could be
+# a broken query or an outage, a second consecutive one almost never is, and the
+# old items must not stay in memory forever.
+_EMPTY_RUNS_BEFORE_FORGET = 2
 
-    revisions: dict[str, int] = field(default_factory=dict)
-    entities: dict[str, dict] = field(default_factory=dict)
-    links: dict[str, list[str]] = field(default_factory=dict)
+
+@dataclass
+class _Run:
+    """One sync: what was selected, synced and forgotten so far."""
+
+    client: _WikibaseClient
+    settings: _Settings
+    previous: dict[str, dict]
+    stats: dict[str, int]
+    refetch: bool
+    # Items already re-fetched by an earlier, rate-limited attempt at the same
+    # full sync; they are compared by revision instead of fetched again.
+    refetched_before: frozenset[str] = frozenset()
+    synced: dict[str, dict] = field(default_factory=dict)
+    rendered: set[str] = field(default_factory=set)
+    forgotten: set[str] = field(default_factory=set)
     redirected: dict[str, str] = field(default_factory=dict)
     missing: set[str] = field(default_factory=set)
     truncated: bool = False
 
+    def needs_fetch(self, entity_id: str, revision: int) -> bool:
+        if self.refetch and entity_id not in self.refetched_before:
+            return True
+        return (self.previous.get(entity_id) or {}).get("rev") != revision
 
-def _select(
-    client: _WikibaseClient, settings: _Settings, previous: dict[str, dict], refetch: bool
-) -> _Selection:
-    """Resolve roots and expansion hops; fetch full data only for changed items."""
-    selection = _Selection()
-    roots = list(dict.fromkeys([*settings.items, *_sparql_items(client, settings)]))
+    def progress(self) -> dict[str, dict]:
+        """The items state after a partial run: previous, updated by what was done."""
+        items = {
+            entity_id: record
+            for entity_id, record in self.previous.items()
+            if entity_id not in self.forgotten
+        }
+        items.update(self.synced)
+        return items
+
+
+def _check_seeds(run: _Run, state: dict) -> None:
+    """Raise for a newly configured seed that does not exist (a typo).
+
+    A seed synced before and deleted since is forgotten instead.
+    """
+    previous_selection = state.get("selection")
+    known_seeds = (
+        set(previous_selection[0] or [])
+        if isinstance(previous_selection, list) and previous_selection
+        else set()
+    )
+    unknown = sorted(run.missing & (set(run.settings.items) - known_seeds))
+    if unknown:
+        raise WikidataScopeError(f"These ids do not exist (deleted or never assigned): {unknown}")
+
+
+def _walk(run: _Run, state: dict) -> Iterator[dict]:
+    """Resolve the selection level by level, yielding changed items as it goes.
+
+    Items are fetched, labelled, rendered and yielded 50 at a time, so a run
+    stopped by a rate limit keeps what it finished. Unchanged items are only
+    revision-checked; their expansion links come from the previous run.
+    """
+    client, settings = run.client, run.settings
     entity_params = _entity_params(settings)
-    frontier = roots
+    labels = _Labels(client, settings.language)
+    node_set = f"{SOURCE_TAG}:{urlparse(client.api_url).netloc}"
+    frontier = list(dict.fromkeys([*settings.items, *_sparql_items(client, settings)]))
     depth = 0
     while frontier:
-        room = settings.max_items - len(selection.revisions)
+        room = settings.max_items - len(run.synced)
         if room <= 0:
-            selection.truncated = True
+            run.truncated = True
             break
         info = client.get_entities(frontier, _INFO_PARAMS)
-        changed: list[str] = []
         level: list[str] = []
+        changed: list[str] = []
+        revisions: dict[str, int] = {}
         for requested in frontier:
             entity = info.get(requested)
             if _is_missing(entity):
-                selection.missing.add(requested)
+                run.missing.add(requested)
                 continue
             canonical = str(entity["id"])
             if canonical != requested:
-                selection.redirected[requested] = canonical
-            if canonical in selection.revisions or canonical in level:
+                run.redirected[requested] = canonical
+            if canonical in run.synced or canonical in revisions:
                 continue
             if len(level) >= room:
-                selection.truncated = True
+                run.truncated = True
                 break
             level.append(canonical)
-            revision = int(entity.get("lastrevid") or 0)
-            selection.revisions[canonical] = revision
-            seen = previous.get(canonical) or {}
-            if refetch or seen.get("rev") != revision:
+            revisions[canonical] = int(entity.get("lastrevid") or 0)
+            if run.needs_fetch(canonical, revisions[canonical]):
                 changed.append(canonical)
             else:
-                selection.links[canonical] = list(seen.get("links") or [])
+                run.synced[canonical] = run.previous[canonical]
+                run.stats["items_unchanged"] += 1
+        if depth == 0:
+            _check_seeds(run, state)  # before anything is yielded
 
-        if changed:
-            fetched = client.get_entities(changed, entity_params)
-            for entity_id in changed:
+        for batch in _batched(changed, _BATCH_SIZE):
+            fetched = client.get_entities(batch, entity_params)
+            entities = []
+            for entity_id in batch:
                 entity = fetched.get(entity_id)
                 if _is_missing(entity):  # deleted between the two requests
-                    selection.revisions.pop(entity_id, None)
-                    selection.missing.add(entity_id)
+                    run.missing.add(entity_id)
                     continue
-                selection.revisions[entity_id] = int(
-                    entity.get("lastrevid") or selection.revisions[entity_id]
-                )
-                selection.entities[entity_id] = entity
-                selection.links[entity_id] = _expansion_links(entity, settings)
+                entities.append(entity)
+            labels.prefetch(
+                entity_id for entity in entities for entity_id in _referenced_ids(entity, settings)
+            )
+            for entity in entities:
+                entity_id = str(entity["id"])
+                title, content = render_document(entity, labels, settings)
+                run.synced[entity_id] = {
+                    "rev": int(entity.get("lastrevid") or revisions[entity_id]),
+                    "links": _expansion_links(entity, settings),
+                }
+                run.rendered.add(entity_id)
+                run.stats["items_changed"] += 1
+                yield {
+                    "id": entity_id,
+                    "title": title,
+                    "content": content,
+                    "url": _entity_url(client.api_url, entity),
+                    "_deleted": False,
+                    dlt_utils.NODE_SET_COLUMN: [node_set],
+                }
 
         if depth >= settings.expand_depth or not settings.expand_properties:
             break
@@ -668,15 +735,20 @@ def _select(
             dict.fromkeys(
                 link
                 for entity_id in level
-                if entity_id in selection.revisions
-                for link in selection.links.get(entity_id) or []
-                if link not in selection.revisions
+                if entity_id in run.synced
+                for link in run.synced[entity_id].get("links") or []
+                if link not in run.synced
             )
         )
-    return selection
 
 
-def _sync(client: _WikibaseClient, settings: _Settings, state: dict, stats: dict[str, int]):
+def _sync(
+    client: _WikibaseClient,
+    settings: _Settings,
+    state: dict,
+    stats: dict[str, int],
+    holder: dict,
+):
     previous: dict[str, dict] = dict(state.get("items") or {})
 
     reason = None
@@ -692,83 +764,68 @@ def _sync(client: _WikibaseClient, settings: _Settings, state: dict, stats: dict
         stats["full_sync"] = 1
         stats[f"full_sync_{reason}"] = 1
 
-    selection = _select(client, settings, previous, refetch=reason is not None)
-
-    # A seed that does not exist is a typo when it was just added to the
-    # configuration; one synced before and deleted since is forgotten below.
-    previous_selection = state.get("selection")
-    known_seeds = (
-        set(previous_selection[0] or [])
-        if isinstance(previous_selection, list) and previous_selection
-        else set()
+    progress = state.get("refetch_progress") or {}
+    progress_key = [settings.selection_fingerprint(), settings.render_fingerprint()]
+    refetch = reason is not None
+    run = _Run(
+        client=client,
+        settings=settings,
+        previous=previous,
+        stats=stats,
+        refetch=refetch,
+        refetched_before=frozenset(
+            progress.get("ids") or [] if refetch and progress.get("for") == progress_key else []
+        ),
     )
-    unknown = sorted(selection.missing & (set(settings.items) - known_seeds))
-    if unknown:
-        raise WikidataScopeError(f"These ids do not exist (deleted or never assigned): {unknown}")
+    holder.update(run=run, progress_key=progress_key)
 
-    stats["items_selected"] = len(selection.revisions)
-    stats["redirected"] = len(selection.redirected)
-    if selection.truncated:
+    yield from _walk(run, state)
+    stats["items_selected"] = len(run.synced)
+    stats["redirected"] = len(run.redirected)
+    if run.truncated:
         logger.warning(
             "Wikidata: the selection reached max_items=%d; further items were skipped.",
             settings.max_items,
         )
         stats["truncated"] = 1
 
-    confirmed_gone = selection.missing | set(selection.redirected)
-    if previous and not selection.revisions and not previous.keys() <= confirmed_gone:
-        # An empty selection while items were synced before is far more likely
-        # a broken SPARQL query or an outage than every item vanishing at once.
-        # Forgetting the whole dataset would be permanent, so the run changes
-        # nothing and the next one retries. When the API itself reported every
-        # synced item missing (deleted upstream), the deletions are real and go
-        # ahead.
-        logger.warning(
-            "Wikidata: the selection resolved to 0 items but %d were synced before; "
-            "leaving the dataset and the sync state untouched.",
-            len(previous),
+    if previous and not run.synced:
+        empty_runs = int(state.get("empty_runs") or 0) + 1
+        # An empty selection could be a broken SPARQL query or an outage, so the
+        # first one deletes nothing and leaves the state alone. It is believed
+        # when the API itself reported every synced item gone (deleted or
+        # merged), right after the selection was changed, or the second time in
+        # a row: the old items must not stay forever.
+        confirmed = (
+            previous.keys() <= (run.missing | set(run.redirected))
+            or reason == "selection_changed"
+            or empty_runs >= _EMPTY_RUNS_BEFORE_FORGET
         )
-        stats["failed"] = 1
-        stats["failed_empty_scope"] = 1
-        return
+        if not confirmed:
+            logger.warning(
+                "Wikidata: the selection resolved to 0 items but %d were synced before; "
+                "keeping them for now (forgotten if the next run is empty too).",
+                len(previous),
+            )
+            stats["failed"] = 1
+            stats["failed_empty_scope"] = 1
+            state["empty_runs"] = empty_runs
+            holder["keep_state"] = True
+            return
 
-    labels = _Labels(client, settings.language)
-    labels.prefetch(
-        entity_id
-        for entity in selection.entities.values()
-        for entity_id in _referenced_ids(entity, settings)
-    )
-    node_set = f"{SOURCE_TAG}:{urlparse(client.api_url).netloc}"
-    synced: dict[str, dict] = {}
-    for entity_id, revision in selection.revisions.items():
-        record = {"rev": revision, "links": selection.links.get(entity_id) or []}
-        entity = selection.entities.get(entity_id)
-        if entity is None:
-            synced[entity_id] = record
-            stats["items_unchanged"] += 1
-            continue
-        title, content = render_document(entity, labels, settings)
-        synced[entity_id] = record
-        stats["items_changed"] += 1
-        yield {
-            "id": entity_id,
-            "title": title,
-            "content": content,
-            "url": _entity_url(client.api_url, entity),
-            "_deleted": False,
-            dlt_utils.NODE_SET_COLUMN: [node_set],
-        }
-
-    for entity_id in sorted(previous.keys() - synced.keys()):
+    for entity_id in sorted(previous.keys() - run.synced.keys()):
+        run.forgotten.add(entity_id)
         stats["deleted"] += 1
         yield _tombstone(entity_id)
 
     # State is written only after the last row was yielded, so a run that raises
     # part-way keeps the previous state (dlt also discards the state of a failed
     # load).
-    state["items"] = synced
+    state["items"] = run.synced
     state["selection"] = settings.selection_fingerprint()
     state["render"] = settings.render_fingerprint()
+    state.pop("empty_runs", None)
+    state.pop("refetch_progress", None)
     logger.info(
         "Wikidata: %s sync, %d changed, %d unchanged, %d deleted, %d request(s).",
         "full" if reason else "incremental",
@@ -779,17 +836,36 @@ def _sync(client: _WikibaseClient, settings: _Settings, state: dict, stats: dict
     )
 
 
+def _save_progress(state: dict, holder: dict) -> None:
+    """After a rate-limited stop: keep what was done, so the next run continues.
+
+    The selection and render fingerprints are left alone (a due full sync is
+    repeated), but the items already fetched are recorded with their revisions,
+    so the next run does not fetch them again.
+    """
+    run: _Run | None = holder.get("run")
+    if run is None or holder.get("keep_state"):
+        return
+    state["items"] = run.progress()
+    if run.refetch:
+        state["refetch_progress"] = {
+            "for": holder.get("progress_key"),
+            "ids": sorted(run.rendered | set(run.refetched_before)),
+        }
+
+
 def sync_items(client: _WikibaseClient, settings: _Settings, state: dict, stats: dict):
     """Yield changed item documents and deletion tombstones, then advance ``state``.
 
-    ``stats`` receives plain int counters for the host: ``items_selected``,
-    ``items_changed``, ``items_unchanged``, ``deleted``, ``redirected``,
-    ``truncated``, ``requests``, ``full_sync`` (plus ``full_sync_<reason>``) and
-    ``failed`` (plus ``failed_<reason>``: ``rate_limit``, ``auth``, ``empty_scope``).
+    ``stats`` receives plain int counters for the host, all present on every run:
+    ``items_selected``, ``items_changed``, ``items_unchanged``, ``deleted``,
+    ``redirected``, ``truncated``, ``requests``, ``full_sync`` (plus
+    ``full_sync_<reason>``) and ``failed`` (plus ``failed_<reason>``:
+    ``rate_limit`` and ``empty_scope`` finish the run; ``auth``, ``scope``,
+    ``api`` and ``error`` also raise).
 
     A service that keeps rate-limiting the run stops it cleanly: what was yielded
-    stays, the state is not advanced, and the next run resumes. An access
-    failure raises.
+    stays, the work done is recorded, and the next run continues from there.
     """
     stats.clear()
     stats.update(
@@ -803,15 +879,29 @@ def sync_items(client: _WikibaseClient, settings: _Settings, state: dict, stats:
         full_sync=0,
         failed=0,
     )
+    holder: dict = {}
+
+    def failed(reason: str) -> None:
+        stats["failed"] = 1
+        stats[f"failed_{reason}"] = 1
+
     try:
-        yield from _sync(client, settings, state, stats)
+        yield from _sync(client, settings, state, stats, holder)
     except WikidataRateLimitedError as exc:
-        stats["failed"] = 1
-        stats["failed_rate_limit"] = 1
-        logger.warning("Wikidata: rate limited (%s); the next run resumes from here.", exc.code)
+        failed("rate_limit")
+        _save_progress(state, holder)
+        logger.warning("Wikidata: rate limited (%s); the next run continues from here.", exc.code)
     except WikidataAuthError:
-        stats["failed"] = 1
-        stats["failed_auth"] = 1
+        failed("auth")
+        raise
+    except WikidataScopeError:
+        failed("scope")
+        raise
+    except WikidataAPIError:
+        failed("api")
+        raise
+    except Exception:
+        failed("error")
         raise
     finally:
         stats["requests"] = client.requests
@@ -850,7 +940,6 @@ def wikidata_source(
     resource_name: str | None = None,
     check_active: Callable[[], None] | None = None,
     service: Any = None,
-    http_client: Any = None,
 ):
     """Return a ``dlt`` resource yielding one document row per selected item.
 
@@ -895,7 +984,6 @@ def wikidata_source(
             other's items.
         check_active: Optional host authorization checkpoint during extraction.
         service: Pre-built ``httpx.Client`` (mainly a test injection point).
-        http_client: Alias of ``service``.
     """
     import dlt
     import httpx
@@ -905,10 +993,6 @@ def wikidata_source(
             "The Wikidata connector requires a cognee build that reads per-row node "
             "sets (DOCUMENT_SYNC_VERSION >= 2, cognee 1.6.3+). Upgrade cognee."
         )
-
-    if service is not None and http_client is not None and service is not http_client:
-        raise ValueError("Pass the pre-built client as service= or http_client=, not both.")
-    injected_client = service if service is not None else http_client
 
     resolved_api_url = (api_url or "").strip()
     parsed = urlparse(resolved_api_url)
@@ -964,13 +1048,11 @@ def wikidata_source(
     def wikidata_items():
         # The query service can take up to its 60 s limit to answer.
         owned_client = (
-            None
-            if injected_client is not None
-            else httpx.Client(timeout=75.0, follow_redirects=True)
+            None if service is not None else httpx.Client(timeout=75.0, follow_redirects=True)
         )
         try:
             client = _WikibaseClient(
-                injected_client or owned_client,
+                service or owned_client,
                 resolved_api_url,
                 user_agent,
                 maxlag,
