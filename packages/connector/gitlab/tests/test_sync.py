@@ -457,6 +457,64 @@ def test_notes_failure_preserves_state():
     assert state == before
 
 
+def internal_comment(note_id, body):
+    return {**comment(note_id, body), "internal": True}
+
+
+def test_internal_comments_are_left_out_by_default():
+    t0 = "2026-10-17T10:00:00Z"
+    responses = {
+        "1/issues": [with_notes(1, t0, 2)],
+        "1/merge_requests": [with_notes(2, t0, 1)],
+        "1/issues/1/notes": [comment(10, "public"), internal_comment(11, "secret plan")],
+        "1/merge_requests/2/notes": [{**comment(20, "old secret"), "confidential": True}],
+    }
+    rows, _ = run_projects({}, PROJECT_ONE, responses, selected=COMMENT_SELECTION)
+    issue = next(row for row in rows if ":issue:" in row["id"])
+    merge_request = next(row for row in rows if ":merge_request:" in row["id"])
+    assert "public" in issue["content"]
+    assert "secret plan" not in issue["content"] and "[internal]" not in issue["content"]
+    assert "## Comments" not in merge_request["content"]
+
+
+def test_include_internal_keeps_marked_internal_comments():
+    responses = {
+        "1/issues": [with_notes(1, "2026-10-17T10:00:00Z", 2)],
+        "1/issues/1/notes": [comment(10, "public"), internal_comment(11, "secret plan")],
+    }
+    rows, _ = run_projects(
+        {}, PROJECT_ONE, responses, selected=("comments", "issues"), include_internal=True
+    )
+    assert "bob [internal]:\nsecret plan" in rows[0]["content"]
+
+
+def test_confidential_issues_are_skipped_and_removed_once_confidential():
+    state = {}
+    t0, t1 = "2026-10-17T10:00:00Z", "2026-10-17T10:05:00Z"
+    responses = {
+        "1/issues": [
+            with_notes(1, t0, 0),
+            {**with_notes(2, t0, 0), "confidential": True},
+        ],
+    }
+    first, _ = run_projects(state, PROJECT_ONE, responses, selected=("issues",))
+    assert [row["id"] for row in first] == ["https://gitlab.example:project:1:issue:1001"]
+
+    # Issue 1 turns confidential. It still reads successfully, so the deletion
+    # check must not keep it; it is removed like a deleted item.
+    responses["1/issues"] = [{**with_notes(1, t1, 0), "confidential": True}]
+    responses["1/issues/1"] = {**with_notes(1, t1, 0), "confidential": True}
+    rows, _ = run_projects(state, PROJECT_ONE, responses, selected=("issues",))
+    assert rows == [{"id": first[0]["id"], "_deleted": True}]
+    assert state["projects"]["1"]["issues"]["hashes"] == {}
+
+
+def test_include_internal_keeps_confidential_issues():
+    responses = {"1/issues": [{**with_notes(1, "2026-10-17T10:00:00Z", 0), "confidential": True}]}
+    rows, _ = run_projects({}, PROJECT_ONE, responses, selected=("issues",), include_internal=True)
+    assert len(rows) == 1
+
+
 def test_without_comments_no_notes_are_read():
     responses = {"1/issues": [with_notes(1, "2026-10-17T10:00:00Z", 3)]}
     rows, paths = run_projects({}, PROJECT_ONE, responses, selected=("issues", "wiki"))

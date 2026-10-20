@@ -83,16 +83,27 @@ def test_http_failures_do_not_expose_response_body(status):
         assert "test-secret" not in str(exc.value)
 
 
-def test_rate_limit_reports_clear_error_without_retrying():
+@pytest.mark.parametrize(
+    ("headers", "message"),
+    [
+        ({"Retry-After": "30"}, "GitLab rate limit reached. Retry after 30 seconds."),
+        ({}, "GitLab rate limit reached. Retry the sync later."),
+        (
+            {"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"},
+            "GitLab rate limit reached. Retry the sync later.",
+        ),
+    ],
+)
+def test_rate_limit_reports_wait_time_without_retrying(headers, message):
     requests = []
 
     def handler(request):
         requests.append(request)
-        return httpx.Response(429, headers={"Retry-After": "30"}, text="test-secret")
+        return httpx.Response(429, headers=headers, text="test-secret")
 
     with client_for(handler) as client, pytest.raises(GitLabAPIError) as exc:
         _validate_token(client)
-    assert str(exc.value) == "GitLab rate limit reached. Retry the sync later."
+    assert str(exc.value) == message
     assert len(requests) == 1
 
 

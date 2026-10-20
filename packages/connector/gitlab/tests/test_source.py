@@ -21,6 +21,7 @@ def build_source(
     token="test-token",
     instance="https://gitlab.example",
     project_ids=None,
+    include_internal=False,
 ):
     def handler(request):
         path = request.url.path
@@ -58,7 +59,11 @@ def build_source(
         side_effect=lambda **kwargs: HTTPClient(**kwargs, transport=httpx.MockTransport(handler)),
     ).start()
     return gitlab_source(
-        token, resource_types=selection, base_url=instance, project_ids=project_ids
+        token,
+        resource_types=selection,
+        base_url=instance,
+        project_ids=project_ids,
+        include_internal=include_internal,
     )
 
 
@@ -72,6 +77,17 @@ def test_source_yields_mapped_documents():
     assert len({row["id"] for row in rows}) == 3
     assert "Body" in rows[0]["content"]
     assert "Welcome" in rows[2]["content"]
+
+
+def test_include_internal_has_its_own_staging_scope():
+    default = build_source(["issues"])
+    internal = build_source(["issues"], include_internal=True)
+    assert default.cognee_pipeline_scope != internal.cognee_pipeline_scope
+
+
+def test_include_internal_must_be_a_bool():
+    with pytest.raises(ValueError, match="include_internal"):
+        build_source(["issues"], include_internal="yes")
 
 
 def test_staging_identity_survives_token_rotation_and_selection_order():

@@ -49,7 +49,10 @@ def _get_json(
     if response.status_code == 404 and missing_ok:
         return None
     if response.status_code == 429:
-        raise GitLabAPIError("GitLab rate limit reached. Retry the sync later.")
+        # Report GitLab's wait time when it sends one; there is no automatic retry.
+        wait = response.headers.get("Retry-After", "").strip()
+        hint = f"Retry after {wait} seconds." if wait.isdigit() else "Retry the sync later."
+        raise GitLabAPIError(f"GitLab rate limit reached. {hint}")
     if response.status_code != 200:
         raise GitLabAPIError(f"GitLab read failed with HTTP {response.status_code}.")
     try:
@@ -348,6 +351,7 @@ def gitlab_source(
     resource_types: Sequence[ResourceType],
     base_url: str = "https://gitlab.com",
     project_ids: Sequence[int | str] | None = None,
+    include_internal: bool = False,
 ) -> "DltSource":
     """Fetch selected GitLab content and return a document-mode DLT source.
 
@@ -358,6 +362,9 @@ def gitlab_source(
         project_ids: Optional projects to sync, as numeric IDs or
             ``group/project`` paths. When omitted, every project the token
             owner is a member of (directly or through a group) is synced.
+        include_internal: Also ingest confidential issues and internal
+            comments. Off by default, because anyone who can query the
+            dataset can read its content.
 
     Validates the PAT immediately. Resource fetching runs during DLT extraction,
     using per-project checkpoints in DLT resource state. Pass
@@ -377,6 +384,8 @@ def gitlab_source(
         raise ValueError("Selecting comments requires issues or merge_requests as well.")
     selected = tuple(sorted(set(resource_types)))
     project_refs = _normalize_project_ids(project_ids)
+    if not isinstance(include_internal, bool):
+        raise ValueError("include_internal must be True or False.")
 
     if not isinstance(token, str) or not token.strip():
         raise ValueError("A non-empty GitLab token is required.")
@@ -412,8 +421,10 @@ def gitlab_source(
         raise RuntimeError("GitLab document ingestion requires DOCUMENT_SYNC_VERSION >= 1.")
     # Exclude credentials from identity so rotating the PAT preserves staging.
     # A project selection is its own scope, so narrowing it never deletes
-    # documents another selection still owns.
-    identity = [instance, owner_id, selected]
+    # documents another selection still owns. include_internal is part of the
+    # scope too: notes are re-read only when an item changes, so flipping it in
+    # place would leave earlier documents rendered under the old setting.
+    identity = [instance, owner_id, selected, include_internal]
     if project_refs is not None:
         identity.append(sorted(str(ref) for ref in project_refs))
     scope = sha256(json.dumps(identity).encode()).hexdigest()[:32]
@@ -441,6 +452,7 @@ def gitlab_source(
                 selected,
                 dlt.current.resource_state(),
                 project_ids=project_refs,
+                include_internal=include_internal,
             )
 
     @dlt.source(name=f"gitlab_{scope}")

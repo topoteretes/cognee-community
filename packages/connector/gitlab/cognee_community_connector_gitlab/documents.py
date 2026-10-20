@@ -53,7 +53,7 @@ def _render_comments(notes: list[dict[str, Any]]) -> list[str]:
     Long threads are not trimmed: cognify chunks long documents like any other.
 
     System notes (label changes, cross-references) are dropped. Internal
-    comments are kept and marked, like confidential issues are.
+    comments reach this function only with ``include_internal`` and are marked.
     """
     entries = []
     for note in notes:

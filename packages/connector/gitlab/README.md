@@ -125,6 +125,7 @@ def gitlab_source(
     resource_types: Sequence[Literal["issues", "merge_requests", "comments", "wiki"]],
     base_url: str = "https://gitlab.com",
     project_ids: Sequence[int | str] | None = None,
+    include_internal: bool = False,
 ) -> DltSource
 ```
 
@@ -138,6 +139,7 @@ Cognee runs it, not when the source is created.
 | `resource_types` | Required | Non-empty selection of `issues`, `merge_requests`, `comments`, `wiki`. `comments` requires `issues` or `merge_requests`. |
 | `base_url` | `https://gitlab.com` | Instance URL, without credentials or query string. |
 | `project_ids` | `None` | Numeric IDs or `group/project` paths. `None` syncs every project the token owner is a member of. |
+| `include_internal` | `False` | Also ingest confidential issues and internal comments. See [Confidential issues and internal comments](#confidential-issues-and-internal-comments). |
 
 `gitlab_source()` validates the legacy token immediately (active, with `read_api` or
 `api`) using `GET /personal_access_tokens/self`, so a bad token fails before any
@@ -150,7 +152,7 @@ It raises:
 - `ValueError` for invalid arguments: an empty token, an unknown or empty
   `resource_types`, `comments` without `issues` or `merge_requests`, a `base_url`
   with credentials, a query string or a non-HTTP(S) scheme, or an empty or invalid
-  `project_ids` entry.
+  `project_ids` entry, or an `include_internal` that is not a bool.
 - `GitLabAPIError` (a `RuntimeError`, importable from
   `cognee_community_connector_gitlab.gitlab`) when GitLab rejects the token, the
   token is inactive or lacks `read_api`, or a request fails (network error,
@@ -183,21 +185,27 @@ appends a `## Comments` section to the parent document, oldest first:
 alice (2026-10-12):
 I think the bug is in the auth middleware.
 
-bob (2026-10-13) [internal]:
+bob (2026-10-13):
 Confirmed, fixed in !28.
 ```
 
-System notes ("added label", "mentioned in") are skipped. Every user comment is
-kept; Cognee chunks long documents like any other. Deleting an issue or MR removes
+System notes ("added label", "mentioned in") are skipped. Every other user
+comment is kept, except internal comments unless `include_internal=True`; Cognee
+chunks long documents like any other. Deleting an issue or MR removes
 its comments too.
 
 ### Confidential issues and internal comments
 
-The connector ingests everything the token can read. That includes confidential
-issues and internal comments; internal comments are marked `[internal]` in the
-text. Anyone who can query the destination dataset can read that content, so
-either restrict access to the dataset or use a token whose user cannot read the
-confidential content. There is no option to filter them out yet.
+By default (`include_internal=False`) the connector leaves out confidential
+issues and internal comments, because anyone who can query the destination
+dataset can read what is in it. An issue that becomes confidential after it was
+synced is removed on the next run, like a deleted issue.
+
+With `include_internal=True`, both are ingested and each internal comment is
+marked `[internal]` in the text (`bob (2026-10-13) [internal]:`). Restrict access
+to the dataset accordingly. The setting is part of the staging scope, so switching
+it builds a separate set of documents instead of leaving earlier ones rendered
+under the old setting; use a separate dataset for each value.
 
 ## Choosing projects
 
@@ -246,10 +254,12 @@ inventory would be incomplete.
   with `GET /projects/:id` the same way.
 - **Failures:** 401, 429, 5xx, timeouts, redirects, failed pages, and malformed
   payloads abort the run without saving a partial checkpoint or emitting
-  tombstones. There are no automatic retries; a 429 raises a rate-limit error,
-  and rerunning later is safe. No response bodies or tokens are logged.
+  tombstones. There are no automatic retries; a 429 raises a rate-limit error
+  that includes GitLab's `Retry-After` wait when the response has one, and
+  rerunning later is safe. No response bodies or tokens are logged.
 - **Isolation:** staging and pipeline names are scoped by instance URL, token
-  owner ID, resource selection, project selection, and destination dataset.
+  owner ID, resource selection, project selection, the `include_internal`
+  setting, and destination dataset.
   Rotating the token keeps the same scope.
 - **Memory:** each scan buffers documents and bookkeeping in memory; very large
   inventories would need a database-backed state strategy.
@@ -324,7 +334,8 @@ uv run ruff check .
 uv run ruff format --check .
 ```
 
-182 offline tests cover token validation, discovery, mapping, comments,
+190 offline tests cover token validation, discovery, mapping, comments,
+internal-content filtering, rate-limit messages,
 incremental cursors, deletion reconciliation, failure atomicity, token rotation,
 and a real dlt + SQLite pipeline with hard deletes. They need no network or
 credentials. See [`tests/README.md`](tests/README.md) for the layout.

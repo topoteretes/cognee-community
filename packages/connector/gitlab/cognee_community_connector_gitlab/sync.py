@@ -41,6 +41,7 @@ def sync_documents(
     state: dict,
     *,
     project_ids: tuple[int | str, ...] | None = None,
+    include_internal: bool = False,
 ):
     """Yield changed documents and tombstones, then update DLT-managed state.
 
@@ -56,6 +57,10 @@ def sync_documents(
     changed: GitLab bumps ``updated_at`` when a comment is added or edited (at
     most once a minute, covered by the cursor overlap), but not when one is
     deleted, which only lowers the count. Unchanged items keep their stored hash.
+
+    Without ``include_internal``, internal comments are left out of documents,
+    and confidential issues are skipped; one synced earlier is removed when it
+    becomes confidential.
 
     A resource a project has turned off (by metadata, or 403/404 on its list
     endpoint) is skipped for that project only, and documents previously synced
@@ -175,6 +180,14 @@ def sync_documents(
                 latest[document_id] = (identity, item)
                 if resource != "wiki":
                     timestamps.append(_timestamp(item.get("updated_at")))
+            if resource == "issues" and not include_internal:
+                # Filter after reconciliation: a confidential issue still reads
+                # successfully, so it must not be kept as a deletion candidate.
+                for document_id, (_, item) in list(latest.items()):
+                    if item.get("confidential") is True:
+                        del latest[document_id]
+                        if document_id in old_hashes:
+                            rows.append({"id": document_id, "_deleted": True})
 
             documents = {}
             identities = {}
@@ -191,6 +204,12 @@ def sync_documents(
                     kept_hashes[document_id] = old_hashes[document_id]
                     continue
                 notes = _fetch_notes(client, project["id"], resource, item["iid"])
+                if not include_internal:
+                    notes = [
+                        note
+                        for note in notes
+                        if not (note.get("internal") or note.get("confidential"))
+                    ]
                 documents[document_id] = mapper(item, project, instance, notes=notes)
             current_hashes = dict(kept_hashes)
             for document_id, document in documents.items():

@@ -34,6 +34,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dataset", default="gitlab", help="Dedicated Cognee dataset")
     parser.add_argument("--question", default="Summarize the open issues and their discussion.")
+    parser.add_argument(
+        "--include-internal",
+        action="store_true",
+        help="Also ingest confidential issues and internal comments (off by default)",
+    )
     args = parser.parse_args()
     if not os.getenv("GITLAB_TOKEN", "").strip():
         parser.error("set GITLAB_TOKEN to a legacy personal access token with read_api")
@@ -54,6 +59,7 @@ async def main(args: argparse.Namespace) -> None:
         base_url=args.base_url,
         resource_types=args.resources,
         project_ids=args.projects or None,
+        include_internal=args.include_internal,
     )
     print("Syncing GitLab into Cognee ...")
     result = await cognee.remember(
