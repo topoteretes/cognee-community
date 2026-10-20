@@ -223,10 +223,11 @@ asyncio.run(main())
 ## Offline tests
 
 ```bash
-uv run python -m unittest discover -s tests -p 'test_*.py'
+uv run --locked pytest tests/
 ```
 
-Tests use mocked GCS clients and temporary SQLite dlt destinations. They require
+Tests use pytest with shared fixtures, mocked GCS clients, and temporary SQLite
+dlt destinations. Credential discovery and HTTP requests are blocked during tests. They require
 no Google credentials or live bucket and cover updates, unchanged runs, deletion
 markers, size limits, listing failures, and persistent inventories. A real-bucket
 test is still needed to validate service-account access and the complete Cognee
