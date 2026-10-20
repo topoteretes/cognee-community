@@ -27,6 +27,7 @@ import asyncio
 import os
 
 import cognee
+from cognee.modules.retrieval.exceptions.exceptions import NoDataError
 
 from cognee_community_connector_telegram import telegram_source
 
@@ -51,14 +52,15 @@ def _chats_from_env():
 
 
 async def main():
-    if not os.environ.get("TELEGRAM_BOT_TOKEN"):
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not token:
         print("Set TELEGRAM_BOT_TOKEN first (see the setup steps at the top of this file).")
         return
 
     chats = _chats_from_env()
     print(f"Syncing {'all chats the bot is in' if chats is None else chats} ...")
     result = await cognee.remember(
-        telegram_source(chats=chats),
+        telegram_source(token=token, chats=chats),
         dataset_name=DATASET_NAME,
         **TELEGRAM_REMEMBER_KWARGS,
     )
@@ -69,9 +71,7 @@ async def main():
             "What has been discussed in these chats, and who said what?",
             datasets=[DATASET_NAME],
         )
-    except Exception as error:  # cognee raises NoDataError while the dataset is empty
-        if type(error).__name__ != "NoDataError":
-            raise
+    except NoDataError:  # the dataset is still empty
         print(
             "Nothing to search yet: the bot has not seen any messages. Send a few "
             "messages in a chat the bot is in, then run this again."

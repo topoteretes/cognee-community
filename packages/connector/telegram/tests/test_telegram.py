@@ -41,7 +41,7 @@ def run(bot, state, **kwargs):
 def test_message_row_has_document_columns_and_stable_key():
     row = message_to_row(msg(GROUP, 7, "Deploy is on Friday"))
     assert row["id"] == "-100:7"
-    assert row["title"] == "Team chat: message 7"
+    assert row["title"] == "Deploy is on Friday"  # the first line says more than "message 7"
     assert "From: Alice (@alice)" in row["content"]
     assert row["content"].endswith("Deploy is on Friday")
     assert row["_deleted"] is False
@@ -179,7 +179,7 @@ def test_message_and_removal_in_same_batch_ends_deleted():
     bot.add(message=msg(GROUP, 1, "a"))
     bot.add(my_chat_member=removed(GROUP))
     rows = run(bot, {})
-    assert rows == [{"id": "-100:1", "chat_id": -100, "message_id": 1, "_deleted": True}]
+    assert rows == [{"id": "-100:1", "_deleted": True}]
 
 
 def test_removal_from_unselected_chat_is_ignored():
@@ -208,22 +208,24 @@ def test_group_upgrade_keeps_syncing_and_removal_forgets_both_ids():
 
 
 # --------------------------------------------------------------------- paging / errors
-def test_pages_through_more_than_100_updates():
+def test_one_getupdates_call_per_run_and_a_backlog_catches_up_over_runs():
     bot = FakeBot()
     for i in range(1, 251):
         bot.add(message=msg(GROUP, i, f"m{i}"))
-    rows = run(bot, {})
-    assert len(rows) == 250
-    assert sum(1 for c in bot.calls if c[0] == "getUpdates") == 3
+    state = {}
+    sizes = [len(run(bot, state)) for _ in range(4)]
+    assert sizes == [100, 100, 50, 0]
+    assert len(bot.get_updates_calls()) == 4, "never a second getUpdates in one run"
 
 
-def test_max_updates_per_run_fetches_one_page():
+def test_max_updates_per_run_limits_the_page():
     bot = FakeBot()
-    for i in range(1, 151):
+    for i in range(1, 31):
         bot.add(message=msg(GROUP, i, f"m{i}"))
     state = {}
-    assert len(run(bot, state, max_updates=100)) == 100
-    assert len(run(bot, state, max_updates=100)) == 50
+    assert len(run(bot, state, max_updates=20)) == 20
+    assert bot.get_updates_calls()[0]["limit"] == 20
+    assert len(run(bot, state, max_updates=20)) == 10
 
 
 def test_webhook_conflict_raises_clear_error():
@@ -231,9 +233,9 @@ def test_webhook_conflict_raises_clear_error():
         run(FakeBot(conflict=True), {})
 
 
-def test_missing_token_raises(monkeypatch):
-    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
-    with pytest.raises(ValueError, match="TELEGRAM_BOT_TOKEN"):
+def test_missing_token_raises_and_the_env_var_is_not_read(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "111:from-env")
+    with pytest.raises(ValueError, match="token="):
         telegram_source()
 
 
@@ -265,7 +267,7 @@ def test_row_becomes_a_telegram_document_in_cognee():
     assert item.system_metadata["source"] == "telegram"
     assert item.system_metadata["external_id"] == "-1001:3"
     assert item.system_metadata["url"] == "https://t.me/news_chan/3"
-    assert item.data.startswith("# News: message 3")
+    assert item.data.startswith("# Release notes")
     assert item.data.endswith("Release notes")
 
 
@@ -333,7 +335,9 @@ def test_each_bot_gets_its_own_table_and_sync_state():
     assert getattr(source, PIPELINE_SCOPE_ATTR) == "telegram:12345"
     named = telegram_source(token="12345:secret", resource_name="team_bot", client=FakeBot())
     assert set(named.resources) == {"team_bot"}
-    assert getattr(named, PIPELINE_SCOPE_ATTR) == "telegram:12345:team_bot"
+    # A chosen name is the scope, so two bots given one name share one state (and
+    # the second is refused) instead of silently writing into one table.
+    assert getattr(named, PIPELINE_SCOPE_ATTR) == "telegram:team_bot"
 
 
 def test_check_active_runs_before_every_request():

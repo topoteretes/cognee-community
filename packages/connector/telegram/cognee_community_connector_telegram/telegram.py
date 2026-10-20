@@ -7,7 +7,7 @@ Hand the source to :func:`cognee.remember`::
     from cognee_community_connector_telegram import telegram_source
 
     await cognee.remember(
-        telegram_source(chats=[-1001234567890, "@my_channel"]),
+        telegram_source(token="123456:ABC...", chats=[-1001234567890, "@my_channel"]),
         dataset_name="telegram",
         primary_key="id",
         write_disposition="merge",   # REQUIRED, see below
@@ -16,12 +16,21 @@ Hand the source to :func:`cognee.remember`::
 
 Design
 ------
-* **Auth**: a bot token from @BotFather (``TELEGRAM_BOT_TOKEN``). It is checked
-  once with ``getMe`` so a wrong token fails immediately. The token is only ever
-  sent to ``api.telegram.org`` and is never logged.
-* **Incremental cursor**: the Bot API ``update_id``. Each run calls
-  ``getUpdates(offset=last_update_id + 1)`` and the new ``last_update_id`` is
-  kept in dlt resource state, which dlt only commits after a successful load.
+* **Auth**: a bot token from @BotFather, passed as ``token=``. It is checked once
+  with ``getMe`` so a wrong token fails immediately. The token is only ever sent
+  to ``api.telegram.org`` and never logged, and errors never carry the request URL
+  (the token is part of it).
+* **One page per run**: asking ``getUpdates`` for the next page confirms the
+  previous one on Telegram's side, and confirmed updates are gone for good. So a
+  run makes a single ``getUpdates`` call (up to 100 updates), and those updates are
+  only confirmed by the *next* run, whose offset comes from the state dlt saved
+  after this run's load succeeded. A failed load, or a host revoking access
+  mid-run, therefore never loses an update: the next run gets the same page again.
+  A busy bot catches up over a few runs.
+* **Incremental cursor**: the Bot API ``update_id``, kept in dlt resource state.
+  After a week without updates Telegram restarts ``update_id`` at a random value,
+  possibly below the saved cursor, so after six quiet days the connector asks
+  without an offset (which confirms nothing) instead of risking dropping them.
 * **Edits**: ``edited_message`` / ``edited_channel_post`` carry the same
   ``message_id``, so they upsert the existing row (``merge`` on ``chat_id:message_id``;
   message ids are only unique inside one chat).
@@ -40,7 +49,9 @@ Design
 * **Several bots**: two bots in one chat see the same ``chat_id:message_id`` keys,
   so each bot writes its own table and sync state, named after ``resource_name``
   (``telegram_<bot id>`` by default). Otherwise removing one bot from a chat would
-  forget the messages the other bot still sees.
+  forget the messages the other bot still sees. A sync state written by another
+  bot is refused. A state left by the first version of this connector (one
+  ``telegram_messages`` table per bot) is adopted, and its table kept.
 
 .. important::
    ``write_disposition="merge"`` is mandatory. The add pipeline defaults to
@@ -51,26 +62,25 @@ Bot API limits
 --------------
 * A bot only sees messages sent after it joined (no history backfill), and
   in groups only what privacy mode allows (disable it in @BotFather, or make the
-  bot an admin, to see all messages).
+  bot an admin, to see all messages). The connector warns when privacy mode is on.
 * Telegram keeps unconfirmed updates for about 24 hours, so sync at least daily.
-* Requesting the next page of updates confirms the previous page on Telegram's
-  side. If a run fetches several pages and then fails to load, the updates of the
-  earlier pages are not delivered again; pass ``max_updates_per_run=100`` to fetch
-  a single page per run if that matters more than throughput.
-* ``getUpdates`` fails with 409 while the bot has a webhook. The connector raises
-  a clear error instead of deleting someone else's webhook; use a dedicated bot.
+* ``getUpdates`` fails with 409 while the bot has a webhook, or while another
+  process polls the same bot. The connector raises a clear error saying which,
+  instead of deleting someone else's webhook; use a dedicated bot.
+* Flood waits longer than a minute are not slept through: the run stops without
+  rows or a state change, reports ``failed_rate_limit``, and the next sync resumes.
 """
 
 from __future__ import annotations
 
+import http.client
 import json
-import os
+import re
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 from collections.abc import Callable, Iterable, Iterator
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from cognee.shared.logging_utils import get_logger
@@ -83,10 +93,18 @@ from cognee.tasks.ingestion.dlt_utils import (
 logger = get_logger("telegram_connector")
 
 TELEGRAM_SOURCE_NAME = "telegram"
+# The table (and state) name of the first version of this connector.
+LEGACY_RESOURCE_NAME = "telegram_messages"
 
 _API_BASE = "https://api.telegram.org"
 _MAX_RETRIES = 5
 _PAGE_SIZE = 100  # Bot API maximum for getUpdates
+_MAX_RETRY_AFTER = 60.0  # longer flood waits stop the run instead of sleeping
+# dlt snake-cases table names, so "Team-Bot" and "team_bot" would share a table while
+# keeping separate sync states. Only names dlt leaves unchanged are accepted.
+_RESOURCE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
+_QUIET_RESET_SECONDS = 6 * 24 * 3600  # update_id may restart after a week without updates
+_TITLE_LENGTH = 80
 _ALLOWED_UPDATES = [
     "message",
     "edited_message",
@@ -102,7 +120,23 @@ class TelegramAPIError(RuntimeError):
     """A Bot API call failed permanently."""
 
 
-class TelegramWebhookConflictError(TelegramAPIError):
+class TelegramAuthError(TelegramAPIError):
+    """Telegram rejected the bot token."""
+
+
+class TelegramRateLimitError(TelegramAPIError):
+    """Telegram asked to wait longer than the connector sleeps (or kept answering 429)."""
+
+    def __init__(self, message: str, retry_after: float | None = None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+class TelegramConflictError(TelegramAPIError):
+    """``getUpdates`` is unavailable (409): a webhook is set, or another process polls."""
+
+
+class TelegramWebhookConflictError(TelegramConflictError):
     """``getUpdates`` is unavailable because a webhook is set on the bot."""
 
 
@@ -112,14 +146,24 @@ class TelegramWebhookConflictError(TelegramAPIError):
 class TelegramBotClient:
     """Small Bot API client: ``call(method, **params) -> result``.
 
-    Retries 429 (honouring ``retry_after``) and 5xx/network errors with backoff;
-    raises :class:`TelegramAPIError` for everything else. The token is part of
-    the URL path, so URLs are never logged.
+    Retries 429 (honouring ``retry_after`` up to a minute) and 5xx/network errors
+    with backoff; raises :class:`TelegramAPIError` for everything else. The token
+    is part of the URL path, so URLs are never logged or put in an error.
     """
 
-    def __init__(self, token: str, timeout: float = 30.0):
+    def __init__(
+        self, token: str, timeout: float = 30.0, sleep: Callable[[float], None] = time.sleep
+    ):
         self._token = token
         self._timeout = timeout
+        self._sleep = sleep
+
+    def __repr__(self) -> str:
+        # The token is a password: keep it out of any repr, log or traceback.
+        return "TelegramBotClient(token=<redacted>)"
+
+    def _open(self, request):
+        return urllib.request.urlopen(request, timeout=self._timeout)
 
     def call(self, method: str, **params: Any) -> Any:
         url = f"{_API_BASE}/bot{self._token}/{method}"
@@ -129,21 +173,43 @@ class TelegramBotClient:
                 url, data=body, headers={"Content-Type": "application/json"}
             )
             try:
-                with urllib.request.urlopen(request, timeout=self._timeout) as response:
+                with self._open(request) as response:
                     payload = json.load(response)
             except urllib.error.HTTPError as exc:
+                # Every raise below uses ``from None``: the HTTPError carries the
+                # request URL, and the URL carries the bot token.
                 payload = _read_error_payload(exc)
                 status = exc.code
+                description = str(payload.get("description") or "")[:200]
                 if status == 409:
-                    raise TelegramWebhookConflictError(
-                        "Telegram returned 409 Conflict: this bot has a webhook set, so "
-                        "getUpdates is unavailable. Use a dedicated bot for cognee, or "
-                        "remove the webhook yourself (deleteWebhook) if it is not in use."
+                    if "webhook" in description.lower():
+                        raise TelegramWebhookConflictError(
+                            f"Telegram returned 409 Conflict ({description}): this bot has a "
+                            "webhook set, so getUpdates is unavailable. Use a dedicated bot for "
+                            "cognee, or remove the webhook yourself (deleteWebhook) if it is "
+                            "not in use."
+                        ) from None
+                    raise TelegramConflictError(
+                        f"Telegram returned 409 Conflict ({description}): another process is "
+                        "polling this bot with getUpdates. Stop it, or use a dedicated bot "
+                        "for cognee."
                     ) from None
-                if status == 401 or status == 404:
-                    raise TelegramAPIError(
-                        "Telegram rejected the bot token (check TELEGRAM_BOT_TOKEN)."
+                if status in (401, 404):
+                    raise TelegramAuthError(
+                        "Telegram rejected the bot token. Create one with @BotFather and pass "
+                        "it as token=."
                     ) from None
+                if status == 429:
+                    retry_after = _retry_after(payload)
+                    if retry_after is not None and retry_after > _MAX_RETRY_AFTER:
+                        raise TelegramRateLimitError(
+                            f"Telegram {method}: flood wait of {retry_after:.0f}s.", retry_after
+                        ) from None
+                    if attempt == _MAX_RETRIES - 1:
+                        raise TelegramRateLimitError(
+                            f"Telegram {method}: still rate limited after {_MAX_RETRIES} tries.",
+                            retry_after,
+                        ) from None
                 if (status == 429 or status >= 500) and attempt < _MAX_RETRIES - 1:
                     delay = _retry_delay(payload, attempt)
                     logger.warning(
@@ -154,18 +220,29 @@ class TelegramBotClient:
                         attempt + 1,
                         _MAX_RETRIES,
                     )
-                    time.sleep(delay)
+                    self._sleep(delay)
                     continue
                 raise TelegramAPIError(
-                    f"Telegram {method} failed: HTTP {status} {payload.get('description', '')}"
+                    f"Telegram {method} failed: HTTP {status} {description}"
                 ) from None
-            except (urllib.error.URLError, TimeoutError) as exc:
+            except ValueError:
+                # A 200 whose body is not JSON (a proxy's error page, a cut-off reply).
+                raise TelegramAPIError(
+                    f"Telegram {method} returned a body that is not JSON."
+                ) from None
+            except (OSError, http.client.HTTPException) as exc:
+                # URLError, timeouts, ConnectionResetError, RemoteDisconnected and
+                # IncompleteRead: a dropped connection is retried like a 5xx.
                 if attempt < _MAX_RETRIES - 1:
                     delay = float(2**attempt)
                     logger.warning("Telegram %s: network error, retrying in %.1fs.", method, delay)
-                    time.sleep(delay)
+                    self._sleep(delay)
                     continue
-                raise TelegramAPIError(f"Telegram {method} failed: {exc.reason!s}") from None
+                # ``from None``: the URLError's text can include the URL, and so the token.
+                reason = getattr(exc, "reason", exc)
+                raise TelegramAPIError(
+                    f"Telegram {method} failed: {type(reason).__name__}"
+                ) from None
 
             if not payload.get("ok"):
                 raise TelegramAPIError(
@@ -176,16 +253,14 @@ class TelegramBotClient:
 
 
 class _CheckedClient:
-    """Runs the host's ``check_active`` before every Bot API call.
-
-    A run makes all its calls before it emits the first row, so checking only
-    around rows would let a sync whose access was revoked keep calling Telegram
-    until the end.
-    """
+    """Runs the host's ``check_active`` before every Bot API call."""
 
     def __init__(self, client, check_active: Callable[[], None]):
         self._client = client
         self._check_active = check_active
+
+    def __repr__(self) -> str:
+        return f"_CheckedClient({self._client!r})"
 
     def call(self, method: str, **params: Any) -> Any:
         self._check_active()
@@ -199,12 +274,18 @@ def _read_error_payload(exc: urllib.error.HTTPError) -> dict:
         return {}
 
 
-def _retry_delay(payload: dict, attempt: int) -> float:
-    retry_after = (payload.get("parameters") or {}).get("retry_after")
+def _retry_after(payload: dict) -> float | None:
+    value = (payload.get("parameters") or {}).get("retry_after")
     try:
-        return float(retry_after)
+        seconds = float(value)
     except (TypeError, ValueError):
-        return float(2**attempt)
+        return None
+    return seconds if seconds >= 0 else None
+
+
+def _retry_delay(payload: dict, attempt: int) -> float:
+    retry_after = _retry_after(payload)
+    return retry_after if retry_after is not None else float(2**attempt)
 
 
 # ---------------------------------------------------------------------------
@@ -290,7 +371,7 @@ def _message_text(message: dict) -> str:
 def _iso(ts: int | None) -> str:
     if not ts:
         return ""
-    return datetime.fromtimestamp(ts, tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
 def message_to_row(message: dict) -> dict[str, Any] | None:
@@ -330,19 +411,24 @@ def message_to_row(message: dict) -> dict[str, Any] | None:
 
     return {
         "id": row_key(chat_id, message_id),
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "title": f"{chat_name}: message {message_id}",
+        "title": _title(text, chat_name, message_id),
         "content": content,
         "url": _message_url(chat, message_id),
         "_deleted": False,
     }
 
 
+def _title(text: str, chat_name: str, message_id) -> str:
+    """The message's first line (shortened), which says more than a message number."""
+    first = next((line.strip() for line in text.splitlines() if line.strip()), "")
+    if not first:
+        return f"{chat_name}: message {message_id}"
+    return first if len(first) <= _TITLE_LENGTH else first[: _TITLE_LENGTH - 1].rstrip() + "…"
+
+
 def deleted_row(key: str) -> dict[str, Any]:
     """Hard-delete marker for a stored message."""
-    chat_id, message_id = key.split(":", 1)
-    return {"id": key, "chat_id": int(chat_id), "message_id": int(message_id), "_deleted": True}
+    return {"id": key, "_deleted": True}
 
 
 # ---------------------------------------------------------------------------
@@ -360,7 +446,7 @@ def _normalize_selection(chats: Iterable[int | str] | None):
     return ids, usernames
 
 
-def _selected(chat: dict, ids, usernames, state: dict) -> bool:
+def _selected(chat: dict, ids, usernames, migrated_from: dict[str, str]) -> bool:
     if ids is None:
         return True
     chat_id = chat.get("id")
@@ -369,67 +455,85 @@ def _selected(chat: dict, ids, usernames, state: dict) -> bool:
     if (chat.get("username") or "").lower() in usernames:
         return True
     # A selected group that was upgraded keeps syncing under its new id.
-    old = state.get("migrated_from", {}).get(str(chat_id))
+    old = migrated_from.get(str(chat_id))
     return old is not None and int(old) in ids
 
 
-def iter_updates(client, state: dict, max_updates: int | None = None) -> Iterator[dict]:
-    """Yield updates after ``state['last_update_id']``, page by page."""
-    offset = state.get("last_update_id")
-    offset = offset + 1 if offset is not None else None
-    fetched = 0
-    while True:
-        limit = _PAGE_SIZE if max_updates is None else min(_PAGE_SIZE, max_updates - fetched)
-        if limit <= 0:
-            return
-        updates = (
-            client.call(
-                "getUpdates",
-                offset=offset,
-                limit=limit,
-                timeout=0,
-                allowed_updates=_ALLOWED_UPDATES,
-            )
-            or []
+def fetch_page(client, state: dict, limit: int = _PAGE_SIZE, now: float | None = None) -> list:
+    """The one ``getUpdates`` call of a run.
+
+    The offset confirms everything before it, which is safe here: those updates
+    were loaded by an earlier run whose state dlt saved. After six days without
+    updates the offset is left out, because Telegram may restart ``update_id``
+    below the saved cursor after a quiet week, and an offset above the new ids
+    would confirm (drop) them. Without an offset nothing is confirmed.
+    """
+    now = time.time() if now is None else now
+    last = state.get("last_update_id")
+    seen_at = state.get("last_update_seen_at")
+    quiet = seen_at is not None and now - seen_at > _QUIET_RESET_SECONDS
+    offset = last + 1 if last is not None and not quiet else None
+    if quiet:
+        logger.info("Telegram: no updates for over six days; reading without an offset.")
+    return (
+        client.call(
+            "getUpdates",
+            offset=offset,
+            limit=max(1, min(limit, _PAGE_SIZE)),
+            timeout=0,
+            allowed_updates=_ALLOWED_UPDATES,
         )
-        if not updates:
-            return
-        yield from updates
-        fetched += len(updates)
-        offset = updates[-1]["update_id"] + 1
-        if len(updates) < limit:
-            return
+        or []
+    )
 
 
 def sync_updates(
     client,
     state: dict,
     chats: Iterable[int | str] | None = None,
-    max_updates: int | None = None,
+    max_updates: int = _PAGE_SIZE,
+    stats: dict | None = None,
+    now: float | None = None,
 ) -> Iterator[dict[str, Any]]:
-    """Turn new updates into message rows and hard-delete rows.
+    """Fetch one page of updates and turn it into rows (``fetch_page`` + ``process_updates``)."""
+    now = time.time() if now is None else now
+    updates = fetch_page(client, state, max_updates, now)
+    yield from process_updates(updates, state, chats, max_updates, stats, now)
+
+
+def process_updates(
+    updates: list,
+    state: dict,
+    chats: Iterable[int | str] | None = None,
+    max_updates: int = _PAGE_SIZE,
+    stats: dict | None = None,
+    now: float | None = None,
+) -> Iterator[dict[str, Any]]:
+    """Turn one page of updates into message rows and hard-delete rows.
 
     ``state`` (dlt resource state) holds ``last_update_id``, the stored message
-    keys per chat (``known``) and group-upgrade links (``migrated_from``). It is
-    only persisted by dlt after the load succeeds, so a failed run is retried
-    from the same cursor.
+    keys per chat (``known``) and group-upgrade links (``migrated_from``). The
+    run works on copies and writes the state only after its last row, and dlt
+    only persists it after the load succeeds, so a failed run is retried from
+    the same cursor.
     """
+    if stats is None:
+        stats = {}
+    now = time.time() if now is None else now
     ids, usernames = _normalize_selection(chats)
-    known: dict[str, list[int]] = state.setdefault("known", {})
-    migrated_from: dict[str, str] = state.setdefault("migrated_from", {})
+    known: dict[str, list[int]] = {k: list(v) for k, v in state.get("known", {}).items()}
+    migrated_from: dict[str, str] = dict(state.get("migrated_from", {}))
     known_sets: dict[str, set[int]] = {}  # fast membership checks for this run
     rows: dict[str, dict] = {}
     seen_chats: dict[int, str] = {}  # logged at the end, to help pick chat ids
-    last_update_id = state.get("last_update_id")
+    last_update_id = updates[-1]["update_id"] if updates else state.get("last_update_id")
 
-    for update in iter_updates(client, state, max_updates):
-        last_update_id = update["update_id"]
-
+    for update in updates:
         member = update.get("my_chat_member")
         if member:
             chat = member.get("chat") or {}
             status = (member.get("new_chat_member") or {}).get("status")
-            if status in _REMOVED_STATUSES and _selected(chat, ids, usernames, state):
+            if status in _REMOVED_STATUSES and _selected(chat, ids, usernames, migrated_from):
                 for chat_id in _chat_and_aliases(chat.get("id"), migrated_from):
                     known_sets.pop(str(chat_id), None)
                     for message_id in known.pop(str(chat_id), []):
@@ -453,36 +557,52 @@ def sync_updates(
             migrated_from[str(chat.get("id"))] = str(message["migrate_from_chat_id"])
         if chat.get("id") is not None:
             seen_chats[chat["id"]] = _log_label(chat)
-        if not _selected(chat, ids, usernames, state):
+        if not _selected(chat, ids, usernames, migrated_from):
+            stats["skipped"] = stats.get("skipped", 0) + 1
             continue
         row = message_to_row(message)
         if row is None:
+            stats["skipped"] = stats.get("skipped", 0) + 1
             continue
         rows[row["id"]] = row  # a later edit in the same batch wins
-        chat_key = str(row["chat_id"])
+        chat_key = str(chat.get("id"))
+        message_id = message.get("message_id")
         seen = known_sets.setdefault(chat_key, set(known.get(chat_key, [])))
-        if row["message_id"] not in seen:
-            seen.add(row["message_id"])
-            known.setdefault(chat_key, []).append(row["message_id"])
+        if message_id not in seen:
+            seen.add(message_id)
+            known.setdefault(chat_key, []).append(message_id)
 
-    if last_update_id is not None:
-        state["last_update_id"] = last_update_id
     if seen_chats:
         logger.info(
             "Telegram: chats seen in this run: %s.",
             ", ".join(f"{label} ({chat_id})" for chat_id, label in seen_chats.items()),
         )
     live = sum(1 for r in rows.values() if not r["_deleted"])
+    stats["messages"] = stats.get("messages", 0) + live
+    stats["deletions"] = stats.get("deletions", 0) + len(rows) - live
     logger.info("Telegram: %d message row(s), %d deletion(s).", live, len(rows) - live)
+    if len(updates) >= max(1, min(max_updates, _PAGE_SIZE)):
+        logger.info("Telegram: more updates are waiting; the next run continues.")
     yield from rows.values()
+
+    # Only reached once every row is out: a run stopped mid-way saves nothing.
+    if last_update_id is not None:
+        state["last_update_id"] = last_update_id
+    if updates:
+        state["last_update_seen_at"] = now
+    state["known"] = known
+    state["migrated_from"] = migrated_from
 
 
 def _chat_and_aliases(chat_id, migrated_from: dict[str, str]) -> list[int]:
-    """The chat id plus every older id it was upgraded from."""
-    out, current = [], chat_id
-    while current is not None and current not in out:
+    """The chat id plus every older id it was upgraded from (cycles stop the walk)."""
+    out: list[int] = []
+    seen: set[str] = set()
+    current = None if chat_id is None else str(chat_id)
+    while current is not None and current not in seen:
+        seen.add(current)
         out.append(int(current))
-        current = migrated_from.get(str(current))
+        current = migrated_from.get(current)
     return out
 
 
@@ -492,20 +612,23 @@ def _chat_and_aliases(chat_id, migrated_from: dict[str, str]) -> list[int]:
 def telegram_source(
     token: str | None = None,
     chats: Iterable[int | str] | None = None,
-    max_updates_per_run: int | None = None,
+    max_updates_per_run: int = _PAGE_SIZE,
     resource_name: str | None = None,
     check_active: Callable[[], None] | None = None,
     client: Any = None,
+    service: Any = None,
 ):
     """Create a dlt source that yields Telegram messages as documents.
 
     Args:
-        token: Bot token from @BotFather. Falls back to ``TELEGRAM_BOT_TOKEN``.
+        token: Bot token from @BotFather.
         chats: Chats to ingest, by numeric id (e.g. ``-1001234567890``) or
-            ``@username``. ``None`` ingests every chat the bot is in. Updates
-            from other chats are still consumed (use a dedicated bot).
-        max_updates_per_run: Fetch at most this many updates per run
-            (``100`` = a single page, see the module notes). ``None`` = all.
+            ``@username``. ``None`` ingests every chat the bot is in, private
+            messages to the bot included. Updates from other chats are still
+            consumed (use a dedicated bot), and dropping a chat from ``chats``
+            later leaves its messages in memory.
+        max_updates_per_run: Updates read per run, 1 to 100 (one ``getUpdates``
+            page, see the module notes). A busy bot catches up over several runs.
         resource_name: Table name and part of the sync state key. Defaults to
             ``telegram_<bot id>`` (the part of the token before ``:``), so two
             bots in one dataset never share a table. Keep it fixed across runs.
@@ -513,12 +636,15 @@ def telegram_source(
             Bot API call and around every row (``dlt_utils.guarded_rows``);
             raising from it stops the sync.
         client: Object with ``call(method, **params)``; a test injection point.
-            Built from the token when omitted.
+            Built from the token when omitted. ``service`` is an alias.
 
     Returns:
         A dlt source with one ``<resource_name>`` resource
         (``primary_key="id"``, ``write_disposition="merge"``, ``_deleted`` hard
         delete). Pass ``write_disposition="merge"`` to ``cognee.remember`` too.
+        ``source.cognee_sync_stats`` holds counts only: ``messages``,
+        ``deletions``, ``skipped``, ``failed``, ``failed_auth`` and
+        ``failed_rate_limit``.
     """
     try:
         import dlt
@@ -527,18 +653,29 @@ def telegram_source(
             'The Telegram connector requires dlt: pip install "dlt[sqlalchemy]".'
         ) from exc
 
+    if client is not None and service is not None and client is not service:
+        raise ValueError("Pass client= or service=, not both.")
+    client = client if client is not None else service
+    if not isinstance(max_updates_per_run, int) or not 1 <= max_updates_per_run <= _PAGE_SIZE:
+        raise ValueError("max_updates_per_run must be between 1 and 100 (one getUpdates page).")
     chats = list(chats) if chats is not None else None
-    resolved = token or os.environ.get("TELEGRAM_BOT_TOKEN")
+    token = (token or "").strip() or None
+    if resource_name and not _RESOURCE_NAME_RE.match(resource_name):
+        raise ValueError(
+            "resource_name must be lowercase letters, digits and underscores, starting with a "
+            "letter, so dlt uses it unchanged as the table name."
+        )
     if client is None:
-        if not resolved:
-            raise ValueError("Telegram bot token required: pass token= or set TELEGRAM_BOT_TOKEN.")
-        client = TelegramBotClient(resolved)
+        if not token:
+            raise ValueError("Telegram bot token required: pass token= (from @BotFather).")
+        client = TelegramBotClient(token)
     # The part of a bot token before ":" is the bot's public numeric id.
-    bot_id = resolved.split(":", 1)[0] if resolved else "default"
+    bot_id = token.split(":", 1)[0] if token else "default"
     default_name = f"telegram_{bot_id}"
     resource_name = resource_name or default_name
     if check_active is not None:
         client = _CheckedClient(client, check_active)
+    stats: dict[str, int] = {}
 
     @dlt.resource(
         name=resource_name,
@@ -551,17 +688,75 @@ def telegram_source(
             "title": {"data_type": "text", "nullable": True},
             "content": {"data_type": "text", "nullable": True},
             "url": {"data_type": "text", "nullable": True},
-            "chat_id": {"data_type": "bigint"},
-            "message_id": {"data_type": "bigint"},
         },
     )
     def telegram_messages():
         yield from guarded_rows(_messages(dlt.current.resource_state()), check_active)
 
     def _messages(state):
-        me = client.call("getMe")  # fail fast on a bad token
-        logger.info("Telegram: syncing as @%s.", (me or {}).get("username", "?"))
-        yield from sync_updates(client, state, chats=chats, max_updates=max_updates_per_run)
+        stats.clear()
+        stats.update(messages=0, deletions=0, skipped=0, failed=0)
+        table = _adopt_legacy_state(state, resource_name)
+        try:
+            me = client.call("getMe") or {}  # fail fast on a bad token
+            _check_owner(state, me)
+            if me.get("can_read_all_group_messages") is False:
+                logger.warning(
+                    "Telegram: privacy mode is on, so in groups this bot only sees commands "
+                    "and replies to it. Disable it in @BotFather (/setprivacy) or make the bot "
+                    "an admin to sync every message."
+                )
+            now = time.time()
+            updates = fetch_page(client, state, max_updates_per_run, now)
+        except TelegramAuthError:
+            stats.update(failed=1, failed_auth=1)
+            raise
+        except TelegramRateLimitError as exc:
+            # Stop cleanly: nothing was confirmed and no state moves, so the next
+            # sync reads the same page. Raising would only fail the host's run.
+            stats.update(failed=1, failed_rate_limit=1)
+            logger.warning(
+                "Telegram: rate limited%s; stopping this run, the next sync resumes.",
+                f" for {exc.retry_after:.0f}s" if exc.retry_after else "",
+            )
+            return
+        # The state is written after the last row, so a run stopped between rows
+        # (by check_active, say) saves nothing and the next run reads this page again.
+        for row in process_updates(updates, state, chats, max_updates_per_run, stats, now):
+            yield dlt.mark.with_table_name(row, table) if table else row
+
+    def _adopt_legacy_state(state: dict, name: str) -> str | None:
+        """Keep a sync from the first version (``telegram_messages``) going.
+
+        That version wrote one ``telegram_messages`` table in a pipeline scoped to
+        the bot, the same scope this default uses. Its state is adopted once, and
+        its rows keep going to that table, so edits and removals still reach them.
+        """
+        if state.get("table"):
+            return state["table"]
+        if name != default_name or state.get("last_update_id") is not None:
+            return None
+        resources = dlt.current.source_state().get("resources", {})
+        legacy = resources.get(LEGACY_RESOURCE_NAME)
+        if not legacy or legacy.get("last_update_id") is None:
+            return None
+        state.update(
+            last_update_id=legacy["last_update_id"],
+            known={k: list(v) for k, v in legacy.get("known", {}).items()},
+            migrated_from=dict(legacy.get("migrated_from", {})),
+            table=LEGACY_RESOURCE_NAME,
+        )
+        logger.info("Telegram: continuing the sync state of %s.", LEGACY_RESOURCE_NAME)
+        return LEGACY_RESOURCE_NAME
+
+    def _check_owner(state: dict, me: dict) -> None:
+        owner, current = state.get("bot_id"), str(me.get("id") or bot_id)
+        if owner is not None and owner != current:
+            raise ValueError(
+                f"This sync state ('{resource_name}') belongs to another bot. Give each bot "
+                "its own resource_name."
+            )
+        state["bot_id"] = current
 
     @dlt.source(name=TELEGRAM_SOURCE_NAME)
     def _telegram():
@@ -570,10 +765,12 @@ def telegram_source(
     source = _telegram()
     # Route rows through the document path (text -> cognify), like Notion.
     setattr(source, DOCUMENT_SOURCE_ATTR, TELEGRAM_SOURCE_NAME)
-    # Keep the update cursor per bot and resource name (and, in cognee, per dataset),
-    # so two bots or datasets never resume from each other's cursor.
-    scope = f"telegram:{bot_id}"
-    if resource_name != default_name:
-        scope = f"{scope}:{resource_name}"
+    # Keep the update cursor per bot by default (the same scope as the first
+    # version), and per name when one is chosen, so two bots given the same
+    # name share one state and the second is refused instead of mixing tables.
+    scope = f"telegram:{bot_id}" if resource_name == default_name else f"telegram:{resource_name}"
     setattr(source, PIPELINE_SCOPE_ATTR, scope)
+    # Host-readable diagnostics contain counts only, never chat names or text.
+    source.cognee_sync_stats = stats
+    source.resources[resource_name].cognee_sync_stats = stats
     return source

@@ -28,25 +28,45 @@ def removed(chat, status="left"):
 
 
 class FakeBot:
-    """In-memory Bot API: a list of updates served like getUpdates does."""
+    """In-memory Bot API: a list of updates served like getUpdates does.
 
-    def __init__(self, updates=None, conflict=False):
+    Like the real API, a getUpdates call with an offset confirms (drops) every
+    update below it, so a test can see an update get lost for good.
+    """
+
+    def __init__(self, updates=None, conflict=False, bot_id=99, can_read_all=True):
         self.updates = list(updates or [])
         self.conflict = conflict
+        self.bot_id = bot_id
+        self.can_read_all = can_read_all
         self.calls = []
+        self.next_id = 1000
 
     def add(self, **update):
-        next_id = (self.updates[-1]["update_id"] + 1) if self.updates else 1000
-        self.updates.append({"update_id": next_id, **update})
+        # Ids keep counting after confirmed updates are dropped, like Telegram's.
+        self.updates.append({"update_id": self.next_id, **update})
+        self.next_id += 1
+
+    def add_with_id(self, update_id, **update):
+        self.updates.append({"update_id": update_id, **update})
 
     def call(self, method, **params):
         self.calls.append((method, params))
         if method == "getMe":
-            return {"id": 99, "is_bot": True, "username": "test_bot"}
+            return {
+                "id": self.bot_id,
+                "is_bot": True,
+                "username": "test_bot",
+                "can_read_all_group_messages": self.can_read_all,
+            }
         if method == "getUpdates":
             if self.conflict:
                 raise TelegramWebhookConflictError("409")
             offset = params.get("offset")
-            pending = [u for u in self.updates if offset is None or u["update_id"] >= offset]
-            return pending[: params.get("limit", 100)]
+            if offset is not None:
+                self.updates = [u for u in self.updates if u["update_id"] >= offset]
+            return self.updates[: params.get("limit", 100)]
         raise AssertionError(method)
+
+    def get_updates_calls(self):
+        return [p for m, p in self.calls if m == "getUpdates"]
