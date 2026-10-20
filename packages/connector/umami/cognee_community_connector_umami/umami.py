@@ -24,8 +24,20 @@ from collections.abc import Iterator
 from typing import Any
 
 import httpx
-from cognee.shared.logging_utils import get_logger
-from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
+
+try:
+    from cognee.shared.logging_utils import get_logger
+except ImportError:
+    import logging
+
+    def get_logger(name: str):
+        return logging.getLogger(name)
+
+
+try:
+    from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
+except ImportError:
+    DOCUMENT_SOURCE_ATTR = "cognee_document_source"
 
 logger = get_logger("umami_connector")
 
