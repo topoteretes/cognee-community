@@ -11,7 +11,6 @@ logger = get_logger("gcs_connector")
 DEFAULT_MAX_OBJECTS = 1000
 DEFAULT_MAX_OBJECT_SIZE = 10 * 1024 * 1024
 
-# Match the text extensions accepted by the S3 connector (PR #209).
 TEXT_EXTENSIONS = frozenset(
     {"txt", "md", "markdown", "json", "csv", "xml", "yaml", "yml", "log", "html", "htm", "rst"}
 )
