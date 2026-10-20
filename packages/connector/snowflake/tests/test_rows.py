@@ -428,3 +428,100 @@ def test_first_sync_and_full_refresh_read_the_whole_tracked_table(account):
 
     assert changes_reads(account) == []
     assert len(rows_of(docs)) == 4
+
+
+# -- row cap and filters --------------------------------------------------------
+
+OPEN_ONLY = {"SALES_DB.SALES.ORDERS": "STATUS = 'open'"}
+
+
+def test_a_table_over_the_row_cap_fails_alone_and_keeps_its_state(account):
+    state = {}
+    sync(account, state)
+    saved = dict(state["tables"]["SALES_DB.SALES.CUSTOMERS"])
+    account.insert("CUSTOMERS", CUSTOMER_ID=3, NAME="Northwind")
+    account.update("ORDERS", (101,), STATUS="refunded")
+
+    docs, stats = sync(account, state, max_rows=2)
+
+    assert stats["failed"] == 1
+    assert state["tables"]["SALES_DB.SALES.CUSTOMERS"] == saved
+    assert "ORDERS 101" in rows_of(docs)
+    # Over the cap, the table is refused before a single row is read.
+    assert 'SELECT * FROM "SALES_DB"."SALES"."CUSTOMERS" ORDER BY "CUSTOMER_ID"' not in reads(
+        account
+    )
+
+
+def test_the_row_cap_error_says_what_to_change(account):
+    with pytest.raises(SnowflakeConnectorError, match=r"more than max_rows \(1\).*filter"):
+        sync(account, {}, refs=(ORDERS,), max_rows=1)
+
+
+@pytest.mark.parametrize("no_cap", [None, 0])
+def test_the_row_cap_can_be_turned_off(account, no_cap):
+    docs, _ = sync(account, {}, max_rows=no_cap)
+
+    assert len(rows_of(docs)) == 4
+
+
+def test_a_filter_reads_only_matching_rows(account):
+    docs, _ = sync(account, {}, refs=(ORDERS,), filters=OPEN_ONLY)
+
+    assert sorted(rows_of(docs)) == ["ORDERS 102"]
+    assert reads(account) == [
+        'SELECT * FROM "SALES_DB"."SALES"."ORDERS" WHERE (STATUS = \'open\') ORDER BY "ORDER_ID"'
+    ]
+
+
+def test_the_row_cap_counts_only_filtered_rows(account):
+    docs, stats = sync(account, {}, refs=(ORDERS,), filters=OPEN_ONLY, max_rows=1)
+
+    assert "failed" not in stats
+    assert sorted(rows_of(docs)) == ["ORDERS 102"]
+
+
+def test_changing_a_filter_reads_again_and_forgets_rows_left_out(account):
+    state = {}
+    sync(account, state, refs=(ORDERS,))
+
+    docs, _ = sync(account, state, refs=(ORDERS,), filters=OPEN_ONLY)
+
+    assert forgotten(docs) == ["snowflake:row:SALES_DB.SALES.ORDERS:101"]
+    assert changes_reads(account) == []
+
+
+def test_a_row_updated_out_of_the_filter_is_forgotten_from_the_change_feed(account):
+    state = {}
+    sync(account, state, refs=(ORDERS,), filters=OPEN_ONLY)
+    account.update("ORDERS", (102,), STATUS="shipped")
+
+    docs, _ = sync(account, state, refs=(ORDERS,), filters=OPEN_ONLY)
+
+    assert len(changes_reads(account)) == 1
+    assert forgotten(docs) == ["snowflake:row:SALES_DB.SALES.ORDERS:102"]
+
+
+def test_a_row_updated_into_the_filter_is_added_from_the_change_feed(account):
+    state = {}
+    sync(account, state, refs=(ORDERS,), filters=OPEN_ONLY)
+    account.update("ORDERS", (101,), STATUS="open")
+
+    docs, _ = sync(account, state, refs=(ORDERS,), filters=OPEN_ONLY)
+
+    assert sorted(rows_of(docs)) == ["ORDERS 101"]
+    assert state["tables"]["SALES_DB.SALES.ORDERS"]["keys"] == ["101", "102"]
+
+
+def test_a_tracked_table_growing_past_the_cap_fails_and_keeps_its_state(account):
+    state = {}
+    sync(account, state, refs=(ORDERS, CUSTOMERS), max_rows=2)
+    saved = dict(state["tables"]["SALES_DB.SALES.ORDERS"])
+    account.insert("ORDERS", ORDER_ID=103, CUSTOMER_ID=1, STATUS="open", UPDATED_AT=WHEN)
+    account.update("CUSTOMERS", (1,), NAME="Contoso Ltd")
+
+    docs, stats = sync(account, state, refs=(ORDERS, CUSTOMERS), max_rows=2)
+
+    assert stats["failed"] == 1
+    assert "ORDERS 103" not in rows_of(docs)
+    assert state["tables"]["SALES_DB.SALES.ORDERS"] == saved

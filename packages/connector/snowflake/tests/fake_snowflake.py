@@ -195,6 +195,9 @@ class FakeAccount:
         self.sql.append(sql)
         if sql.startswith("SELECT CURRENT_TIMESTAMP()"):
             return [{"NOW": f"T{self._clock}"}]
+        if sql.startswith("SELECT COUNT(*)"):
+            table, keep = self._target(sql)
+            return [{"N": sum(1 for row in self.rows[table].values() if keep(row))}]
         if sql.startswith("SELECT SYSTEM$LAST_CHANGE_COMMIT_TIME"):
             table = params[0].split(".")[-1].strip('"')
             return [{"LAST_CHANGE": self.commits[table]}]
@@ -202,14 +205,29 @@ class FakeAccount:
 
     def fetch(self, sql):
         self.sql.append(sql)
-        table = sql.split(" FROM ")[1].split(" ")[0].split(".")[-1].strip('"')
+        table, keep = self._target(sql)
         if table in self.failing:
             raise self.failing[table]
         if " CHANGES(" in sql:
-            yield from self._changes(table, int(re.search(r"'T(\d+)'", sql).group(1)))
+            since = int(re.search(r"'T(\d+)'", sql).group(1))
+            yield from (row for row in self._changes(table, since) if keep(row))
             return
         rows = [dict(row) for _, row in sorted(self.rows[table].items(), key=lambda kv: str(kv[0]))]
-        yield from rows
+        yield from (row for row in rows if keep(row))
+
+    @staticmethod
+    def _target(sql):
+        """The table a query reads, and its WHERE filter as a row test.
+
+        Filters in tests are ``COL = 'text'`` or ``COL = 123``, joined by AND.
+        """
+        table = sql.split(" FROM ")[1].split(" ")[0].split(".")[-1].strip('"')
+        match = re.search(r" WHERE \((.*)\)", sql)
+        tests = []
+        for condition in match.group(1).split(" AND ") if match else []:
+            column, value = (part.strip() for part in condition.split("="))
+            tests.append((column, value[1:-1] if value.startswith("'") else int(value)))
+        return table, lambda row: all(row.get(column) == value for column, value in tests)
 
     def _changes(self, table, since):
         """Net changes since a moment, shaped like CHANGES(INFORMATION => DEFAULT)."""

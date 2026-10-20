@@ -591,7 +591,30 @@ def _column_type(data_type: Any) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _iter_rows(run, fetch, refs, state, stats, keys=None, full_refresh=False):
+# Every row is a document that cognee reads with an LLM, so a table is only
+# synced up to this many rows unless the caller raises or removes the cap.
+DEFAULT_MAX_ROWS = 10_000
+
+
+@dataclass(frozen=True)
+class _SyncOptions:
+    keys: dict[str, list[str]] = field(default_factory=dict)
+    filters: dict[str, str] = field(default_factory=dict)
+    max_rows: int | None = DEFAULT_MAX_ROWS
+    full_refresh: bool = False
+
+
+def _iter_rows(
+    run,
+    fetch,
+    refs,
+    state,
+    stats,
+    keys=None,
+    filters=None,
+    max_rows=DEFAULT_MAX_ROWS,
+    full_refresh=False,
+):
     """Yield table and row documents, and ``_deleted`` rows for what is gone.
 
     ``run(sql, params)`` returns all rows of a small query, ``fetch(sql)``
@@ -600,6 +623,7 @@ def _iter_rows(run, fetch, refs, state, stats, keys=None, full_refresh=False):
     run while the others finish. The run raises only when no table finished,
     or on a login problem, since every table would fail the same way.
     """
+    options = _SyncOptions(keys or {}, filters or {}, max_rows or None, full_refresh)
     selected = {ref.fqn for ref in refs}
     saved = state.setdefault("tables", {})
     infos, missing = _table_infos(run, refs)
@@ -609,23 +633,21 @@ def _iter_rows(run, fetch, refs, state, stats, keys=None, full_refresh=False):
         if fqn in saved:
             yield from _forget_table(fqn, saved.pop(fqn), stats)
 
-    synced, failed = 0, 0
+    synced, failed, first_error = 0, 0, None
     for info in infos:
         table_stats: dict[str, int] = {}
         try:
             # Collected per table, so a table that fails half way emits and
             # counts nothing.
-            documents = list(
-                _sync_table(run, fetch, info, saved, table_stats, keys or {}, full_refresh)
-            )
+            documents = list(_sync_table(run, fetch, info, saved, table_stats, options))
         except SnowflakeAuthError:
             raise
         except SnowflakeConnectorError as error:
             failed += 1
+            first_error = first_error or error
+            # The connector's own messages carry no secrets, and say what to change.
             logger.warning(
-                "Snowflake: a table failed to sync (%s); it keeps its state and is retried "
-                "on the next run.",
-                type(error).__name__,
+                "Snowflake: a table failed to sync and is retried on the next run: %s", error
             )
             continue
         synced += 1
@@ -645,16 +667,19 @@ def _iter_rows(run, fetch, refs, state, stats, keys=None, full_refresh=False):
     )
     if failed and not synced:
         raise SnowflakeConnectorError(
-            f"No Snowflake table could be synced: {failed} failed. Nothing was forgotten."
-        )
+            f"No Snowflake table could be synced: {failed} failed. Nothing was forgotten. "
+            f"First error: {first_error}"
+        ) from first_error
 
 
-def _sync_table(run, fetch, info, saved, stats, keys, full_refresh):
+def _sync_table(run, fetch, info, saved, stats, options: _SyncOptions):
     """One table: its description, then its rows if it changed since the last sync."""
     ref = info.ref
     yield info.description
 
-    key_columns = keys.get(ref.fqn) or info.primary_key
+    key_columns = options.keys.get(ref.fqn) or info.primary_key
+    row_filter = options.filters.get(ref.fqn)
+    where = f" WHERE ({row_filter})" if row_filter else ""
     if not key_columns:
         # Without a key a row has no stable identity, so it could never be
         # updated or forgotten. The table is described, its rows are not read.
@@ -672,9 +697,11 @@ def _sync_table(run, fetch, info, saved, stats, keys, full_refresh):
     )
     before = saved.get(ref.fqn) or {}
     unchanged = (
-        before.get("last_change") == last_change and before.get("key_columns") == key_columns
+        before.get("last_change") == last_change
+        and before.get("key_columns") == key_columns
+        and before.get("filter") == row_filter
     )
-    if unchanged and not full_refresh:
+    if unchanged and not options.full_refresh:
         stats["unchanged"] = stats.get("unchanged", 0) + 1
         return
 
@@ -683,22 +710,28 @@ def _sync_table(run, fetch, info, saved, stats, keys, full_refresh):
     now = str(run("SELECT CURRENT_TIMESTAMP()::STRING AS NOW")[0]["NOW"])
     known = set(before.get("keys", []))
 
-    if info.change_tracking and before.get("since") and not full_refresh:
-        changes = _read_changes(fetch, ref, before["since"])
+    same_scope = before.get("key_columns") == key_columns and before.get("filter") == row_filter
+    if info.change_tracking and before.get("since") and same_scope and not options.full_refresh:
+        changes = _read_changes(fetch, ref, before["since"], where)
         if changes is not None:
+            documents = list(_apply_changes(info, key_columns, changes, known, stats))
+            _check_size(len(known), options.max_rows)
             stats["from_changes"] = stats.get("from_changes", 0) + 1
-            yield from _apply_changes(info, key_columns, changes, known, stats)
+            yield from documents
             saved[ref.fqn] = {
                 "last_change": last_change,
                 "key_columns": key_columns,
+                "filter": row_filter,
                 "since": now,
                 "keys": sorted(known),
             }
             return
 
+    # Counting runs without a warehouse when there is no filter.
+    _check_size(run(f"SELECT COUNT(*) AS N FROM {ref.sql}{where}")[0]["N"], options.max_rows)
     order = ", ".join(_quote(column) for column in key_columns)
     seen: set[str] = set()
-    for row in fetch(f"SELECT * FROM {ref.sql} ORDER BY {order}"):
+    for row in fetch(f"SELECT * FROM {ref.sql}{where} ORDER BY {order}"):
         key = _row_key(key_columns, row)
         if key in seen:
             continue
@@ -714,9 +747,23 @@ def _sync_table(run, fetch, info, saved, stats, keys, full_refresh):
     saved[ref.fqn] = {
         "last_change": last_change,
         "key_columns": key_columns,
+        "filter": row_filter,
         "since": now,
         "keys": sorted(seen),
     }
+
+
+def _check_size(rows: int, max_rows: int | None) -> None:
+    """Refuse a table over the row cap instead of syncing part of it.
+
+    A partial table would make the rows left out look deleted, so the whole
+    table fails and keeps its saved state, while the other tables sync.
+    """
+    if max_rows and rows > max_rows:
+        raise SnowflakeConnectorError(
+            f"A table has {rows} rows, more than max_rows ({max_rows}). Every row becomes a "
+            "document that cognee reads with an LLM. Add a filter for it, or raise max_rows."
+        )
 
 
 # Snowflake's answers when the change history no longer reaches back far enough:
@@ -725,7 +772,7 @@ def _sync_table(run, fetch, info, saved, stats, keys, full_refresh):
 _HISTORY_GONE = {707, 91930}
 
 
-def _read_changes(fetch, ref: _TableRef, since: str) -> list[dict] | None:
+def _read_changes(fetch, ref: _TableRef, since: str, where: str = "") -> list[dict] | None:
     """The net changes since a moment, or None when the history is gone.
 
     CHANGES(INFORMATION => DEFAULT) returns the net delta: an insert as INSERT, a
@@ -733,9 +780,11 @@ def _read_changes(fetch, ref: _TableRef, since: str) -> list[dict] | None:
     row that was added and removed again in between.
     """
     literal = since.replace("'", "''")
+    # A filter applies to both halves of an update, so a row updated out of the
+    # filter comes back as a DELETE only, and is forgotten.
     sql = (
         f"SELECT * FROM {ref.sql} CHANGES(INFORMATION => DEFAULT) "
-        f"AT(TIMESTAMP => '{literal}'::TIMESTAMP_LTZ)"
+        f"AT(TIMESTAMP => '{literal}'::TIMESTAMP_LTZ){where}"
     )
     try:
         return list(fetch(sql))
