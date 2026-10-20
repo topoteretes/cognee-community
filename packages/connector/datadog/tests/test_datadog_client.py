@@ -54,6 +54,14 @@ def test_a_missing_item_raises_not_found():
         client_for(FakeDatadog()).get("monitors", "404")
 
 
+def test_an_item_id_is_quoted_into_the_path():
+    fake = FakeDatadog()
+    with pytest.raises(DatadogNotFoundError):
+        client_for(fake).get("monitors", "1/../../v2/incidents")
+
+    assert fake.calls == ["GET /api/v1/monitor/1%2F..%2F..%2Fv2%2Fincidents"]
+
+
 def test_a_wrapped_item_is_unwrapped():
     fake = FakeDatadog()
     fake.add_slo("slo1", "Checkout availability")

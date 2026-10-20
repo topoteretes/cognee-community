@@ -21,6 +21,7 @@ import hashlib
 import json
 from collections.abc import Callable, Iterator
 from typing import Any
+from urllib.parse import quote
 
 import requests
 from cognee.shared.logging_utils import get_logger
@@ -227,8 +228,10 @@ class DatadogClient:
 
     def get(self, kind: str, item_id: str) -> dict:
         """Fetch one item; raises ``DatadogNotFoundError`` once it is deleted."""
+        # ids come from datadog or the stored state; quoted so one can't reshape the path
+        path = _ITEM_PATHS[kind].format(quote(str(item_id), safe=""))
         try:
-            response = self._rest.get(_ITEM_PATHS[kind].format(item_id))
+            response = self._rest.get(path)
         except requests.RequestException as exc:
             raise DatadogAPIError(f"Datadog request failed: {type(exc).__name__}") from None
         if response.status_code != 200:
@@ -375,7 +378,8 @@ def render_notebook(notebook: dict, app: str) -> dict[str, Any]:
             parts.extend(["", _text(definition.get("text"))])
         elif _text(definition.get("title")):
             # a graph cell: its title says what was looked at
-            parts.extend(["", f"[{_text(definition.get('type'))}] {definition['title']}"])
+            cell_title = _text(definition.get("title"))
+            parts.extend(["", f"[{_text(definition.get('type'))}] {cell_title}"])
     return _document(
         f"notebook:{notebook['id']}", title, parts, f"https://{app}/notebook/{notebook['id']}"
     )
@@ -445,10 +449,6 @@ def render_incident(incident: dict, app: str) -> dict[str, Any]:
 
 def _hash(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, default=str).encode()).hexdigest()[:16]
-
-
-def _item_id(kind: str, item: dict) -> str:
-    return str(item["id"])
 
 
 def _is_test(incident: dict) -> bool:
@@ -584,7 +584,7 @@ class _Walker:
         """Dashboards and notebooks: fetch an item only when its list stamp moved."""
         window_spent = False
         for item in items:
-            item_id = _item_id(kind, item)
+            item_id = str(item["id"])
             row_id = f"{_PREFIX[kind]}:{item_id}"
             seen.add(row_id)
             stamp = _stamp(kind, item)
@@ -683,6 +683,14 @@ class _Walker:
                 exc,
                 _SCOPES[kind],
             )
+            return
+        except DatadogAuthError:
+            raise  # the API key itself was rejected; no other kind can succeed
+        except DatadogAPIError as exc:
+            # a 5xx left after the retries, or an unreadable page: same as a stopped listing
+            self.stats["failed"] += 1
+            self.stats[f"failed_error_{kind}"] = 1
+            logger.warning("Datadog %s listing failed (%s); retried next run.", kind, exc)
             return
         yield from self._forget(kind, seen)
 

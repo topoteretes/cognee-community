@@ -10,6 +10,7 @@ from fake_datadog import FakeDatadog, client_for
 from cognee_community_connector_datadog.datadog import (
     KINDS,
     DatadogAccessError,
+    DatadogAuthError,
     DatadogSourceError,
     _iter_rows,
 )
@@ -352,6 +353,28 @@ def test_a_kind_the_keys_cannot_read_is_skipped():
     assert "incident:inc-1" not in rows
     assert "monitor:1" in rows
     assert stats["failed_access_incidents"] == 1
+
+
+def test_a_server_error_on_one_listing_skips_that_kind_without_forgetting_it():
+    fake = _org()
+    state: dict = {}
+    _run(fake, state)
+
+    fake.statuses["list:slos"] = 500
+    del fake.monitors["2"]
+    rows, stats = _run(fake, state)
+
+    assert rows == {"monitor:2": {"id": "monitor:2", "_deleted": True}}
+    assert stats["failed_error_slos"] == 1
+    assert "slo:slo1" in state["rows"], "a failed listing proves nothing deleted"
+
+
+def test_a_rejected_api_key_fails_the_run():
+    fake = _org()
+    fake.statuses["list:monitors"] = 401
+
+    with pytest.raises(DatadogAuthError):
+        _run(fake, {})
 
 
 def test_keys_that_can_read_nothing_fail_the_run():

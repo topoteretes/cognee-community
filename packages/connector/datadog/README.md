@@ -131,15 +131,22 @@ are left in its window.
   is read on the next run. Deletions are still applied.
 - `max_requests` (500 by default) caps a whole run. A large org finishes over several runs.
 
+Network errors and 5xx answers are retried twice. A list that still fails is treated like one
+that stopped early: that kind is skipped for the run and nothing of it is forgotten. Only a
+rejected API key (HTTP 401) fails the whole run.
+
 Progress is reported in `source.cognee_sync_stats` (`scanned`, `skipped`, `deferred`, `deleted`,
-`failed`, and a `failed_<reason>_<kind>` entry for a kind that stopped early or was refused).
+`failed`, and a `failed_<reason>_<kind>` entry, reason `rate_limit`, `access` or `error`, for a
+kind that stopped early or was refused).
 
 ## Limitations
 
 - An application key without a kind's read scope makes that kind fail with HTTP 403. The run
   skips it, logs the missing scope and goes on; a run where every kind is refused raises
   `DatadogAccessError`, which usually means the keys belong to another site.
-- Incident timelines, monitor alert history and dashboard tabs are not ingested.
+- Incident timelines, monitor alert history and dashboard tabs are not ingested. Alert history
+  is an event stream (one entry per state change), the same high-volume kind of data as
+  metrics and logs; a monitor's definition and runbook are what an agent needs to reason with.
 - The dataset holds what your team wrote in Datadog, which can include internal hostnames and
   on-call handles. With cognee's access control (on by default) only the user who ran the sync,
   and users granted permission on the dataset, can read it.
