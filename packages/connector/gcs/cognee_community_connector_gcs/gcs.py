@@ -11,6 +11,11 @@ logger = get_logger("gcs_connector")
 DEFAULT_MAX_OBJECTS = 1000
 DEFAULT_MAX_OBJECT_SIZE = 10 * 1024 * 1024
 
+# Match the text extensions accepted by the S3 connector (PR #209).
+TEXT_EXTENSIONS = frozenset(
+    {"txt", "md", "markdown", "json", "csv", "xml", "yaml", "yml", "log", "html", "htm", "rst"}
+)
+
 
 def gcs_source(
     bucket_name: str,
@@ -31,13 +36,15 @@ def gcs_source(
     ``prefix`` is required to scope ingestion. ``max_objects`` limits the number
     of non-directory objects listed; exceeding it aborts before any downloads.
     Objects larger than ``max_object_size`` bytes are logged and skipped. Previously
-    ingested objects that become oversized are removed from staging on the next sync.
+    ingested objects that become oversized or have unsupported extensions are removed
+    from staging on the next sync. Unsupported objects still count toward ``max_objects``.
     An optional pre-built ``client`` bypasses credential discovery and remains
     owned by the caller (the connector does not close it).
 
     Authentication and network reads happen when the source is consumed.
-    Every eligible non-directory object in the scope
-    must contain UTF-8 text; binary document extraction is not implemented yet.
+    Only objects with supported text extensions (case-insensitive) are downloaded.
+    Extensionless and unsupported objects are skipped. Eligible objects must contain
+    UTF-8 text; binary document extraction and OCR are not implemented.
     Read/decoding failures abort extraction instead of
     publishing a partial snapshot.
 
@@ -93,9 +100,15 @@ def gcs_source(
                     raise ValueError(f"GCS prefix exceeds max_objects={max_objects}.")
 
             inventory = {}
-            oversized = set()
+            ineligible = set()
             for blob in objects:
                 uri = f"gs://{bucket_name}/{blob.name}"
+                filename = blob.name.rsplit("/", 1)[-1]
+                extension = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+                if extension not in TEXT_EXTENSIONS:
+                    logger.debug("GCS: skipping %s (unsupported type).", uri)
+                    ineligible.add(uri)
+                    continue
                 if blob.size > max_object_size:
                     logger.warning(
                         "GCS: skipping %s (%d bytes exceeds max_object_size=%d).",
@@ -103,7 +116,7 @@ def gcs_source(
                         blob.size,
                         max_object_size,
                     )
-                    oversized.add(uri)
+                    ineligible.add(uri)
                     continue
                 inventory[uri] = {
                     "updated": blob.updated.astimezone(UTC).isoformat().replace("+00:00", "Z"),
@@ -132,7 +145,7 @@ def gcs_source(
             for uri in sorted(previous.keys() - inventory.keys()):
                 name = uri.removeprefix(f"gs://{bucket_name}/")
                 if (
-                    uri not in oversized
+                    uri not in ineligible
                     and storage_client.bucket(bucket_name).get_blob(name) is not None
                 ):
                     raise RuntimeError(f"GCS inventory changed during sync; retry: {uri}")

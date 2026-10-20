@@ -1,6 +1,6 @@
 # cognee-community-connector-gcs
 
-Read UTF-8 documents from a Google Cloud Storage bucket prefix into
+Read UTF-8 text files from a Google Cloud Storage bucket prefix into
 [Cognee](https://github.com/topoteretes/cognee). The connector exposes a dlt source
 for `cognee.remember()` / `cognee.add()`, using Cognee's normal document-processing
 path. Repeated merge loads download new or changed content and emit deletion
@@ -181,11 +181,15 @@ asyncio.run(main())
   Rerun after resolving the failure. dlt persists inventories with successful
   loads; a successful dlt load does not guarantee subsequent Cognee graph
   processing succeeded.
-- Only UTF-8 text is decoded, with an optional BOM. File extensions are not
-  filtered; PDFs, images, DOCX, and other binary formats are not extracted and
-  may fail decoding. OCR, scanned-document recognition, image understanding,
-  and audio/video processing are not supported. Keep the selected prefix limited
-  to supported text files.
+- Accepts `.txt`, `.md`, `.markdown`, `.json`, `.csv`, `.xml`, `.yaml`, `.yml`,
+  `.log`, `.html`, `.htm`, and `.rst` (case-insensitive), matching the
+  [S3 connector in PR #209](https://github.com/topoteretes/cognee-community/pull/209).
+  Unsupported extensions and extensionless objects are skipped before download,
+  even when their contents are text. They still count toward `max_objects`.
+  Previously ingested objects excluded by this filter are removed on merge sync.
+- Supported files must contain UTF-8 text, with an optional BOM. UTF-8 is the
+  encoding, not a file format. Invalid UTF-8 in a supported extension still aborts
+  extraction. No OCR, PDF/DOCX extraction, or image/audio/video processing is provided.
 - Preserve dlt's pipeline state between runs. Losing it loses the previous
   inventory, so previously deleted objects cannot be inferred from it.
 - Use independent dlt pipelines for separate accounts or destination datasets.

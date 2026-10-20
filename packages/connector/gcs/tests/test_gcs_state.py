@@ -5,10 +5,10 @@ import unittest
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, call, create_autospec
+from unittest.mock import MagicMock, call, create_autospec, patch
 
 import dlt
-from cognee_community_connector_gcs.gcs import _scope, gcs_source
+from cognee_community_connector_gcs.gcs import TEXT_EXTENSIONS, _scope, gcs_source
 from dlt.pipeline.exceptions import PipelineStepFailed
 from google.cloud import storage
 
@@ -229,3 +229,83 @@ class GcsStateTests(unittest.TestCase):
         inventories = self.inventories(self.pipeline("other_dataset"))
         self.assertEqual(inventories, previous)
         self.assertEqual(self.inventories(self.pipeline()), previous)
+
+    def test_supported_text_extensions_are_downloaded_case_insensitively(self):
+        extensions = {
+            "txt",
+            "md",
+            "markdown",
+            "json",
+            "csv",
+            "xml",
+            "yaml",
+            "yml",
+            "log",
+            "html",
+            "htm",
+            "rst",
+        }
+        self.assertEqual(TEXT_EXTENSIONS, extensions)
+        blobs = [self.blob(f"docs/file.{extension.upper()}") for extension in sorted(extensions)]
+        self.client.list_blobs.return_value = blobs
+        self.run_sync(self.pipeline())
+        self.assertEqual(len(self.rows(self.pipeline())), len(extensions))
+        for blob in blobs:
+            blob.download_as_bytes.assert_called_once()
+
+    def test_unsupported_objects_are_skipped_without_download_or_decode(self):
+        supported = self.blob()
+        skipped = [
+            self.blob(name)
+            for name in (
+                "docs/report.pdf",
+                "docs/photo.png",
+                "docs/report.docx",
+                "docs/archive.zip",
+                "docs/README",
+                "docs/folder.txt/README",
+                "docs/unknown.exe",
+            )
+        ]
+        for blob in skipped:
+            blob.download_as_bytes.return_value = b"\xff\xfe"
+        self.client.list_blobs.return_value = [supported, *skipped]
+        self.run_sync(self.pipeline())
+        self.assertEqual(list(self.rows(self.pipeline())), ["gs://company-documents/docs/a.txt"])
+        for blob in skipped:
+            blob.download_as_bytes.assert_not_called()
+
+    def test_unsupported_objects_still_count_toward_object_limit(self):
+        blobs = [self.blob(), self.blob("docs/report.pdf")]
+        self.client.list_blobs.return_value = blobs
+        with self.assertRaisesRegex(PipelineStepFailed, "max_objects"):
+            self.run_sync(self.pipeline(), max_objects=1)
+        for blob in blobs:
+            blob.download_as_bytes.assert_not_called()
+
+    def test_previously_ingested_unsupported_object_is_removed(self):
+        legacy = self.blob("docs/legacy.dat")
+        self.client.list_blobs.return_value = [legacy, self.blob()]
+        with patch("cognee_community_connector_gcs.gcs.TEXT_EXTENSIONS", TEXT_EXTENSIONS | {"dat"}):
+            self.run_sync(self.pipeline())
+        legacy.download_as_bytes.reset_mock()
+        self.run_sync(self.pipeline())
+        legacy.download_as_bytes.assert_not_called()
+        self.bucket.get_blob.assert_not_called()
+        self.assertEqual(list(self.rows(self.pipeline())), ["gs://company-documents/docs/a.txt"])
+        self.assertNotIn(
+            "gs://company-documents/docs/legacy.dat",
+            self.inventories(self.pipeline())["company-documents/docs/"],
+        )
+
+    def test_invalid_utf8_in_supported_file_preserves_previous_state(self):
+        self.client.list_blobs.return_value = [self.blob()]
+        self.run_sync(self.pipeline())
+        previous = self.inventories(self.pipeline())
+        changed = self.blob(generation="654321")
+        changed.download_as_bytes.return_value = b"\xff\xfe"
+        self.client.list_blobs.return_value = [changed]
+        with self.assertRaises(PipelineStepFailed):
+            self.run_sync(self.pipeline())
+        self.assertEqual(self.inventories(self.pipeline()), previous)
+        self.assertEqual(self.rows(self.pipeline()), {"gs://company-documents/docs/a.txt": "hello"})
