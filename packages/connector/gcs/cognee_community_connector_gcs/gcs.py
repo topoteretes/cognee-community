@@ -54,7 +54,8 @@ def gcs_source(
     Absent objects are rechecked before hard-delete tombstones are emitted. Other
     write dispositions fall back to full snapshots to retain unchanged rows.
     Pass ``write_disposition="merge"`` to ``cognee.remember`` for incremental sync.
-    Use separate dlt pipelines for independent accounts or destination datasets.
+    Cognee runs each bucket/prefix and destination dataset in its own dlt pipeline,
+    so their sync state stays independent.
     Use the pinned Cognee 1.6.5 with foreground ingestion for final-object
     cleanup. Cognee 1.4.0 skipped graph orphan cleanup on an empty corpus.
     """
@@ -67,7 +68,7 @@ def gcs_source(
         raise ValueError("max_objects and max_object_size must be positive.")
 
     import dlt
-    from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
+    from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR, PIPELINE_SCOPE_ATTR
 
     @dlt.resource(
         name="gcs_documents",
@@ -118,6 +119,8 @@ def gcs_source(
     result = source()
     holder = {"resource": result.resources["gcs_documents"]}
     setattr(result, DOCUMENT_SOURCE_ATTR, "gcs")
+    # Cognee also includes the destination dataset in the pipeline name.
+    setattr(result, PIPELINE_SCOPE_ATTR, _scope(bucket_name, prefix))
     return result
 
 

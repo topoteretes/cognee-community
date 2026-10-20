@@ -198,9 +198,9 @@ asyncio.run(main())
   image/audio/video processing is provided.
 - Preserve dlt's pipeline state between runs. Losing it loses the previous
   inventory, so previously deleted objects cannot be inferred from it.
-- Use independent dlt pipelines for separate accounts or destination datasets.
-  Inventory namespacing alone covers only bucket and prefix; this connector
-  does not establish account/dataset isolation automatically.
+- Sync state is isolated per bucket, prefix and destination dataset: the source
+  sets Cognee's pipeline scope, so each combination gets its own dlt pipeline.
+  Bucket names are globally unique in GCS, so no separate account scope is needed.
 - **Cognee version:** this package pins 1.6.5. Live final-document deletion
   validation on this version cleared staging, Data records, graph nodes/edges,
   and document/chunk vectors. Cognee 1.4.0 skipped core orphan cleanup when the

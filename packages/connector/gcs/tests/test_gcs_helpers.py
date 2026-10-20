@@ -13,6 +13,7 @@ from cognee_community_connector_gcs.gcs import (
     _object_to_row,
     _read_retry,
     _stamp,
+    gcs_source,
 )
 from google.api_core.exceptions import (
     Forbidden,
@@ -96,3 +97,14 @@ def test_retry_does_not_repeat_permission_missing_or_version_errors(error):
     with pytest.raises(type(error)):
         _read_retry()(operation)()
     operation.assert_called_once()
+
+
+def test_source_sets_pipeline_scope_per_bucket_and_prefix():
+    from cognee.tasks.ingestion.dlt_utils import PIPELINE_SCOPE_ATTR, pipeline_name_for_source
+
+    first = gcs_source("bucket-a", "docs/", client=MagicMock())
+    other_prefix = gcs_source("bucket-a", "other/", client=MagicMock())
+
+    assert getattr(first, PIPELINE_SCOPE_ATTR) == "bucket-a/docs/"
+    assert pipeline_name_for_source(first, "ds1") != pipeline_name_for_source(first, "ds2")
+    assert pipeline_name_for_source(first, "ds1") != pipeline_name_for_source(other_prefix, "ds1")
