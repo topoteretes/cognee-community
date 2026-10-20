@@ -12,11 +12,12 @@ sync.
 
 Privacy / opt-in
 ----------------
-This reads project settings, deployment metadata and the build output of failed
-deployments. Environment variable values, deploy-hook URLs and protection
-secrets are never ingested. Build output is ingested as Vercel returns it, so
-pass ``include_build_logs=False`` if your builds print secrets. Use a dedicated
-dataset so you can wipe it on its own.
+This reads project settings and deployment metadata. The env values, deploy-hook
+URLs and protection secrets that come back on the project object are never
+copied. Build output of failed deployments is off by default and switched on
+below: it is ingested as Vercel returns it, and Vercel only redacts sensitive
+values of 32 characters or more, so leave it off if your builds can print
+secrets. Use a dedicated dataset so you can wipe it on its own.
 
 One-time setup
 --------------
@@ -54,7 +55,9 @@ async def main() -> None:
 
     # Scope with project_ids=[...] and lookback_days=...; the defaults read every
     # project the token can see and the last 30 days of deployments.
-    source = vercel_source(lookback_days=7)
+    # include_build_logs=True: also read what failed builds printed. Off by
+    # default, because a build can print a secret into its log.
+    source = vercel_source(lookback_days=7, include_build_logs=True)
 
     print("Syncing Vercel projects and deployments into cognee ...")
     # self_improvement=False: a re-sync should not trigger the whole-graph

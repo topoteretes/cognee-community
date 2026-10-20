@@ -12,6 +12,7 @@ in-memory fixtures. Two layers:
 """
 
 import gzip
+import itertools
 import json
 import sqlite3
 import time
@@ -19,6 +20,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 import requests
+from dlt.pipeline.exceptions import PipelineStepFailed
 from requests.adapters import BaseAdapter
 
 from cognee_community_connector_vercel.vercel import (
@@ -30,6 +32,7 @@ from cognee_community_connector_vercel.vercel import (
     VERCEL_PROJECTS_TABLE,
     VERCEL_SOURCE_NAME,
     _build_log_rows,
+    _default_session,
     _deployment_row,
     _event_text,
     _project_row,
@@ -55,17 +58,22 @@ DAY_MS = 24 * 60 * MINUTE_MS
 # ---------------------------------------------------------------------------
 
 
+_UPDATED = itertools.count()
+
+
 def _project(project_id, name):
-    """A project shaped like the real list response, secrets included."""
+    """A project shaped like the real list response, secrets included.
+
+    Each one gets its own ``updatedAt``, which is what the list pages by.
+    """
     return {
         "id": project_id,
         "name": name,
-        "accountId": "team_1",
         "framework": "nextjs",
         "nodeVersion": "22.x",
         "rootDirectory": "apps/web",
         "createdAt": NOW_MS - 90 * DAY_MS,
-        "updatedAt": NOW_MS,
+        "updatedAt": NOW_MS - next(_UPDATED),
         "env": [
             {"id": "env_1", "key": "API_KEY", "type": "plain", "value": CANARY_ENV},
             {"id": "env_2", "key": "DB_URL", "type": "sensitive", "value": CANARY_ENV},
@@ -139,8 +147,14 @@ class FakeVercel(BaseAdapter):
     ``pagination.next`` comes back as ``until``.
     """
 
-    def __init__(self, projects, deployments, logs=None, page_size=2):
+    def __init__(self, projects, deployments, logs=None, page_size=2, account="team_1"):
         super().__init__()
+        # Like the real API, a project carries the accountId that owns it, and a
+        # token answers 403 for a teamId it does not belong to.
+        self.account = account
+        self.omit_account = False  # serve projects without accountId
+        self.before = None  # callable(path, params) run before answering, e.g. an edit
+        self.timeouts = []  # the timeout each request was sent with
         self.projects = projects
         self.deployments = deployments
         self.logs = logs or {}
@@ -150,6 +164,8 @@ class FakeVercel(BaseAdapter):
         self.projects_as_array = False
         self.drop_pagination = set()  # paths whose list bodies lose their pagination block
         self.events_as_object = False  # events body that is not a list
+        self.not_json = set()  # paths that answer 200 with an HTML page
+        self.retry_after = "0"  # Retry-After sent with every failure
 
     def session(self):
         session = requests.Session()
@@ -162,12 +178,30 @@ class FakeVercel(BaseAdapter):
         params = {key: values[0] for key, values in multi.items()}
         params["projectIds"] = multi.get("projectIds", [])
         self.calls.append((url.path, params, request.headers.get("Authorization")))
+        self.timeouts.append(kwargs.get("timeout"))
+        if self.before:
+            self.before(url.path, params)
+        if len(self.calls) > 500:
+            # A cursor that never moves would loop forever; fail the test instead.
+            raise AssertionError("FakeVercel: more than 500 requests in one test")
 
+        if url.path in self.not_json:
+            response = self._response(request, 200, None)
+            response._content = b"<html>maintenance</html>"
+            return response
         status = self.fail(url.path, params) if self.fail else None
         if status:
-            return self._response(request, status, {"error": {"code": "boom"}})
+            response = self._response(request, status, {"error": {"code": "boom"}})
+            response.headers["Retry-After"] = self.retry_after
+            return response
+        if params.get("teamId") not in (None, self.account):
+            return self._response(request, 403, {"error": {"code": "forbidden"}})
         if url.path == "/v10/projects":
-            page = self._page(self.projects, "updatedAt", "projects", params)
+            owned = [
+                project if self.omit_account else {"accountId": self.account, **project}
+                for project in self.projects
+            ]
+            page = self._page(owned, "updatedAt", "projects", params)
             body = page["projects"] if self.projects_as_array else page
             if url.path in self.drop_pagination and isinstance(body, dict):
                 body.pop("pagination")
@@ -175,22 +209,27 @@ class FakeVercel(BaseAdapter):
         if url.path == "/v7/deployments":
             wanted_states = set(filter(None, params.get("state", "").split(",")))
             since = int(params.get("since", 0))
-            # Like the real API: projectId takes an id or a name (any case) and
-            # answers 404 for an unknown one; projectIds takes at most 20 ids and
-            # returns nothing, with no error, for a name.
+            # Like the real API: projectId takes an id or a name (any case),
+            # resolves it to the project, and answers 404 for an unknown one;
+            # projectIds takes at most 20 ids and returns nothing, with no error,
+            # for a name.
             one, many = params.get("projectId"), params["projectIds"]
             if len(many) > 20:
                 return self._response(request, 400, {"error": {"code": "bad_request"}})
-            if one and not any(
-                one == item["id"] or one.lower() == item["name"] for item in self.projects
-            ):
-                return self._response(request, 404, {"error": {"code": "not_found"}})
+            if one:
+                found = [
+                    item["id"]
+                    for item in self.projects
+                    if one == item["id"] or one.lower() == item["name"].lower()
+                ]
+                if not found:
+                    return self._response(request, 404, {"error": {"code": "not_found"}})
+                many = found
             items = [
                 item
                 for item in self.deployments
                 if item["created"] >= since
-                and (not wanted_states or item["state"] in wanted_states)
-                and (not one or one == item["projectId"] or one.lower() == item["name"])
+                and (not wanted_states or item.get("state") in wanted_states)
                 and (not many or item["projectId"] in many)
             ]
             page = self._page(items, "created", "deployments", params)
@@ -213,6 +252,9 @@ class FakeVercel(BaseAdapter):
         return self._response(request, 404, {"error": {"code": "not_found"}})
 
     def _page(self, items, order_key, list_key, params):
+        # Like the real API: `until` is exclusive, and `next` is the timestamp of
+        # the page's last item, so a second item from that millisecond is only
+        # reached by asking for until=next+1.
         ordered = sorted(items, key=lambda item: item[order_key], reverse=True)
         if "until" in params:
             ordered = [item for item in ordered if item[order_key] < int(params["until"])]
@@ -397,7 +439,7 @@ def test_build_log_rows_keep_deployments_apart():
 def test_a_team_gets_its_own_tables_and_state():
     from cognee.tasks.ingestion.dlt_utils import PIPELINE_SCOPE_ATTR
 
-    source = vercel_source(token="test-token", team_id="team_AbC1")
+    source = vercel_source(token="test-token", team_id="team_AbC1", include_build_logs=True)
     assert set(source.resources.selected) == {
         "vercel_team_abc1_projects",
         "vercel_team_abc1_deployments",
@@ -408,7 +450,9 @@ def test_a_team_gets_its_own_tables_and_state():
     assert "vercel_main_projects" in named.resources.selected
 
 
-@pytest.mark.parametrize("bad", ["Vercel", "vercel-prod", "1vercel", "vercel prod"])
+@pytest.mark.parametrize(
+    "bad", ["Vercel", "vercel-prod", "1vercel", "vercel prod", "vercel__prod", "vercel_"]
+)
 def test_resource_name_must_fit_a_table_name(bad):
     with pytest.raises(ValueError, match="resource_name"):
         vercel_source(token="test-token", resource_name=bad)
@@ -442,6 +486,52 @@ def test_event_text_drops_colour_codes_and_carriage_returns():
     assert _event_text({"text": "50%\r100%"}) == "50%\n100%"
 
 
+def test_event_text_drops_control_characters_and_terminal_titles():
+    # A NUL makes Postgres refuse the whole load; OSC sets a window title or link.
+    text = "\x1b]0;my title\x07\x1b]8;;https://x\x1b\\link\x1b]8;;\x1b\\ ok\x00\x08\tdone"
+    assert _event_text({"text": text}) == "link ok\tdone"
+    # A lone surrogate cannot be encoded as UTF-8; it is replaced, not fatal.
+    assert _event_text({"text": "bad \ud800 byte"}) == "bad ? byte"
+
+
+def test_event_text_keeps_the_text_after_an_unclosed_escape():
+    # An OSC that never ends must not swallow the error after it.
+    assert "Error: real failure" in _event_text(
+        {"text": "a\x1b]0;title never ends Error: real failure"}
+    )
+    # Charset and two-character escapes, as `tput sgr0` and full-screen tools write them.
+    assert _event_text({"text": "\x1b(Bok \x1b=a\x1b>b \x1bMc \x1b7d\x1b8"}) == "ok ab c d"
+
+
+def test_a_staging_read_that_fails_aborts_instead_of_dropping_the_log(
+    dlt_mod, tmp_path, monkeypatch
+):
+    # Vercel no longer serves an expired log, so dropping the kept copy would
+    # lose it for good. Only a missing table means there is nothing to keep.
+    from dlt.destinations.exceptions import DatabaseTransientException
+
+    from cognee_community_connector_vercel import vercel
+
+    fake = _fleet()
+    before = _read(_run_sync(dlt_mod, tmp_path, fake), VERCEL_BUILD_LOGS_TABLE)
+    fake.fail = lambda path, params: 410 if path.endswith("/events") else None
+
+    def locked(pipeline, table):
+        raise DatabaseTransientException(Exception("database is locked"))
+
+    monkeypatch.setattr(vercel, "_select_staged", locked)
+    with pytest.raises(PipelineStepFailed, match="database is locked"):
+        _run_sync(dlt_mod, tmp_path, fake)
+    assert _read(_pipeline(dlt_mod, tmp_path), VERCEL_BUILD_LOGS_TABLE) == before
+
+
+def test_build_events_without_the_parent_field_abort():
+    # If rest_api renamed the copied parent fields, every log would be dropped
+    # without a word.
+    with pytest.raises(ValueError, match="without"):
+        list(_build_log_rows(_log("line"), max_log_chars=None))
+
+
 def test_vercel_source_declares_document_marker():
     # resolve_dlt_sources routes on this marker; the tag it carries is the source name.
     from cognee.tasks.ingestion.dlt_utils import document_source_tag
@@ -458,18 +548,35 @@ def test_vercel_source_requires_a_token(monkeypatch):
 
 
 def test_vercel_source_selects_only_loadable_resources():
-    # The failed-deployments parent and the per-line events are plumbing: if they
-    # were loaded, cognee would read them back as documents.
-    assert set(vercel_source(token="test-token").resources.selected) == {
+    # The raw lists, the failed-deployments parent and the per-line events are
+    # plumbing: if they were loaded, cognee would read them back as documents.
+    with_logs = vercel_source(token="test-token", include_build_logs=True)
+    assert set(with_logs.resources) == {
         VERCEL_PROJECTS_TABLE,
         VERCEL_DEPLOYMENTS_TABLE,
         VERCEL_BUILD_LOGS_TABLE,
     }
-    without_logs = vercel_source(token="test-token", include_build_logs=False)
-    assert set(without_logs.resources.selected) == {
+    # Build logs are off unless asked for: a build can print a secret.
+    assert set(vercel_source(token="test-token").resources) == {
         VERCEL_PROJECTS_TABLE,
         VERCEL_DEPLOYMENTS_TABLE,
     }
+
+
+def test_vercel_source_takes_keyword_arguments_only():
+    with pytest.raises(TypeError):
+        vercel_source("test-token")
+
+
+def test_a_team_id_that_cannot_name_tables_is_reported_as_the_team_id():
+    with pytest.raises(ValueError, match="team_id 'team-AbC'"):
+        vercel_source(token="test-token", team_id="team-AbC")
+
+
+def test_project_ids_must_be_a_list():
+    # set("prj_web") is its letters, which would match nothing.
+    with pytest.raises(ValueError, match="project_ids must be a list"):
+        vercel_source(token="test-token", project_ids="prj_web")
 
 
 # ---------------------------------------------------------------------------
@@ -493,9 +600,15 @@ def _pipeline(dlt, tmp_path):
 
 
 def _run_sync(dlt, tmp_path, fake, **source_kwargs):
-    """Run vercel_source through a dlt pipeline into a temp sqlite destination."""
+    """Run vercel_source through a dlt pipeline into a temp sqlite destination.
+
+    Build logs are off by default in the connector and on here, so the tests
+    cover all three tables unless they say otherwise.
+    """
+    source_kwargs.setdefault("include_build_logs", True)
+    source_kwargs.setdefault("service", fake.session())
     pipeline = _pipeline(dlt, tmp_path)
-    pipeline.run(vercel_source(token="test-token", session=fake.session(), **source_kwargs))
+    pipeline.run(vercel_source(token="test-token", **source_kwargs))
     return pipeline
 
 
@@ -616,9 +729,10 @@ def test_lists_are_paged_with_until_and_sent_with_bearer_auth(dlt_mod, tmp_path)
     ]
     assert len(deployment_pages) == 2
     assert "until" not in deployment_pages[0]
-    # The second request carries the first page's pagination.next as `until`.
+    # The second request carries the first page's pagination.next plus one as
+    # `until`, which is exclusive, so the page's last item is read again.
     oldest_on_page_one = sorted(item["created"] for item in fake.deployments)[1]
-    assert deployment_pages[1]["until"] == str(oldest_on_page_one)
+    assert deployment_pages[1]["until"] == str(oldest_on_page_one + 1)
     # Every request is authenticated, team-scoped and bounded by the lookback window.
     assert {auth for _, _, auth in fake.calls} == {"Bearer test-token"}
     assert {params.get("teamId") for _, params, _ in fake.calls} == {"team_1"}
@@ -739,7 +853,8 @@ def test_one_selected_project_is_filtered_on_the_server(dlt_mod, tmp_path):
     fake = _fleet()
     pipeline = _run_sync(dlt_mod, tmp_path, fake, project_ids=["web"])  # a name works
 
-    assert {params.get("projectId") for params in _deployment_calls(fake)} == {"web"}
+    # The name is resolved through the projects list and sent as the id.
+    assert {params.get("projectId") for params in _deployment_calls(fake)} == {"prj_web"}
     assert set(_read(pipeline, VERCEL_DEPLOYMENTS_TABLE)) == {"dpl_ok1", "dpl_err"}
 
 
@@ -752,24 +867,55 @@ def test_several_project_ids_are_filtered_on_the_server(dlt_mod, tmp_path):
     assert set(_read(pipeline, VERCEL_DEPLOYMENTS_TABLE)) == {"dpl_ok1", "dpl_ok2", "dpl_err"}
 
 
-def test_a_name_in_a_list_is_never_sent_as_project_ids(dlt_mod, tmp_path):
+def test_a_name_in_a_list_is_sent_as_its_project_id(dlt_mod, tmp_path):
     # projectIds with a name returns no deployments and no error, which under
-    # replace would forget them all. Such a list is filtered client-side instead.
+    # replace would forget them all. Names are resolved to ids first.
     fake = _fleet_with_docs()
     pipeline = _run_sync(dlt_mod, tmp_path, fake, project_ids=["web", "prj_api"])
     _assert_docs_left_out(fake, pipeline)
 
-    assert all(
-        not params["projectIds"] and "projectId" not in params for params in _deployment_calls(fake)
-    )
+    assert all(params["projectIds"] == ["prj_api", "prj_web"] for params in _deployment_calls(fake))
     assert set(_read(pipeline, VERCEL_DEPLOYMENTS_TABLE)) == {"dpl_ok1", "dpl_ok2", "dpl_err"}
+
+
+def test_a_project_named_like_an_id_is_still_found(dlt_mod, tmp_path):
+    # Vercel allows "_" in names, so "prj_tools" can be a name. Sent as an id it
+    # would match nothing and its deployments would be forgotten.
+    fake = _fleet()
+    fake.projects.append(_project("prj_9f3k", "prj_tools"))
+    tools = _deployment("dpl_tools", "prj_tools", minutes_ago=5)
+    tools["projectId"] = "prj_9f3k"
+    fake.deployments.append(tools)
+    pipeline = _run_sync(dlt_mod, tmp_path, fake, project_ids=["prj_web", "prj_tools"])
+
+    assert set(_read(pipeline, VERCEL_PROJECTS_TABLE)) == {"prj_web", "prj_9f3k"}
+    assert set(_read(pipeline, VERCEL_DEPLOYMENTS_TABLE)) == {"dpl_ok1", "dpl_err", "dpl_tools"}
+    sent = {tuple(params["projectIds"]) for params in _deployment_calls(fake)}
+    assert sent == {("prj_9f3k", "prj_web")}
+
+
+def test_a_reused_source_moves_its_window(dlt_mod, tmp_path):
+    # The window is worked out per run. If it were fixed when the source was
+    # built, a long-lived source would never let old deployments age out.
+    fake = _fleet()
+    source = vercel_source(token="test-token", service=fake.session())
+    pipeline = _pipeline(dlt_mod, tmp_path)
+    pipeline.run(source)
+    first = {params["since"] for params in _deployment_calls(fake)}
+    fake.calls.clear()
+    time.sleep(0.01)
+    pipeline.run(source)
+    second = {params["since"] for params in _deployment_calls(fake)}
+    assert len(first) == len(second) == 1
+    assert int(second.pop()) > int(first.pop())
 
 
 def test_more_than_20_ids_are_filtered_after_listing(dlt_mod, tmp_path):
     # Vercel answers 400 above 20 projectIds, which would fail every run.
     fake = _fleet_with_docs()
-    selected = ["prj_web", "prj_api", *(f"prj_gone{number}" for number in range(19))]
-    pipeline = _run_sync(dlt_mod, tmp_path, fake, project_ids=selected)
+    extra = [f"prj_extra{number}" for number in range(19)]
+    fake.projects += [_project(item, item.removeprefix("prj_")) for item in extra]
+    pipeline = _run_sync(dlt_mod, tmp_path, fake, project_ids=["prj_web", "prj_api", *extra])
 
     assert all(not params["projectIds"] for params in _deployment_calls(fake))
     assert set(_read(pipeline, VERCEL_DEPLOYMENTS_TABLE)) == {"dpl_ok1", "dpl_ok2", "dpl_err"}
@@ -785,18 +931,88 @@ def test_a_project_name_matches_in_any_case(dlt_mod, tmp_path):
     assert set(_read(pipeline, VERCEL_DEPLOYMENTS_TABLE)) == {"dpl_ok1", "dpl_err"}
 
 
-def test_a_selected_project_that_was_deleted_is_forgotten(dlt_mod, tmp_path):
+def test_a_selected_project_that_is_gone_aborts_and_names_it(dlt_mod, tmp_path):
+    # A deleted project, a renamed one or a typo look the same from here. Under
+    # replace each would forget its documents, so the run stops and says which.
     fake = _fleet()
-    first = _run_sync(dlt_mod, tmp_path, fake, project_ids=["web"])
-    assert set(_read(first, VERCEL_DEPLOYMENTS_TABLE)) == {"dpl_ok1", "dpl_err"}
+    first = _run_sync(dlt_mod, tmp_path, fake, project_ids=["web", "prj_api"])
+    before = {table: _read(first, table) for table in _TABLES}
 
-    # Deleted in Vercel: projectId=web now answers 404 instead of a list.
     fake.projects = [item for item in fake.projects if item["name"] != "web"]
     fake.deployments = [item for item in fake.deployments if item["name"] != "web"]
-    pipeline = _run_sync(dlt_mod, tmp_path, fake, project_ids=["web"])
+    with pytest.raises(
+        PipelineStepFailed, match=r"not found among the 1 projects this token can see: \[.web.\]"
+    ):
+        _run_sync(dlt_mod, tmp_path, fake, project_ids=["web", "prj_api"])
 
-    assert _read(pipeline, VERCEL_PROJECTS_TABLE) == {}
+    assert {table: _read(_pipeline(dlt_mod, tmp_path), table) for table in _TABLES} == before
+
+
+def test_allow_empty_forgets_a_selected_project_that_is_gone(dlt_mod, tmp_path):
+    # For a one-entry selection, dropping the entry would sync the whole account.
+    fake = _fleet()
+    _run_sync(dlt_mod, tmp_path, fake, project_ids=["web"])
+    _run_sync(dlt_mod, tmp_path, fake, project_ids=["web", "prj_api"])
+    web = [item for item in fake.projects if item["name"] == "web"]
+    fake.projects = [item for item in fake.projects if item["name"] != "web"]
+
+    with pytest.raises(PipelineStepFailed, match=r"not found among the 1 projects.*\['web'\]"):
+        _run_sync(dlt_mod, tmp_path, fake, project_ids=["web", "prj_api"])
+    pipeline = _run_sync(dlt_mod, tmp_path, fake, project_ids=["web", "prj_api"], allow_empty=True)
+    assert set(_read(pipeline, VERCEL_PROJECTS_TABLE)) == {"prj_api"}
+    assert set(_read(pipeline, VERCEL_DEPLOYMENTS_TABLE)) == {"dpl_ok2"}
+
+    # Later runs without the flag skip the forgotten entry instead of stopping.
+    pipeline = _run_sync(dlt_mod, tmp_path, fake, project_ids=["web", "prj_api"])
+    assert set(_read(pipeline, VERCEL_DEPLOYMENTS_TABLE)) == {"dpl_ok2"}
+    # A new missing entry still stops the run.
+    with pytest.raises(PipelineStepFailed, match="docs"):
+        _run_sync(dlt_mod, tmp_path, fake, project_ids=["web", "prj_api", "docs"])
+    # And once the project is back, it is synced again.
+    fake.projects += web
+    pipeline = _run_sync(dlt_mod, tmp_path, fake, project_ids=["web", "prj_api"])
+    assert set(_read(pipeline, VERCEL_DEPLOYMENTS_TABLE)) == {"dpl_ok1", "dpl_ok2", "dpl_err"}
+
+
+def test_a_selection_that_is_all_gone_lists_no_deployments(dlt_mod, tmp_path):
+    fake = _fleet()
+    _run_sync(dlt_mod, tmp_path, fake, project_ids=["web"])
+    fake.projects = [item for item in fake.projects if item["name"] != "web"]
+    fake.calls.clear()
+    pipeline = _run_sync(dlt_mod, tmp_path, fake, project_ids=["web"], allow_empty=True)
     assert _read(pipeline, VERCEL_DEPLOYMENTS_TABLE) == {}
+    assert _deployment_calls(fake) == [], "nothing selected is left, so nothing is listed"
+    assert fake.event_paths() == []
+
+
+def test_project_ids_that_match_nothing_abort(dlt_mod, tmp_path):
+    fake = _fleet()
+    with pytest.raises(PipelineStepFailed, match="prj_typo"):
+        _run_sync(dlt_mod, tmp_path, fake, project_ids=["prj_typo", "prj_web"])
+
+
+def test_a_renamed_project_keeps_its_older_deployments(dlt_mod, tmp_path):
+    # Vercel picks deployments by project, but each one keeps the name it was
+    # built under. Matching the new name against that would drop them all.
+    fake = _fleet()
+    fake.projects[0]["name"] = "site"  # was "web"; dpl_ok1 and dpl_err still say web
+    pipeline = _run_sync(dlt_mod, tmp_path, fake, project_ids=["site"])
+
+    assert set(_read(pipeline, VERCEL_PROJECTS_TABLE)) == {"prj_web"}
+    assert set(_read(pipeline, VERCEL_DEPLOYMENTS_TABLE)) == {"dpl_ok1", "dpl_err"}
+    assert fake.event_paths() == ["/v3/deployments/dpl_err/events"]
+
+
+def test_a_renamed_project_among_several_names_keeps_its_deployments(dlt_mod, tmp_path):
+    # Two names are filtered here, not by Vercel. Deployments are matched on the
+    # project id the names resolve to, never on the name they were built under.
+    fake = _fleet_with_docs()
+    fake.projects[0]["name"] = "site"  # was "web"; dpl_ok1 and dpl_err still say web
+    pipeline = _run_sync(dlt_mod, tmp_path, fake, project_ids=["site", "api"])
+
+    assert set(_read(pipeline, VERCEL_DEPLOYMENTS_TABLE)) == {"dpl_ok1", "dpl_ok2", "dpl_err"}
+    assert sorted(fake.event_paths()) == ["/v3/deployments/dpl_err/events"]
+    _assert_docs_left_out(fake, pipeline)
 
 
 @pytest.mark.parametrize("days", [0, -1])
@@ -846,7 +1062,7 @@ def test_http_error_aborts_sync_and_keeps_previous_snapshot(dlt_mod, tmp_path, f
     before = {table: _read(first, table) for table in _TABLES}
 
     fake.fail = lambda path, params: 500 if failing_call(path, params) else None
-    with pytest.raises(Exception):  # noqa: B017 - dlt wraps the HTTP error in PipelineStepFailed
+    with pytest.raises(PipelineStepFailed):
         _run_sync(dlt_mod, tmp_path, fake)
 
     # Nothing was loaded, so staging (and cognee's memory) still holds the last
@@ -876,7 +1092,7 @@ def test_check_active_can_stop_a_sync(dlt_mod, tmp_path):
             raise PermissionError("access revoked")
 
     fake.deployments = fake.deployments[:1]
-    with pytest.raises(Exception, match="access revoked"):
+    with pytest.raises(PipelineStepFailed, match="access revoked"):
         _run_sync(dlt_mod, tmp_path, fake, check_active=revoked_after_two_pages)
 
     pipeline = _pipeline(dlt_mod, tmp_path)
@@ -891,7 +1107,7 @@ def test_list_without_pagination_aborts_sync(dlt_mod, tmp_path):
     before = {table: _read(first, table) for table in _TABLES}
 
     fake.drop_pagination = {"/v10/projects", "/v7/deployments"}
-    with pytest.raises(Exception, match=r"pagination\.next"):
+    with pytest.raises(PipelineStepFailed, match=r"pagination\.next"):
         _run_sync(dlt_mod, tmp_path, fake)
 
     pipeline = _pipeline(dlt_mod, tmp_path)
@@ -905,7 +1121,7 @@ def test_deployment_list_without_pagination_aborts_sync(dlt_mod, tmp_path):
     before = _read(first, VERCEL_DEPLOYMENTS_TABLE)
 
     fake.drop_pagination = {"/v7/deployments"}
-    with pytest.raises(Exception, match=r"pagination\.next") as raised:
+    with pytest.raises(PipelineStepFailed, match=r"pagination\.next") as raised:
         _run_sync(dlt_mod, tmp_path, fake, project_ids=["web"])
     # Status and endpoint only: the query (team id, project names) stays out of logs.
     assert "/v7/deployments" in str(raised.value)
@@ -920,10 +1136,47 @@ def test_events_body_that_is_not_a_list_aborts_sync(dlt_mod, tmp_path):
     before = _read(first, VERCEL_BUILD_LOGS_TABLE)
 
     fake.events_as_object = True
-    with pytest.raises(Exception, match="list of build events"):
+    with pytest.raises(PipelineStepFailed, match="list of build events") as raised:
         _run_sync(dlt_mod, tmp_path, fake)
+    # The message names the endpoint, not the deployment.
+    assert "/v3/deployments/{id}/events" in str(raised.value)
+    assert "dpl_err" not in str(raised.value)
 
     assert _read(_pipeline(dlt_mod, tmp_path), VERCEL_BUILD_LOGS_TABLE) == before
+
+
+def test_a_body_that_is_not_json_aborts(dlt_mod, tmp_path):
+    fake = _fleet()
+    first = _run_sync(dlt_mod, tmp_path, fake)
+    before = {table: _read(first, table) for table in _TABLES}
+
+    fake.not_json = {"/v7/deployments"}
+    with pytest.raises(PipelineStepFailed, match="is not JSON"):
+        _run_sync(dlt_mod, tmp_path, fake)
+    assert {table: _read(_pipeline(dlt_mod, tmp_path), table) for table in _TABLES} == before
+
+
+def test_one_source_object_run_twice_reads_everything_both_times(dlt_mod, tmp_path):
+    # The paginator lives as long as the source. If its cursor carried over, the
+    # second run would start mid-list and forget the newest deployments.
+    fake = _fleet()
+    source = vercel_source(token="test-token", service=fake.session(), include_build_logs=True)
+    pipeline = _pipeline(dlt_mod, tmp_path)
+    pipeline.run(source)
+    first = {table: _read(pipeline, table) for table in _TABLES}
+    fake.calls.clear()
+    pipeline.run(source)
+    assert {table: _read(pipeline, table) for table in _TABLES} == first
+    assert "until" not in _deployment_calls(fake)[0], "the second run starts at the newest page"
+
+
+def test_an_older_cognee_is_refused(monkeypatch):
+    # Without table-scoped cleanup, a sync of one table would forget the other two.
+    from cognee.tasks.ingestion import dlt_utils
+
+    monkeypatch.setattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 0)
+    with pytest.raises(RuntimeError, match=r"cognee>=1\.6\.1"):
+        vercel_source(token="test-token")
 
 
 def test_an_account_that_suddenly_lists_no_projects_aborts(dlt_mod, tmp_path):
@@ -934,11 +1187,81 @@ def test_an_account_that_suddenly_lists_no_projects_aborts(dlt_mod, tmp_path):
     before = {table: _read(first, table) for table in _TABLES}
 
     fake.projects, fake.deployments = [], []
-    with pytest.raises(Exception, match="no projects at all"):
+    with pytest.raises(PipelineStepFailed, match="no projects at all"):
         _run_sync(dlt_mod, tmp_path, fake)
 
     pipeline = _pipeline(dlt_mod, tmp_path)
     assert {table: _read(pipeline, table) for table in _TABLES} == before
+
+
+def test_a_token_for_another_account_aborts(dlt_mod, tmp_path):
+    # Another account still has projects, so the empty check alone would let it
+    # through, and replace would forget every document of the first account.
+    fake = _fleet()
+    first = _run_sync(dlt_mod, tmp_path, fake)
+    before = {table: _read(first, table) for table in _TABLES}
+
+    other = FakeVercel(
+        account="team_2",
+        projects=[_project("prj_x", "x")],
+        deployments=[_deployment("dpl_x", "x")],
+    )
+    with pytest.raises(PipelineStepFailed, match="another account"):
+        _run_sync(dlt_mod, tmp_path, other)
+    assert {table: _read(_pipeline(dlt_mod, tmp_path), table) for table in _TABLES} == before
+
+    # Meant on purpose: allow_empty lets the switch through once.
+    pipeline = _run_sync(dlt_mod, tmp_path, other, allow_empty=True)
+    assert set(_read(pipeline, VERCEL_PROJECTS_TABLE)) == {"prj_x"}
+    _run_sync(dlt_mod, tmp_path, other)
+
+
+def test_projects_without_an_account_id_keep_the_account_check(dlt_mod, tmp_path):
+    # A list that carries no accountId must not clear what the check compares to.
+    fake = _fleet()
+    _run_sync(dlt_mod, tmp_path, fake)
+    fake.omit_account = True
+    _run_sync(dlt_mod, tmp_path, fake)
+
+    other = FakeVercel(account="team_2", projects=[_project("prj_x", "x")], deployments=[])
+    with pytest.raises(PipelineStepFailed, match="another account"):
+        _run_sync(dlt_mod, tmp_path, other)
+
+
+def test_a_project_edited_while_the_list_pages_is_kept(dlt_mod, tmp_path):
+    # Projects page by updatedAt, newest first. One edited during the paging
+    # moves to the front, behind the cursor; the newest page is read again at
+    # the end, so it is not dropped, and neither are its deployments.
+    fake = _fleet_with_docs()  # three projects on pages of two
+    oldest = min(fake.projects, key=lambda project: project["updatedAt"])
+
+    def edit_during_page_two(path, params):
+        if path == "/v10/projects" and "until" in params:
+            oldest["updatedAt"] = NOW_MS + 1000
+            oldest["framework"] = "astro"
+
+    fake.before = edit_during_page_two
+    pipeline = _run_sync(dlt_mod, tmp_path, fake, project_ids=["web", "api", "docs"])
+
+    projects = _read(pipeline, VERCEL_PROJECTS_TABLE)
+    assert set(projects) == {"prj_web", "prj_api", "prj_docs"}
+    assert "Framework: astro" in projects[oldest["id"]]["content"], "the newer copy wins"
+    assert set(_read(pipeline, VERCEL_DEPLOYMENTS_TABLE)) == {
+        "dpl_ok1",
+        "dpl_ok2",
+        "dpl_err",
+        "dpl_docs_err",
+    }
+    # The projects are read once per run: two pages and the newest page again.
+    assert len([call for call in fake.calls if call[0] == "/v10/projects"]) == 3
+
+
+def test_a_project_added_or_removed_in_the_same_account_is_fine(dlt_mod, tmp_path):
+    fake = _fleet()
+    _run_sync(dlt_mod, tmp_path, fake)
+    fake.projects = [_project("prj_new", "new")]  # same accountId, all-new projects
+    pipeline = _run_sync(dlt_mod, tmp_path, fake)
+    assert set(_read(pipeline, VERCEL_PROJECTS_TABLE)) == {"prj_new"}
 
 
 def test_allow_empty_lets_an_emptied_account_through(dlt_mod, tmp_path):
@@ -967,10 +1290,262 @@ def test_unexpected_list_shape_aborts_sync(dlt_mod, tmp_path):
     before = _read(first, VERCEL_PROJECTS_TABLE)
 
     fake.projects_as_array = True
-    with pytest.raises(Exception, match="expected an object with a 'projects' list"):
+    with pytest.raises(PipelineStepFailed, match="expected an object with a 'projects' list"):
         _run_sync(dlt_mod, tmp_path, fake)
 
     assert _read(_pipeline(dlt_mod, tmp_path), VERCEL_PROJECTS_TABLE) == before
+
+
+def test_sync_stats_count_the_rows_of_the_last_run(dlt_mod, tmp_path):
+    fake = _fleet()
+    source = vercel_source(token="test-token", service=fake.session(), include_build_logs=True)
+    _pipeline(dlt_mod, tmp_path).run(source)
+    assert source.cognee_sync_stats == {
+        "projects": 2,
+        "deployments": 3,
+        "build_logs": 1,
+        "failed_rate_limit": 0,
+    }
+
+
+def test_without_a_service_the_capped_retrying_session_is_used(dlt_mod, tmp_path, monkeypatch):
+    from cognee_community_connector_vercel import vercel
+
+    fake = _fleet()
+    made = []
+
+    def capped():
+        session = _default_session()
+        session.mount("https://", fake)
+        made.append(session)
+        return session
+
+    monkeypatch.setattr(vercel, "_default_session", capped)
+    pipeline = _pipeline(dlt_mod, tmp_path)
+    pipeline.run(vercel_source(token="test-token"))
+    assert len(made) == 1
+    assert set(_read(pipeline, VERCEL_PROJECTS_TABLE)) == {"prj_web", "prj_api"}
+
+
+def test_a_table_that_empties_logs_a_warning(dlt_mod, tmp_path, monkeypatch):
+    from cognee_community_connector_vercel import vercel
+
+    warnings = []
+    monkeypatch.setattr(vercel.logger, "warning", lambda *args: warnings.append(args))
+    fake = _fleet()
+    _run_sync(dlt_mod, tmp_path, fake)
+    assert warnings == []
+    fake.logs = {}
+    fake.deployments = [item for item in fake.deployments if item["state"] != "ERROR"]
+    _run_sync(dlt_mod, tmp_path, fake)
+    assert [args[1:] for args in warnings] == [(VERCEL_BUILD_LOGS_TABLE, 1)]
+
+
+def test_a_deployment_with_only_ready_state_deleted_is_left_out(dlt_mod, tmp_path):
+    # Vercel's spec makes readyState the required field and state optional.
+    fake = _fleet()
+    gone = _deployment("dpl_gone", "web", minutes_ago=5, readyState="DELETED")
+    del gone["state"]
+    fake.deployments.append(gone)
+    pipeline = _run_sync(dlt_mod, tmp_path, fake)
+    assert set(_read(pipeline, VERCEL_DEPLOYMENTS_TABLE)) == {"dpl_ok1", "dpl_ok2", "dpl_err"}
+
+
+def test_two_deployments_from_one_millisecond_at_a_page_boundary_are_both_kept(dlt_mod, tmp_path):
+    # `until` is exclusive and `next` is the last item's timestamp, so without the
+    # overlap the twin after the boundary would never be read, and be forgotten.
+    fake = _fleet()
+    fake.page_size = 3  # page one ends on dpl_a, page two starts with its twin
+    first, twin = (
+        _deployment(uid, "web", state="ERROR", minutes_ago=15) for uid in ("dpl_a", "dpl_b")
+    )
+    twin["created"] = first["created"]
+    # dpl_new failed too, so the failed-only list has its page boundary between
+    # the twins as well.
+    fake.deployments += [first, twin, _deployment("dpl_new", "api", state="ERROR", minutes_ago=12)]
+    fake.logs.update(dpl_a=_log("a failed"), dpl_b=_log("b failed"), dpl_new=_log("new failed"))
+    pipeline = _run_sync(dlt_mod, tmp_path, fake)
+
+    deployments = _read(pipeline, VERCEL_DEPLOYMENTS_TABLE)
+    assert set(deployments) == {"dpl_ok1", "dpl_ok2", "dpl_err", "dpl_new", "dpl_a", "dpl_b"}
+    with pipeline.sql_client() as client:
+        (rows,) = client.execute_sql(f"SELECT COUNT(*) FROM {VERCEL_DEPLOYMENTS_TABLE}")[0]
+    assert rows == 6, "an item read twice is loaded once"
+    # The repeated item costs no second events request either.
+    assert sorted(fake.event_paths()) == sorted(set(fake.event_paths()))
+    assert len(fake.event_paths()) == 4
+    assert set(_read(pipeline, VERCEL_BUILD_LOGS_TABLE)) == {"dpl_err", "dpl_new", "dpl_a", "dpl_b"}
+    with pipeline.sql_client() as client:
+        (logs,) = client.execute_sql(f"SELECT COUNT(*) FROM {VERCEL_BUILD_LOGS_TABLE}")[0]
+    assert logs == 4
+
+
+def test_a_project_read_twice_at_a_page_boundary_is_loaded_once(dlt_mod, tmp_path):
+    fake = _fleet_with_docs()  # three projects on pages of two
+    pipeline = _run_sync(dlt_mod, tmp_path, fake)
+    with pipeline.sql_client() as client:
+        (rows,) = client.execute_sql(f"SELECT COUNT(*) FROM {VERCEL_PROJECTS_TABLE}")[0]
+    assert rows == 3
+
+
+def test_a_cursor_that_does_not_move_aborts(dlt_mod, tmp_path):
+    # One item a page means the overlap re-reads the same item forever.
+    fake = _fleet()
+    fake.page_size = 1
+    with pytest.raises(PipelineStepFailed, match="did not move"):
+        _run_sync(dlt_mod, tmp_path, fake)
+
+
+def test_a_404_on_a_later_page_aborts(dlt_mod, tmp_path):
+    # Treating it as "project deleted" would keep only the pages read before it.
+    fake = _fleet()
+    first = _run_sync(dlt_mod, tmp_path, fake, project_ids=["web"])
+    before = _read(first, VERCEL_DEPLOYMENTS_TABLE)
+
+    fake.deployments.append(_deployment("dpl_ok3", "web", minutes_ago=40))  # a second page
+    later_page = lambda path, params: path == "/v7/deployments" and "until" in params  # noqa: E731
+    fake.fail = lambda path, params: 404 if later_page(path, params) else None
+    with pytest.raises(PipelineStepFailed):
+        _run_sync(dlt_mod, tmp_path, fake, project_ids=["web"])
+    assert _read(_pipeline(dlt_mod, tmp_path), VERCEL_DEPLOYMENTS_TABLE) == before
+
+
+def _session_on(fake):
+    session = _default_session()
+    session.mount("https://", fake)
+    return session
+
+
+def test_a_429_stops_the_run_at_once(dlt_mod, tmp_path):
+    # Waiting out the limit would hold cognee's staging lock, which every other
+    # dlt ingestion in the process waits on. The run stops instead.
+    fake = _fleet()
+    before = {table: _read(_run_sync(dlt_mod, tmp_path, fake), table) for table in _TABLES}
+
+    fake.calls.clear()
+    fake.retry_after = "1000"
+    fake.fail = lambda path, params: 429 if path == "/v7/deployments" else None
+    source = vercel_source(token="test-token", service=_session_on(fake), include_build_logs=True)
+    started = time.monotonic()
+    with pytest.raises(PipelineStepFailed, match=r"rate limited \(429\)"):
+        _pipeline(dlt_mod, tmp_path).run(source)
+
+    assert time.monotonic() - started < 10, "no Retry-After wait"
+    assert len(_deployment_calls(fake)) == 1, "not retried"
+    assert source.cognee_sync_stats["failed_rate_limit"] == 1
+    assert {table: _read(_pipeline(dlt_mod, tmp_path), table) for table in _TABLES} == before
+
+
+def test_a_5xx_stops_the_run_without_a_retry(dlt_mod, tmp_path, monkeypatch):
+    # Any wait would be spent inside cognee's staging lock, and the next run
+    # re-reads everything, so the default session never retries.
+    slept = []
+    monkeypatch.setattr(time, "sleep", slept.append)
+    fake = _fleet()
+    before = {table: _read(_run_sync(dlt_mod, tmp_path, fake), table) for table in _TABLES}
+
+    fake.calls.clear()
+    fake.retry_after = "1000"
+    fake.fail = lambda path, params: 503 if path == "/v7/deployments" else None
+    with pytest.raises(PipelineStepFailed, match="503"):
+        _run_sync(dlt_mod, tmp_path, fake, service=_session_on(fake))
+    assert len(_deployment_calls(fake)) == 1, "not retried"
+    assert slept == [], "no wait"
+    assert {table: _read(_pipeline(dlt_mod, tmp_path), table) for table in _TABLES} == before
+
+
+def test_each_request_times_out_after_30_seconds(dlt_mod, tmp_path):
+    fake = _fleet()
+    _run_sync(dlt_mod, tmp_path, fake, service=_session_on(fake))
+    assert fake.timeouts and set(fake.timeouts) == {30}
+
+
+def test_a_429_on_a_later_page_stops_the_run(dlt_mod, tmp_path):
+    fake = _fleet()
+    before = {table: _read(_run_sync(dlt_mod, tmp_path, fake), table) for table in _TABLES}
+    fake.fail = lambda path, params: (
+        429 if path == "/v7/deployments" and "until" in params else None
+    )
+    with pytest.raises(PipelineStepFailed, match=r"rate limited \(429\)"):
+        _run_sync(dlt_mod, tmp_path, fake)
+    assert {table: _read(_pipeline(dlt_mod, tmp_path), table) for table in _TABLES} == before
+
+
+def test_counts_are_cleared_when_a_run_fails(dlt_mod, tmp_path):
+    fake = _fleet()
+    source = vercel_source(token="test-token", service=fake.session())
+    pipeline = _pipeline(dlt_mod, tmp_path)
+    pipeline.run(source)
+    assert source.cognee_sync_stats["deployments"] == 3
+
+    fake.fail = lambda path, params: 500 if path == "/v7/deployments" else None
+    with pytest.raises(PipelineStepFailed):
+        pipeline.run(source)
+    assert "deployments" not in source.cognee_sync_stats
+
+
+def test_an_expired_build_log_keeps_its_document(dlt_mod, tmp_path):
+    # Vercel answers 410 once it no longer keeps a build's output. The deployment
+    # is still listed, so the log row from the last load is loaded again,
+    # unchanged, and cognee keeps the document.
+    fake = _fleet()
+    before = _read(_run_sync(dlt_mod, tmp_path, fake), VERCEL_BUILD_LOGS_TABLE)
+    assert set(before) == {"dpl_err"}
+
+    fake.fail = lambda path, params: 410 if path.endswith("/events") else None
+    pipeline = _run_sync(dlt_mod, tmp_path, fake)
+    assert _read(pipeline, VERCEL_BUILD_LOGS_TABLE) == before
+    assert "dpl_err" in _read(pipeline, VERCEL_DEPLOYMENTS_TABLE)
+
+    # Once the deployment itself is gone, so is the kept log.
+    fake.deployments = [item for item in fake.deployments if item["uid"] != "dpl_err"]
+    pipeline = _run_sync(dlt_mod, tmp_path, fake)
+    assert _read(pipeline, VERCEL_BUILD_LOGS_TABLE) == {}
+
+
+def test_an_expired_log_without_an_inspector_url_keeps_its_document(dlt_mod, tmp_path):
+    # Vercel types inspectorUrl as nullable. If no failed build of a load has
+    # one, dlt creates no `url` column, and the kept row must be read back
+    # without it, exactly as it was loaded.
+    fake = _fleet()
+    for deployment in fake.deployments:
+        if deployment["uid"] == "dpl_err":
+            del deployment["inspectorUrl"]
+    first = _run_sync(dlt_mod, tmp_path, fake)
+    before = _read(first, VERCEL_BUILD_LOGS_TABLE)
+    assert set(before) == {"dpl_err"} and "url" not in before["dpl_err"]
+
+    fake.fail = lambda path, params: 410 if path.endswith("/events") else None
+    for _ in range(2):  # and again on the next run, from the row it kept
+        pipeline = _run_sync(dlt_mod, tmp_path, fake)
+        assert _read(pipeline, VERCEL_BUILD_LOGS_TABLE) == before
+
+
+def test_an_expired_log_with_no_earlier_load_is_skipped(dlt_mod, tmp_path):
+    fake = _fleet()
+    fake.fail = lambda path, params: 410 if path.endswith("/events") else None
+    source = vercel_source(token="test-token", service=fake.session(), include_build_logs=True)
+    pipeline = _pipeline(dlt_mod, tmp_path)
+    pipeline.run(source)
+    assert source.cognee_sync_stats["build_logs"] == 0
+    assert "dpl_err" in _read(pipeline, VERCEL_DEPLOYMENTS_TABLE)
+
+
+def test_a_secret_printed_by_a_build_stays_out_by_default(dlt_mod, tmp_path):
+    # Vercel only redacts sensitive values of 32 characters or more, so a build
+    # can print a shorter one into its log. Logs are only read when asked for.
+    fake = _fleet()
+    fake.logs["dpl_err"] = _log("Installing dependencies", f"DB_URL={CANARY_ENV}")
+    _run_sync(dlt_mod, tmp_path / "default", fake, include_build_logs=False)
+
+    _, written = _everything_written(tmp_path / "default")
+    assert CANARY_ENV not in written
+    assert fake.event_paths() == []
+
+    # Asked for, the log is loaded as Vercel returns it. The README says so.
+    _run_sync(dlt_mod, tmp_path / "logs", fake, include_build_logs=True)
+    _, written = _everything_written(tmp_path / "logs")
+    assert CANARY_ENV in written
 
 
 _TABLES = (VERCEL_PROJECTS_TABLE, VERCEL_DEPLOYMENTS_TABLE, VERCEL_BUILD_LOGS_TABLE)
@@ -1048,11 +1623,14 @@ def test_two_teams_in_one_dataset_keep_their_documents(tmp_path, monkeypatch):
 
     cognee = _cognee_offline(tmp_path, monkeypatch)
     team_a = FakeVercel(
-        projects=[], deployments=[_deployment("dpl_a1", "alpha"), _deployment("dpl_a2", "alpha")]
+        account="team_A",
+        projects=[],
+        deployments=[_deployment("dpl_a1", "alpha"), _deployment("dpl_a2", "alpha")],
     )
-    team_b = FakeVercel(projects=[], deployments=[_deployment("dpl_b1", "bravo")])
+    team_b = FakeVercel(projects=[], deployments=[_deployment("dpl_b1", "bravo")], account="team_B")
 
     async def sync(fake, team):
+        # `session` is the older name of `service`; both are accepted.
         source = vercel_source(token="test-token", team_id=team, session=fake.session())
         await cognee.add(source, dataset_name="vercel_teams")
 
@@ -1071,6 +1649,41 @@ def test_two_teams_in_one_dataset_keep_their_documents(tmp_path, monkeypatch):
             team_a.deployments = team_a.deployments[:1]
             await sync(team_a, "team_A")
             assert await count() == 2, "only team A's deleted deployment may go"
+        finally:
+            await cognee.prune.prune_data()
+            await cognee.prune.prune_system(metadata=True)
+
+    asyncio.run(scenario())
+
+
+def test_cognee_keeps_an_expired_log(tmp_path, monkeypatch):
+    # The kept log is read back from cognee's own staging database, so check it
+    # there: after the events call starts answering 410, no document goes.
+    pytest.importorskip("dlt")
+    import asyncio
+
+    cognee = _cognee_offline(tmp_path, monkeypatch)
+    fake = _fleet()
+
+    async def sync():
+        source = vercel_source(token="test-token", service=fake.session(), include_build_logs=True)
+        await cognee.add(source, dataset_name="vercel_expiry")
+        return source.cognee_sync_stats
+
+    async def count():
+        datasets = await cognee.datasets.list_datasets()
+        found = next(item for item in datasets if item.name == "vercel_expiry")
+        return len(await cognee.datasets.list_data(found.id))
+
+    async def scenario():
+        await cognee.prune.prune_data()
+        await cognee.prune.prune_system(metadata=True)
+        try:
+            assert (await sync())["build_logs"] == 1
+            documents = await count()
+            fake.fail = lambda path, params: 410 if path.endswith("/events") else None
+            assert (await sync())["build_logs"] == 1, "the expired log is kept"
+            assert await count() == documents
         finally:
             await cognee.prune.prune_data()
             await cognee.prune.prune_system(metadata=True)
@@ -1122,9 +1735,8 @@ def test_deleted_deployment_is_forgotten_from_the_graph(tmp_path, monkeypatch):
     )
 
     async def sync():
-        await cognee.add(
-            vercel_source(token="test-token", session=fake.session()), dataset_name=dataset
-        )
+        source = vercel_source(token="test-token", service=fake.session(), include_build_logs=True)
+        await cognee.add(source, dataset_name=dataset)
         await cognee.cognify(datasets=[dataset])
 
     async def scenario():
