@@ -677,3 +677,13 @@ def test_cross_host_next_link_is_never_followed(fake, sync):
     with pytest.raises(OutreachError, match="pagination"):
         sync("prospects", fake, {})
     assert all("evil" not in str(c) for c in fake.calls)
+
+
+def test_ingest_works_when_the_server_honours_sparse_fieldsets(fake, make_source, pipeline_factory):
+    fake.honor_fields = True
+    pipeline = pipeline_factory()
+    pipeline.run(make_source(fake, resources=["prospects"]), **RUN)
+    rows = read_table(pipeline, PROS, "id, owner_id, account_id")
+    assert {r[0] for r in rows} == PROSPECT_IDS and all(r[1] == "1" and r[2] == "9" for r in rows)
+    pipeline.run(make_source(fake, resources=["prospects"]), **RUN)  # sweep needs updatedAt only
+    assert ids(pipeline, PROS) == PROSPECT_IDS

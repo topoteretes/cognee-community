@@ -95,6 +95,7 @@ class FakeOutreach(HTTPAdapter):
             else {path: load(name) for path, name in FIXTURE_FILES.items()}
         )
         self.forced_page_size = page_size
+        self.honor_fields = False  # real Outreach trims to fields[type]; off to test the allowlist
         self.calls = []  # (path, params, authorization)
         self.scripted = {}  # path -> list of (status, headers) consumed first
         self.status_for = {}  # (path, "sweep"|"data"|"any") -> status
@@ -201,6 +202,19 @@ class FakeOutreach(HTTPAdapter):
         size = self.forced_page_size or int(params.get("page[size]", 50))
         start = int(params.get("page[after]", 0))
         chunk = records[start : start + size]
+        fieldset = next((v for k, v in params.items() if k.startswith("fields[")), None)
+        if self.honor_fields and fieldset is not None:
+            wanted = set(fieldset.split(","))
+            chunk = [
+                {
+                    **r,
+                    "attributes": {k: v for k, v in r["attributes"].items() if k in wanted},
+                    "relationships": {
+                        k: v for k, v in r.get("relationships", {}).items() if k in wanted
+                    },
+                }
+                for r in chunk
+            ]
         body = {"data": chunk, "meta": {}}
         nxt = start + size
         if self.repeat_page:
