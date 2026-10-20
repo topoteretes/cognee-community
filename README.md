@@ -107,6 +107,12 @@ poetry run python ./examples/example.py
 | `cognee-community-hybrid-adapter-duckdb`     | Hybrid   | DuckDB hybrid database adapter for cognee          |
 | `cognee-community-hybrid-adapter-falkor`     | Hybrid   | FalkorDB hybrid database adapter for cognee        |
 
+## Data-source Connectors
+
+The [Azure Blob Storage connector](packages/connector/azure-blob/) imports text documents
+from a selected container prefix, with SAS/account-key authentication, incremental sync,
+and downstream cleanup when source blobs are deleted. See its README for setup and examples.
+
 ## Custom Packages
 
 Custom packages are also a part of this repo, containing, for example, custom pipelines, tasks, and retrievers.

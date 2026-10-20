@@ -5,9 +5,10 @@ description = "Azure Blob Storage data-source connector for cognee — sync docu
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
 dependencies = [
-    # Match the Google Calendar connector's cognee pin for scoped document sync.
-    "cognee==1.6.3",
+    # Match GCS PR #452: includes final-document graph/vector cleanup fixes.
+    "cognee==1.6.5",
     "dlt[sqlalchemy]>=1.9.0,<2",
+    "azure-core>=1.31,<2",
     "azure-storage-blob>=12.25.1,<13",
 ]
 
@@ -36,6 +37,8 @@ pythonpath = ["."]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+# Use the same import roots as the repository-wide Ruff configuration.
+src = ["../../.."]
 
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "N", "B", "UP", "C4", "PGH", "SIM", "RUF"]
