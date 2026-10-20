@@ -1,10 +1,12 @@
-import pytest
 from unittest.mock import MagicMock, patch
+
+import pytest
+
 from cognee_community_connector_umami.umami import (
-    umami_source,
-    _format_website_markdown,
-    UMAMI_TABLE_NAME,
     DOCUMENT_SOURCE_ATTR,
+    UMAMI_TABLE_NAME,
+    _format_website_markdown,
+    umami_source,
 )
 
 
@@ -39,9 +41,11 @@ def sample_top_pages():
 
 def test_missing_api_key_raises_error():
     """Verify that omitting the Umami API key raises ValueError."""
-    with patch.dict("os.environ", {}, clear=True):
-        with pytest.raises(ValueError, match="Umami API key required"):
-            umami_source(api_key=None)
+    with (
+        patch.dict("os.environ", {}, clear=True),
+        pytest.raises(ValueError, match="Umami API key required"),
+    ):
+        umami_source(api_key=None)
 
 
 def test_website_markdown_formatting_deterministic(sample_website, sample_stats, sample_top_pages):

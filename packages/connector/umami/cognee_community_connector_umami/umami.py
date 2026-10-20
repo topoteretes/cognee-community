@@ -1,4 +1,4 @@
-"""DLT source for Umami privacy-preserving analytics and traffic trends (full snapshot + forget-on-delete).
+"""DLT source for Umami privacy-preserving analytics and traffic trends.
 
 Fetches Umami tracked websites, visitor totals, pageviews, session durations,
 bounce statistics, and top page paths, rendering them into clean Markdown documents.
@@ -18,13 +18,12 @@ propagate cleanly — a removed website drops out of the snapshot, so cognee's e
 preserve stable content-hash ``data_id`` keys, preventing redundant re-ingestion.
 """
 
-from collections.abc import Iterator
 import os
 import time
+from collections.abc import Iterator
 from typing import Any
 
 import httpx
-
 from cognee.shared.logging_utils import get_logger
 from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
 
@@ -51,15 +50,16 @@ def _request_with_retry(
         try:
             response = client.request(method, url, headers=headers, params=params, timeout=30.0)
             if response.status_code == 429:
-                retry_after = float(response.headers.get("Retry-After", _BASE_BACKOFF * (2**attempt)))
-                logger.warning("Umami rate limit reached, waiting %.1f seconds", retry_after)
-                time.sleep(retry_after)
+                delay = float(response.headers.get("Retry-After", _BASE_BACKOFF * (2**attempt)))
+                logger.warning("Umami rate limit reached, waiting %.1f seconds", delay)
+                time.sleep(delay)
                 continue
             response.raise_for_status()
             return response.json()
         except (httpx.TransportError, httpx.HTTPStatusError) as exc:
             if attempt == _MAX_RETRIES - 1:
-                raise RuntimeError(f"Umami request failed after {_MAX_RETRIES} attempts: {exc}") from exc
+                msg = f"Umami request failed after {_MAX_RETRIES} attempts: {exc}"
+                raise RuntimeError(msg) from exc
             time.sleep(_BASE_BACKOFF * (2**attempt))
     raise RuntimeError(f"Umami request exceeded retry budget for {url}")
 
@@ -74,13 +74,21 @@ def _format_website_markdown(
     name = (website.get("name") or "Unnamed Website").strip()
     domain = website.get("domain", "")
 
-    pageviews = (stats.get("pageviews") or {}).get("value", 0) if isinstance(stats.get("pageviews"), dict) else stats.get("pageviews", 0)
-    visitors = (stats.get("visitors") or {}).get("value", 0) if isinstance(stats.get("visitors"), dict) else stats.get("visitors", 0)
-    visits = (stats.get("visits") or {}).get("value", 0) if isinstance(stats.get("visits"), dict) else stats.get("visits", 0)
-    bounces = (stats.get("bounces") or {}).get("value", 0) if isinstance(stats.get("bounces"), dict) else stats.get("bounces", 0)
-    totaltime = (stats.get("totaltime") or {}).get("value", 0) if isinstance(stats.get("totaltime"), dict) else stats.get("totaltime", 0)
+    pv = stats.get("pageviews")
+    pageviews = pv.get("value", 0) if isinstance(pv, dict) else (pv or 0)
 
-    # Derived metrics
+    vis = stats.get("visitors")
+    visitors = vis.get("value", 0) if isinstance(vis, dict) else (vis or 0)
+
+    vst = stats.get("visits")
+    visits = vst.get("value", 0) if isinstance(vst, dict) else (vst or 0)
+
+    bnc = stats.get("bounces")
+    bounces = bnc.get("value", 0) if isinstance(bnc, dict) else (bnc or 0)
+
+    tt = stats.get("totaltime")
+    totaltime = tt.get("value", 0) if isinstance(tt, dict) else (tt or 0)
+
     bounce_rate = f"{(bounces / visits * 100):.1f}%" if visits and visits > 0 else "N/A"
     avg_duration_sec = f"{(totaltime / visits):.1f}s" if visits and visits > 0 else "N/A"
 
@@ -116,7 +124,7 @@ def umami_source(
     Args:
         api_key: Umami API key. Falls back to ``UMAMI_API_KEY``.
         base_url: Umami API base URL (default: ``https://api.umami.is/v1``).
-        website_ids: Restrict ingestion to specific website IDs. When omitted, all websites are ingested.
+        website_ids: Restrict ingestion to specific website IDs (all if omitted).
         client: Pre-built ``httpx.Client`` (primarily for test mock injection).
 
     Returns:
@@ -131,9 +139,7 @@ def umami_source(
 
     resolved_key = api_key or os.environ.get("UMAMI_API_KEY")
     if not resolved_key:
-        raise ValueError(
-            "Umami API key required: pass api_key= or set UMAMI_API_KEY."
-        )
+        raise ValueError("Umami API key required: pass api_key= or set UMAMI_API_KEY.")
 
     api_base = (base_url or os.environ.get("UMAMI_BASE_URL") or DEFAULT_UMAMI_BASE_URL).rstrip("/")
     http_client = client or httpx.Client(timeout=30.0)
@@ -145,7 +151,6 @@ def umami_source(
 
     @dlt.resource(name=UMAMI_TABLE_NAME, primary_key="id", write_disposition="replace")
     def umami_documents() -> Iterator[dict[str, Any]]:
-        # Fetch tracked websites
         websites_url = f"{api_base}/websites"
         data = _request_with_retry(http_client, "GET", websites_url, headers)
         websites = data.get("data") if isinstance(data, dict) and "data" in data else data
@@ -153,7 +158,6 @@ def umami_source(
             websites = []
 
         now_ms = int(time.time() * 1000)
-        # Default window: past 30 days
         thirty_days_ms = 30 * 24 * 60 * 60 * 1000
         start_ms = now_ms - thirty_days_ms
 
@@ -162,20 +166,22 @@ def umami_source(
             if website_ids and s_id not in website_ids:
                 continue
 
-            # Fetch general stats
             stats_url = f"{api_base}/websites/{s_id}/stats"
             stats_params = {"startAt": start_ms, "endAt": now_ms}
             stats = _request_with_retry(http_client, "GET", stats_url, headers, stats_params)
 
-            # Fetch top page paths
             metrics_url = f"{api_base}/websites/{s_id}/metrics"
             metrics_params = {"type": "url", "startAt": start_ms, "endAt": now_ms}
             try:
-                top_pages = _request_with_retry(http_client, "GET", metrics_url, headers, metrics_params)
+                top_pages = _request_with_retry(
+                    http_client, "GET", metrics_url, headers, metrics_params
+                )
             except Exception:
                 top_pages = []
 
-            doc_markdown = _format_website_markdown(site, stats if isinstance(stats, dict) else {}, top_pages if isinstance(top_pages, list) else [])
+            safe_stats = stats if isinstance(stats, dict) else {}
+            safe_pages = top_pages if isinstance(top_pages, list) else []
+            doc_markdown = _format_website_markdown(site, safe_stats, safe_pages)
             yield {
                 "id": f"website_{s_id}",
                 "name": site.get("name", ""),
@@ -184,7 +190,6 @@ def umami_source(
                 "body": doc_markdown,
             }
 
-    # Declare document source attribute so cognee runs full entity extraction (document-mode)
     setattr(umami_documents, DOCUMENT_SOURCE_ATTR, UMAMI_SOURCE_NAME)
 
     @dlt.source(name=UMAMI_SOURCE_NAME)

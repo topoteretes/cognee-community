@@ -45,6 +45,7 @@ import os
 import cognee
 from cognee_community_connector_umami import umami_source
 
+
 async def main():
     # Provide token explicitly or set UMAMI_API_KEY environment variable
     source = umami_source(
@@ -62,6 +63,7 @@ async def main():
         datasets=["umami"],
     )
     print("Search Result:\n", results)
+
 
 if __name__ == "__main__":
     asyncio.run(main())

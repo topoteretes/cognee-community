@@ -24,6 +24,7 @@ import asyncio
 import os
 
 import cognee
+
 from cognee_community_connector_umami import umami_source
 
 # Maintain Umami in its own dedicated dataset for easy inspection and lifecycle management
