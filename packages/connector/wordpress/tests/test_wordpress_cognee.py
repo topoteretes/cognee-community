@@ -108,7 +108,7 @@ async def clean_environment(tmp_path, monkeypatch):
 
 
 async def _sync(wp: FakeWordPress):
-    source = wordpress_source(SITE_URL, http_client=wp.client())
+    source = wordpress_source(SITE_URL, service=wp.client())
     await cognee.add(
         source,
         dataset_name=DATASET,
@@ -176,7 +176,7 @@ async def test_example_runs_without_live_credentials(clean_environment, monkeypa
     spec.loader.exec_module(example)
 
     def offline_source(*args, **kwargs):
-        return wordpress_source(*args, **kwargs, http_client=wp.client())
+        return wordpress_source(*args, **kwargs, service=wp.client())
 
     # recall() searches the vector index, so index for real. Embeddings stay
     # mocked, as a constant non-zero vector so every chunk is a match.

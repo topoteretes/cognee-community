@@ -36,6 +36,7 @@ from cognee_community_connector_wordpress import wordpress_source
 from cognee_community_connector_wordpress.wordpress import (
     WordPressAPIError,
     WordPressAuthError,
+    WordPressScopeError,
     _Api,
     _PostType,
     _render_row,
@@ -503,6 +504,8 @@ def test_empty_sweep_never_mass_deletes_and_leaves_the_state_untouched(wp):
     assert live == {} and deleted == set()
     # Neither the cursor nor the reconcile clock may move: edits made before
     # this run must still be replayed once the items are listed again.
+    # Only the empty-run counter is recorded; the cursor does not move.
+    assert state.pop("empty_runs") == 1
     assert state == snapshot
     assert stats["failed"] == 1 and stats["failed_empty_scope"] == 1
 
@@ -545,7 +548,7 @@ def test_api_error_aborts_the_run_and_keeps_the_previous_state(wp):
 # dlt resource
 # ---------------------------------------------------------------------------
 def test_resource_is_a_merge_document_source():
-    resource = wordpress_source(SITE_URL, http_client=httpx.Client())
+    resource = wordpress_source(SITE_URL, service=httpx.Client())
     assert resource.name == "wordpress_blog_example_com"
     assert resource.write_disposition == "merge"
     assert resource.columns["_deleted"]["hard_delete"] is True
@@ -593,7 +596,7 @@ def test_forget_on_delete_end_to_end_through_a_real_dlt_merge(wp, tmp_path):
     pipeline = _pipeline(tmp_path)
 
     def run():
-        source = wordpress_source(SITE_URL, http_client=wp.client())
+        source = wordpress_source(SITE_URL, service=wp.client())
         pipeline.run(source)
         return source
 
@@ -612,13 +615,13 @@ def test_forget_on_delete_end_to_end_through_a_real_dlt_merge(wp, tmp_path):
 
 def test_one_resource_name_cannot_hold_two_sites(wp, tmp_path):
     pipeline = _pipeline(tmp_path)
-    pipeline.run(wordpress_source(SITE_URL, http_client=wp.client(), resource_name="items"))
+    pipeline.run(wordpress_source(SITE_URL, service=wp.client(), resource_name="items"))
 
     other = FakeWordPress()
     with pytest.raises(Exception, match="another site"):
         pipeline.run(
             wordpress_source(
-                "https://other.example.com", http_client=other.client(), resource_name="items"
+                "https://other.example.com", service=other.client(), resource_name="items"
             )
         )
 
@@ -687,8 +690,70 @@ def test_a_non_json_answer_is_an_error_not_an_empty_site(wp):
         _sync(wp, {})
 
 
-def test_service_is_an_alias_of_http_client():
-    client = httpx.Client()
-    assert wordpress_source(SITE_URL, service=client).name == "wordpress_blog_example_com"
-    with pytest.raises(ValueError, match="not both"):
-        wordpress_source(SITE_URL, service=client, http_client=httpx.Client())
+def test_the_injected_service_is_the_client_that_extracts(wp, tmp_path):
+    pipeline = _pipeline(tmp_path)
+    source = wordpress_source(SITE_URL, service=wp.client())
+    pipeline.run(source)
+    assert len(_staged(pipeline, source.name)) == 3
+    assert wp.requests, "every request went through the injected client"
+
+
+# ---------------------------------------------------------------------------
+# Review round 2 (same points as the MediaWiki connector)
+# ---------------------------------------------------------------------------
+def test_an_emptied_scope_is_forgotten_on_the_second_empty_sweep(wp):
+    state: dict = {}
+    _sync(wp, state)
+    for item in wp.items.values():
+        item.status = "draft"
+
+    _, deleted, stats = _sync(wp, state)
+    assert deleted == set() and stats["failed_empty_scope"] == 1  # could be an outage
+    _, deleted, stats = _sync(wp, state)
+    assert len(deleted) == 3, "a second empty sweep is believed"
+    assert stats["failed"] == 0 and state["items"] == {}
+
+
+def test_switching_to_an_empty_scope_forgets_the_old_items(wp):
+    state: dict = {}
+    _sync(wp, state)
+    wp.tags[99] = ("empty-tag", "Empty tag")  # exists, but no post carries it
+    _, deleted, stats = _sync(wp, state, post_types=("post",), tags=("empty-tag",))
+    assert stats["full_sync_scope_changed"] == 1
+    assert len(deleted) == 3 and stats["failed"] == 0
+
+
+def test_a_rate_limited_run_makes_progress_across_runs(monkeypatch):
+    import cognee_community_connector_wordpress.wordpress as module
+
+    monkeypatch.setattr(module, "_PAGE_SIZE", 2)  # small batches, so a stop is mid-run
+    wp = FakeWordPress()
+    for number in range(8):
+        wp.add("post", f"Post {number}", f"<p>Text {number}.</p>")
+    # Let the first requests through, then the site asks for an hour.
+    wp.failures = [("pass", None)] * 9 + [("http", (429, "3600"))]
+
+    state: dict = {}
+    _, _, first = _sync(wp, state, post_types=("post",), include_comments=False)
+    assert first["failed_rate_limit"] == 1 and 0 < first["items_changed"] < 8
+
+    _, _, second = _sync(wp, state, post_types=("post",), include_comments=False)
+    assert second["failed"] == 0
+    assert first["items_changed"] + second["items_changed"] == 8, "nothing rendered twice"
+
+
+@pytest.mark.parametrize(
+    ("overrides", "failures", "reason", "error"),
+    [
+        ({"post_types": ("no_such_type",)}, [], "scope", WordPressScopeError),
+        ({}, [("http", (404, "0"))], "api", WordPressAPIError),
+    ],
+)
+def test_every_failure_sets_failed(wp, overrides, failures, reason, error):
+    wp.failures = list(failures)
+    stats: dict = {}
+    http = wp.client()
+    client = _WordPressClient(http, discover_api(http, SITE_URL, "ua"), "ua", sleep=lambda _s: None)
+    with pytest.raises(error):
+        list(sync_items(client, _settings(**overrides), {}, stats))
+    assert stats["failed"] == 1 and stats[f"failed_{reason}"] == 1

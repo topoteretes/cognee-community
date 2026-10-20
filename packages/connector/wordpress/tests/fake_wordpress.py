@@ -155,8 +155,9 @@ class FakeWordPress:
                 raise httpx.ConnectError("boom", request=request)
             if kind == "html":
                 return httpx.Response(200, text="<html>Maintenance</html>")
-            status, retry_after = value if isinstance(value, tuple) else (value, "0")
-            return httpx.Response(status, headers={"Retry-After": retry_after})
+            if kind != "pass":  # "pass" lets this request through, to fail a later one
+                status, retry_after = value if isinstance(value, tuple) else (value, "0")
+                return httpx.Response(status, headers={"Retry-After": retry_after})
 
         params = dict(request.url.params)
         if path == "/wp-json/":

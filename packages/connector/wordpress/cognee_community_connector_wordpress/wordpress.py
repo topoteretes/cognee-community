@@ -128,6 +128,10 @@ class WordPressRateLimitedError(WordPressAPIError):
     """The site kept answering 429 beyond what a run waits."""
 
 
+class WordPressScopeError(ValueError):
+    """A configured post type, category or tag does not exist on the site."""
+
+
 # ---------------------------------------------------------------------------
 # HTTP client
 # ---------------------------------------------------------------------------
@@ -375,13 +379,13 @@ def _resolve_scope(client: _WordPressClient, settings: _Settings) -> _Scope:
     selected: list[_PostType] = []
     unknown = [slug for slug in settings.post_types if slug not in types]
     if unknown:
-        raise ValueError(
+        raise WordPressScopeError(
             f"Unknown post type(s) {unknown}; this site exposes {sorted(types)} over REST."
         )
     for slug in settings.post_types:
         spec = types[slug]
         if not spec.get("rest_base"):
-            raise ValueError(f"Post type {slug!r} has no REST route on this site.")
+            raise WordPressScopeError(f"Post type {slug!r} has no REST route on this site.")
         selected.append(
             _PostType(
                 slug=slug,
@@ -419,7 +423,7 @@ def _term_ids(client: _WordPressClient, route: str, slugs: tuple[str, ...]) -> l
     if missing:
         # A typo would otherwise sync nothing and, worse, look like every
         # previously synced item was deleted.
-        raise ValueError(f"No {route} with slug(s) {missing} on this site.")
+        raise WordPressScopeError(f"No {route} with slug(s) {missing} on this site.")
     return sorted(found.values())
 
 
@@ -729,6 +733,29 @@ class _Run:
     rerender: bool
     items: dict[int, dict] = field(default_factory=dict)
     stats: dict[str, int] = field(default_factory=dict)
+    # Items already re-rendered by an earlier, rate-limited attempt at the same
+    # re-render; they are compared as usual instead of rendered again.
+    rerendered_before: frozenset[int] = frozenset()
+    rendered: set[int] = field(default_factory=set)
+    forgotten: set[int] = field(default_factory=set)
+    keep_state: bool = False
+    empty_runs: int = 0
+
+    def forget(self, item_id: int) -> dict:
+        self.items.pop(item_id, None)
+        self.forgotten.add(item_id)
+        self.stats["deleted"] += 1
+        return _tombstone(item_id)
+
+    def progress(self) -> dict[str, dict]:
+        """The items state after a partial run: previous, updated by what was done."""
+        items = {
+            item_id: seen
+            for item_id, seen in self.previous.items()
+            if item_id not in self.forgotten
+        }
+        items.update(self.items)
+        return {str(item_id): seen for item_id, seen in sorted(items.items())}
 
     def seen(self, item: dict, post_type: _PostType, comments_hash: str | None) -> dict:
         return {
@@ -806,7 +833,20 @@ def _full_sync_reason(state: dict, settings: _Settings, now: datetime) -> str | 
     return None
 
 
-def _sync(client: _WordPressClient, settings: _Settings, state: dict, stats: dict[str, int]):
+# A sweep that lists nothing twice in a row is taken at its word: the first time
+# could be an outage, a second consecutive one almost never is, and the old items
+# must not stay in memory forever.
+_EMPTY_RUNS_BEFORE_FORGET = 2
+_RERENDER_REASONS = ("render_changed", "requested", "periodic")
+
+
+def _sync(
+    client: _WordPressClient,
+    settings: _Settings,
+    state: dict,
+    stats: dict[str, int],
+    holder: dict,
+):
     if client.authenticated:
         # WordPress serves a request with rejected credentials as anonymous, so
         # a wrong password would otherwise surface as a confusing "status is
@@ -827,15 +867,24 @@ def _sync(client: _WordPressClient, settings: _Settings, state: dict, stats: dic
         stats["full_sync"] = 1
         stats[f"full_sync_{reason}"] = 1
 
+    rerender = reason in _RERENDER_REASONS
+    progress = state.get("rerender_progress") or {}
+    progress_key = [reason, settings.render_fingerprint(), settings.scope_fingerprint()]
     run = _Run(
         client=client,
         settings=settings,
         scope=scope,
         node_set=f"{SOURCE_TAG}:{client.api.host}",
         previous=previous,
-        rerender=reason in ("render_changed", "requested", "periodic"),
+        rerender=rerender,
         stats=stats,
+        rerendered_before=frozenset(
+            int(item_id)
+            for item_id in progress.get("ids") or []
+            if rerender and progress.get("for") == progress_key
+        ),
     )
+    holder.update(run=run, progress_key=progress_key)
 
     present: dict[int, tuple[_PostType, str]] = {}
     fetched: dict[int, tuple[_PostType, dict]] = {}
@@ -863,6 +912,29 @@ def _sync(client: _WordPressClient, settings: _Settings, state: dict, stats: dic
             present[item_id] = (post_type, modified)
 
     stats["items_scanned"] = len(present)
+    if previous and not present:
+        empty_runs = int(state.get("empty_runs") or 0) + 1
+        # An empty sweep could be a revoked password, a disabled REST route or
+        # an outage, so the first one deletes nothing and moves no cursor. A
+        # scope the caller just changed is believed right away, and so is the
+        # second consecutive empty sweep: the old items must not stay forever.
+        if reason != "scope_changed" and empty_runs < _EMPTY_RUNS_BEFORE_FORGET:
+            logger.warning(
+                "WordPress: the scope listed 0 items but %d were synced before; "
+                "keeping them for now (forgotten if the next sweep is empty too).",
+                len(previous),
+            )
+            run.keep_state = True
+            run.empty_runs = empty_runs
+            stats["failed"] = 1
+            stats["failed_empty_scope"] = 1
+            state["empty_runs"] = empty_runs
+            return
+        logger.warning(
+            "WordPress: the scope is empty; forgetting the %d items synced before.",
+            len(previous),
+        )
+
     comment_sets: dict[int, list[int]] = (
         _comment_sweep(
             client,
@@ -872,20 +944,6 @@ def _sync(client: _WordPressClient, settings: _Settings, state: dict, stats: dic
         if settings.include_comments
         else {}
     )
-    if previous and not present:
-        # An empty sweep while items were known is far more likely a revoked
-        # password, a disabled REST route or an outage than a site that deleted
-        # everything. Forgetting the whole dataset would be permanent, and
-        # moving the cursor would skip the edits made before this run, so the
-        # run changes nothing and the next one retries.
-        logger.warning(
-            "WordPress: the scope listed 0 items but %d were synced before; "
-            "leaving the dataset and the sync state untouched.",
-            len(previous),
-        )
-        stats["failed"] = 1
-        stats["failed_empty_scope"] = 1
-        return
     yield from _emit_changes(run, present, fetched, comment_sets)
     yield from _emit_deletions(run, present)
 
@@ -898,6 +956,8 @@ def _sync(client: _WordPressClient, settings: _Settings, state: dict, stats: dic
     state["render"] = settings.render_fingerprint()
     if reason:
         state["last_full_sync"] = _format_time(now)
+    state.pop("empty_runs", None)
+    state.pop("rerender_progress", None)
     logger.info(
         "WordPress: %s sync, %d changed, %d unchanged, %d deleted, %d request(s).",
         "full" if reason else "incremental",
@@ -908,17 +968,36 @@ def _sync(client: _WordPressClient, settings: _Settings, state: dict, stats: dic
     )
 
 
+def _save_progress(state: dict, holder: dict) -> None:
+    """After a rate-limited stop: keep what was done, so the next run continues.
+
+    The cursor, scope and render settings are left alone (the next run replays
+    the same window and repeats a due full sync), but the items already compared,
+    rendered or forgotten are recorded, so it does not start over.
+    """
+    run: _Run | None = holder.get("run")
+    if run is None or run.keep_state:
+        return
+    state["items"] = run.progress()
+    if run.rerender:
+        state["rerender_progress"] = {
+            "for": holder.get("progress_key"),
+            "ids": sorted(run.rendered | set(run.rerendered_before)),
+        }
+
+
 def sync_items(client: _WordPressClient, settings: _Settings, state: dict, stats: dict):
     """Yield changed items and deletion tombstones, then advance ``state``.
 
-    ``stats`` receives plain int counters for the host: ``items_scanned``,
-    ``items_changed``, ``items_unchanged``, ``deleted``, ``fetched_by_id``,
-    ``requests``, ``full_sync`` (plus ``full_sync_<reason>``) and ``failed``
-    (plus ``failed_<reason>``: ``rate_limit``, ``auth``, ``empty_scope``).
+    ``stats`` receives plain int counters for the host, all present on every run:
+    ``items_scanned`` (items listed by the sweep), ``items_changed``,
+    ``items_unchanged``, ``deleted``, ``fetched_by_id``, ``requests``,
+    ``full_sync`` (plus ``full_sync_<reason>``) and ``failed`` (plus
+    ``failed_<reason>``: ``rate_limit`` and ``empty_scope`` finish the run;
+    ``auth``, ``scope``, ``api`` and ``error`` also raise).
 
     A site that keeps rate-limiting the run stops it cleanly: what was yielded
-    stays, the state is not advanced, and the next run resumes from the same
-    cursor. Rejected credentials raise.
+    stays, the work done is recorded, and the next run continues from there.
     """
     stats.clear()
     stats.update(
@@ -931,15 +1010,29 @@ def sync_items(client: _WordPressClient, settings: _Settings, state: dict, stats
         full_sync=0,
         failed=0,
     )
+    holder: dict = {}
+
+    def failed(reason: str) -> None:
+        stats["failed"] = 1
+        stats[f"failed_{reason}"] = 1
+
     try:
-        yield from _sync(client, settings, state, stats)
+        yield from _sync(client, settings, state, stats, holder)
     except WordPressRateLimitedError as exc:
-        stats["failed"] = 1
-        stats["failed_rate_limit"] = 1
-        logger.warning("WordPress: rate limited (%s); the next run resumes from here.", exc.code)
+        failed("rate_limit")
+        _save_progress(state, holder)
+        logger.warning("WordPress: rate limited (%s); the next run continues from here.", exc.code)
     except WordPressAuthError:
-        stats["failed"] = 1
-        stats["failed_auth"] = 1
+        failed("auth")
+        raise
+    except WordPressScopeError:
+        failed("scope")
+        raise
+    except WordPressAPIError:
+        failed("api")
+        raise
+    except Exception:
+        failed("error")
         raise
     finally:
         stats["requests"] = client.requests
@@ -964,63 +1057,73 @@ def _emit_changes(
         comments_changed = not before.get("skipped") and before.get("comments") != comments_hash(
             item_id
         )
-        if run.rerender or not before or before.get("modified") != modified or comments_changed:
+        forced = run.rerender and item_id not in run.rerendered_before
+        if forced or not before or before.get("modified") != modified or comments_changed:
             stale.append(item_id)
         else:
             run.items[item_id] = before
             run.stats["items_unchanged"] += 1
 
-    # Fetch whatever the change feed did not already return: on a full sync
-    # that is every stale item; on an incremental run, only what the sweep
-    # caught that modified_after cannot see (a scheduled post going live, a
-    # new comment, a modification time tied with the cursor).
-    missing: dict[str, list[int]] = {}
-    for item_id in stale:
-        if item_id not in fetched:
-            missing.setdefault(present[item_id][0].slug, []).append(item_id)
+    # Worked through in batches of one page of items, each yielded before the
+    # next is fetched, so a run stopped by a rate limit keeps what it finished.
     types = {post_type.slug: post_type for post_type in run.scope.types}
-    for slug, ids in missing.items():
-        for item in _fetch_items(run.client, run, types[slug], sorted(ids)):
-            fetched[item["id"]] = (types[slug], item)
-    run.stats["fetched_by_id"] = sum(len(ids) for ids in missing.values())
+    stale.sort()
+    for start in range(0, len(stale), _PAGE_SIZE):
+        batch = stale[start : start + _PAGE_SIZE]
+        # Fetch whatever the change feed did not already return: on a full sync
+        # that is every stale item; on an incremental run, only what the sweep
+        # caught that modified_after cannot see (a scheduled post going live, a
+        # new comment, a modification time tied with the cursor).
+        missing: dict[str, list[int]] = {}
+        for item_id in batch:
+            if item_id not in fetched:
+                missing.setdefault(present[item_id][0].slug, []).append(item_id)
+        for slug, ids in missing.items():
+            for item in _fetch_items(run.client, run, types[slug], sorted(ids)):
+                fetched[item["id"]] = (types[slug], item)
+        run.stats["fetched_by_id"] += sum(len(ids) for ids in missing.values())
 
-    renderable: list[int] = []
-    for item_id in sorted(stale):
-        if item_id not in fetched:
-            continue  # listed by the sweep but gone by the time it was fetched
-        post_type, item = fetched[item_id]
-        if not (item.get("content") or {}).get("protected"):
-            renderable.append(item_id)
-            continue
-        # Password-protected: never ingested. Remembered as skipped so it is
-        # not fetched again every run, and forgotten if it was ingested before
-        # the password was set.
-        before = run.previous.get(item_id) or {}
-        if before and not before.get("skipped"):
-            run.stats["deleted"] += 1
-            yield _tombstone(item_id)
-        run.items[item_id] = {**run.seen(item, post_type, None), "skipped": True}
+        renderable: list[int] = []
+        for item_id in batch:
+            if item_id not in fetched:
+                continue  # listed by the sweep but gone by the time it was fetched
+            post_type, item = fetched[item_id]
+            if not (item.get("content") or {}).get("protected"):
+                renderable.append(item_id)
+                continue
+            # Password-protected: never ingested. Remembered as skipped so it is
+            # not fetched again every run, and forgotten if it was ingested
+            # before the password was set.
+            before = run.previous.get(item_id) or {}
+            if before and not before.get("skipped"):
+                yield run.forget(item_id)
+            run.items[item_id] = {**run.seen(item, post_type, None), "skipped": True}
 
-    # Fetched only for items that will be rendered: anonymously, a comments
-    # query that names a password-protected item fails as a whole (HTTP 401).
-    comments = _fetch_comments(run.client, renderable) if run.settings.include_comments else {}
-    for item_id in renderable:
-        post_type, item = fetched[item_id]
-        item_comments = comments.get(item_id, [])
-        row = _render_row(item, post_type, run.scope, item_comments, run.node_set)
-        run.items[item_id] = run.seen(
-            item,
-            post_type,
-            _comments_hash(c["id"] for c in item_comments)
-            if run.settings.include_comments
-            else None,
-        )
-        run.stats["items_changed"] += 1
-        yield row
+        # Fetched only for items that will be rendered: anonymously, a comments
+        # query that names a password-protected item fails as a whole (HTTP 401).
+        comments = _fetch_comments(run.client, renderable) if run.settings.include_comments else {}
+        for item_id in renderable:
+            post_type, item = fetched[item_id]
+            item_comments = comments.get(item_id, [])
+            row = _render_row(item, post_type, run.scope, item_comments, run.node_set)
+            run.items[item_id] = run.seen(
+                item,
+                post_type,
+                _comments_hash(c["id"] for c in item_comments)
+                if run.settings.include_comments
+                else None,
+            )
+            run.rendered.add(item_id)
+            run.stats["items_changed"] += 1
+            yield row
 
 
 def _emit_deletions(run: _Run, present: dict[int, tuple[_PostType, str]]) -> Iterator[dict]:
-    candidates = [item_id for item_id in run.previous if item_id not in run.items]
+    candidates = [
+        item_id
+        for item_id in run.previous
+        if item_id not in run.items and item_id not in run.forgotten
+    ]
     if not candidates:
         return
     # Offset pagination can skip an item while the site changes underneath the
@@ -1046,8 +1149,7 @@ def _emit_deletions(run: _Run, present: dict[int, tuple[_PostType, str]]) -> Ite
             continue  # never ingested, so there is nothing to forget
         # Gone, out of scope, or listed but no longer renderable (deleted
         # mid-run, or made password-protected).
-        run.stats["deleted"] += 1
-        yield _tombstone(item_id)
+        yield run.forget(item_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1076,7 +1178,6 @@ def wordpress_source(
     resource_name: str | None = None,
     check_active: Callable[[], None] | None = None,
     service: Any = None,
-    http_client: Any = None,
 ):
     """Return a ``dlt`` resource yielding one document row per in-scope item.
 
@@ -1113,7 +1214,6 @@ def wordpress_source(
         check_active: Optional host authorization checkpoint during extraction.
         service: Pre-built ``httpx.Client`` (a test injection point, or a client
             that already carries a session).
-        http_client: Alias of ``service``.
     """
     import dlt
     import httpx
@@ -1124,10 +1224,6 @@ def wordpress_source(
             "sets (DOCUMENT_SYNC_VERSION >= 2, cognee 1.6.3+). Upgrade cognee."
         )
 
-    if service is not None and http_client is not None and service is not http_client:
-        raise ValueError("Pass the pre-built client as service= or http_client=, not both.")
-    injected_client = service if service is not None else http_client
-
     resolved_url = (site_url or "").strip()
     if urlparse(resolved_url).scheme not in ("http", "https") or not urlparse(resolved_url).netloc:
         raise ValueError("wordpress_source needs the site's URL, e.g. https://blog.example.com.")
@@ -1137,11 +1233,7 @@ def wordpress_source(
         raise ValueError("user_agent must not be empty.")
     resolved_types = post_types or ["post", "page"]
     resolved_statuses = statuses or ["publish"]
-    if (
-        set(resolved_statuses) - {"publish"}
-        and not application_password
-        and injected_client is None
-    ):
+    if set(resolved_statuses) - {"publish"} and not application_password and service is None:
         raise ValueError(
             f"Statuses {sorted(set(resolved_statuses) - {'publish'})} are only visible with "
             "an Application Password (pass username= and application_password=)."
@@ -1175,12 +1267,10 @@ def wordpress_source(
     )
     def wordpress_items():
         owned_client = (
-            None
-            if injected_client is not None
-            else httpx.Client(timeout=30.0, follow_redirects=True)
+            None if service is not None else httpx.Client(timeout=30.0, follow_redirects=True)
         )
         try:
-            http = injected_client or owned_client
+            http = service or owned_client
             api = discover_api(http, resolved_url, user_agent)
             client = _WordPressClient(http, api, user_agent, auth)
             state = dlt.current.resource_state()

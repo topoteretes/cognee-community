@@ -90,7 +90,7 @@ the run instead of syncing nothing.
 | `user_agent` | generic | `User-Agent` header |
 | `resource_name` | from the URL | staging table and state key; unique per site, so several sites can share a dataset |
 | `check_active` | none | host authorization checkpoint, called while rows are produced |
-| `service` | none | a pre-built `httpx.Client` (alias: `http_client`) |
+| `service` | none | a pre-built `httpx.Client` |
 
 ## What a document contains
 
@@ -130,23 +130,33 @@ Every item carries the `wordpress:<host>` node set (e.g. `wordpress:blog.example
 4. **Comments.** An id-only sweep of the approved comments **of the items in scope** (never
    site-wide) re-renders the items whose comment set changed: new, deleted or unapproved
    comments.
-5. **Safety.** A sweep that returns no items while items were synced before deletes nothing
-   and leaves the sync state untouched, so the cursor does not move (a revoked password or a
-   disabled REST route can neither wipe the dataset nor skip edits; the run reports
-   `failed_empty_scope`). Every API error aborts the run before its state is saved, so the
-   next run retries. HTTP 429, 5xx and network errors are retried, honouring `Retry-After` up
-   to 60 seconds; a site that keeps rate-limiting the run stops it cleanly instead (what was
-   synced stays, the state is not advanced, and the next run resumes).
+5. **Empty scopes.** A sweep that returns no items while items were synced before could be
+   an outage, so the first one deletes nothing and leaves the cursor where it is (the run
+   reports `failed_empty_scope`). A second consecutive empty sweep is believed and forgets
+   the old items, and so is an empty sweep right after the scope was changed (switching to
+   an empty tag forgets the old items at once).
+6. **Errors and rate limits.** Every API error aborts the run before its state is saved, so
+   the next run retries. HTTP 429, 5xx and network errors are retried, honouring
+   `Retry-After` up to 60 seconds. A site that keeps rate-limiting the run stops it cleanly
+   instead: changed items are fetched and yielded one page at a time, what was synced stays,
+   and the items already done are recorded, so the next run continues from there instead
+   of starting over; the cursor only advances once a run completes.
 
 A scope or rendering change (different `post_types`, `statuses`, `categories`, `tags` or
 `include_comments`) reconciles everything: items that left the scope are forgotten.
 
 ### Sync stats
 
-After a run, `source.cognee_sync_stats` holds plain int counters: `items_scanned`,
-`items_changed`, `items_unchanged`, `deleted`, `fetched_by_id`, `requests`, `full_sync` (with
-`full_sync_<reason>` for `initial`, `requested`, `scope_changed`, `render_changed` or
-`periodic`) and `failed` (with `failed_rate_limit`, `failed_auth` or `failed_empty_scope`).
+After a run, `source.cognee_sync_stats` holds plain int counters, all present on every run:
+
+| Counter | Meaning |
+| --- | --- |
+| `items_scanned` | items listed by this run's sweep |
+| `items_changed` / `items_unchanged` / `deleted` | what happened to them |
+| `fetched_by_id` | items fetched by id because the change feed could not return them |
+| `requests` | API requests made |
+| `full_sync` | 1 for a full sync, with `full_sync_<reason>`: `initial`, `requested`, `scope_changed`, `render_changed` or `periodic` |
+| `failed` | 1 when the run failed or stopped early, with `failed_<reason>`: `rate_limit`, `empty_scope` (both finish the run), or `auth`, `scope`, `api`, `error` (these also raise) |
 
 ### Privacy
 
