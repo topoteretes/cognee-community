@@ -14,6 +14,17 @@ dlt = pytest.importorskip("dlt")
 
 UA = "cognee-basecamp-tests (test@example.com)"
 TABLE = "basecamp_999_recordings"
+ZERO = {
+    "scanned": 0,
+    "changed": 0,
+    "unchanged": 0,
+    "deleted": 0,
+    "skipped": 0,
+    "held_back": 0,
+    "failed": 0,
+    "failed_auth": 0,
+    "failed_rate_limit": 0,
+}
 
 
 def _source(fake, **kwargs):
@@ -66,19 +77,11 @@ def test_source_has_its_own_pipeline_scope():
     assert pipeline_name_for_source(a, "ds") != pipeline_name_for_source(b, "ds")
 
 
-def test_source_refuses_cognee_without_per_row_node_sets(monkeypatch):
-    from cognee.tasks.ingestion import dlt_utils
-
-    monkeypatch.setattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 1)
-    with pytest.raises(RuntimeError, match="DOCUMENT_SYNC_VERSION"):
-        basecamp_source("999", access_token="t", user_agent=UA)
-
-
 def test_sync_stats_report_counts_only(seeded, tmp_path):
     pipeline = _pipeline(tmp_path)
     source = _source(seeded)
     pipeline.run(source)
-    assert source.cognee_sync_stats == {"scanned": 6, "changed": 6, "deleted": 0, "skipped": 0}
+    assert source.cognee_sync_stats == {**ZERO, "scanned": 6, "changed": 6}
 
     doc = _doc_id(seeded)
     seeded.set_status(doc, "trashed")
@@ -102,11 +105,11 @@ def test_check_active_can_stop_a_sync(seeded, tmp_path):
     assert len(calls) == 4
 
 
-def test_source_requires_user_agent_and_token(monkeypatch):
-    for var in ("BASECAMP_USER_AGENT", "BASECAMP_ACCESS_TOKEN", "BASECAMP_REFRESH_TOKEN"):
-        monkeypatch.delenv(var, raising=False)
+def test_source_requires_user_agent_and_token():
+    with pytest.raises(TypeError):
+        basecamp_source("999", access_token="t")  # user_agent is required
     with pytest.raises(ValueError, match="user_agent"):
-        basecamp_source("999", access_token="t")
+        basecamp_source("999", access_token="t", user_agent=" ")
     with pytest.raises(ValueError, match="access token"):
         basecamp_source("999", user_agent=UA)
     with pytest.raises(ValueError, match="Unsupported"):
@@ -182,3 +185,59 @@ def test_failed_run_changes_nothing(seeded, tmp_path, monkeypatch):
     # The cursor did not move, so the next good run still sees the trash.
     pipeline.run(_source(seeded))
     assert f"document:{doc}" not in _rows(pipeline)
+
+
+def test_stats_have_every_key_before_the_first_run(seeded):
+    assert _source(seeded).cognee_sync_stats == ZERO
+
+
+def test_failed_runs_report_a_category(seeded, tmp_path, monkeypatch):
+    monkeypatch.setattr("cognee_community_connector_basecamp.basecamp.time.sleep", lambda s: None)
+    for status, key in ((401, "failed_auth"), (429, "failed_rate_limit")):
+        source = basecamp_source(
+            "999",
+            access_token="token",
+            user_agent=UA,
+            http_client=httpx.Client(
+                transport=httpx.MockTransport(lambda r, s=status: httpx.Response(s))
+            ),
+        )
+        with pytest.raises(Exception, match=r"not authorized|gave up"):
+            _pipeline(tmp_path / key).run(source)
+        assert source.cognee_sync_stats == {**ZERO, "failed": 1, key: 1}
+
+
+def test_stats_start_fresh_on_every_run(seeded, tmp_path):
+    broken = []
+
+    def handler(request):
+        return httpx.Response(401) if broken else seeded.handler(request)
+
+    source = basecamp_source(
+        "999",
+        access_token="token",
+        user_agent=UA,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    _pipeline(tmp_path / "a").run(source)
+    assert source.cognee_sync_stats["scanned"] == 6
+    broken.append(1)
+    with pytest.raises(Exception, match="not authorized"):
+        _pipeline(tmp_path / "b").run(source)
+    assert source.cognee_sync_stats == {**ZERO, "failed": 1, "failed_auth": 1}
+
+
+def test_arguments_come_only_from_the_call(monkeypatch):
+    monkeypatch.setenv("BASECAMP_ACCOUNT_ID", "999")
+    monkeypatch.setenv("BASECAMP_ACCESS_TOKEN", "t")
+    monkeypatch.setenv("BASECAMP_USER_AGENT", UA)
+    with pytest.raises(TypeError):
+        basecamp_source()
+    with pytest.raises(TypeError):
+        basecamp_source("999", access_token="t")  # nothing is read from BASECAMP_USER_AGENT
+    with pytest.raises(TypeError, match="list of ids"):
+        basecamp_source("999", access_token="t", user_agent=UA, project_ids="1,2")
+    with pytest.raises(ValueError, match="full_sync_every"):
+        basecamp_source("999", access_token="t", user_agent=UA, full_sync_every=-1)
+    with pytest.raises(ValueError, match="max_delete_ratio"):
+        basecamp_source("999", access_token="t", user_agent=UA, max_delete_ratio=0)

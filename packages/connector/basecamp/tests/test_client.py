@@ -9,6 +9,7 @@ from cognee_community_connector_basecamp.basecamp import (
     BasecampClient,
     BasecampError,
     BasecampNotFoundError,
+    BasecampRateLimitError,
 )
 
 TOKEN = "secret-token-value"
@@ -135,3 +136,83 @@ def test_token_never_appears_in_errors():
     with pytest.raises(BasecampError) as excinfo:
         _client(handler).request(f"https://3.basecampapi.com/999/x.json?token={TOKEN}")
     assert TOKEN not in str(excinfo.value)
+
+
+def _scripted(*responses):
+    """A client whose transport answers with the given responses in order."""
+    queue = list(responses)
+    seen, waits = [], []
+
+    def handler(request):
+        seen.append(request)
+        return queue.pop(0)
+
+    http = httpx.Client(transport=httpx.MockTransport(handler))
+    return BasecampClient("999", TOKEN, UA, http_client=http, sleep=waits.append), seen, waits
+
+
+URL = "https://3.basecampapi.com/999/x.json"
+
+
+def test_long_retry_after_stops_instead_of_sleeping():
+    # cognee holds its dlt staging lock while a source runs.
+    for value in ("3600", "inf", "1e9"):
+        client, seen, waits = _scripted(httpx.Response(429, headers={"Retry-After": value}))
+        with pytest.raises(BasecampRateLimitError, match="asked to wait"):
+            client.request(URL)
+        assert (waits, len(seen)) == ([], 1), value
+
+
+def test_unusable_retry_after_falls_back_to_backoff():
+    # float("nan") parses, and max(0.0, nan) is 0.0 or nan depending on the
+    # order; 0 or a negative value would retry back to back.
+    for value in ("nan", "-inf", "-5", "0"):
+        client, _, waits = _scripted(
+            httpx.Response(429, headers={"Retry-After": value}),
+            httpx.Response(429, headers={"Retry-After": value}),
+            httpx.Response(200, json=[]),
+        )
+        assert client.request(URL).status_code == 200
+        assert waits == [2.0, 4.0], value
+
+
+def test_429_that_never_clears_is_a_rate_limit_error():
+    client, _, _ = _scripted(*[httpx.Response(429, headers={"Retry-After": "1"})] * 5)
+    with pytest.raises(BasecampRateLimitError, match="gave up"):
+        client.request(URL)
+
+
+def test_long_wait_on_a_5xx_is_a_rate_limit_too():
+    client, _, waits = _scripted(httpx.Response(503, headers={"Retry-After": "600"}))
+    with pytest.raises(BasecampRateLimitError, match="asked to wait 600s"):
+        client.request(URL)
+    assert waits == []
+
+
+def test_an_odd_200_body_never_reads_as_an_empty_listing():
+    # An empty listing makes the sweep forget everything, so anything that is
+    # not a JSON list stops the run instead.
+    for response in (
+        httpx.Response(200, json={}),
+        httpx.Response(200, json={"error": "x"}),
+        httpx.Response(200, content=b""),
+        httpx.Response(200, content=b"null"),
+    ):
+        client, _, _ = _scripted(response)
+        with pytest.raises(BasecampError, match="unexpected body"):
+            list(client.iter_pages("/projects/recordings.json"))
+
+
+def test_paging_that_does_not_advance_stops_instead_of_looping():
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        # A regression here would loop forever; fail fast instead.
+        assert len(calls) < 20, "paging looped"
+        return httpx.Response(
+            200, json=[{"id": 1}], headers={"link": f'<{request.url}>; rel="next"'}
+        )
+
+    with pytest.raises(BasecampError, match="did not advance"):
+        list(_client(handler).iter_pages("/projects/recordings.json"))

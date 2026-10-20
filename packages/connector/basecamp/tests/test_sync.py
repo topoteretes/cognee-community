@@ -137,3 +137,69 @@ def test_sweep_runs_every_n_runs(seeded):
 def test_project_filter_is_sent_as_bucket(seeded):
     _run(seeded, {}, project_ids=("1", "7"))
     assert all(r.url.params.get("bucket") == "1,7" for r in seeded.requests)
+
+
+def _many(fake, n):
+    return [fake.add("Message", f"Message {i}")["id"] for i in range(n)]
+
+
+def _sweep(fake, state, **config):
+    return _run(fake, state, full_sync=True, **config)
+
+
+def test_a_sweep_that_loses_most_items_holds_them_back(fake):
+    # A wrong project filter looks exactly like a mass purge.
+    _many(fake, 12)
+    state = {}
+    _run(fake, state)
+    live, deleted = _sweep(fake, state, project_ids=("2",))
+    assert deleted == set()
+    assert len(state["pending_delete"]) == 12
+    # The right filter again: everything is still there, nothing is forgotten.
+    live, deleted = _run(fake, state)
+    # A held batch makes this run a sweep: all 12 are listed again, none forgotten.
+    assert (len(live), deleted) == (12, set())
+    assert "pending_delete" not in state
+    assert len(state["known_ids"]["Message"]) == 12
+
+
+def test_a_held_batch_is_forgotten_when_the_next_run_still_misses_it(fake):
+    ids = _many(fake, 12)
+    state = {}
+    _run(fake, state)
+    for rec_id in ids[:11]:
+        fake.purge(rec_id)
+    _, deleted = _sweep(fake, state)
+    assert deleted == set()
+    # No sweep is configured, but a held batch makes the next run sweep.
+    _, deleted = _run(fake, state)
+    assert deleted == {f"message:{i}" for i in ids[:11]}
+    assert "pending_delete" not in state
+    assert state["known_ids"]["Message"] == [f"message:{ids[11]}"]
+
+
+def test_a_rolling_mass_purge_is_forgotten_not_held_forever(fake):
+    ids = _many(fake, 30)
+    state = {}
+    _run(fake, state)
+    for rec_id in ids[:16]:
+        fake.purge(rec_id)
+    _, deleted = _sweep(fake, state)
+    assert deleted == set()
+    for n in range(16, 20):
+        fake.purge(ids[n])
+        _, deleted = _sweep(fake, state)
+        # The ones still gone are confirmed; the single new one is ordinary.
+        assert len(deleted) == (17 if n == 16 else 1)
+    assert len(state["known_ids"]["Message"]) == 10
+
+
+def test_trashed_items_are_forgotten_at_once_even_in_bulk(fake):
+    # The trash listing is direct evidence, so it is never held back.
+    ids = _many(fake, 12)
+    state = {}
+    _run(fake, state)
+    for rec_id in ids[:11]:
+        fake.set_status(rec_id, "trashed")
+    _, deleted = _run(fake, state)
+    assert len(deleted) == 11

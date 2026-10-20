@@ -8,7 +8,8 @@ purged from the trash are forgotten on the next full sweep.
 Privacy / opt-in
 ----------------
 This reads the content of your Basecamp projects. Nothing is fetched until you
-run this script. Limit the scope with BASECAMP_PROJECT_IDS, and keep the data in
+run this script. Limit the scope with BASECAMP_PROJECT_IDS (comma separated),
+and keep the data in
 its own dataset so ``cognee.forget(dataset="basecamp")`` removes all of it.
 
 Setup
@@ -45,9 +46,21 @@ async def main() -> None:
         print(f"Set {', '.join(missing)} to run this example.")
         return
 
+    # The source takes plain arguments; this example reads them from the environment.
+    project_ids = os.environ.get("BASECAMP_PROJECT_IDS", "")
+    source = basecamp_source(
+        os.environ["BASECAMP_ACCOUNT_ID"],
+        user_agent=os.environ["BASECAMP_USER_AGENT"],
+        access_token=os.environ.get("BASECAMP_ACCESS_TOKEN"),
+        refresh_token=os.environ.get("BASECAMP_REFRESH_TOKEN"),
+        client_id=os.environ.get("BASECAMP_CLIENT_ID"),
+        client_secret=os.environ.get("BASECAMP_CLIENT_SECRET"),
+        project_ids=[p for p in project_ids.split(",") if p.strip()] or None,
+    )
+
     print("Syncing Basecamp into cognee ...")
     await cognee.remember(
-        basecamp_source(),
+        source,
         dataset_name=DATASET_NAME,
         # remember() defaults to "replace"; merge is what makes incremental sync
         # and the _deleted tombstones work.

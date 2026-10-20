@@ -49,10 +49,10 @@ Limitations
 from __future__ import annotations
 
 import html
-import os
+import math
 import re
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from html.parser import HTMLParser
@@ -82,12 +82,25 @@ SUPPORTED_TYPES: dict[str, str] = {
 }
 DEFAULT_TYPES: tuple[str, ...] = tuple(SUPPORTED_TYPES)
 
+# Tries per request for 429 and 5xx (waits 2, 4, 8 and 16s).
 MAX_ATTEMPTS = 5
+# A longer Retry-After stops the run instead of sleeping: cognee holds its dlt
+# staging lock while a source runs, and the next sync simply retries.
+MAX_RETRY_AFTER_SECONDS = 60.0
 # Re-read a little before the cursor so items updated at nearly the same moment
 # as the last run are never skipped. Re-yielding them is harmless: same content,
 # same row id, so cognee does not process them again.
 CURSOR_OVERLAP = timedelta(minutes=5)
 DEFAULT_FULL_SYNC_EVERY = 10
+# A sweep finding more than this share of the synced items newly gone, and at
+# least MASS_DELETE_MIN_ITEMS of them, holds those deletes back for one run. Our
+# own choice: half catches a wrong account, project filter or token, which makes
+# most of what was synced vanish at once.
+DEFAULT_MAX_DELETE_RATIO = 0.5
+# Below 10 the ratio alone would hold back ordinary cleanups in small accounts
+# (purging 2 of 3 items is two thirds), and a wrong selection there costs little
+# to re-sync.
+MASS_DELETE_MIN_ITEMS = 10
 
 
 class BasecampError(RuntimeError):
@@ -104,6 +117,10 @@ class BasecampAccountInactiveError(BasecampError):
 
 class BasecampNotFoundError(BasecampError):
     """404: the item was deleted or the token cannot see it. Never retried."""
+
+
+class BasecampRateLimitError(BasecampError):
+    """429 that did not clear after retrying, or asked for too long a wait."""
 
 
 # ---------------------------------------------------------------------------
@@ -201,8 +218,19 @@ class BasecampClient:
                 raise BasecampNotFoundError(f"Basecamp: not found: {_redact(url)}")
             if status == 429 or status >= 500:
                 if attempt == MAX_ATTEMPTS:
-                    break
+                    error = BasecampRateLimitError if status == 429 else BasecampError
+                    raise error(
+                        f"Basecamp: gave up after {MAX_ATTEMPTS} attempts for {_redact(url)} "
+                        f"(HTTP {status})"
+                    )
                 delay = _retry_delay(resp, attempt)
+                if delay > MAX_RETRY_AFTER_SECONDS:  # inf included
+                    # Being told to wait this long is rate limiting, whatever the status.
+                    wait = "without limit" if math.isinf(delay) else f"{delay:.0f}s"
+                    raise BasecampRateLimitError(
+                        f"Basecamp: HTTP {status} for {_redact(url)} asked to wait {wait}; "
+                        "stopping so the next sync can retry."
+                    )
                 logger.warning(
                     "Basecamp: HTTP %d, retrying in %.1fs (attempt %d/%d).",
                     status,
@@ -215,7 +243,7 @@ class BasecampClient:
             if status == 304 or 200 <= status < 300:
                 return resp
             raise BasecampError(f"Basecamp: unexpected HTTP {status} for {_redact(url)}")
-
+        # Only a token refresh on the last attempt leaves the loop without an answer.
         raise BasecampError(f"Basecamp: gave up after {MAX_ATTEMPTS} attempts for {_redact(url)}")
 
     def iter_pages(
@@ -238,9 +266,24 @@ class BasecampClient:
                     self.last_etag = etag
                     return
                 first = False
-            yield from resp.json() or []
+            try:
+                items = resp.json()
+            except ValueError:
+                items = None
+            if not isinstance(items, list):
+                # An odd 200 must never read as an empty listing: the sweep would
+                # forget everything it holds.
+                raise BasecampError(
+                    f"Basecamp: unexpected body for {_redact(str(url))}; "
+                    "nothing was synced or forgotten."
+                )
+            yield from items
             next_link = resp.links.get("next", {}).get("url")
-            url = httpx.URL(next_link) if next_link else None
+            next_url = httpx.URL(next_link) if next_link else None
+            if next_url is not None and next_url == url:
+                # A next link pointing at the same page would loop forever.
+                raise BasecampError(f"Basecamp: paging did not advance for {_redact(str(url))}")
+            url = next_url
 
     def list_recordings(
         self,
@@ -265,9 +308,13 @@ def _retry_delay(resp: httpx.Response, attempt: int) -> float:
     retry_after = resp.headers.get("retry-after")
     if retry_after:
         try:
-            return max(0.0, float(retry_after))
+            delay = float(retry_after)
         except ValueError:
-            pass
+            delay = math.nan
+        # Zero, a negative value or "nan" is no usable wait: fall back to the
+        # backoff. "inf" is kept, so the caller's cap stops the run.
+        if delay > 0:
+            return delay
     return float(min(2**attempt, 60))
 
 
@@ -408,12 +455,29 @@ class _SyncConfig:
     project_ids: tuple[str, ...]
     full_sync: bool
     full_sync_every: int
+    max_delete_ratio: float = DEFAULT_MAX_DELETE_RATIO
+    allow_mass_delete: bool = False
 
 
 def _parse_ts(value: str | None) -> datetime | None:
     if not value:
         return None
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _reset_stats(stats: dict[str, int]) -> None:
+    stats.clear()
+    stats.update(
+        scanned=0,
+        changed=0,
+        unchanged=0,
+        deleted=0,
+        skipped=0,
+        held_back=0,
+        failed=0,
+        failed_auth=0,
+        failed_rate_limit=0,
+    )
 
 
 def _iter_rows(
@@ -425,22 +489,27 @@ def _iter_rows(
     """Yield changed rows and delete tombstones for every configured type.
 
     ``state`` is dlt's resource state (a plain dict in tests). It holds, per
-    type: the ``updated_at`` cursor, the ids already synced, and list etags.
-    ``stats`` (optional) receives counts only, never titles or content.
+    type: the ``updated_at`` cursor, the ids already synced, and list etags,
+    plus the sweep deletes held back for confirmation. ``stats`` receives
+    counts only, never titles or content.
     """
     if stats is None:
         stats = {}
-    for key in ("scanned", "changed", "deleted", "skipped"):
-        stats.setdefault(key, 0)
+        _reset_stats(stats)
     runs = int(state.get("runs", 0)) + 1
+    pending = set(state.get("pending_delete") or [])
     sweep = (
         config.full_sync
         or "known_ids" not in state
         or (config.full_sync_every > 0 and runs % config.full_sync_every == 0)
+        # Held deletes are confirmed by the very next run, not the next scheduled sweep.
+        or bool(pending)
     )
     cursors: dict[str, str] = state.setdefault("cursors", {})
     known_all: dict[str, list[str]] = state.setdefault("known_ids", {})
     etags: dict[str, str] = state.setdefault("etags", {})
+    synced_before = sum(len(known_all.get(t, [])) for t in config.types)
+    vanished: dict[str, list[str]] = {}
 
     changed = deleted = 0
     for record_type in config.types:
@@ -495,74 +564,114 @@ def _iter_rows(
         if sweep:
             # Anything we synced before that is neither active nor archived any
             # more was purged (emptied trash, 25-day expiry, project removed).
-            for rid in sorted(known - seen):
-                deleted += 1
-                stats["deleted"] += 1
-                yield {"id": rid, "_deleted": True}
-            known = {rid for rid in known if rid in seen}
+            # Judged below, across all types, before anything is forgotten.
+            vanished[record_type] = sorted(known - seen)
 
         known_all[record_type] = sorted(known)
         if newest:
             cursors[record_type] = newest.isoformat()
 
+    gone = sorted(rid for rids in vanished.values() for rid in rids)
+    # Items held back last run and still gone are confirmed. What is newly gone
+    # is judged on its own: held back if it alone looks like a mass delete.
+    fresh = [rid for rid in gone if rid not in pending]
+    large = len(fresh) >= MASS_DELETE_MIN_ITEMS and len(fresh) > (
+        config.max_delete_ratio * synced_before
+    )
+    if large and not config.allow_mass_delete:
+        # A wrong project filter, account or token looks exactly like a mass
+        # purge. Keep these and forget them when the next run misses them too,
+        # so a scheduled sync never needs a manual override.
+        logger.warning(
+            "Basecamp: %d of %d synced items are newly gone; holding them until the next "
+            "sync confirms them.",
+            len(fresh),
+            synced_before,
+        )
+        held = set(fresh)
+        state["pending_delete"] = fresh
+        stats["held_back"] = len(fresh)
+    else:
+        held = set()
+        state.pop("pending_delete", None)
+    for record_type, rids in vanished.items():
+        forget = [rid for rid in rids if rid not in held]
+        for rid in forget:
+            deleted += 1
+            stats["deleted"] += 1
+            yield {"id": rid, "_deleted": True}
+        known_all[record_type] = sorted(set(known_all[record_type]) - set(forget))
+
     state["runs"] = runs
     logger.info(
-        "Basecamp: %s sync yielded %d changed item(s) and %d deletion(s).",
+        "Basecamp: %s sync yielded %d changed item(s) and %d deletion(s), %d held back.",
         "full" if sweep else "incremental",
         changed,
         deleted,
+        stats["held_back"],
     )
 
 
 # ---------------------------------------------------------------------------
 # Public factory
 # ---------------------------------------------------------------------------
-def _split_ids(value: str | list[str] | tuple[str, ...] | None) -> tuple[str, ...]:
-    if not value:
+def _id_list(name: str, values: list[str] | tuple[str, ...] | None) -> tuple[str, ...]:
+    if values is None:
         return ()
-    if isinstance(value, str):
-        value = value.split(",")
-    return tuple(str(v).strip() for v in value if str(v).strip())
+    if isinstance(values, str):
+        # A bare string would be read one character at a time.
+        raise TypeError(f"{name} takes a list of ids, for example [{values!r}].")
+    return tuple(str(v).strip() for v in values if str(v).strip())
 
 
 def basecamp_source(
-    account_id: str | int | None = None,
+    account_id: str | int,
     *,
-    project_ids: list[str] | tuple[str, ...] | str | None = None,
-    types: list[str] | tuple[str, ...] | None = None,
+    user_agent: str,
     access_token: str | None = None,
     refresh_token: str | None = None,
     client_id: str | None = None,
     client_secret: str | None = None,
-    user_agent: str | None = None,
+    project_ids: list[str] | tuple[str, ...] | None = None,
+    types: list[str] | tuple[str, ...] | None = None,
     full_sync: bool = False,
-    full_sync_every: int | None = None,
+    full_sync_every: int = DEFAULT_FULL_SYNC_EVERY,
+    max_delete_ratio: float = DEFAULT_MAX_DELETE_RATIO,
+    allow_mass_delete: bool = False,
     http_client: httpx.Client | None = None,
-    check_active=None,
+    check_active: Callable[[], None] | None = None,
 ):
     """Return a ``dlt`` resource yielding one row per Basecamp recording.
 
-    Arguments left as ``None`` fall back to ``BASECAMP_*`` environment
-    variables. Hand the result to ``cognee.remember(...)`` with
-    ``write_disposition="merge"`` and ``max_rows_per_table=0``.
+    Hand the result to ``cognee.remember(...)`` with
+    ``write_disposition="merge"`` and ``max_rows_per_table=0``. Settings come
+    only from the arguments; ``examples/example.py`` shows reading them from
+    the environment.
 
     Args:
         account_id: Basecamp account id (the number in ``3.basecamp.com/<id>/``).
-        project_ids: Limit the sync to these project ids. Default: all active projects.
-        types: Recording types to sync. Default: Message, Todo, Document, Comment.
+        user_agent: Required by Basecamp, e.g. ``"My App (me@example.com)"``.
         access_token: OAuth access token (2-week lifetime).
         refresh_token, client_id, client_secret: Optional; used to renew the
             access token when it is missing, expired or rejected.
-        user_agent: Required by Basecamp, e.g. ``"My App (me@example.com)"``.
+        project_ids: Limit the sync to these project ids. Default: all active projects.
+        types: Recording types to sync. Default: Message, Todo, Document, Comment.
         full_sync: Force a reconciliation sweep on this run.
         full_sync_every: Run the sweep every N runs (default 10; 0 disables).
-        http_client: Pre-built ``httpx.Client``; mainly an injection point for tests.
+        max_delete_ratio: When a sweep finds more than this share of the synced
+            items newly gone (and at least 10 of them), it holds those back and
+            forgets the ones the next run also finds gone. Trashed items are
+            never held: the trash listing is direct evidence.
+        allow_mass_delete: Forget such a batch at once, for an intended cleanup.
+        http_client: Pre-built ``httpx`` client, for a host that manages its own
+            connections, and for tests.
         check_active: Optional callable a host can pass to stop a running sync
             (for example when its stored credentials are revoked); it is called
             between rows, as in cognee's own connectors.
 
-    The returned resource also carries ``cognee_sync_stats`` (counts only:
-    scanned, changed, deleted, skipped) for hosts that report sync progress.
+    ``cognee_sync_stats`` on the returned resource holds counts only: scanned,
+    changed, unchanged, deleted, skipped, held_back, and failed, failed_auth,
+    failed_rate_limit (set to 1 when a run stops on that kind of error).
     """
     try:
         import dlt
@@ -571,53 +680,39 @@ def basecamp_source(
             'The Basecamp connector requires dlt: pip install "cognee[dlt]".'
         ) from exc
 
-    # Rows carry per-row node sets, which cognee reads from sync version 2 on.
-    if getattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 0) < 2:
-        raise RuntimeError(
-            "The Basecamp connector requires a cognee build that reads per-row node sets "
-            "(DOCUMENT_SYNC_VERSION >= 2, cognee 1.6.3 or later). Upgrade cognee before syncing."
-        )
-
-    resolved_account = str(account_id or os.getenv("BASECAMP_ACCOUNT_ID") or "").strip()
+    resolved_account = str(account_id).strip() if account_id is not None else ""
     if not resolved_account:
-        raise ValueError("account_id is required (pass it or set BASECAMP_ACCOUNT_ID).")
-
-    resolved_agent = user_agent or os.getenv("BASECAMP_USER_AGENT")
-    if not resolved_agent:
-        raise ValueError(
-            "user_agent is required by Basecamp, e.g. 'My Sync (me@example.com)' "
-            "(pass it or set BASECAMP_USER_AGENT)."
-        )
+        raise ValueError("account_id is required.")
+    if not isinstance(user_agent, str) or not user_agent.strip():
+        raise ValueError("user_agent is required by Basecamp, e.g. 'My Sync (me@example.com)'.")
+    resolved_agent = user_agent.strip()
 
     resolved_types = tuple(types) if types else DEFAULT_TYPES
     unknown = [t for t in resolved_types if t not in SUPPORTED_TYPES]
     if unknown:
         raise ValueError(f"Unsupported Basecamp types: {unknown}. Use {list(SUPPORTED_TYPES)}.")
+    if full_sync_every < 0:
+        raise ValueError("full_sync_every must be 0 or more.")
+    if not 0 < max_delete_ratio <= 1:
+        raise ValueError("max_delete_ratio must be above 0 and at most 1.")
 
-    every = (
-        full_sync_every
-        if full_sync_every is not None
-        else int(os.getenv("BASECAMP_FULL_SYNC_EVERY", str(DEFAULT_FULL_SYNC_EVERY)))
-    )
     config = _SyncConfig(
         types=resolved_types,
-        project_ids=_split_ids(project_ids or os.getenv("BASECAMP_PROJECT_IDS")),
+        project_ids=_id_list("project_ids", project_ids),
         full_sync=full_sync,
-        full_sync_every=every,
+        full_sync_every=full_sync_every,
+        max_delete_ratio=max_delete_ratio,
+        allow_mass_delete=allow_mass_delete,
     )
-
-    token = access_token or os.getenv("BASECAMP_ACCESS_TOKEN")
-    refresh = refresh_token or os.getenv("BASECAMP_REFRESH_TOKEN")
-    cid = client_id or os.getenv("BASECAMP_CLIENT_ID")
-    csecret = client_secret or os.getenv("BASECAMP_CLIENT_SECRET")
-    if not token and not refresh:
+    if not access_token and not refresh_token:
         raise ValueError(
-            "An access token is required (pass access_token or set BASECAMP_ACCESS_TOKEN), "
+            "An access token is required (access_token), "
             "or a refresh_token with client_id and client_secret."
         )
 
     resource_name = f"basecamp_{resolved_account}_recordings"
     stats: dict[str, int] = {}
+    _reset_stats(stats)
 
     @dlt.resource(
         # One table per account, so syncing a second account never treats the
@@ -631,20 +726,35 @@ def basecamp_source(
         columns={"_deleted": {"data_type": "bool", "hard_delete": True}, **NODE_SET_COLUMN_HINT},
     )
     def basecamp_recordings():
-        client = BasecampClient(
-            resolved_account,
-            token,
-            resolved_agent,
-            refresh_token=refresh,
-            client_id=cid,
-            client_secret=csecret,
-            http_client=http_client,
-        )
-        stats.clear()
-        yield from dlt_utils.guarded_rows(
-            _iter_rows(client, config, dlt.current.resource_state(), stats),
-            check_active,
-        )
+        # First thing in the run, so nothing from a previous run is left over
+        # even when this one fails before reading anything.
+        _reset_stats(stats)
+        owned = None if http_client is not None else httpx.Client(timeout=30.0)
+        try:
+            client = BasecampClient(
+                resolved_account,
+                access_token,
+                resolved_agent,
+                refresh_token=refresh_token,
+                client_id=client_id,
+                client_secret=client_secret,
+                http_client=http_client or owned,
+            )
+            yield from dlt_utils.guarded_rows(
+                _iter_rows(client, config, dlt.current.resource_state(), stats),
+                check_active,
+            )
+        except Exception as exc:
+            # Categories only, never the message: a host shows these counts.
+            stats["failed"] = 1
+            if isinstance(exc, BasecampAuthError):
+                stats["failed_auth"] = 1
+            elif isinstance(exc, BasecampRateLimitError):
+                stats["failed_rate_limit"] = 1
+            raise
+        finally:
+            if owned is not None:
+                owned.close()
 
     resource = basecamp_recordings()
     # Opt into cognee's document path: each row becomes a text document that

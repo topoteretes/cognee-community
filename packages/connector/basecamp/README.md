@@ -45,10 +45,9 @@ await cognee.remember(
 print(await cognee.recall("Which to-dos are still open?", datasets=["basecamp"]))
 ```
 
-Every argument can also come from the environment: `BASECAMP_ACCOUNT_ID`,
-`BASECAMP_ACCESS_TOKEN`, `BASECAMP_REFRESH_TOKEN`, `BASECAMP_CLIENT_ID`,
-`BASECAMP_CLIENT_SECRET`, `BASECAMP_USER_AGENT`, `BASECAMP_PROJECT_IDS`
-(comma separated) and `BASECAMP_FULL_SYNC_EVERY`.
+Settings come only from the arguments; the source reads no environment
+variables. `examples/example.py` shows reading them from `BASECAMP_*`
+variables.
 
 **Pass `write_disposition="merge"` to `remember()`.** `remember()` defaults to
 `"replace"`, which overrides the source's own setting and breaks both the
@@ -76,6 +75,15 @@ to one project.
   first run) lists everything that still exists and deletes anything missing.
   Force one with `full_sync=True`. If your team empties the trash often, sync
   regularly or lower `full_sync_every`.
+- **Mass deletes wait for a second run.** When a sweep finds more than half of
+  what it has synced newly gone (and at least 10 items), which is what a wrong
+  project filter, account or token looks like, it keeps those items and reports
+  them as `held_back`, and the next run sweeps again. That run forgets every
+  held item that is still gone and keeps the ones that came back; anything gone
+  for the first time is judged on its own. No run ever stops on this, so a
+  scheduled sync needs no manual step. `allow_mass_delete=True` forgets such a
+  batch at once; `max_delete_ratio` tunes the threshold. Trashed items are never
+  held: the trash listing is direct evidence.
 - **Archived items are kept.** Archiving is not deleting; archived items stay in
   memory (marked "archived") and their comments stay with them.
 - **A failed sync changes nothing.** Any API error stops the run. The cursor is
@@ -84,8 +92,19 @@ to one project.
 - **Own sync state per account.** Each account uses its own dlt pipeline
   (`PIPELINE_SCOPE_ATTR`, as in cognee's built-in connectors), so its cursor never
   mixes with other dlt sources. The source also exposes `cognee_sync_stats`
-  (counts only: scanned, changed, deleted, skipped) and accepts an optional
-  `check_active` callable that a host can use to stop a running sync.
+  (counts only: scanned, changed, unchanged, deleted, skipped, held_back, plus
+  failed, failed_auth and failed_rate_limit set to 1 when a run stops on that
+  kind of error), takes a pre-built `httpx` client as `http_client`, and accepts
+  an optional `check_active` callable that a host can use to stop a running
+  sync.
+- **Rate limits.** 429 and 5xx responses are retried using `Retry-After` or
+  exponential backoff (a zero, negative or unreadable `Retry-After` uses the
+  backoff). A `Retry-After` above 60 seconds, whatever the status, stops the run
+  as a rate limit instead (cognee holds its dlt staging lock while a source
+  runs); the next sync retries.
+- **An odd response never reads as "nothing there".** A listing page that is
+  not a JSON list, or a `next` link that points at the same page, stops the run
+  before anything is forgotten.
 
 ## Setup
 
