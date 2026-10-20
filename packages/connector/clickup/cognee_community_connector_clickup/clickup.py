@@ -25,8 +25,20 @@ from collections.abc import Iterator
 from typing import Any
 
 import httpx
-from cognee.shared.logging_utils import get_logger
-from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
+
+try:
+    from cognee.shared.logging_utils import get_logger
+except ImportError:
+    import logging
+
+    def get_logger(name: str):
+        return logging.getLogger(name)
+
+
+try:
+    from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
+except ImportError:
+    DOCUMENT_SOURCE_ATTR = "cognee_document_source"
 
 logger = get_logger("clickup_connector")
 
@@ -51,7 +63,10 @@ def _request_with_retry(
         try:
             response = client.request(method, url, headers=headers, params=params, timeout=30.0)
             if response.status_code == 429:
-                retry_after = float(response.headers.get("Retry-After", _BASE_BACKOFF * (2**attempt)))
+                header_backoff = response.headers.get("Retry-After")
+                retry_after = (
+                    float(header_backoff) if header_backoff else _BASE_BACKOFF * (2**attempt)
+                )
                 logger.warning("ClickUp rate limit hit, backing off for %.1f seconds", retry_after)
                 time.sleep(retry_after)
                 continue
@@ -59,7 +74,8 @@ def _request_with_retry(
             return response.json()
         except (httpx.TransportError, httpx.HTTPStatusError) as exc:
             if attempt == _MAX_RETRIES - 1:
-                raise RuntimeError(f"ClickUp request failed after {_MAX_RETRIES} attempts: {exc}") from exc
+                msg = f"ClickUp request failed after {_MAX_RETRIES} attempts: {exc}"
+                raise RuntimeError(msg) from exc
             time.sleep(_BASE_BACKOFF * (2**attempt))
     raise RuntimeError(f"ClickUp request exceeded retry budget for {url}")
 
@@ -160,9 +176,7 @@ def clickup_source(
 
     resolved_token = api_token or os.environ.get("CLICKUP_API_TOKEN")
     if not resolved_token:
-        raise ValueError(
-            "ClickUp API token required: pass api_token= or set CLICKUP_API_TOKEN."
-        )
+        raise ValueError("ClickUp API token required: pass api_token= or set CLICKUP_API_TOKEN.")
 
     http_client = client or httpx.Client(timeout=30.0)
     headers = {"Authorization": resolved_token}
@@ -177,7 +191,11 @@ def clickup_source(
             if not teams:
                 raise RuntimeError("No ClickUp workspaces found for the provided API token.")
             active_team_id = str(teams[0]["id"])
-            logger.info("Auto-detected ClickUp workspace team_id: %s (%s)", active_team_id, teams[0].get("name"))
+            logger.info(
+                "Auto-detected ClickUp workspace team_id: %s (%s)",
+                active_team_id,
+                teams[0].get("name"),
+            )
 
         task_ids_seen = set()
 
@@ -226,7 +244,11 @@ def clickup_source(
                 params["space_ids[]"] = space_ids
 
             data = _request_with_retry(
-                http_client, "GET", f"{CLICKUP_BASE_URL}/team/{active_team_id}/task", headers, params
+                http_client,
+                "GET",
+                f"{CLICKUP_BASE_URL}/team/{active_team_id}/task",
+                headers,
+                params,
             )
             tasks = data.get("tasks") or []
             if not tasks:

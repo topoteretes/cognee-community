@@ -45,6 +45,7 @@ import os
 import cognee
 from cognee_community_connector_clickup import clickup_source
 
+
 async def main():
     # Provide token explicitly or set CLICKUP_API_TOKEN environment variable
     source = clickup_source(api_token=os.environ.get("CLICKUP_API_TOKEN"))
@@ -59,6 +60,7 @@ async def main():
         datasets=["clickup"],
     )
     print("Search Result:\n", results)
+
 
 if __name__ == "__main__":
     asyncio.run(main())

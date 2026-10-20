@@ -48,7 +48,9 @@ async def main() -> None:
 
     print("\nQuerying knowledge graph ...")
     answer = await cognee.search(
-        query_text="What are the highest priority tasks currently open, and who is assigned to them?",
+        query_text=(
+            "What are the highest priority tasks currently open, and who is assigned to them?"
+        ),
         query_type=cognee.SearchType.GRAPH_COMPLETION,
         datasets=[DATASET_NAME],
     )

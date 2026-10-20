@@ -40,9 +40,11 @@ def sample_task():
 
 def test_missing_api_token_raises_error():
     """Verify that omitting the API token raises ValueError."""
-    with patch.dict("os.environ", {}, clear=True):
-        with pytest.raises(ValueError, match="ClickUp API token required"):
-            clickup_source(api_token=None)
+    with (
+        patch.dict("os.environ", {}, clear=True),
+        pytest.raises(ValueError, match="ClickUp API token required"),
+    ):
+        clickup_source(api_token=None)
 
 
 def test_task_markdown_formatting_deterministic(sample_task):
