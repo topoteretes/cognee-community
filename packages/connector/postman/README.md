@@ -44,7 +44,8 @@ table. Keep it fixed when editing selection; choose different names for sibling 
 The factory performs no provider reads or authorization callbacks. During extraction,
 `/me` verifies the account and binds it in transactional state. Minimal and explicit-account
 calls share the stable workspace/owner/dataset/resource namespace. A different account
-on an existing resource aborts; choose a distinct resource for another account.
+on an existing resource aborts; choose a distinct resource for another account. Two accounts
+on the same workspace must use different resource names; account IDs are not table-name inputs.
 An optional `account_id` must match. Optional owner/dataset constraints remain available
 for advanced hosts. The factory reads no environment variables and changes no backend
 paths. `service=` injects a reader; `client=` remains an alias.
@@ -67,17 +68,22 @@ selecting all visible collections (`collection_ids=None`). Explicitly selected m
 UIDs require `confirmed_deleted`, even if other collections remain visible. Unsharing,
 moving or permission loss can also cause absence. **Removal safeguards:** an empty
 provider inventory never clears a populated cache without confirmation; more than one
-automatic removal within a rolling five-minute window also aborts by default. Successful
-automatic removals are recorded in transactional state across syncs. The refusal lists
+outstanding automatic removal also aborts by default. Pending removals are recorded
+in transactional state across syncs and never expire with elapsed time. The refusal lists
 unconfirmed UIDs so callers can inspect and pass `confirmed_deleted` deliberately.
-`max_unconfirmed_removals` changes the rolling budget; zero requires confirmation for
+`max_unconfirmed_removals` changes this outstanding budget; zero requires confirmation for
 every disappearance. Confirmed removal and explicit selection edits (including `[]`)
 remain intentional. The guards limit risk, not proof of provider deletion: a partial
-listing may still remove one all-visible collection per window.
+listing may still remove one all-visible collection. The pending UID keeps consuming the
+budget until passed in `confirmed_deleted` or visible again; scheduled runs do not reset it.
+Older timestamped/acknowledged removal history is migrated conservatively as pending.
+If an old acknowledgement was already approved, explicitly confirm it again on upgrade.
 
 Use `missing_collection_policy="require_confirmation"` for conservative handling of any
 visibility loss. Unknown selected UIDs, inaccessible workspace, API/quota faults and
-malformed/incomplete pagination abort. Confirmations cannot remove visible collections.
+malformed/incomplete pagination abort. Stale confirmations for visible collections are ignored; those collections are restored
+normally. Acknowledgements are retained only for explicitly selected missing UIDs and
+pruned on reappearance or deliberate deselection.
 
 An unchanged small workspace costs **three reads**: `/me` during extraction, workspace
 validation and one paginated inventory. Fetches or membership changes require a second
@@ -96,11 +102,11 @@ UI. The request creator is never inferred from the collection owner. Positional 
 fallback changes on reorder/move.
 
 Auth, bodies, scripts, examples and raw header/query/variable values are omitted. Best-effort
-filtering recognizes secret-typed variables, sensitive body fields (including JSON bodies),
-headers outside a small content/transport allowlist, sensitive query names, long mixed
-unstructured tokens, known credential patterns (including GitHub tokens and Slack webhook
+filtering recognizes secret-typed variables, sensitive body fields (JSON, form-encoded and raw assignment text),
+sensitive/declared auth header names, sensitive query names, long mixed
+unstructured tokens, 32+ character hex values and JWT shapes (including URL paths), known credential patterns (including GitHub tokens and Slack webhook
 paths) and explicit `redact_values`. Sorts, dates and region/format enums remain prose.
-Values shorter than four characters are not globally replaced in prose or endpoint hosts;
+Values shorter than eight characters, including explicit `redact_values` entries, are not globally replaced in prose or endpoint hosts;
 they cannot be distinguished from words. Explicit auth syntax is still scrubbed. Filtering
 is best effort, not universal secret detection: arbitrary prose, hosts, paths or unusual names
 can contain undiscoverable private values. Review documentation and use explicit values.

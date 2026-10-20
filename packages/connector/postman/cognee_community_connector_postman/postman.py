@@ -1,5 +1,6 @@
 """Incremental Postman extraction with a complete, replayable document snapshot."""
 
+import base64
 import copy
 import hashlib
 import json
@@ -8,7 +9,7 @@ import time
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator
 from typing import TYPE_CHECKING, Any, Protocol, TypedDict
-from urllib.parse import parse_qsl, quote, urlsplit
+from urllib.parse import parse_qsl, quote, unquote, urlsplit
 
 import httpx
 from cognee.shared.logging_utils import get_logger
@@ -20,7 +21,8 @@ if TYPE_CHECKING:
 
 # Bump when allowlisted rendering or identity semantics change, so old cached
 # rows cannot indefinitely bypass a new rendering policy on an unchanged tree.
-_RENDER_VERSION = 6
+_RENDER_VERSION = 7
+_MIN_PROSE_SECRET_LENGTH = 8
 
 
 class DocumentRow(TypedDict):
@@ -157,13 +159,13 @@ def _secret_values(value: Any) -> set[str]:
     """Exact auth/sensitive-key values only; ordinary metadata is not secret."""
     secrets = set()
     sensitive = re.compile(
-        r"(?i)(authorization|(?:^|[-_])auth(?:$|[-_])|cookie|password|secret|token|api[-_]?key|credential|signature|session|(?:^|[-_])sig(?:$|[-_])|(?:^|[-_])key$)"
+        r"(?i)(authorization|(?:^|[-_])auth(?:$|[-_])|cookie|password|(?:^|[-_])(?:pwd|pass)(?:$|[-_])|secret|token|api[-_]?key|credential|signature|session|(?:^|[-_])sig(?:$|[-_])|(?:^|[-_])key$)"
     )
 
     def strings(part):
         if isinstance(part, str) and part:
             secrets.add(part)
-            match = re.fullmatch(r"(?i)(?:bearer|basic)\s+(.+)", part)
+            match = re.fullmatch(r"(?i)(?:bearer|basic|token)\s+(.+)", part)
             if match:
                 secrets.add(match.group(1))
         elif isinstance(part, dict):
@@ -173,28 +175,94 @@ def _secret_values(value: Any) -> set[str]:
             for child in part:
                 strings(child)
 
-    # Common content/transport metadata is useful prose, not credential evidence.
-    public_headers = {
-        "accept",
-        "accept-encoding",
-        "accept-language",
-        "content-type",
-        "content-length",
-        "user-agent",
-        "host",
-        "x-client",
-    }
-
     def token_like(text):
-        # Only unstructured long mixed tokens: dates and word-separated enums survive.
-        return (
-            isinstance(text, str)
-            and len(text) >= 24
-            and re.fullmatch(r"[A-Za-z0-9+/=]+", text)
-            and re.search(r"[a-z]", text)
-            and re.search(r"[A-Z]", text)
-            and re.search(r"[0-9]", text)
+        if not isinstance(text, str):
+            return False
+        # Validate a three-part JWT header to avoid treating ordinary host names
+        # as credentials; JSON whitespace/header ordering need not be canonical.
+        if re.fullmatch(r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", text):
+            try:
+                header = text.split(".", 1)[0]
+                decoded = json.loads(base64.urlsafe_b64decode(header + "=" * (-len(header) % 4)))
+                if isinstance(decoded, dict) and isinstance(decoded.get("alg"), str):
+                    return True
+            except (ValueError, UnicodeError):
+                pass
+        # Hex tokens need not be mixed case. Long opaque values exclude dates,
+        # regions and word-separated enums. Both are heuristics, not secret proofs.
+        return bool(
+            re.fullmatch(r"[A-Fa-f0-9]{32,}", text)
+            or (
+                len(text) >= 24
+                and re.fullmatch(r"[A-Za-z0-9+/=]+", text)
+                and re.search(r"[a-z]", text)
+                and re.search(r"[A-Z]", text)
+                and re.search(r"[0-9]", text)
+            )
         )
+
+    def text_values(text):
+        # Shared fallback for raw text/form bodies and URL components. Never render bodies.
+        for name, val in parse_qsl(text, keep_blank_values=True):
+            if sensitive.search(name) or name.casefold() == "code" or token_like(val):
+                strings(val)
+        for match in re.finditer(
+            r"([A-Za-z_][A-Za-z0-9_-]*)[\"']?\s*[:=]\s*[\"']?([^\s&;,\"'<>]+)", text
+        ):
+            if sensitive.search(match[1]) or match[1].casefold() == "code":
+                strings(match[2])
+        for match in re.finditer(
+            r"(?i)\bauthorization\s*:\s*(?:bearer|basic|token)\s+([A-Za-z0-9._~+/=-]+)", text
+        ):
+            strings(match[1])
+        urls = [text, *(match[0] for match in re.finditer(r"(?:https?://|//)[^\s\"'<>]+", text))]
+        for candidate in urls:
+            try:
+                parsed = urlsplit(candidate)
+                strings(parsed.password)
+                for name, val in parse_qsl(parsed.query):
+                    if sensitive.search(name) or name.casefold() == "code" or token_like(val):
+                        strings(val)
+                for segment in parsed.path.split("/"):
+                    decoded = unquote(segment)
+                    if token_like(decoded):
+                        strings(segment)
+                        strings(decoded)
+            except ValueError:
+                continue
+        for val in re.findall(r"[A-Za-z0-9_+/=.-]+", text):
+            val = val.strip(".,")
+            if token_like(val):
+                strings(val)
+
+    def body_values(part, private=False):
+        # Payload keys are application data, never Postman schema dispatch keys.
+        # A JSON field called header/query/auth must not bypass credential discovery.
+        if isinstance(part, dict):
+            field = str(part.get("key", ""))
+            if "value" in part and (
+                sensitive.search(field)
+                or field.casefold() == "code"
+                or part.get("type") == "secret"
+            ):
+                strings(part["value"])
+            for name, child in part.items():
+                child_private = bool(private or sensitive.search(name) or name.casefold() == "code")
+                child_private = child_private and name.casefold() not in {
+                    "type",
+                    "key",
+                    "in",
+                    "name",
+                    "description",
+                }
+                body_values(child, child_private)
+        elif isinstance(part, list):
+            for child in part:
+                body_values(child, private)
+        elif isinstance(part, str):
+            text_values(part)
+            if private or token_like(part):
+                strings(part)
 
     auth_headers = set()
 
@@ -217,7 +285,10 @@ def _secret_values(value: Any) -> set[str]:
 
     find_auth(value)
 
-    def walk(part, auth=False):
+    def walk(part, auth=False, body=False):
+        if body:
+            body_values(part)
+            return
         if isinstance(part, dict):
             # Postman key/value entries in auth, headers, variables and query.
             field = str(part.get("key", ""))
@@ -225,6 +296,7 @@ def _secret_values(value: Any) -> set[str]:
                 auth
                 or part.get("type") == "secret"
                 or sensitive.search(field)
+                or field.casefold() == "code"
                 or field.strip().casefold() in auth_headers
             ):
                 strings(part["value"])
@@ -241,45 +313,71 @@ def _secret_values(value: Any) -> set[str]:
                                         }:
                                             strings(entry.get("value"))
                                 elif isinstance(auth_value, dict):
-                                    walk(auth_value, True)
+                                    walk(auth_value, True, body)
                                 else:
                                     strings(auth_value)
                 elif key == "query" and isinstance(child, list):
                     for entry in child:
                         if isinstance(entry, dict):
                             field, val = str(entry.get("key", "")), entry.get("value")
-                            if sensitive.search(field) or token_like(val):
+                            if (
+                                sensitive.search(field)
+                                or field.casefold() == "code"
+                                or token_like(val)
+                            ):
                                 strings(val)
                 elif key == "body" and isinstance(child, dict):
-                    walk(child)
+                    walk(child, body=True)
                     raw = child.get("raw")
                     if isinstance(raw, str):
                         try:
-                            walk(json.loads(raw))
-                        except (ValueError, RecursionError):
-                            pass
+                            walk(json.loads(raw), body=True)
+                        except ValueError:
+                            text_values(raw)
+                        except RecursionError:
+                            raise PostmanDataError("Request body nesting is unsupported.") from None
                 elif key == "header" and isinstance(child, list):
                     for entry in child:
                         if isinstance(entry, dict):
                             name = str(entry.get("key", "")).strip().casefold()
-                            if name not in public_headers or name in auth_headers:
+                            if (
+                                sensitive.search(name)
+                                or name in auth_headers
+                                or token_like(entry.get("value"))
+                            ):
                                 strings(entry.get("value"))
+                elif key == "path" and isinstance(child, (str, list)):
+                    segments = child.split("/") if isinstance(child, str) else child
+                    for segment in segments:
+                        if isinstance(segment, str) and token_like(unquote(segment)):
+                            strings(segment)
+                            strings(unquote(segment))
                 elif key == "cookie":
-                    walk(child, True)
+                    walk(child, True, body)
                 elif key == "header" and isinstance(child, str):
                     for line in child.splitlines():
                         name, sep, val = line.partition(":")
                         if sep and (
-                            name.strip().casefold() not in public_headers
+                            sensitive.search(name.strip())
                             or name.strip().casefold() in auth_headers
+                            or token_like(val.strip())
                         ):
                             strings(val.strip())
                 elif key in {"url", "request", "raw"} and isinstance(child, str):
                     try:
                         parsed = urlsplit(child)
                         strings(parsed.password)
+                        for segment in parsed.path.split("/"):
+                            decoded = unquote(segment)
+                            if token_like(decoded):
+                                strings(segment)
+                                strings(decoded)
                         for name, val in parse_qsl(parsed.query):
-                            if sensitive.search(name) or token_like(val):
+                            if (
+                                sensitive.search(name)
+                                or name.casefold() == "code"
+                                or token_like(val)
+                            ):
                                 strings(val)
                     except ValueError:
                         pass
@@ -288,10 +386,10 @@ def _secret_values(value: Any) -> set[str]:
                 ):
                     strings(child)
                 else:
-                    walk(child, auth)
+                    walk(child, auth, body)
         elif isinstance(part, list):
             for child in part:
-                walk(child, auth)
+                walk(child, auth, body)
 
     walk(value)
     return secrets
@@ -320,10 +418,15 @@ def flatten_collection(
         for secret in sorted(secrets, key=len, reverse=True):
             # Short values cannot be distinguished from ordinary prose/host words.
             # Credential-bearing fields are omitted; explicit auth syntax is scrubbed below.
-            if len(secret) >= 4:
+            if len(secret) >= _MIN_PROSE_SECRET_LENGTH:
                 text = text.replace(secret, "[REDACTED]")
         text = re.sub(r"\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9_-]+", "[REDACTED]", text)
         text = re.sub(r"(?i)\b(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]+", "[REDACTED]", text)
+        text = re.sub(
+            r"(?i)\bauthorization\s*:\s*token\s+[A-Za-z0-9._~+/=-]+",
+            "Authorization: [REDACTED]",
+            text,
+        )
         text = re.sub(r"\bgh[pousr]_[A-Za-z0-9_]+", "[REDACTED]", text)
         text = re.sub(
             r"(?i)((?:https?:)?//hooks\.slack\.com(?::[0-9]+)?/services)/[^\s?#]+",
@@ -332,7 +435,7 @@ def flatten_collection(
         )
         text = re.sub(r"PMAK-[A-Za-z0-9-]+", "[REDACTED]", text)
         text = re.sub(
-            r"(?i)\b(password|secret|token|api[_-]?key)\s*[:=]\s*[^\s,;]+",
+            r"(?i)\b(password|db[_-]?(?:pwd|pass)|secret|token|api[_-]?key)\s*[:=]\s*[^\s,;]+",
             r"\1=[REDACTED]",
             text,
         )
@@ -586,8 +689,8 @@ def build_snapshot(
     inventory = _inventory(client, workspace_id, page_size, max_pages)
     selected = set(inventory) if collection_ids is None else set(collection_ids)
     confirmed = set(confirmed_deleted)
-    if confirmed & set(inventory):
-        raise PostmanSyncError("Confirmed removal is still visible; refusing to remove it.")
+    # A stale confirmation must not suppress a collection that becomes visible again.
+    confirmed -= set(inventory)
     cached = copy.deepcopy(state.get("collections", {}))
     acknowledged = set(state.get("removed_collections", []))
     # Deliberately deselected collections retire from this stable resource.
@@ -602,17 +705,36 @@ def build_snapshot(
             + ", ".join(sorted(missing - allowed))
         )
     unconfirmed = (missing & set(cached)) - confirmed - acknowledged
-    # A per-run cap alone lets an intermittent listing erase a corpus gradually.
-    # Persist successful automatic removals for five minutes in transactional state.
-    now = time.time()
-    recent = [entry for entry in state.get("automatic_removals", []) if entry["at"] > now - 300]
+    # Outstanding automatic removals never expire with wall time. A scheduled
+    # sync must not get a fresh deletion budget merely because it ran hours later.
+    pending_values = state.get("pending_removals", [])
+    if not isinstance(pending_values, list) or any(
+        not isinstance(uid, str) or not uid for uid in pending_values
+    ):
+        raise PostmanDataError("Malformed pending removal state; snapshot withheld.")
+    pending = set(pending_values)
+    if "pending_removals" not in state and collection_ids is None:
+        # Old releases may have expired the timestamped history while keeping
+        # acknowledgements. Treat that ambiguous history conservatively on upgrade.
+        pending.update(acknowledged)
+    legacy = state.get("automatic_removals", [])
+    if not isinstance(legacy, list) or any(
+        not isinstance(entry, dict) or not isinstance(entry.get("uid"), str) for entry in legacy
+    ):
+        raise PostmanDataError("Malformed legacy removal state; snapshot withheld.")
+    pending.update(entry["uid"] for entry in legacy)
+    if any(not isinstance(uid, str) for uid in pending):
+        raise PostmanDataError("Malformed pending removal state; snapshot withheld.")
+    pending -= set(inventory) | confirmed
+    if collection_ids is not None:
+        pending &= selected  # Explicit deselection is deliberate, not provider absence.
     if missing_collection_policy == "mirror_visibility" and unconfirmed:
-        if not inventory or len(recent) + len(unconfirmed) > max_unconfirmed_removals:
+        if not inventory or len(pending | unconfirmed) > max_unconfirmed_removals:
             raise PostmanSyncError(
                 "Bulk collection removal requires confirmed_deleted; snapshot withheld. "
-                "Unconfirmed UIDs: " + ", ".join(sorted(unconfirmed))
+                "Unconfirmed UIDs: " + ", ".join(sorted(pending | unconfirmed))
             )
-        recent.extend({"uid": uid, "at": now} for uid in sorted(unconfirmed))
+        pending |= unconfirmed
     fresh = {}
     fetched = reused = 0
     for uid in sorted(selected & set(inventory)):
@@ -647,10 +769,11 @@ def build_snapshot(
     ) != inventory:
         raise PostmanSyncError("Inventory changed during tree fetch; retry sync.")
     rows = [row for uid in sorted(fresh) for row in fresh[uid]["rows"]]
-    next_state = {"collections": fresh}
-    if recent:
-        next_state["automatic_removals"] = recent
-    removed = (acknowledged | (missing & allowed)) - set(inventory)
+    next_state = {"collections": fresh, "pending_removals": sorted(pending)}
+    # Keep only acknowledgements needed to replay an explicit missing selection.
+    removed = (
+        (acknowledged | (missing & allowed)) & missing if collection_ids is not None else set()
+    )
     if removed:
         next_state["removed_collections"] = sorted(removed)
     if stats is not None:

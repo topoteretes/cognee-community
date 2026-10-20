@@ -105,12 +105,14 @@ without raising, so search/exit code alone is not a forgetting proof.
 ## Limits
 
 Filtering is best effort, including secret-typed variables, declared/raw custom auth
-headers, sensitive body/query fields and known token patterns. Values shorter than four
-characters are omitted from global prose replacement; explicit auth syntax is scrubbed.
+headers, sensitive body/query fields and known token patterns. Values shorter than eight
+characters, including explicit redact_values, are omitted from global prose replacement; explicit auth syntax is scrubbed.
 Arbitrary secrets cannot be universally identified. A stable partial provider listing may still mean visibility
 loss; the bulk guard limits automatic removals but does not prove physical deletion.
 Empty inventories over populated caches and explicitly selected missing UIDs require confirmation.
-The automatic removal budget spans five minutes across successful syncs.
+Pending automatic removals never expire by time; explicit confirmation or reappearance
+clears them from the outstanding budget. The tests include runs spaced days apart,
+legacy removal-state migration and actual SQL refusal rollback.
 
 No atomic provider snapshot, same-scope concurrent ingestion, full backend/Python matrix,
 every partial crash or byte-budgeted large response is claimed. Exact environment and

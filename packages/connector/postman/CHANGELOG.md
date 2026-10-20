@@ -9,13 +9,15 @@
   identities can leave old tables/documents behind. Retire the old owned scope before
   upgrading or migrate via a dedicated dataset; do not broadly clear shared datasets.
 - Empty provider inventories over populated caches and explicitly selected missing collections
-  require confirmation. Automatic all-visible removals use a configurable rolling five-minute
-  budget (one by default); refusal diagnostics list unconfirmed UIDs.
+  require confirmation. Automatic all-visible removals use a configurable outstanding-pending
+  budget (one by default) with no time expiry; refusal diagnostics list unconfirmed UIDs.
 - Endpoint templates are enabled by default; empty metadata labels are omitted. Request UI
   provenance requires a provider-supplied request UID, otherwise the collection link is used.
-- Renderer policy6 narrows query-token heuristics, preserves short prose values, filters
+- Renderer policy7 narrows query-token heuristics, preserves short prose values, filters
   sensitive JSON body fields/custom headers and additional known token paths. Filtering
-  remains best effort; values below four characters skip global prose replacement.
+  remains best effort; values below eight characters (including explicit redact_values) skip global prose replacement.
+  Targeted header checks preserve ordinary transport/version/region values; token shapes
+  cover hex/JWT paths and non-JSON bodies. Stale confirmations cannot block reappearance.
 - Three-read unchanged sync, centralized authorization checkpoints, all-exception failure
   counts with exception-class diagnostics, malformed-item rejection and Python>=3.10,<3.15.
 - Public example uses remember. Blog and credential-writing setup removed; isolated

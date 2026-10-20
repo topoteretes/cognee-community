@@ -49,7 +49,7 @@ def test_short_secrets_do_not_replace_prose_articles_or_hosts():
 @pytest.mark.parametrize("header", ["X-Api-Signature", "X-Session", "X-Client-Key", "X-Unusual"])
 @pytest.mark.parametrize("raw", [False, True])
 def test_custom_header_values_do_not_leak(header, raw):
-    val = "PrivateHeader987"
+    val = "PrivateHeader987AbCdEf123456789"
     headers = f"{header}: {val}" if raw else [{"key": header, "value": val}]
     assert val not in rendered({"header": headers, "description": f"Copied {val} here"})
 
@@ -66,7 +66,7 @@ def test_sensitive_body_values_repeated_in_prose_do_not_leak(body):
     assert "BODYPW55" not in rendered({"body": body, "description": "Copied BODYPW55 here"})
 
 
-@pytest.mark.parametrize("val", ["abcdefghij", "ABC12"])
+@pytest.mark.parametrize("val", ["abcdefghij", "ABC12345"])
 def test_sensitive_sig_query_is_not_subject_to_entropy_floor(val):
     assert val not in rendered(
         {"url": f"https://example.invalid/?sig={val}", "description": f"Copied {val} here"}
@@ -106,7 +106,7 @@ def test_single_cached_collection_empty_listing_refuses_and_lists_uid():
     assert snapshot(client, state, confirmed_deleted=["1-c"])[0] == []
 
 
-def test_rolling_removal_budget_and_expiry(monkeypatch):
+def test_pending_removal_budget_does_not_expire(monkeypatch):
     import cognee_community_connector_postman.postman as module
 
     now = 1000
@@ -121,8 +121,10 @@ def test_rolling_removal_budget_and_expiry(monkeypatch):
     with pytest.raises(PostmanSyncError, match="1-b"):
         snapshot(client, state)
     assert state == saved
-    now += 301
-    _, state = snapshot(client, state)
+    now += 86400
+    with pytest.raises(PostmanSyncError, match="1-b"):
+        snapshot(client, state)
+    _, state = snapshot(client, state, confirmed_deleted=["1-a", "1-b"])
     assert set(state["collections"]) == {"1-c", "1-d"}
 
 

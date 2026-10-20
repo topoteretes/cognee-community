@@ -97,7 +97,7 @@ def test_collection_disappearance_requires_confirmation_and_final_empty():
         snapshot(client, state, missing_collection_policy="require_confirmation")
     assert state == saved
     rows, next_state = snapshot(client, state, confirmed_deleted=["1-c"])
-    assert rows == [] and next_state == {"collections": {}, "removed_collections": ["1-c"]}
+    assert rows == [] and next_state == {"collections": {}, "pending_removals": []}
 
 
 def test_explicit_missing_selection_never_silently_erases():
@@ -105,9 +105,9 @@ def test_explicit_missing_selection_never_silently_erases():
         snapshot(FakeClient(), collection_ids=["nonexistent"])
 
 
-def test_live_confirmation_is_rejected():
-    with pytest.raises(PostmanSyncError, match="still visible"):
-        snapshot(FakeClient(), confirmed_deleted=["1-c"])
+def test_stale_confirmation_never_removes_a_visible_collection():
+    rows, state = snapshot(FakeClient(), confirmed_deleted=["1-c"])
+    assert len(rows) == 2 and set(state["collections"]) == {"1-c"}
 
 
 def test_invalid_workspace_and_failed_tree_preserve_state():
