@@ -19,14 +19,13 @@ Unchanged items preserve stable content-hash ``data_id`` keys, preventing redund
 re-ingestion.
 """
 
-from collections.abc import Iterator
 import os
 import re
 import time
+from collections.abc import Iterator
 from typing import Any
 
 import httpx
-
 from cognee.shared.logging_utils import get_logger
 from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
 

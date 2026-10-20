@@ -23,6 +23,7 @@ import asyncio
 import os
 
 import cognee
+
 from cognee_community_connector_sendgrid import sendgrid_source
 
 # Maintain SendGrid in its own dedicated dataset for easy inspection and pruning

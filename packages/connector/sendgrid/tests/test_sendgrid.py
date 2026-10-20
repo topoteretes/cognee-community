@@ -1,12 +1,14 @@
-import pytest
 from unittest.mock import MagicMock, patch
+
+import pytest
+
 from cognee_community_connector_sendgrid.sendgrid import (
-    sendgrid_source,
-    _format_template_markdown,
-    _format_marketing_list_markdown,
-    _strip_html_tags,
-    SENDGRID_TABLE_NAME,
     DOCUMENT_SOURCE_ATTR,
+    SENDGRID_TABLE_NAME,
+    _format_marketing_list_markdown,
+    _format_template_markdown,
+    _strip_html_tags,
+    sendgrid_source,
 )
 
 
