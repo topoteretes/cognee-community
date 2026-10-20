@@ -135,7 +135,7 @@ def azure_blob_source(
                         try:
                             container.get_blob_client(previous[uri]["name"]).get_blob_properties()
                         except ResourceNotFoundError as exc:
-                            if exc.error_code != "BlobNotFound":
+                            if getattr(exc, "error_code", None) != "BlobNotFound":
                                 raise
                         else:
                             # Still exists: retain its state and reconsider next sync.
@@ -157,7 +157,7 @@ def azure_blob_source(
     return result
 
 
-def _build_client(account_url: str, credentials: str):
+def _build_client(account_url: str, credentials: str | None):
     """Build the Azure service client from the resolved endpoint and credentials."""
     from azure.storage.blob import BlobServiceClient
 
@@ -208,7 +208,7 @@ def _read_object(container, blob) -> str | None:
             .readall()
         )
     except ResourceNotFoundError as exc:
-        if exc.error_code != "BlobNotFound":
+        if getattr(exc, "error_code", None) != "BlobNotFound":
             raise
         logger.warning("Azure Blob: %s disappeared before download, skipping.", blob.name)
         return None
