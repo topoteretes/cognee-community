@@ -25,7 +25,7 @@ def main():
         scopes=[USER_READ, MAIL_READ, CALENDARS_READ],
         token_cache_path=cache_path,
     )
-    provider.token()
+    provider.login()
     print(f"Signed in. Token cache saved to {cache_path}")
 
 

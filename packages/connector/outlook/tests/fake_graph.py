@@ -165,6 +165,12 @@ class FakeGraph:
         del self.events[event_id]
         self.event_log.append(("removed", event_id))
 
+    def delete_series(self, master_id: str) -> None:
+        """Graph reports the master and every occurrence as removed."""
+        for event_id in [i for i in self.events if i.startswith(f"{master_id}-occ-")]:
+            self.delete_event(event_id)
+        self.delete_event(master_id)
+
     # ------------------------------------------------------------------
     # HTTP
     # ------------------------------------------------------------------
