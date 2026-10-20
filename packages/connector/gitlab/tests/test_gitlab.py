@@ -2,7 +2,6 @@ from unittest.mock import patch
 
 import httpx
 import pytest
-
 from cognee_community_connector_gitlab.gitlab import (
     GitLabAPIError,
     _discover_projects,

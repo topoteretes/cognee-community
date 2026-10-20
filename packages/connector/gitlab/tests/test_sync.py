@@ -3,7 +3,6 @@ from unittest.mock import patch
 
 import httpx
 import pytest
-
 from cognee_community_connector_gitlab.gitlab import GitLabAPIError
 from cognee_community_connector_gitlab.sync import sync_documents
 
@@ -249,7 +248,10 @@ def test_reconciliation_permission_failure_preserves_state():
 def run_projects(
     state, projects, responses, *, selected=("issues", "merge_requests", "wiki"), **kw
 ):
-    """Sync several projects; ``responses`` maps "<project_id>/<endpoint>" to a payload or status."""
+    """Sync several projects.
+
+    ``responses`` maps "<project_id>/<endpoint>" to a payload or status.
+    """
     requests = []
 
     def handler(request):

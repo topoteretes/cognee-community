@@ -11,7 +11,7 @@ that only lowers the count. `test_source.py` verifies account scoping, DLT state
 persistence across pipeline instances, merge updates, and hard deletions in
 temporary SQLite staging. These tests require no credentials or network access.
 
-Run `uv run --extra dev pytest tests/` from this package directory.
+Run `uv run pytest tests/` from this package directory.
 
 Not covered here: automatic retries (the connector has none; a 429 aborts the
 run), LLM extraction, and graph/vector cleanup in Cognee. The live end-to-end

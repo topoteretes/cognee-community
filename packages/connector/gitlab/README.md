@@ -9,11 +9,11 @@ documents whose source was deleted upstream. Implements
 
 ## Install
 
-Requires Python 3.11–3.14. From this repository's root:
+Requires Python 3.11–3.13. From this repository's root:
 
 ```bash
 cd packages/connector/gitlab
-uv sync --extra dev
+uv sync
 ```
 
 This installs the package, Cognee, dlt, `httpx`, and the test/lint tools into
@@ -217,10 +217,11 @@ guarantee Cognee's graph processing finished; check the result's `status`.
 
 ## Cognee version
 
-The package requires `cognee>=1.6.2,<2`, and the lockfile uses 1.6.4. Cognee 1.4.0
-skipped graph cleanup when a dataset's last document was deleted. Deleting the
-final document of a dataset has not been verified live with this connector;
-the live deletion check below removed one issue while others remained.
+The package pins `cognee==1.6.5`, the same version as the other storage and
+document connectors under review. Cognee 1.4.0 skipped graph cleanup when a
+dataset's last document was deleted. Deleting the final document of a dataset has
+not been verified live with this connector; the live deletion check below removed
+one issue while others remained.
 
 ## Live validation
 
@@ -276,9 +277,9 @@ existing users' saved state, so treat it as a migration.
 ## Tests
 
 ```bash
-uv run --extra dev pytest tests/
-uv run --extra dev ruff check .
-uv run --extra dev ruff format --check .
+uv run pytest tests/
+uv run ruff check .
+uv run ruff format --check .
 ```
 
 182 offline tests cover token validation, discovery, mapping, comments,

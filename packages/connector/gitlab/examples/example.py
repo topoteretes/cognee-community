@@ -47,7 +47,6 @@ def parse_args() -> argparse.Namespace:
 async def main(args: argparse.Namespace) -> None:
     import cognee
     from cognee.modules.retrieval.exceptions.exceptions import NoDataError
-
     from cognee_community_connector_gitlab import gitlab_source
 
     source = gitlab_source(

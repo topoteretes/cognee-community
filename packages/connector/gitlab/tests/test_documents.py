@@ -1,5 +1,4 @@
 import pytest
-
 from cognee_community_connector_gitlab.documents import (
     _issue_to_document,
     _merge_request_to_document,

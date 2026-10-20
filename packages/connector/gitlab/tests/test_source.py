@@ -3,7 +3,6 @@ from unittest.mock import patch
 import dlt
 import httpx
 import pytest
-
 from cognee_community_connector_gitlab import gitlab_source
 
 HTTPClient = httpx.Client

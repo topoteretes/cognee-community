@@ -1,13 +1,13 @@
 """Fetch GitLab resources and expose mapped documents as a DLT source."""
 
 import json
-import logging
 from collections.abc import Sequence
 from hashlib import sha256
 from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import quote
 
 import httpx
+from cognee.shared.logging_utils import get_logger
 
 from .documents import _instance_url
 
@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 
 ResourceType = Literal["issues", "merge_requests", "comments", "wiki"]
 
-logger = logging.getLogger(__name__)
+logger = get_logger("gitlab_connector")
 
 
 class GitLabAPIError(RuntimeError):
