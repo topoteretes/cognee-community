@@ -9,6 +9,16 @@ dependencies = [
     # every cognee 1.4.0+. 1.6.4 is the latest stable release.
     "cognee==1.6.4",
     "dlt[sqlalchemy]>=1.9.0,<1.31",
+    # Snowflake's own driver, for key-pair login and the Snowflake-only queries
+    # (CHANGES, SYSTEM$LAST_CHANGE_COMMIT_TIME). Below 5: 5.0 is a fresh rewrite
+    # (October 2026) that is four times larger and warns on every connect.
+    "snowflake-connector-python>=3.12,<5",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8,<9",
+    "pytest-asyncio>=0.23,<2",
 ]
 
 [project.urls]
