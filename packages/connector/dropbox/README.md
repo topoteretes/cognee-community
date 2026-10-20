@@ -90,7 +90,7 @@ Run the same `remember` call again whenever you want to sync. See
 | `app_secret` | unset, not needed for PKCE tokens |
 | `access_token` | short-lived, for quick tries only |
 | `max_file_size_mb` | 25 |
-| `resource_name` | `dropbox_files`. Lowercase letters, digits and underscores, up to 64. **Two Dropbox accounts in one dataset need different names**, or they would share one table and one sync state |
+| `resource_name` | `dropbox_files`. Lowercase letters, digits and single underscores, up to 64, not ending in an underscore: a name dlt keeps as it is, since dlt would turn `work__dbx` into the table of `work_dbx`. **Two Dropbox accounts in one dataset need different names**, or they would share one table and one sync state |
 | `check_active` | optional host callback, asked before every Dropbox request |
 | `service` | a pre-built Dropbox client, mainly for tests (`client` still works) |
 
@@ -117,22 +117,31 @@ After a run, `source.cognee_sync_stats` holds counts only, never file names or c
   graph and vector stores.
 - **Errors never delete.** Only a confirmed `not_found` removes data. A reset cursor
   (`409 reset`) triggers a fresh listing reconciled against the index. A configured folder
-  that does not exist on its **first** sync raises `DropboxFolderNotFoundError`, since it
-  is most likely a typo; a folder that disappears later is forgotten like a delete.
+  that was never listed raises `DropboxFolderNotFoundError`, since it is most likely a
+  typo. A folder that was synced and disappears later is forgotten like a delete, and
+  later runs keep syncing the other folders: the state remembers which folders were
+  listed at least once.
 - **Failed downloads are retried by id.** The cursor always moves forward. A file that
   failed to download (a 5xx or a network error) is kept in a `retry` map in dlt state with
   its number of attempts, and fetched again by id next run, which costs two requests:
   its metadata and the download. After 3 failed runs it is skipped as `unavailable`, so
-  an error that never goes away does not cost requests forever. Files Dropbox can never
-  download or export, like restricted content or unsupported types, are skipped at once.
+  an error that never goes away does not cost requests forever, and if an older version
+  of it was stored, that version is forgotten, since it is no longer current. A file
+  that changes starts its 3 attempts over. Files Dropbox can never download or export,
+  like restricted content or unsupported types, are skipped at once.
+- **What is stored is tracked.** The state keeps the ids that are in cognee right now,
+  apart from the index, which also holds skipped and failed files. Only those get a
+  tombstone when they are skipped later, so `deleted` counts real deletes.
 - **Rate limits.** A 429 is waited out up to 60 seconds, at most 3 times per request,
   with `check_active` asked again before each retry, and all waits of a run share a
   budget of 2 minutes. A longer wait is never slept through, since cognee holds its dlt
-  staging lock during a sync: the run stops, keeps what it stored, and the remaining files
-  are fetched next run without counting as one of their 3 attempts.
+  staging lock during a sync. During downloads the run stops, keeps what it stored, and
+  the remaining files are fetched next run without counting as one of their 3 attempts.
+  During listing nothing has been emitted yet, so the run ends with `failed_rate_limit`
+  and the state untouched, and the next run lists again from the same place.
 - **An expired or revoked token mid-run** stops the run the same way, since every later
-  request would fail too. If nothing was stored yet, the error is raised: that is just a
-  bad token.
+  request would fail too. If nothing was emitted yet, including during listing, the error
+  is raised and counted in `failed_auth`: that is just a bad token.
 - **One failing folder fails the run.** Folders are not independent here: a file moved
   from one synced folder into another shows up as a delete in the first. If the second
   folder could not be read, the move would look like a delete, so the run stops before

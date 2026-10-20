@@ -28,7 +28,7 @@ line-length = 100
 target-version = "py310"
 
 [tool.ruff.lint]
-select = ["E", "W", "F", "I", "N", "B", "UP", "C4", "PGH", "SIM", "RUF"]
+select = ["E", "W", "F", "I", "N", "B", "BLE", "UP", "C4", "PGH", "SIM", "RUF"]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]

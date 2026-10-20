@@ -65,7 +65,9 @@ def test_service_is_the_injected_client_and_client_still_works():
     assert dropbox_source(client=fake) is not None
 
 
-@pytest.mark.parametrize("name", ["", "x" * 65, "Work-Dropbox", "work dropbox", "1dropbox"])
+@pytest.mark.parametrize(
+    "name", ["", "x" * 65, "Work-Dropbox", "work dropbox", "1dropbox", "work__dbx", "work_", "x__"]
+)
 def test_resource_name_that_would_lose_or_share_state_is_refused(name):
     with pytest.raises(ValueError, match="resource_name"):
         dropbox_source(resource_name=name, service=FakeDropbox())
@@ -98,27 +100,41 @@ def test_refresh_token_goes_to_the_sdk_as_a_refresh_token(monkeypatch):
     assert all(kwargs["max_retries_on_rate_limit"] == 0 for kwargs in built)
 
 
-def test_a_client_built_for_the_run_is_closed_when_it_ends(monkeypatch, tmp_path):
+def test_names_dlt_keeps_as_they_are_are_accepted():
+    for name in ("dropbox_files", "work_dbx", "a1_b2", "dbx"):
+        assert dropbox_source(resource_name=name, service=FakeDropbox()).name == name
+
+
+def test_each_run_builds_its_own_client_and_closes_it(monkeypatch, tmp_path):
     import dlt
 
-    class ClosingFake(FakeDropbox):
-        closed = False
+    built: list[FakeDropbox] = []
 
-        def close(self):
-            self.closed = True
-
-    built: list[ClosingFake] = []
-
-    def build(**_kwargs):
-        built.append(ClosingFake())
+    def fake_sdk(**kwargs):
+        built.append(FakeDropbox(**kwargs))
         built[-1].put("/a.md", "alpha")
         return built[-1]
 
-    monkeypatch.setattr(dropbox_module, "build_dropbox_client", build)
+    # The real build_dropbox_client runs; only the SDK class is replaced.
+    monkeypatch.setattr(dropbox_module, "Dropbox", fake_sdk)
     monkeypatch.setenv("DLT_DATA_DIR", str(tmp_path))
-    resource = dropbox_source(access_token="token")
-    pipeline = dlt.pipeline("dropbox_close_test", destination="duckdb", dev_mode=True)
+    resource = dropbox_source(refresh_token="refresh", app_key="key")
+    pipeline = dlt.pipeline("dropbox_close_test", dev_mode=True)
 
     pipeline.extract(resource)
+    pipeline.extract(resource)
 
-    assert len(built) == 1 and built[0].closed
+    assert len(built) == 2, "a client per run, not one shared across runs"
+    assert all(client.closed for client in built)
+
+
+def test_an_injected_client_is_never_closed(monkeypatch, tmp_path):
+    import dlt
+
+    service = FakeDropbox()
+    service.put("/a.md", "alpha")
+    monkeypatch.setenv("DLT_DATA_DIR", str(tmp_path))
+
+    dlt.pipeline("dropbox_injected_test", dev_mode=True).extract(dropbox_source(service=service))
+
+    assert not service.closed

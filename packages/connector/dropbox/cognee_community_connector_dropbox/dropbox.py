@@ -38,7 +38,6 @@ from dropbox import Dropbox
 from dropbox import files as dropbox_files
 from dropbox.exceptions import ApiError, AuthError, HttpError, RateLimitError
 from pypdf import PdfReader
-from pypdf.errors import PyPdfError
 from requests import RequestException
 
 logger = get_logger("dropbox_connector")
@@ -66,7 +65,8 @@ DEFAULT_RATE_LIMIT_WAIT_SECONDS = 5
 # error that never goes away does not cost requests on every run forever.
 MAX_RETRY_ATTEMPTS = 3
 # dlt uses the resource name as a table name and a state key, so it has to be
-# already normalized and short enough to be part of a file name.
+# short enough to be part of a file name; _valid_resource_name also checks dlt
+# would keep it unchanged.
 _RESOURCE_NAME = re.compile(r"[a-z][a-z0-9_]{0,63}")
 
 # Patched in tests so rate-limit waits take no time.
@@ -293,9 +293,10 @@ def _iter_rows(
     """Yield one row per new or changed file, plus hard-delete tombstones.
 
     ``state`` holds ``cursors`` (folder path -> list_folder cursor), ``index``
-    (file path_lower -> file id) and ``retry`` (file id -> failed attempts).
-    It is a plain dict standing in for dlt's resource state, so this is
-    directly unit-testable with a fake client.
+    (file path_lower -> file id), ``stored`` (ids that are in cognee),
+    ``synced_folders`` (folders listed at least once) and ``retry`` (file id ->
+    failed attempts).  It is a plain dict standing in for dlt's resource state,
+    so this is directly unit-testable with a fake client.
     """
     if stats is None:
         stats = {}
@@ -305,7 +306,12 @@ def _iter_rows(
 
     old_cursors: dict[str, str] = dict(state.get("cursors", {}))
     index: dict[str, str] = dict(state.get("index", {}))
-    stored_before = set(index.values())
+    # Skipped and failed files are indexed too, so the index alone can't say
+    # what is in cognee.  Older state has no ``stored``: assume all indexed.
+    stored: set[str] = set(state.get("stored", index.values()))
+    # A folder listed once and gone later is forgotten like a delete; only one
+    # that was never listed is taken for a typo.
+    synced_folders: set[str] = set(state.get("synced_folders", old_cursors))
     saved_retry = state.get("retry", {})
     # Before attempts were counted, retry was a plain list of ids.
     retry: dict[str, int] = (
@@ -343,58 +349,79 @@ def _iter_rows(
             # A folder created where a file used to be.
             removed_ids.add(index.pop(path))
 
-    # Folders dropped from the config: forget the files only they covered.
-    # A folder that is still covered by a configured parent is re-listed below,
-    # and its files reappear instead of being deleted.
-    for folder in old_cursors:
-        if folder not in config.folder_paths:
-            forget(folder)
+    def list_all() -> None:
+        # Folders dropped from the config: forget the files only they covered.
+        # A folder still covered by a configured parent is re-listed below, and
+        # its files reappear instead of being deleted.
+        for folder in old_cursors:
+            if folder not in config.folder_paths:
+                forget(folder)
 
-    for folder in config.folder_paths:
-        cursor = old_cursors.get(folder)
-        if cursor is not None:
-            try:
-                entries, new_cursors[folder] = _list_changes(session, cursor)
-            except ApiError as exc:
-                if _is_reset(exc):
-                    logger.info("Dropbox: a folder's cursor was reset; listing it again.")
-                elif _path_lookup_error(exc) is not None:
-                    # Confirm with a fresh listing before deleting anything.
-                    logger.info("Dropbox: a synced folder is not reachable; listing it again.")
+        for folder in config.folder_paths:
+            cursor = old_cursors.get(folder)
+            if cursor is not None:
+                try:
+                    entries, new_cursors[folder] = _list_changes(session, cursor)
+                except ApiError as exc:
+                    if _is_reset(exc):
+                        logger.info("Dropbox: a folder's cursor was reset; listing it again.")
+                    elif _path_lookup_error(exc) is not None:
+                        # Confirm with a fresh listing before deleting anything.
+                        logger.info("Dropbox: a synced folder is not reachable; listing it again.")
+                    else:
+                        raise
                 else:
-                    raise
-            else:
-                for entry in entries:
-                    apply(entry)
-                continue
+                    for entry in entries:
+                        apply(entry)
+                    continue
 
-        # First run, reset cursor, or a path error to confirm: list the whole
-        # folder and reconcile it against the index like a snapshot.
-        try:
-            entries, new_cursors[folder] = _list_folder(session, folder)
-        except ApiError as exc:
-            if not _is_not_found(exc):
-                raise
-            if folder not in old_cursors:
-                # Never synced: most likely a typo in folder_paths, which would
-                # otherwise just produce an empty dataset.
-                raise DropboxFolderNotFoundError(
-                    "A configured Dropbox folder was not found. Check folder_paths."
-                ) from None
-            logger.warning("Dropbox: a synced folder was not found; forgetting its files.")
+            # First run, reset cursor, or a path error to confirm: list the
+            # whole folder and reconcile it against the index like a snapshot.
+            try:
+                entries, new_cursors[folder] = _list_folder(session, folder)
+            except ApiError as exc:
+                if not _is_not_found(exc):
+                    raise
+                if folder not in synced_folders:
+                    # Never listed: most likely a typo in folder_paths, which
+                    # would otherwise just produce an empty dataset.
+                    raise DropboxFolderNotFoundError(
+                        "A configured Dropbox folder was not found. Check folder_paths."
+                    ) from None
+                logger.warning("Dropbox: a synced folder was not found; forgetting its files.")
+                forget(folder)
+                continue
+            synced_folders.add(folder)
             forget(folder)
-            continue
-        forget(folder)
-        for entry in entries:
-            apply(entry)
+            for entry in entries:
+                apply(entry)
+
+    # Listing comes before anything is emitted, and state is only written at
+    # the end, so stopping here leaves the previous state exactly as it was.
+    try:
+        list_all()
+    except DropboxRateLimitedError:
+        stats["failed_rate_limit"] += 1
+        logger.warning("Dropbox: rate limited while listing; the next run lists again.")
+        return
+    except AuthError:
+        # Nothing was done yet, so this is just a bad token: say so.
+        stats["failed_auth"] += 1
+        raise
+
+    def tombstone(file_id: str) -> dict:
+        if file_id in stored:
+            stored.discard(file_id)
+            stats["deleted"] += 1
+        return {"id": file_id, "_deleted": True}
 
     present_ids = set(index.values())
     # This also tombstones a file added and deleted within the round. That is
     # a no-op if it was never stored, but after a failed run it may have been
-    # stored without the index being saved, and must not be left behind.
+    # stored without the state being saved, and must not be left behind.
     for file_id in sorted(removed_ids - present_ids):
-        stats["deleted"] += 1
-        yield {"id": file_id, "_deleted": True}
+        yield tombstone(file_id)
+    emitted = len(removed_ids - present_ids)
 
     # Files changed this round, then files that failed before and did not
     # change since (None: their metadata is fetched again by id).  Added and
@@ -403,17 +430,22 @@ def _iter_rows(
     work += [(file_id, None) for file_id in retry if file_id not in changed]
     work = [(file_id, entry) for file_id, entry in work if file_id in present_ids]
 
+    def attempts_so_far(file_id: str) -> int:
+        # A new revision starts over: its failures are its own.
+        return 0 if file_id in changed else retry.get(file_id, 0)
+
     next_retry: dict[str, int] = {}
 
-    def failed(file_id: str) -> None:
-        attempts = retry.get(file_id, 0) + 1
+    def failed(file_id: str) -> bool:
+        """Count a failure; True once the file is given up for good."""
+        attempts = attempts_so_far(file_id) + 1
         if attempts >= MAX_RETRY_ATTEMPTS:
             _count_skip(stats, "unavailable")
-        else:
-            stats["failed"] += 1
-            next_retry[file_id] = attempts
+            return True
+        stats["failed"] += 1
+        next_retry[file_id] = attempts
+        return False
 
-    yielded = 0
     for position, (file_id, entry) in enumerate(work):
         try:
             if entry is None:
@@ -426,11 +458,11 @@ def _iter_rows(
             # what was stored, and fetch the rest next run without counting
             # this as one of their attempts.
             remaining = [file_id for file_id, _ in work[position:]]
-            next_retry.update({file_id: retry.get(file_id, 0) for file_id in remaining})
+            next_retry.update({file_id: attempts_so_far(file_id) for file_id in remaining})
             stats["failed"] += len(remaining)
             if isinstance(exc, AuthError):
                 stats["failed_auth"] += len(remaining)
-                if not yielded and not stats["deleted"]:
+                if not emitted:
                     # Nothing done yet: that's just a bad token, say so.
                     raise
             else:
@@ -444,28 +476,33 @@ def _iter_rows(
         except (ApiError, HttpError, RequestException):
             # Only the metadata lookup of a retried file gets here; downloads
             # handle their own errors.
-            failed(file_id)
-            continue
+            row = _RETRY
         if row is _RETRY:
-            failed(file_id)
+            if failed(file_id) and file_id in stored:
+                # Given up: its stored text is no longer current, so it goes.
+                emitted += 1
+                yield tombstone(file_id)
         elif row is not None:
-            yielded += 1
+            stored.add(file_id)
+            emitted += 1
             yield row
-        elif file_id in stored_before:
-            # Synced before but skipped now (emptied, too large, renamed to an
+        elif file_id in stored:
+            # Stored before but skipped now (emptied, too large, renamed to an
             # unsupported type): its old text must not stay in memory.
-            stats["deleted"] += 1
-            yield {"id": file_id, "_deleted": True}
+            emitted += 1
+            yield tombstone(file_id)
 
     # The cursors always move forward: files that failed are kept by id in
     # ``retry`` instead, so one bad file never makes later runs replay
     # everything since it failed.
     state["index"] = index
     state["cursors"] = new_cursors
+    state["stored"] = sorted(stored)
+    state["synced_folders"] = sorted(synced_folders)
     state["retry"] = next_retry
     if next_retry:
         logger.warning("Dropbox: %d file(s) failed and will be retried next run.", len(next_retry))
-    logger.info("Dropbox: sync yielded %d changed file(s); stats %s", yielded, stats)
+    logger.info("Dropbox: sync stats %s", stats)
 
 
 # ---------------------------------------------------------------------------
@@ -526,9 +563,11 @@ def _file_to_row(session: _Session, entry, config: _DropboxConfig, stats: dict[s
 
     try:
         text = parse(data)
-    except (PyPdfError, ValueError):
-        # A corrupt file fails the same way every time, so skip it rather than
-        # retrying it forever.
+    except Exception:  # noqa: BLE001
+        # One unit on purpose: on malformed files pypdf raises KeyError,
+        # TypeError, AttributeError, zlib.error or RecursionError besides its
+        # own errors, and our decode raises ValueError.  A corrupt file fails
+        # the same way every time, so skip it rather than break every run.
         _count_skip(stats, "unparseable")
         return None
     if not text.strip():
@@ -609,6 +648,22 @@ def _count_skip(stats: dict[str, int], reason: str) -> None:
 # ---------------------------------------------------------------------------
 # Public factory
 # ---------------------------------------------------------------------------
+def _valid_resource_name(name: Any) -> bool:
+    """A name dlt keeps as it is.
+
+    The table follows dlt's normalized name but the pipeline scope follows the
+    name itself, so ``work__dbx`` and ``work_dbx`` would share one table with
+    separate state.  An empty name would drop the pipeline scope altogether.
+    """
+    from dlt.common.normalizers.naming.snake_case import NamingConvention
+
+    return (
+        isinstance(name, str)
+        and _RESOURCE_NAME.fullmatch(name) is not None
+        and NamingConvention().normalize_identifier(name) == name
+    )
+
+
 def dropbox_source(
     folder_paths: list[str] | str | None = None,
     *,
@@ -655,12 +710,10 @@ def dropbox_source(
             "Dropbox sync requires a Cognee build with table-scoped DLT document cleanup. "
             "Upgrade Cognee before syncing to avoid deleting another source's data."
         )
-    if not isinstance(resource_name, str) or not _RESOURCE_NAME.fullmatch(resource_name):
-        # An empty name would silently drop the pipeline scope, and a name dlt
-        # normalizes differently would share a table with another source.
+    if not _valid_resource_name(resource_name):
         raise ValueError(
-            "resource_name must be 1 to 64 lowercase letters, digits or underscores, "
-            'starting with a letter, like "work_dropbox".'
+            "resource_name must be 1 to 64 lowercase letters, digits and single "
+            'underscores, starting with a letter and not ending in one, like "work_dropbox".'
         )
 
     if folder_paths is None:

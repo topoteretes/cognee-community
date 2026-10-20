@@ -837,3 +837,179 @@ def test_every_download_response_is_closed(fake):
 
     assert len(fake.responses) == 2
     assert all(response.closed for response in fake.responses)
+
+
+# ---------------------------------------------------------------------------
+# Review round 4
+# ---------------------------------------------------------------------------
+def test_a_synced_folder_that_is_deleted_keeps_later_runs_working(fake):
+    n = fake.put("/N/a.md", "in N")
+    fake.put("/M/b.md", "in M")
+    state: dict = {}
+    sync(fake, state, ("/n", "/m"))
+
+    fake.delete("/N")
+    _, deletes, _ = sync(fake, state, ("/n", "/m"))
+    assert deletes == [n]
+
+    for run in range(2):  # the third and fourth sync used to raise
+        new = fake.put(f"/M/new{run}.md", "still syncing")
+        upserts, deletes, _ = sync(fake, state, ("/n", "/m"))
+        assert set(upserts) == {new} and deletes == []
+
+
+def test_a_stored_file_given_up_after_failing_is_forgotten(fake):
+    a = fake.put("/a.md", "x")
+    state: dict = {}
+    sync(fake, state)
+
+    fake.put("/a.md", "x, edited")
+    fake.download_errors[a] = requests.ConnectionError("timeout")
+    deletes_per_run = []
+    for _ in range(3):
+        _, deletes, stats = sync(fake, state)
+        deletes_per_run.append(deletes)
+
+    assert deletes_per_run == [[], [], [a]], "the stale x must not stay in memory"
+    assert stats["skipped_unavailable"] == 1 and stats["deleted"] == 1
+    assert state["retry"] == {} and a not in state["stored"]
+
+
+def test_a_new_revision_starts_its_attempts_over(fake):
+    a = fake.put("/a.md", "v1")
+    fake.download_errors[a] = requests.ConnectionError("timeout")
+    state: dict = {}
+    sync(fake, state)
+    sync(fake, state)
+    assert state["retry"] == {a: 2}
+
+    fake.put("/a.md", "v2")  # edited, and its download fails once
+    _, _, stats = sync(fake, state)
+
+    assert state["retry"] == {a: 1}, "not given up after one failure of the new revision"
+    assert stats["failed"] == 1
+
+
+def test_rate_limited_files_do_not_use_up_an_attempt(fake, waits):
+    a = fake.put("/a.md", "alpha")
+    fake.download_errors[a] = requests.ConnectionError("timeout")
+    state: dict = {}
+    sync(fake, state)
+    sync(fake, state)
+    assert state["retry"] == {a: 2}
+
+    fake.download_errors[a] = RateLimitError("request-id", None, 3600)
+    _, _, stats = sync(fake, state)
+
+    assert state["retry"] == {a: 2} and stats["failed_rate_limit"] == 1
+
+
+def test_retry_saved_as_a_list_by_the_previous_version_still_works(fake):
+    a = fake.put("/a.md", "alpha")
+    state: dict = {}
+    sync(fake, state)
+    state["retry"] = [a]  # how the commit before this one saved it
+
+    upserts, _, _ = sync(fake, state)
+
+    assert set(upserts) == {a}
+    assert state["retry"] == {}
+
+
+def test_a_skipped_file_that_was_never_stored_emits_no_tombstone(fake):
+    fake.put("/e.md", "   ")
+    state: dict = {}
+    sync(fake, state)
+
+    fake.put("/e.md", " \n\t ")
+    _, deletes, stats = sync(fake, state)
+
+    assert deletes == [] and stats["deleted"] == 0
+
+
+def test_a_bad_token_is_raised_when_only_blank_files_came_before(fake):
+    fake.put("/e.md", "   ")
+    b = fake.put("/f.md", "beta")
+    state: dict = {}
+    sync(fake, state)
+
+    fake.put("/e.md", " \n\t ")
+    fake.put("/f.md", "beta, edited")
+    fake.download_errors[b] = AuthError("request-id", "invalid_access_token")
+    with pytest.raises(AuthError):
+        sync(fake, state)
+
+
+@pytest.mark.parametrize("failure", ["continue", "list"])
+def test_a_long_rate_limit_while_listing_stops_cleanly(fake, waits, failure):
+    fake.put("/a.md", "alpha")
+    state: dict = {}
+    if failure == "continue":
+        sync(fake, state)
+        fake.put("/b.md", "beta")
+        fake.continue_errors.append(RateLimitError("request-id", None, 3600))
+    else:
+        fake.list_errors.append(RateLimitError("request-id", None, 3600))
+    before = copy.deepcopy(state)
+
+    upserts, deletes, stats = sync(fake, state)
+
+    assert upserts == {} and deletes == []
+    assert stats["failed_rate_limit"] == 1
+    assert state == before, "the next run lists again from the same place"
+
+
+def test_a_bad_token_while_listing_raises_and_is_counted(fake):
+    fake.put("/a.md", "alpha")
+    fake.list_errors.append(AuthError("request-id", "invalid_access_token"))
+    stats: dict = {}
+
+    with pytest.raises(AuthError):
+        list(_iter_rows(fake, _DropboxConfig(("",), 25), {}, stats))
+
+    assert stats["failed_auth"] == 1
+
+
+@pytest.mark.parametrize("error", [KeyError, TypeError, AttributeError, RecursionError])
+def test_any_pdf_parser_error_skips_the_file_and_the_run_goes_on(fake, monkeypatch, error):
+    class BrokenPage:
+        def extract_text(self):
+            raise error("pypdf on a malformed file")
+
+    monkeypatch.setattr(
+        dropbox_module, "PdfReader", lambda *_a, **_k: type("R", (), {"pages": [BrokenPage()]})
+    )
+    fake.put("/broken.pdf", b"%PDF-1.4 whatever")
+    ok = fake.put("/ok.md", "fine")
+
+    upserts, _, stats = sync(fake, {})
+
+    assert set(upserts) == {ok}
+    assert stats["skipped_unparseable"] == 1
+
+
+def test_nul_bytes_are_stripped_from_pdf_text(fake, monkeypatch):
+    class Page:
+        def extract_text(self):
+            return "Quarterly\x00 report"
+
+    monkeypatch.setattr(
+        dropbox_module, "PdfReader", lambda *_a, **_k: type("R", (), {"pages": [Page()]})
+    )
+    pdf = fake.put("/report.pdf", b"%PDF-1.4 whatever")
+
+    upserts, _, _ = sync(fake, {})
+
+    assert "Quarterly report" in upserts[pdf]["content"]
+    assert "\x00" not in upserts[pdf]["content"]
+
+
+def test_a_paper_doc_that_only_exports_html_is_skipped(fake):
+    info = files.ExportInfo(export_as="html", export_options=["html"])
+    fake.put("/Notes.paper", "<p>hi</p>", is_downloadable=False, export_info=info)
+
+    upserts, _, stats = sync(fake, {})
+
+    assert upserts == {}
+    assert stats["skipped_unsupported_type"] == 1
+    assert fake.exports == []

@@ -32,8 +32,10 @@ class FakeResponse:
 
 
 class FakeDropbox:
-    def __init__(self, page_size: int = 2000):
+    def __init__(self, page_size: int = 2000, **_sdk_kwargs):
         self.page_size = page_size
+        # Set by close(), which the connector calls on a client it built.
+        self.closed = False
         self.files: dict[str, files.FileMetadata] = {}  # path_lower -> metadata
         self.folders: dict[str, files.FolderMetadata] = {}  # path_lower -> metadata
         self.content: dict[str, bytes] = {}  # file id -> bytes
@@ -108,6 +110,9 @@ class FakeDropbox:
     # ------------------------------------------------------------------
     # SDK surface used by the connector
     # ------------------------------------------------------------------
+    def close(self):
+        self.closed = True
+
     def files_list_folder(self, path, recursive=False, limit=None, **_kwargs):
         self.api_calls.append("list_folder")
         if self.list_errors:
