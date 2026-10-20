@@ -19,13 +19,12 @@ it from the graph and vector stores. Unchanged tasks maintain a stable content h
 ``data_id``, preventing unnecessary re-ingestion or re-cognification.
 """
 
-from collections.abc import Iterator
 import os
 import time
+from collections.abc import Iterator
 from typing import Any
 
 import httpx
-
 from cognee.shared.logging_utils import get_logger
 from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
 
@@ -72,7 +71,7 @@ def _format_task_markdown(task: dict[str, Any]) -> str:
     status = (task.get("status") or {}).get("status", "open")
     priority = (task.get("priority") or {}).get("priority", "none")
     url = task.get("url", "")
-    
+
     # Extract assignees deterministically (sorted by username/email)
     assignees_raw = task.get("assignees") or []
     assignee_names = sorted(

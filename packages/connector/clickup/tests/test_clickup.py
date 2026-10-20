@@ -1,10 +1,12 @@
-import pytest
 from unittest.mock import MagicMock, patch
+
+import pytest
+
 from cognee_community_connector_clickup.clickup import (
-    clickup_source,
-    _format_task_markdown,
     CLICKUP_TABLE_NAME,
     DOCUMENT_SOURCE_ATTR,
+    _format_task_markdown,
+    clickup_source,
 )
 
 

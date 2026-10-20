@@ -27,6 +27,7 @@ import asyncio
 import os
 
 import cognee
+
 from cognee_community_connector_clickup import clickup_source
 
 # Keep ClickUp in its own dataset for easy inspection and lifecycle management
