@@ -8,13 +8,16 @@ the empty-listing guard, paging, the HTTP client, and the dlt wiring.
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
 from cognee_community_connector_azure_repos import azure_repos as repos_mod
 from cognee_community_connector_azure_repos.azure_repos import (
+    AzureDevOpsAccessError,
+    AzureDevOpsAuthError,
     AzureDevOpsClient,
+    AzureDevOpsError,
     _Scope,
     azure_repos_source,
     render_pull_request,
@@ -23,7 +26,7 @@ from cognee_community_connector_azure_repos.azure_repos import (
 
 ORG_URL = "https://dev.azure.com/acme"
 PROJECT = "Shop"
-NOW = datetime(2026, 10, 19, 12, 0, tzinfo=UTC)
+NOW = datetime(2026, 10, 19, 12, 0, tzinfo=timezone.utc)
 
 
 def repo(rid="r1", name="shop-api", **extra):
@@ -537,7 +540,7 @@ def test_client_retries_429_and_honours_retry_after_on_a_200(clock):
 
 
 def test_client_gives_up_after_repeated_server_errors(clock):
-    session = _Session([_Response(503) for _ in range(repos_mod._MAX_RETRIES)])
+    session = _Session([_Response(503) for _ in range(repos_mod._MAX_ATTEMPTS)])
     with pytest.raises(RuntimeError, match="503"):
         AzureDevOpsClient(ORG_URL, "pat", session=session).get("x")
     assert clock == [1.0, 2.0, 4.0, 8.0]
@@ -563,12 +566,14 @@ def test_resource_is_a_scoped_merge_document_source():
     assert schema["columns"]["_deleted"].get("hard_delete") is True
 
 
-def test_source_needs_an_organization_and_a_token(monkeypatch):
-    monkeypatch.delenv("AZURE_DEVOPS_PAT", raising=False)
+def test_source_needs_an_organization_and_a_token_argument(monkeypatch):
+    # the token comes in as an argument only; the env var is the example's business
+    monkeypatch.setenv("AZURE_DEVOPS_PAT", "from-env")
     with pytest.raises(ValueError, match="organization"):
         azure_repos_source(project=PROJECT, pat="x")
-    with pytest.raises(ValueError, match="AZURE_DEVOPS_PAT"):
+    with pytest.raises(ValueError, match="pat="):
         azure_repos_source(organization="acme", project=PROJECT)
+    assert azure_repos_source(organization="acme", project=PROJECT, pat="x")
 
 
 def test_check_active_can_stop_a_sync():
@@ -617,3 +622,188 @@ def test_azure_devops_timestamps_with_seven_fraction_digits_parse():
 
     assert scope.warm(recent, NOW) is True
     assert scope.warm(old, NOW) is False
+    for stamp in ("2026-10-17T16:30:32.74Z", "2026-10-17T16:30:32Z", "2026-10-17T16:30:32.093Z"):
+        assert scope.warm({"status": "completed", "closedDate": stamp}, NOW) is True
+
+
+# ---------------------------------------------------------------------------
+# Same hardening as the Boards connector got in review
+# ---------------------------------------------------------------------------
+def test_client_errors_keep_secrets_and_the_url_out_of_the_message(clock):
+    session = _Session([_Response(401)])
+    client = AzureDevOpsClient(ORG_URL, "super-secret-pat", session=session)
+
+    with pytest.raises(AzureDevOpsAuthError) as err:
+        client.get("Shop/_apis/git/repositories")
+    assert "401" in str(err.value)
+    assert "super-secret-pat" not in str(err.value) and "acme" not in str(err.value)
+    assert err.value.url == f"{ORG_URL}/Shop/_apis/git/repositories"
+    assert "super-secret-pat" not in repr(client)
+
+
+def test_client_maps_403_and_caps_retry_after(clock):
+    with pytest.raises(AzureDevOpsAccessError):
+        AzureDevOpsClient(ORG_URL, "pat", session=_Session([_Response(403)])).get("x")
+    session = _Session([_Response(429, headers={"Retry-After": "3600"}), _Response(200, {"ok": 1})])
+    assert AzureDevOpsClient(ORG_URL, "pat", session=session).get("x") == {"ok": 1}
+    assert clock == [60.0]
+
+
+def test_client_retries_network_errors_then_raises(clock):
+    import requests
+
+    class _Down(_Session):
+        def request(self, method, url, **kwargs):
+            raise requests.ConnectionError(url)
+
+    with pytest.raises(AzureDevOpsError) as err:
+        AzureDevOpsClient(ORG_URL, "pat", session=_Down([])).get("Shop/x")
+    assert "acme" not in str(err.value)
+    assert clock == [1.0, 2.0, 4.0, 8.0]
+
+
+def test_repeated_commit_token_raises_instead_of_looping():
+    fake = FakeAzureRepos([repo()])
+    fake.add(
+        "r1", pull_request(1), commits=[{"commitId": f"c{i}", "comment": "x"} for i in range(6)]
+    )
+    fake.get_page = lambda path, params=None: (
+        {"value": [{"commitId": "c", "comment": "x"}]},
+        "same",
+    )
+
+    with pytest.raises(AzureDevOpsError, match="continuation token"):
+        run(fake, {})
+
+
+def test_pr_list_that_ignores_skip_raises_instead_of_looping():
+    fake = FakeAzureRepos([repo()])
+    fake.add("r1", pull_request(1))
+    real_get = fake.get
+
+    def ignores_skip(path, params=None):
+        if path.endswith("/pullrequests"):
+            params = {**params, "$skip": 0}
+        return real_get(path, params)
+
+    fake.get = ignores_skip
+    with pytest.raises(AzureDevOpsError, match="same page"):
+        run(fake, {})
+
+
+def test_turning_commits_off_rerenders_every_pr_once():
+    fake = FakeAzureRepos([repo()])
+    fake.add(
+        "r1",
+        pull_request(1, status="completed", closed="2026-01-05T10:00:00Z"),
+        commits=[{"commitId": "abc1234def", "comment": "Retry on timeout"}],
+    )
+    state: dict = {}
+    assert "Retry on timeout" in run(fake, state)[0]["content"]
+
+    rows = run(fake, state, include_commits=False)
+    assert keys(rows) == ["r1/1"]
+    assert "Retry on timeout" not in rows[0]["content"]
+    assert run(fake, state, include_commits=False) == []
+
+
+def test_budget_stops_cleanly_keeps_progress_and_deletes_nothing():
+    fake = FakeAzureRepos([repo("r1", "shop-api"), repo("r2", "shop-web")])
+    for pid in range(1, 6):
+        fake.add("r1", pull_request(pid))
+    fake.add("r2", pull_request(9))
+    state: dict = {}
+    run(fake, state, include_commits=False)
+
+    fake.repos = [repo("r1", "shop-api")]  # r2 deleted
+    for pid in range(1, 6):
+        fake.pr("r1", pid)["title"] = "changed"
+    stats: dict = {}
+    first = list(
+        sync_pull_requests(
+            fake,
+            _Scope(project=PROJECT, include_commits=False),
+            state,
+            stats,
+            now=NOW,
+            max_requests=6,
+        )
+    )
+
+    assert stats["failed_budget"] == 1
+    assert not any(r["_deleted"] for r in first)  # incomplete listing: no deletes
+    rest = run(fake, state, include_commits=False)
+    assert sorted(r["id"] for r in first + rest if not r["_deleted"]) == [
+        f"r1/{i}" for i in range(1, 6)
+    ]
+    assert [r["id"] for r in rest if r["_deleted"]] == ["r2/9"]
+
+
+def test_rate_limit_that_wont_clear_stops_cleanly():
+    fake = FakeAzureRepos([repo()])
+    fake.add("r1", pull_request(1))
+
+    def limited(*args, **kwargs):
+        raise repos_mod.AzureDevOpsRateLimitedError("Azure DevOps returned HTTP 429", status=429)
+
+    fake.get = limited
+    stats: dict = {}
+    assert list(sync_pull_requests(fake, _Scope(project=PROJECT), {}, stats, now=NOW)) == []
+    assert stats["failed_rate_limit"] == 1
+
+
+def test_check_active_runs_before_every_request():
+    fake = FakeAzureRepos([repo()])
+    fake.add("r1", pull_request(1), commits=[{"commitId": "c1", "comment": "x"}])
+    checks = []
+
+    list(
+        sync_pull_requests(
+            fake, _Scope(project=PROJECT), {}, now=NOW, check_active=lambda: checks.append(1)
+        )
+    )
+
+    assert len(checks) == len(fake.calls)
+
+
+def test_shuffled_threads_and_commits_render_the_same_text():
+    import random
+
+    threads = [
+        {"id": n, "comments": [text_comment(f"note {n}", publishedDate=f"2026-10-0{n}")]}
+        for n in (3, 1, 2)
+    ]
+    commits = [
+        {
+            "commitId": f"c{n}",
+            "comment": f"commit {n}",
+            "author": {"name": "P", "date": f"2026-10-0{n}"},
+        }
+        for n in (2, 3, 1)
+    ]
+    pr = pull_request(1)
+    first = render_pull_request(repo(), pr, threads, commits)
+
+    assert (
+        render_pull_request(repo(), pr, random.sample(threads, 3), random.sample(commits, 3))
+        == first
+    )
+
+
+def test_resource_name_version_guard_and_stats(monkeypatch):
+    from cognee.tasks.ingestion.dlt_utils import PIPELINE_SCOPE_ATTR
+
+    fake = FakeAzureRepos([repo()])
+    fake.add("r1", pull_request(1))
+    fake.add("r1", pull_request(2, status="abandoned", closed="2026-10-01T10:00:00Z"))
+    resource = azure_repos_source(
+        project=PROJECT, service=fake, resource_name="shop_prs", include_abandoned=False
+    )
+    list(resource)
+
+    assert resource.name == "shop_prs" and getattr(resource, PIPELINE_SCOPE_ATTR) == "shop_prs"
+    assert resource.cognee_sync_stats == {"scanned": 1, "skipped": 0, "deleted": 0, "failed": 0}
+
+    monkeypatch.setattr(repos_mod.dlt_utils, "DOCUMENT_SYNC_VERSION", 0)
+    with pytest.raises(RuntimeError, match=r"1\.6\.3"):
+        azure_repos_source(project=PROJECT, service=fake)

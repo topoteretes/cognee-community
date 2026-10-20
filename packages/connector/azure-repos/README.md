@@ -24,14 +24,18 @@ export LLM_API_KEY="..."   # cognee's LLM key, as for any cognee run
 ## Usage
 
 ```python
+import os
+
 import cognee
 from cognee_community_connector_azure_repos import azure_repos_source
 
-await cognee.remember(
-    azure_repos_source(organization="my-org", project="my-project"),
-    dataset_name="my_repos",
-    write_disposition="merge",
+source = azure_repos_source(
+    organization="my-org",
+    project="my-project",
+    pat=os.environ["AZURE_DEVOPS_PAT"],
 )
+await cognee.remember(source, dataset_name="my_repos", write_disposition="merge")
+print(source.cognee_sync_stats)  # {"scanned": ..., "skipped": ..., "deleted": ..., "failed": ...}
 
 answer = await cognee.search(
     query_text="Why did we switch the payment client to retries?",
@@ -41,21 +45,24 @@ answer = await cognee.search(
 
 Always pass `write_disposition="merge"`. cognee's default for this call is `"replace"`, and later runs only send PRs that changed, so under replace every other PR would be forgotten.
 
-Each project keeps its own state, so you can sync several projects into one dataset or separate ones.
+Each project keeps its own state, so you can sync several projects into one dataset or separate ones. If you sync the same project twice with different selections, give each source its own `resource_name`.
 
 ### Options
 
 | Argument | What it does |
 |---|---|
-| `organization` | Organisation name from `https://dev.azure.com/<organization>` |
 | `project` | Project name or id |
-| `pat` | Token. Falls back to `AZURE_DEVOPS_PAT` |
+| `pat` | Personal access token. Passed in, never read from the environment by the connector |
+| `organization` | Organisation name from `https://dev.azure.com/<organization>` |
 | `organization_url` | Full URL instead of `organization`, for Azure DevOps Server or `*.visualstudio.com` |
 | `repositories` | Repository names to sync. All of the project's by default |
 | `include_abandoned` | Keep abandoned PRs (default `True`). They often explain why something wasn't done |
 | `include_commits` | Add commit messages (default `True`) |
 | `created_after` | Skip PRs created before this `date` |
 | `recheck_closed_days` | Read the threads of PRs closed in the last N days on every run (default `30`). `None` reads every PR's threads every run |
+| `resource_name` | Name of the table and sync state. Defaults to `azure_repos_<org>_<project>` |
+| `max_requests` | Request budget per run (default 5,000). A big first sync finishes over several runs |
+| `check_active` | Optional callback run before every request, for hosts that need to stop a sync |
 
 ## What a pull request looks like in memory
 
@@ -91,6 +98,12 @@ Pull requests have no "last updated" field and the API can't list PRs changed si
 A lot of what changes on a PR doesn't show up in that list: new comments, a work item getting linked, or an edit past the first 400 characters of the description. So for PRs that are still open, or were closed in the last `recheck_closed_days` days, the connector also reads the full PR and its review threads on every run, two requests each, and fingerprints those too. Only PRs where something moved get their commits read and a new document written.
 
 The trade-off is that a comment left on a PR closed more than 30 days ago is picked up the next time that PR changes. If that matters to you, set `recheck_closed_days=None`, which costs two requests per PR per run.
+
+Changing `include_commits` re-renders every PR once on the next run, since it changes the text without changing anything the fingerprints look at.
+
+Each run stops after `max_requests` requests, or when Azure DevOps keeps answering 429. It stops cleanly: PRs already synced keep their new fingerprints, nothing is deleted because the listing didn't finish, and the next run skips what's done and carries on. `cognee_sync_stats` then has `failed: 1` plus `failed_budget` or `failed_rate_limit`.
+
+Requests honour `Retry-After`, including when Azure DevOps sends it on a normal 200 as an early warning, capped at 60 seconds per wait. Errors are raised as `AzureDevOpsAuthError` (401), `AzureDevOpsAccessError` (403) or `AzureDevOpsError`, with the status in the message and the URL only on the exception's `url` attribute. If a listing or commit page keeps coming back the same, the run fails instead of looping.
 
 Some API details it handles for you. The PR list only returns active PRs unless asked for every status, it cuts descriptions at 400 characters, and long commit messages come back truncated. Each of these would silently lose content.
 

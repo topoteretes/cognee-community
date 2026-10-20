@@ -12,7 +12,11 @@ commits, review threads) on the document path, so cognify extracts from it.
 * The PR list returns active PRs only unless asked for status=all, and cuts
   descriptions at 400 characters, so full text comes from the single-PR call.
 * PRs can't be deleted, only abandoned. What disappears is a repo (deleted,
-  deselected, no longer visible), and its PRs are tombstoned with it.
+  deselected, no longer visible), and its PRs are tombstoned with it. That
+  only happens after a complete listing.
+* Each run has a request budget. When it runs out, or Azure DevOps keeps
+  answering 429, the run stops cleanly: what's synced stays, nothing is
+  deleted, and the next run picks up the rest.
 * Callers must pass write_disposition="merge". cognee hands it to
   pipeline.run, which overrides the resource hint, and its default is
   "replace", which would forget every PR that didn't change.
@@ -22,12 +26,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 import time
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import quote
 
@@ -41,11 +44,19 @@ logger = get_logger("azure_repos_connector")
 
 SOURCE_TAG = "azure_repos"
 API_VERSION = "7.1"
+# our own page size for the PR list; the server may cap it lower, which paging handles
 _PR_PAGE = 500
+# our own page size for PR commits; the next page comes in x-ms-continuationtoken
 _COMMIT_PAGE = 100
-_MAX_RETRIES = 5
+# requests per run; listing costs about one per 500 PRs, each open PR costs two
+DEFAULT_MAX_REQUESTS = 5_000
+# attempts per request on 429, 5xx or network errors
+_MAX_ATTEMPTS = 5
+# our own ceiling on a single Retry-After wait; Azure DevOps doesn't document one
+_MAX_RETRY_AFTER = 60.0
 _TIMEOUT = 60
 
+# reviewer vote values, from the GitPullRequest reviewers docs
 _VOTES = {
     10: "approved",
     5: "approved with suggestions",
@@ -62,16 +73,60 @@ _THREAD_STATUS = {
 }
 
 
-class AzureDevOpsClient:
-    """Read-only client for one org, same as the Azure DevOps Boards connector's.
-    Azure DevOps rate limits per identity, so both should share one token's budget."""
+class AzureDevOpsError(RuntimeError):
+    """Azure DevOps answered with an error or couldn't be reached.
 
-    def __init__(self, organization_url: str, pat: str, session: Any = None):
+    The message carries the status only. ``url`` holds the request URL, which
+    names the organisation and project, for whoever needs to debug it.
+    """
+
+    def __init__(self, message: str, status: int | None = None, url: str | None = None):
+        super().__init__(message)
+        self.status = status
+        self.url = url
+
+
+class AzureDevOpsAuthError(AzureDevOpsError):
+    """HTTP 401: the personal access token is wrong or expired."""
+
+
+class AzureDevOpsAccessError(AzureDevOpsError):
+    """HTTP 403: the token is missing a scope this call needs."""
+
+
+class AzureDevOpsRateLimitedError(AzureDevOpsError):
+    """HTTP 429 that didn't clear after retrying."""
+
+
+_ERRORS = {
+    401: (AzureDevOpsAuthError, "check the personal access token"),
+    403: (AzureDevOpsAccessError, "the token is missing a scope this call needs"),
+    429: (AzureDevOpsRateLimitedError, "rate limited"),
+}
+
+
+class AzureDevOpsClient:
+    """Read-only client for one org, the same one the Azure DevOps Boards connector
+    uses. Azure DevOps rate limits per identity, so both share one token's budget."""
+
+    def __init__(
+        self,
+        organization_url: str,
+        pat: str,
+        session: Any = None,
+        sleep: Callable[[float], None] | None = None,
+    ):
+        if not pat:
+            raise ValueError("A personal access token is required")
         self.organization_url = organization_url.rstrip("/")
         self.session = session or requests.Session()
         self.session.auth = ("", pat)  # PAT is the password, username is ignored
         self.session.headers.update({"Accept": "application/json"})
+        self._sleep = sleep or time.sleep
         self._wait_until = 0.0
+
+    def __repr__(self) -> str:
+        return f"AzureDevOpsClient({self.organization_url!r}, pat=<redacted>)"
 
     def get(self, path: str, params: dict | None = None) -> dict:
         return self._request("GET", path, params=params).json()
@@ -81,46 +136,93 @@ class AzureDevOpsClient:
         resp = self._request("GET", path, params=params)
         return resp.json(), resp.headers.get("x-ms-continuationtoken")
 
-    def _request(self, method: str, path: str, **kwargs) -> Any:
+    def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         url = path if path.startswith("http") else f"{self.organization_url}/{path.lstrip('/')}"
-        for attempt in range(_MAX_RETRIES):
+        attempt = 0
+        while True:
+            attempt += 1
             if (delay := self._wait_until - time.monotonic()) > 0:
-                time.sleep(delay)
-            resp = self.session.request(method, url, timeout=_TIMEOUT, **kwargs)
+                self._sleep(delay)
+            try:
+                resp = self.session.request(method, url, timeout=_TIMEOUT, **kwargs)
+            except requests.RequestException as exc:
+                if attempt >= _MAX_ATTEMPTS:
+                    raise AzureDevOpsError("Azure DevOps could not be reached", url=url) from exc
+                self._wait_until = time.monotonic() + 2.0 ** (attempt - 1)
+                continue
+
             status = resp.status_code
-            retry = (status == 429 or status >= 500) and attempt < _MAX_RETRIES - 1
             # ADO also sends Retry-After on a 200, as a warning before it throttles.
             wait = _retry_after(resp.headers)
-            if retry and wait is None:
-                wait = 2.0**attempt
+            retryable = status == 429 or status >= 500
+            if retryable and attempt < _MAX_ATTEMPTS:
+                wait = wait if wait is not None else 2.0 ** (attempt - 1)
+                logger.warning("Azure DevOps: HTTP %s, retrying in %.1fs", status, wait)
             if wait is not None:
                 self._wait_until = time.monotonic() + wait
-            if not retry:
-                resp.raise_for_status()
-                return resp
-            logger.warning("Azure DevOps: HTTP %s on %s, retrying in %.1fs", status, path, wait)
-        raise AssertionError("unreachable")
+            if retryable and attempt < _MAX_ATTEMPTS:
+                continue
+            if status >= 400:
+                error, hint = _ERRORS.get(status, (AzureDevOpsError, "request failed"))
+                raise error(f"Azure DevOps returned HTTP {status}: {hint}", status=status, url=url)
+            return resp
 
 
 def _retry_after(headers: Any) -> float | None:
     try:
-        return max(0.0, float(headers["Retry-After"]))
+        return min(_MAX_RETRY_AFTER, max(0.0, float(headers["Retry-After"])))
     except (KeyError, TypeError, ValueError):
         return None
 
 
-def _repos(client: AzureDevOpsClient, project: str) -> list[dict]:
+class _CutShortError(Exception):
+    """Stop this run here and keep what's done. ``reason`` ends up in the stats."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+class _Calls:
+    """Every request of one run goes through here: host check, then the budget."""
+
+    def __init__(self, service: Any, max_requests: int, check_active: Callable[[], None] | None):
+        self.service = service
+        self.max_requests = max_requests
+        self.check_active = check_active
+        self.made = 0
+
+    def get(self, path: str, params: dict | None = None) -> dict:
+        return self._call(self.service.get, path, params)
+
+    def get_page(self, path: str, params: dict | None = None) -> tuple[dict, str | None]:
+        return self._call(self.service.get_page, path, params)
+
+    def _call(self, method: Callable[..., Any], *args: Any) -> Any:
+        if self.check_active is not None:
+            self.check_active()
+        if self.made >= self.max_requests:
+            raise _CutShortError("budget")
+        self.made += 1
+        try:
+            return method(*args)
+        except AzureDevOpsRateLimitedError:
+            raise _CutShortError("rate_limit") from None
+
+
+def _repos(calls: _Calls, project: str) -> list[dict]:
     path = f"{quote(project)}/_apis/git/repositories"
-    return client.get(path, {"api-version": API_VERSION}).get("value") or []
+    return calls.get(path, {"api-version": API_VERSION}).get("value") or []
 
 
 def _pull_requests(
-    client: AzureDevOpsClient, project: str, repo_id: str, created_after: date | None
+    calls: _Calls, project: str, repo_id: str, created_after: date | None
 ) -> Iterator[dict]:
     """Every PR in the repo, any status.
 
     Pages with $skip until an empty page, not until a short one: the server may
     cap $top below what we ask for, and stopping on a short page would drop PRs.
+    A server that ignores $skip would loop forever, so a repeated page raises.
     """
     path = f"{quote(project)}/_apis/git/repositories/{repo_id}/pullrequests"
     params: dict[str, Any] = {
@@ -132,34 +234,43 @@ def _pull_requests(
         params["searchCriteria.queryTimeRangeType"] = "created"
         params["searchCriteria.minTime"] = f"{created_after.isoformat()}T00:00:00Z"
     skip = 0
-    while page := client.get(path, {**params, "$skip": skip}).get("value") or []:
+    previous: list[int] = []
+    while page := calls.get(path, {**params, "$skip": skip}).get("value") or []:
+        ids = [pr.get("pullRequestId") for pr in page]
+        if ids == previous:
+            raise AzureDevOpsError("The pull request list returned the same page twice")
+        previous = ids
         yield from page
         skip += len(page)
 
 
-def _pull_request(client: AzureDevOpsClient, project: str, repo_id: str, pr_id: int) -> dict:
+def _pull_request(calls: _Calls, project: str, repo_id: str, pr_id: int) -> dict:
     path = f"{quote(project)}/_apis/git/repositories/{repo_id}/pullrequests/{pr_id}"
-    return client.get(path, {"api-version": API_VERSION, "includeWorkItemRefs": "true"})
+    return calls.get(path, {"api-version": API_VERSION, "includeWorkItemRefs": "true"})
 
 
-def _threads(client: AzureDevOpsClient, project: str, repo_id: str, pr_id: int) -> list[dict]:
+def _threads(calls: _Calls, project: str, repo_id: str, pr_id: int) -> list[dict]:
     path = f"{quote(project)}/_apis/git/repositories/{repo_id}/pullRequests/{pr_id}/threads"
-    return client.get(path, {"api-version": API_VERSION}).get("value") or []
+    return calls.get(path, {"api-version": API_VERSION}).get("value") or []
 
 
-def _commits(client: AzureDevOpsClient, project: str, repo_id: str, pr_id: int) -> list[dict]:
+def _commits(calls: _Calls, project: str, repo_id: str, pr_id: int) -> list[dict]:
     repo_path = f"{quote(project)}/_apis/git/repositories/{repo_id}"
     params: dict[str, Any] = {"api-version": API_VERSION, "$top": _COMMIT_PAGE}
     commits: list[dict] = []
+    seen: set[str] = set()
     while True:
-        page, token = client.get_page(f"{repo_path}/pullRequests/{pr_id}/commits", params)
+        page, token = calls.get_page(f"{repo_path}/pullRequests/{pr_id}/commits", params)
         commits += page.get("value") or []
         if not token:
             break
+        if token in seen:
+            raise AzureDevOpsError("The commit list returned the same continuation token twice")
+        seen.add(token)
         params = {**params, "continuationToken": token}
     for commit in commits:
         if commit.get("commentTruncated"):  # the list cuts long messages
-            full = client.get(
+            full = calls.get(
                 f"{repo_path}/commits/{commit['commitId']}", {"api-version": API_VERSION}
             )
             commit["comment"] = full.get("comment") or commit.get("comment")
@@ -235,14 +346,17 @@ def _reviewers(pr: dict) -> str:
 def _thread_block(thread: dict) -> str | None:
     if thread.get("isDeleted"):
         return None
-    comments = [
-        c
-        for c in thread.get("comments") or []
-        # system comments are "X voted 10" / "ref updated" noise; votes are on the reviewers line
-        if c.get("commentType") != "system"
-        and not c.get("isDeleted")
-        and (c.get("content") or "").strip()
-    ]
+    comments = sorted(
+        (
+            c
+            for c in thread.get("comments") or []
+            # system comments ("X voted 10", "ref updated") are noise; votes have their own line
+            if c.get("commentType") != "system"
+            and not c.get("isDeleted")
+            and (c.get("content") or "").strip()
+        ),
+        key=lambda c: (c.get("publishedDate") or "", c.get("id") or 0),
+    )
     if not comments:
         return None
     ctx = thread.get("threadContext") or {}
@@ -269,7 +383,7 @@ def _commit_line(commit: dict) -> str:
 
 def render_pull_request(repo: dict, pr: dict, threads: list[dict], commits: list[dict]) -> str:
     """Leave out anything that changes without a reader noticing (merge ids, iteration
-    numbers), so unchanged PRs keep the same content hash."""
+    numbers) and sort every collection, so unchanged PRs keep the same content hash."""
     lines: list[str] = []
 
     def add(label: str, value: Any) -> None:
@@ -292,9 +406,13 @@ def render_pull_request(repo: dict, pr: dict, threads: list[dict], commits: list
 
     if description := (pr.get("description") or "").strip():
         lines.append(f"\nDescription:\n{description}")
-    if commits:
-        lines.append("\nCommits:\n" + "\n".join(map(_commit_line, commits)))
-    if discussion := [b for b in map(_thread_block, threads) if b]:
+    ordered_commits = sorted(
+        commits, key=lambda c: ((c.get("author") or {}).get("date") or "", c.get("commitId") or "")
+    )
+    if ordered_commits:
+        lines.append("\nCommits:\n" + "\n".join(map(_commit_line, ordered_commits)))
+    ordered_threads = sorted(threads, key=lambda t: t.get("id") or 0)
+    if discussion := [b for b in map(_thread_block, ordered_threads) if b]:
         lines.append("\nReview discussion:\n" + "\n\n".join(discussion))
     return "\n".join(lines).strip()
 
@@ -311,6 +429,13 @@ def _row(repo: dict, pr: dict, content: str, org_url: str, project: str) -> dict
     }
 
 
+def _parse_time(value: str) -> datetime:
+    """Azure DevOps sends anywhere from 1 to 7 fractional digits. Python 3.10 only
+    parses 3 or 6, so pad or cut them to 6 first."""
+    value = re.sub(r"\.(\d+)", lambda m: "." + (m.group(1) + "000000")[:6], value)
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
 @dataclass
 class _Scope:
     project: str
@@ -320,97 +445,124 @@ class _Scope:
     created_after: date | None = None
     recheck_closed_days: int | None = 30
 
+    def render_key(self) -> str:
+        """Options that change a PR's text without changing its fingerprint. When
+        this changes, every PR is rendered again once."""
+        return json.dumps([self.include_commits])
+
     def wants_repo(self, repo: dict) -> bool:
         return not self.repositories or repo.get("name", "").lower() in {
             r.lower() for r in self.repositories
         }
 
     def warm(self, pr: dict, now: datetime) -> bool:
-        """Whether to read threads this run. Comments mostly land on open PRs."""
+        """Whether to read the full PR and threads this run. Activity mostly lands on
+        open PRs and ones that closed recently."""
         if self.recheck_closed_days is None or pr.get("status") == "active":
             return True
         closed = pr.get("closedDate")
         if not closed:
             return True
-        closed_at = datetime.fromisoformat(closed.replace("Z", "+00:00"))
-        return now - closed_at <= timedelta(days=self.recheck_closed_days)
+        return now - _parse_time(closed) <= timedelta(days=self.recheck_closed_days)
 
 
 def sync_pull_requests(
-    client: AzureDevOpsClient,
+    service: Any,
     scope: _Scope,
     state: dict,
-    stats: dict | None = None,
+    stats: dict[str, int] | None = None,
+    *,
     now: datetime | None = None,
+    max_requests: int = DEFAULT_MAX_REQUESTS,
+    check_active: Callable[[], None] | None = None,
 ) -> Iterator[dict]:
     """Rows for new or changed PRs, then tombstones.
 
     ``state["fingerprints"]`` maps each PR key to "<list fp>:<detail fp>". The
     detail half is only compared on runs that fetched it, so an old PR going quiet
-    doesn't look like a change. State is written at the end only, so a failed run
-    is retried from where the last good one left off.
+    doesn't look like a change. If the run is cut short, the fingerprints of the
+    PRs already synced are kept and nothing is deleted, because the listing is
+    incomplete; the next run skips what's done and carries on.
     """
-    now = now or datetime.now(UTC)
-    known: dict[str, str] = dict(state.get("fingerprints", {}))
+    now = now or datetime.now(timezone.utc)
     stats = stats if stats is not None else {}
-    stats.update(scanned=0, changed=0, removed=0)
+    for key in ("scanned", "skipped", "deleted", "failed"):
+        stats.setdefault(key, 0)
+    calls = _Calls(service, max_requests, check_active)
+    org_url = service.organization_url
 
-    repos = _repos(client, scope.project)
-    if not repos and known:
-        # A failed listing is far likelier than a project with no repos left.
-        logger.warning("Azure Repos: no repositories listed but %d PRs known, skipping", len(known))
-        return
-    selected = [r for r in repos if scope.wants_repo(r)]
-    missing = set(map(str.lower, scope.repositories)) - {r["name"].lower() for r in selected}
-    if missing:
-        logger.warning("Azure Repos: repositories not found: %s", ", ".join(sorted(missing)))
+    known: dict[str, str] = dict(state.get("fingerprints", {}))
+    if state.get("render") not in (None, scope.render_key()):
+        logger.info("Azure Repos: rendering options changed, re-rendering every pull request")
+        known = dict.fromkeys(known, "")
+
+    def save() -> None:
+        state["fingerprints"] = known
+        state["render"] = scope.render_key()
 
     seen: set[str] = set()
-    for repo in selected:
-        prefix = f"{repo['id']}/"
-        if repo.get("isDisabled"):
-            # Disabled isn't deleted, and its PRs can't be read. Keep what we have.
-            seen |= {key for key in known if key.startswith(prefix)}
-            continue
-        for pr in _pull_requests(client, scope.project, repo["id"], scope.created_after):
-            if pr.get("status") == "abandoned" and not scope.include_abandoned:
+    try:
+        repos = _repos(calls, scope.project)
+        if not repos and known:
+            # A failed listing is far likelier than a project with no repos left.
+            logger.warning("Azure Repos: no repositories listed but %d PRs known", len(known))
+            return
+        selected = [r for r in repos if scope.wants_repo(r)]
+        missing = set(map(str.lower, scope.repositories)) - {r["name"].lower() for r in selected}
+        if missing:
+            logger.warning("Azure Repos: repositories not found: %s", ", ".join(sorted(missing)))
+
+        for repo in selected:
+            prefix = f"{repo['id']}/"
+            if repo.get("isDisabled"):
+                # Disabled isn't deleted, and its PRs can't be read. Keep what we have.
+                seen |= {key for key in known if key.startswith(prefix)}
                 continue
-            key = prefix + str(pr["pullRequestId"])
-            seen.add(key)
-            stats["scanned"] += 1
-            pr_id = pr["pullRequestId"]
-            list_fp = _list_fingerprint(repo, pr)
-            old_list_fp, _, old_detail_fp = known.get(key, "").partition(":")
-            full: dict | None = None
-            threads: list[dict] = []
-            detail_fp = None
-            if key not in known or scope.warm(pr, now):
-                full = _pull_request(client, scope.project, repo["id"], pr_id)
-                threads = _threads(client, scope.project, repo["id"], pr_id)
-                detail_fp = _detail_fingerprint(full, threads)
-            if old_list_fp == list_fp and detail_fp in (None, old_detail_fp):
-                continue
-            if full is None:
-                full = _pull_request(client, scope.project, repo["id"], pr_id)
-                threads = _threads(client, scope.project, repo["id"], pr_id)
-                detail_fp = _detail_fingerprint(full, threads)
-            commits = (
-                _commits(client, scope.project, repo["id"], pr_id) if scope.include_commits else []
-            )
-            known[key] = f"{list_fp}:{detail_fp}"
-            stats["changed"] += 1
-            content = render_pull_request(repo, full, threads, commits)
-            yield _row(repo, full, content, client.organization_url, scope.project)
+            for pr in _pull_requests(calls, scope.project, repo["id"], scope.created_after):
+                if pr.get("status") == "abandoned" and not scope.include_abandoned:
+                    continue
+                pr_id = pr["pullRequestId"]
+                key = prefix + str(pr_id)
+                seen.add(key)
+                stats["scanned"] += 1
+                list_fp = _list_fingerprint(repo, pr)
+                old_list_fp, _, old_detail_fp = known.get(key, "").partition(":")
+                full: dict | None = None
+                threads: list[dict] = []
+                detail_fp = None
+                if key not in known or scope.warm(pr, now):
+                    full = _pull_request(calls, scope.project, repo["id"], pr_id)
+                    threads = _threads(calls, scope.project, repo["id"], pr_id)
+                    detail_fp = _detail_fingerprint(full, threads)
+                if old_list_fp == list_fp and detail_fp in (None, old_detail_fp):
+                    stats["skipped"] += 1
+                    continue
+                if full is None:
+                    full = _pull_request(calls, scope.project, repo["id"], pr_id)
+                    threads = _threads(calls, scope.project, repo["id"], pr_id)
+                    detail_fp = _detail_fingerprint(full, threads)
+                commits = (
+                    _commits(calls, scope.project, repo["id"], pr_id)
+                    if scope.include_commits
+                    else []
+                )
+                known[key] = f"{list_fp}:{detail_fp}"
+                content = render_pull_request(repo, full, threads, commits)
+                yield _row(repo, full, content, org_url, scope.project)
+    except _CutShortError as cut:
+        save()
+        stats["failed"] = max(1, stats["failed"])
+        stats[f"failed_{cut.reason}"] = 1
+        logger.warning("Azure Repos stopped early (%s); the next run resumes.", cut.reason)
+        return
 
     for key in sorted(set(known) - seen):
         del known[key]
-        stats["removed"] += 1
+        stats["deleted"] += 1
         yield {"id": key, "_deleted": True}
 
-    state["fingerprints"] = known
-    logger.info(
-        "Azure Repos: %(scanned)d PRs scanned, %(changed)d changed, %(removed)d removed", stats
-    )
+    save()
+    logger.info("Azure Repos: %(scanned)d scanned, %(skipped)d skipped, %(deleted)d deleted", stats)
 
 
 def _resource_name(org_url: str, project: str) -> str:
@@ -420,24 +572,28 @@ def _resource_name(org_url: str, project: str) -> str:
 
 def azure_repos_source(
     *,
-    organization: str | None = None,
     project: str,
     pat: str | None = None,
+    organization: str | None = None,
     organization_url: str | None = None,
     repositories: Iterable[str] | None = None,
     include_abandoned: bool = True,
     include_commits: bool = True,
     created_after: date | None = None,
     recheck_closed_days: int | None = 30,
+    resource_name: str | None = None,
+    max_requests: int = DEFAULT_MAX_REQUESTS,
     check_active: Callable[[], None] | None = None,
-    client: AzureDevOpsClient | None = None,
+    service: Any = None,
+    client: Any = None,
 ):
     """A dlt resource with one row per pull request. Use write_disposition="merge".
 
     Args:
-        organization: Name from ``https://dev.azure.com/<organization>``.
         project: Project name or id.
-        pat: Token with Code (Read). Defaults to ``AZURE_DEVOPS_PAT``.
+        pat: Personal access token with Code (Read). Needed unless ``service`` is
+            given.
+        organization: Name from ``https://dev.azure.com/<organization>``.
         organization_url: Full URL instead, for Azure DevOps Server or
             ``*.visualstudio.com``.
         repositories: Repository names to sync. All of the project's by default.
@@ -445,24 +601,29 @@ def azure_repos_source(
             wasn't done.
         include_commits: Add each PR's commit messages.
         created_after: Skip PRs created before this date.
-        recheck_closed_days: Re-read threads of PRs closed within this many days
-            on every run. ``None`` re-reads every PR, which costs one request
-            per PR per run.
-        check_active: Optional host authorization checkpoint during extraction.
-        client: Ready-made client, for tests.
+        recheck_closed_days: Read the full PR and threads of PRs closed within this
+            many days on every run. ``None`` reads every PR's, two requests per PR.
+        resource_name: Name of this source's table and sync state. Defaults to
+            ``azure_repos_<org>_<project>``. Give each source its own name when one
+            project is synced twice with different selections.
+        max_requests: Request budget of one run. A bigger project finishes over
+            several runs.
+        check_active: Optional host authorization checkpoint, called before each
+            request.
+        service: Pre-built client, mainly for tests. ``client`` is an alias.
     """
     if getattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 0) < 1:
         raise RuntimeError(
-            "Azure Repos sync needs a cognee build with table-scoped document cleanup."
+            "Azure Repos sync requires cognee>=1.6.3 (table-scoped document cleanup)."
         )
-    if client is None:
+    service = service or client
+    if service is None:
         url = organization_url or (organization and f"https://dev.azure.com/{organization}")
-        token = pat or os.environ.get("AZURE_DEVOPS_PAT")
-        if not url or not token:
-            raise ValueError(
-                "Need organization= (or organization_url=) and pat= (or AZURE_DEVOPS_PAT)."
-            )
-        client = AzureDevOpsClient(url, token)
+        if not url:
+            raise ValueError("Pass organization= (or organization_url= for Azure DevOps Server).")
+        if not pat:
+            raise ValueError("Pass pat=, a personal access token with Code (Read).")
+        service = AzureDevOpsClient(url, pat)
 
     scope = _Scope(
         project,
@@ -472,9 +633,9 @@ def azure_repos_source(
         created_after,
         recheck_closed_days,
     )
-    # Named per org and project, and used as the pipeline scope, so two projects
-    # (or one project in two datasets) never share fingerprints or a cleanup table.
-    name = _resource_name(client.organization_url, project)
+    # Named per org and project by default, and used as the pipeline scope, so two
+    # projects (or one project in two datasets) never share fingerprints or a cleanup table.
+    name = resource_name or _resource_name(service.organization_url, project)
     stats: dict[str, int] = {}
 
     @dlt.resource(
@@ -484,7 +645,15 @@ def azure_repos_source(
         columns={"_deleted": {"data_type": "bool", "hard_delete": True}},
     )
     def azure_repos_pull_requests():
-        rows = sync_pull_requests(client, scope, dlt.current.resource_state(), stats)
+        stats.clear()
+        rows = sync_pull_requests(
+            service,
+            scope,
+            dlt.current.resource_state(),
+            stats,
+            max_requests=max_requests,
+            check_active=check_active,
+        )
         yield from dlt_utils.guarded_rows(rows, check_active)
 
     resource = azure_repos_pull_requests()
