@@ -62,8 +62,8 @@ the same call again to sync only what changed. See `examples/example.py`.
 | `include_comments` | `True` | Add each card's comments to its document. |
 | `include_checklists` | `True` | Add each card's checklists to its document. |
 | `full_resync` | `False` | Re-render every card and read all comments again. |
-| `max_requests` | `1500` | Request budget of one run, checked between boards. A bigger account finishes over several runs. |
-| `resource_name` | derived | Names this sync's state and cleanup. Derived from the board, the workspace, or `trello_my_boards`; **required** when `board_ids` lists several boards, since two sources sharing one would delete each other's cards. |
+| `max_requests` | `1500` | Request budget of one run, checked before each request once a card or board is saved. A bigger account finishes over several runs. |
+| `resource_name` | derived | Names this sync's state and cleanup. Derived from the board or the workspace (plus a short hash when it has capitals, spaces or punctuation), or `trello_my_boards`; **required** when `board_ids` lists several boards, since two sources sharing one would delete each other's cards. |
 
 Changing `include_comments` or `include_checklists` re-renders every card on the next run.
 
@@ -79,7 +79,9 @@ id), so the order Trello happens to answer in never changes a document.
 
 **Known gaps:** attachments, custom fields, votes and stickers are not ingested. A comment
 edited without any other change on its card shows up on the card's next change, or with
-`full_resync=True`.
+`full_resync=True`. A board in `board_ids` that keeps answering 401 stops every run at that
+board once a row was emitted, so the boards listed after it do not sync until it is fixed;
+the only trace is `failed_auth` in `cognee_sync_stats`.
 
 ## How sync and forget-on-delete work
 
@@ -92,7 +94,9 @@ edited without any other change on its card shows up on the card's next change, 
   labels, checklists) and compared card by card. Each card's comment count is part of that
   comparison, which also catches added and deleted comments.
 - **Comments of changed cards only.** They are read per card, or for the whole board when
-  that takes fewer requests (for example on the first sync).
+  that takes fewer requests (for example on the first sync). The card endpoint returns at
+  most 1000 comments, so a card with more is always read through the board feed. A card
+  deleted while the run reads its comments is skipped, and the board is read again next run.
 - **Forget-on-delete.** Deleted cards, archived ones (unless `include_archived`), boards
   that are deleted or archived, and boards you stop selecting are removed from memory on
   the next sync. Deletions are decided once per run across all selected boards, so a card
@@ -101,7 +105,7 @@ edited without any other change on its card shows up on the card's next change, 
 - **A run is bounded.** On a rate limit (Trello allows 100 requests per 10 seconds per
   token and 300 per key, and `Retry-After` is honoured up to 60 seconds), an expired token
   after progress, or a spent `max_requests` budget, the run stops cleanly, keeps the boards
-  it finished, and reports why in `cognee_sync_stats` (`failed`, plus `failed_rate_limit`,
+  and cards it finished, and reports why in `cognee_sync_stats` (`failed`, plus `failed_rate_limit`,
   `failed_auth` or `failed_budget`). Deletions are only decided by a run that finished.
   Any other error raises, and dlt keeps the previous state.
 

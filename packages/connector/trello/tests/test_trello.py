@@ -299,6 +299,8 @@ def test_new_comment_is_read_for_that_card_only(trello):
     assert _ids(rows) == ["card:c1"]
     assert "Priya Shah (2026-10-05): Fixed in 2.3" in rows[0]["content"]
     assert _comment_calls(trello) == ["/cards/c1/actions"]
+    params = next(p for path, p in trello.calls if path == "/cards/c1/actions")
+    assert params["memberCreator_fields"] == "fullName" and params["member"] == "false"
 
 
 def test_deleted_comment_is_caught_through_the_comment_count(trello):
@@ -321,6 +323,44 @@ def test_many_changed_cards_read_comments_for_the_whole_board(trello):
         trello.comment(f"c{index}", "note")
     _run(trello, {})
     assert _comment_calls(trello) == [f"/boards/{BOARD}/actions"]
+
+
+def test_card_over_1000_comments_is_read_from_the_board_feed(trello):
+    trello.add_card("c1", "Export")
+    for index in range(1050):
+        trello.comment("c1", f"comment-{index:04d}")
+    rows = _run(trello, {})
+    card = next(row for row in rows if row["id"] == "card:c1")
+    assert "comment-0000" in card["content"] and card["content"].count("comment-") == 1050
+    assert _comment_calls(trello) == [f"/boards/{BOARD}/actions"] * 2
+
+
+def test_card_endpoint_stopping_at_1000_comments_raises_naming_the_card(trello):
+    trello.add_card("c1", "Export")
+    for index in range(1001):
+        trello.comment("c1", f"comment {index}")
+    walker = _Walker(trello, _config(), {}, _stats(), None)
+    with pytest.raises(TrelloAPIError, match="card c1 has more comments"):
+        walker._card_comments("c1")
+
+
+@pytest.mark.parametrize("board_ids", [(BOARD,), ()])
+def test_card_deleted_during_the_run_keeps_its_board(trello, board_ids):
+    trello.add_card("c1", "Export")
+    trello.add_card("c2", "Dark mode")
+    state = {}
+    _run(trello, state, board_ids=board_ids)
+
+    trello.comment("c1", "New note")
+    trello.errors["c1"] = 404
+    stats = _stats()
+    assert _run(trello, state, stats=stats, board_ids=board_ids) == []
+    assert stats["gone"] == 0 and set(state["boards"][BOARD]["cards"]) == {"c1", "c2"}
+
+    # The board cursor did not move, so the next run reads the card again.
+    del trello.errors["c1"]
+    rows = _run(trello, state, board_ids=board_ids)
+    assert _ids(rows) == ["card:c1"] and "New note" in rows[0]["content"]
 
 
 def test_checklist_change_without_any_action_is_caught_and_keeps_comments(trello):
@@ -465,13 +505,28 @@ def test_rate_limit_stops_cleanly_and_skips_deletions(trello):
     assert state["boards"]["b2"]["cards"]
 
 
-def test_request_budget_is_checked_between_boards(trello):
+def test_request_budget_is_checked_after_the_first_saved_board(trello):
     trello.add_board("b2", "Ops")
     trello.add_card("c2", "Deploy", board_id="b2")
     stats = _stats()
     rows = _run(trello, {}, stats=stats, board_ids=("b1", "b2"), max_requests=3)
     assert _ids(rows) == [f"board:{BOARD}"]
     assert stats["failed_budget"] == 1
+
+
+def test_request_budget_stops_inside_a_board_and_resumes(trello):
+    for index in range(3):
+        trello.add_card(f"c{index}", f"Card {index}")
+        for note in range(700):
+            trello.comment(f"c{index}", f"note {note}")
+    state = {}
+    emitted, failed = [], []
+    for _ in range(4):
+        stats = _stats()
+        emitted.append(_ids(_run(trello, state, stats=stats, max_requests=10)))
+        failed.append(stats["failed"])
+    assert emitted == [[f"board:{BOARD}", "card:c0"], ["card:c1"], ["card:c2"], []]
+    assert failed == [1, 1, 0, 0]
 
 
 def test_deselected_board_is_forgotten(trello):
@@ -546,7 +601,11 @@ def test_source_declares_document_path_and_scope(trello):
     assert getattr(source, dlt_utils.DOCUMENT_SOURCE_ATTR) == "trello"
     assert getattr(source, dlt_utils.PIPELINE_SCOPE_ATTR) == "trello_b1"
     assert source.name == "trello_b1"
-    assert trello_source(workspace_id="Acme Team", client=trello).name == "trello_acme_team"
+    spaced = trello_source(workspace_id="Acme Team", client=trello).name
+    dashed = trello_source(workspace_id="acme-team", client=trello).name
+    assert spaced.startswith("trello_acme_team_") and dashed.startswith("trello_acme_team_")
+    assert spaced != dashed
+    assert trello_source(workspace_id="acme", service=trello).name == "trello_acme"
     assert trello_source(service=trello).name == "trello_my_boards"
 
 

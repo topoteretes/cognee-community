@@ -138,6 +138,7 @@ class FakeTrello:
             ]
         match = re.fullmatch(r"/cards/(\w+)/actions", path)
         if match:
+            self._fail(match.group(1))
             comments = sorted(self._comments(match.group(1)), key=lambda a: a["id"], reverse=True)
             page = int(params["page"])
             return comments[page * 50 : (page + 1) * 50]
