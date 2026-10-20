@@ -69,7 +69,7 @@ and forgets what was deleted. See `examples/example.py` for the full flow.
 |---|---|
 | *(none)* | The whole workspace. |
 | `group_ids=["<uuid>"]` | Only stories, epics and iterations of these teams (the API calls a team a "group"). |
-| `epic_ids=[16, 42]` | Only these epics, the stories in them, and the iterations those stories are planned in. |
+| `epic_ids=[16, 42]` | Only these epics, the stories in them, and the iterations those stories are planned in. An iteration none of those stories sits in any more (the last one moved to another sprint) is forgotten, as a story leaving a selected epic is. |
 | `include_archived=False` | Leave out archived stories and epics. One is forgotten once it is archived. Default `True`: archived stories are kept and marked `Archived: yes`. |
 | `token="..."` | API token. Defaults to the `SHORTCUT_API_TOKEN` environment variable. |
 | `resource_name="shortcut_documents"` | The dlt table name, which also scopes the sync state. Lowercase snake_case, at most 64 characters. See below. |
@@ -167,10 +167,11 @@ per minute.
 ## How forget-on-delete works
 
 Every run lists all in-scope stories by `created_at` and compares the ids, plus the current
-epic and iteration ids, with the ids emitted by earlier runs. The listing ends at Shortcut's
-own clock (the `Date` header of its first answer), so a local clock that runs behind cannot
-leave new stories out; without a `Date` header the local clock is used and a warning logged. Ids that are gone are emitted
-with the `_deleted` hard-delete marker, dlt removes those rows on `merge`, and cognee's
+epic and iteration ids, with the ids emitted by earlier runs. The listing ends at the later
+of Shortcut's clock (the `Date` header of its first answer) and the local one, so neither a
+local clock that runs behind nor a stale `Date` from a caching proxy can leave new stories
+out; a gap of over a minute between the two, or a missing `Date`, is logged. Ids that are
+gone are emitted with the `_deleted` hard-delete marker, dlt removes those rows on `merge`, and cognee's
 `orphan_cleanup` removes them from the graph and vector stores.
 
 All listings and lookups are completed before the first row is emitted, and state is saved
@@ -187,12 +188,17 @@ whose own `GET` fails keeps its previous document and is fetched again on the ne
 rest of the run goes on. Epics and labels come from their listings and have no request of
 their own.
 
-- **`403` or `404`** (hidden from this token, or a passing glitch): kept. If it answers that
-  way in three runs in a row at the same `updated_at`, its document is forgotten and it is not
-  asked about again until its `updated_at` moves. A `403` only counts toward that when another
-  item of the same kind was fetched in the same run: if every story (or every iteration)
-  answers `403`, the token has lost a permission, nothing is forgotten, a warning says so, and
-  the stats count it as `failed_permission`.
+- **`403` or `404`**: kept. The item may be hidden from this token, or Shortcut may be failing
+  or the token may have lost a permission; only the first is a reason to forget it. So the
+  answer counts only when access to that kind is shown to work in the same run: another
+  story (or iteration) was read, or, when nothing else of that kind changed, one unchanged
+  item is read as a check (one request, and only while something is unreadable). If the
+  check answers `403`/`404` too, or there is nothing to check with, nothing counts, a warning
+  names the token's permissions, and the stats count it as `failed_permission`; if the check
+  hits a server error, nothing counts either. After three counted runs at the same
+  `updated_at` **and** 24 hours since the first, the document is forgotten. A forgotten item
+  is asked again when its `updated_at` moves, and otherwise once a day (at most 10 per run,
+  after everything else); if it reads again, it comes back.
 - **A server error or no answer** that outlasts the retries: kept. Three of these in a row on
   fresh items means Shortcut itself is down, and the run stops cleanly (below).
 
@@ -200,23 +206,26 @@ Items kept from an earlier run are fetched after the fresh ones and never count 
 streak, so items that keep failing cannot hold up the others.
 
 Some failures stop the run **cleanly** instead of aborting it: a `401` after at least one item
-was emitted, a rate limit that outlasts the retries or asks for a wait over 60 seconds, and
-the outage above. The run then ends normally: what it emitted is loaded, nothing is deleted,
-and the cursor stays where it was, so the next run lists the same window again and fetches
+was emitted, a rate limit that outlasts the retries or asks for a wait over 60 seconds, a run
+that has already waited 120 seconds in all, and the outage above. The run then ends normally:
+what it emitted is loaded, nothing is deleted, nothing counts toward forgetting an item, and
+the cursor stays where it was, so the next run lists the same window again and fetches
 what this one did not reach, even if nothing changed upstream. Relisting costs nothing extra:
 the sweep runs every time anyway, and the `updated_at` listing is one more search request.
 A `401` before anything was emitted still raises, since that is a bad token.
 
 Error messages name the status and the endpoint only (`Shortcut /stories/123: HTTP 404`).
-Shortcut's own message is on the exception's `detail`; a response body or the token never is.
+Shortcut's own message is on the exception's `detail`, with the token cut out should Shortcut
+echo it; a response body never is.
 
 ### Sync stats
 
 `resource.cognee_sync_stats` holds the counts of the last run, as plain ints: `scanned`
 (stories listed), `skipped` (unchanged), `failed` (item failures), `deleted`, `kept` (items
 waiting for a retry) and `given_up`, plus `failed_auth`, `failed_rate_limit` or
-`failed_unavailable` when the run stopped early for that reason, and `failed_permission`
-(items answering `403` while nothing of their kind could be read).
+`failed_unavailable` when the run stopped early for that reason, `failed_permission` (items
+answering `403`/`404` while nothing of their kind could be read), and `probe_story` /
+`probe_iteration` when a check request was made.
 
 ## Limits
 
@@ -231,8 +240,9 @@ waiting for a retry) and `given_up`, plus `failed_auth`, `failed_rate_limit` or
 - A renamed member updates the stories they own. A comment keeps its author's old name
   until that story changes for another reason.
 - Epic comments and iteration-level discussion are not read.
-- A story or iteration that answers `403` or `404` in three runs in a row is forgotten until
-  it changes.
+- A story or iteration that answers `403` or `404` while others of its kind read fine, in
+  three runs over at least 24 hours, is forgotten until it changes or reads again (asked
+  once a day).
 - Deletions propagate on a foreground `remember(...)`. cognee skips orphan cleanup for
   `run_in_background=True`.
 
@@ -290,10 +300,14 @@ The tests mock the Shortcut API (no token, no network). They cover rendering, th
 fingerprint, the date-window splitting, the cursor and its overlap, one-second timestamps,
 renames and deletions of epics, iterations, labels, states and owners, iterations fetched
 only on change, story deletion, stories and iterations that fail on their own (kept and
-retried, three unreadable ones not blocking a run and given up after three runs, retries
-going last), the clean stops (`401` mid-run, rate limit, long `Retry-After`, outage) and
-what the next run picks up, the sweep ending at Shortcut's clock, bodies of the wrong shape
-(also on the split path), retries, the token never reaching a message or a log line, and the
+retried, retries going last, three unreadable ones not blocking a run, `403`/`404` counted
+only when access is shown to work, with a check request in steady state, nothing forgotten
+in a partial outage, within a day, or after a lost permission, given-up items asked again
+after a day, runs that stopped early counting nothing), the clean stops (`401` mid-run, rate
+limit, long `Retry-After`, the run's wait budget, outage) and what the next run picks up,
+the sweep ending at the later of Shortcut's and the local clock (a stale `Date` included),
+bodies of the wrong shape (also on the split path), retries, the token never reaching a
+message, a log line or an error's `detail`, state written by the previous version, and the
 failure paths that must delete nothing. A real `dlt` pipeline into a temp sqlite destination
 checks edits, renames and deletes across runs (the deleted row is gone from the table), two
 sources in one dataset staying apart (also for deletions), a story kept and retried, a `401`

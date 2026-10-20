@@ -48,16 +48,30 @@ _MAX_RETRIES = 5
 # 429 is Shortcut's rate limit (200 requests a minute, per its docs); the 5xx
 # answers are the usual temporary ones.
 _TRANSIENT_STATUSES = (429, 500, 502, 503, 504)
-# The longest single wait. cognee holds its dlt staging lock during a sync, so
-# a longer Retry-After stops the run cleanly instead (it resumes next run).
+# The longest single wait, and the most a run waits in all. cognee holds its dlt
+# staging lock during a sync, so a longer Retry-After, or a wait past the
+# budget, stops the run cleanly instead (it resumes next run).
 _MAX_WAIT_SECONDS = 60
+_MAX_TOTAL_WAIT_SECONDS = 120
 # Fresh item failures in a row (5xx or no answer, after retries) that mean
-# Shortcut itself is down: the run stops cleanly. Items already kept for a retry
-# never count.
+# Shortcut itself is down: the run stops cleanly. One or two can be a single
+# broken item; three different items failing back to back are rarely a
+# coincidence, and a stop costs nothing, as the next run resumes. Items already
+# kept for a retry never count.
 _OUTAGE_STREAK = 3
-# Runs a listed story or iteration may answer 403/404 at the same stamp before
-# its document is forgotten. It is asked again once its stamp moves.
+# A listed story or iteration that answers 403/404 at the same stamp is
+# forgotten after 3 runs AND 24 hours, counting only runs that finished and
+# showed access to work (see _Run.settle): a host on a fast cron cannot forget
+# an item in minutes, and a weekly cron still needs three observations. A
+# forgotten item is asked again when its stamp moves, or after another day.
 _GIVE_UP_RUNS = 3
+_GIVE_UP_AFTER = timedelta(hours=24)
+_REASK_AFTER = timedelta(hours=24)
+# Forgotten items asked again per run, oldest first, after everything else.
+_MAX_REASKS = 10
+# The run's clock is the later of Shortcut's Date header and the local clock.
+# They differing by more than this is logged (a proxy may cache a stale Date).
+_CLOCK_TOLERANCE = timedelta(seconds=60)
 
 # A story listing with this many results or more is treated as possibly
 # truncated and split. Listings up to 2,609 stories were verified complete.
@@ -66,6 +80,7 @@ _WINDOW_CAP = 2500
 _SECOND = timedelta(seconds=1)
 # Where the first window starts.
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+_EPOCH_STAMP = "1970-01-01T00:00:00Z"
 # How far before the cursor the updated_at listing starts (see _Run.list).
 # The overlap only has to catch a story stamped at or just before the cursor
 # that the previous listing could not see yet; a minute is a wide margin.
@@ -83,7 +98,7 @@ class ShortcutAPIError(RuntimeError):
     """An error answer from Shortcut (``status``), or no answer at all (``status`` 0).
 
     The message names only the status and the endpoint. Shortcut's own
-    explanation is on ``detail``; a response body or the token never is.
+    explanation is on ``detail``, with the token cut out; a response body never is.
     """
 
     def __init__(self, status: int, endpoint: str, detail: str = ""):
@@ -136,19 +151,35 @@ def _check_token(token: str) -> None:
 class _Client:
     """One run's access to Shortcut: the session, the host's check, the waits, the clock."""
 
-    def __init__(self, session: Any, check_active: Callable[[], None] | None = None):
+    def __init__(
+        self, session: Any, check_active: Callable[[], None] | None = None, secret: str = ""
+    ):
         self.session = session
         self.check_active = check_active
-        # Shortcut's clock at its first answer (the Date header): the sweep ends there,
-        # so a local clock that runs behind cannot leave new stories out.
+        # The token, only to cut it out of Shortcut's error messages.
+        headers = getattr(session, "headers", None)
+        self.secret = secret or (headers.get("Shortcut-Token", "") if headers else "")
+        # Shortcut's clock at its first answer (the Date header), see _run_clock.
         self.server_now: datetime | None = None
+        self.waited = 0.0  # seconds slept this run
+        self.out_of_time = False  # a wait was refused for the run's budget
 
     def check(self) -> None:
         if self.check_active is not None:
             self.check_active()
 
+    def can_wait(self, seconds: float) -> bool:
+        """Whether a wait fits in the single-wait cap and the run's budget."""
+        if seconds > _MAX_WAIT_SECONDS:
+            return False
+        if self.waited + seconds > _MAX_TOTAL_WAIT_SECONDS:
+            self.out_of_time = True
+            return False
+        return True
+
     def wait(self, seconds: float) -> None:
         self.check()
+        self.waited += seconds
         time.sleep(seconds)
 
 
@@ -162,9 +193,10 @@ def _send(
     """Call a Shortcut API path and return the successful response, retrying transient errors.
 
     Rate limits (429), server errors (5xx) and network failures are retried up
-    to ``_MAX_RETRIES`` times; a wait over ``_MAX_WAIT_SECONDS`` is not taken.
-    Every other error status raises :class:`ShortcutAPIError`. Both 200 and 201
-    are success: the story query answers 201.
+    to ``_MAX_RETRIES`` times; a wait over ``_MAX_WAIT_SECONDS``, or past the
+    run's ``_MAX_TOTAL_WAIT_SECONDS``, is not taken. Every other error status
+    raises :class:`ShortcutAPIError`. Both 200 and 201 are success: the story
+    query answers 201.
     """
     client = _as_client(client)
     url = f"{_API_BASE}{path}"
@@ -178,10 +210,10 @@ def _send(
             )
         except requests.RequestException as exc:
             # Only the type: the message of some requests errors holds a header.
-            if last_attempt:
-                raise ShortcutAPIError(0, path, type(exc).__name__) from None
-            delay = float(2**attempt)
             name = type(exc).__name__
+            delay = float(2**attempt)
+            if last_attempt or not client.can_wait(delay):
+                raise ShortcutAPIError(0, path, name) from None
             logger.warning("Shortcut: %s on %s; retrying in %.0fs.", name, path, delay)
             client.wait(delay)
             attempt += 1
@@ -194,13 +226,13 @@ def _send(
             return response
         if status in _TRANSIENT_STATUSES and not last_attempt:
             delay = _retry_delay(response.headers, attempt)
-            if delay > _MAX_WAIT_SECONDS:
+            if not client.can_wait(delay):
                 raise ShortcutAPIError(status, path, f"asked to wait {delay:.0f}s")
             logger.warning("Shortcut: HTTP %d on %s; retrying in %.0fs.", status, path, delay)
             client.wait(delay)
             attempt += 1
             continue
-        raise ShortcutAPIError(status, path, _error_detail(response))
+        raise ShortcutAPIError(status, path, _redact(_error_detail(response), client.secret))
 
 
 def _request(
@@ -251,6 +283,17 @@ def _error_detail(response: Any) -> str:
     return message[:200] if isinstance(message, str) else ""
 
 
+def _redact(text: str, secret: str) -> str:
+    """``text`` with the token cut out, in case Shortcut echoes it back.
+
+    A token too short to replace safely (it could match ordinary words) drops
+    the whole text when it occurs in it.
+    """
+    if not secret or secret not in text:
+        return text
+    return text.replace(secret, "[token]") if len(secret) >= 8 else ""
+
+
 # ---------------------------------------------------------------------------
 # Timestamps
 # ---------------------------------------------------------------------------
@@ -271,12 +314,14 @@ def _stamp(moment: datetime) -> str:
 def _server_time(response: Any) -> datetime | None:
     """Shortcut's clock when it answered, from the ``Date`` response header.
 
-    ``None`` when the header is missing or unreadable.
+    ``None`` when the header is missing or unreadable. A zone of ``-0000``
+    (unknown) is read as UTC, the zone HTTP dates are in.
     """
     try:
-        return parsedate_to_datetime((response.headers or {}).get("Date"))
+        moment = parsedate_to_datetime((response.headers or {}).get("Date"))
     except (TypeError, ValueError):
         return None
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
 
 
 def _is_settled(updated_at: str, fetched_at: datetime | None) -> bool:
@@ -564,8 +609,10 @@ class _Run:
     ``updated_at`` seen), ``seen`` (stories near the cursor whose copy is final),
     ``fingerprints`` (story id -> hash of its header lines), ``iterations``
     (iteration id -> its mark when last rendered), ``retry`` (row ids kept after a
-    failure), ``unreadable`` (row id -> ``{stamp, runs}`` of items answering
-    403/404) and ``given_up`` (row id -> the stamp at which one was forgotten).
+    failure), ``unreadable`` (row id -> ``{stamp, runs, since}`` of items answering
+    403/404, ``since`` being the run clock at the first counted run) and
+    ``given_up`` (row id -> ``{stamp, at}``: the stamp at which one was forgotten,
+    and when it was last asked).
     """
 
     def __init__(self, client: _Client, state: dict, stats: dict[str, int]):
@@ -581,14 +628,25 @@ class _Run:
         self.unreadable: dict[str, dict] = {
             row_id: dict(entry) for row_id, entry in state.get("unreadable", {}).items()
         }
-        self.given_up: dict[str, str] = dict(state.get("given_up", {}))
+        # A ``given_up`` entry written as a bare stamp (by the previous version of
+        # this connector) is due to be asked again.
+        self.given_up: dict[str, dict] = {
+            row_id: dict(entry) if isinstance(entry, dict) else {"stamp": entry, "at": _EPOCH_STAMP}
+            for row_id, entry in state.get("given_up", {}).items()
+        }
+        # What a run that stops early commits instead: only finished runs count.
+        self.unreadable_before = {row_id: dict(e) for row_id, e in self.unreadable.items()}
         self.kept: set[str] = set()
         self.rendered: set[str] = set()
         self.reached: set[str] = set()  # row ids whose fetch was attempted
         self.outage = 0
-        self.forbidden: list[str] = []  # row ids that answered 403 this run
+        self.unread: dict[str, list[str]] = {}  # kind -> row ids that answered 403/404
+        self.counted: set[str] = set()  # row ids whose 403/404 counted in this run
+        self.reasks: set[str] = set()  # forgotten row ids asked again this run
+        self.reask_failed: set[str] = set()
         self.listed = False
         # Filled by list():
+        self.now = _EPOCH  # the run clock (see _run_clock)
         self.names: dict[str, dict] = {}
         self.epics: list[dict] = []
         self.iterations: list[dict] = []
@@ -596,7 +654,7 @@ class _Run:
         self.stamps: dict[Any, str] = {}  # story id -> updated_at in the cursor listing
         self.settled: set[Any] = set()
         self.prints: dict[str, str] = {}  # story id -> fingerprint of its header now
-        self.order: list[Any] = []  # story ids to render: fresh first, then retries
+        self.order: list[Any] = []  # story ids to render: fresh, retries, then re-asks
         self.next_marks: dict[str, str] = {}
         self.stamp_of: dict[str, str] = {}  # row id -> its listing stamp
 
@@ -622,7 +680,17 @@ class _Run:
         }
         self.epics = [e for e in all_epics if _in_scope(e, group_ids, epic_ids, include_archived)]
 
-        end = (now or _shop_now(self.client)).replace(microsecond=0)
+        self.now = (now or _run_clock(self.client)).replace(microsecond=0)
+        end = self.now
+        # Entries written before ``since`` existed start their 24 hours now; one
+        # that never counted is dropped.
+        for entries in (self.unreadable, self.unreadable_before):
+            for row_id, entry in list(entries.items()):
+                if "since" not in entry:
+                    if entry.get("runs"):
+                        entry["since"] = _stamp(self.now)
+                    else:
+                        del entries[row_id]
         filters = _scope_filters(group_ids, epic_ids, include_archived)
         # The sweep: every in-scope story that exists right now. created_at never
         # changes, so a story cannot move between windows while they are queried.
@@ -632,7 +700,9 @@ class _Run:
         }
         iterations = [i for i in all_iterations if _in_scope(i, group_ids, None, include_archived)]
         if epic_ids:
-            # Only the iterations the selected epics' stories are planned in.
+            # Only the iterations the selected epics' stories are planned in: one
+            # that no selected story sits in any more leaves the scope, as a story
+            # leaving a selected epic does.
             used = {story.get("iteration_id") for story in self.swept.values()}
             iterations = [i for i in iterations if i["id"] in used]
         self.iterations = iterations
@@ -666,16 +736,22 @@ class _Run:
             for story_id in self.swept
             if self.fingerprints.get(str(story_id)) != self.prints[str(story_id)]
         }
-        # A forgotten unreadable item is asked again only once its stamp moves.
+        # A forgotten item is asked again once its stamp moves, or after a day.
         stamp_of = {_story_id(i): s.get("updated_at") or "" for i, s in self.swept.items()}
         stamp_of |= {_iteration_id(i["id"]): _iteration_mark(i) for i in self.iterations}
-        for row_id, stamp in list(self.given_up.items()):
+        for row_id, entry in list(self.given_up.items()):
             if row_id not in stamp_of:
                 del self.given_up[row_id]
-            elif stamp_of[row_id] != stamp:
+            elif stamp_of[row_id] != entry["stamp"]:
                 del self.given_up[row_id]
                 kind, key = row_id.split(":", 1)
                 (self.fingerprints if kind == "story" else self.marks).pop(key, None)
+        due = sorted(
+            (entry["at"], row_id)
+            for row_id, entry in self.given_up.items()
+            if _parse(entry["at"]) <= self.now - _REASK_AFTER
+        )
+        self.reasks = {row_id for _, row_id in due[:_MAX_REASKS]}
         self.stamp_of = stamp_of
         # Only stories in the sweep are rendered, so every emitted id can be deleted.
         changed &= self.swept.keys()
@@ -683,7 +759,8 @@ class _Run:
         self.retry &= set(stamp_of) - set(self.given_up)
         fresh = sorted(i for i in changed if _story_id(i) not in self.retry)
         retried = sorted(i for i in changed if _story_id(i) in self.retry)
-        self.order = fresh + retried
+        asked = sorted(i for i in self.swept if _story_id(i) in self.reasks)
+        self.order = fresh + retried + asked
         self.stats["scanned"] = len(self.swept)
         self.stats["skipped"] = len(self.swept) - len(self.order)
         self.listed = True
@@ -706,6 +783,7 @@ class _Run:
             if _is_settled(self.stamps.get(story_id, ""), fetched_at):
                 self.settled.add(story_id)
             yield _story_row(story, self.names)
+        self.settle("story")
 
         # The epic list carries everything an epic document shows, so epics cost
         # no request and are emitted every run; unchanged text keeps its hash.
@@ -714,13 +792,13 @@ class _Run:
 
         # The iteration list has no description, so an iteration costs one request,
         # made only when the list shows it is new or changed.
-        fresh = [i for i in self.iterations if _iteration_id(i["id"]) not in self.retry]
-        retried = [i for i in self.iterations if _iteration_id(i["id"]) in self.retry]
-        for item in fresh + retried:
+        listed = [i for i in self.iterations if _iteration_id(i["id"]) not in self.given_up]
+        fresh = [i for i in listed if _iteration_id(i["id"]) not in self.retry]
+        retried = [i for i in listed if _iteration_id(i["id"]) in self.retry]
+        asked = [i for i in self.iterations if _iteration_id(i["id"]) in self.reasks]
+        for item in fresh + retried + asked:
             row_id, key, mark = _iteration_id(item["id"]), str(item["id"]), _iteration_mark(item)
-            if row_id in self.given_up:
-                continue
-            if self.marks.get(key) == mark and row_id not in self.retry:
+            if self.marks.get(key) == mark and row_id not in self.retry | self.reasks:
                 self.next_marks[key] = mark
                 continue
             self.reached.add(row_id)
@@ -734,10 +812,13 @@ class _Run:
             if _is_settled(item.get("updated_at") or "", fetched_at):
                 self.next_marks[key] = mark
             yield _iteration_row(iteration)
+        self.settle("iteration")
 
     def _succeeded(self, row_id: str) -> None:
-        if row_id not in self.retry:
+        if row_id not in self.retry | self.reasks:
             self.outage = 0
+        if self.given_up.pop(row_id, None) is not None:
+            logger.info("Shortcut: %s is readable again.", row_id)
         self.unreadable.pop(row_id, None)
         self.rendered.add(row_id)
 
@@ -747,51 +828,101 @@ class _Run:
         self.stop_if_systemic(exc)
         if exc.status == 401:
             raise exc  # nothing rendered yet: the token is bad
+        if row_id in self.reasks:
+            # Still unreadable: it stays forgotten and is asked again in a day.
+            self.reask_failed.add(row_id)
+            return
         self.kept.add(row_id)
         logger.warning("Shortcut: kept %s for a retry next run (%s).", row_id, exc)
-        if exc.status == 403:
-            self.forbidden.append(row_id)  # counted once the run knows if access works
-        elif exc.status == 404:
-            # Still listed, so not gone: a passing glitch, or hidden from this token.
-            self._count_unreadable(row_id)
+        if exc.status in (403, 404):
+            # Still listed, so not gone: hidden from this token, or a passing
+            # failure. settle() decides which once the kind's fetches are done.
+            self.unread.setdefault(row_id.split(":", 1)[0], []).append(row_id)
         elif row_id not in self.retry:
             self.outage += 1
             if self.outage >= _OUTAGE_STREAK:
                 raise _CutShortError("unavailable")
 
-    def _count_unreadable(self, row_id: str) -> None:
-        entry = self.unreadable.get(row_id) or {}
-        stamp = self.stamp_of.get(row_id, "")
-        runs = entry.get("runs", 0) + 1 if entry.get("stamp") == stamp else 1
-        self.unreadable[row_id] = {"stamp": stamp, "runs": runs}
+    def settle(self, kind: str) -> None:
+        """Count this run's 403/404s of one kind where access to that kind is shown to work.
 
-    def _settle_forbidden(self) -> None:
-        """Count this run's 403s as unreadable only where access is shown to work.
-
-        A 403 counts toward giving an item up only if another item of the same
-        kind was fetched in this run: then this one is hidden on its own. If every
-        fetch of a kind answered 403, the token has lost a permission, and nothing
-        may be forgotten for that; the items are only kept.
+        A 403 or 404 on a listed item means it is hidden from this token, or that
+        Shortcut is failing or the token lost a permission; only the first is a
+        reason to forget it. So it counts only if another item of the same kind
+        was read in this run. In steady state the others are unchanged and not
+        fetched, so one of them is fetched as a probe; if the probe fails too,
+        nothing counts.
         """
-        for kind in sorted({row_id.split(":", 1)[0] for row_id in self.forbidden}):
-            mine = [row_id for row_id in self.forbidden if row_id.startswith(f"{kind}:")]
-            if any(row_id.startswith(f"{kind}:") for row_id in self.rendered):
-                for row_id in mine:
-                    self._count_unreadable(row_id)
-                continue
-            self.stats["failed_permission"] = self.stats.get("failed_permission", 0) + len(mine)
-            logger.warning(
-                "Shortcut: %s: every fetch answered 403 this run; check the token's permissions.",
-                kind,
-            )
-            for row_id in mine:
-                entry = self.unreadable.get(row_id)
-                stamp = self.stamp_of.get(row_id, "")
-                if not entry or entry.get("stamp") != stamp:
-                    self.unreadable[row_id] = {"stamp": stamp, "runs": 0}
-        self.forbidden = []
+        pending = self.unread.pop(kind, [])
+        if not pending:
+            return
+        readable = any(row_id.startswith(f"{kind}:") for row_id in self.rendered)
+        probe = None if readable else self._probe(kind)
+        if readable or probe:
+            for row_id in pending:
+                self._count_unreadable(row_id)
+        elif probe is False:
+            self.stats["failed_permission"] = self.stats.get("failed_permission", 0) + len(pending)
+            if self._probe_path(kind) is None:
+                logger.warning(
+                    "Shortcut: %s: every fetch answered 403/404 this run and there is no other "
+                    "%s to check access with; nothing counts toward forgetting it.",
+                    kind,
+                    kind,
+                )
+            else:
+                logger.warning(
+                    "Shortcut: %s: every fetch answered 403/404 this run; "
+                    "check the token's permissions.",
+                    kind,
+                )
+
+    def _probe(self, kind: str) -> bool | None:
+        """Fetch one unchanged item of ``kind``: True when it is readable.
+
+        False when it answers 403/404 too, or there is no other item to try;
+        None when Shortcut is failing (5xx, no answer), which proves nothing.
+        """
+        path = self._probe_path(kind)
+        if path is None:
+            return False
+        self.stats[f"probe_{kind}"] = 1
+        try:
+            _fetch(self.client, path)
+        except ShortcutAPIError as exc:
+            self.stop_if_systemic(exc)
+            if exc.status == 401:
+                raise exc
+            return False if exc.status in (403, 404) else None
+        return True
+
+    def _probe_path(self, kind: str) -> str | None:
+        """The newest item of ``kind`` not fetched this run and not unreadable."""
+        unusable = self.reached | self.unreadable.keys() | self.given_up.keys()
+        if kind == "story":
+            ids = [i for i in self.swept if _story_id(i) not in unusable]
+            if not ids:
+                return None
+            best = max(ids, key=lambda i: (self.swept[i].get("updated_at") or "", i))
+            return f"/stories/{best}"
+        items = [i for i in self.iterations if _iteration_id(i["id"]) not in unusable]
+        if not items:
+            return None
+        best = max(items, key=lambda i: (i.get("updated_at") or "", i["id"]))
+        return f"/iterations/{best['id']}"
+
+    def _count_unreadable(self, row_id: str) -> None:
+        self.counted.add(row_id)
+        entry = self.unreadable.get(row_id)
+        stamp = self.stamp_of.get(row_id, "")
+        if entry and entry["stamp"] == stamp:
+            self.unreadable[row_id] = {**entry, "runs": entry["runs"] + 1}
+        else:
+            self.unreadable[row_id] = {"stamp": stamp, "runs": 1, "since": _stamp(self.now)}
 
     def stop_if_systemic(self, exc: ShortcutAPIError) -> None:
+        if self.client.out_of_time:
+            raise _CutShortError("rate_limit" if exc.status == 429 else "unavailable") from None
         if exc.status == 429:
             raise _CutShortError("rate_limit") from None
         if exc.status == 401 and self.rendered:
@@ -799,21 +930,29 @@ class _Run:
 
     # -- 3. Delete and 4. Commit ------------------------------------------------
     def finish(self) -> Iterator[dict[str, Any]]:
-        self._settle_forbidden()
         current_ids = {_story_id(i) for i in self.swept}
         current_ids |= {_epic_id(e["id"]) for e in self.epics}
         current_ids |= {_iteration_id(i["id"]) for i in self.iterations}
         for row_id, entry in self.unreadable.items():
-            if row_id in self.kept and entry["runs"] >= _GIVE_UP_RUNS:
+            # Only a run that counted this item's failure can give it up: one where
+            # access was not shown to work (a lost permission) never does.
+            if (
+                row_id in self.counted
+                and entry["runs"] >= _GIVE_UP_RUNS
+                and _parse(entry["since"]) <= self.now - _GIVE_UP_AFTER
+            ):
                 logger.warning(
-                    "Shortcut: %s answered HTTP 403/404 in %d runs; its document is "
-                    "forgotten until it changes.",
+                    "Shortcut: %s answered HTTP 403/404 in %d runs since %s; its document is "
+                    "forgotten until it changes or reads again.",
                     row_id,
                     entry["runs"],
+                    entry["since"],
                 )
-                self.given_up[row_id] = entry["stamp"]
+                self.given_up[row_id] = {"stamp": entry["stamp"], "at": _stamp(self.now)}
                 self.kept.discard(row_id)
                 self.stats["given_up"] += 1
+        for row_id in self.reask_failed:
+            self.given_up[row_id]["at"] = _stamp(self.now)
         current_ids -= set(self.given_up)
         deleted = sorted(self.known_ids - current_ids)
         for row_id in deleted:
@@ -835,17 +974,19 @@ class _Run:
             for story_id, when in self.stamps.items()
             if story_id in self.settled and when >= window_start
         }
-        self._commit_items(self.kept, unsettled=self.kept)
+        self._commit_items(self.kept, self.unreadable, self.given_up)
 
     def commit_progress(self) -> None:
         """After a clean stop: keep what was rendered, delete nothing, keep the cursor.
 
         The cursor stays, so the next run lists the same window again (one search),
         and the stories not rendered still differ from their fingerprint or ``seen``.
+        Nothing this run saw counts toward giving an item up. A forgotten item that
+        was read again, has changed or is gone is no longer forgotten (as in any
+        run); nothing new is forgotten, and none is marked as asked.
         """
         if not self.listed:
             return  # stopped while listing: nothing moved
-        self._settle_forbidden()
         for story_id in self.order:
             row_id = _story_id(story_id)
             if row_id in self.rendered:
@@ -859,25 +1000,40 @@ class _Run:
         self.state["cursor"] = self.cursor
         self.state["seen"] = self.seen
         unreached = set(self.retry) - self.reached
-        self._commit_items(self.kept | unreached, unsettled=self.kept | unreached)
+        self._commit_items(
+            self.kept | unreached,
+            {r: e for r, e in self.unreadable_before.items() if r not in self.rendered},
+            self.given_up,
+        )
 
-    def _commit_items(self, retry: set[str], unsettled: set[str]) -> None:
+    def _commit_items(self, retry: set[str], unreadable: dict, given_up: dict) -> None:
         self.state["retry"] = sorted(retry)
         self.state["unreadable"] = {
-            row_id: entry
-            for row_id, entry in sorted(self.unreadable.items())
-            if row_id in unsettled
+            row_id: entry for row_id, entry in sorted(unreadable.items()) if row_id in retry
         }
-        self.state["given_up"] = dict(sorted(self.given_up.items()))
+        self.state["given_up"] = dict(sorted(given_up.items()))
         self.stats["kept"] = len(retry)
 
 
-def _shop_now(client: _Client) -> datetime:
-    """Shortcut's clock at the run's first answer, or the local clock (logged) without one."""
-    if client.server_now is not None:
-        return client.server_now
-    logger.warning("Shortcut: no Date header seen; the sweep ends at the local clock.")
-    return _local_now()
+def _run_clock(client: _Client) -> datetime:
+    """The run's clock: the later of Shortcut's (its first answer's Date) and the local one.
+
+    The sweep ends there, and the give-up times are read from it. The later of
+    the two means neither a local clock that runs behind nor a stale Date (a
+    caching proxy) ends the sweep early, which would make the newest stories look
+    deleted. A clock that runs ahead only widens the windows.
+    """
+    local = _local_now()
+    server = client.server_now
+    if server is None:
+        logger.warning("Shortcut: no Date header seen; the run uses the local clock.")
+        return local
+    if abs(server - local) > _CLOCK_TOLERANCE:
+        logger.warning(
+            "Shortcut: its Date header and the local clock differ by %.0fs; using the later one.",
+            abs((server - local).total_seconds()),
+        )
+    return max(server, local)
 
 
 def _local_now() -> datetime:
@@ -899,14 +1055,14 @@ def sync_stories(
 
     1. *List.* Lookups, epics, iterations, every in-scope story (the sweep) and
        the stories updated since the cursor. A failure here propagates first.
-    2. *Render.* Each changed story (fresh first, then retries), each epic, and
-       each new or changed iteration.
+    2. *Render.* Each changed story (fresh first, then retries, then forgotten
+       ones due to be asked again), each epic, and each new or changed iteration.
     3. *Delete.* A hard-delete marker for every known id that is no longer current.
     4. *Commit.* Only now is ``state`` written.
 
-    A run stopped cleanly (a ``401`` after progress, a rate limit, an outage)
-    keeps what it rendered and its cursor, and deletes nothing. ``now`` (for
-    tests) defaults to Shortcut's clock, read from the run's first answer.
+    A run stopped cleanly (a ``401`` after progress, a rate limit, an outage,
+    the wait budget spent) keeps what it rendered and its cursor, and deletes
+    nothing. ``now`` (for tests) defaults to the run clock (see ``_run_clock``).
     """
     stats = {} if stats is None else stats
     for key in _STAT_KEYS:
@@ -923,7 +1079,6 @@ def sync_stories(
             raise
     except _CutShortError as cut:
         run.commit_progress()
-        stats["failed"] = max(1, stats["failed"])
         stats[f"failed_{cut.reason}"] = 1
         logger.warning("Shortcut sync stopped early (%s); it resumes on the next run.", cut.reason)
         return
@@ -1011,7 +1166,7 @@ def shortcut_source(
         http = service if service is not None else _make_session(resolved_token)
         try:
             rows = sync_stories(
-                _Client(http, check_active),
+                _Client(http, check_active, resolved_token),
                 dlt.current.resource_state(),
                 group_ids=group_ids,
                 epic_ids=epic_ids,

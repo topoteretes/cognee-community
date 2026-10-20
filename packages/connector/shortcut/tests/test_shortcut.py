@@ -320,8 +320,13 @@ def fake():
     return FakeShortcut()
 
 
-def run_sync(session, state, **kwargs):
-    return list(sync_stories(session, state, now=NOW, **kwargs))
+def run_sync(session, state, now=NOW, **kwargs):
+    return list(sync_stories(session, state, now=now, **kwargs))
+
+
+def hours(n):
+    """The run clock ``n`` hours after ``NOW``, for the give-up rule's 24 hours."""
+    return NOW + timedelta(hours=n)
 
 
 def story_rows(rows):
@@ -844,6 +849,9 @@ def test_server_time_reads_the_date_header():
     assert _server_time(response) == datetime(2026, 10, 9, 20, 30, 21, tzinfo=UTC)
     assert _server_time(_Resp(200, {})) is None
     assert _server_time(_Resp(200, {}, {"Date": "soon"})) is None
+    # "-0000" (zone unknown) parses without a zone; it is read as UTC.
+    unknown_zone = _Resp(200, {}, {"Date": "Mon, 19 Oct 2026 06:00:00 -0000"})
+    assert _server_time(unknown_zone) == datetime(2026, 10, 19, 6, 0, 0, tzinfo=UTC)
 
 
 # ---------------------------------------------------------------------------
@@ -1033,6 +1041,23 @@ def test_selection_filters_stories_epics_and_iterations(fake):
     assert [r["id"] for r in both] == ["story:3", "iteration:3"]
 
 
+def test_with_epic_ids_an_iteration_leaves_the_scope_with_its_last_story(fake):
+    fake.add_epic(8)
+    fake.add_iteration(3)
+    fake.add_iteration(4, name="Sprint 13")
+    fake.add_story(1, updated_at=at(1), epic_id=8, iteration_id=3)
+    state = {}
+    rows = run_sync(fake, state, epic_ids=[8])
+    assert [r["id"] for r in rows] == ["story:1", "epic:8", "iteration:3"]
+
+    # The story moves to the next sprint. The scope follows it, as it does for a
+    # story leaving a selected epic: iteration 3 is forgotten, iteration 4 added.
+    fake.stories[1].update(iteration_id=4, updated_at=at(5))
+    rows = run_sync(fake, state, epic_ids=[8])
+    assert [r["id"] for r in rows if not r["_deleted"]] == ["story:1", "epic:8", "iteration:4"]
+    assert tombstones(rows) == [{"id": "iteration:3", "_deleted": True}]
+
+
 def test_archived_story_is_kept_with_its_state(fake):
     fake.add_story(1, updated_at=at(1), workflow_state_id=DONE)
     state = {}
@@ -1214,37 +1239,84 @@ def test_three_unreadable_stories_never_block_the_run_and_are_given_up(fake):
     for run in (1, 2):
         forbid()
         stats = {}
-        rows = run_sync(fake, state, stats=stats)
+        rows = run_sync(fake, state, now=hours(12 * run), stats=stats)
         if run == 1:
             assert set(story_rows(rows)) == {"story:10", "story:14"}  # the others went on
+        else:
+            assert stats["probe_story"] == 1  # 10 and 14 are unchanged: one is read as a check
         assert tombstones(rows) == []
         assert state["retry"] == ["story:11", "story:12", "story:13"]
         runs = {row_id: entry["runs"] for row_id, entry in state["unreadable"].items()}
         assert runs == {"story:11": run, "story:12": run, "story:13": run}
         assert stats["kept"] == 3 and "failed_unavailable" not in stats
+        assert "failed_permission" not in stats
 
     # A story created upstream meanwhile still gets its first document.
     fake.add_story(15, updated_at=at(6))
     forbid()
     stats = {}
-    rows = run_sync(fake, state, stats=stats)
+    rows = run_sync(fake, state, now=hours(36), stats=stats)
     assert "story:15" in story_rows(rows)
-    # Third run at the same stamp: forgotten, and no longer asked about.
+    # Third run, 24 hours after the first: forgotten, and no longer asked about.
     assert [r["id"] for r in tombstones(rows)] == ["story:11", "story:12", "story:13"]
     assert stats["given_up"] == 3 and state["retry"] == [] and state["unreadable"] == {}
     fake.calls.clear()
-    run_sync(fake, state)
+    run_sync(fake, state, now=hours(48))
     assert 11 not in fake.fetched_stories()
 
     # Once a given-up story changes upstream, it is asked about (and ingested) again.
     fake.stories[12]["updated_at"] = at(7)
-    rows = run_sync(fake, state)
+    rows = run_sync(fake, state, now=hours(48))
     assert set(story_rows(rows)) == {"story:12"}
     assert "story:12" not in state["given_up"]
 
 
+def test_failing_runs_within_a_day_forget_nothing_and_a_recovery_clears_them(fake):
+    # A host that syncs every ten minutes sees four runs of 404s in under an hour.
+    for story_id in (1, 2):
+        fake.add_story(story_id, updated_at=at(1))
+    state = {}
+    run_sync(fake, state)
+    fake.stories[2]["updated_at"] = at(5)
+
+    for minutes in (10, 20, 30, 40):
+        fake.queue("/stories/2", _error(404, "Resource not found."))
+        rows = run_sync(fake, state, now=NOW + timedelta(minutes=minutes))
+        assert tombstones(rows) == []
+    assert state["unreadable"]["story:2"]["runs"] == 4
+    assert state["given_up"] == {}
+
+    # Shortcut recovers: the story is read again and its failures are forgotten.
+    rows = run_sync(fake, state, now=hours(1))
+    assert set(story_rows(rows)) == {"story:2"}
+    assert state["unreadable"] == {} and state["retry"] == []
+
+
+def test_a_partial_outage_answering_404_everywhere_forgets_nothing(fake, caplog):
+    # Every GET /stories/N answers 404, the check of an unchanged story included.
+    for story_id in (1, 2, 3, 4):
+        fake.add_story(story_id, updated_at=at(1))
+    state = {}
+    run_sync(fake, state)
+    for story_id in (1, 2, 3):
+        fake.stories[story_id]["updated_at"] = at(5)
+
+    for run in (1, 2, 3, 4):
+        for story_id in (1, 2, 3, 4):
+            fake.queue(f"/stories/{story_id}", _error(404, "Resource not found."))
+        stats = {}
+        rows = run_sync(fake, state, now=hours(24 * run), stats=stats)
+        assert tombstones(rows) == []
+        assert stats["probe_story"] == 1 and stats["given_up"] == 0
+        assert stats["failed_permission"] == 3
+        assert state["unreadable"] == {}
+    assert "story: every fetch answered 403/404 this run" in caplog.text
+    assert {"story:1", "story:2", "story:3", "story:4"} <= set(state["known_ids"])
+
+
 def test_a_lost_permission_never_gives_anything_up(fake, caplog):
-    # Every story answers 403 (the token lost access to stories): kept, never forgotten.
+    # Every story answers 403 and there is no other story to compare with: kept,
+    # never forgotten, and the token's permissions are named.
     for story_id in (1, 2, 3):
         fake.add_story(story_id, updated_at=at(1))
     state = {}
@@ -1252,34 +1324,211 @@ def test_a_lost_permission_never_gives_anything_up(fake, caplog):
     for story_id in (1, 2, 3):
         fake.stories[story_id]["updated_at"] = at(5)
 
-    for _ in range(4):
+    for run in (1, 2, 3, 4):
         for story_id in (1, 2, 3):
             fake.queue(f"/stories/{story_id}", _error(403, "Forbidden"))
         stats = {}
-        rows = run_sync(fake, state, stats=stats)
+        rows = run_sync(fake, state, now=hours(24 * run), stats=stats)
         assert tombstones(rows) == []
         assert stats["failed_permission"] == 3 and stats["given_up"] == 0
-        assert {entry["runs"] for entry in state["unreadable"].values()} == {0}
-    assert "story: every fetch answered 403 this run" in caplog.text
+        assert "probe_story" not in stats
+        assert state["unreadable"] == {}
+    assert "there is no other story to check access with" in caplog.text
     assert {"story:1", "story:2", "story:3"} <= set(state["known_ids"])
 
 
-def test_one_hidden_story_among_readable_ones_is_given_up(fake):
+def test_one_hidden_story_among_unchanged_ones_is_given_up(fake, caplog):
+    # Steady state: story 1 is unchanged and skipped, so only story 2 is fetched,
+    # and story 1 is read once per run to show that access works.
     for story_id in (1, 2):
         fake.add_story(story_id, updated_at=at(1))
     state = {}
     run_sync(fake, state)
-    for story_id in (1, 2):
-        fake.stories[story_id]["updated_at"] = at(5)
+    fake.stories[2]["updated_at"] = at(5)
 
     for run in (1, 2, 3):
         fake.queue("/stories/2", _error(403, "Forbidden"))
-        if run > 1:
-            fake.stories[1]["updated_at"] = at(5 + run)  # story 1 keeps being fetched
+        fake.calls.clear()
         stats = {}
-        rows = run_sync(fake, state, stats=stats)
-        assert "failed_permission" not in stats
+        rows = run_sync(fake, state, now=hours(12 * run), stats=stats)
+        assert fake.fetched_stories() == [2, 1]  # the check comes after the failure
+        assert stats["probe_story"] == 1 and "failed_permission" not in stats
+        assert story_rows(rows) == {}  # the check is not emitted
     assert [r["id"] for r in tombstones(rows)] == ["story:2"]
+    assert "check the token's permissions" not in caplog.text
+
+
+def test_a_hidden_iteration_is_checked_against_an_unchanged_one(fake):
+    fake.add_iteration(3)
+    fake.add_iteration(4, name="Sprint 13")
+    state = {}
+    run_sync(fake, state)
+    fake.iterations[4]["updated_at"] = at(5)
+
+    for run in (1, 2, 3):
+        fake.queue("/iterations/4", _error(403, "Forbidden"))
+        stats = {}
+        rows = run_sync(fake, state, now=hours(12 * run), stats=stats)
+        assert stats["probe_iteration"] == 1 and "failed_permission" not in stats
+    assert [r["id"] for r in tombstones(rows)] == ["iteration:4"]
+
+
+@pytest.mark.parametrize("check", ["403", "500"])
+def test_a_run_that_counted_nothing_gives_nothing_up(fake, caplog, check):
+    # Story 2 is counted three times within an hour (a fast cron), so the 24 hours
+    # hold it back. A day later the token loses access to stories: the check fails
+    # too, and that run must not give story 2 up on its old count.
+    for story_id in (1, 2):
+        fake.add_story(story_id, updated_at=at(1))
+    state = {}
+    run_sync(fake, state)
+    fake.stories[2]["updated_at"] = at(5)
+    for minutes in (10, 20, 30):
+        fake.queue("/stories/2", _error(404, "Resource not found."))
+        run_sync(fake, state, now=NOW + timedelta(minutes=minutes))
+    assert state["unreadable"]["story:2"]["runs"] == 3
+
+    fake.queue("/stories/2", _error(403, "Forbidden"))
+    if check == "403":
+        fake.queue("/stories/1", _error(403, "Forbidden"))
+    else:
+        _fail(fake, "/stories/1")
+    stats = {}
+    rows = run_sync(fake, state, now=hours(25), stats=stats)
+
+    assert tombstones(rows) == [] and stats["given_up"] == 0
+    assert state["given_up"] == {} and state["unreadable"]["story:2"]["runs"] == 3
+    assert ("failed_permission" in stats) == (check == "403")
+
+
+def test_state_written_by_the_previous_version_is_read(fake):
+    # Before this version, given_up held a bare stamp and unreadable had no since.
+    for story_id in (1, 2, 3, 4):
+        fake.add_story(story_id, updated_at=at(1))
+    state = {}
+    run_sync(fake, state)
+    for story_id in (2, 3):
+        fake.stories[story_id]["updated_at"] = at(5)
+    state["given_up"] = {"story:4": at(1)}
+    state["known_ids"].remove("story:4")
+    state["unreadable"] = {
+        "story:2": {"stamp": at(5), "runs": 2},
+        "story:3": {"stamp": at(5), "runs": 0},
+    }
+    state["retry"] = ["story:2", "story:3"]
+    fake.queue("/stories/2", _error(404, "Resource not found."))
+
+    rows = run_sync(fake, state, now=hours(1))
+
+    assert set(story_rows(rows)) == {"story:3", "story:4"}  # 4 was due to be asked again
+    assert state["given_up"] == {}
+    assert state["unreadable"] == {
+        "story:2": {"stamp": at(5), "runs": 3, "since": _stamp(hours(1))}
+    }
+
+
+def test_a_check_answering_a_server_error_counts_nothing(fake, caplog):
+    for story_id in (1, 2):
+        fake.add_story(story_id, updated_at=at(1))
+    state = {}
+    run_sync(fake, state)
+    fake.stories[2]["updated_at"] = at(5)
+    fake.queue("/stories/2", _error(403, "Forbidden"))
+    _fail(fake, "/stories/1")  # the check: Shortcut is failing, which proves nothing
+    stats = {}
+
+    rows = run_sync(fake, state, now=hours(12), stats=stats)
+
+    assert tombstones(rows) == []
+    assert stats["probe_story"] == 1 and "failed_permission" not in stats
+    assert state["unreadable"] == {} and state["retry"] == ["story:2"]
+    assert "check the token's permissions" not in caplog.text
+
+
+def test_a_given_up_story_is_asked_again_after_a_day(fake):
+    for story_id in (1, 2):
+        fake.add_story(story_id, updated_at=at(1))
+    state = {}
+    run_sync(fake, state)
+    fake.stories[2]["updated_at"] = at(5)
+    for run in (1, 2, 3):
+        fake.queue("/stories/2", _error(404, "Resource not found."))
+        run_sync(fake, state, now=hours(12 * run))
+    assert state["given_up"] == {"story:2": {"stamp": at(5), "at": _stamp(hours(36))}}
+
+    # Not asked within the day; asked a day later, and still unreadable.
+    fake.calls.clear()
+    run_sync(fake, state, now=hours(59))
+    assert 2 not in fake.fetched_stories()
+    fake.queue("/stories/2", _error(404, "Resource not found."))
+    stats = {}
+    rows = run_sync(fake, state, now=hours(60), stats=stats)
+    assert 2 in fake.fetched_stories() and rows == []
+    assert stats["failed"] == 1 and stats["kept"] == 0
+    assert state["given_up"]["story:2"]["at"] == _stamp(hours(60))
+    assert state["retry"] == [] and state["unreadable"] == {}
+
+    # Readable again a day later, though never edited: it comes back, and stays.
+    rows = run_sync(fake, state, now=hours(84))
+    assert set(story_rows(rows)) == {"story:2"}
+    assert state["given_up"] == {} and "story:2" in state["known_ids"]
+    assert tombstones(run_sync(fake, state, now=hours(85))) == []
+
+
+def test_given_up_items_are_asked_again_a_few_per_run_oldest_first(fake, monkeypatch):
+    monkeypatch.setattr(shortcut, "_MAX_REASKS", 1)
+    for story_id in (1, 2, 3):
+        fake.add_story(story_id, updated_at=at(1))
+    state = {}
+    run_sync(fake, state)
+    # Stories 2 and 3 were forgotten two and three days ago.
+    state["given_up"] = {
+        "story:2": {"stamp": at(1), "at": _stamp(hours(-48))},
+        "story:3": {"stamp": at(1), "at": _stamp(hours(-72))},
+    }
+    state["known_ids"] = ["story:1"]
+    for key in ("2", "3"):
+        del state["fingerprints"][key]
+    fake.add_story(4, updated_at=at(6))
+    fake.calls.clear()
+
+    rows = run_sync(fake, state)
+
+    assert fake.fetched_stories() == [4, 3]  # new stories first, then the oldest one
+    assert set(story_rows(rows)) == {"story:3", "story:4"}
+    assert list(state["given_up"]) == ["story:2"]
+
+
+def test_a_run_that_stops_early_counts_nothing_toward_giving_up(fake):
+    for story_id in (1, 2, 3):
+        fake.add_story(story_id, updated_at=at(1))
+    fake.add_iteration(9)
+    state = {}
+    run_sync(fake, state)
+    fake.stories[2]["updated_at"] = at(5)
+    for run in (1, 2):
+        fake.queue("/stories/2", _error(403, "Forbidden"))
+        run_sync(fake, state, now=hours(12 * run))
+    unreadable = copy.deepcopy(state["unreadable"])
+    assert unreadable["story:2"]["runs"] == 2
+    # Story 3 was forgotten a day ago and is due to be asked again.
+    state["given_up"] = {"story:3": {"stamp": at(1), "at": _stamp(hours(24))}}
+    state["known_ids"].remove("story:3")
+    del state["fingerprints"]["3"]
+
+    # Run 3: story 1 is read, story 2 answers 403 again, story 3 is still hidden,
+    # then the token is revoked on the iteration and the run stops.
+    fake.stories[1]["updated_at"] = at(6)
+    fake.iterations[9]["updated_at"] = at(6)
+    fake.queue("/stories/2", _error(403, "Forbidden"))
+    fake.queue("/stories/3", _error(404, "Resource not found."))
+    fake.queue("/iterations/9", _error(401, "Unauthorized"))
+    stats = {}
+    rows = run_sync(fake, state, now=hours(48), stats=stats)
+
+    assert stats["failed_auth"] == 1 and tombstones(rows) == []
+    assert state["unreadable"] == unreadable  # not a third run
+    assert state["given_up"] == {"story:3": {"stamp": at(1), "at": _stamp(hours(24))}}
 
 
 def test_retries_go_last_and_never_count_toward_an_outage(fake):
@@ -1861,6 +2110,23 @@ def test_without_a_date_header_the_local_clock_ends_the_sweep_and_is_logged(
     assert "no Date header" in caplog.text
 
 
+def test_a_stale_date_header_cannot_end_the_sweep_early(fake, monkeypatch, caplog):
+    # Story 9 was created yesterday evening and is known. A proxy then serves a
+    # Date a day old: the sweep must still reach story 9, so nothing looks deleted.
+    monkeypatch.setattr(shortcut, "_local_now", lambda: NOW)
+    fake.add_story(1, updated_at=at(1))
+    fake.add_story(9, updated_at="2024-03-27T12:00:00Z")
+    state = {}
+    list(sync_stories(fake, state))
+    fake.clock = NOW - timedelta(days=1)
+
+    rows = list(sync_stories(fake, state))
+
+    assert tombstones(rows) == []
+    assert fake.requested(SEARCH)[-2]["created_at_end"] == _stamp(NOW)
+    assert "differ by 86400s" in caplog.text
+
+
 SECRET = "SECRET-TOKEN-123"
 
 
@@ -1883,10 +2149,12 @@ def test_the_token_is_never_in_an_error_message_or_a_log_line(fake, caplog, slee
     assert SECRET not in str(excinfo.value) and excinfo.value.status == 0
 
     # A 401 whose body echoes the token: neither the message nor the logs carry it.
+    fake.headers = {"Shortcut-Token": SECRET}
     fake.queue("/epics", _Resp(401, {"message": f"bad token abcd-{SECRET}"}))
     with pytest.raises(ShortcutAPIError) as excinfo:
         run_sync(fake, {})
     assert str(excinfo.value) == "Shortcut /epics: HTTP 401"
+    assert excinfo.value.detail == "bad token abcd-[token]"
     assert SECRET not in caplog.text
     fake.queue("/epics", _Resp(401, f"<html>{SECRET}</html>"))
     with pytest.raises(ShortcutAPIError) as excinfo:
@@ -1906,6 +2174,32 @@ def test_waits_are_capped_and_ask_check_active_first(fake, sleeps):
     assert excinfo.value.status == 429
     assert sleeps == [30.0]  # the 61 s wait was not taken
     assert checks == [0, 0, 1]  # before the request, before the wait, before the retry
+
+
+def test_redact_cuts_the_token_out_and_drops_text_for_a_short_one():
+    assert shortcut._redact(f"bad token {SECRET}", SECRET) == "bad token [token]"
+    assert shortcut._redact("Resource not found.", SECRET) == "Resource not found."
+    assert shortcut._redact("anything", "") == "anything"
+    assert shortcut._redact("bad token abc", "abc") == ""  # too short to replace safely
+
+
+def test_a_run_waits_at_most_its_budget_in_all(fake, sleeps):
+    for story_id in (1, 2):
+        fake.add_story(story_id, updated_at=at(1))
+    state = {}
+    run_sync(fake, state)
+    for story_id in (1, 2):
+        fake.stories[story_id]["updated_at"] = at(5)
+    for _ in range(shortcut._MAX_RETRIES):
+        fake.queue("/stories/1", _error(503, "Unavailable", headers={"Retry-After": "50"}))
+    stats = {}
+
+    rows = run_sync(fake, state, stats=stats)
+
+    assert sleeps == [50.0, 50.0]  # a third wait would pass the 120 s budget
+    assert stats["failed_unavailable"] == 1 and stats["failed"] == 1
+    assert story_rows(rows) == {} and tombstones(rows) == []
+    assert set(story_rows(run_sync(fake, state))) == {"story:1", "story:2"}  # resumed
 
 
 @pytest.mark.parametrize("name", ["", "Foo-Bar", "a" * 65, None])
@@ -1958,3 +2252,9 @@ def test_sync_stats_count_what_a_run_did(fake):
         "kept": 0,
         "given_up": 0,
     }
+
+    # A run stopped by a rate limit while listing says why, with no failure invented.
+    fake.queue("/epics", _error(429, "Too Many Requests", headers={"Retry-After": "120"}))
+    list(source)
+    assert source.cognee_sync_stats["failed"] == 0
+    assert source.cognee_sync_stats["failed_rate_limit"] == 1
