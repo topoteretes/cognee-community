@@ -1,0 +1,18 @@
+[project]
+name = "cognee-community-connector-gcs"
+version = "0.1.0"
+description = "Google Cloud Storage data-source connector for cognee"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "cognee==1.6.5",
+    "dlt[sqlalchemy]>=1.9.0,<2",
+    "google-cloud-storage>=3.17.1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cognee_community_connector_gcs"]
