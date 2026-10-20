@@ -9,12 +9,17 @@ import copy
 import logging
 
 import pytest
+import requests
 from dropbox import files
 from dropbox.exceptions import AuthError, RateLimitError
 from fake_dropbox import FakeDropbox, api_error, make_pdf
 
 from cognee_community_connector_dropbox import dropbox as dropbox_module
-from cognee_community_connector_dropbox.dropbox import _DropboxConfig, _iter_rows
+from cognee_community_connector_dropbox.dropbox import (
+    DropboxFolderNotFoundError,
+    _DropboxConfig,
+    _iter_rows,
+)
 
 
 def sync(fake, state, folders=("",), max_file_size_mb=25, check_active=None):
@@ -184,7 +189,7 @@ def test_file_added_and_deleted_in_the_same_round_is_never_downloaded(fake):
     upserts, deletes, _ = sync(fake, state)
 
     assert upserts == {}
-    assert fake.downloads == []
+    assert "download" not in fake.api_calls
     # A harmless no-op tombstone: see the replay test below for why it is kept.
     assert deletes == [temp]
 
@@ -192,10 +197,10 @@ def test_file_added_and_deleted_in_the_same_round_is_never_downloaded(fake):
 def test_file_stored_next_to_a_failed_one_is_still_forgotten(fake):
     x = fake.put("/x.md", "stored next to a file that failed")
     y = fake.put("/y.md", "fails to download")
-    fake.download_errors[y] = ConnectionError("timeout")
+    fake.download_errors[y] = requests.ConnectionError("timeout")
     state: dict = {}
     upserts, _, _ = sync(fake, state)
-    assert x in upserts and state["retry"] == [y]  # the cursor moved, y waits by id
+    assert x in upserts and list(state["retry"]) == [y]  # the cursor moved, y waits by id
 
     fake.delete("/x.md")
     del fake.download_errors[y]
@@ -214,7 +219,7 @@ def test_failed_file_is_fetched_again_by_id_without_replaying_the_round(fake):
     fake.move("/a.md", "/Archive/a.md")
     gone = fake.put("/gone.md", "short lived")
     flaky = fake.put("/flaky.md", "fails once")
-    fake.download_errors[flaky] = ConnectionError("timeout")
+    fake.download_errors[flaky] = requests.ConnectionError("timeout")
     sync(fake, state)  # stores moved, fails on flaky
     fake.delete("/gone.md")
     del fake.download_errors[flaky]
@@ -273,12 +278,14 @@ def test_synced_folder_that_disappears_forgets_its_files(fake):
     assert state["cursors"] == {}
 
 
-def test_folder_missing_on_first_sync_yields_nothing(fake):
+def test_folder_missing_on_first_sync_raises_instead_of_an_empty_dataset(fake):
     state: dict = {}
 
-    upserts, deletes, _ = sync(fake, state, ("/does-not-exist",))
+    with pytest.raises(DropboxFolderNotFoundError, match="folder_paths") as error:
+        sync(fake, state, ("/does-not-exist",))
 
-    assert upserts == {} and deletes == []
+    assert "does-not-exist" not in str(error.value)
+    assert state == {}
 
 
 @pytest.mark.parametrize(
@@ -321,13 +328,13 @@ def test_failed_download_is_kept_by_id_and_retried(fake):
     a = fake.put("/a.md", "alpha")
     b = fake.put("/b.md", "bravo")
     state: dict = {}
-    fake.download_errors[b] = ConnectionError("timeout")
+    fake.download_errors[b] = requests.ConnectionError("timeout")
 
     upserts, _, stats = sync(fake, state)
 
     assert set(upserts) == {a}
     assert stats["failed"] == 1
-    assert state["retry"] == [b]
+    assert list(state["retry"]) == [b]
     assert "cursors" in state  # the cursor moves on; b waits by id
 
     del fake.download_errors[b]
@@ -335,15 +342,15 @@ def test_failed_download_is_kept_by_id_and_retried(fake):
 
     assert set(upserts) == {b}
     assert stats["failed"] == 0
-    assert state["retry"] == []
+    assert state["retry"] == {}
     assert set(state["index"].values()) == {a, b}
 
 
-def test_a_file_that_keeps_failing_does_not_grow_later_runs(fake):
+def test_a_file_that_keeps_failing_is_given_up_after_three_runs(fake):
     state: dict = {}
     sync(fake, state)
     bad = fake.put("/bad.md", "never downloads")
-    fake.download_errors[bad] = ConnectionError("timeout")
+    fake.download_errors[bad] = requests.ConnectionError("timeout")
 
     downloads_per_run = []
     for run in range(4):
@@ -351,26 +358,28 @@ def test_a_file_that_keeps_failing_does_not_grow_later_runs(fake):
         fake.downloads.clear()
         _, _, stats = sync(fake, state)
         downloads_per_run.append(len(fake.downloads))
-        assert stats["failed"] == 1
-        assert state["retry"] == [bad]
+        if run < 2:
+            assert stats["failed"] == 1 and state["retry"] == {bad: run + 1}
+    assert stats["failed"] == 0 and state["retry"] == {}
 
-    # The new file plus one more try of the bad one, every run.
-    assert downloads_per_run == [2, 2, 2, 2]
+    # The new file plus one more try of the bad one, until the third try,
+    # then it is skipped as unavailable and costs nothing.
+    assert downloads_per_run == [2, 2, 2, 1]
 
 
 def test_retried_file_deleted_in_the_meantime_is_dropped(fake):
     a = fake.put("/a.md", "alpha")
-    fake.download_errors[a] = ConnectionError("timeout")
+    fake.download_errors[a] = requests.ConnectionError("timeout")
     state: dict = {}
     sync(fake, state)
-    assert state["retry"] == [a]
+    assert list(state["retry"]) == [a]
 
     fake.delete("/a.md")
     upserts, deletes, _ = sync(fake, state)
 
     assert upserts == {}
     assert deletes == [a]
-    assert state["retry"] == []
+    assert state["retry"] == {}
 
 
 # ---------------------------------------------------------------------------
@@ -409,14 +418,14 @@ def test_long_rate_limit_stops_cleanly_and_resumes_next_run(fake, waits):
     assert set(upserts) == {a}
     assert waits == []  # an hour is never slept through
     assert stats["failed_rate_limit"] == 2
-    assert state["retry"] == [b, c]
+    assert list(state["retry"]) == [b, c]
 
     fake.downloads.clear()
     upserts, _, stats = sync(fake, state)
 
     assert set(upserts) == {b, c}
     assert fake.downloads == [b, c]
-    assert state["retry"] == []
+    assert state["retry"] == {}
 
 
 def test_rate_limit_that_never_ends_gives_up_after_a_few_short_waits(fake, waits):
@@ -429,7 +438,7 @@ def test_rate_limit_that_never_ends_gives_up_after_a_few_short_waits(fake, waits
     assert upserts == {}
     assert waits == [1, 1, 1]
     assert stats["failed_rate_limit"] == 1
-    assert state["retry"] == [a]
+    assert list(state["retry"]) == [a]
 
 
 def test_expired_token_mid_run_stops_keeps_progress_and_resumes(fake):
@@ -444,7 +453,7 @@ def test_expired_token_mid_run_stops_keeps_progress_and_resumes(fake):
     assert set(upserts) == {a}
     assert fake.downloads == [a, b], "no request after the 401"
     assert stats["failed_auth"] == 2
-    assert state["retry"] == [b, c]
+    assert list(state["retry"]) == [b, c]
 
     upserts, _, _ = sync(fake, state)
 
@@ -646,7 +655,7 @@ def test_no_file_names_paths_or_ids_reach_the_logs(fake, caplog):
     photo = fake.put("/Secret Plans/photo.png", b"\x89PNG")
     broken = fake.put("/Secret Plans/broken.pdf", b"not a pdf")
     offline = fake.put("/Secret Plans/offline.md", "later")
-    fake.download_errors[offline] = ConnectionError("timeout for /Secret Plans/offline.md")
+    fake.download_errors[offline] = requests.ConnectionError("timeout for /Secret Plans/offline.md")
     blocked = fake.put("/Secret Plans/blocked.md", "no")
     fake.download_errors[blocked] = api_error(
         files.DownloadError.path(files.LookupError.restricted_content)
@@ -668,3 +677,163 @@ def test_no_file_names_paths_or_ids_reach_the_logs(fake, caplog):
         assert secret not in caplog.text
     for file_id in (budget, photo, broken, offline, blocked):
         assert file_id not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Review round 3: the cases found by running the connector through cognee
+# ---------------------------------------------------------------------------
+def test_file_written_over_a_path_without_a_delete_forgets_the_old_id(fake):
+    old = fake.put("/a.md", "old file")
+    state: dict = {}
+    sync(fake, state)
+
+    fake.vanish("/a.md")  # the delta holds only the new file
+    new = fake.put("/a.md", "brand new file")
+    upserts, deletes, _ = sync(fake, state)
+
+    assert deletes == [old]
+    assert list(upserts) == [new]
+    assert state["index"] == {"/a.md": new}
+
+
+def test_folder_created_where_a_file_was_forgets_the_file(fake):
+    old = fake.put("/plans", "a file called plans")
+    state: dict = {}
+    sync(fake, state)
+
+    fake.vanish("/plans")
+    inner = fake.put("/Plans/q1.md", "now a folder")
+    upserts, deletes, _ = sync(fake, state)
+
+    assert deletes == [old]
+    assert list(upserts) == [inner]
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda fake: fake.put("/a.md", "   \n  "),  # emptied
+        lambda fake: fake.put("/a.md", "x" * 2 * 1024 * 1024),  # grew past the limit
+    ],
+)
+def test_stored_file_that_is_now_skipped_is_forgotten(fake, change):
+    a = fake.put("/a.md", "alpha")
+    state: dict = {}
+    sync(fake, state, max_file_size_mb=1)
+
+    change(fake)
+    upserts, deletes, _ = sync(fake, state, max_file_size_mb=1)
+
+    assert upserts == {}
+    assert deletes == [a], "the old text must not stay in memory"
+
+
+def test_new_file_that_is_skipped_emits_no_tombstone(fake):
+    fake.put("/photo.png", b"\x89PNG")
+
+    _, deletes, stats = sync(fake, {})
+
+    assert deletes == [] and stats["deleted"] == 0
+
+
+def test_exported_paper_doc_is_held_to_the_size_limit(fake):
+    info = files.ExportInfo(export_as="markdown", export_options=["markdown", "html"])
+    fake.put(
+        "/Big plan.paper", "# Plan", is_downloadable=False, export_info=info, size=3 * 1024 * 1024
+    )
+
+    upserts, _, stats = sync(fake, {}, max_file_size_mb=1)
+
+    assert upserts == {}
+    assert stats["skipped_too_large"] == 1
+    assert fake.exports == [], "never read into memory"
+
+
+def test_utf16_text_is_decoded_and_binary_text_is_skipped(fake):
+    notepad = fake.put("/notepad.txt", "hello from notepad".encode("utf-16"))
+    fake.put("/binary.csv", b"a,b\x00\x01\x02")
+
+    upserts, _, stats = sync(fake, {})
+
+    assert "hello from notepad" in upserts[notepad]["content"]
+    assert "\x00" not in upserts[notepad]["content"]
+    assert len(upserts) == 1 and stats["skipped_unparseable"] == 1
+
+
+def test_change_without_a_path_is_skipped_not_fatal(fake):
+    a = fake.put("/a.md", "alpha")
+    state: dict = {}
+    sync(fake, state)
+    fake.log.append(files.DeletedMetadata(name="unmounted"))  # path_lower is None
+
+    upserts, deletes, _ = sync(fake, state)
+
+    assert upserts == {} and deletes == []
+    assert state["index"] == {"/a.md": a}
+
+
+@pytest.mark.parametrize("error", [PermissionError, TimeoutError, ConnectionError])
+def test_os_errors_from_check_active_stop_the_run_and_are_not_counted(fake, error):
+    fake.put("/a.md", "alpha")
+
+    def check_active():
+        if fake.api_calls == ["list_folder"]:  # revoked right before the download
+            raise error("revoked")
+
+    stats: dict = {}
+    with pytest.raises(error):
+        list(_iter_rows(fake, _DropboxConfig(("",), 25), {}, stats, check_active))
+
+    assert stats["failed"] == 0
+    assert "download" not in fake.api_calls
+
+
+def test_unsupported_file_is_skipped_not_retried(fake):
+    a = fake.put("/locked.md", "no")
+    fake.download_errors[a] = api_error(files.DownloadError.unsupported_file)
+    state: dict = {}
+
+    upserts, _, stats = sync(fake, state)
+
+    assert upserts == {}
+    assert stats["skipped_unsupported_type"] == 1 and stats["failed"] == 0
+    assert state["retry"] == {}
+
+
+def test_retried_file_that_vanished_without_a_delete_is_dropped(fake):
+    a = fake.put("/a.md", "alpha")
+    fake.download_errors[a] = requests.ConnectionError("timeout")
+    state: dict = {}
+    sync(fake, state)
+    assert state["retry"] == {a: 1}
+
+    fake.vanish("/a.md")  # still in the index, but get_metadata says not_found
+    upserts, deletes, stats = sync(fake, state)
+
+    assert upserts == {} and deletes == []
+    assert stats["failed"] == 0 and state["retry"] == {}
+
+
+def test_rate_limit_waits_share_one_budget_per_run(fake, waits):
+    ids = [fake.put(f"/f{i:02}.md", f"file {i}") for i in range(20)]
+    for file_id in ids:
+        fake.download_errors_once[file_id] = RateLimitError("request-id", None, 60)
+    state: dict = {}
+
+    upserts, _, stats = sync(fake, state)
+
+    assert waits == [60, 60], "two minutes for the whole run, not per call"
+    assert set(upserts) == set(ids[:2])
+    assert stats["failed_rate_limit"] == 18
+    assert list(state["retry"]) == ids[2:]
+
+
+def test_every_download_response_is_closed(fake):
+    fake.put("/a.md", "alpha")
+    info = files.ExportInfo(export_as="markdown", export_options=["markdown"])
+    fake.put("/Plan.paper", "# Plan", is_downloadable=False, export_info=info)
+
+    sync(fake, {})
+
+    assert len(fake.responses) == 2
+    assert all(response.closed for response in fake.responses)

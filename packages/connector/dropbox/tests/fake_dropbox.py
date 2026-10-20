@@ -47,6 +47,8 @@ class FakeDropbox:
         self.download_errors_once: dict[str, Exception] = {}
         self.downloads: list[str] = []
         self.exports: list[tuple[str, str]] = []
+        # Every download or export response handed out, to check they get closed.
+        self.responses: list[FakeResponse] = []
         # Every SDK call the connector made, in order, by method name.
         self.api_calls: list[str] = []
         self._pages: dict[str, tuple[list, str]] = {}
@@ -89,6 +91,11 @@ class FakeDropbox:
         moved.export_info = meta.export_info
         self.files[new_path.lower()] = moved
         self.log.append(moved)
+
+    def vanish(self, path: str) -> None:
+        """Remove a file without a delete in the change log, like a delete and
+        re-create that Dropbox collapses into one entry between two cursors."""
+        self.files.pop(path.lower())
 
     def delete(self, path: str) -> None:
         """Delete a file, or a folder and everything under it, as one entry."""
@@ -144,7 +151,9 @@ class FakeDropbox:
             raise self.download_errors_once.pop(path)
         if path in self.download_errors:
             raise self.download_errors[path]
-        return meta, FakeResponse(self.content[meta.id])
+        response = FakeResponse(self.content[meta.id])
+        self.responses.append(response)
+        return meta, response
 
     def files_get_metadata(self, path):
         self.api_calls.append("get_metadata")
@@ -159,7 +168,9 @@ class FakeDropbox:
         self.exports.append((path, export_format))
         if path in self.download_errors:
             raise self.download_errors[path]
-        return files.ExportResult(), FakeResponse(self.content[meta.id])
+        response = FakeResponse(self.content[meta.id])
+        self.responses.append(response)
+        return files.ExportResult(), response
 
     # ------------------------------------------------------------------
     # Internals

@@ -99,6 +99,8 @@ async def clean_environment(cognee_root, tmp_path, monkeypatch):
     monkeypatch.setenv("COGNEE_SKIP_CONNECTION_TEST", "true")
     # dlt keeps pipeline state under ~/.dlt, which cognee's prune never clears,
     # so without this a second test run would start from the first run's cursors.
+    # dlt also restores state from its destination, so each test below syncs
+    # under its own resource_name.
     monkeypatch.setenv("DLT_DATA_DIR", str(tmp_path / "dlt"))
     cognee.config.data_root_directory(str(cognee_root / "data"))
     cognee.config.system_root_directory(str(cognee_root / "system"))
@@ -188,4 +190,24 @@ async def test_two_dropbox_sources_in_one_dataset_stay_apart(clean_environment):
 
     assert not await _graph_has(ALPHA)
     assert await _graph_has(BRAVO), "a delete in one account must not touch the other"
+    assert await _stored_documents() == 1
+
+
+@pytest.mark.asyncio
+async def test_overwritten_and_emptied_files_leave_memory(clean_environment):
+    fake = FakeDropbox()
+    fake.put("/Notes/alpha.md", f"{ALPHA} is a company in the logistics sector.")
+    fake.put("/Notes/bravo.md", f"{BRAVO} is an unrelated company in finance.")
+    await _sync(fake, "dropbox_overwrites")
+    assert await _stored_documents() == 2
+
+    # Delete and re-create between two cursors: the delta holds only the new file.
+    fake.vanish("/Notes/alpha.md")
+    fake.put("/Notes/alpha.md", f"{CHARLIE} builds rockets.")
+    fake.put("/Notes/bravo.md", "   ")  # emptied, so skipped from now on
+    await _sync(fake, "dropbox_overwrites")
+
+    assert not await _graph_has(ALPHA), "the overwritten file's old version must go"
+    assert await _graph_has(CHARLIE)
+    assert not await _graph_has(BRAVO), "an emptied file's old text must go"
     assert await _stored_documents() == 1

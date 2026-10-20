@@ -22,6 +22,7 @@ into ids.  Only a confirmed ``not_found`` removes data.  The README explains the
 sync model, the retry rules and the limitations.
 """
 
+import codecs
 import io
 import posixpath
 import re
@@ -33,28 +34,37 @@ from typing import Any
 from cognee.shared.logging_utils import get_logger
 from cognee.tasks.ingestion import dlt_utils
 from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
+from dropbox import Dropbox
 from dropbox import files as dropbox_files
 from dropbox.exceptions import ApiError, AuthError, HttpError, RateLimitError
+from pypdf import PdfReader
+from pypdf.errors import PyPdfError
+from requests import RequestException
 
 logger = get_logger("dropbox_connector")
 
 TEXT_EXTENSIONS = {".txt", ".md", ".markdown", ".csv"}
 PDF_EXTENSION = ".pdf"
-# Text formats we accept from files/export, in order of preference.  Paper docs
-# offer markdown; other non-downloadable types are skipped as unsupported.
-TEXT_EXPORT_FORMATS = ("markdown", "md", "txt", "plain_text", "csv")
+# Paper docs export as markdown (or html, which we skip).  Other
+# non-downloadable files only offer binary formats and are skipped.
+TEXT_EXPORT_FORMATS = ("markdown",)
 # The largest page size list_folder accepts.
 LIST_FOLDER_LIMIT = 2000
 # Our own choice: big enough for long PDFs, small enough that one file can't
 # take over a cognify run.  Dropbox has no limit of its own to follow here.
 DEFAULT_MAX_FILE_SIZE_MB = 25
 # Rate limits are handled here, not by the SDK, which would sleep the full
-# Retry-After while cognee holds its dlt staging lock.  A longer wait stops the
-# run cleanly instead, and the next sync picks up from there.
+# Retry-After while cognee holds its dlt staging lock.  One wait is capped at a
+# minute, and all waits of a run share a budget of two; past either the run
+# stops cleanly and the next sync picks up from there.
 MAX_RATE_LIMIT_WAIT_SECONDS = 60
+RATE_LIMIT_WAIT_BUDGET_SECONDS = 120
 RATE_LIMIT_RETRIES = 3
 # The SDK's own wait when a 429 comes without Retry-After.
 DEFAULT_RATE_LIMIT_WAIT_SECONDS = 5
+# A file that fails this many runs in a row is skipped as unavailable, so an
+# error that never goes away does not cost requests on every run forever.
+MAX_RETRY_ATTEMPTS = 3
 # dlt uses the resource name as a table name and a state key, so it has to be
 # already normalized and short enough to be part of a file name.
 _RESOURCE_NAME = re.compile(r"[a-z][a-z0-9_]{0,63}")
@@ -67,6 +77,10 @@ class DropboxRateLimitedError(Exception):
     """Dropbox kept rate limiting, or asked for a longer wait than we accept."""
 
 
+class DropboxFolderNotFoundError(ValueError):
+    """A configured folder does not exist in Dropbox on its first sync."""
+
+
 @dataclass(frozen=True)
 class _DropboxConfig:
     folder_paths: tuple[str, ...]
@@ -76,39 +90,44 @@ class _DropboxConfig:
 # ---------------------------------------------------------------------------
 # Auth / client construction
 # ---------------------------------------------------------------------------
+def _check_credentials(
+    access_token: str | None, refresh_token: str | None, app_key: str | None
+) -> None:
+    """Fail when the source is built, not halfway through a pipeline run."""
+    if refresh_token and not app_key:
+        raise ValueError(
+            "A Dropbox refresh token needs the app key. Pass app_key "
+            "(and app_secret unless the token came from a PKCE flow)."
+        )
+    if not (refresh_token or access_token):
+        raise ValueError(
+            "Dropbox credentials are missing. Pass refresh_token and app_key, "
+            "or access_token for a quick try."
+        )
+
+
 def build_dropbox_client(
     *,
     access_token: str | None = None,
     refresh_token: str | None = None,
     app_key: str | None = None,
     app_secret: str | None = None,
-) -> Any:
+) -> Dropbox:
     """Build an authenticated Dropbox API client.
 
     A refresh token is preferred: the SDK uses it to fetch new short-lived
     access tokens whenever the current one expires.
     """
-    from dropbox import Dropbox
-
+    _check_credentials(access_token, refresh_token, app_key)
     if refresh_token:
-        if not app_key:
-            raise ValueError(
-                "A Dropbox refresh token needs the app key. Pass app_key "
-                "(and app_secret unless the token came from a PKCE flow)."
-            )
         return Dropbox(
             oauth2_refresh_token=refresh_token,
             app_key=app_key,
             app_secret=app_secret,
-            # 0 hands every 429 to _call, which caps the wait.
+            # 0 hands every 429 to _Session.call, which caps the wait.
             max_retries_on_rate_limit=0,
         )
-    if access_token:
-        return Dropbox(oauth2_access_token=access_token, max_retries_on_rate_limit=0)
-    raise ValueError(
-        "Dropbox credentials are missing. Pass refresh_token and app_key, "
-        "or access_token for a quick try."
-    )
+    return Dropbox(oauth2_access_token=access_token, max_retries_on_rate_limit=0)
 
 
 # ---------------------------------------------------------------------------
@@ -165,43 +184,65 @@ def _is_reset(exc: ApiError) -> bool:
     return hasattr(error, "is_reset") and error.is_reset()
 
 
-def _call(check_active: Callable[[], None] | None, method, *args, **kwargs):
-    """Run one Dropbox API call after the host's authorization checkpoint.
+def _is_unsupported(exc: ApiError) -> bool:
+    """A file Dropbox will never download or export: retrying cannot help."""
+    error = exc.error
+    return any(
+        getattr(error, check, lambda: False)()
+        for check in ("is_unsupported_file", "is_non_exportable", "is_invalid_export_format")
+    )
 
-    A 429 is retried here after a short wait, and ``check_active`` is asked
-    again before every attempt.  A long or repeated rate limit raises
-    ``DropboxRateLimitedError`` instead of sleeping through it.
-    """
-    for attempt in range(RATE_LIMIT_RETRIES + 1):
-        if check_active is not None:
-            check_active()
-        try:
-            return method(*args, **kwargs)
-        except RateLimitError as exc:
-            wait = exc.backoff if exc.backoff is not None else DEFAULT_RATE_LIMIT_WAIT_SECONDS
-            if wait > MAX_RATE_LIMIT_WAIT_SECONDS or attempt == RATE_LIMIT_RETRIES:
-                raise DropboxRateLimitedError(
-                    f"Dropbox is rate limiting; it asked to wait {wait:.0f}s."
-                ) from None
-            _sleep(wait)
+
+class _Session:
+    """One run's access to Dropbox: the host checkpoint and the rate-limit budget."""
+
+    def __init__(self, client: Any, check_active: Callable[[], None] | None):
+        self.client = client
+        self.check_active = check_active
+        self.wait_left = RATE_LIMIT_WAIT_BUDGET_SECONDS
+
+    def call(self, method: Callable, *args: Any, **kwargs: Any) -> Any:
+        """Run one API call after the host's authorization checkpoint.
+
+        ``check_active`` runs outside the ``try``, so whatever it raises
+        reaches the host untouched.  A 429 is retried after a short wait that
+        comes out of the run's budget; a long or repeated rate limit raises
+        ``DropboxRateLimitedError`` instead of sleeping through it.
+        """
+        for attempt in range(RATE_LIMIT_RETRIES + 1):
+            if self.check_active is not None:
+                self.check_active()
+            try:
+                return method(*args, **kwargs)
+            except RateLimitError as exc:
+                wait = exc.backoff if exc.backoff is not None else DEFAULT_RATE_LIMIT_WAIT_SECONDS
+                if (
+                    wait > MAX_RATE_LIMIT_WAIT_SECONDS
+                    or wait > self.wait_left
+                    or attempt == RATE_LIMIT_RETRIES
+                ):
+                    raise DropboxRateLimitedError(
+                        f"Dropbox is rate limiting; it asked to wait {wait:.0f}s."
+                    ) from None
+                self.wait_left -= wait
+                _sleep(wait)
 
 
 # ---------------------------------------------------------------------------
 # Listing
 # ---------------------------------------------------------------------------
-def _next_page(client, result, seen: set[str], check_active):
+def _next_page(session: _Session, result, seen: set[str]):
     """Follow ``has_more``, refusing a cursor Dropbox already gave us."""
     if result.cursor in seen:
         raise RuntimeError("Dropbox returned the same cursor twice; stopping instead of looping.")
     seen.add(result.cursor)
-    return _call(check_active, client.files_list_folder_continue, result.cursor)
+    return session.call(session.client.files_list_folder_continue, result.cursor)
 
 
-def _list_folder(client, path: str, check_active=None) -> tuple[list, str]:
+def _list_folder(session: _Session, path: str) -> tuple[list, str]:
     """Full recursive listing of one folder. Returns (entries, cursor)."""
-    result = _call(
-        check_active,
-        client.files_list_folder,
+    result = session.call(
+        session.client.files_list_folder,
         path,
         recursive=True,
         limit=LIST_FOLDER_LIMIT,
@@ -210,27 +251,27 @@ def _list_folder(client, path: str, check_active=None) -> tuple[list, str]:
     entries = list(result.entries)
     seen: set[str] = set()
     while result.has_more:
-        result = _next_page(client, result, seen, check_active)
+        result = _next_page(session, result, seen)
         entries.extend(result.entries)
     return entries, result.cursor
 
 
-def _list_changes(client, cursor: str, check_active=None) -> tuple[list, str]:
+def _list_changes(session: _Session, cursor: str) -> tuple[list, str]:
     """Every change since ``cursor``. Returns (entries, new cursor)."""
-    result = _call(check_active, client.files_list_folder_continue, cursor)
+    result = session.call(session.client.files_list_folder_continue, cursor)
     entries = list(result.entries)
     seen = {cursor}
     # The cursor is only complete once has_more is false.
     while result.has_more:
-        result = _next_page(client, result, seen, check_active)
+        result = _next_page(session, result, seen)
         entries.extend(result.entries)
     return entries, result.cursor
 
 
-def _get_metadata(client, file_id: str, check_active=None) -> Any:
+def _get_metadata(session: _Session, file_id: str) -> Any:
     """Current metadata of a file kept for retry, or None once it is gone."""
     try:
-        meta = _call(check_active, client.files_get_metadata, file_id)
+        meta = session.call(session.client.files_get_metadata, file_id)
     except ApiError as exc:
         if _is_not_found(exc):
             # Gone since it failed: the listing reports the delete.
@@ -252,7 +293,7 @@ def _iter_rows(
     """Yield one row per new or changed file, plus hard-delete tombstones.
 
     ``state`` holds ``cursors`` (folder path -> list_folder cursor), ``index``
-    (file path_lower -> file id) and ``retry`` (ids of files to fetch again).
+    (file path_lower -> file id) and ``retry`` (file id -> failed attempts).
     It is a plain dict standing in for dlt's resource state, so this is
     directly unit-testable with a fake client.
     """
@@ -260,10 +301,16 @@ def _iter_rows(
         stats = {}
     stats.clear()
     stats.update(scanned=0, skipped=0, failed=0, deleted=0, failed_auth=0, failed_rate_limit=0)
+    session = _Session(client, check_active)
 
     old_cursors: dict[str, str] = dict(state.get("cursors", {}))
     index: dict[str, str] = dict(state.get("index", {}))
-    retry: list[str] = list(state.get("retry", []))
+    stored_before = set(index.values())
+    saved_retry = state.get("retry", {})
+    # Before attempts were counted, retry was a plain list of ids.
+    retry: dict[str, int] = (
+        dict.fromkeys(saved_retry, 1) if isinstance(saved_retry, list) else dict(saved_retry)
+    )
     new_cursors: dict[str, str] = {}
     # Ids whose path went away this round. Held until every folder is read,
     # because a move shows up as a deleted old path plus the same id elsewhere.
@@ -276,13 +323,25 @@ def _iter_rows(
             removed_ids.add(index.pop(path))
 
     def apply(entry) -> None:
+        path = entry.path_lower
+        if path is None:
+            # Unmounted entries come without a path; there is nothing to index.
+            logger.warning("Dropbox: skipped a change without a path.")
+            return
         if isinstance(entry, dropbox_files.FileMetadata):
-            index[entry.path_lower] = entry.id
+            previous = index.get(path)
+            if previous is not None and previous != entry.id:
+                # A new file written over a path whose old file was deleted,
+                # without a delete in this round's changes.
+                removed_ids.add(previous)
+            index[path] = entry.id
             changed[entry.id] = entry
         elif isinstance(entry, dropbox_files.DeletedMetadata):
             # A deleted folder is one entry, so forget everything under it.
-            forget(entry.path_lower)
-        # FolderMetadata needs no row: folder paths live inside file paths.
+            forget(path)
+        elif path in index:
+            # A folder created where a file used to be.
+            removed_ids.add(index.pop(path))
 
     # Folders dropped from the config: forget the files only they covered.
     # A folder that is still covered by a configured parent is re-listed below,
@@ -295,7 +354,7 @@ def _iter_rows(
         cursor = old_cursors.get(folder)
         if cursor is not None:
             try:
-                entries, new_cursors[folder] = _list_changes(client, cursor, check_active)
+                entries, new_cursors[folder] = _list_changes(session, cursor)
             except ApiError as exc:
                 if _is_reset(exc):
                     logger.info("Dropbox: a folder's cursor was reset; listing it again.")
@@ -312,10 +371,16 @@ def _iter_rows(
         # First run, reset cursor, or a path error to confirm: list the whole
         # folder and reconcile it against the index like a snapshot.
         try:
-            entries, new_cursors[folder] = _list_folder(client, folder, check_active)
+            entries, new_cursors[folder] = _list_folder(session, folder)
         except ApiError as exc:
             if not _is_not_found(exc):
                 raise
+            if folder not in old_cursors:
+                # Never synced: most likely a typo in folder_paths, which would
+                # otherwise just produce an empty dataset.
+                raise DropboxFolderNotFoundError(
+                    "A configured Dropbox folder was not found. Check folder_paths."
+                ) from None
             logger.warning("Dropbox: a synced folder was not found; forgetting its files.")
             forget(folder)
             continue
@@ -335,23 +400,33 @@ def _iter_rows(
     # change since (None: their metadata is fetched again by id).  Added and
     # then deleted within the round, or gone since they failed: nothing to do.
     work: list[tuple[str, Any]] = list(changed.items())
-    work += [(file_id, None) for file_id in dict.fromkeys(retry) if file_id not in changed]
+    work += [(file_id, None) for file_id in retry if file_id not in changed]
     work = [(file_id, entry) for file_id, entry in work if file_id in present_ids]
 
-    next_retry: list[str] = []
+    next_retry: dict[str, int] = {}
+
+    def failed(file_id: str) -> None:
+        attempts = retry.get(file_id, 0) + 1
+        if attempts >= MAX_RETRY_ATTEMPTS:
+            _count_skip(stats, "unavailable")
+        else:
+            stats["failed"] += 1
+            next_retry[file_id] = attempts
+
     yielded = 0
     for position, (file_id, entry) in enumerate(work):
         try:
             if entry is None:
-                entry = _get_metadata(client, file_id, check_active)
+                entry = _get_metadata(session, file_id)
                 if entry is None:
                     continue
-            row = _file_to_row(client, entry, config, stats, check_active)
+            row = _file_to_row(session, entry, config, stats)
         except (AuthError, DropboxRateLimitedError) as exc:
             # Every later request would fail the same way. Stop here, keep
-            # what was stored, and fetch the rest next run.
+            # what was stored, and fetch the rest next run without counting
+            # this as one of their attempts.
             remaining = [file_id for file_id, _ in work[position:]]
-            next_retry.extend(remaining)
+            next_retry.update({file_id: retry.get(file_id, 0) for file_id in remaining})
             stats["failed"] += len(remaining)
             if isinstance(exc, AuthError):
                 stats["failed_auth"] += len(remaining)
@@ -366,17 +441,21 @@ def _iter_rows(
                 len(remaining),
             )
             break
-        except (ApiError, HttpError, OSError):
+        except (ApiError, HttpError, RequestException):
             # Only the metadata lookup of a retried file gets here; downloads
-            # handle their own errors.  Keep it for the next run.
-            stats["failed"] += 1
-            next_retry.append(file_id)
+            # handle their own errors.
+            failed(file_id)
             continue
         if row is _RETRY:
-            next_retry.append(file_id)
+            failed(file_id)
         elif row is not None:
             yielded += 1
             yield row
+        elif file_id in stored_before:
+            # Synced before but skipped now (emptied, too large, renamed to an
+            # unsupported type): its old text must not stay in memory.
+            stats["deleted"] += 1
+            yield {"id": file_id, "_deleted": True}
 
     # The cursors always move forward: files that failed are kept by id in
     # ``retry`` instead, so one bad file never makes later runs replay
@@ -396,11 +475,15 @@ def _iter_rows(
 _RETRY = object()
 
 
-def _file_to_row(client, entry, config: _DropboxConfig, stats: dict[str, int], check_active=None):
+def _file_to_row(session: _Session, entry, config: _DropboxConfig, stats: dict[str, int]):
     """Download and render one file: a row, None when skipped, or _RETRY."""
     stats["scanned"] += 1
     name = entry.name
 
+    # Checked first, so an exported Paper doc is held to the limit as well.
+    if entry.size > config.max_file_size_mb * 1024 * 1024:
+        _count_skip(stats, "too_large")
+        return None
     export_format = None
     if entry.is_downloadable:
         extension = posixpath.splitext(name)[1].lower()
@@ -411,9 +494,6 @@ def _file_to_row(client, entry, config: _DropboxConfig, stats: dict[str, int], c
         else:
             _count_skip(stats, "unsupported_type")
             return None
-        if entry.size > config.max_file_size_mb * 1024 * 1024:
-            _count_skip(stats, "too_large")
-            return None
     else:
         export_format = _pick_export_format(entry.export_info)
         if export_format is None:
@@ -422,7 +502,7 @@ def _file_to_row(client, entry, config: _DropboxConfig, stats: dict[str, int], c
         parse = _decode
 
     try:
-        data = _fetch_bytes(client, entry.id, export_format, check_active)
+        data = _fetch_bytes(session, entry.id, export_format)
     except ApiError as exc:
         lookup = _path_lookup_error(exc)
         if lookup is not None:
@@ -431,21 +511,22 @@ def _file_to_row(client, entry, config: _DropboxConfig, stats: dict[str, int], c
             # downloaded, like restricted content. Skip it, don't retry it.
             _count_skip(stats, "not_found" if lookup.is_not_found() else "unavailable")
             return None
-        stats["failed"] += 1
+        if _is_unsupported(exc):
+            _count_skip(stats, "unsupported_type")
+            return None
         return _RETRY
     except AuthError:
         # Not this file's fault: the caller stops the run.
         raise
-    except (HttpError, OSError):
+    except (HttpError, RequestException):
         # 5xx after the SDK's own retries, or the network: worth another try.
-        # Narrow on purpose, so an exception from check_active is never
-        # mistaken for a failed download.
-        stats["failed"] += 1
+        # Not OSError: a host's check_active may raise PermissionError or
+        # TimeoutError, and that must stop the run, not count as a failure.
         return _RETRY
 
     try:
         text = parse(data)
-    except Exception:
+    except (PyPdfError, ValueError):
         # A corrupt file fails the same way every time, so skip it rather than
         # retrying it forever.
         _count_skip(stats, "unparseable")
@@ -479,11 +560,12 @@ def _pick_export_format(export_info) -> str | None:
     return None
 
 
-def _fetch_bytes(client, file_id: str, export_format: str | None, check_active=None) -> bytes:
+def _fetch_bytes(session: _Session, file_id: str, export_format: str | None) -> bytes:
+    client = session.client
     if export_format is None:
-        _, response = _call(check_active, client.files_download, file_id)
+        _, response = session.call(client.files_download, file_id)
     else:
-        _, response = _call(check_active, client.files_export, file_id, export_format=export_format)
+        _, response = session.call(client.files_export, file_id, export_format=export_format)
     try:
         return response.content
     finally:
@@ -497,14 +579,25 @@ def _render_content(entry, text: str) -> str:
 
 
 def _decode(data: bytes) -> str:
-    return data.decode("utf-8", errors="replace")
+    """Text from a .txt, .md or .csv file, or ValueError when it isn't text.
+
+    Notepad saves UTF-16 with a BOM, which UTF-8 would turn into mojibake with
+    a NUL after every letter.  NUL bytes also break a load into Postgres.
+    """
+    if data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        text = data.decode("utf-16")
+    else:
+        text = data.decode("utf-8-sig", errors="replace")
+    if "\x00" in text:
+        raise ValueError("binary content")
+    return text
 
 
 def _extract_pdf_text(data: bytes) -> str:
-    from pypdf import PdfReader
-
     reader = PdfReader(io.BytesIO(data), strict=False)
-    return "\n".join(page.extract_text() or "" for page in reader.pages)
+    text = "\n".join(page.extract_text() or "" for page in reader.pages)
+    # Some PDFs carry NUL bytes in their text layer; they break a Postgres load.
+    return text.replace("\x00", "")
 
 
 def _count_skip(stats: dict[str, int], reason: str) -> None:
@@ -538,6 +631,8 @@ def dropbox_source(
     Args:
         folder_paths: Folders to sync recursively, like ``["/Notes", "/Work"]``.
             Defaults to the whole Dropbox (the app folder for App folder apps).
+            A folder that does not exist on its first sync raises
+            ``DropboxFolderNotFoundError``.
         resource_name: Stable dlt resource name: lowercase letters, digits and
             underscores, up to 64 characters.  Give each source its own name
             when several sync into one dataset, so their state stays separate.
@@ -549,7 +644,8 @@ def dropbox_source(
         app_secret: Dropbox app secret; leave unset for a PKCE refresh token.
         max_file_size_mb: Skip files larger than this.
         service: Pre-built Dropbox client, mainly for tests.  When omitted a
-            client is built from the auth settings above.
+            client is built from the auth settings above for each run, and
+            closed when the run ends.
         client: Older name for ``service``.
     """
     import dlt
@@ -582,18 +678,9 @@ def dropbox_source(
         folder_paths=_normalize_folder_paths(folder_paths),
         max_file_size_mb=max_file_size_mb,
     )
-    # Building the client makes no network call, so bad settings fail here
-    # instead of halfway through a pipeline run.
-    dropbox_client = (
-        service
-        or client
-        or build_dropbox_client(
-            access_token=access_token,
-            refresh_token=refresh_token,
-            app_key=app_key,
-            app_secret=app_secret,
-        )
-    )
+    injected = service or client
+    if injected is None:
+        _check_credentials(access_token, refresh_token, app_key)
 
     stats: dict[str, int] = {}
 
@@ -607,10 +694,23 @@ def dropbox_source(
         columns={"_deleted": {"data_type": "bool", "hard_delete": True}},
     )
     def dropbox_files():
-        yield from dlt_utils.guarded_rows(
-            _iter_rows(dropbox_client, config, dlt.current.resource_state(), stats, check_active),
-            check_active,
+        dropbox_client = injected or build_dropbox_client(
+            access_token=access_token,
+            refresh_token=refresh_token,
+            app_key=app_key,
+            app_secret=app_secret,
         )
+        try:
+            yield from dlt_utils.guarded_rows(
+                _iter_rows(
+                    dropbox_client, config, dlt.current.resource_state(), stats, check_active
+                ),
+                check_active,
+            )
+        finally:
+            if injected is None:
+                # Built for this run, so its HTTP session is ours to close.
+                dropbox_client.close()
 
     resource = dropbox_files()
     # Opt into the document ingestion path: each file row (id/title/content/url)

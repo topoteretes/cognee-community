@@ -4,8 +4,12 @@ import pytest
 from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR, PIPELINE_SCOPE_ATTR
 from fake_dropbox import FakeDropbox
 
+from cognee_community_connector_dropbox import dropbox as dropbox_module
 from cognee_community_connector_dropbox import dropbox_source
-from cognee_community_connector_dropbox.dropbox import _normalize_folder_paths
+from cognee_community_connector_dropbox.dropbox import (
+    _normalize_folder_paths,
+    build_dropbox_client,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -79,3 +83,42 @@ def test_folder_paths_are_normalized_and_nested_folders_dropped():
         "/work",
     )
     assert _normalize_folder_paths(["/", "/Anything"]) == ("",)
+
+
+def test_refresh_token_goes_to_the_sdk_as_a_refresh_token(monkeypatch):
+    built: list[dict] = []
+    monkeypatch.setattr(dropbox_module, "Dropbox", lambda **kwargs: built.append(kwargs))
+
+    build_dropbox_client(refresh_token="refresh", app_key="key", app_secret="secret")
+    build_dropbox_client(access_token="access")
+
+    assert built[0]["oauth2_refresh_token"] == "refresh"
+    assert "oauth2_access_token" not in built[0]
+    assert built[1]["oauth2_access_token"] == "access"
+    assert all(kwargs["max_retries_on_rate_limit"] == 0 for kwargs in built)
+
+
+def test_a_client_built_for_the_run_is_closed_when_it_ends(monkeypatch, tmp_path):
+    import dlt
+
+    class ClosingFake(FakeDropbox):
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    built: list[ClosingFake] = []
+
+    def build(**_kwargs):
+        built.append(ClosingFake())
+        built[-1].put("/a.md", "alpha")
+        return built[-1]
+
+    monkeypatch.setattr(dropbox_module, "build_dropbox_client", build)
+    monkeypatch.setenv("DLT_DATA_DIR", str(tmp_path))
+    resource = dropbox_source(access_token="token")
+    pipeline = dlt.pipeline("dropbox_close_test", destination="duckdb", dev_mode=True)
+
+    pipeline.extract(resource)
+
+    assert len(built) == 1 and built[0].closed

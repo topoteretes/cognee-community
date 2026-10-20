@@ -11,10 +11,10 @@ via cognee's document-mode marker.
 
 | Dropbox file | How it is read |
 |---|---|
-| `.txt`, `.md`, `.markdown`, `.csv` | downloaded as text |
+| `.txt`, `.md`, `.markdown`, `.csv` | downloaded as text: UTF-8, or UTF-16 with a byte order mark, like Notepad saves it |
 | `.pdf` | text extracted with `pypdf` |
 | Paper docs and other non-downloadable files | exported through `files/export` (markdown when offered) |
-| anything else, files over `max_file_size_mb`, empty or corrupt files | skipped with a warning and counted in the sync stats |
+| anything else, files over `max_file_size_mb` (exported Paper docs included), empty, binary or corrupt files | skipped and counted in the sync stats. A file that was synced before and is skipped now is forgotten, so its old text does not stay in memory |
 
 Folders are synced recursively. Each document starts with the file's Dropbox path and
 folder, so the graph can relate files that live together.
@@ -23,7 +23,7 @@ folder, so the graph can relate files that live together.
 
 - cognee **1.6.3 or newer** (below 2). The connector relies on table-scoped document
   cleanup (`DOCUMENT_SYNC_VERSION`), `PIPELINE_SCOPE_ATTR` and `guarded_rows`.
-- Python 3.10 to 3.13.
+- Python 3.10 to 3.14.
 
 ## Install
 
@@ -110,20 +110,26 @@ After a run, `source.cognee_sync_stats` holds counts only, never file names or c
 - **Moves and renames** arrive as a deleted old path plus the same id at a new path.
   Deletions are held until every folder is read, so a moved file is updated in place,
   not forgotten and re-learned.
+- **A new file written over an old path** forgets the old file's id even when the
+  changes hold only the new file, and so does a folder created where a file used to be.
 - Deleted files are emitted as `{"id": ..., "_deleted": True}` with a `hard_delete`
   column. dlt removes them on `merge`, and cognee's orphan cleanup removes them from the
   graph and vector stores.
 - **Errors never delete.** Only a confirmed `not_found` removes data. A reset cursor
-  (`409 reset`) triggers a fresh listing reconciled against the index.
+  (`409 reset`) triggers a fresh listing reconciled against the index. A configured folder
+  that does not exist on its **first** sync raises `DropboxFolderNotFoundError`, since it
+  is most likely a typo; a folder that disappears later is forgotten like a delete.
 - **Failed downloads are retried by id.** The cursor always moves forward. A file that
-  failed to download (a 5xx or a network error) is kept in a `retry` list in dlt state and
-  fetched again by id next run, so one bad file never makes later runs replay everything.
-  A file that keeps failing costs one extra request per run and keeps `failed` at 1 or
-  more. Files that can never be downloaded, like restricted content, are skipped instead.
-- **Rate limits.** A 429 is waited out up to 60 seconds, at most 3 times, with
-  `check_active` asked again before each retry. A longer wait is never slept through,
-  since cognee holds its dlt staging lock during a sync: the run stops, keeps what it
-  stored, and the remaining files are fetched next run.
+  failed to download (a 5xx or a network error) is kept in a `retry` map in dlt state with
+  its number of attempts, and fetched again by id next run, which costs two requests:
+  its metadata and the download. After 3 failed runs it is skipped as `unavailable`, so
+  an error that never goes away does not cost requests forever. Files Dropbox can never
+  download or export, like restricted content or unsupported types, are skipped at once.
+- **Rate limits.** A 429 is waited out up to 60 seconds, at most 3 times per request,
+  with `check_active` asked again before each retry, and all waits of a run share a
+  budget of 2 minutes. A longer wait is never slept through, since cognee holds its dlt
+  staging lock during a sync: the run stops, keeps what it stored, and the remaining files
+  are fetched next run without counting as one of their 3 attempts.
 - **An expired or revoked token mid-run** stops the run the same way, since every later
   request would fail too. If nothing was stored yet, the error is raised: that is just a
   bad token.
@@ -172,8 +178,11 @@ through cursors.
 - `test_dropbox_sync.py` covers first sync, pagination, edits, moves (within, between
   and out of synced folders), file and folder deletes, a path reused by a new file,
   cursor reset, a vanished folder, listing errors that must not delete, failed downloads
-  retried by id without growing later runs, short and long rate limits, an expired token
-  mid-run, a repeated cursor, restricted files, PDF and Paper export, skip reasons, folder
+  retried by id and given up after 3 runs, short and long rate limits and one wait budget
+  per run, an expired token mid-run, a repeated cursor, a file written over an old path
+  and a folder created on one, a stored file that is skipped now, UTF-16 and binary text,
+  a change without a path, `check_active` raising an `OSError`, unsupported files,
+  restricted files, PDF and Paper export, skip reasons, folder
   configuration, `check_active` before every request (listing pages, incremental rounds and
   downloads) and never swallowed by the download error handling, and no file names, paths
   or ids in the logs.
