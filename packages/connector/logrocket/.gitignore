@@ -1,0 +1,19 @@
+# Local credentials, captures, test/runtime output; never publish these.
+.env
+.env.*
+.dlt/
+.venv/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+*.log
+dist/
+logrocket-capabilities.json
+!*.env.example
+
+# Publish only the user guide and future API integration guide.
+# Other Markdown notes remain local, including the test-data walkthrough.
+*.md
+!/README.md
+!/API_INTEGRATION.md

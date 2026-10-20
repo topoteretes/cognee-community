@@ -1,0 +1,54 @@
+name: LogRocket Connector
+
+on:
+  pull_request:
+    paths:
+      - "packages/connector/logrocket/**"
+      - ".github/workflows/logrocket_connector.yml"
+  push:
+    branches: [main, dev]
+    paths:
+      - "packages/connector/logrocket/**"
+      - ".github/workflows/logrocket_connector.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: logrocket-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  offline-tests:
+    name: Python ${{ matrix.python }} / DLT minimum
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    defaults:
+      run:
+        working-directory: packages/connector/logrocket
+    env:
+      TELEMETRY_DISABLED: "true"
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      LOGROCKET_RUN_COGNEE_E2E: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12.22"
+          python-version: ${{ matrix.python }}
+      - name: Install locked dependencies
+        run: uv sync --locked --group dev
+      - name: Lint and format
+        run: |
+          uv run --locked ruff check .
+          uv run --locked ruff format --check .
+      - name: Offline tests against declared DLT minimum
+        run: uv run --locked --with 'dlt[sqlalchemy]==1.31.0' python -m pytest -q
+      - name: Build distributions
+        run: uv build
