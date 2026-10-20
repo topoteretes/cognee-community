@@ -18,15 +18,25 @@ cleanly — an archived or deleted link drops out of the snapshot, so cognee's e
 preserve stable content-hash ``data_id`` keys, preventing redundant re-ingestion.
 """
 
-from collections.abc import Iterator
 import os
 import time
+from collections.abc import Iterator
 from typing import Any
 
 import httpx
 
-from cognee.shared.logging_utils import get_logger
-from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
+try:
+    from cognee.shared.logging_utils import get_logger
+except ImportError:
+    import logging
+
+    def get_logger(name: str):
+        return logging.getLogger(name)
+
+try:
+    from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
+except ImportError:
+    DOCUMENT_SOURCE_ATTR = "cognee_document_source"
 
 logger = get_logger("dub_connector")
 
@@ -51,15 +61,16 @@ def _request_with_retry(
         try:
             response = client.request(method, url, headers=headers, params=params, timeout=30.0)
             if response.status_code == 429:
-                retry_after = float(response.headers.get("Retry-After", _BASE_BACKOFF * (2**attempt)))
-                logger.warning("Dub.co rate limit reached, waiting %.1f seconds", retry_after)
-                time.sleep(retry_after)
+                delay = float(response.headers.get("Retry-After", _BASE_BACKOFF * (2**attempt)))
+                logger.warning("Dub.co rate limit reached, waiting %.1f seconds", delay)
+                time.sleep(delay)
                 continue
             response.raise_for_status()
             return response.json()
         except (httpx.TransportError, httpx.HTTPStatusError) as exc:
             if attempt == _MAX_RETRIES - 1:
-                raise RuntimeError(f"Dub.co request failed after {_MAX_RETRIES} attempts: {exc}") from exc
+                msg = f"Dub.co request failed after {_MAX_RETRIES} attempts: {exc}"
+                raise RuntimeError(msg) from exc
             time.sleep(_BASE_BACKOFF * (2**attempt))
     raise RuntimeError(f"Dub.co request exceeded retry budget for {url}")
 
@@ -128,9 +139,7 @@ def dub_source(
 
     resolved_token = api_key or os.environ.get("DUB_API_KEY")
     if not resolved_token:
-        raise ValueError(
-            "Dub.co API token required: pass api_key= or set DUB_API_KEY."
-        )
+        raise ValueError("Dub.co API token required: pass api_key= or set DUB_API_KEY.")
 
     http_client = client or httpx.Client(timeout=30.0)
     headers = {
@@ -142,8 +151,9 @@ def dub_source(
     def dub_documents() -> Iterator[dict[str, Any]]:
         active_workspace = workspace_id or os.environ.get("DUB_WORKSPACE_ID")
         if not active_workspace:
-            workspaces_data = _request_with_retry(http_client, "GET", f"{DUB_BASE_URL}/workspaces", headers)
-            workspaces = workspaces_data if isinstance(workspaces_data, list) else workspaces_data.get("workspaces", [])
+            ws_url = f"{DUB_BASE_URL}/workspaces"
+            data = _request_with_retry(http_client, "GET", ws_url, headers)
+            workspaces = data if isinstance(data, list) else data.get("workspaces", [])
             if workspaces:
                 active_workspace = str(workspaces[0].get("id"))
                 logger.info("Auto-detected Dub.co workspace_id: %s", active_workspace)
@@ -183,7 +193,6 @@ def dub_source(
                 break
             page += 1
 
-    # Declare document source attribute so cognee runs full entity extraction (document-mode)
     setattr(dub_documents, DOCUMENT_SOURCE_ATTR, DUB_SOURCE_NAME)
 
     @dlt.source(name=DUB_SOURCE_NAME)

@@ -45,6 +45,7 @@ import os
 import cognee
 from cognee_community_connector_dub import dub_source
 
+
 async def main():
     # Provide token explicitly or set DUB_API_KEY environment variable
     source = dub_source(api_key=os.environ.get("DUB_API_KEY"))
@@ -59,6 +60,7 @@ async def main():
         datasets=["dub"],
     )
     print("Search Result:\n", results)
+
 
 if __name__ == "__main__":
     asyncio.run(main())

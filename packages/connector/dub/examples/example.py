@@ -23,6 +23,7 @@ import asyncio
 import os
 
 import cognee
+
 from cognee_community_connector_dub import dub_source
 
 # Maintain Dub.co in its own dedicated dataset for easy inspection and lifecycle management
@@ -42,8 +43,9 @@ async def main() -> None:
     await cognee.remember(source, dataset_name=DATASET_NAME, self_improvement=False)
 
     print("\nQuerying knowledge graph ...")
+    query = "What campaign short links do we have, and which ones have the highest clicks?"
     answer = await cognee.search(
-        query_text="What campaign short links do we have, where do they redirect, and which ones have the highest clicks?",
+        query_text=query,
         query_type=cognee.SearchType.GRAPH_COMPLETION,
         datasets=[DATASET_NAME],
     )

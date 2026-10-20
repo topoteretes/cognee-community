@@ -1,10 +1,12 @@
-import pytest
 from unittest.mock import MagicMock, patch
+
+import pytest
+
 from cognee_community_connector_dub.dub import (
-    dub_source,
-    _format_link_markdown,
-    DUB_TABLE_NAME,
     DOCUMENT_SOURCE_ATTR,
+    DUB_TABLE_NAME,
+    _format_link_markdown,
+    dub_source,
 )
 
 
@@ -26,9 +28,11 @@ def sample_link():
 
 def test_missing_api_key_raises_error():
     """Verify that omitting the Dub.co API token raises ValueError."""
-    with patch.dict("os.environ", {}, clear=True):
-        with pytest.raises(ValueError, match="Dub.co API token required"):
-            dub_source(api_key=None)
+    with (
+        patch.dict("os.environ", {}, clear=True),
+        pytest.raises(ValueError, match=r"Dub\.co API token required"),
+    ):
+        dub_source(api_key=None)
 
 
 def test_link_markdown_formatting_deterministic(sample_link):
@@ -80,6 +84,8 @@ def test_dub_source_extracts_links(sample_link):
     assert len(items) == 1
     assert items[0]["id"] == "link_link_xyz123"
     assert items[0]["key"] == "product-launch"
-    assert items[0]["url"] == "https://company.com/blog/2026-product-announcement?utm_source=twitter"
+    assert (
+        items[0]["url"] == "https://company.com/blog/2026-product-announcement?utm_source=twitter"
+    )
     assert items[0]["type"] == "short_link"
     assert "# Dub.co Link:" in items[0]["body"]
