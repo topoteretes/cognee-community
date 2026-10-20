@@ -120,7 +120,7 @@ class FakeOutreach(HTTPAdapter):
         return [
             c
             for c in self.list_calls(path)
-            if "updatedAt" == next((v for k, v in c.items() if k.startswith("fields[")), None)
+            if next((v for k, v in c.items() if k.startswith("fields[")), None) == "updatedAt"
         ]
 
     def remove(self, path, rid):

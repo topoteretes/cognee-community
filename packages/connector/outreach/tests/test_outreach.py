@@ -6,6 +6,8 @@ No network and no credentials. Fixtures under ``fixtures/`` are obviously fake.
 """
 
 import copy
+import io
+import json
 import logging
 from datetime import UTC, datetime, timedelta
 
@@ -193,7 +195,7 @@ def test_source_is_a_document_source_and_row_shape(fake, make_source, pipeline_f
 
 def test_request_shape_filters_sorting_sparse_fieldsets(fake, make_source, pipeline_factory):
     pipeline_factory().run(make_source(fake, resources=["prospects"]), **RUN)
-    data = [c for c in fake.list_calls("/prospects") if "sort" in c][0]
+    data = next(c for c in fake.list_calls("/prospects") if "sort" in c)
     assert data["sort"] == "updatedAt" and data["count"] == "false" and data["page[size]"] == "2"
     assert "filter[updatedAt]" not in data  # first run: no cursor
     fields = data["fields[prospect]"].split(",")
@@ -260,7 +262,7 @@ def test_second_run_uses_stored_cursor_and_only_emits_changes(fake, make_source,
     emitted = res_state(pipeline, PROS)["last_run"]["emitted"]
     assert emitted == 2  # the edited record and the cursor-boundary record (overlap), not all 5
     assert res_state(pipeline, PROS)["cursor_updated_at"] == "2026-04-01T00:00:00+00:00"
-    (title,) = read_table(pipeline, PROS, "content")[1:2] or [("",)]
+    assert "Director" in _content(pipeline, PROS)
     assert ids(pipeline, PROS) == PROSPECT_IDS
 
 
@@ -332,7 +334,7 @@ def test_future_timestamp_cannot_push_cursor_past_now(fake, sync):
 def test_activity_first_sync_uses_lookback_window(fake, sync):
     state = {}
     sync("mailings", fake, state, activity_since=timedelta(days=30))
-    first = [c for c in fake.list_calls("/mailings") if "sort" in c][0]
+    first = next(c for c in fake.list_calls("/mailings") if "sort" in c)
     assert first["filter[updatedAt]"] == "2026-05-02T00:00:00.000Z..inf"
 
 
@@ -658,3 +660,20 @@ def test_now_iso_helper_is_utc():
 
 def test_paths_table_matches_streams():
     assert {s.path for s in STREAMS.values()} == set(PATHS.values())
+
+
+def test_cross_host_next_link_is_never_followed(fake, sync):
+    """A hostile ``links.next`` must not receive the bearer token."""
+    real = fake._list
+
+    def evil(request, path, params, parsed):
+        response = real(request, path, params, parsed)
+        body = json.loads(response.raw.getvalue())
+        body["links"] = {"next": "https://evil.example.test/steal"}
+        response.raw = io.BytesIO(json.dumps(body).encode())
+        return response
+
+    fake._list = evil
+    with pytest.raises(OutreachError, match="pagination"):
+        sync("prospects", fake, {})
+    assert all("evil" not in str(c) for c in fake.calls)

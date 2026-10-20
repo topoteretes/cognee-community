@@ -414,6 +414,15 @@ class TokenStore:
 # ===========================================================================
 
 
+def _build_token_session():
+    """Token-endpoint session: one attempt only.
+
+    A retried refresh after the server already rotated the refresh token would present the
+    dead old one and lock the account out; a failed attempt is simply retried next run.
+    """
+    return _build_session(max_attempts=1)
+
+
 def _build_session(
     *,
     max_attempts: int = MAX_ATTEMPTS,
@@ -631,7 +640,7 @@ def build_auth(
         client_id=client_id,
         client_secret=client_secret,
         store=TokenStore(token_store),
-        session_factory=(lambda: session) if session is not None else _build_session,
+        session_factory=(lambda: session) if session is not None else _build_token_session,
         token_url=token_url,
         redirect_uri=redirect_uri or os.environ.get(REDIRECT_URI_ENV),
         clock=clock,
@@ -681,7 +690,7 @@ def exchange_code(
 ) -> dict[str, Any]:
     """Swap the authorization code for tokens and save them (0600). Returns the record."""
     body = _token_request(
-        session or _build_session(),
+        session or _build_token_session(),
         token_url,
         {
             "grant_type": "authorization_code",
@@ -996,11 +1005,17 @@ def unpack_known(packed: Any) -> dict[str, int]:
 # ===========================================================================
 
 
-def _paginator():
+def _paginator(base_url: str):
     from dlt.sources.helpers.rest_client.paginators import JSONLinkPaginator
 
+    host = urllib.parse.urlparse(base_url).netloc
+
     class _GuardedLinkPaginator(JSONLinkPaginator):
-        """Follows ``links.next``; stops on empty, repeated or looping pages."""
+        """Follows ``links.next``; stops on empty, repeated, looping or cross-host pages.
+
+        A next link pointing at another host would carry the bearer token there, so it is
+        treated like a pagination fault (``repeated``): the pass is incomplete.
+        """
 
         def __init__(self, max_pages: int = 1_000_000) -> None:
             super().__init__(next_url_path=NEXT_LINK_PATH)
@@ -1020,6 +1035,10 @@ def _paginator():
                 "|".join(str(r.get("id")) if isinstance(r, dict) else "?" for r in data).encode()
             ).hexdigest()
             link = self._next_reference
+            if link and urllib.parse.urlparse(link).netloc not in ("", host):
+                self.repeated = True
+                self._has_next_page = False
+                return
             if (
                 signature == self._prev_signature
                 or self._pages >= self.max_pages
@@ -1046,6 +1065,10 @@ class _Api:
         self._client = RESTClient(
             base_url=base_url, auth=auth, session=session, headers=self._headers
         )
+
+    @property
+    def base_url(self) -> str:
+        return self._base_url
 
     def probe(self, path: str) -> int:
         """One cheap authenticated GET; returns the HTTP status."""
@@ -1110,7 +1133,7 @@ class _Pass:
 
     def __init__(self, api: _Api, stream: _Stream, params: dict[str, Any], *, strict: bool):
         self._api, self._stream, self._params, self._strict = api, stream, params, strict
-        self._paginator = _paginator()
+        self._paginator = _paginator(api.base_url)
         self.fetched = 0
         self.complete = True
         self.reason: str | None = None
