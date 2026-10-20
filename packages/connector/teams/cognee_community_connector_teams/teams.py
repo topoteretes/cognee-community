@@ -362,8 +362,8 @@ def _thread_to_row(root: dict, replies: list[dict], channel_name: str) -> dict |
     ]
     live_replies.sort(key=lambda reply: (reply.get("createdDateTime") or "", reply.get("id")))
 
-    sections = [_render_message(root, heading="")]
-    sections.extend(_render_message(reply, heading="Reply from ") for reply in live_replies)
+    sections = [_render_message(root, verb="wrote")]
+    sections.extend(_render_message(reply, verb="replied") for reply in live_replies)
     sections = [section for section in sections if section]
     if not sections:
         return None
@@ -378,14 +378,18 @@ def _thread_to_row(root: dict, replies: list[dict], channel_name: str) -> dict |
     }
 
 
-def _render_message(message: dict, heading: str) -> str:
-    """Render one message as ``<author> (<time>):`` followed by its text."""
+def _render_message(message: dict, verb: str) -> str:
+    """Render one message as ``<author> <verb> on <date> at <time> UTC:`` and its text.
+
+    The header reads as a sentence on purpose: label-style headers such as
+    ``Reply from <author> (<time>):`` were extracted as entities of their own.
+    """
     text = _message_text(message)
     if not text:
         return ""
     created = _parse_time(message.get("createdDateTime"))
-    when = f" ({created:%Y-%m-%d %H:%M} UTC)" if created else ""
-    return f"{heading}{_author(message)}{when}:\n{text}"
+    when = f" on {created:%Y-%m-%d} at {created:%H:%M} UTC" if created else ""
+    return f"{_author(message)} {verb}{when}:\n{text}"
 
 
 def _message_text(message: dict) -> str:

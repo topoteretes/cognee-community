@@ -114,9 +114,9 @@ def test_thread_to_row_renders_root_then_replies_in_time_order():
     assert row["url"] == "https://teams/1"
     assert row["_deleted"] is False
     assert row["content"] == (
-        "Robin (2026-01-01 09:00 UTC):\nKickoff\n\n"
-        "Reply from Alex (2026-01-01 09:01 UTC):\nfirst\n\n"
-        "Reply from Jane (2026-01-01 09:02 UTC):\nsecond"
+        "Robin wrote on 2026-01-01 at 09:00 UTC:\nKickoff\n\n"
+        "Alex replied on 2026-01-01 at 09:01 UTC:\nfirst\n\n"
+        "Jane replied on 2026-01-01 at 09:02 UTC:\nsecond"
     )
 
 
@@ -154,7 +154,7 @@ def test_build_document_data_item_tags_source():
             "id": _thread_id(GENERAL, "1"),
             "url": "https://teams/1",
             "title": "General: Kickoff",
-            "content": "Robin (2026-01-01 09:00 UTC):\nKickoff",
+            "content": "Robin wrote on 2026-01-01 at 09:00 UTC:\nKickoff",
         },
         table_name="teams_threads",
         content_hash="abc123",
@@ -278,7 +278,7 @@ def test_new_reply_re_renders_an_old_thread_and_walk_stops_early(graph):
     # previous newest thread is re-read only as the cursor's overlap window.
     assert _thread_id(GENERAL, old) in _live(rows)
     assert len(rows) == 2
-    assert "Reply from Jane Smith" in rows[_thread_id(GENERAL, old)]["content"]
+    assert "Jane Smith replied" in rows[_thread_id(GENERAL, old)]["content"]
     assert "late answer" in rows[_thread_id(GENERAL, old)]["content"]
     assert len(graph.message_requests()) == 2
 
