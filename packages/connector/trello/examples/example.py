@@ -5,8 +5,8 @@ Every card (list, labels, members, dates, description, checklists, comments) and
 every board is ingested as a normal document, so it goes through cognify entity
 extraction.
 
-Re-running syncs only what changed: edited cards are processed again and cards
-or boards you delete are forgotten.
+The script syncs twice: change something on the board in between (edit or
+comment on a card, delete one) and the second sync processes only that change.
 
 Privacy / opt-in
 ----------------
@@ -36,15 +36,8 @@ from cognee_community_connector_trello import trello_source
 DATASET_NAME = "trello"
 
 
-async def main() -> None:
-    required = ("TRELLO_API_KEY", "TRELLO_TOKEN", "TRELLO_BOARD_ID")
-    if not all(os.environ.get(name) for name in required):
-        print(f"Set {', '.join(required)} to run this example.")
-        return
-
-    source = trello_source(board_ids=[os.environ["TRELLO_BOARD_ID"]])
-
-    print("Syncing Trello into cognee ...")
+async def sync(board_id: str) -> None:
+    source = trello_source(board_ids=[board_id])
     await cognee.remember(
         source,
         dataset_name=DATASET_NAME,
@@ -55,15 +48,26 @@ async def main() -> None:
     )
     print("Sync stats:", source.cognee_sync_stats)
 
+
+async def main() -> None:
+    required = ("TRELLO_API_KEY", "TRELLO_TOKEN", "TRELLO_BOARD_ID")
+    if not all(os.environ.get(name) for name in required):
+        print(f"Set {', '.join(required)} to run this example.")
+        return
+    board_id = os.environ["TRELLO_BOARD_ID"]
+
+    print("First sync: every card and the board are ingested ...")
+    await sync(board_id)
     results = await cognee.recall(
         "What is in progress on this board and who is working on it?", datasets=[DATASET_NAME]
     )
     print("\nRecall result:\n", results)
 
-    print(
-        "\nEdit, comment on or delete a card, then re-run: only the changes are synced "
-        "and deleted cards are forgotten."
+    await asyncio.to_thread(
+        input, "\nEdit, comment on or delete a card in Trello, then press Enter to sync again."
     )
+    print("Second sync: only what changed is processed ...")
+    await sync(board_id)
 
 
 if __name__ == "__main__":

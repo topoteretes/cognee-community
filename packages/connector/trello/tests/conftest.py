@@ -5,7 +5,11 @@ import re
 
 import pytest
 
-from cognee_community_connector_trello.trello import TrelloAPIError
+from cognee_community_connector_trello.trello import (
+    TrelloAPIError,
+    TrelloAuthError,
+    TrelloRateLimitedError,
+)
 
 BOARD = "b1"
 PRIYA = {"id": "m1", "fullName": "Priya Shah"}
@@ -24,6 +28,7 @@ class FakeTrello:
         self.actions: dict[str, list[dict]] = {}
         self.bad_token = False
         self.errors: dict[str, int] = {}
+        self.rate_limited: set[str] = set()
         self.calls: list[tuple[str, dict]] = []
         self._ids = itertools.count(1)
         self.add_board(BOARD, "Product")
@@ -61,7 +66,7 @@ class FakeTrello:
             "memberCreator": PRIYA,
         }
         self.actions[board_id].append(action)
-        self.boards[board_id]["dateLastActivity"] = f"2026-10-05T10:00:{len(self.actions):02d}Z"
+        self.boards[board_id]["dateLastActivity"] = f"2026-10-05T10:{len(self.actions):02d}Z"
         return action
 
     def add_card(self, card_id, name, board_id=BOARD, **fields):
@@ -80,6 +85,17 @@ class FakeTrello:
         self.act(board_id, "createCard", card={"id": card_id})
         return card
 
+    def move_card(self, card_id, source, target):
+        card = self.card(card_id, source)
+        self.boards[source]["cards"].remove(card)
+        self.boards[target]["cards"].append(card)
+        self.act(source, "moveCardFromBoard", card={"id": card_id})
+        self.act(target, "moveCardToBoard", card={"id": card_id})
+        for action in [a for a in self.actions[source] if a["type"] == "commentCard"]:
+            if action["data"]["card"]["id"] == card_id:
+                self.actions[source].remove(action)
+                self.actions[target].append(action)
+
     def comment(self, card_id, text, board_id=BOARD, author=SAM):
         action = self.act(board_id, "commentCard", card={"id": card_id}, text=text)
         action["memberCreator"] = author
@@ -88,12 +104,29 @@ class FakeTrello:
     def card(self, card_id, board_id=BOARD):
         return next(c for c in self.boards[board_id]["cards"] if c["id"] == card_id)
 
+    def _comments(self, card_id):
+        return [
+            a
+            for actions in self.actions.values()
+            for a in actions
+            if a["type"] == "commentCard" and a["data"]["card"]["id"] == card_id
+        ]
+
+    def _fail(self, key):
+        if key in self.rate_limited:
+            raise TrelloRateLimitedError("Trello rate limit exceeded (HTTP 429)")
+        status = self.errors.get(key)
+        if status == 401:
+            raise TrelloAuthError("Trello rejected the API key or token (HTTP 401)")
+        if status:
+            raise TrelloAPIError(f"Trello request failed: HTTP {status}", status=status)
+
     def get(self, path, params=None):
         params = dict(params or {})
         self.calls.append((path, params))
         if path == "/members/me":
             if self.bad_token:
-                raise TrelloAPIError("Trello request failed: HTTP 401", status=401)
+                raise TrelloAuthError("Trello rejected the API key or token (HTTP 401)")
             return {"id": "me"}
         if path == "/members/me/boards" or path.startswith("/organizations/"):
             organization = path.split("/")[2] if path.startswith("/organizations/") else None
@@ -103,19 +136,30 @@ class FakeTrello:
                 if (organization is None or b["idOrganization"] == organization)
                 and (params["filter"] == "all" or not b["closed"])
             ]
-        match = re.fullmatch(r"/boards/(\w+)(/actions)?", path)
+        match = re.fullmatch(r"/cards/(\w+)/actions", path)
+        if match:
+            comments = sorted(self._comments(match.group(1)), key=lambda a: a["id"], reverse=True)
+            page = int(params["page"])
+            return comments[page * 50 : (page + 1) * 50]
+        match = re.fullmatch(r"/boards/(\w+)(/actions|/checklists)?", path)
         if not match:
             raise AssertionError(f"unexpected path {path}")
-        board_id = match.group(1)
-        if board_id in self.errors:
-            status = self.errors[board_id]
-            raise TrelloAPIError(f"Trello request failed: HTTP {status}", status=status)
+        board_id, part = match.groups()
+        self._fail(board_id)
         if board_id not in self.boards:
             raise TrelloAPIError("Trello request failed: HTTP 404", status=404)
-        if not match.group(2):
-            return self.boards[board_id]
+        board = self.boards[board_id]
+        if part == "/checklists":
+            return board["checklists"]
+        if part is None and "cards" in params:
+            cards = [
+                {**c, "badges": {"comments": len(self._comments(c["id"]))}} for c in board["cards"]
+            ]
+            return {"id": board_id, "cards": cards}
+        if part is None:
+            return {k: v for k, v in board.items() if k not in ("cards", "checklists")}
         actions = sorted(self.actions[board_id], key=lambda a: a["id"], reverse=True)
-        if params.get("filter"):
+        if params.get("filter", "all") != "all":
             actions = [a for a in actions if a["type"] in params["filter"].split(",")]
         if params.get("since"):
             actions = [a for a in actions if a["id"] >= params["since"]]

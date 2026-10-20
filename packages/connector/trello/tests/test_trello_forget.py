@@ -86,7 +86,7 @@ async def clean_environment(tmp_path, monkeypatch):
 
 async def _sync(trello):
     await cognee.remember(
-        trello_source([BOARD], client=trello),
+        trello_source([BOARD], service=trello),
         dataset_name=DATASET,
         primary_key="id",
         write_disposition="merge",

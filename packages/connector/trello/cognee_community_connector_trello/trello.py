@@ -19,20 +19,25 @@ Design
 ------
 * **Auth** is an API key plus a user token, sent in the ``Authorization`` header
   so the token never shows up in URLs or logs.
-* **Rows** are flat ``{id, title, content, url, _deleted}``: one per card
-  (``card:<id>``) and one per board (``board:<id>``). Card titles stay out of
-  the board document, so a new card does not re-process the board.
+* **Rows** are flat ``{id, title, content, url, _deleted}`` plus the board as a
+  node set: one per card (``card:<id>``) and one per board (``board:<id>``).
+  Card titles stay out of the board document, so a new card does not re-process
+  the board, and everything is sorted so the API's ordering never changes a row.
 * **Incremental.** Cards carry no reliable updated timestamp, so the board
-  ``actions`` feed drives the sync: its newest action id is the cursor. Trello
-  leaves some action types out of the feed (comment edits and deletions,
-  checklist item and label changes), so every run also reads one snapshot of
-  the board (cards, lists, labels, checklists) and diffs it by hash. Comments,
-  the expensive part, are only read again when the feed has new actions, the
-  board's ``dateLastActivity`` moved, or a card changed.
-* **Forget-on-delete.** A card that is deleted or moved off the board, a board
-  that is deleted or no longer visible, and a board removed from the selection
-  are emitted as hard-delete tombstones. Any other failure raises, and dlt rolls
-  the state of a failed run back.
+  ``actions`` feed drives the sync: its newest action id is the cursor. A board
+  with no new action and the same ``dateLastActivity`` costs two requests. A
+  changed board is read again (cards, lists, labels, checklists) and diffed card
+  by card, which also catches the action types Trello leaves out of the feed
+  (checklist items, labels, deleted comments through the comment count).
+  Comments are read only for the cards that changed.
+* **Forget-on-delete.** Deleted cards and boards are emitted as hard-delete
+  tombstones, decided once per run across all selected boards, so a card moved
+  between two of them is never lost. A board listed in ``board_ids`` that cannot
+  be read raises instead of being forgotten.
+* **A run is bounded.** On a rate limit, an expired token after progress, or a
+  spent request budget it stops cleanly, keeps the boards it finished, and
+  reports why in ``cognee_sync_stats``; deletions are only decided by a run
+  that finished.
 
 Privacy
 -------
@@ -46,22 +51,30 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Any
 
 from cognee.tasks.ingestion import dlt_utils
-from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
+from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR, NODE_SET_COLUMN
 
 logger = logging.getLogger(__name__)
 
 API_URL = "https://api.trello.com/1"
+# Largest ``limit`` the board actions endpoint accepts.
 _ACTIONS_PAGE = 1000
+# Card actions come in fixed pages of 50, at most 20 pages.
+_CARD_ACTIONS_PAGE = 50
+_CARD_ACTIONS_MAX_PAGE = 19
+# Trello's gateway gives up on a request after 30 seconds.
 _TIMEOUT = 30.0
 _RETRIES = 5
-_MAX_RETRY_SLEEP = 10.0
-_CARD_FIELDS = "id,name,desc,idList,labels,idMembers,start,due,dueComplete,closed,shortUrl"
+# Trello's limits run in 10 second windows; a longer Retry-After stops the run.
+_MAX_RETRY_WAIT = 60.0
+DEFAULT_MAX_REQUESTS = 1500
+_CARD_FIELDS = "id,name,desc,idList,labels,idMembers,start,due,dueComplete,closed,shortUrl,badges"
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +85,11 @@ class TrelloSourceError(RuntimeError):
 
 
 class TrelloAuthError(TrelloSourceError):
-    """Trello rejected the API key or token."""
+    """Trello rejected the API key or token (HTTP 401)."""
+
+
+class TrelloRateLimitedError(TrelloSourceError):
+    """Trello kept answering HTTP 429."""
 
 
 class TrelloAPIError(TrelloSourceError):
@@ -86,12 +103,11 @@ class TrelloAPIError(TrelloSourceError):
 # ---------------------------------------------------------------------------
 # Transport
 # ---------------------------------------------------------------------------
-def _retry_delay(response: Any, attempt: int) -> float:
+def _retry_after(response: Any) -> float | None:
     try:
-        delay = float(response.headers.get("Retry-After"))
+        return max(float(response.headers.get("Retry-After")), 0.0)
     except (TypeError, ValueError):
-        delay = float(2**attempt)
-    return min(max(delay, 0.0), _MAX_RETRY_SLEEP)
+        return None
 
 
 class TrelloClient:
@@ -128,7 +144,8 @@ class TrelloClient:
     def get(self, path: str, params: dict[str, Any] | None = None) -> Any:
         import httpx
 
-        for attempt in range(_RETRIES):
+        attempt = 0
+        while True:
             last = attempt == _RETRIES - 1
             try:
                 response = self._http.get(API_URL + path, params=params, headers=self._headers)
@@ -136,15 +153,23 @@ class TrelloClient:
                 if last:
                     raise TrelloAPIError(f"Trello request failed: {type(exc).__name__}") from None
                 self._sleep(float(2**attempt))
+                attempt += 1
                 continue
             status = response.status_code
-            if (status == 429 or status >= 500) and not last:
-                self._sleep(_retry_delay(response, attempt))
-                continue
-            if status != 200:
+            if status == 429:
+                wait = _retry_after(response)
+                if last or (wait is not None and wait > _MAX_RETRY_WAIT):
+                    raise TrelloRateLimitedError("Trello rate limit exceeded (HTTP 429)")
+                self._sleep(wait if wait is not None else float(2**attempt))
+            elif status >= 500 and not last:
+                self._sleep(float(2**attempt))
+            elif status == 401:
+                raise TrelloAuthError("Trello rejected the API key or token (HTTP 401)")
+            elif status != 200:
                 raise TrelloAPIError(f"Trello request failed: HTTP {status}", status=status)
-            return response.json()
-        raise TrelloAPIError("Trello request failed")  # pragma: no cover
+            else:
+                return response.json()
+            attempt += 1
 
 
 # ---------------------------------------------------------------------------
@@ -154,9 +179,14 @@ def _date(value: Any) -> str:
     return str(value)[:10] if value else ""
 
 
+def _ordered(items: list[dict]) -> list[dict]:
+    """Trello's position order, with the id as tiebreak so the result is stable."""
+    return sorted(items, key=lambda item: (item.get("pos") or 0, str(item.get("id"))))
+
+
 def _label_names(labels: list[dict]) -> list[str]:
     names = (str(label.get("name") or label.get("color") or "") for label in labels)
-    return [name for name in names if name]
+    return sorted(name for name in names if name)
 
 
 def _card_list(card: dict, board: dict) -> dict:
@@ -169,15 +199,15 @@ def _archived(card: dict, board: dict) -> bool:
 
 
 def render_board(board: dict) -> dict[str, Any]:
-    lists = sorted(board.get("lists") or [], key=lambda item: item.get("pos") or 0)
     members = sorted(name for m in board.get("members") or [] if (name := m.get("fullName")))
-    labels = sorted(_label_names(board.get("labels") or []))
+    labels = _label_names(board.get("labels") or [])
     parts = [f"Board: {board.get('name') or board['id']}"]
     if board.get("closed"):
         parts.append("Status: archived")
     description = str(board.get("desc") or "").strip()
     if description:
         parts.extend(["", description])
+    lists = _ordered(board.get("lists") or [])
     if lists:
         parts.extend(["", "Lists:"])
         parts.extend(
@@ -193,6 +223,7 @@ def render_board(board: dict) -> dict[str, Any]:
         "title": str(board.get("name") or board["id"]),
         "content": "\n".join(parts),
         "url": str(board.get("url") or ""),
+        NODE_SET_COLUMN: [f"trello:{board['id']}"],
         "_deleted": False,
     }
 
@@ -201,6 +232,7 @@ def render_card(
     card: dict, board: dict, checklists: list[dict], comments: list[dict]
 ) -> dict[str, Any]:
     members = {m["id"]: str(m.get("fullName") or "") for m in board.get("members") or []}
+    member_names = sorted(members[m] for m in card.get("idMembers") or [] if members.get(m))
     due = _date(card.get("due"))
     if due and card.get("dueComplete"):
         due += " (done)"
@@ -208,7 +240,7 @@ def render_card(
         ("Board", str(board.get("name") or "")),
         ("List", str(_card_list(card, board).get("name") or "")),
         ("Labels", ", ".join(_label_names(card.get("labels") or []))),
-        ("Members", ", ".join(members[m] for m in card.get("idMembers") or [] if members.get(m))),
+        ("Members", ", ".join(member_names)),
         ("Start", _date(card.get("start"))),
         ("Due", due),
         ("Status", "archived" if _archived(card, board) else ""),
@@ -219,9 +251,9 @@ def render_card(
         parts.extend(["", description])
     if checklists:
         parts.extend(["", "Checklists:"])
-        for checklist in sorted(checklists, key=lambda c: c.get("pos") or 0):
+        for checklist in _ordered(checklists):
             parts.append(f"{checklist.get('name') or 'Checklist'}:")
-            for item in sorted(checklist.get("checkItems") or [], key=lambda i: i.get("pos") or 0):
+            for item in _ordered(checklist.get("checkItems") or []):
                 mark = "x" if item.get("state") == "complete" else " "
                 parts.append(f"- [{mark}] {item.get('name')}")
     if comments:
@@ -235,12 +267,13 @@ def render_card(
         "title": str(card.get("name") or "").strip() or "Untitled card",
         "content": "\n".join(parts),
         "url": str(card.get("shortUrl") or ""),
+        NODE_SET_COLUMN: [f"trello:{board['id']}"],
         "_deleted": False,
     }
 
 
-def _digest(row: dict) -> str:
-    return hashlib.md5(json.dumps(row, sort_keys=True).encode()).hexdigest()
+def _digest(value: Any) -> str:
+    return hashlib.md5(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -254,206 +287,322 @@ class _TrelloConfig:
     include_comments: bool
     include_checklists: bool
     full_resync: bool
+    max_requests: int = DEFAULT_MAX_REQUESTS
 
 
-def _board_ids(client: Any, config: _TrelloConfig) -> list[str]:
-    if config.board_ids:
-        return list(config.board_ids)
-    params = {"filter": "all" if config.include_archived else "open", "fields": "id"}
-    if config.workspace_id:
-        boards = client.get(f"/organizations/{config.workspace_id}/boards", params)
-    else:
-        boards = client.get("/members/me/boards", params)
-    return [str(board["id"]) for board in boards]
+class _CutShortError(Exception):
+    """Internal: stop the run here, keeping the boards finished so far."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
 
 
-def _snapshot(client: Any, board_id: str) -> dict:
-    """One request: the board with its lists, labels, members, cards and checklists."""
-    return client.get(
-        f"/boards/{board_id}",
-        {
-            "fields": "name,desc,closed,url,dateLastActivity",
-            "lists": "all",
-            "labels": "all",
-            # The nested label list is capped at 50 unless asked for more.
-            "labels_limit": 1000,
-            "members": "all",
-            "cards": "all",
-            "card_fields": _CARD_FIELDS,
-            "checklists": "all",
-        },
-    )
+class _Walker:
+    """One run over the selected boards, writing progress into ``state``."""
 
+    def __init__(
+        self,
+        client: Any,
+        config: _TrelloConfig,
+        state: dict,
+        stats: dict[str, int],
+        check_active: Callable[[], None] | None,
+    ):
+        self.client = client
+        self.config = config
+        self.state = state
+        self.stats = stats
+        self.check_active = check_active
+        self.requests = 0
+        self.emitted = 0
+        options = [config.include_archived, config.include_comments, config.include_checklists]
+        # Changed include flags re-render every card, so documents follow them.
+        self.rerender = config.full_resync or state.get("options") != options
+        self.options = options
 
-def _newest_action(client: Any, board_id: str, cursor: str | None) -> str | None:
-    """The newest action id after ``cursor``, or None when nothing happened."""
-    params: dict[str, Any] = {"limit": 2, "fields": "id"}
-    if cursor:
-        params["since"] = cursor
-    actions = client.get(f"/boards/{board_id}/actions", params)
-    # Action ids are Mongo ObjectIds, so newer ones compare greater.
-    newer = [str(a["id"]) for a in actions if not cursor or str(a["id"]) > cursor]
-    return max(newer, default=None)
+    def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        if self.check_active is not None:
+            self.check_active()
+        self.requests += 1
+        try:
+            return self.client.get(path, params)
+        except TrelloRateLimitedError:
+            raise _CutShortError("rate_limit") from None
+        except TrelloAuthError:
+            if self.emitted:
+                raise _CutShortError("auth") from None
+            raise
 
+    # -- reading -----------------------------------------------------------
+    def _board_ids(self) -> list[str]:
+        if self.config.board_ids:
+            return list(self.config.board_ids)
+        params = {"filter": "all" if self.config.include_archived else "open", "fields": "id"}
+        if self.config.workspace_id:
+            boards = self._get(f"/organizations/{self.config.workspace_id}/boards", params)
+        else:
+            boards = self._get("/members/me/boards", params)
+        return [str(board["id"]) for board in boards]
 
-def _comments(client: Any, board_id: str) -> dict[str, list[dict]]:
-    by_card: dict[str, list[dict]] = {}
-    before = None
-    while True:
-        params: dict[str, Any] = {"filter": "commentCard", "limit": _ACTIONS_PAGE}
-        if before:
-            params["before"] = before
-        page = client.get(f"/boards/{board_id}/actions", params)
-        for action in page:
-            card_id = ((action.get("data") or {}).get("card") or {}).get("id")
-            if card_id:
-                by_card.setdefault(str(card_id), []).append(action)
-        if len(page) < _ACTIONS_PAGE:
-            return by_card
-        oldest = min(str(a["id"]) for a in page)
-        if oldest == before:
-            raise TrelloAPIError("Trello action pagination did not advance")
-        before = oldest
+    def _newest_action(self, board_id: str, cursor: str | None) -> str | None:
+        """The newest action id after ``cursor``, or None when nothing happened."""
+        params: dict[str, Any] = {"filter": "all", "limit": 2, "fields": "id"}
+        if cursor:
+            params["since"] = cursor
+        actions = self._get(f"/boards/{board_id}/actions", params)
+        # Action ids are Mongo ObjectIds, so newer ones compare greater.
+        newer = [str(a["id"]) for a in actions if not cursor or str(a["id"]) > cursor]
+        return max(newer, default=None)
 
+    def _board(self, board_id: str) -> dict:
+        return self._get(
+            f"/boards/{board_id}",
+            {
+                "fields": "name,desc,closed,url,dateLastActivity",
+                "lists": "all",
+                "labels": "all",
+                # The nested label list is capped at 50 unless asked for more.
+                "labels_limit": 1000,
+                "members": "all",
+            },
+        )
 
-def _forget(board_id: str, entry: dict, stats: dict[str, int]) -> Iterator[dict]:
-    for cid in entry["cards"]:
-        stats["deleted"] += 1
-        yield {"id": f"card:{cid}", "_deleted": True}
-    if entry["board"]:
-        stats["deleted"] += 1
-        yield {"id": f"board:{board_id}", "_deleted": True}
+    def _cards(self, board_id: str) -> list[dict]:
+        # The nested form has no documented cap; /boards/{id}/cards takes a limit of 1000.
+        params = {"fields": "id", "cards": "all", "card_fields": _CARD_FIELDS}
+        return self._get(f"/boards/{board_id}", params).get("cards") or []
 
+    def _checklists(self, board_id: str) -> dict[str, list[dict]]:
+        by_card: dict[str, list[dict]] = {}
+        if self.config.include_checklists:
+            for checklist in self._get(f"/boards/{board_id}/checklists"):
+                by_card.setdefault(str(checklist.get("idCard")), []).append(checklist)
+        return by_card
 
-def _sync_board(
-    client: Any, config: _TrelloConfig, board_id: str, entry: dict, stats: dict[str, int]
-) -> Iterator[dict]:
-    """Yield one board's changed rows and tombstones, updating ``entry`` in place."""
-    board = _snapshot(client, board_id)
-    newest = _newest_action(client, board_id, entry["cursor"])
-    activity = board.get("dateLastActivity")
+    def _comments(self, board_id: str, cards: dict[str, dict], wanted: set[str]):
+        """Comments of the ``wanted`` cards, read per card or for the whole board,
+        whichever costs fewer requests."""
+        counts = {
+            cid: int((card.get("badges") or {}).get("comments") or 0) for cid, card in cards.items()
+        }
+        wanted = {cid for cid in wanted if counts[cid]}
+        if not wanted:
+            return {}
+        if len(wanted) <= sum(counts.values()) // _ACTIONS_PAGE + 1:
+            return {cid: self._card_comments(cid) for cid in sorted(wanted)}
+        by_card: dict[str, list[dict]] = {}
+        for action in self._board_comments(board_id):
+            card_id = str(((action.get("data") or {}).get("card") or {}).get("id"))
+            if card_id in wanted:
+                by_card.setdefault(card_id, []).append(action)
+        return by_card
 
-    if board.get("closed") and not config.include_archived:
-        yield from _forget(board_id, entry, stats)
-        entry.update(board=None, cards={})
-        return
+    def _card_comments(self, card_id: str) -> list[dict]:
+        comments: list[dict] = []
+        for page in range(_CARD_ACTIONS_MAX_PAGE + 1):
+            batch = self._get(f"/cards/{card_id}/actions", {"filter": "commentCard", "page": page})
+            comments.extend(batch)
+            if len(batch) < _CARD_ACTIONS_PAGE:
+                break
+        return comments
 
-    board_row = render_board(board)
-    if _digest(board_row) != entry["board"]:
-        entry["board"] = _digest(board_row)
-        stats["emitted"] += 1
-        yield board_row
+    def _board_comments(self, board_id: str) -> Iterator[dict]:
+        before = None
+        while True:
+            params: dict[str, Any] = {
+                "filter": "commentCard",
+                "limit": _ACTIONS_PAGE,
+                "fields": "data,date",
+                "member": "false",
+                "memberCreator_fields": "fullName",
+            }
+            if before:
+                params["before"] = before
+            page = self._get(f"/boards/{board_id}/actions", params)
+            yield from page
+            if len(page) < _ACTIONS_PAGE:
+                return
+            oldest = min(str(a["id"]) for a in page)
+            if oldest == before:
+                raise TrelloAPIError("Trello action pagination did not advance")
+            before = oldest
 
-    checklists: dict[str, list[dict]] = {}
-    if config.include_checklists:
-        for checklist in board.get("checklists") or []:
-            checklists.setdefault(str(checklist.get("idCard")), []).append(checklist)
-    cards = {
-        str(card["id"]): card
-        for card in board.get("cards") or []
-        if config.include_archived or not _archived(card, board)
-    }
-    # A card's base is its document without comments. It catches the changes the
-    # actions feed leaves out (checklist items, labels) without reading comments.
-    bases = {
-        cid: _digest(render_card(card, board, checklists.get(cid, []), []))
-        for cid, card in cards.items()
-    }
-    known: dict[str, dict] = entry["cards"]
-    changed = (
-        config.full_resync
-        or newest is not None
-        or activity != entry["activity"]
-        or any(known.get(cid, {}).get("base") != base for cid, base in bases.items())
-    )
-    comments = _comments(client, board_id) if config.include_comments and changed else None
+    # -- one board ---------------------------------------------------------
+    def _sync_board(self, board_id: str, entry: dict) -> tuple[list[dict], set[str]]:
+        """Changed rows of one board and the ids of the cards it holds, updating ``entry``."""
+        # Read the cursor first, so nothing that happens during the read is skipped.
+        newest = self._newest_action(board_id, entry["cursor"])
+        board = self._board(board_id)
+        if board.get("closed") and not self.config.include_archived:
+            rows = [{"id": f"board:{board_id}", "_deleted": True}] if entry["board"] else []
+            entry.update(board=None, cursor=newest or entry["cursor"])
+            return rows, set()
 
-    for cid, card in cards.items():
-        previous = known.get(cid)
-        if comments is None and previous and previous["base"] == bases[cid]:
-            stats["unchanged"] += 1
-            continue
-        row = render_card(card, board, checklists.get(cid, []), (comments or {}).get(cid, []))
-        known[cid] = {"base": bases[cid], "row": _digest(row)}
-        if previous and previous["row"] == known[cid]["row"]:
-            stats["unchanged"] += 1
-            continue
-        stats["emitted"] += 1
-        yield row
+        rows = []
+        board_row = render_board(board)
+        board_changed = _digest(board_row) != entry["board"]
+        if board_changed:
+            entry["board"] = _digest(board_row)
+            rows.append(board_row)
+        changed = (
+            self.rerender
+            or newest is not None
+            or board_changed
+            or board.get("dateLastActivity") != entry["activity"]
+        )
+        entry["cursor"] = newest or entry["cursor"]
+        entry["activity"] = board.get("dateLastActivity")
+        if not changed:
+            self.stats["unchanged"] += len(entry["cards"])
+            return rows, set(entry["cards"])
 
-    # Deleted, moved to another board, or archived while archived cards are excluded.
-    for cid in [cid for cid in known if cid not in cards]:
-        del known[cid]
-        stats["deleted"] += 1
-        yield {"id": f"card:{cid}", "_deleted": True}
+        cards = {
+            str(card["id"]): card
+            for card in self._cards(board_id)
+            if self.config.include_archived or not _archived(card, board)
+        }
+        rows.extend(self._card_rows(board_id, board, cards, entry["cards"]))
+        return rows, set(cards)
 
-    entry["cursor"] = newest or entry["cursor"]
-    entry["activity"] = activity
+    def _card_rows(self, board_id: str, board: dict, cards: dict, known: dict) -> list[dict]:
+        checklists = self._checklists(board_id)
+        # A card's base is its document without comments plus its comment count:
+        # it moves on checklist and label edits, which the feed leaves out, and on
+        # added or deleted comments, without reading any comment.
+        bases = {
+            cid: _digest(
+                [
+                    render_card(card, board, checklists.get(cid, []), []),
+                    (card.get("badges") or {}).get("comments")
+                    if self.config.include_comments
+                    else None,
+                ]
+            )
+            for cid, card in cards.items()
+        }
+        changed = {
+            cid
+            for cid in cards
+            if self.rerender or (known.get(cid) or {}).get("base") != bases[cid]
+        }
+        comments = self._comments(board_id, cards, changed) if self.config.include_comments else {}
+        rows = []
+        for cid in sorted(cards):
+            if cid not in changed:
+                self.stats["unchanged"] += 1
+                continue
+            row = render_card(cards[cid], board, checklists.get(cid, []), comments.get(cid, []))
+            previous = known.get(cid)
+            known[cid] = {"base": bases[cid], "row": _digest(row)}
+            if previous and previous["row"] == known[cid]["row"]:
+                self.stats["unchanged"] += 1
+                continue
+            rows.append(row)
+        return rows
+
+    # -- the run -----------------------------------------------------------
+    def rows(self) -> Iterator[dict]:
+        # A bad key or token must fail loudly, never look like every board was deleted.
+        self._get("/members/me", {"fields": "id"})
+        boards: dict[str, dict] = self.state.setdefault("boards", {})
+        configured = bool(self.config.board_ids)
+        present: dict[str, set[str]] = {}
+        for board_id in self._board_ids():
+            if self.requests >= self.config.max_requests:
+                raise _CutShortError("budget")
+            # Work on a copy, so a board that fails keeps its previous state.
+            entry = copy.deepcopy(boards.get(board_id)) or {
+                "cursor": None,
+                "activity": None,
+                "board": None,
+                "cards": {},
+            }
+            try:
+                rows, cards = self._sync_board(board_id, entry)
+            except TrelloAPIError as exc:
+                if exc.status != 404:
+                    raise
+                if configured:
+                    raise TrelloAPIError(
+                        f"Trello board {board_id} was not found or is not visible to this token",
+                        status=404,
+                    ) from None
+                logger.warning("Trello board %s answered 404.", board_id)
+                self.stats["gone"] += 1
+                continue
+            boards[board_id] = entry
+            present[board_id] = cards
+            for row in rows:
+                self.emitted += 1
+                self.stats["emitted"] += 1
+                yield row
+        yield from self._forget(boards, present)
+        self.state["options"] = self.options
+
+    def _forget(self, boards: dict[str, dict], present: dict[str, set[str]]) -> Iterator[dict]:
+        """Tombstones, decided once across all boards so a card moved between two
+        selected boards is never deleted."""
+        live = set().union(*present.values())
+        for board_id in list(boards):
+            entry = boards[board_id]
+            if board_id not in present:
+                logger.warning("Forgetting Trello board %s and its cards.", board_id)
+                boards.pop(board_id)
+                if entry["board"]:
+                    self.stats["deleted"] += 1
+                    yield {"id": f"board:{board_id}", "_deleted": True}
+            for cid in [cid for cid in entry["cards"] if cid not in present.get(board_id, ())]:
+                del entry["cards"][cid]
+                if cid not in live:
+                    self.stats["deleted"] += 1
+                    yield {"id": f"card:{cid}", "_deleted": True}
 
 
 def _iter_rows(
-    client: Any, config: _TrelloConfig, state: dict, stats: dict[str, int]
+    client: Any,
+    config: _TrelloConfig,
+    state: dict,
+    stats: dict[str, int],
+    check_active: Callable[[], None] | None = None,
 ) -> Iterator[dict]:
     """Yield changed rows and tombstones. Pure of dlt, so tests drive it with a dict."""
-    # A bad key or token must fail loudly, never look like every board was deleted.
+    walker = _Walker(client, config, state, stats, check_active)
     try:
-        client.get("/members/me", {"fields": "id"})
-    except TrelloAPIError as exc:
-        if exc.status in (400, 401):
-            raise TrelloAuthError(
-                f"Trello rejected the API key or token (HTTP {exc.status})"
-            ) from None
-        raise
-
-    boards: dict[str, dict] = state.setdefault("boards", {})
-    seen: set[str] = set()
-    for board_id in _board_ids(client, config):
-        # Work on a copy, so a board that turns out to be gone keeps its old state.
-        entry = copy.deepcopy(boards.get(board_id)) or {
-            "cursor": None,
-            "activity": None,
-            "board": None,
-            "cards": {},
-        }
-        try:
-            rows = list(_sync_board(client, config, board_id, entry, stats))
-        except TrelloAPIError as exc:
-            # Deleted, or no longer visible to this (valid) token.
-            if exc.status not in (401, 404):
-                raise
-            stats["gone"] += 1
-            continue
-        boards[board_id] = entry
-        seen.add(board_id)
-        yield from rows
-
-    # Deleted, hidden or deselected boards: forget the board and all its cards.
-    for board_id in [b for b in boards if b not in seen]:
-        yield from _forget(board_id, boards.pop(board_id), stats)
-
-    logger.info(
-        "Trello: %d row(s) emitted, %d deleted, %d board(s) gone.",
-        stats["emitted"],
-        stats["deleted"],
-        stats["gone"],
-    )
+        yield from walker.rows()
+    except _CutShortError as cut:
+        stats["failed"] = 1
+        stats[f"failed_{cut.reason}"] = 1
+        logger.warning("Trello sync stopped early (%s); it resumes on the next run.", cut.reason)
 
 
 # ---------------------------------------------------------------------------
 # Public factory
 # ---------------------------------------------------------------------------
+def _default_resource_name(board_ids: list[str] | None, workspace_id: str | None) -> str:
+    if board_ids and len(board_ids) > 1:
+        raise ValueError(
+            "Pass a resource_name when syncing several boards: it scopes this sync's "
+            "state and cleanup, and two sources sharing one would delete each other's cards."
+        )
+    scope = board_ids[0] if board_ids else workspace_id or "my_boards"
+    return "trello_" + re.sub(r"[^a-z0-9]+", "_", scope.lower()).strip("_")
+
+
 def trello_source(
     board_ids: list[str] | None = None,
     *,
     workspace_id: str | None = None,
     api_key: str | None = None,
     token: str | None = None,
-    include_archived: bool = True,
+    include_archived: bool = False,
     include_comments: bool = True,
     include_checklists: bool = True,
     full_resync: bool = False,
-    resource_name: str = "trello_cards",
+    max_requests: int = DEFAULT_MAX_REQUESTS,
+    resource_name: str | None = None,
     check_active: Callable[[], None] | None = None,
+    service: Any = None,
     client: Any = None,
 ):
     """Return a ``dlt`` resource that yields one document per Trello card and board.
@@ -462,21 +611,23 @@ def trello_source(
     and ``primary_key="id"``.
 
     Args:
-        board_ids: Boards to sync. Defaults to every board of ``workspace_id``,
-            or every board the token's user belongs to.
+        board_ids: Boards to sync. A listed board that cannot be read raises. Defaults
+            to every board of ``workspace_id``, or every board the token's user belongs to.
         workspace_id: Sync every board of this workspace (id or name).
         api_key: Trello API key (``TRELLO_API_KEY``).
         token: Trello user token (``TRELLO_TOKEN``).
-        include_archived: Keep archived cards, lists and boards, marked as archived.
-            When False they are forgotten.
+        include_archived: Also ingest archived cards, lists and boards, marked as archived.
         include_comments: Add each card's comments to its document.
         include_checklists: Add each card's checklists to its document.
-        full_resync: Read every board's comments again, whatever the feed says.
-        resource_name: Staging table name. Use a different one per sync scope
-            that shares a dataset.
-        check_active: Optional host authorization checkpoint, called around each row.
-        client: Pre-built client (see :class:`TrelloClient`). Mainly an injection
-            point for tests and hosts.
+        full_resync: Re-render every card, reading all comments again.
+        max_requests: Request budget of one run, checked between boards. A bigger
+            account finishes over several runs.
+        resource_name: Stable name of this sync, which scopes its state and cleanup.
+            Defaults to one derived from the board or workspace; required when
+            ``board_ids`` lists several boards.
+        check_active: Optional host authorization checkpoint, called before each request.
+        service: Pre-built client (see :class:`TrelloClient`). Mainly an injection
+            point for tests and hosts. ``client`` is accepted as an alias.
 
     Returns:
         A ``dlt`` resource configured with ``primary_key="id"``,
@@ -492,7 +643,9 @@ def trello_source(
             "Trello sync requires a cognee build with table-scoped DLT document cleanup."
         )
 
-    if client is None:
+    name = resource_name or _default_resource_name(board_ids, workspace_id)
+    service = service or client
+    if service is None:
         resolved_key = api_key or os.getenv("TRELLO_API_KEY")
         resolved_token = token or os.getenv("TRELLO_TOKEN")
         if not (resolved_key and resolved_token):
@@ -500,7 +653,7 @@ def trello_source(
                 "Trello credentials missing: pass api_key and token or set "
                 "TRELLO_API_KEY and TRELLO_TOKEN."
             )
-        client = TrelloClient(resolved_key, resolved_token)
+        service = TrelloClient(resolved_key, resolved_token)
 
     config = _TrelloConfig(
         board_ids=tuple(str(b) for b in board_ids or ()),
@@ -509,23 +662,27 @@ def trello_source(
         include_comments=include_comments,
         include_checklists=include_checklists,
         full_resync=full_resync,
+        max_requests=max_requests,
     )
     stats: dict[str, int] = {}
 
     @dlt.resource(
-        name=resource_name,
+        name=name,
         primary_key="id",
         write_disposition="merge",
-        columns={"_deleted": {"data_type": "bool", "hard_delete": True}},
+        columns={
+            "_deleted": {"data_type": "bool", "hard_delete": True},
+            **dlt_utils.NODE_SET_COLUMN_HINT,
+        },
     )
     def trello_cards():
         stats.clear()
-        stats.update(emitted=0, unchanged=0, deleted=0, gone=0)
-        rows = _iter_rows(client, config, dlt.current.resource_state(), stats)
+        stats.update(emitted=0, unchanged=0, deleted=0, gone=0, failed=0)
+        rows = _iter_rows(service, config, dlt.current.resource_state(), stats, check_active)
         yield from dlt_utils.guarded_rows(rows, check_active)
 
     resource = trello_cards()
     setattr(resource, DOCUMENT_SOURCE_ATTR, "trello")
-    setattr(resource, dlt_utils.PIPELINE_SCOPE_ATTR, resource_name)
+    setattr(resource, dlt_utils.PIPELINE_SCOPE_ATTR, name)
     resource.cognee_sync_stats = stats
     return resource

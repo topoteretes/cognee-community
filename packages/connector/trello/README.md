@@ -3,10 +3,9 @@
 A Trello data-source connector for [cognee](https://github.com/topoteretes/cognee): turn
 your boards into memory, so you can ask "what is blocking the export work and who owns it?".
 
-It exposes a `dlt` source you hand to `cognee.remember(...)`. Every card becomes one
-document (list, labels, members, dates, description, checklists, comments) and every board
-one more (description, lists, labels, members), all flowing through cognee's normal
-cognify entity extraction.
+It exposes a `dlt` source you hand to `cognee.remember(...)`. Every card and every board
+becomes one document that flows through cognee's normal cognify entity extraction, in a
+`trello:<board id>` node set so a search can be scoped to one board.
 
 ## Install
 
@@ -24,7 +23,7 @@ cd packages/connector/trello && uv sync
    clicking **Allow**:
    `https://trello.com/1/authorize?expiration=30days&scope=read&response_type=token&key=<your key>`
    (`expiration` can also be `1day` or `never`). A token gives access to your whole account,
-   so keep it secret.
+   so keep it secret. When it expires, the sync raises instead of forgetting anything.
 3. Export both, together with your `LLM_API_KEY` like any other cognee run:
 
 ```bash
@@ -57,39 +56,58 @@ the same call again to sync only what changed. See `examples/example.py`.
 
 | Argument | Default | Meaning |
 | --- | --- | --- |
-| `board_ids` | all your boards | Boards to sync. Without it, every board of `workspace_id`, or every board you belong to. |
+| `board_ids` | all your boards | Boards to sync. A listed board that cannot be read raises. Without it, every board of `workspace_id`, or every board you belong to. |
 | `workspace_id` | none | Sync every board of this workspace (id or name). |
-| `include_archived` | `True` | Keep archived cards, lists and boards, marked as archived. `False` forgets them. |
+| `include_archived` | `False` | Also ingest archived cards, lists and boards, marked as archived. On an old board they can be most of it. |
 | `include_comments` | `True` | Add each card's comments to its document. |
 | `include_checklists` | `True` | Add each card's checklists to its document. |
-| `full_resync` | `False` | Read every board's comments again, whatever the feed says. |
-| `resource_name` | `trello_cards` | Staging table. Use a different name per sync scope that shares a dataset. |
+| `full_resync` | `False` | Re-render every card and read all comments again. |
+| `max_requests` | `1500` | Request budget of one run, checked between boards. A bigger account finishes over several runs. |
+| `resource_name` | derived | Names this sync's state and cleanup. Derived from the board, the workspace, or `trello_my_boards`; **required** when `board_ids` lists several boards, since two sources sharing one would delete each other's cards. |
+
+Changing `include_comments` or `include_checklists` re-renders every card on the next run.
+
+## What is ingested
+
+| Document | Id | Content |
+| --- | --- | --- |
+| Card | `card:<id>` | board, list, labels, members, start and due date (`(done)` when completed), archived marker, description, checklists with their items, comments with author and date |
+| Board | `board:<id>` | name, description, lists in order, labels, members, archived marker. Card titles stay out, so a new card does not re-process the board |
+
+Everything is sorted (labels, members, and lists, checklists and items by position, then
+id), so the order Trello happens to answer in never changes a document.
+
+**Known gaps:** attachments, custom fields, votes and stickers are not ingested. A comment
+edited without any other change on its card shows up on the card's next change, or with
+`full_resync=True`.
 
 ## How sync and forget-on-delete work
 
-- **Actions feed.** Cards have no reliable "updated" timestamp, so the board `actions`
-  feed drives the sync: its newest action id is the cursor, passed back as `since`.
-- **Snapshot.** Trello leaves some action types out of the feed: comment edits and
-  deletions, checklist item changes and label changes only reach webhooks. So every run
-  also reads one snapshot of each board (a single request with its cards, lists, labels,
-  members and checklists) and compares each card with the last run. Only cards whose
-  document changed are processed again.
-- **Comments.** Comments are the expensive part, so they are read again only when the
-  feed has new actions, the board's `dateLastActivity` moved, or a card changed. A
-  comment edited or deleted with neither of those signals shows up on the card's next
-  change, or with `full_resync=True`.
-- **Forget-on-delete.** A card deleted or moved to another board, a board deleted or no
-  longer visible to your token, and a board you stop selecting are removed from memory
-  on the next sync. With `include_archived=False`, archiving does the same. Archiving a
-  list or board does not archive its cards in Trello's API, so a card counts as archived
-  if the card, its list or its board is archived.
-- **Failures.** The token is checked first, so a bad key or token raises instead of
-  looking like every board was deleted. Other errors abort the sync after retries
-  (429 and 5xx), and dlt keeps the previous state.
+- **Actions feed.** Cards have no reliable "updated" timestamp, so the board `actions` feed
+  drives the sync: its newest action id is the cursor, passed back as `since`, read before
+  anything else in the run.
+- **Changed boards only.** A board with no new action and the same `dateLastActivity` is
+  skipped. Trello leaves some action types out of the feed (comment edits and deletions,
+  checklist item and label changes), so a changed board is read again (cards, lists,
+  labels, checklists) and compared card by card. Each card's comment count is part of that
+  comparison, which also catches added and deleted comments.
+- **Comments of changed cards only.** They are read per card, or for the whole board when
+  that takes fewer requests (for example on the first sync).
+- **Forget-on-delete.** Deleted cards, archived ones (unless `include_archived`), boards
+  that are deleted or archived, and boards you stop selecting are removed from memory on
+  the next sync. Deletions are decided once per run across all selected boards, so a card
+  moved from one selected board to another is never lost. A board discovered through
+  `workspace_id` or your board list is forgotten when Trello answers 404.
+- **A run is bounded.** On a rate limit (Trello allows 100 requests per 10 seconds per
+  token and 300 per key, and `Retry-After` is honoured up to 60 seconds), an expired token
+  after progress, or a spent `max_requests` budget, the run stops cleanly, keeps the boards
+  it finished, and reports why in `cognee_sync_stats` (`failed`, plus `failed_rate_limit`,
+  `failed_auth` or `failed_budget`). Deletions are only decided by a run that finished.
+  Any other error raises, and dlt keeps the previous state.
 
-Trello allows 100 requests per 10 seconds per token and 300 per key. A board with no
-changes costs two requests per sync, and a changed board adds one request per 1,000
-comments.
+**Requests per run:** one `/members/me` check, then two per unchanged board (the feed and
+the board itself). A changed board adds two (its cards and checklists) plus the comment
+reads of its changed cards.
 
 ## Privacy
 
@@ -105,6 +123,8 @@ uv run pytest tests/
 ```
 
 The tests need no Trello account. They run the client against a mocked HTTP transport,
-check card and board rendering, drive the sync against a fake Trello API through a real
-dlt pipeline (feed cursor, changes the feed leaves out, deletions, gone boards, failed
-runs), and run `cognee.remember` end to end to prove a deleted card leaves the graph.
+check card and board rendering (including ordering), drive the sync against a fake Trello
+API through a real dlt pipeline (feed cursor, changes the feed leaves out, comment reads,
+moved cards, include flag changes, deletions, unreadable boards, stopped runs, two sources
+in one dataset), and run `cognee.remember` end to end to prove a deleted card leaves the
+graph.
