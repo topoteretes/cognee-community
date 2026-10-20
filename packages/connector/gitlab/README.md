@@ -1,123 +1,127 @@
 # cognee-community-connector-gitlab
 
-Python connector for [cognee issue #4709](https://github.com/topoteretes/cognee/issues/4709).
+Sync GitLab issues, merge requests, their comments, and wiki pages into
+[Cognee](https://github.com/topoteretes/cognee). The connector exposes a
+document-mode dlt source for `cognee.remember()`, works with gitlab.com or a
+self-managed instance, picks up only changed items on later runs, and removes
+documents whose source was deleted upstream. Implements
+[cognee issue #4709](https://github.com/topoteretes/cognee/issues/4709).
 
-**Status:** legacy PAT validation, project discovery or selection, issue/MR/wiki
-fetching, issue/MR comments, DLT document ingestion, persistent checkpoints, and
-resource deletion reconciliation are implemented. `gitlab_source()` validates the
-PAT immediately; fetching and mapping happen during DLT extraction.
+## Install
 
-## Scope
+Requires Python 3.11–3.14. From this repository's root:
 
-- Required legacy Personal Access Token with `read_api`, supplied through `token`.
-  The broader `api` scope also passes validation but is not needed.
-- Configurable `base_url`, defaulting to `https://gitlab.com`.
-- Optional `project_ids`: numeric IDs or `group/project` paths to sync. When
-  omitted, every project the token owner is a member of is synced.
-- Required `resource_types`: `issues`, `merge_requests`, `comments`, and `wiki`.
-  An empty selection is rejected.
-  Unsupported names are rejected before any HTTP requests.
-- `comments` adds each issue's or MR's comments to that issue's or MR's
-  document. It requires `issues` or `merge_requests` in the same selection.
-- Document rows with `id`, `title`, `content`, and `url`, exposed as a `dlt` source
-  for `cognee.remember()`.
-- Incremental updates and verified upstream deletion reconciliation.
-- Python API only; no UI in this package.
-
-Token validation uses `GET /api/v4/personal_access_tokens/self` and checks active
-status and read scope. GitLab's active status already accounts for expiry and
-revocation; the connector does not compare dates against the local clock.
-
-## Choosing projects
-
-Without `project_ids`, discovery uses keyset pagination on
-`GET /api/v4/projects?membership=true`. That lists the token owner's own
-projects and projects shared with them directly or through a group, and leaves
-out unrelated public projects on the instance.
-
-With `project_ids`, discovery is skipped and each entry is read with
-`GET /api/v4/projects/:id` (paths are URL-encoded, so `team/app` becomes
-`team%2Fapp`). A numeric ID and a path naming the same project are synced once.
-A selected project that returns 404 is logged and skipped, and documents synced
-from it earlier are removed. Each distinct selection has its own staging scope,
-so changing the selection starts a separate corpus rather than deleting
-documents from the previous one.
-
-```python
-source = gitlab_source(
-    token=os.environ["GITLAB_TOKEN"],
-    resource_types=["issues", "merge_requests"],
-    project_ids=["my-team/backend", 87746024],
-)
+```bash
+cd packages/connector/gitlab
+uv sync --extra dev
 ```
 
-## Projects with features turned off
+This installs the package, Cognee, dlt, `httpx`, and the test/lint tools into
+the package's `.venv`.
 
-A project can turn off its issues, merge requests, or wiki. The connector skips
-only that resource for that project and continues with the rest of the project
-and with the next project. A feature counts as turned off when project metadata
-says so (`<feature>_access_level: "disabled"`, or `<feature>_enabled: false` on
-older releases), or when the first list request returns HTTP 403 or 404.
-Documents synced earlier from a resource that is now turned off are removed.
-A 403/404 on a later page, or on the full inventory after a readable delta,
-still aborts the run, because it means the inventory would be incomplete.
+## GitLab setup
 
-## Error handling
+1. Sign in to GitLab with an account that can read the projects you want to sync.
+2. Open your avatar → **Edit profile** → **Access tokens** (personal access
+   tokens), then **Add new token**.
+3. Give it a name and an expiration date, select the **`read_api`** scope, and
+   create it. Copy the token; GitLab shows it only once.
+4. Export it, plus the instance URL if you are not on gitlab.com:
 
-HTTP failures,
-redirects, timeouts, and malformed responses abort the operation rather than
-being interpreted as empty results. No response bodies or tokens are logged.
-HTTP 429 raises a specific rate-limit error without waiting or retrying. A
-rate-limited fetch preserves existing staged documents and sync checkpoints;
-rerun the sync later.
+```bash
+export GITLAB_TOKEN="glpat-..."
+export GITLAB_BASE_URL="https://gitlab.example.com"   # optional; defaults to gitlab.com
+```
 
-When `issues` is selected, the connector reads `/projects/:id/issues` for each
-discovered project, with `scope=all`, `state=all`, and offset pagination. It
-maps the issue payloads into documents. A failed page aborts the operation.
-Later runs apply `updated_after` from the saved per-project issue checkpoint.
+`read_api` is enough; the broader `api` scope is accepted but not needed. The
+connector only reads. Keep the token out of Git and logs. See GitLab's
+[personal access token guide](https://docs.gitlab.com/user/profile/personal_access_tokens/).
 
-When `merge_requests` is selected, the connector reads `/projects/:id/merge_requests`
-with `scope=all`, `state=all`, and offset pagination, including closed and merged
-MRs. Issues and MRs share pagination and identity validation helpers. Later MR
-fetches also use their own `updated_after` checkpoint.
+## Run the example
 
-When `wiki` is selected, the connector reads `/projects/:id/wikis?with_content=1`.
-GitLab returns the entire wiki page list without pagination. Pages are identified
-by their unique slug and include raw content and format. Empty content is valid;
-missing content is an error. HTTP 403/404 means the wiki is turned off (see
-above), not an empty wiki.
+From `packages/connector/gitlab`, with `GITLAB_TOKEN` and your Cognee model
+credentials (for example `LLM_API_KEY`) set:
 
-## Resource payloads and document mapping
+```bash
+uv run python examples/example.py
+uv run python examples/example.py --projects my-team/backend,87746024 \
+  --resources issues,merge_requests,comments --question "What is blocking the release?"
+```
 
-All mappers return `{id, title, content, url}`. They do not make HTTP requests.
-Useful metadata is rendered into `content`, which is the text cognee processes.
+The example syncs into the `gitlab` dataset, waits for processing, and runs a
+search. Run it again after editing or deleting an issue, MR, comment, or wiki page
+to see the change applied. `--help` lists all options. Without `--projects` (or
+`GITLAB_PROJECT_IDS`), it syncs every project the token owner is a member of.
 
-| Resource | Required payload fields | Optional fields consumed | Mapping |
-| --- | --- | --- | --- |
-| Issue | `id`, `iid`, `project_id`, `title` | `description`, `state`, `labels`, `author`, `web_url` | Title, description, project, reference, state, author, labels, source URL |
-| Merge request | `id`, `iid`, `project_id`, `title` | Issue fields plus `source_branch`, `target_branch` | Same prose format, with MR reference and branch metadata |
-| Wiki | `slug`, `title`, `content` | `format` | Title and original markup, project, format, source URL |
+## Python usage
 
-Each mapper also receives the project and GitLab instance URL. Projects need an
-`id`, and `web_url` or `path_with_namespace` when constructing URLs. Issue/MR
-`web_url` takes precedence when supplied. Wiki source URLs are constructed from
-the project URL and encoded slug.
+```python
+import asyncio
+import os
 
-Document IDs include the instance, project, type, and upstream ID (wiki slug).
-Edits keep the same external ID; a wiki rename changes it. Titles and content
-changes do not affect external identity. Null/missing descriptions become empty
-text; absent optional metadata is omitted. Wiki markup is preserved, not
-converted from AsciiDoc/RDoc to Markdown. Unknown API fields are not ingested.
+import cognee
+from cognee_community_connector_gitlab import gitlab_source
 
-MR commits, diffs, attachments, repository README files, and `docs/` files are
-not fetched or included.
 
-## Comments
+async def main():
+    source = gitlab_source(
+        token=os.environ["GITLAB_TOKEN"],
+        base_url="https://gitlab.com",
+        resource_types=["issues", "merge_requests", "comments", "wiki"],
+        project_ids=["my-team/backend"],
+    )
+    result = await cognee.remember(
+        source,
+        dataset_name="gitlab",
+        primary_key="id",
+        write_disposition="merge",
+        max_rows_per_table=0,
+        run_in_background=False,
+    )
+    if result.status != "completed":
+        raise RuntimeError(result.error or result.status)
 
-GitLab's issue and MR payloads only carry `user_notes_count`, not comment text.
-With `comments` selected, the connector reads
-`/projects/:id/issues/:iid/notes` (or `merge_requests`) for each item, oldest
-first, and appends a `## Comments` section to that item's document:
+
+asyncio.run(main())
+```
+
+Always pass `write_disposition="merge"` (Cognee defaults to `replace`, which would
+erase unchanged rows) and `max_rows_per_table=0` (a row limit would truncate the
+inventory used for deletion checks). Use foreground ingestion
+(`run_in_background=False`) so Cognee's orphan cleanup runs after deletions, and
+use a dedicated dataset. Create a new source for each sync.
+
+| Argument | Default | Meaning |
+| --- | --- | --- |
+| `token` | Required | Personal access token with `read_api`. |
+| `resource_types` | Required | Non-empty selection of `issues`, `merge_requests`, `comments`, `wiki`. `comments` requires `issues` or `merge_requests`. |
+| `base_url` | `https://gitlab.com` | Instance URL, without credentials or query string. |
+| `project_ids` | `None` | Numeric IDs or `group/project` paths. `None` syncs every project the token owner is a member of. |
+
+`gitlab_source()` validates the token immediately (active, with `read_api` or
+`api`) using `GET /personal_access_tokens/self`, so a bad token fails before any
+sync starts. Very old self-managed releases without that endpoint are not supported.
+
+## What gets ingested
+
+One document per issue, merge request, or wiki page, with `id`, `title`,
+`content`, and `url`. Metadata is rendered into `content`, which is the text
+Cognee processes:
+
+| Resource | Content |
+| --- | --- |
+| Issue | Project, reference (`#iid`), state, author, labels, source URL, description |
+| Merge request | The same, with `!iid` and source/target branches |
+| Wiki page | Project, format, source URL, and the page's original markup |
+
+MR commits, diffs, attachments, and repository files are not ingested. Wiki
+markup is kept as-is, not converted to Markdown.
+
+### Comments
+
+Issue and MR payloads only carry a comment count, so with `comments` selected
+the connector reads `/projects/:id/issues/:iid/notes` (or `merge_requests`) and
+appends a `## Comments` section to the parent document, oldest first:
 
 ```
 alice (2026-10-12):
@@ -127,126 +131,143 @@ bob (2026-10-13) [internal]:
 Confirmed, fixed in !28.
 ```
 
-- System notes (label changes, cross-references, "mentioned in") are skipped.
-- Internal comments the token can read are kept and marked `[internal]`.
-- Every user comment is kept, however long the thread; cognify chunks long
-  documents like any other.
-- Comments live inside their parent document, so deleting an issue or MR
-  removes its comments too, and a changed comment re-ingests its parent.
+System notes ("added label", "mentioned in") are skipped. Every user comment is
+kept; Cognee chunks long documents like any other. Deleting an issue or MR removes
+its comments too.
 
-Notes are re-read only for items whose `updated_at` or `user_notes_count`
-changed since the last run. This was checked against GitLab's source and a live
-gitlab.com test:
+### Confidential issues and internal comments
 
-| Comment action | Parent `updated_at` | `user_notes_count` |
-| --- | --- | --- |
-| Added | bumped | +1 |
-| Edited | bumped | unchanged |
-| Deleted | **unchanged** | -1 |
+The connector ingests everything the token can read. That includes confidential
+issues and internal comments; internal comments are marked `[internal]` in the
+text. Anyone who can query the destination dataset can read that content, so
+either restrict access to the dataset or use a token whose user cannot read the
+confidential content. There is no option to filter them out yet.
 
-GitLab bumps `updated_at` at most once a minute per item; the one-minute cursor
-overlap covers that window. Comments on items whose two fields did not change
-are not re-read, so a project rename (rendered into content) is picked up for
-those items only when they next change.
-This package maps GitLab payloads only; GitHub has no adapter here.
+## Choosing projects
 
-## Ingest into cognee
+Without `project_ids`, discovery uses keyset pagination on
+`GET /projects?membership=true`: the token owner's own projects and projects
+shared with them directly or through a group, never unrelated public projects.
 
-```python
-import os
-import cognee
-from cognee_community_connector_gitlab import gitlab_source
+With `project_ids`, each entry is read with `GET /projects/:id` (paths are
+URL-encoded, so `team/app` becomes `team%2Fapp`). A numeric ID and a path naming
+the same project are synced once. A selected project that returns 404 is logged
+and skipped, and documents synced from it earlier are removed. Each distinct
+selection has its own staging scope, so changing the selection starts a separate
+corpus rather than deleting documents from the previous one.
 
-source = gitlab_source(
-    token=os.environ["GITLAB_TOKEN"],
-    resource_types=["issues", "merge_requests", "wiki"],
-    base_url="https://gitlab.com",
-)
-await cognee.remember(
-    source,
-    dataset_name="gitlab",
-    primary_key="id",
-    write_disposition="merge",
-    max_rows_per_table=0,
-    run_in_background=False,
-)
-```
+A project can turn off its issues, merge requests, or wiki. The connector skips
+only that resource for that project, detected from project metadata
+(`<feature>_access_level: "disabled"`, or `<feature>_enabled: false` on older
+releases) or a 403/404 on the first list page. Documents synced earlier from that
+resource are removed. A 403/404 on a later page still aborts the run, because the
+inventory would be incomplete.
 
-Use a dedicated dataset and explicitly pass `write_disposition="merge"` because
-cognee's default is `replace`. The source declares document mode so each row is
-processed as prose, rather than a relational schema manifest. A compatible core
-must provide `DOCUMENT_SYNC_VERSION >= 1`.
+## Sync behavior
 
-## Persistent sync state
+- **First run:** reads every selected resource and stores a baseline in dlt
+  resource state.
+- **Issues and MRs:** later runs request items with `updated_after` set to the
+  greatest `updated_at` seen, minus a one-minute overlap, per project and
+  resource. Because GitLab has no deletion feed, each run also reads the full
+  unfiltered issue/MR list to find deleted items. Whether a document is emitted
+  is decided by a hash of its rendered content, so the `updated_after` request
+  adds one request per resource and does not reduce traffic. It is kept because
+  the issue specifies it as the incremental cursor. Using it to limit the
+  inventory read is a possible follow-up.
+- **Comments:** notes are re-read only when an item's `updated_at` or
+  `user_notes_count` changed. GitLab bumps `updated_at` when a comment is added
+  or edited, at most once a minute (covered by the overlap), but not when one is
+  deleted, which only lowers the count. Items whose two fields did not change
+  are not re-rendered, so a project rename reaches their text only when they next change.
+- **Wiki:** the listing endpoint has no `updated_after` filter and no pagination,
+  so every run reads all pages with content and compares hashes.
+- **Deletions:** a known item missing from the inventory is read directly. Only a
+  404 emits a `_deleted` hard-delete marker; a successful read keeps it, which
+  protects against offset-pagination skips. GitLab also returns 404 for items the
+  token can no longer see, so this removes items from the token's visible scope,
+  not only physically deleted ones. Projects missing from discovery are checked
+  with `GET /projects/:id` the same way.
+- **Failures:** 401, 429, 5xx, timeouts, redirects, failed pages, and malformed
+  payloads abort the run without saving a partial checkpoint or emitting
+  tombstones. There are no automatic retries; a 429 raises a rate-limit error,
+  and rerunning later is safe. No response bodies or tokens are logged.
+- **Isolation:** staging and pipeline names are scoped by instance URL, token
+  owner ID, resource selection, project selection, and destination dataset.
+  Rotating the token keeps the same scope.
+- **Memory:** each scan buffers documents and bookkeeping in memory; very large
+  inventories would need a database-backed state strategy.
 
-`sync.py` coordinates fetching and reconciliation; `gitlab.py` contains HTTP
-helpers and the DLT entry point, and `documents.py` maps resource payloads.
+The saved checkpoint is a staging checkpoint. A successful dlt load does not
+guarantee Cognee's graph processing finished; check the result's `status`.
 
-Inside the DLT resource, `dlt.current.resource_state()` holds per-project and
-per-resource checkpoints, document hashes, and upstream identities. Full document
-bodies are stored in staging, not in state. DLT persists state in its pipeline
-working directory (normally `~/.dlt/pipelines/<pipeline_name>/`) and destination
-`_dlt_pipeline_state` table. Keep the same destination and dataset across runs.
-Staging and pipeline names are scoped by instance URL, token owner ID, resource
-selection (including `comments`), project selection (when given), and
-destination dataset. Token rotation preserves the scope.
+## Cognee version
 
-- First run: fetch all selected resources and establish a baseline.
-- Later issue/MR runs: use the greatest observed upstream `updated_at`, minus a
-  one-minute overlap, as `updated_after`. Each resource has its own cursor.
-  Invalid or timezone-free timestamps abort the run. Empty resources retain no
-  timestamp until an upstream record supplies one.
-- Wiki: fetch all pages and compare mapped-document hashes, since its listing
-  endpoint has no `updated_after` filter.
-- Only changed mapped documents are emitted; stable IDs and merge make replay
-  idempotent. Hashing also catches changes to project metadata rendered in text.
-- Deletion checks still fetch a complete unfiltered issue/MR inventory every
-  run. **This implementation reduces emitted documents, not total API traffic:**
-  inventories return full payloads, so a later run can make more API calls than
-  a full snapshot alone. GitLab does not supply a deletion feed here.
-- Previously known records absent from both inventory and delta are checked
-  individually. A successful individual read retains the record (protecting
-  against pagination races); HTTP 404 emits an `_deleted` hard-delete marker.
-  DLT removes the staged row on merge, and Cognee reconciles the retained corpus.
-  GitLab can also hide inaccessible records behind 404: this means removal from
-  the token's visible resource scope, not proof of a physical upstream deletion.
-- Previously known projects missing from membership discovery are checked with
-  `GET /projects/:id`. A 200 response keeps the project in the sync; a 404 emits
-  deletion markers for all its known documents and removes its saved checkpoints.
-  This covers deleted projects and projects hidden after access is revoked;
-  GitLab's 404 does not distinguish those cases. Cleanup runs on the next sync.
-  With `project_ids`, a selected project returning 404 is removed the same way.
-  HTTP 401/429/5xx, failed pages, malformed payloads, and mapping errors abort
-  the run without publishing partial checkpoints or tombstones.
+The package requires `cognee>=1.6.2,<2`, and the lockfile uses 1.6.4. Cognee 1.4.0
+skipped graph cleanup when a dataset's last document was deleted. Deleting the
+final document of a dataset has not been verified live with this connector;
+the live deletion check below removed one issue while others remained.
 
-The coordinator builds the next state separately and assigns it only after all
-reads, mapping, and row iteration finish. DLT owns extraction/load state and
-retry handling; the checkpoint is a staging checkpoint, not a guarantee that
-Cognee graph processing finished. Retained staging rows allow graph processing
-to be retried even when the next extraction has no changes.
+## Live validation
 
-Always pass `write_disposition="merge"` and `max_rows_per_table=0` to
-`cognee.remember()`: replace would erase unchanged rows, and a row limit would
-truncate the corpus used for reconciliation. Recreate the source for each sync.
-Current scans buffer documents and bookkeeping in memory; large inventories
-will need a database-backed state strategy. Readable confidential issues are
-included, so choose the destination dataset's permissions accordingly.
+Run read-only against gitlab.com with DeepSeek as the LLM and local fastembed
+embeddings:
 
-## Development setup
+- Membership discovery found the account's 3 projects, including a group project.
+  The first sync produced 36 documents (29 with comments); an unchanged second sync
+  emitted 0 rows and made 0 notes requests.
+- Comment timestamps, on a throwaway issue:
 
-From this package directory:
+  | Action | Parent `updated_at` | `user_notes_count` |
+  | --- | --- | --- |
+  | Add (after 70s) | bumped | 0 → 1 |
+  | Add (within 60s) | unchanged | 1 → 2 |
+  | Edit (after 70s) | bumped | 2 |
+  | Delete (after 70s) | **unchanged** | 2 → 1 |
+
+- End to end (`remember` → delete the issue upstream → `remember`), on an isolated
+  Cognee data directory with a throwaway issue carrying a unique marker:
+
+  | | Data rows with marker | Chunk hits | Graph nodes with marker | Graph nodes / edges |
+  | --- | --- | --- | --- | --- |
+  | After sync 1 | 1 | 1 | 4 | 59 / 113 |
+  | After deleting the issue and sync 2 | **0** | **0** | **0** | 52 / 100 |
+
+## Design notes for maintainers
+
+| Module | Role |
+| --- | --- |
+| `gitlab.py` | HTTP helpers, token validation, project discovery, list/notes/wiki fetchers, and `gitlab_source()`. |
+| `sync.py` | `sync_documents()`: cursors, inventories, note re-reads, hashing, deletion checks, and the next state. |
+| `documents.py` | Pure mappers from GitLab payloads to `{id, title, content, url}`; no HTTP. |
+
+Invariants to keep when changing the sync:
+
+- Never decide a deletion from the `updated_after` delta; use the full inventory
+  plus a direct read that returns 404.
+- Build the next state separately and assign it only after every read and mapping
+  succeeds, so a failure never publishes a partial checkpoint or tombstones.
+- Never follow redirects or server-supplied pagination URLs, so the token stays on
+  the configured instance.
+- Keep document IDs stable; they are the merge and hard-delete key:
+  `<instance>:project:<project_id>:issue:<id>`, `...:merge_request:<id>`, and
+  `...:wiki:<url-encoded slug>`. A wiki rename is a delete plus an add.
+
+Stored state: `resource_state()["projects"][<project_id>][<resource>]` holds
+`hashes` (document ID → content hash), `identities` (document ID → IID or slug),
+`updated_after` (issues/MRs), and `notes_marks` (document ID →
+`[updated_at, user_notes_count]`, comment mode only). Changing this shape breaks
+existing users' saved state, so treat it as a migration.
+
+## Tests
 
 ```bash
-uv sync --extra dev
+uv run --extra dev pytest tests/
+uv run --extra dev ruff check .
+uv run --extra dev ruff format --check .
 ```
 
-Dependencies are initial development bounds; compatibility must be validated
-before release. HTTP requests use `httpx` with a 30-second timeout.
-
-## Example and tests
-
-`examples/example.py` runs the initial ingestion flow. It requires `GITLAB_TOKEN`
-and a configured cognee LLM/embedding provider. Set `GITLAB_PROJECT_IDS` (comma
-separated, e.g. `my-team/backend,87746024`) to limit the sync to those projects. Run the mocked API and local
-SQLite DLT integration tests with
-`uv run pytest tests/`. These do not require credentials or network access.
+182 offline tests cover token validation, discovery, mapping, comments,
+incremental cursors, deletion reconciliation, failure atomicity, token rotation,
+and a real dlt + SQLite pipeline with hard deletes. They need no network or
+credentials. See [`tests/README.md`](tests/README.md) for the layout.
