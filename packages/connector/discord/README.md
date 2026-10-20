@@ -58,18 +58,20 @@ Run the same call again to sync only what changed. See `examples/example.py`.
 
 | Argument | Default | Meaning |
 | --- | --- | --- |
-| `channel_ids` | all | Channel ids to sync. By default every text, announcement, forum and media channel. |
+| `channel_ids` | all | Channel ids to sync. By default every text, announcement, forum and media channel. A listed channel that is missing or cannot be read raises. |
 | `include_threads` | `True` | Active and archived public threads of text channels. |
 | `include_forums` | `True` | Forum and media posts (each post is a thread). |
 | `include_private_threads` | `False` | Private threads. Archived ones need **Manage Threads**. |
 | `include_bot_messages` | `False` | Messages from bots and webhooks. |
 | `since_days` | `90` | How far back the first sync of a channel reads. |
-| `rescan_days` | `7` | Recent days re-read on every run to catch edits and deletions. |
+| `rescan_days` | `7` | Recent days re-read on every run to catch edits and deletions. With `0` only the cursor's day and newer messages are read. |
 | `full_resync` | `False` | Re-read the whole `since_days` history once. |
+| `max_requests` | `2000` | Request budget of one run, checked once a new day or a whole channel is done. A bigger server finishes over several runs. |
 | `resource_name` | `discord_messages` | Staging table. Use a different name per sync scope that shares a dataset. |
 
-Channels the bot cannot see are skipped, but each one costs a refused request per sync,
-so pass `channel_ids` on servers with many private channels.
+Channels the bot cannot read are left as they are and counted in `unreadable`, but each
+one costs a refused request per sync, so pass `channel_ids` on servers with many private
+channels.
 
 ## What a document looks like
 
@@ -83,8 +85,13 @@ Date: 2026-10-02
 ```
 
 Mentions are resolved to names, custom emoji to `:name:`, and attachments are kept as
-file names only, since Discord's attachment links are signed and expire. Forum posts start
+file names only, since Discord's attachment links are signed and expire. Embeds from bots
+and webhooks (title, description and link), sticker names and polls are kept as text; link
+previews are left out, since they repeat a URL already in the message. Forum posts start
 with the post title and its tags. System messages (joins, pins, boosts) are skipped.
+
+The server name is part of every document. After a rename, days inside the re-scan window
+pick up the new name and older ones keep the old one until a `full_resync`.
 
 ## How sync and forget-on-delete work
 
@@ -94,18 +101,28 @@ with the post title and its tags. System messages (joins, pins, boosts) are skip
   behind it, and Discord has no "changed since" endpoint (edits and deletes only arrive
   live over the Gateway). So each run re-reads from the start of the UTC day of
   `min(cursor, now - rescan_days)`. Edits and deletions in that window update their day,
-  and a new message only re-processes today's document. Older days are left untouched
-  and cost nothing. Use `full_resync=True` when older edits and deletions matter.
+  and a new message only re-processes today's document. A channel or thread with nothing
+  new and nothing inside the window costs no request, and older days are left untouched.
+  Use `full_resync=True` when older edits and deletions matter.
 - **Forget-on-delete.** A day whose messages were all deleted, a deleted thread or forum
-  post, a deleted channel, a channel the bot can no longer see, and a channel you remove
-  from `channel_ids` are all removed from memory on the next sync.
-- **Safe failures.** Only definitive answers (unknown channel, missing access) delete
-  anything. If a channel stops returning history (Read Message History removed), it is
-  left unchanged instead of looking deleted. Any other failure aborts the sync, and dlt
-  keeps the previous state.
+  post, a channel that is deleted (gone from the server's channel list), and a channel you
+  remove from `channel_ids` are all removed from memory on the next sync.
+- **Safe failures.** A channel the bot cannot read (missing access or permissions, or Read
+  Message History removed, which makes Discord return an empty list) is left unchanged
+  with its threads and counted in `unreadable`, instead of looking deleted. Deselect it to
+  forget it. Any other failure aborts the sync, and dlt keeps the previous state.
 - **Rate limits.** The client waits out exhausted rate-limit buckets and honors
   `retry_after` on 429, and it never retries a 401 or 403. Discord temporarily bans an IP
   after 10,000 of those responses in 10 minutes.
+- **A run is bounded.** A `retry_after` over 60 seconds (the global limit), a 429 that
+  outlasts the retries, or a spent `max_requests` budget stops the run cleanly. It keeps
+  the days it finished, reports why in `cognee_sync_stats` (`failed`, plus
+  `failed_rate_limit` or `failed_budget`), and the next run starts after the last channel
+  it finished. Deleted channels and threads are only forgotten by a run that finished.
+
+`cognee_sync_stats` also counts `scanned` messages, `emitted`, `unchanged` and `deleted`
+days, `unreadable` channels, `empty` messages (no content at all, which points at a missing
+Message Content Intent) and `skipped_no_text` (messages with nothing to render).
 
 ## Privacy
 
@@ -121,7 +138,8 @@ uv run pytest tests/
 ```
 
 The tests need no bot or server. They run the client against a mocked HTTP transport
-(headers, rate limits, error codes), check snowflakes and message rendering, drive the
-sync against a fake Discord API through a real dlt pipeline (incremental cursor, re-scan
-window, deletions, failed runs), and run `cognee.remember` end to end to prove a deleted
-thread leaves the graph.
+(headers, rate limits, error codes), check snowflakes and message rendering (embeds,
+stickers, polls), drive the sync against a fake Discord API (incremental cursor, re-scan
+window, deletions, unreadable channels and thread lists, stopped runs and resuming,
+`check_active`) and through a real dlt pipeline, and run `cognee.remember` end to end to
+prove a deleted thread leaves the graph.

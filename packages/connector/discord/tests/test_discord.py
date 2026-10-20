@@ -8,7 +8,7 @@
   prove the incremental cursor and forget-on-delete.
 """
 
-from datetime import UTC, date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from uuid import NAMESPACE_OID, uuid5
 
@@ -24,6 +24,8 @@ from cognee_community_connector_discord.discord import (
     DiscordAuthError,
     DiscordClient,
     DiscordIntentError,
+    DiscordRateLimitedError,
+    DiscordSourceError,
     _archived_threads,
     _DiscordConfig,
     _iter_rows,
@@ -57,13 +59,12 @@ def _config(**overrides):
     return _DiscordConfig(**values)
 
 
-def _stats():
-    return {"emitted": 0, "unchanged": 0, "deleted": 0, "gone": 0, "unreadable": 0, "empty": 0}
-
-
-def _run(discord, state, now=NOW, stats=None, **overrides):
-    stats = stats if stats is not None else _stats()
-    return list(_iter_rows(discord, _config(**overrides), state, stats, now=lambda: now))
+def _run(discord, state, now=NOW, stats=None, check_active=None, **overrides):
+    stats = stats if stats is not None else {}
+    rows = _iter_rows(
+        discord, _config(**overrides), state, stats, now=lambda: now, check_active=check_active
+    )
+    return list(rows)
 
 
 def _by_id(rows):
@@ -114,6 +115,17 @@ def test_client_waits_out_429_and_5xx():
     assert sleeps == [1.5, 2.0]
 
 
+@pytest.mark.parametrize("retry_after", [900.0, 1.0])
+def test_client_gives_up_on_a_long_or_endless_429(retry_after):
+    client, requests, sleeps = _client(
+        [httpx.Response(429, json={"retry_after": retry_after, "global": True})]
+    )
+    with pytest.raises(DiscordRateLimitedError):
+        client.get("/channels/1/messages")
+    assert sleeps == ([] if retry_after > 60 else [1.0] * 4)
+    assert len(requests) == (1 if retry_after > 60 else 5)
+
+
 def test_client_waits_when_the_bucket_is_exhausted():
     client, _, sleeps = _client(
         [
@@ -154,9 +166,9 @@ def test_client_rejects_bad_tokens_without_echoing_them():
 def test_snowflake_matches_discord_reference_example():
     # The example id from Discord's reference docs.
     assert snowflake_time("175928847299117063") == datetime(
-        2016, 4, 30, 11, 18, 25, 796000, tzinfo=UTC
+        2016, 4, 30, 11, 18, 25, 796000, tzinfo=timezone.utc
     )
-    moment = datetime(2026, 10, 1, tzinfo=UTC)
+    moment = datetime(2026, 10, 1, tzinfo=timezone.utc)
     assert snowflake_time(time_snowflake(moment)) == moment
 
 
@@ -164,7 +176,8 @@ def test_messages_after_pages_forward_through_newest_first_pages(discord):
     for minute in range(150):
         discord.message(GENERAL, TODAY + timedelta(minutes=minute), f"m{minute}")
     messages = _messages_after(discord, GENERAL, 0)
-    assert sorted(m["content"] for m in messages) == sorted(f"m{i}" for i in range(150))
+    assert next(messages)["content"] == "m0" and len(discord.calls) == 1
+    assert [m["content"] for m in messages] == [f"m{i}" for i in range(1, 150)]
     afters = [p["after"] for path, p in discord.calls if path.endswith("/messages")]
     assert len(afters) == 2 and afters[0] == "0"
 
@@ -208,6 +221,37 @@ def test_render_message_marks_replies_and_thread_starters(discord):
     starter = discord.message("8", TODAY, "", type=21, referenced_message=original)
     assert render_message(reply, NAMES) == "[09:00] Priya Shah (reply to Sam Lee): On it"
     assert render_message(starter, NAMES) == "[09:00] Sam Lee: Export is broken"
+
+
+def test_render_message_keeps_embeds_stickers_and_polls(discord):
+    embed = {
+        "type": "rich",
+        "title": "PR #12 merged",
+        "description": "Adds CSV export",
+        "url": "https://github.com/acme/app/pull/12",
+    }
+    preview = {"type": "link", "title": "Acme", "url": "https://acme.dev"}
+    poll = {
+        "question": {"text": "Ship Friday?"},
+        "answers": [{"poll_media": {"text": "Yes"}}, {"poll_media": {"text": "No"}}],
+    }
+    message = discord.message(
+        GENERAL, TODAY, "", embeds=[embed, preview], sticker_items=[{"name": "wave"}], poll=poll
+    )
+    assert render_message(message, NAMES) == (
+        "[09:00] Priya Shah: [embed: PR #12 merged: Adds CSV export "
+        "https://github.com/acme/app/pull/12] [sticker: wave] [poll: Ship Friday? (Yes / No)]"
+    )
+    assert render_message(discord.message(GENERAL, TODAY, "", embeds=[preview]), NAMES) is None
+
+
+def test_messages_without_text_are_counted(discord):
+    discord.message(GENERAL, TODAY, "hello")
+    discord.message(GENERAL, TODAY, "", embeds=[{"type": "link", "url": "https://acme.dev"}])
+    discord.message(GENERAL, TODAY, "", attachments=[])
+    stats = {}
+    _run(discord, {}, stats=stats)
+    assert (stats["skipped_no_text"], stats["empty"], stats["scanned"]) == (1, 1, 3)
 
 
 def test_render_day_for_a_forum_post():
@@ -372,16 +416,56 @@ def test_deleted_thread_is_forgotten(discord):
     assert _run(discord, state) == [{"id": _day_id("81", TODAY), "_deleted": True}]
 
 
-@pytest.mark.parametrize(("status", "code"), [(404, 10003), (403, 50001)])
-def test_unknown_or_hidden_channel_is_forgotten(discord, status, code):
+@pytest.mark.parametrize(("status", "code"), [(404, 10003), (403, 50001), (403, 50013)])
+def test_unreadable_channel_is_left_unchanged(discord, status, code):
     discord.message(GENERAL, TODAY, "hello")
     state = {}
     _run(discord, state)
 
     discord.errors[GENERAL] = (status, code)
-    stats = _stats()
-    assert _run(discord, state, stats=stats) == [{"id": _day_id(GENERAL, TODAY), "_deleted": True}]
-    assert stats["gone"] == 1
+    stats = {}
+    assert _run(discord, state, stats=stats) == []
+    assert stats["unreadable"] == 1 and state["containers"][GENERAL]["days"]
+
+
+def test_deleted_channel_is_forgotten(discord):
+    discord.message(GENERAL, TODAY, "hello")
+    state = {}
+    _run(discord, state)
+
+    discord.channels = [c for c in discord.channels if c["id"] != GENERAL]
+    assert _run(discord, state) == [{"id": _day_id(GENERAL, TODAY), "_deleted": True}]
+
+
+def test_channel_ids_that_are_missing_or_unreadable_raise(discord):
+    with pytest.raises(DiscordSourceError, match="999"):
+        _run(discord, {}, channel_ids=("999",))
+    discord.errors[GENERAL] = (403, 50001)
+    with pytest.raises(DiscordSourceError, match=GENERAL):
+        _run(discord, {}, channel_ids=(GENERAL,))
+
+    # A thread list it cannot read only skips the threads.
+    discord.errors.clear()
+    discord.message(GENERAL, TODAY, "hello")
+    discord.thread_errors[GENERAL] = (403, 50013)
+    stats = {}
+    rows = _run(discord, {}, stats=stats, channel_ids=(GENERAL,), include_private_threads=True)
+    assert [r["id"] for r in rows] == [_day_id(GENERAL, TODAY)] and stats["unreadable"] == 1
+
+
+def test_unlistable_archived_threads_skip_the_channel_and_keep_its_threads(discord):
+    discord.thread("81", GENERAL, "export bug", archived=True)
+    discord.message("81", TODAY, "trace")
+    state = {}
+    _run(discord, state)
+
+    discord.thread_errors[GENERAL] = (403, 50001)
+    discord.thread("82", FORUM, "Dark mode")
+    discord.message("82", TODAY, "please")
+    stats = {}
+    rows = _run(discord, state, stats=stats)
+    assert [r["id"] for r in rows] == [_day_id("82", TODAY)]
+    assert stats["unreadable"] == 1 and "81" in state["containers"]
 
 
 def test_deselected_channel_is_forgotten(discord):
@@ -405,6 +489,8 @@ def test_other_errors_raise_instead_of_forgetting(discord):
 
 def test_lost_history_permission_does_not_look_like_deletion(discord):
     discord.message(GENERAL, TODAY, "hello")
+    discord.thread("81", GENERAL, "export bug")
+    discord.message("81", TODAY, "trace")
     state = {}
     _run(discord, state)
 
@@ -415,10 +501,21 @@ def test_lost_history_permission_does_not_look_like_deletion(discord):
         return [] if path.endswith("/messages") else result
 
     discord.get = no_history
-    stats = _stats()
+    stats = {}
     assert _run(discord, state, stats=stats) == []
-    assert stats["unreadable"] == 1
-    assert state["containers"][GENERAL]["days"]
+    assert stats["unreadable"] == 2
+    assert state["containers"][GENERAL]["days"] and state["containers"]["81"]["days"]
+
+
+def test_window_emptied_behind_a_stale_last_message_id_is_forgotten(discord):
+    discord.message(GENERAL, TODAY - timedelta(days=20), "old")
+    recent = discord.message(GENERAL, YESTERDAY, "recent")
+    state = {}
+    _run(discord, state)
+
+    discord.messages[GENERAL].remove(recent)
+    discord.stale_last[GENERAL] = recent["id"]
+    assert _run(discord, state) == [{"id": _day_id(GENERAL, YESTERDAY), "_deleted": True}]
 
 
 def test_channel_added_later_backfills_since_days_from_now(discord):
@@ -434,6 +531,105 @@ def test_channel_added_later_backfills_since_days_from_now(discord):
     assert "outside" not in contents
 
 
+def test_quiet_old_thread_costs_no_request(discord):
+    discord.thread("82", FORUM, "Dark mode", archived=True)
+    discord.message("82", TODAY - timedelta(days=20), "please")
+    state = {}
+    _run(discord, state)
+
+    discord.calls.clear()
+    assert _run(discord, state) == []
+    assert not [path for path, _ in discord.calls if path == "/channels/82/messages"]
+
+
+def test_old_days_keep_only_their_key_and_are_still_forgotten(discord):
+    discord.message(GENERAL, TODAY - timedelta(days=20), "old")
+    state = {}
+    _run(discord, state)
+
+    later = NOW + timedelta(days=80)
+    _run(discord, state, now=later)
+    assert state["containers"][GENERAL]["days"] == {
+        (TODAY - timedelta(days=20)).date().isoformat(): ""
+    }
+    discord.channels = [c for c in discord.channels if c["id"] != GENERAL]
+    assert _run(discord, state, now=later) == [
+        {"id": _day_id(GENERAL, TODAY - timedelta(days=20)), "_deleted": True}
+    ]
+
+
+def test_rate_limit_stops_cleanly_and_resumes(discord):
+    discord.message(GENERAL, TODAY, "hello")
+    discord.thread("81", GENERAL, "export bug")
+    discord.message("81", TODAY, "trace")
+    state = {}
+    real_get = discord.get
+
+    def limited(path, params=None):
+        if path == f"/channels/{GENERAL}/messages":
+            raise DiscordRateLimitedError("Discord rate limit exceeded (HTTP 429)")
+        return real_get(path, params)
+
+    discord.get = limited
+    stats = {}
+    rows = _run(discord, state, stats=stats)
+    assert [r["id"] for r in rows] == [_day_id("81", TODAY)]
+    assert stats["failed"] == 1 and stats["failed_rate_limit"] == 1
+    assert state["resume"] == "81" and GENERAL not in state["containers"]
+
+    discord.get = real_get
+    stats = {}
+    assert [r["id"] for r in _run(discord, state, stats=stats)] == [_day_id(GENERAL, TODAY)]
+    assert stats["failed"] == 0 and "resume" not in state
+
+
+def test_budget_stops_inside_a_channel_and_the_next_run_goes_further(discord):
+    for day, count in ((30, 120), (29, 120), (28, 1)):
+        for index in range(count):
+            moment = TODAY - timedelta(days=day) + timedelta(seconds=index)
+            discord.message(GENERAL, moment, f"d{day} m{index}")
+    state = {}
+    options = {"include_threads": False, "include_forums": False, "max_requests": 6}
+
+    stats = {}
+    rows = _run(discord, state, stats=stats, **options)
+    assert [r["id"] for r in rows] == [_day_id(GENERAL, TODAY - timedelta(days=30))]
+    assert stats["failed_budget"] == 1
+
+    stats = {}
+    rows = _run(discord, state, stats=stats, **options)
+    assert [r["id"] for r in rows] == [
+        _day_id(GENERAL, TODAY - timedelta(days=29)),
+        _day_id(GENERAL, TODAY - timedelta(days=28)),
+    ]
+    assert stats["failed"] == 0
+
+
+def test_budget_cut_runs_resume_after_the_last_finished_container(discord):
+    discord.message(GENERAL, TODAY, "hello")
+    discord.thread("81", GENERAL, "export bug")
+    discord.message("81", TODAY, "trace")
+    discord.thread("82", FORUM, "Dark mode")
+    discord.message("82", TODAY, "please")
+    state = {}
+    # Seven discovery requests, then one container per run.
+    emitted = [[r["id"] for r in _run(discord, state, max_requests=8)] for _ in range(3)]
+    assert emitted == [[_day_id("81", TODAY)], [_day_id("82", TODAY)], [_day_id(GENERAL, TODAY)]]
+
+
+def test_check_active_runs_before_every_request(discord):
+    calls = []
+
+    def check_active():
+        calls.append(len(discord.calls))
+        if len(calls) == 3:
+            raise PermissionError("revoked")
+
+    with pytest.raises(PermissionError):
+        _run(discord, {}, check_active=check_active)
+    assert calls == [0, 1, 2] and len(discord.calls) == 2
+
+
 def test_private_threads_and_bot_messages_are_opt_in(discord):
     discord.thread("83", GENERAL, "secret", type_=12)
     discord.message("83", TODAY, "private talk")
@@ -447,7 +643,7 @@ def test_private_threads_and_bot_messages_are_opt_in(discord):
 # discord_source factory
 # ---------------------------------------------------------------------------
 def test_source_declares_document_path_and_scope(discord):
-    source = discord_source(guild_id=GUILD, client=discord, resource_name="discord_acme")
+    source = discord_source(guild_id=GUILD, service=discord, resource_name="discord_acme")
     assert getattr(source, dlt_utils.DOCUMENT_SOURCE_ATTR) == "discord"
     assert getattr(source, dlt_utils.PIPELINE_SCOPE_ATTR) == "discord_acme"
     assert source.name == "discord_acme"
