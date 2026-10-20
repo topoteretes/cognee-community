@@ -5,13 +5,14 @@ hard-delete, and whatever is no longer in that table is forgotten by cognee's
 orphan cleanup. So "gone from the table" here means "forgotten" in cognee.
 """
 
+import httpx
 import pytest
 
 from cognee_community_connector_twist import twist_source
 
 dlt = pytest.importorskip("dlt")
 
-LAUNCH = 852087
+LAUNCH, DESIGN = 852087, 852086
 
 
 def _source(fake, **kwargs):
@@ -214,3 +215,79 @@ def test_one_resource_name_cannot_hold_two_workspaces(seeded, tmp_path):
     )
     with pytest.raises(Exception, match="own resource_name"):
         pipeline.run(other)
+
+
+def test_archived_channel_survives_a_wrong_channel_list(fake, tmp_path):
+    # Review scenario: B is synced while active, then archived. A run with a
+    # wrong channel list holds B back; once the list is fixed B must still be
+    # there, not forgotten.
+    fake.add_channel(LAUNCH, "launch")
+    fake.add_channel(DESIGN, "design")
+    fake.add_thread(LAUNCH, "Launch date")
+    for i in range(12):
+        fake.add_thread(DESIGN, f"Design {i}")
+    pipeline = _pipeline(tmp_path)
+    pipeline.run(_source(fake))
+    fake.channels[DESIGN]["archived"] = True
+
+    pipeline.run(_source(fake))
+    assert len(_rows(pipeline, fake)) == 15
+
+    wrong = _source(fake, channel_ids=[LAUNCH])
+    pipeline.run(wrong)
+    assert wrong.cognee_sync_stats["held_back"] == 13
+    assert len(_rows(pipeline, fake)) == 15
+
+    fixed = _source(fake)
+    pipeline.run(fixed)
+    assert (fixed.cognee_sync_stats["deleted"], fixed.cognee_sync_stats["held_back"]) == (0, 0)
+    assert len(_rows(pipeline, fake)) == 15
+    # And it stays: the next default run keeps it too.
+    again = _source(fake)
+    pipeline.run(again)
+    assert (again.cognee_sync_stats["deleted"], again.cognee_sync_stats["held_back"]) == (0, 0)
+    assert len(_rows(pipeline, fake)) == 15
+
+
+def test_rate_limit_on_the_archived_listing_is_counted(seeded, tmp_path, monkeypatch):
+    monkeypatch.setattr("cognee_community_connector_twist.twist.time.sleep", lambda s: None)
+    seeded.fail_archived_listing = 429
+    source = _source(seeded)
+    with pytest.raises(Exception, match="429"):
+        _pipeline(tmp_path).run(source)
+    stats = source.cognee_sync_stats
+    assert (stats["failed"], stats["failed_rate_limit"], stats["failed_auth"]) == (1, 1, 0)
+
+
+def test_stats_start_fresh_even_when_a_run_fails_early(seeded, tmp_path):
+    source = _source(seeded, resource_name="shared")
+    _pipeline(tmp_path / "a").run(source)
+    assert source.cognee_sync_stats["scanned"] == 3
+    # Another workspace owns "shared" in this pipeline, so the same source
+    # object fails before it reads anything the second time.
+    pipeline = _pipeline(tmp_path / "b")
+    original = seeded.handler
+    seeded.handler = lambda r: (
+        httpx.Response(200, json={"id": 111, "name": "Other"})
+        if r.url.path.endswith("workspaces/getone")
+        else original(r)
+    )
+    pipeline.run(
+        twist_source(
+            111, access_token=seeded.token, http_client=seeded.http_client(), resource_name="shared"
+        )
+    )
+    seeded.handler = original
+    with pytest.raises(Exception, match="own resource_name"):
+        pipeline.run(source)
+    assert source.cognee_sync_stats == {
+        "scanned": 0,
+        "changed": 0,
+        "unchanged": 0,
+        "deleted": 0,
+        "skipped": 0,
+        "held_back": 0,
+        "failed": 1,
+        "failed_auth": 0,
+        "failed_rate_limit": 0,
+    }

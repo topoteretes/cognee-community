@@ -93,15 +93,25 @@ def test_429_that_never_clears_is_a_rate_limit_error():
     assert sleeps == [1.0] * 4
 
 
-def test_non_finite_retry_after_falls_back_to_backoff():
-    # float("nan") parses, and max(nan, 0.0) is nan, which time.sleep rejects.
-    for value in ("nan", "inf", "-inf"):
+def test_unusable_retry_after_falls_back_to_backoff():
+    # float("nan") parses, and max(nan, 0.0) is nan, which time.sleep rejects;
+    # 0 or a negative value would retry back to back.
+    for value in ("nan", "-inf", "-5", "0"):
         client, _, sleeps = _scripted(
+            httpx.Response(429, headers={"retry-after": value}),
             httpx.Response(429, headers={"retry-after": value}),
             httpx.Response(200, json={"ok": True}),
         )
         assert client.request("v3/channels/get") == {"ok": True}
-        assert sleeps == [2.0]
+        assert sleeps == [2.0, 4.0], value
+
+
+def test_infinite_retry_after_stops_like_a_long_wait():
+    for value in ("inf", "1e9"):
+        client, seen, sleeps = _scripted(httpx.Response(429, headers={"retry-after": value}))
+        with pytest.raises(TwistRateLimitError, match="asked to wait"):
+            client.request("v3/channels/get")
+        assert (sleeps, len(seen)) == ([], 1), value
 
 
 def test_long_wait_on_a_5xx_is_a_rate_limit_too():
@@ -220,7 +230,7 @@ def test_comment_windows_cover_a_low_count_and_stop_at_an_empty_one(seeded, monk
         assert _windows(seeded) == [0, 2, 4]
 
 
-def test_an_inflated_comment_count_costs_one_extra_request(seeded, monkeypatch):
+def test_an_inflated_comment_count_costs_one_request_per_window(seeded, monkeypatch):
     monkeypatch.setattr(twist_module, "PAGE_LIMIT", 2)
     thread = seeded.add_thread(852087, "Short")
     for i in range(4):
@@ -229,13 +239,36 @@ def test_an_inflated_comment_count_costs_one_extra_request(seeded, monkeypatch):
     original = seeded.handler
 
     def budget(request):
-        # A regression here would mean millions of requests; fail fast instead.
+        # Bounded by the count: a regression would loop; fail fast instead.
         assert len(seeded.requests) < 20, "request storm on an inflated comment_count"
         return original(request)
 
     seeded.handler = budget
-    assert len(list(_client(seeded).iter_comments(thread["id"], 10**9))) == 4
-    assert _windows(seeded) == [0, 2, 4]  # the empty window ends it
+    assert len(list(_client(seeded).iter_comments(thread["id"], 10))) == 4
+    assert _windows(seeded) == [0, 2, 4, 6, 8]  # stops once the count is covered
+
+
+def test_comments_after_empty_windows_are_still_read(seeded, monkeypatch):
+    # Review case: only obj_index 500..699 left (cc=700). Here with windows of 2:
+    # obj_index 0..3 are missing, 4 and 5 are there, comment_count says 6.
+    monkeypatch.setattr(twist_module, "PAGE_LIMIT", 2)
+    thread = seeded.add_thread(852087, "Old thread")
+    for i in range(6):
+        seeded.add_comment(thread["id"], f"reply {i}")
+    del seeded.comments[thread["id"]][:4]
+    seeded.requests.clear()
+    comments = list(_client(seeded).iter_comments(thread["id"], 6))
+    assert [c["content"] for c in comments] == ["reply 4", "reply 5"]
+    assert _windows(seeded) == [0, 2, 4, 6]
+
+
+def test_a_rate_limit_on_the_archived_listing_stops_the_run(seeded):
+    seeded.fail_archived_listing = 429
+    seeded.requests.clear()
+    with pytest.raises(TwistRateLimitError):
+        _client(seeded).list_channels(seeded.workspace_id)
+    archived_calls = [r for r in seeded.requests if r.url.params.get("archived") == "true"]
+    assert len(archived_calls) == 5  # retried, then stopped instead of falling back
 
 
 def test_a_stale_zero_count_still_reads_the_first_window(seeded):

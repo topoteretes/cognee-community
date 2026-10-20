@@ -178,11 +178,12 @@ class TwistClient:
                 if attempt == MAX_ATTEMPTS:
                     raise error(f"Twist API returned {status} on {path} after {attempt} tries")
                 delay = _retry_delay(response, attempt)
-                if delay > MAX_RETRY_AFTER_SECONDS:
+                if delay > MAX_RETRY_AFTER_SECONDS:  # inf included
                     # Being told to wait this long is rate limiting, whatever the status.
+                    wait = "without limit" if math.isinf(delay) else f"{delay:.0f}s"
                     raise TwistRateLimitError(
                         f"Twist API returned {status} on {path} and asked to wait "
-                        f"{delay:.0f}s; stopping so the next sync can retry."
+                        f"{wait}; stopping so the next sync can retry."
                     )
                 logger.warning(
                     "Twist: %s on %s, retrying in %.1fs (%d/%d).",
@@ -231,7 +232,8 @@ class TwistClient:
         channels = {int(c["id"]): c for c in self._list("v3/channels/get", params)}
         try:
             archived = self._list("v3/channels/get", {**params, "archived": "true"})
-        except TwistAuthError:
+        except (TwistAuthError, TwistRateLimitError):
+            # Stop the run so it is counted, instead of skipping archived channels.
             raise
         except TwistError as exc:
             logger.warning(
@@ -266,10 +268,11 @@ class TwistClient:
         Without a range, ``limit=N`` returns the last N comments, so the windows
         are explicit. The first window is always read (a stale ``comment_count``
         of 0 must not hide real comments). After that the next window is read
-        when the last one came back full (``comment_count`` too low) or when it
-        had comments and ``comment_count`` says there are more. An empty window
-        always ends it, so an inflated ``comment_count`` costs one extra request,
-        not thousands. The thread's ``last_obj_index`` is not used: Twist's docs
+        when the last one came back full (``comment_count`` too low) or while
+        ``comment_count`` says there are more, even past an empty window, since
+        the comments of a window can be missing (older than the free plan's
+        history). So an inflated ``comment_count`` costs one request per 500 it
+        is too high. The thread's ``last_obj_index`` is not used: Twist's docs
         describe it as the reader's position ("-1 means the whole thread is
         unread").
         """
@@ -286,8 +289,6 @@ class TwistClient:
             )
             yield from page
             start += PAGE_LIMIT
-            if not page:
-                return
             if len(page) < PAGE_LIMIT and (comment_count is None or start >= comment_count):
                 return
 
@@ -299,9 +300,10 @@ def _retry_delay(response: httpx.Response, attempt: int) -> float:
             delay = float(retry_after)
         except ValueError:
             delay = math.nan
-        # "nan" and "inf" parse as floats but are no delay; fall back to backoff.
-        if math.isfinite(delay):
-            return max(delay, 0.0)
+        # Zero, a negative value or "nan" is no usable wait: fall back to the
+        # backoff. "inf" is kept, so the caller's cap stops the run.
+        if delay > 0:
+            return delay
     return float(2**attempt)
 
 
@@ -479,7 +481,6 @@ def _iter_rows(
     thread, ``["channel", digest]`` for a channel. Any API error propagates and
     aborts the run before a tombstone is yielded; dlt then keeps the old state.
     """
-    _reset_stats(stats)
     previous: dict[str, list] = dict(state.get("items") or {})
     runs = int(state.get("runs", 0))
     sweep = full_sync or runs == 0 or (full_sync_every > 0 and runs % full_sync_every == 0)
@@ -487,20 +488,30 @@ def _iter_rows(
     workspace_name = client.get_workspace(workspace_id).get("name") or ""
     channels, archived_listed = client.list_channels(workspace_id)
     by_id = {int(channel["id"]): channel for channel in channels}
-    # Channels synced while they were active (kept after being archived).
-    synced_active = set(state.get("active_channels") or [])
+    # Channels synced while they were active (kept after being archived). State
+    # from before this list existed kept every synced channel, so it starts from
+    # the channels already stored.
+    if "active_channels" in state:
+        synced_active = set(state["active_channels"])
+    else:
+        synced_active = {int(k[8:]) for k in previous if k.startswith("channel:")}
     if not archived_listed:
         unseen = [k for k in previous if k.startswith("channel:") and int(k[8:]) not in by_id]
-        if unseen:
+        if unseen or include_archived:
             # Without the archived listing a channel we synced may only be
-            # missing from the plain one, so nothing can be forgotten safely.
+            # missing from the plain one, and archived channels that were asked
+            # for may be missing too, so nothing can be synced or forgotten safely.
             raise TwistError(
-                "Twist channels/get with archived=true failed and a synced channel is not in "
-                "the plain listing, so archived channels cannot be told from deleted ones. "
-                "Nothing was synced or forgotten."
+                "Twist channels/get with archived=true failed, so archived channels cannot be "
+                "told from deleted ones. Nothing was synced or forgotten."
             )
     if channel_ids:
         missing = [cid for cid in channel_ids if cid not in by_id]
+        if missing and not archived_listed:
+            raise TwistError(
+                f"Twist channel(s) {missing} are not in the plain channel listing and "
+                "channels/get with archived=true failed. Nothing was synced or forgotten."
+            )
         if missing:
             # A selected channel this token cannot see is a configuration or
             # permission problem, never proof that its threads were deleted.
@@ -519,9 +530,7 @@ def _iter_rows(
             for c in channels
             if include_archived or not c.get("archived") or int(c["id"]) in synced_active
         ]
-    active_channels = [
-        int(c["id"]) for c in selected if not c.get("archived") or int(c["id"]) in synced_active
-    ]
+    synced_active.update(int(c["id"]) for c in selected if not c.get("archived"))
 
     present: dict[str, list] = {}
     for channel in selected:
@@ -616,7 +625,9 @@ def _iter_rows(
         yield {"id": key, "_deleted": True}
 
     state["items"] = present
-    state["active_channels"] = active_channels
+    # A channel keeps its mark until it is actually forgotten, so a run that
+    # leaves it out (a held batch, another channel list) does not drop it.
+    state["active_channels"] = sorted(cid for cid in synced_active if f"channel:{cid}" in present)
     state["runs"] = runs + 1
     logger.info(
         "Twist: scanned %d thread(s): %d changed, %d unchanged, %d skipped; "
@@ -671,7 +682,9 @@ def twist_source(
             given. Explicitly listed channels are always synced. Without either,
             an archived channel is synced only if it was synced while it was
             active (archiving deletes nothing); one synced only because it was
-            listed or included is dropped once it no longer is.
+            listed or included is dropped once it no longer is. If Twist's
+            archived channel listing fails, a run that asks for archived
+            channels stops instead of skipping them.
         full_sync: Re-read every thread's comments this run, to pick up edited
             comments right away.
         full_sync_every: Do that automatically every Nth run (default 10, and
@@ -716,6 +729,9 @@ def twist_source(
         columns={"_deleted": {"data_type": "bool", "hard_delete": True}, **NODE_SET_COLUMN_HINT},
     )
     def twist_threads():
+        # First thing in the run, so nothing from a previous run is left over
+        # even when this one fails before reading anything.
+        _reset_stats(stats)
         owned = None if http_client is not None else httpx.Client(timeout=30.0)
         try:
             client = TwistClient(token, http_client=http_client or owned)

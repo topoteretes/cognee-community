@@ -108,8 +108,10 @@ These rules come from testing the Twist API on a live workspace.
   run is judged on its own, so ordinary deletes alongside a held batch are not
   delayed. No run ever stops on this, so a scheduled sync needs no manual step.
   `allow_mass_delete=True` forgets such a batch at once; `max_delete_ratio`
-  tunes the threshold. A wrong selection that lasts two runs does forget the
-  items; when it is fixed they come back as new and are ingested again.
+  tunes the threshold. A held batch keeps an archived channel synced. A wrong
+  selection that lasts two runs does forget the items; when it is fixed, active
+  channels come back as new and are ingested again, and an archived one comes
+  back once it is asked for (`include_archived` or `channel_ids`).
 - **Own sync state per workspace.** Each source uses its own dlt pipeline and
   state, named after its `resource_name` (default `twist_<workspace_id>`,
   through `PIPELINE_SCOPE_ATTR`), and a run refuses to continue if the stored
@@ -183,14 +185,18 @@ changes one, this is where to look first.
 - `channels/get` already returns archived channels without `archived`
   (documented as needed for them), so the connector asks both ways and merges.
   If the `archived=true` call fails, the plain listing is used, unless a channel
-  that was synced before is missing from it; then the run stops, since an
-  archived channel cannot be told from a deleted one.
+  that was synced before is missing from it, `include_archived` is on, or a
+  `channel_ids` entry is missing from it; then the run stops, since an archived
+  channel cannot be told from a deleted one. A rate limit or a rejected token on
+  that call stops the run as well.
 - A thread's `last_obj_index` is documented as the reader's position ("-1 means
   the whole thread is unread"), so it is never used. Comments are read in
   windows of 500: the first window always, the next one while a window comes
-  back full or `comment_count` says there are more, and never past an empty
-  window. (On a live workspace `last_obj_index` stayed at the last comment's
-  index for a thread marked unread.)
+  back full or `comment_count` says there are more, even past an empty window
+  (comments older than the free plan's history can be missing), so an inflated
+  `comment_count` costs one request per 500 it is too high. (On a live
+  workspace `last_obj_index` stayed at the last comment's index for a thread
+  marked unread.)
 - Errors come back as `error_code` / `error_string` (documented as
   `{"error": [code, string]}`); both are read. A rejected token is HTTP 403 with
   error code 200, not 401.

@@ -12,6 +12,7 @@ from cognee_community_connector_twist.twist import (
     TwistForbiddenError,
     TwistNotFoundError,
     _iter_rows,
+    _reset_stats,
 )
 
 LAUNCH, DESIGN = 852087, 852086
@@ -20,6 +21,7 @@ LAUNCH, DESIGN = 852087, 852086
 def run(fake, state, **kwargs):
     """One sync run; returns ({row id: row}, stats). ``state`` is updated in place."""
     stats: dict[str, int] = {}
+    _reset_stats(stats)
     kwargs.setdefault("full_sync_every", 0)
     client = TwistClient(fake.token, http_client=fake.http_client())
     rows = _iter_rows(client, workspace_id=fake.workspace_id, state=state, stats=stats, **kwargs)
@@ -425,6 +427,50 @@ def test_a_failed_archived_listing_never_forgets_a_known_channel(seeded):
     with pytest.raises(TwistError, match="archived=true failed"):
         run(seeded, state)
     assert state == before
+
+
+def test_archived_listing_failure_stops_a_run_that_asks_for_archived_channels(seeded):
+    # The plain listing may leave archived channels out, so they cannot be skipped quietly.
+    seeded.plain_hides_archived = True
+    seeded.channels[DESIGN]["archived"] = True
+    seeded.fail_archived_listing = 400
+    for opt_in in ({"include_archived": True}, {"channel_ids": [DESIGN]}):
+        state: dict = {}
+        with pytest.raises(TwistError, match="archived=true failed"):
+            run(seeded, state, **opt_in)
+        assert state == {}
+    # Without asking for archived channels a fresh sync still runs on the plain listing.
+    rows, stats = run(seeded, {})
+    assert f"channel:{LAUNCH}" in rows and stats["deleted"] == 0
+
+
+def test_state_from_the_previous_version_keeps_archived_channels(seeded, thread_named):
+    # 0462b02 wrote no active_channels and kept every synced channel.
+    state = synced(seeded)
+    del state["active_channels"]
+    seeded.channels[DESIGN]["archived"] = True
+    rows, stats = run(seeded, state)
+    assert stats["deleted"] == 0
+    assert DESIGN in state["active_channels"]
+    logo = thread_named("Logo refresh")
+    seeded.add_comment(logo["id"], "Still synced after the upgrade.")
+    rows, _ = run(seeded, state)
+    assert "Still synced after the upgrade." in rows[f"thread:{logo['id']}"]["content"]
+
+
+def test_active_channels_mark_is_dropped_only_when_the_channel_is_forgotten(seeded):
+    state = synced(seeded)
+    assert sorted(state["active_channels"]) == sorted([LAUNCH, DESIGN])
+    seeded.channels[DESIGN]["archived"] = True
+    # A small wrong selection forgets DESIGN at once (below the mass-delete floor)...
+    _, stats = run(seeded, state, channel_ids=[LAUNCH])
+    assert stats["deleted"] == 2  # the channel and its one thread
+    assert state["active_channels"] == [LAUNCH]
+    # ...and as an archived channel it now comes back only when asked for.
+    rows, _ = run(seeded, state)
+    assert f"channel:{DESIGN}" not in rows
+    rows, _ = run(seeded, state, include_archived=True)
+    assert f"channel:{DESIGN}" in rows
 
 
 def test_channel_archived_after_sync_is_kept_not_forgotten(seeded, thread_named):
