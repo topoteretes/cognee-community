@@ -1,16 +1,7 @@
 """Zoho CRM connector demo - turn your CRM into memory.
 
-Pull Zoho CRM records (Leads, Contacts, Accounts, Deals), their notes and,
-optionally, text attachments into cognee, incrementally and with
-forget-on-delete. ``zoho_crm_source`` returns a ``dlt`` source you hand to
-``cognee.remember``.
-
-First run: backfills everything. Later runs: only records changed since the last
-run are fetched (``If-Modified-Since``), and records deleted in Zoho are
-forgotten.
-
-Privacy: this reads customer data. Nothing is fetched until you run it. The OAuth
-scope is read-only and e-mail/phone fields are left out by default.
+Pull Zoho CRM records, their notes and, optionally, text attachments into cognee,
+incrementally and with forget-on-delete.
 
 Setup (see README for the Self Client steps):
 
@@ -39,12 +30,22 @@ async def main() -> None:
         print("Set ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET and ZOHO_REFRESH_TOKEN to run this example.")
         return
 
-    # Limit with modules=[...]; add include_attachments=True for text files.
-    source = zoho_crm_source()
+    source = zoho_crm_source(
+        resource_name="zoho_crm",  # one per Zoho org; keep it fixed
+        client_id=os.environ["ZOHO_CLIENT_ID"],
+        client_secret=os.environ["ZOHO_CLIENT_SECRET"],
+        refresh_token=os.environ["ZOHO_REFRESH_TOKEN"],
+        region=os.environ.get("ZOHO_REGION", "com"),
+        # modules=["Leads", "Deals"], include_attachments=True, reconcile_every=6, ...
+    )
 
     print("Syncing Zoho CRM into cognee ...")
-    # write_disposition="merge" is REQUIRED: incremental runs only see changes.
-    await cognee.remember(source, dataset_name=DATASET_NAME, write_disposition="merge")
+    # primary_key="id" + write_disposition="merge" are REQUIRED: incremental runs
+    # only see changes, and tombstones remove deleted records by id.
+    await cognee.remember(
+        source, dataset_name=DATASET_NAME, primary_key="id", write_disposition="merge"
+    )
+    print("Run stats:", source.cognee_sync_stats)
 
     answer = await cognee.search(
         query_text="Which deals are open, and what do the notes say about them?",
@@ -52,8 +53,6 @@ async def main() -> None:
         datasets=[DATASET_NAME],
     )
     print("\nSearch result:\n", answer)
-
-    print("\nEdit or delete a record in Zoho, then re-run: only the changes are fetched.")
 
 
 if __name__ == "__main__":
