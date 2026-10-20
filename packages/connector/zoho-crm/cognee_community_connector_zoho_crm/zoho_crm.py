@@ -647,6 +647,9 @@ def _sync_records(
 ) -> Iterator[dict]:
     cursors: dict = dict(state.get("cursors") or {})
     known: dict[str, list[str]] = {m: list(v) for m, v in (state.get("known") or {}).items()}
+    reconcile_positions: dict[str, int] = {
+        m: int(v) for m, v in (state.get("reconcile_positions") or {}).items()
+    }
     config = {"redact": options.redact_contact_details}
     if state.get("config") not in (None, config):
         cursors = {}  # rendering changed: re-read everything
@@ -660,6 +663,7 @@ def _sync_records(
             _count(stats, "records_forgotten")
             yield _tombstone(module, record_id)
         cursors.pop(module, None)
+        reconcile_positions.pop(module, None)
 
     for module in options.modules:
         ids = set(known.get(module) or [])
@@ -677,7 +681,18 @@ def _sync_records(
         if module in cursors:  # deletions only matter once something was loaded
             gone.update(i for i in _iter_deleted(api, module, cursors[module]) if i in ids)
             if do_reconcile:
-                gone.update(_vanished(api, module, ids - emitted - gone, stats))
+                verified_gone, next_position = _vanished(
+                    api,
+                    module,
+                    ids - emitted - gone,
+                    stats,
+                    reconcile_positions.get(module, 0),
+                )
+                gone.update(verified_gone)
+                if next_position is None:
+                    reconcile_positions.pop(module, None)
+                else:
+                    reconcile_positions[module] = next_position
         for record_id in sorted(gone):
             _count(stats, "records_forgotten")
             yield _tombstone(module, record_id)
@@ -687,6 +702,7 @@ def _sync_records(
     cursor_now = _new_cursor(api)
     state["cursors"] = dict.fromkeys(options.modules, cursor_now)
     state["known"] = known
+    state["reconcile_positions"] = reconcile_positions
     state["config"] = config
     backlog = stats.pop("_reconcile_backlog", 0)
     state["runs_since_reconcile"] = (
@@ -694,10 +710,16 @@ def _sync_records(
     )
 
 
-def _vanished(api: _Api, module: str, candidates: set[str], stats: dict[str, int]) -> set[str]:
-    """Known ids missing from a full id listing, each confirmed gone by a GET."""
+def _vanished(
+    api: _Api,
+    module: str,
+    candidates: set[str],
+    stats: dict[str, int],
+    position: int = 0,
+) -> tuple[set[str], int | None]:
+    """Confirm one rotating batch of ids missing from a full id listing."""
     if not candidates:
-        return set()
+        return set(), None
     try:
         present = {
             str(r["id"])
@@ -708,22 +730,28 @@ def _vanished(api: _Api, module: str, candidates: set[str], stats: dict[str, int
     except _UnstableListingError as exc:
         _count(stats, "reconcile_skipped")
         logger.warning("Zoho CRM: %s Nothing is forgotten this run.", exc)
-        return set()
+        return set(), position
     missing = sorted(candidates - present)
+    next_position: int | None = None
     if len(missing) > MAX_VERIFY:
+        position %= len(missing)
+        rotated = missing[position:] + missing[:position]
+        batch = rotated[:MAX_VERIFY]
+        next_position = (position + MAX_VERIFY) % len(missing)
         deferred = len(missing) - MAX_VERIFY
-        missing = missing[:MAX_VERIFY]
         stats["_reconcile_backlog"] = stats.get("_reconcile_backlog", 0) + deferred
         logger.warning(
-            "Zoho CRM: verifying the first %d of %d vanished %s records; "
+            "Zoho CRM: verifying a rotating batch of %d from %d vanished %s records; "
             "the remaining %d continue next run.",
             MAX_VERIFY,
-            MAX_VERIFY + deferred,
+            len(missing),
             module,
             deferred,
         )
+    else:
+        batch = missing
     gone = set()
-    for record_id in missing:
+    for record_id in batch:
         record = (
             api.get(f"{module}/{record_id}", {"fields": "id,Converted__s"})
             if module == "Leads"
@@ -732,7 +760,7 @@ def _vanished(api: _Api, module: str, candidates: set[str], stats: dict[str, int
         data = (record or {}).get("data") or []
         if not data or data[0].get("Converted__s") is True:  # 204 = gone; converted lead
             gone.add(record_id)
-    return gone
+    return gone, next_position
 
 
 def _record_row(module: str, record: dict, fields: list[_Field], web_base: str) -> dict:
@@ -889,16 +917,21 @@ def _sync_attachments(
         progress.get("modules") != modules
         or progress.get("since") != since
         or not isinstance(progress.get("processed"), dict)
+        or any(not isinstance(items, dict) for items in progress.get("processed", {}).values())
     ):
         progress = {"modules": modules, "since": since, "processed": {}}
-    processed = {m: set(ids) for m, ids in progress["processed"].items()}
+    processed = {m: dict(items) for m, items in progress["processed"].items()}
 
     for module in options.modules:
-        done = processed.setdefault(module, set())
-        # Records changed since the cursor (all on a first run) are re-listed.
-        for record in _iter_pages(api, module, {"fields": "id"}, _since_header(since)):
+        done = processed.setdefault(module, {})
+        # Modified_Time makes a resume checkpoint safe when a completed parent
+        # changes between the stopped run and the resumed run.
+        for record in _iter_pages(
+            api, module, {"fields": "id,Modified_Time"}, _since_header(since)
+        ):
             record_id = str(record["id"])
-            if record_id in done:
+            modified = record.get("Modified_Time")
+            if record_id in done and done[record_id] == modified:
                 continue
             listed: set[str] = set()
             path = f"{module}/{record_id}/Attachments"
@@ -937,12 +970,12 @@ def _sync_attachments(
                 owners.pop(att_id, None)
                 _count(stats, "attachments_forgotten")
                 yield {"id": f"Attachments:{att_id}", "_deleted": True}
-            done.add(record_id)
+            done[record_id] = modified
             state["owners"] = owners
             state["progress"] = {
                 "modules": modules,
                 "since": since,
-                "processed": {m: sorted(ids) for m, ids in processed.items()},
+                "processed": {m: dict(sorted(items.items())) for m, items in processed.items()},
             }
 
     if cursor:

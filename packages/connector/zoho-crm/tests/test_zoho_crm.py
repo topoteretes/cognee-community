@@ -547,6 +547,31 @@ def test_more_than_max_verify_converted_leads_make_progress(tmp_path):
     assert set(_rows(pipeline)) == {"Leads:250"}
 
 
+def test_reconcile_rotates_past_live_ids_to_reach_converted_backlog(tmp_path):
+    leads = [_lead(f"{i:03d}") for i in range(260)]
+    fake = FakeZoho({"Leads": leads, "Deals": []}, page_size=200)
+    _run(tmp_path, fake)
+    for lead in fake.records["Leads"][200:]:
+        lead["Converted__s"] = True
+
+    real_page = fake._page
+
+    def hide_first_two_hundred(items, params, use_token):
+        if params.get("sort_by") == "id":
+            items = [item for item in items if int(item["id"]) >= 200]
+        return real_page(items, params, use_token)
+
+    fake._page = hide_first_two_hundred
+    pipeline, _ = _run(tmp_path, fake)
+    assert len(_rows(pipeline)) == 260  # first rotating batch was alive
+    assert _state(pipeline)["reconcile_positions"]["Leads"] == 200
+
+    pipeline, _ = _run(tmp_path, fake)
+    rows = _rows(pipeline)
+    assert len(rows) == 200
+    assert all(f"Leads:{i:03d}" in rows for i in range(200))
+
+
 def test_live_record_missing_from_listing_is_kept_after_recheck(tmp_path):
     fake = FakeZoho({"Leads": [_lead("1"), _lead("2")], "Deals": [_deal()]})
     _run(tmp_path, fake)
@@ -714,11 +739,16 @@ def test_attachment_fanout_resumes_completed_parents(tmp_path):
     assert "cursor" not in state
     assert len(state["progress"]["processed"]["Deals"]) == 3
 
+    # A completed parent changes while the run is waiting to resume. Its newer
+    # Modified_Time must invalidate only that parent's checkpoint.
+    fake.attachments[("Deals", "0")] = [_att("t9", "new.txt", b"new after stop")]
+    fake.records["Deals"][0]["Modified_Time"] = "2999-01-01T00:00:00+00:00"
     fake.get = real_get
     fake.calls.clear()
     pipeline, _ = _run(tmp_path, fake, include_attachments=True)
     calls = [p for p, _, _ in fake.calls if p.endswith("/Attachments")]
-    assert len(calls) == 7  # the first three completed parent calls were checkpointed
+    assert len(calls) == 8  # 7 unfinished parents + changed parent 0
+    assert set(_rows(pipeline, "zoho_crm_attachments")) == {"Attachments:t9"}
     assert "progress" not in _state(pipeline, "zoho_crm_attachments")
 
 

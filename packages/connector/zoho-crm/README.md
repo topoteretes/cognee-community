@@ -162,8 +162,9 @@ a re-listed record are forgotten.
 **Failures.** `5xx` and network errors are retried with backoff. A `Retry-After` up to
 `max_rate_limit_wait` is slept; a longer one stops all interleaved resources before their next API
 request. The stopped resource moves no cursor; already completed resources keep theirs, and completed
-attachment-parent checkpoints are saved so a large first run resumes instead of restarting. Any other
-error aborts the run. Errors carry the HTTP status and Zoho's error code, never response bodies.
+attachment-parent checkpoints are saved so a large first run resumes instead of restarting. A
+checkpoint includes the parent's `Modified_Time`, so a parent changed while waiting is processed again.
+Any other error aborts the run. Errors carry the HTTP status and Zoho's error code, never response bodies.
 
 ## Known gaps
 
@@ -183,6 +184,8 @@ error aborts the run. Errors carry the HTTP status and Zoho's error code, never 
 * **Credits.** Zoho meters API use in credits per day. A quiet run costs about two requests per module
   (`304` list + `304` deleted feed) plus field metadata. A reconcile adds one request per 200 records.
   Attachment sync fans out to one list request per changed parent record, plus one download per kept file.
+  Reconciliation also uses one confirming GET per candidate that vanished from the id listing (up to 200
+  per run); its rotating checkpoint prevents repeatedly-live low ids from starving later candidates.
 
 ## Privacy
 
