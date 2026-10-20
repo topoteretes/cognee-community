@@ -1,0 +1,156 @@
+name: Test ClickHouse Community Adapter
+
+on:
+  workflow_call:
+    inputs:
+      event-type:
+        required: false
+        type: string
+        default: "regular-testing-event"
+    secrets:
+      LLM_MODEL:
+        required: true
+      LLM_ENDPOINT:
+        required: true
+      LLM_API_KEY:
+        required: true
+      LLM_API_VERSION:
+        required: true
+      EMBEDDING_MODEL:
+        required: true
+      EMBEDDING_ENDPOINT:
+        required: true
+      EMBEDDING_API_KEY:
+        required: true
+      EMBEDDING_API_VERSION:
+        required: true
+  workflow_dispatch:
+  pull_request:
+    branches: [ main, dev ]
+    paths:
+      - 'packages/vector/clickhouse/**'
+      - '.github/workflows/test_clickhouse.yml'
+      - '.github/workflows/vector_db_community_tests.yml'
+
+concurrency:
+  group: clickhouse-test-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+env:
+  VECTOR_DB_PROVIDER: clickhouse
+  VECTOR_DATASET_DATABASE_HANDLER: clickhouse
+  VECTOR_DB_URL: http://127.0.0.1:8123/cognee
+  VECTOR_DB_NAME: cognee
+  CLICKHOUSE_HOST: 127.0.0.1
+  CLICKHOUSE_PORT: 8123
+  CLICKHOUSE_DATABASE: cognee
+  CLICKHOUSE_USERNAME: default
+  CLICKHOUSE_PASSWORD: ''
+  CLICKHOUSE_SECURE: 'false'
+
+jobs:
+  run-clickhouse-example:
+    name: "ClickHouse Community Adapter Example"
+    runs-on: ubuntu-22.04
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:25.8
+        env:
+          CLICKHOUSE_DB: cognee
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+        ports:
+          - 8123:8123
+          - 9000:9000
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Community Setup
+        uses: ./.github/actions/community_setup
+        with:
+          python-version: '3.11.x'
+          package-path: packages/vector/clickhouse
+          event-type: ${{ inputs.event-type }}
+
+      - name: Wait for ClickHouse
+        run: |
+          for i in {1..60}; do
+            if curl -fsS "http://127.0.0.1:8123/ping"; then
+              curl -fsS "http://127.0.0.1:8123/" \
+                --data-binary "CREATE DATABASE IF NOT EXISTS cognee"
+              exit 0
+            fi
+            echo "ClickHouse not ready yet... (attempt $i/60)"
+            sleep 2
+          done
+          exit 1
+
+      - name: Run ClickHouse Example
+        env:
+          ENV: 'dev'
+          ENABLE_BACKEND_ACCESS_CONTROL: False
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+          LLM_ENDPOINT: ${{ secrets.LLM_ENDPOINT }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_API_VERSION: ${{ secrets.LLM_API_VERSION }}
+          EMBEDDING_MODEL: ${{ secrets.EMBEDDING_MODEL }}
+          EMBEDDING_ENDPOINT: ${{ secrets.EMBEDDING_ENDPOINT }}
+          EMBEDDING_API_KEY: ${{ secrets.EMBEDDING_API_KEY }}
+          EMBEDDING_API_VERSION: ${{ secrets.EMBEDDING_API_VERSION }}
+          CLICKHOUSE_URL: http://127.0.0.1:8123/cognee
+          CLICKHOUSE_KEY: ''
+        working-directory: ./packages/vector/clickhouse
+        run: poetry run python example.py
+
+  test-clickhouse:
+    name: "ClickHouse Community Adapter Test"
+    runs-on: ubuntu-22.04
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:25.8
+        env:
+          CLICKHOUSE_DB: cognee
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+        ports:
+          - 8123:8123
+          - 9000:9000
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Community Setup
+        uses: ./.github/actions/community_setup
+        with:
+          python-version: '3.11.x'
+          package-path: packages/vector/clickhouse
+          event-type: ${{ inputs.event-type }}
+
+      - name: Wait for ClickHouse
+        run: |
+          for i in {1..60}; do
+            if curl -fsS "http://127.0.0.1:8123/ping"; then
+              curl -fsS "http://127.0.0.1:8123/" \
+                --data-binary "CREATE DATABASE IF NOT EXISTS cognee"
+              exit 0
+            fi
+            echo "ClickHouse not ready yet... (attempt $i/60)"
+            sleep 2
+          done
+          exit 1
+
+      - name: Run ClickHouse Tests
+        env:
+          ENV: 'dev'
+          ENABLE_BACKEND_ACCESS_CONTROL: False
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+          LLM_ENDPOINT: ${{ secrets.LLM_ENDPOINT }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_API_VERSION: ${{ secrets.LLM_API_VERSION }}
+          EMBEDDING_MODEL: ${{ secrets.EMBEDDING_MODEL }}
+          EMBEDDING_ENDPOINT: ${{ secrets.EMBEDDING_ENDPOINT }}
+          EMBEDDING_API_KEY: ${{ secrets.EMBEDDING_API_KEY }}
+          EMBEDDING_API_VERSION: ${{ secrets.EMBEDDING_API_VERSION }}
+          CLICKHOUSE_URL: http://127.0.0.1:8123/cognee
+          CLICKHOUSE_KEY: ''
+        working-directory: ./packages/vector/clickhouse
+        run: poetry run pytest tests/test_clickhouse.py
