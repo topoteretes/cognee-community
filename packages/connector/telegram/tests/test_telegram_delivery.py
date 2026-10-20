@@ -334,6 +334,28 @@ def test_privacy_mode_gets_a_warning(monkeypatch):
     assert any("privacy mode is on" in line for line in lines)
 
 
+def test_a_full_page_warns_that_updates_are_waiting(monkeypatch):
+    warnings = []
+
+    class RecordingLogger:
+        def info(self, fmt, *args):
+            pass
+
+        def warning(self, fmt, *args):
+            warnings.append(fmt % args)
+
+    monkeypatch.setattr(module, "logger", RecordingLogger())
+    bot = FakeBot()
+    for i in range(1, 6):
+        bot.add(message=msg(GROUP, i, f"m{i}"))
+    list(sync_updates(bot, {}, max_updates=5))
+    assert any("more are waiting" in w for w in warnings)
+
+    warnings.clear()
+    list(sync_updates(FakeBot(), {}, max_updates=5))
+    assert warnings == [], "no warning when the page is not full"
+
+
 def test_upgrade_links_that_form_a_cycle_do_not_loop_forever():
     assert sorted(_chat_and_aliases(-5, {"-5": "-4", "-4": "-5"})) == [-5, -4]
     assert _chat_and_aliases("-5", {}) == [-5]

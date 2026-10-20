@@ -582,7 +582,14 @@ def process_updates(
     stats["deletions"] = stats.get("deletions", 0) + len(rows) - live
     logger.info("Telegram: %d message row(s), %d deletion(s).", live, len(rows) - live)
     if len(updates) >= max(1, min(max_updates, _PAGE_SIZE)):
-        logger.info("Telegram: more updates are waiting; the next run continues.")
+        # Telegram drops updates it has not delivered after about 24 hours, so a
+        # backlog that keeps up with the runs is the difference between late and lost.
+        logger.warning(
+            "Telegram: a full page of %d updates was read and more are waiting. The next "
+            "run continues; sync more often if this repeats, since Telegram drops "
+            "undelivered updates after about 24 hours.",
+            len(updates),
+        )
     yield from rows.values()
 
     # Only reached once every row is out: a run stopped mid-way saves nothing.

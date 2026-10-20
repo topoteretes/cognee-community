@@ -86,8 +86,10 @@ pipeline default (`replace`) would wipe earlier messages on the second sync.
   deleted (checked on a live bot: nothing arrives, not even a gap in `update_id`), so
   deletion works per chat, as described above.
 - **No history backfill.** A bot only sees messages sent after it joined.
-- **Updates expire.** Unconfirmed updates are kept for about 24 hours, so sync at least
-  daily.
+- **Updates expire.** Unconfirmed updates are kept for about 24 hours. A run reads at most
+  100 (`max_updates_per_run`), so schedule syncs often enough that a day's updates fit in
+  that day's runs: hourly covers about 2,400 messages and edits a day. When a run reads a
+  full page, the connector logs a warning that more are waiting.
 - **Paging confirms earlier pages.** Asking Telegram for the next page of updates confirms
   the previous one, which is why a run reads a single page (see above).
 - **Quiet weeks.** `update_id` can restart after a week without updates (handled, see
@@ -119,8 +121,11 @@ and dataset (`PIPELINE_SCOPE_ATTR`).
   `skipped`, `failed`, `failed_auth` and `failed_rate_limit`.
 - Anyone who can read the cognee dataset can recall the synced messages. Share it only
   with people who may read those chats.
-- Messages contain personal data. Keep them in their own dataset so you can remove them
-  with one `cognee.forget(dataset=...)` call.
+- Messages contain personal data, so keep them in their own dataset. To remove a chat's
+  messages for good, remove the bot from that chat: the next sync forgets them, and later
+  syncs don't bring them back. `cognee.forget(dataset=...)` alone is not enough: dlt keeps
+  its staging copy of the rows, so the next sync brings the forgotten messages back, even
+  with the pipeline folder deleted.
 
 ## Testing
 
