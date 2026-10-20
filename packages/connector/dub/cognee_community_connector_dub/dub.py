@@ -33,6 +33,7 @@ except ImportError:
     def get_logger(name: str):
         return logging.getLogger(name)
 
+
 try:
     from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
 except ImportError:
