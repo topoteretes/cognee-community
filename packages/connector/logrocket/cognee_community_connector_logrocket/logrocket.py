@@ -9,9 +9,15 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
+import math
+import sqlite3
 from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from types import MethodType
 from typing import Any
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 from cognee_community_connector_logrocket.client import LogRocketMCPClient
 from cognee_community_connector_logrocket.redact import redact_text
@@ -20,6 +26,7 @@ SOURCE_NAME = "logrocket"
 SESSION_RESOURCE = "logrocket_sessions"
 ISSUE_RESOURCE = "logrocket_issues"
 SUPPORTED_RESOURCES = frozenset({"sessions", "issues"})
+RESOURCE_NAMES = {SESSION_RESOURCE: "sessions", ISSUE_RESOURCE: "issues"}
 
 
 class IncompleteLogRocketResultError(RuntimeError):
@@ -27,7 +34,109 @@ class IncompleteLogRocketResultError(RuntimeError):
 
 
 def _is_number(value: Any) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+    try:
+        return (
+            isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+        )
+    except OverflowError:
+        return False
+
+
+def _provenance_url(record: dict[str, Any], key: str) -> str:
+    """Reject unsafe provenance rather than rewrite an identity-bearing URL."""
+    value = _required_string(record, key)
+    try:
+        parsed = urlsplit(value)
+        unsafe = (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.port not in (None, 443)
+            or any(ord(char) <= 32 for char in value)
+            or redact_text(unquote(value)) != unquote(value)
+        )
+        sensitive = {
+            "token",
+            "accesstoken",
+            "apikey",
+            "authorization",
+            "password",
+            "secret",
+            "email",
+            "userid",
+        }
+        parameters = [
+            *parse_qsl(parsed.query, keep_blank_values=True),
+            *parse_qsl(parsed.fragment, keep_blank_values=True),
+        ]
+        unsafe |= any(
+            name.lower().replace("_", "").replace("-", "") in sensitive for name, _ in parameters
+        )
+        decoded_components = [
+            component for name, value in parameters for component in (name, value)
+        ]
+        unsafe |= any(redact_text(component) != component for component in decoded_components)
+    except ValueError:
+        unsafe = True
+    if unsafe:
+        raise ValueError(f"LogRocket {key} must be a safe HTTPS provenance URL; value withheld.")
+    return value
+
+
+def _session_date(record: dict[str, Any]) -> datetime:
+    value = record.get("date")
+    if _is_number(value):
+        try:
+            return datetime.fromtimestamp(value / 1000, tz=UTC)
+        except (ValueError, OverflowError, OSError):
+            pass
+    raise ValueError("LogRocket session date must be a valid Unix timestamp in milliseconds.")
+
+
+def _destination_identity(pipeline: Any) -> str:
+    """Return a credential-free identity for the physical destination and dataset."""
+    try:
+        location = pipeline.destination_client().config.data_location()
+        if not isinstance(location, str) or not location:
+            raise ValueError
+    except Exception:
+        raise ValueError(
+            "Cannot determine LogRocket destination ownership; details withheld."
+        ) from None
+    identity = json.dumps([location, pipeline.dataset_name], separators=(",", ":"))
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def _bind_dataset(pipeline: Any, scope: dict[str, Any], destination_identity: str) -> None:
+    """Reserve ownership outside the pipeline folder that DLT can reset.
+
+    SQLite serializes competing first-use reservations. Keep this registry with
+    the DLT state directory; it contains scope metadata, never source records.
+    """
+    path = Path(pipeline.pipelines_dir) / "logrocket_ownership.sqlite3"
+    value = json.dumps(scope, sort_keys=True)
+    connection = sqlite3.connect(path, timeout=10)
+    try:
+        with connection:
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS destination_owners "
+                "(destination TEXT PRIMARY KEY, scope TEXT NOT NULL)"
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO destination_owners VALUES (?, ?)",
+                (destination_identity, value),
+            )
+            previous = connection.execute(
+                "SELECT scope FROM destination_owners WHERE destination = ?",
+                (destination_identity,),
+            ).fetchone()[0]
+            if previous != value:
+                raise ValueError(
+                    "LogRocket dataset belongs to a different project or resource selection."
+                )
+    finally:
+        connection.close()
 
 
 def _required_string(record: dict[str, Any], key: str) -> str:
@@ -46,6 +155,40 @@ def _optional_string(record: dict[str, Any], key: str) -> str:
     return redact_text(value)
 
 
+def _canonical_identifier(value: str, name: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"LogRocket {name} must be a string.")
+    canonical = value.strip()
+    if not canonical:
+        raise ValueError(f"LogRocket {name} must not be empty.")
+    return canonical
+
+
+def _require_boolean(value: Any, name: str) -> bool:
+    if type(value) is not bool:
+        raise ValueError(f"LogRocket {name} must be a boolean.")
+    return value
+
+
+def _selected_resources(source: Any) -> tuple[str, ...]:
+    try:
+        return tuple(sorted(RESOURCE_NAMES[name] for name in source.resources.selected))
+    except (AttributeError, KeyError):
+        raise ValueError("LogRocket source has an invalid resource selection.") from None
+
+
+def _default_dataset_name(source: Any) -> str:
+    try:
+        scope = (
+            source._logrocket_organization,
+            source._logrocket_project,
+            _selected_resources(source),
+        )
+    except AttributeError:
+        raise ValueError("LogRocket source metadata is missing.") from None
+    return f"logrocket_{hashlib.sha256(repr(scope).encode()).hexdigest()[:16]}"
+
+
 def session_to_row(
     record: dict[str, Any],
     organization_id: str,
@@ -55,25 +198,29 @@ def session_to_row(
     include_location: bool = False,
 ) -> dict[str, str]:
     """Validate and render one observed `find_sessions` entry."""
+    organization_id = _canonical_identifier(organization_id, "organization_id")
+    project_id = _canonical_identifier(project_id, "project_id")
+    include_user_id = _require_boolean(include_user_id, "include_user_id")
+    include_location = _require_boolean(include_location, "include_location")
     if not isinstance(record, dict):
         raise ValueError("Every LogRocket session must be an object.")
     recording_id = _required_string(record, "recordingID")
+    if redact_text(recording_id) != recording_id:
+        raise ValueError("LogRocket recordingID contains sensitive text; value withheld.")
     session_id = record.get("sessionID")
     if not isinstance(session_id, int) or isinstance(session_id, bool):
         raise ValueError("LogRocket sessionID must be an integer.")
-    session_url = _required_string(record, "sessionURL")
-    date = record.get("date")
-    if not _is_number(date):
-        raise ValueError("LogRocket session date must be a Unix timestamp in milliseconds.")
+    session_url = _provenance_url(record, "sessionURL")
+    date = _session_date(record)
 
     stable_id = f"logrocket:{organization_id}:{project_id}:session:{recording_id}:{session_id}"
     lines = [
         "Type: LogRocket session",
-        f"Recorded: {datetime.fromtimestamp(date / 1000, tz=UTC).isoformat()}",
+        f"Recorded: {date.isoformat()}",
     ]
     duration = record.get("durationMs")
     if duration is not None:
-        if not _is_number(duration):
+        if not _is_number(duration) or duration < 0:
             raise ValueError("LogRocket durationMs must be numeric when present.")
         lines.append(f"Duration milliseconds: {duration}")
 
@@ -124,14 +271,16 @@ def issue_to_row(record: dict[str, Any], organization_id: str, project_id: str) 
     LogRocket exposes no explicit issue ID in the observed response. A hash of
     the source URL is the best available provisional identity.
     """
+    organization_id = _canonical_identifier(organization_id, "organization_id")
+    project_id = _canonical_identifier(project_id, "project_id")
     if not isinstance(record, dict):
         raise ValueError("Every LogRocket issue must be an object.")
-    url = _required_string(record, "url")
+    url = _provenance_url(record, "url")
     issue_type = _required_string(record, "issueType")
     earliest = _required_string(record, "earliest")
     latest = _required_string(record, "latest")
     event_count = record.get("eventCount")
-    if not _is_number(event_count):
+    if not _is_number(event_count) or event_count < 0 or event_count % 1:
         raise ValueError("LogRocket issue eventCount must be numeric.")
     messages = record.get("messages")
     if not isinstance(messages, list):
@@ -169,7 +318,7 @@ def issue_to_row(record: dict[str, Any], organization_id: str, project_id: str) 
         lines.extend(["Messages:", *(f"- {message}" for message in rendered_messages)])
     return {
         "id": stable_id,
-        "title": title or f"LogRocket {issue_type} issue",
+        "title": title or f"LogRocket {redact_text(issue_type)} issue",
         "content": "\n".join(lines),
         "url": url,
     }
@@ -261,7 +410,18 @@ def _fetch_rows(
         )
         for record in records
     ]
-    yield from rows
+    if resource == "sessions" and any(
+        not start <= _session_date(record) < end for record in records
+    ):
+        raise ValueError("LogRocket returned sessions outside the requested [start, end) window.")
+    unique: dict[str, dict[str, str]] = {}
+    for row in rows:
+        if row["id"] in unique and unique[row["id"]] != row:
+            raise ValueError(
+                "LogRocket returned conflicting versions of the same record; values withheld."
+            )
+        unique[row["id"]] = row
+    yield from unique.values()
 
 
 def logrocket_source(
@@ -291,11 +451,18 @@ def logrocket_source(
     Search absence is never emitted as a tombstone. Pass this source to
     ``remember_logrocket`` or use ``cognee.remember(..., write_disposition="merge")``.
     """
+    acknowledge_bounded_results = _require_boolean(
+        acknowledge_bounded_results, "acknowledge_bounded_results"
+    )
     if not acknowledge_bounded_results:
         raise ValueError(
             "Set acknowledge_bounded_results=True after accepting that LogRocket MCP search "
             "has no exhaustive data pagination or deletion feed."
         )
+    organization_id = _canonical_identifier(organization_id, "organization_id")
+    project_id = _canonical_identifier(project_id, "project_id")
+    include_user_id = _require_boolean(include_user_id, "include_user_id")
+    include_location = _require_boolean(include_location, "include_location")
     selected = tuple(dict.fromkeys(resources))
     if not selected or any(item not in SUPPORTED_RESOURCES for item in selected):
         raise ValueError("resources must contain sessions, issues, or both.")
@@ -326,6 +493,23 @@ def logrocket_source(
                 "LogRocket bounded imports require write_disposition='merge'. "
                 "Use remember_logrocket or pass write_disposition='merge' to Cognee."
             )
+        # Cognee reuses a pipeline name across datasets. Bind each dataset
+        # separately so importing another project into its own dataset works.
+        bindings = dlt.current.source_state().setdefault("logrocket_scopes", {})
+        destination_identity = _destination_identity(dlt.current.pipeline())
+        active_resources = _selected_resources(dlt.current.source())
+        scope = {
+            "organization": organization_id,
+            "project": project_id,
+            "resources": list(active_resources),
+        }
+        previous = bindings.get(destination_identity)
+        if previous is not None and previous != scope:
+            raise ValueError(
+                "LogRocket dataset belongs to a different project or resource selection."
+            )
+        _bind_dataset(dlt.current.pipeline(), scope, destination_identity)
+        bindings[destination_identity] = scope
 
     @dlt.resource(name=SESSION_RESOURCE, primary_key="id", write_disposition="merge")
     def sessions():
@@ -367,11 +551,29 @@ def logrocket_source(
         return [available[item] for item in selected]
 
     result = source()
-    setattr(result, DOCUMENT_SOURCE_ATTR, SOURCE_NAME)
+    metadata = {
+        DOCUMENT_SOURCE_ATTR: SOURCE_NAME,
+        "_logrocket_organization": organization_id,
+        "_logrocket_project": project_id,
+    }
+
+    def attach_metadata(source: Any) -> None:
+        original_clone = source.clone
+
+        def clone_with_metadata(source: Any, with_name: str | None = None):
+            cloned = original_clone(with_name=with_name)
+            attach_metadata(cloned)
+            return cloned
+
+        for key, value in metadata.items():
+            setattr(source, key, value)
+        source.clone = MethodType(clone_with_metadata, source)
+
+    attach_metadata(result)
     return result
 
 
-async def remember_logrocket(source: Any, *, dataset_name: str = "logrocket", **kwargs: Any):
+async def remember_logrocket(source: Any, *, dataset_name: str | None = None, **kwargs: Any):
     """Ingest into a dedicated dataset with merge enforced at the Cognee boundary.
 
     Cognee otherwise overrides resource hints with its default ``replace``.
@@ -387,5 +589,9 @@ async def remember_logrocket(source: Any, *, dataset_name: str = "logrocket", **
     if kwargs.pop("primary_key", "id") != "id":
         raise ValueError("LogRocket imports require primary_key='id'.")
     return await cognee.remember(
-        source, dataset_name=dataset_name, write_disposition="merge", primary_key="id", **kwargs
+        source,
+        dataset_name=dataset_name or _default_dataset_name(source),
+        write_disposition="merge",
+        primary_key="id",
+        **kwargs,
     )

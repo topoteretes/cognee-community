@@ -65,13 +65,22 @@ narrow the window or query before retrying a capped result.
 
 There is no persisted sync watermark or automatic forget-on-delete. Missing results
 never delete stored documents. Re-fetching issues can refresh returned older reports,
-but does not guarantee detection of every update. Session date filtering is expressed
-in a natural-language query, not a structured date-filter contract.
+but does not guarantee detection of every update. Session dates are checked locally
+against the requested UTC interval (inclusive start, exclusive end); an out-of-window
+result aborts extraction. Exact duplicate documents are collapsed; conflicting versions
+of one ID abort extraction instead of allowing an arbitrary version to win.
 
 Use a dedicated dataset for each project and resource selection. `remember_logrocket`
 enforces `write_disposition="merge"` and `primary_key="id"`; direct Cognee calls must
 pass both explicitly. `replace` and `append` are rejected before requests are made.
-Do not reuse the dataset for another project or change its resource selection.
+The first extraction reserves the dataset for its project and resource selection;
+subsequent mismatches fail before searching. Ownership is recorded in DLT state and
+`logrocket_ownership.sqlite3` in the DLT pipelines directory, outside the pipeline
+folders DLT may reset. Preserve both with your staging data. A failed first import
+retains its reservation. Existing datasets acquire a binding on their next extraction;
+use their original project and resource selection when upgrading.
+When `dataset_name` is omitted, the helper selects a deterministic name derived from
+the organization, project and resource selection.
 
 See [API_INTEGRATION.md](API_INTEGRATION.md) for extending synchronization when
 supported retrieval, update and deletion APIs become available.
@@ -103,6 +112,11 @@ User identity and location are excluded by default. `include_user_id=True` and
 `include_location=True` opt into user IDs and coarse location. Names, emails and IP
 fields remain excluded; free text redacts common emails, IPv4 addresses and tokens.
 Review your data and privacy requirements before ingesting production records.
+Provenance URLs containing credentials, recognized sensitive query parameters or
+redactable text are rejected rather than rewritten, preserving URL-based issue identity.
+Invalid numeric values are rejected. Transient requests respect `Retry-After` within
+the operation deadline; permanent errors, including wrapped authentication failures,
+are not retried.
 
 ## Testing
 

@@ -6,16 +6,23 @@ also inspect search response structure without assuming record fields.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote, urlencode, urlsplit
 
 from cognee_community_connector_logrocket.credentials import CredentialError, resolve_api_key
+from cognee_community_connector_logrocket.retry import retry_delay, retryable
 
 DEFAULT_MCP_URL = "https://mcp.logrocket.com/mcp"
 DEFAULT_API_KEY_ENV = "LOGROCKET_API_KEY"
 DEFAULT_TOOLSETS = ("sessions", "issues")
+INSPECTION_TIMEOUT = 60
+
+
+def _reject_json_constant(value: str):
+    raise ValueError("Non-finite JSON number.")
 
 
 class LogRocketMCPError(RuntimeError):
@@ -234,9 +241,12 @@ class LogRocketMCPClient:
             from mcp import Client
             from mcp.client.streamable_http import streamable_http_client
 
-            async with httpx2.AsyncClient(
-                headers={"Authorization": f"Bearer {api_key}"}, timeout=30.0
-            ) as http_client:
+            async with (
+                asyncio.timeout(INSPECTION_TIMEOUT),
+                httpx2.AsyncClient(
+                    headers={"Authorization": f"Bearer {api_key}"}, timeout=30.0
+                ) as http_client,
+            ):
                 transport = streamable_http_client(self.endpoint, http_client=http_client)
                 async with Client(transport) as mcp_client:
                     return await _collect_snapshot(mcp_client, self.endpoint)
@@ -331,8 +341,10 @@ class LogRocketMCPClient:
                                 "LogRocket search response is not one JSON value."
                             )
                         try:
-                            payload = json.loads(blocks[0].text)
-                        except json.JSONDecodeError:
+                            payload = json.loads(
+                                blocks[0].text, parse_constant=_reject_json_constant
+                            )
+                        except ValueError:
                             raise LogRocketMCPError(
                                 "LogRocket search response contains malformed JSON; "
                                 "response content withheld."
@@ -343,7 +355,7 @@ class LogRocketMCPClient:
 
         last_error: BaseException | None = None
         try:
-            async with asyncio.timeout(100):
+            async with asyncio.timeout(100) as deadline:
                 for attempt in range(3):
                     try:
                         return await search_once()
@@ -357,20 +369,20 @@ class LogRocketMCPClient:
                         raise LogRocketMCPError(
                             "Search arguments no longer conform to the live LogRocket schema."
                         ) from None
-                    except httpx2.HTTPStatusError as exc:
-                        status = exc.response.status_code
-                        if status not in {408, 429, 500, 502, 503, 504}:
-                            raise LogRocketMCPError(
-                                f"LogRocket HTTP request failed with status {status}; "
-                                "error details withheld."
-                            ) from None
-                        last_error = exc
-                        if attempt < 2:
-                            await asyncio.sleep(2**attempt)
                     except Exception as exc:
                         last_error = exc
+                        if not retryable(exc):
+                            raise LogRocketMCPError(
+                                f"LogRocket search failed ({_exception_type_names(exc)}); "
+                                "error details withheld."
+                            ) from None
                         if attempt < 2:
-                            await asyncio.sleep(2**attempt)
+                            delay = retry_delay(exc, attempt)
+                            if delay >= deadline.when() - asyncio.get_running_loop().time():
+                                raise LogRocketMCPError(
+                                    "LogRocket retry delay exceeds the search deadline."
+                                ) from None
+                            await asyncio.sleep(delay)
                 raise LogRocketMCPError(
                     f"LogRocket search failed ({_exception_type_names(last_error)}); "
                     "error details withheld."

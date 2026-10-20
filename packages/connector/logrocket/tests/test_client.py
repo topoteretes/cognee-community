@@ -388,7 +388,7 @@ def test_search_bounds_total_timeout_and_withholds_details(search_transport, mon
     assert "fixture-secret" not in str(caught.value)
 
 
-def test_search_exhausted_retries_hide_exception_details(search_transport):
+def test_search_unknown_errors_fail_without_retry_and_hide_details(search_transport):
     import asyncio
 
     fake = search_transport
@@ -397,4 +397,76 @@ def test_search_exhausted_retries_hide_exception_details(search_transport):
         asyncio.run(fake.client.search("find_sessions", {"query": "test", "limit": 5}))
     assert "RuntimeError" in str(caught.value)
     assert "fixture-secret" not in str(caught.value)
-    assert len(fake.attempts) == 3
+    assert len(fake.attempts) == 1
+
+
+@pytest.mark.parametrize("status,attempts", [(401, 1), (429, 3)])
+def test_nested_http_errors_classified(search_transport, status, attempts):
+    import asyncio
+
+    import httpx2
+
+    request = httpx2.Request("GET", "https://example.test")
+    error = httpx2.HTTPStatusError(
+        "fixture-secret",
+        request=request,
+        response=httpx2.Response(status, request=request, headers={"Retry-After": "7"}),
+    )
+    fake = search_transport
+    fake.outcomes.extend([ExceptionGroup("fixture-secret", [ExceptionGroup("inner", [error])])] * 3)
+    with pytest.raises(LogRocketMCPError) as caught:
+        asyncio.run(fake.client.search("find_sessions", {"query": "test", "limit": 5}))
+    assert "fixture-secret" not in str(caught.value)
+    assert len(fake.attempts) == attempts
+    assert [call.args[0] for call in fake.sleep.await_args_list] == [7] * (attempts - 1)
+
+
+def test_retry_after_beyond_deadline_does_not_retry_early(search_transport):
+    import asyncio
+
+    import httpx2
+
+    request = httpx2.Request("GET", "https://example.test")
+    fake = search_transport
+    fake.outcomes.append(
+        httpx2.HTTPStatusError(
+            "fixture-secret",
+            request=request,
+            response=httpx2.Response(429, request=request, headers={"Retry-After": "1000"}),
+        )
+    )
+    with pytest.raises(LogRocketMCPError, match="deadline"):
+        asyncio.run(fake.client.search("find_sessions", {"query": "test", "limit": 5}))
+    assert len(fake.attempts) == 1
+    fake.sleep.assert_not_awaited()
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_json_nonfinite_constants_rejected(search_transport, constant):
+    import asyncio
+
+    fake = search_transport
+    fake.outcomes.append(result(text='{"value":' + constant + "}"))
+    with pytest.raises(LogRocketMCPError, match="malformed JSON"):
+        asyncio.run(fake.client.search("find_sessions", {"query": "test", "limit": 5}))
+    fake.sleep.assert_not_awaited()
+
+
+def test_inspection_has_overall_deadline(monkeypatch):
+    import asyncio
+
+    import mcp
+    import mcp.client.streamable_http as transport_module
+
+    import cognee_community_connector_logrocket.client as client_module
+
+    @asynccontextmanager
+    async def connect(transport):
+        await asyncio.Event().wait()
+        yield
+
+    monkeypatch.setattr(transport_module, "streamable_http_client", lambda *a, **kw: "offline")
+    monkeypatch.setattr(mcp, "Client", connect)
+    monkeypatch.setattr(client_module, "INSPECTION_TIMEOUT", 0.01)
+    with pytest.raises(LogRocketMCPError, match="TimeoutError"):
+        asyncio.run(LogRocketMCPClient("org", "project", api_key="fixture").inspect_capabilities())

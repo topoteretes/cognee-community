@@ -180,6 +180,29 @@ def test_transient_status_retries_are_bounded(monkeypatch):
     assert sleep.await_count == 4
 
 
+@pytest.mark.parametrize("delay", ["7", "1000"])
+def test_rest_honors_retry_after_or_fails_without_early_retry(monkeypatch, delay):
+    sleep = AsyncMock()
+    monkeypatch.setattr("cognee_community_connector_logrocket.rest.asyncio.sleep", sleep)
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        if len(calls) == 1:
+            return httpx2.Response(429, headers={"Retry-After": delay})
+        return httpx2.Response(200, json=page())
+
+    if delay == "7":
+        assert run(client(handler).audit_page(cursor="0")).records == ()
+        sleep.assert_awaited_once_with(7)
+        assert len(calls) == 2
+    else:
+        with pytest.raises(LogRocketRESTError, match="retry_deadline_exceeded"):
+            run(client(handler).audit_page(cursor="0"))
+        sleep.assert_not_awaited()
+        assert len(calls) == 1
+
+
 def test_transport_failures_are_retried_and_sanitized_in_traceback(monkeypatch):
     sleep = AsyncMock()
     monkeypatch.setattr("cognee_community_connector_logrocket.rest.asyncio.sleep", sleep)

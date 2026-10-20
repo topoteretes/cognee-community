@@ -14,6 +14,7 @@ from urllib.parse import quote, urlsplit
 import httpx2
 
 from cognee_community_connector_logrocket.credentials import CredentialError, resolve_api_key
+from cognee_community_connector_logrocket.retry import TRANSIENT_STATUS, retry_after
 
 
 class LogRocketRESTError(RuntimeError):
@@ -127,7 +128,7 @@ class LogRocketRESTClient:
         except CredentialError as exc:
             raise LogRocketRESTError(exc.code) from None
         try:
-            async with asyncio.timeout(60):
+            async with asyncio.timeout(60) as deadline:
                 async with httpx2.AsyncClient(
                     headers={"Authorization": f"token {api_key}"},
                     timeout=15,
@@ -135,6 +136,7 @@ class LogRocketRESTClient:
                     transport=self._transport,
                 ) as client:
                     for attempt in range(3):
+                        delay = float(2**attempt)
                         try:
                             response = await client.get(self._base + path, params=params)
                         except (httpx2.TransportError, TimeoutError):
@@ -142,7 +144,8 @@ class LogRocketRESTClient:
                                 raise LogRocketRESTError("transport_failure") from None
                         else:
                             status = response.status_code
-                            if status in {408, 429, 500, 502, 503, 504}:
+                            if status in TRANSIENT_STATUS:
+                                delay = max(delay, retry_after(response.headers.get("Retry-After")))
                                 if attempt == 2:
                                     raise LogRocketRESTError(
                                         "transient_http_failure", status=status
@@ -159,7 +162,9 @@ class LogRocketRESTClient:
                                 if not isinstance(payload, dict):
                                     raise LogRocketRESTError("invalid_json_object", status=status)
                                 return payload
-                        await asyncio.sleep(2**attempt)
+                        if delay >= deadline.when() - asyncio.get_running_loop().time():
+                            raise LogRocketRESTError("retry_deadline_exceeded")
+                        await asyncio.sleep(delay)
         except LogRocketRESTError:
             raise
         except TimeoutError:

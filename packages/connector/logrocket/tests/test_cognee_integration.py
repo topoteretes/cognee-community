@@ -77,10 +77,14 @@ async def acceptance_worker(mode):
     dataset_name = "logrocket_acceptance"
 
     def source(session_records, issue_records):
+        from datetime import UTC, datetime
+
         return logrocket_source(
             "fixture",
             "project",
             limit=5,
+            window_start=datetime(2026, 10, 19, tzinfo=UTC),
+            window_end=datetime(2026, 10, 20, tzinfo=UTC),
             acknowledge_bounded_results=True,
             client=FakeClient([{"sessionDefinitions": session_records}, {"issues": issue_records}]),
         )
