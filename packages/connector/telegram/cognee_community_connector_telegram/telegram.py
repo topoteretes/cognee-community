@@ -227,6 +227,7 @@ class TelegramBotClient:
                 ) from None
             except ValueError:
                 # A 200 whose body is not JSON (a proxy's error page, a cut-off reply).
+                # ``from None``: the decode error keeps the whole body (``.doc``).
                 raise TelegramAPIError(
                     f"Telegram {method} returned a body that is not JSON."
                 ) from None
@@ -238,7 +239,7 @@ class TelegramBotClient:
                     logger.warning("Telegram %s: network error, retrying in %.1fs.", method, delay)
                     self._sleep(delay)
                     continue
-                # ``from None``: the URLError's text can include the URL, and so the token.
+                # ``from None``: the error's text can include the URL, and so the token.
                 reason = getattr(exc, "reason", exc)
                 raise TelegramAPIError(
                     f"Telegram {method} failed: {type(reason).__name__}"
