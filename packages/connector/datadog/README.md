@@ -111,9 +111,9 @@ that shows in its text is not emitted again.
 An item missing from a listing that finished is checked once more with a GET before it is
 forgotten, so a list that shifted while it was paged can't forget a live item. Monitors, SLOs,
 notebooks and incidents are hard deleted, so the GET answers 404. A deleted dashboard goes to a
-restorable trash that the list leaves out, so for dashboards the finished listing is the proof.
-A restored dashboard keeps its old `modified` time, but it was forgotten, so it is read and
-ingested again. A forgotten item is emitted with the `_deleted` hard-delete marker, dlt drops it
+restorable trash that the list leaves out and that also answers 404, so it is forgotten the
+same way. A restored dashboard keeps its old `modified` time, but it was forgotten, so it is
+read and ingested again. (Checked live on a US1 org: create, edit, delete, trash and restore.) A forgotten item is emitted with the `_deleted` hard-delete marker, dlt drops it
 on `merge`, and cognee's `orphan_cleanup` removes it from the graph + vector + relational
 stores. Deselecting a kind in `include` forgets its items too. Keep `resource_name` and the
 dataset fixed across runs.

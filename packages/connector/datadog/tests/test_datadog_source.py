@@ -195,6 +195,7 @@ def test_a_trashed_dashboard_is_forgotten_and_comes_back_when_restored():
     fake.trash_dashboard("abc-123")
     rows, _ = _run(fake, state)
     assert rows == {"dashboard:abc-123": {"id": "dashboard:abc-123", "_deleted": True}}
+    assert "GET /api/v1/dashboard/abc-123" in fake.calls, "the trash is confirmed by a 404"
 
     # a restore keeps the old modified_at, so only the forgotten state brings it back
     fake.restore_dashboard("abc-123")

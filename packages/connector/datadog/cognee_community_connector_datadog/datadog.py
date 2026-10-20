@@ -618,13 +618,11 @@ class _Walker:
 
     # -- forget-on-delete --------------------------------------------------
     def _gone(self, kind: str, item_id: str) -> bool:
-        if kind == "dashboards":
-            # a deleted dashboard goes to a restorable trash that the list leaves out,
-            # so the finished listing is the proof; a restored one comes back as new
-            return True
         try:
             item = self._get(kind, item_id)
         except DatadogNotFoundError:
+            # hard deleted, or a dashboard in the trash, which answers 404 as well;
+            # a restored dashboard is back in the list and is read again as new
             return True
         if kind == "notebooks":
             # turned into a template, which this source leaves out

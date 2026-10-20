@@ -22,7 +22,7 @@ class FakeDatadog(BaseAdapter):
         self.host = f"api.{site}"
         self.monitors: dict[str, dict] = {}
         self.dashboards: dict[str, dict] = {}
-        # trashed dashboards: left out of the list, restorable
+        # trashed dashboards: left out of the list, 404 on a GET, restorable
         self.trash: dict[str, dict] = {}
         self.notebooks: dict[str, dict] = {}
         self.slos: dict[str, dict] = {}
