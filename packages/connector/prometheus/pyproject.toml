@@ -3,7 +3,7 @@ name = "cognee-community-connector-prometheus"
 version = "0.1.0"
 description = "Prometheus data-source connector for cognee: alerting and recording rules, optional metric metadata (full snapshot + forget-on-delete)"
 readme = "README.md"
-requires-python = ">=3.10,<3.14"
+requires-python = ">=3.10,<3.15"
 dependencies = [
     # Orphan cleanup scoped per staging table first shipped in cognee 1.6.1. With
     # metadata on, this source loads two tables under one document tag.

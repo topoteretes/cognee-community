@@ -16,17 +16,23 @@ import base64
 import copy
 import json
 import re
+import time
 from collections import Counter
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
 import requests
+from dlt.destinations.exceptions import DatabaseUndefinedRelation
+from dlt.pipeline.exceptions import PipelineStepFailed
 from requests.adapters import BaseAdapter
 
 from cognee_community_connector_prometheus.prometheus import (
     PROMETHEUS_SOURCE_NAME,
+    _default_resource_name,
+    _default_session,
     _duration,
+    _lines,
     _metric_rows,
     _rule_rows,
     prometheus_source,
@@ -34,9 +40,10 @@ from cognee_community_connector_prometheus.prometheus import (
 
 FIXTURES = Path(__file__).parent / "fixtures"
 BASE_URL = "http://prometheus.test:9090"
-# The tables BASE_URL's resource name (prometheus_prometheus_test_9090) gives.
-RULES = "prometheus_prometheus_test_9090_rules"
-METRICS = "prometheus_prometheus_test_9090_metrics"
+# BASE_URL's resource name: prometheus_prometheus_test_9090_<hash of the address>.
+NAME = _default_resource_name(urlsplit(BASE_URL))
+RULES = f"{NAME}_rules"
+METRICS = f"{NAME}_metrics"
 
 
 def _fixture(name):
@@ -79,6 +86,8 @@ class FakePrometheus(BaseAdapter):
         self.calls = []  # (path, params, headers)
         self.fail = None  # callable(path) -> (status, body bytes) or None
         self.ignore_filters = False  # like an older server that ignores type/rule_group[]
+        self.retry_after = "0"  # Retry-After sent with every failure
+        self.timeouts = []  # the timeout each request was sent with
 
     def session(self):
         session = requests.Session()
@@ -89,10 +98,13 @@ class FakePrometheus(BaseAdapter):
         url = urlsplit(request.url)
         params = parse_qs(url.query)
         self.calls.append((url.path, params, dict(request.headers)))
+        self.timeouts.append(kwargs.get("timeout"))
 
         failure = self.fail(url.path) if self.fail else None
         if failure:
-            return self._response(request, *failure)
+            response = self._response(request, *failure)
+            response.headers["Retry-After"] = self.retry_after
+            return response
         if url.path.endswith("/api/v1/rules"):
             body = self.rules if self.ignore_filters else self._filtered(params)
             return self._response(request, 200, json.dumps(body).encode())
@@ -304,26 +316,27 @@ def test_metric_with_several_entries_keeps_each_once_in_order():
 def test_source_declares_document_marker():
     from cognee.tasks.ingestion.dlt_utils import document_source_tag
 
-    source = prometheus_source(BASE_URL)
+    source = prometheus_source(base_url=BASE_URL)
     assert PROMETHEUS_SOURCE_NAME == "prometheus"
     assert document_source_tag(source) == "prometheus"
 
 
-def test_source_rejects_a_url_with_a_query(monkeypatch):
+@pytest.mark.parametrize("suffix", ["/prom?tenant=a", "/prom#rules", "/prom?", "/prom#"])
+def test_source_rejects_a_url_with_a_query(suffix):
     with pytest.raises(ValueError, match="query string"):
-        prometheus_source(f"{BASE_URL}/prom?tenant=a")
+        prometheus_source(base_url=f"{BASE_URL}{suffix}")
 
 
 def test_source_rejects_credentials_in_the_url():
     # They would end up in dlt's logs and in error messages.
     with pytest.raises(ValueError, match="not in the URL"):
-        prometheus_source("http://ops:s3cret@prometheus.test:9090")
+        prometheus_source(base_url="http://ops:s3cret@prometheus.test:9090")
 
 
 @pytest.mark.parametrize("path", ["/api/v1", "/prom/api/v1/"])
 def test_source_rejects_the_api_path_in_the_url(path):
     with pytest.raises(ValueError, match="without /api/v1"):
-        prometheus_source(f"{BASE_URL}{path}")
+        prometheus_source(base_url=f"{BASE_URL}{path}")
 
 
 def test_source_keeps_its_state_per_dataset():
@@ -331,9 +344,8 @@ def test_source_keeps_its_state_per_dataset():
     # dlt source in cognee would share one pipeline state.
     from cognee.tasks.ingestion.dlt_utils import PIPELINE_SCOPE_ATTR
 
-    assert getattr(prometheus_source(BASE_URL), PIPELINE_SCOPE_ATTR) == (
-        "prometheus_prometheus_test_9090"
-    )
+    assert NAME.startswith("prometheus_prometheus_test_9090_")
+    assert getattr(prometheus_source(base_url=BASE_URL), PIPELINE_SCOPE_ATTR) == (NAME)
 
 
 @pytest.mark.parametrize(
@@ -345,21 +357,67 @@ def test_source_keeps_its_state_per_dataset():
     ],
 )
 def test_each_server_gets_its_own_tables(url, name):
-    assert set(prometheus_source(url).resources.selected) == {f"{name}_rules"}
+    (table,) = prometheus_source(base_url=url).resources.selected
+    assert table.startswith(f"{name}_") and table.endswith("_rules")
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        ("http://prom-eu.example.com:9090", "http://prom.eu.example.com:9090"),
+        ("http://prom.test:9090/prom/eu", "http://prom.test:9090/prom-eu"),
+        ("http://prom.test:9090/Prom", "http://prom.test:9090/prom"),
+    ],
+)
+def test_addresses_that_read_alike_get_different_tables(first, second):
+    # Without the hash, both would fold to one name and share tables and state,
+    # and each sync would forget the other server's rules.
+    assert set(prometheus_source(base_url=first).resources.selected) != set(
+        prometheus_source(base_url=second).resources.selected
+    )
 
 
 def test_a_long_address_gets_a_short_stable_name():
     url = "http://" + "very-long-prometheus-host-name." * 3 + "example.com:9090"
-    first = next(iter(prometheus_source(url).resources.selected))
-    assert first == next(iter(prometheus_source(url).resources.selected))
+    first = next(iter(prometheus_source(base_url=url).resources.selected))
+    assert first == next(iter(prometheus_source(base_url=url).resources.selected))
     assert len(first) <= 48 + len("_rules")
+    assert "__" not in first, "a cut at an underscore must not leave two in a row"
+
+
+@pytest.mark.parametrize("cut_at", range(30, 50))
+def test_a_cut_long_name_never_has_two_underscores(cut_at):
+    # Wherever the cut falls, the name must still pass the resource-name check.
+    host = ("a" * (cut_at - len("prometheus_") - 1)) + "-b" * 20
+    prometheus_source(base_url=f"http://{host}.example.com:9090")
 
 
 def test_resource_name_can_be_set_and_must_fit_a_table_name():
-    named = prometheus_source(BASE_URL, resource_name="prom_main")
+    named = prometheus_source(base_url=BASE_URL, resource_name="prom_main")
     assert set(named.resources.selected) == {"prom_main_rules"}
-    with pytest.raises(ValueError, match="resource_name"):
-        prometheus_source(BASE_URL, resource_name="Prom-Main")
+    for bad in ("Prom-Main", "prom__main", "prom_", "1prom"):
+        with pytest.raises(ValueError, match="resource_name"):
+            prometheus_source(base_url=BASE_URL, resource_name=bad)
+
+
+def test_an_older_cognee_is_refused(monkeypatch):
+    # Without table-scoped cleanup, a sync of one table would forget the other.
+    from cognee.tasks.ingestion import dlt_utils
+
+    monkeypatch.setattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 0)
+    with pytest.raises(RuntimeError, match=r"cognee>=1\.6\.1"):
+        prometheus_source(base_url=BASE_URL)
+
+
+def test_source_takes_keyword_arguments_only():
+    with pytest.raises(TypeError):
+        prometheus_source(BASE_URL)
+
+
+def test_row_text_drops_control_characters():
+    # A NUL makes Postgres refuse the whole load, every sync, while the rule exists.
+    assert _lines(("Summary", "disk\x00 full\x1b\tnow\nsoon")) == ["Summary: disk full\tnow\nsoon"]
+    assert _lines(("Help", "bad \ud800 byte")) == ["Help: bad ? byte"]
 
 
 def test_rows_do_not_depend_on_the_order_of_labels_or_annotations():
@@ -402,14 +460,14 @@ def test_source_rejects_bad_arguments(kwargs, message, monkeypatch):
     for name in ("PROMETHEUS_USERNAME", "PROMETHEUS_PASSWORD", "PROMETHEUS_TOKEN"):
         monkeypatch.delenv(name, raising=False)
     with pytest.raises(ValueError, match=message):
-        prometheus_source(BASE_URL, **kwargs)
+        prometheus_source(base_url=BASE_URL, **kwargs)
 
 
 def test_source_selects_only_loadable_resources():
     # The raw API pages are plumbing: if they were loaded, cognee would read them
     # back as documents.
-    assert set(prometheus_source(BASE_URL).resources.selected) == {RULES}
-    with_metadata = prometheus_source(BASE_URL, include_metadata=True)
+    assert set(prometheus_source(base_url=BASE_URL).resources.selected) == {RULES}
+    with_metadata = prometheus_source(base_url=BASE_URL, include_metadata=True)
     assert set(with_metadata.resources.selected) == {
         RULES,
         METRICS,
@@ -438,8 +496,9 @@ def _pipeline(dlt, tmp_path):
 
 def _run_sync(dlt, tmp_path, fake, base_url=BASE_URL, **source_kwargs):
     """Run prometheus_source through a dlt pipeline into a temp sqlite destination."""
+    source_kwargs.setdefault("service", fake.session())
     pipeline = _pipeline(dlt, tmp_path)
-    pipeline.run(prometheus_source(base_url, session=fake.session(), **source_kwargs))
+    pipeline.run(prometheus_source(base_url=base_url, **source_kwargs))
     return pipeline
 
 
@@ -478,7 +537,7 @@ def test_one_source_object_run_twice_keeps_its_ids(dlt_mod, tmp_path):
     # duplicate counter carried over, every id would change and every rule would
     # be forgotten and re-cognified.
     fake = FakePrometheus()
-    source = prometheus_source(BASE_URL, session=fake.session())
+    source = prometheus_source(base_url=BASE_URL, session=fake.session())
     pipeline = _pipeline(dlt_mod, tmp_path)
     pipeline.run(source)
     first = _read(pipeline)
@@ -490,7 +549,8 @@ def test_one_source_object_run_twice_keeps_its_ids(dlt_mod, tmp_path):
 def test_group_names_with_braces_are_sent_as_written(dlt_mod, tmp_path):
     # dlt formats query params with str.format, so "{{" would arrive as "{".
     fake = FakePrometheus()
-    _run_sync(dlt_mod, tmp_path, fake, rule_groups=["slo:{{svc}}", "slo:{svc}"])
+    # allow_empty: the fixture has no such groups, and this test is about the request.
+    _run_sync(dlt_mod, tmp_path, fake, rule_groups=["slo:{{svc}}", "slo:{svc}"], allow_empty=True)
     assert fake.rule_calls()[-1][1]["rule_group[]"] == ["slo:{{svc}}", "slo:{svc}"]
 
 
@@ -540,7 +600,7 @@ def test_server_that_suddenly_has_no_rules_aborts(dlt_mod, tmp_path):
     before = _read(_run_sync(dlt_mod, tmp_path, fake))
 
     fake.rules["data"]["groups"] = []
-    with pytest.raises(Exception, match="no rule groups"):
+    with pytest.raises(PipelineStepFailed, match="no rules at all"):
         _run_sync(dlt_mod, tmp_path, fake)
 
     assert _read(_pipeline(dlt_mod, tmp_path)) == before
@@ -576,13 +636,231 @@ def test_filters_hold_when_the_server_ignores_them(dlt_mod, tmp_path):
     ]
 
 
-def test_allow_empty_also_lets_empty_metadata_through(dlt_mod, tmp_path):
+def test_sync_stats_count_the_rows_of_the_last_run(dlt_mod, tmp_path):
+    fake = FakePrometheus()
+    source = prometheus_source(base_url=BASE_URL, service=fake.session(), include_metadata=True)
+    pipeline = _pipeline(dlt_mod, tmp_path)
+    pipeline.run(source)
+    assert source.cognee_sync_stats == {
+        "rules": len(_read(pipeline)),
+        "metrics": len(_read(pipeline, METRICS)),
+        "failed_rate_limit": 0,
+    }
+    assert source.cognee_sync_stats["rules"] > 0
+
+
+def test_without_a_service_the_capped_retrying_session_is_used(dlt_mod, tmp_path, monkeypatch):
+    from cognee_community_connector_prometheus import prometheus
+
+    fake = FakePrometheus()
+    made = []
+
+    def capped():
+        session = _default_session()
+        session.mount("http://", fake)
+        made.append(session)
+        return session
+
+    monkeypatch.setattr(prometheus, "_default_session", capped)
+    pipeline = _pipeline(dlt_mod, tmp_path)
+    pipeline.run(prometheus_source(base_url=BASE_URL))
+    assert len(made) == 1
+    assert _read(pipeline)
+
+
+def test_counts_are_cleared_when_a_run_fails(dlt_mod, tmp_path):
+    fake = FakePrometheus()
+    source = prometheus_source(base_url=BASE_URL, service=fake.session(), include_metadata=True)
+    pipeline = _pipeline(dlt_mod, tmp_path)
+    pipeline.run(source)
+    assert source.cognee_sync_stats["metrics"] > 0
+
+    fake.fail = lambda path: (503, b"") if path.endswith("/api/v1/metadata") else None
+    with pytest.raises(PipelineStepFailed):
+        pipeline.run(source)
+    assert "metrics" not in source.cognee_sync_stats
+
+
+def test_session_is_still_accepted_as_the_old_name_of_service(dlt_mod, tmp_path):
+    fake = FakePrometheus()
+    pipeline = _pipeline(dlt_mod, tmp_path)
+    pipeline.run(prometheus_source(base_url=BASE_URL, session=fake.session()))
+    assert _read(pipeline)
+
+
+def test_a_filter_that_now_matches_nothing_aborts(dlt_mod, tmp_path):
+    # The server ignores the filter and answers with groups, but none of them is
+    # the one asked for. Checked on the rows left after filtering, that is an
+    # empty snapshot, and it must not forget what the last sync loaded.
+    fake = FakePrometheus()
+    fake.ignore_filters = True
+    first = _run_sync(dlt_mod, tmp_path, fake, rule_groups=["node-health"])
+    before = _read(first)
+    assert before
+
+    for group in fake.rules["data"]["groups"]:
+        if group["name"] == "node-health":
+            group["name"] = "node-health-v2"
+    with pytest.raises(PipelineStepFailed, match="not on the server"):
+        _run_sync(dlt_mod, tmp_path, fake, rule_groups=["node-health"])
+    assert _read(_pipeline(dlt_mod, tmp_path)) == before
+
+
+def _session_on(fake):
+    session = _default_session()
+    session.mount("http://", fake)
+    return session
+
+
+def test_a_429_stops_the_run_at_once(dlt_mod, tmp_path):
+    # Waiting out the limit would hold cognee's staging lock, which every other
+    # dlt ingestion in the process waits on. The run stops instead.
+    fake = FakePrometheus()
+    before = _read(_run_sync(dlt_mod, tmp_path, fake))
+
+    fake.calls.clear()
+    fake.retry_after = "1000"
+    fake.fail = lambda path: (429, b"{}")
+    source = prometheus_source(base_url=BASE_URL, service=_session_on(fake))
+    started = time.monotonic()
+    with pytest.raises(PipelineStepFailed, match=r"rate limited \(429\)"):
+        _pipeline(dlt_mod, tmp_path).run(source)
+
+    assert time.monotonic() - started < 10, "no Retry-After wait"
+    assert len(fake.rule_calls()) == 1, "not retried"
+    assert source.cognee_sync_stats["failed_rate_limit"] == 1
+    assert _read(_pipeline(dlt_mod, tmp_path)) == before
+
+
+def test_a_5xx_stops_the_run_without_a_retry(dlt_mod, tmp_path, monkeypatch):
+    # Any wait would be spent inside cognee's staging lock, and the next run
+    # re-reads everything, so the default session never retries.
+    slept = []
+    monkeypatch.setattr(time, "sleep", slept.append)
+    fake = FakePrometheus()
+    before = _read(_run_sync(dlt_mod, tmp_path, fake))
+
+    fake.calls.clear()
+    fake.retry_after = "1000"
+    fake.fail = lambda path: (503, b"")
+    with pytest.raises(PipelineStepFailed, match="503"):
+        _run_sync(dlt_mod, tmp_path, fake, service=_session_on(fake))
+    assert len(fake.rule_calls()) == 1, "not retried"
+    assert slept == [], "no wait"
+    assert _read(_pipeline(dlt_mod, tmp_path)) == before
+
+
+def test_each_request_times_out_after_30_seconds(dlt_mod, tmp_path):
+    fake = FakePrometheus()
+    _run_sync(dlt_mod, tmp_path, fake, service=_session_on(fake))
+    assert fake.timeouts and set(fake.timeouts) == {30}
+
+
+def test_allow_empty_metrics_lets_emptied_metadata_through(dlt_mod, tmp_path):
     fake = FakePrometheus()
     _run_sync(dlt_mod, tmp_path, fake, include_metadata=True)
 
     fake.metadata = {"status": "success", "data": {}}
-    pipeline = _run_sync(dlt_mod, tmp_path, fake, include_metadata=True, allow_empty=True)
+    pipeline = _run_sync(dlt_mod, tmp_path, fake, include_metadata=True, allow_empty_metrics=True)
     assert _read(pipeline, METRICS) == {}
+
+
+def test_allow_empty_for_rules_does_not_wipe_metrics(dlt_mod, tmp_path):
+    # Forgetting removed rules on purpose, right after a restart that emptied
+    # the metadata, must not take every metric with it.
+    fake = FakePrometheus()
+    first = _run_sync(dlt_mod, tmp_path, fake, include_metadata=True)
+    metrics = _read(first, METRICS)
+
+    fake.rules["data"]["groups"] = []
+    fake.metadata = {"status": "success", "data": {}}
+    with pytest.raises(PipelineStepFailed, match="under half"):
+        _run_sync(dlt_mod, tmp_path, fake, include_metadata=True, allow_empty=True)
+    assert _read(_pipeline(dlt_mod, tmp_path), METRICS) == metrics
+
+
+def test_metadata_that_lost_most_metrics_aborts(dlt_mod, tmp_path):
+    # After a restart Prometheus fills metadata in target by target, so a sync in
+    # that window sees only some metrics.
+    fake = FakePrometheus()
+    fake.metadata = {
+        "status": "success",
+        "data": {f"metric_{n}": [{"type": "gauge", "help": "h", "unit": ""}] for n in range(10)},
+    }
+    first = _read(_run_sync(dlt_mod, tmp_path, fake, include_metadata=True), METRICS)
+    fake.metadata["data"] = dict(list(fake.metadata["data"].items())[:4])
+    with pytest.raises(PipelineStepFailed, match="4 metrics, under half of the 10"):
+        _run_sync(dlt_mod, tmp_path, fake, include_metadata=True)
+    assert _read(_pipeline(dlt_mod, tmp_path), METRICS) == first
+
+    # Ordinary churn, a few metrics gone, goes through.
+    fake.metadata["data"] = {
+        f"metric_{n}": [{"type": "gauge", "help": "h", "unit": ""}] for n in range(7)
+    }
+    assert len(_read(_run_sync(dlt_mod, tmp_path, fake, include_metadata=True), METRICS)) == 7
+
+
+def test_a_rule_group_asked_for_by_name_that_is_gone_aborts(dlt_mod, tmp_path):
+    fake = FakePrometheus()
+    groups = [group["name"] for group in fake.rules["data"]["groups"]][:2]
+    before = _read(_run_sync(dlt_mod, tmp_path, fake, rule_groups=groups))
+
+    for group in fake.rules["data"]["groups"]:
+        if group["name"] == groups[0]:
+            group["name"] = "renamed"
+    with pytest.raises(PipelineStepFailed, match="1 of the 2 rule groups"):
+        _run_sync(dlt_mod, tmp_path, fake, rule_groups=groups)
+    assert _read(_pipeline(dlt_mod, tmp_path)) == before
+
+    # allow_empty forgets it for one run; later runs skip it without the flag.
+    kept = _read(_run_sync(dlt_mod, tmp_path, fake, rule_groups=groups, allow_empty=True))
+    assert kept and set(kept) < set(before)
+    assert _read(_run_sync(dlt_mod, tmp_path, fake, rule_groups=groups)) == kept
+    # Once the group is back, its rules are synced again.
+    for group in fake.rules["data"]["groups"]:
+        if group["name"] == "renamed":
+            group["name"] = groups[0]
+    assert _read(_run_sync(dlt_mod, tmp_path, fake, rule_groups=groups)) == before
+
+
+def test_metadata_with_warnings_aborts(dlt_mod, tmp_path):
+    fake = FakePrometheus()
+    _run_sync(dlt_mod, tmp_path, fake, include_metadata=True)
+    partial = {**fake.metadata, "warnings": ["some targets unreachable"]}
+    body = json.dumps(partial).encode()
+    fake.fail = lambda path: (200, body) if path.endswith("/api/v1/metadata") else None
+    with pytest.raises(PipelineStepFailed, match="carries warnings"):
+        _run_sync(dlt_mod, tmp_path, fake, include_metadata=True)
+
+
+def test_a_table_that_empties_logs_a_warning(dlt_mod, tmp_path, monkeypatch):
+    from cognee_community_connector_prometheus import prometheus
+
+    warnings = []
+    monkeypatch.setattr(prometheus.logger, "warning", lambda *args: warnings.append(args))
+    fake = FakePrometheus()
+    _run_sync(dlt_mod, tmp_path, fake)
+    assert warnings == []
+    fake.rules["data"]["groups"] = []
+    _run_sync(dlt_mod, tmp_path, fake, allow_empty=True)
+    assert len(warnings) == 1 and warnings[0][1] == RULES
+
+
+def test_names_with_control_characters_are_cleaned_everywhere():
+    # Prometheus 3 allows any UTF-8 in names, NUL included.
+    body = copy.deepcopy(_fixture("rules_first_read.json"))
+    body["data"]["groups"][0]["rules"][0]["name"] = "Scrape\x00Down"
+    rows = list(_rule_rows(body["data"]["groups"], Counter()))
+    # Check the values themselves: json.dumps would print a NUL as an escape.
+    assert all("\x00" not in value for row in rows for value in row.values())
+    (row,) = _metric_rows({"weird\x00metric": [{"type": "gauge", "help": "h"}]})
+    assert row["id"] == "weirdmetric"
+    assert all("\x00" not in value for value in row.values())
+
+
+def test_metadata_that_is_not_an_object_aborts():
+    with pytest.raises(ValueError, match="not an object"):
+        list(_metric_rows(["not", "an", "object"]))
 
 
 @pytest.mark.parametrize("base_url", [f"{BASE_URL}/prom", f"{BASE_URL}/prom/"])
@@ -671,7 +949,7 @@ def test_bad_rules_response_aborts_and_keeps_previous_snapshot(dlt_mod, tmp_path
     before = _read(_run_sync(dlt_mod, tmp_path, fake))
 
     fake.fail = lambda path: failure if path.endswith("/api/v1/rules") else None
-    with pytest.raises(Exception, match=re.escape(message)) as raised:
+    with pytest.raises(PipelineStepFailed, match=re.escape(message)) as raised:
         _run_sync(dlt_mod, tmp_path, fake, rule_groups=["checkout-availability"])
     if failure[0] == 200:
         # The connector's own messages give the path only: the query (the groups
@@ -698,7 +976,7 @@ def test_check_active_can_stop_a_sync(dlt_mod, tmp_path):
 
     group, rule = _find(fake.rules, "HeartbeatAlwaysFiring")
     group["rules"].remove(rule)
-    with pytest.raises(Exception, match="access revoked"):
+    with pytest.raises(PipelineStepFailed, match="access revoked"):
         _run_sync(dlt_mod, tmp_path, fake, check_active=revoked)
 
     assert _read(_pipeline(dlt_mod, tmp_path)) == before
@@ -707,7 +985,7 @@ def test_check_active_can_stop_a_sync(dlt_mod, tmp_path):
 def _table_or_empty(pipeline, table):
     try:
         return _read(pipeline, table)
-    except Exception:  # dlt creates no table until a row was ever loaded
+    except DatabaseUndefinedRelation:  # dlt creates no table until a row was loaded
         return {}
 
 
@@ -733,7 +1011,7 @@ def test_rules_response_with_warnings_aborts(dlt_mod, tmp_path):
     partial["warnings"] = ["rule store 10.0.0.2:10901 unreachable"]
     body = json.dumps(partial).encode()
     fake.fail = lambda path: (200, body) if path.endswith("/api/v1/rules") else None
-    with pytest.raises(Exception, match="carries warnings"):
+    with pytest.raises(PipelineStepFailed, match="carries warnings"):
         _run_sync(dlt_mod, tmp_path, fake)
 
     assert _read(_pipeline(dlt_mod, tmp_path)) == before
@@ -747,9 +1025,7 @@ def test_rules_response_with_warnings_aborts(dlt_mod, tmp_path):
         pytest.param((200, b'{"status":"success","data":[]}'), _NO_METADATA, id="list"),
         # What a server returns right after a restart, before its first scrapes.
         # The first sync had metrics, so this is refused.
-        pytest.param(
-            (200, b'{"status":"success","data":{}}'), "came back empty after earlier", id="empty"
-        ),
+        pytest.param((200, b'{"status":"success","data":{}}'), "under half", id="empty"),
     ],
 )
 def test_bad_metadata_response_aborts_the_whole_run(dlt_mod, tmp_path, failure, message):
@@ -758,7 +1034,7 @@ def test_bad_metadata_response_aborts_the_whole_run(dlt_mod, tmp_path, failure, 
     rules, metrics = _read(pipeline), _read(pipeline, METRICS)
 
     fake.fail = lambda path: failure if path.endswith("/api/v1/metadata") else None
-    with pytest.raises(Exception, match=re.escape(message)):
+    with pytest.raises(PipelineStepFailed, match=re.escape(message)):
         _run_sync(dlt_mod, tmp_path, fake, include_metadata=True)
 
     pipeline = _pipeline(dlt_mod, tmp_path)
@@ -852,7 +1128,7 @@ def test_two_servers_in_one_dataset_keep_their_documents(tmp_path, monkeypatch):
     first, second = server("alpha_down", "beta_down"), server("gamma_down")
 
     async def sync(fake, url):
-        source = prometheus_source(url, session=fake.session())
+        source = prometheus_source(base_url=url, session=fake.session())
         await cognee.add(source, dataset_name="prometheus_servers")
 
     async def count():
@@ -916,7 +1192,9 @@ def test_removed_rule_is_forgotten_from_the_graph(tmp_path, monkeypatch):
     fake = FakePrometheus(rules={"status": "success", "data": {"groups": [group]}})
 
     async def sync():
-        await cognee.add(prometheus_source(BASE_URL, session=fake.session()), dataset_name=dataset)
+        await cognee.add(
+            prometheus_source(base_url=BASE_URL, service=fake.session()), dataset_name=dataset
+        )
         await cognee.cognify(datasets=[dataset])
 
     async def data_ids():
