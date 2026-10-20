@@ -3,13 +3,20 @@
 Pulls Help Scout **conversations with their threads** (Inbox API v2) and,
 optionally, **Docs articles** (Docs API v1) into cognee as documents::
 
+    import os
+
     import cognee
     from cognee_community_connector_help_scout import help_scout_source
 
     await cognee.remember(
-        help_scout_source(),             # HELPSCOUT_APP_ID / HELPSCOUT_APP_SECRET from env
+        help_scout_source(
+            resource_name="help_scout_acme",  # one per Help Scout account / scope
+            app_id=os.environ["HELPSCOUT_APP_ID"],
+            app_secret=os.environ["HELPSCOUT_APP_SECRET"],
+        ),
         dataset_name="help_scout",
-        write_disposition="merge",       # REQUIRED (see .. important:: below)
+        primary_key="id",
+        write_disposition="merge",  # REQUIRED (see .. important:: below)
     )
 
 Rows are ingested as *normal documents*: the source declares
@@ -22,64 +29,84 @@ through cognify entity extraction instead of the deterministic dlt-row path.
 
 Design
 ------
+* **Scope** - ``resource_name`` prefixes both tables and is published as the
+  pipeline scope, so two Help Scout accounts (or two configurations) in one
+  dataset keep separate cursors and separate forget-on-delete bookkeeping.
 * **Auth (OAuth 2.0)** - Inbox API: an app id + secret exchanged for a bearer
-  token with the Client Credentials grant (tokens live 2 days; a ``401`` triggers
-  one automatic re-auth), or a ready ``access_token`` from an Authorization Code
-  app. Docs API: a per-user Docs API key over HTTP Basic auth.
-* **One document per conversation** (``id = "conversation:<id>"``): subject,
-  inbox, status, tags, customer, assignee and the thread text oldest-first.
-  Internal notes are off by default; system "line item" threads are skipped.
-* **Incremental** - ``GET /v2/conversations?status=all&modifiedSince=<cursor>``
-  sorted by ``modifiedAt``. The cursor is the UTC time the last run *started*,
-  kept in dlt resource state and only advanced after a fully successful run.
+  token with the Client Credentials grant (renewed once on ``401``), or a ready
+  ``access_token``. Docs API: a per-user Docs API key over HTTP Basic auth.
+* **One document per conversation**, built only from fields that describe the
+  conversation itself: subject, status, channel, customer, assignee, tags
+  (sorted) and the published threads oldest-first. Inbox and collection *names*
+  are left out on purpose: renaming an inbox would otherwise change the content
+  hash of every conversation in it and re-extract them all.
+* **Incremental** - ``status=all&modifiedSince=<cursor>`` sorted by
+  ``modifiedAt``. The cursor comes from Help Scout's own clock (the ``Date``
+  header of the run's first response) minus a 5-minute overlap, never from the
+  local clock, and only moves after a fully successful run. If a conversation
+  is modified while the listing is paged, the sort order shifts and a
+  conversation can slip between pages; that shows up as a repeated id, and the
+  listing is read again (and, if it is still moving, the cursor is not moved).
+* **Configuration changes** - ``mailbox_ids``, ``include_notes`` and
+  ``include_spam`` are stored next to the cursor. When they change, the next run
+  does a full listing, so an inbox added later is backfilled and an inbox removed
+  later is forgotten.
 * **Rate-limit friendly thread loading** - changed conversations are listed with
-  ``embed=threads``, so one request returns up to 25 conversations *with* their
-  threads. The per-conversation threads endpoint is only called when the
-  embedded copy can be incomplete: chat conversations (Help Scout truncates
-  embedded chat threads) or when fewer published threads came back than the
-  conversation's ``threads`` count says.
+  ``embed=threads``. The per-conversation threads endpoint is only called when
+  the embedded copy can be incomplete: chat conversations (Help Scout truncates
+  embedded chat threads) or fewer published threads than the conversation's
+  ``threads`` count. A conversation deleted between those two calls (``404``)
+  becomes a tombstone instead of failing the run.
 * **Forget-on-delete** - conversations in ``state == "deleted"`` (or moved to
   spam, unless ``include_spam=True``) become ``{"id", "_deleted": True}``
-  tombstones. Because a deleted conversation may also just vanish from the list,
-  ``reconcile=True`` (default) also lists all conversation ids each run and
-  tombstones the known ids that are gone. dlt removes tombstoned rows on
-  ``merge`` and cognee's ``orphan_cleanup`` drops them from the graph.
-* **Docs articles** (``id = "article:<id>"``) - collections -> article refs; an
-  article's full text is fetched only when its ``updatedAt`` /
-  ``lastPublishedAt`` / ``status`` marker changed. Articles that are deleted or
-  unpublished drop out of the listing and are tombstoned.
-* **Safe failure** - ``429`` (honouring ``X-RateLimit-Retry-After``), ``5xx`` and
-  network errors are retried; anything else aborts the run, so a partial read
-  never moves a cursor or causes a false deletion.
+  tombstones. Every ``reconcile_every`` runs, all conversation ids are listed
+  (stable ``number`` order) to find conversations that simply vanished. Page
+  paging can shift when something is deleted mid-listing, so the listing must be
+  complete and consistent (same ``totalElements`` on every page, no repeats), and
+  every candidate is re-checked one by one before it is forgotten. A short or
+  shifting listing never turns into deletes. Articles get the same treatment.
+* **Safe failure** - ``5xx`` and network errors are retried with backoff; a
+  rate-limit wait longer than ``max_rate_limit_wait`` stops the run cleanly (what
+  was read is kept, no cursor moves, nothing is forgotten) and is reported in
+  ``cognee_sync_stats``. Any other error aborts the run.
 """
 
 from __future__ import annotations
 
 import base64
-import os
+import email.utils
+import re
 import time
-from collections.abc import Iterable, Iterator
-from dataclasses import dataclass
-from datetime import UTC, datetime
+from collections.abc import Callable, Iterable, Iterator
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from typing import Any
 
 from cognee.shared.logging_utils import get_logger
+from cognee.tasks.ingestion import dlt_utils
 from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
 
 logger = get_logger("help_scout_connector")
 
 HELP_SCOUT_SOURCE_NAME = "help_scout"
-CONVERSATIONS_TABLE = "help_scout_conversations"
-ARTICLES_TABLE = "help_scout_articles"
+DEFAULT_RESOURCE_NAME = "help_scout"
 
 MAILBOX_API = "https://api.helpscout.net/v2"
 TOKEN_URL = f"{MAILBOX_API}/oauth2/token"
 DOCS_API = "https://docsapi.helpscout.net/v1"
 
+CURSOR_OVERLAP = timedelta(minutes=5)
+DEFAULT_MAX_RATE_LIMIT_WAIT = 120.0
+# Re-check at most this many "vanished" ids per run; more than that from one
+# listing is treated as a broken listing, not as a mass delete.
+MAX_VERIFY = 200
+
+_UTC = timezone.utc
 _MAX_RETRIES = 5
-_TRANSIENT_STATUS = frozenset({429, 500, 502, 503, 504})
+_SERVER_ERRORS = frozenset({500, 502, 503, 504})
 _DELETED_COLUMN = {"_deleted": {"data_type": "bool", "hard_delete": True}}
+_RESOURCE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,40}$")
 _THREAD_LABELS = {
     "customer": "customer",
     "message": "reply",
@@ -91,24 +118,44 @@ _THREAD_LABELS = {
     "forwardchild": "forward",
 }
 
-_EXTRA_HINT = (
-    "The Help Scout connector requires dlt and httpx: "
-    "pip install cognee-community-connector-help-scout"
-)
+
+class RateLimitedError(Exception):
+    """Help Scout asked to wait longer than ``max_rate_limit_wait``."""
+
+
+class _NotFoundError(Exception):
+    pass
+
+
+class _UnstableListingError(Exception):
+    pass
 
 
 @dataclass(frozen=True)
 class _Options:
-    mailbox_ids: tuple[int, ...]
-    include_notes: bool
-    include_spam: bool
-    reconcile: bool
-    modified_since: str | None
-    collection_ids: frozenset[str]
-    article_status: str
+    mailbox_ids: tuple[int, ...] = ()
+    include_notes: bool = False
+    include_spam: bool = False
+    reconcile: bool = True
+    reconcile_every: int = 1
+    modified_since: str | None = None
+    collection_ids: frozenset[str] = frozenset()
+    article_status: str = "published"
+
+    def conversation_config(self) -> dict:
+        return {
+            "mailbox_ids": sorted(self.mailbox_ids),
+            "include_notes": self.include_notes,
+            "include_spam": self.include_spam,
+        }
+
+    def article_config(self) -> dict:
+        return {"collection_ids": sorted(self.collection_ids), "status": self.article_status}
 
 
 def help_scout_source(
+    *,
+    resource_name: str = DEFAULT_RESOURCE_NAME,
     app_id: str | None = None,
     app_secret: str | None = None,
     access_token: str | None = None,
@@ -117,120 +164,182 @@ def help_scout_source(
     include_notes: bool = False,
     include_spam: bool = False,
     reconcile: bool = True,
+    reconcile_every: int = 1,
     modified_since: str | None = None,
     docs_api_key: str | None = None,
     include_articles: bool | None = None,
     collection_ids: Iterable[str] | None = None,
     article_status: str = "published",
+    max_rate_limit_wait: float = DEFAULT_MAX_RATE_LIMIT_WAIT,
+    check_active: Callable[[], None] | None = None,
+    service: Any = None,
     client: Any = None,
 ):
     """Create a dlt source with Help Scout conversations and/or Docs articles.
 
+    All arguments are keyword-only. Credentials are taken only from the
+    arguments (the example shows reading them from the environment).
+
     Args:
+        resource_name: Stable name of this connection (lowercase letters, digits,
+            ``_``). Prefixes the tables (``<name>_conversations``,
+            ``<name>_articles``) and scopes the sync state, so use one name per
+            Help Scout account and keep it fixed across runs.
         app_id / app_secret: OAuth app credentials (Client Credentials grant).
-            Fall back to ``HELPSCOUT_APP_ID`` / ``HELPSCOUT_APP_SECRET``.
-        access_token: A ready OAuth bearer token (e.g. from an Authorization Code
-            app). Falls back to ``HELPSCOUT_ACCESS_TOKEN``. Used as-is; it cannot be
-            renewed, so prefer app credentials for scheduled syncs.
+        access_token: A ready OAuth bearer token instead (cannot be renewed).
         mailbox_ids: Only these inboxes. Default: every inbox the token can see.
+            Changing it triggers a full listing on the next run.
         include_conversations: Sync conversations (default ``True``).
         include_notes: Include internal notes in conversation documents.
         include_spam: Keep spam conversations (default: they are forgotten).
-        reconcile: List all conversation ids each run to catch deletions that do
-            not show up as a change. Costs about one request per 25 conversations.
+        reconcile: Look for conversations/articles that vanished without a change.
+        reconcile_every: Reconcile on every N-th run (default every run). The
+            reconcile lists every id (about one request per 25 conversations);
+            raise this on large accounts to keep regular syncs short.
         modified_since: ISO 8601 time; limits only the *first* run.
-        docs_api_key: Docs API key. Falls back to ``HELPSCOUT_DOCS_API_KEY``.
-        include_articles: Sync Docs articles. Default: ``True`` when a Docs key is set.
+        docs_api_key: Docs API key (enables articles).
+        include_articles: Sync Docs articles. Default: ``True`` when a key is given.
         collection_ids: Only these Docs collections. Default: all.
         article_status: ``"published"`` (default) or ``"all"``.
-        client: ``httpx.Client``-like object (test-injection point) with
-            ``get(url, params=, headers=)`` and ``post(url, data=)``.
+        max_rate_limit_wait: Longest rate-limit wait (seconds) the connector will
+            sleep; a longer one stops the run cleanly.
+        check_active: Optional host authorization checkpoint, called before each
+            request and around each row.
+        service: Pre-built ``httpx.Client``-like object; ``client`` is an alias.
 
     Returns:
-        A dlt source for ``cognee.remember(..., write_disposition="merge")``.
+        A dlt source for ``cognee.remember(..., write_disposition="merge")``. Its
+        ``cognee_sync_stats`` dict holds integer counts for the last run.
     """
     try:
         import dlt
     except ImportError as exc:
-        raise ImportError(_EXTRA_HINT) from exc
+        raise ImportError(
+            "The Help Scout connector requires dlt and httpx: "
+            "pip install cognee-community-connector-help-scout"
+        ) from exc
 
-    app_id = app_id or os.environ.get("HELPSCOUT_APP_ID")
-    app_secret = app_secret or os.environ.get("HELPSCOUT_APP_SECRET")
-    access_token = access_token or os.environ.get("HELPSCOUT_ACCESS_TOKEN")
-    docs_api_key = docs_api_key or os.environ.get("HELPSCOUT_DOCS_API_KEY")
+    if getattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 0) < 1:
+        raise RuntimeError(
+            "The Help Scout connector needs a cognee build with table-scoped DLT "
+            "document cleanup (cognee >= 1.6.1). Upgrade cognee before syncing, so a "
+            "sync cannot delete another source's data."
+        )
+    if not isinstance(resource_name, str) or not _RESOURCE_NAME_RE.match(resource_name):
+        raise ValueError(
+            "resource_name must start with a lowercase letter and contain only "
+            "lowercase letters, digits and '_' (max 41 characters)."
+        )
+    if service is not None and client is not None and service is not client:
+        raise ValueError("Pass either service= or client=, not both.")
+    http = service if service is not None else client
     if include_articles is None:
         include_articles = bool(docs_api_key)
-
     if include_conversations and not (access_token or (app_id and app_secret)):
         raise ValueError(
-            "Help Scout credentials required: pass app_id= and app_secret= (or set "
-            "HELPSCOUT_APP_ID / HELPSCOUT_APP_SECRET), or pass access_token=."
+            "Help Scout credentials required: app_id= and app_secret=, or access_token=."
         )
     if include_articles and not docs_api_key:
-        raise ValueError(
-            "Docs articles need a Docs API key: docs_api_key= or HELPSCOUT_DOCS_API_KEY."
-        )
+        raise ValueError("Docs articles need docs_api_key=.")
     if not (include_conversations or include_articles):
         raise ValueError("Nothing to ingest: enable conversations and/or articles.")
+    if not isinstance(reconcile_every, int) or reconcile_every < 1:
+        raise ValueError("reconcile_every must be a positive integer.")
+    if article_status not in ("published", "all"):
+        raise ValueError('article_status must be "published" or "all".')
+    mailboxes = tuple(sorted({int(m) for m in mailbox_ids or ()}))
 
-    if client is None:
+    if http is None:
         try:
             import httpx
-        except ImportError as exc:
-            raise ImportError(_EXTRA_HINT) from exc
-        client = httpx.Client(timeout=60.0)
+        except ImportError as exc:  # pragma: no cover - httpx is a dependency
+            raise ImportError("httpx is required") from exc
+        http = httpx.Client(timeout=60.0)
 
     options = _Options(
-        mailbox_ids=tuple(mailbox_ids or ()),
+        mailbox_ids=mailboxes,
         include_notes=include_notes,
         include_spam=include_spam,
         reconcile=reconcile,
+        reconcile_every=reconcile_every,
         modified_since=modified_since,
         collection_ids=frozenset(collection_ids or ()),
         article_status=article_status,
     )
+    stats: dict[str, int] = {}
 
     resources = []
     if include_conversations:
-        inbox_api = _Api(client, _OAuthToken(client, app_id, app_secret, access_token))
+        token = _OAuthToken(http, app_id, app_secret, access_token)
+        inbox_api = _Api(http, token, stats, check_active, max_rate_limit_wait, "Inbox API")
 
         @dlt.resource(
-            name=CONVERSATIONS_TABLE,
+            name=f"{resource_name}_conversations",
             primary_key="id",
             write_disposition="merge",
             columns=_DELETED_COLUMN,
         )
         def help_scout_conversations():
-            yield from _sync_conversations(inbox_api, dlt.current.resource_state(), options)
+            stats.clear()  # first resource of the run
+            stats.update(failed_rate_limit=0, failed_auth=0)
+            rows = _stop_cleanly(
+                _sync_conversations(inbox_api, dlt.current.resource_state(), options, stats),
+                stats,
+            )
+            yield from dlt_utils.guarded_rows(rows, check_active)
 
         resources.append(help_scout_conversations)
 
     if include_articles:
-        docs_api = _Api(client, _DocsKey(docs_api_key))
+        docs_api = _Api(
+            http, _DocsKey(docs_api_key), stats, check_active, max_rate_limit_wait, "Docs API"
+        )
 
         @dlt.resource(
-            name=ARTICLES_TABLE,
+            name=f"{resource_name}_articles",
             primary_key="id",
             write_disposition="merge",
             columns=_DELETED_COLUMN,
         )
         def help_scout_articles():
-            yield from _sync_articles(docs_api, dlt.current.resource_state(), options)
+            if not include_conversations:
+                stats.clear()
+            stats.setdefault("failed_rate_limit", 0)
+            stats.setdefault("failed_auth", 0)
+            rows = _stop_cleanly(
+                _sync_articles(docs_api, dlt.current.resource_state(), options, stats), stats
+            )
+            yield from dlt_utils.guarded_rows(rows, check_active)
 
         resources.append(help_scout_articles)
 
-    @dlt.source(name=HELP_SCOUT_SOURCE_NAME)
+    @dlt.source(name=resource_name)
     def _help_scout():
         return resources
 
     source = _help_scout()
     # Opt into the document ingestion path (row -> text document -> cognify).
     setattr(source, DOCUMENT_SOURCE_ATTR, HELP_SCOUT_SOURCE_NAME)
+    setattr(source, dlt_utils.PIPELINE_SCOPE_ATTR, resource_name)
+    source.cognee_sync_stats = stats
     return source
 
 
+def _count(stats: dict[str, int], key: str, amount: int = 1) -> None:
+    stats[key] = stats.get(key, 0) + amount
+
+
+def _stop_cleanly(rows: Iterator[dict], stats: dict[str, int]) -> Iterator[dict]:
+    """End the run without error on a long rate limit; state stays untouched."""
+    try:
+        yield from rows
+    except RateLimitedError as exc:
+        _count(stats, "failed_rate_limit")
+        logger.warning("Help Scout: %s Stopping this run; the next run continues.", exc)
+
+
 # ---------------------------------------------------------------------------
-# HTTP: auth + retries
+# HTTP: auth, checkpoints, retries
 # ---------------------------------------------------------------------------
 
 
@@ -253,23 +362,20 @@ class _OAuthToken:
 
     def renew(self) -> None:
         if not self.can_renew():
-            raise PermissionError(
-                "Help Scout rejected the access token (HTTP 401) and no app id/secret "
-                "was given to request a new one."
-            )
+            raise PermissionError("Help Scout rejected the access token (HTTP 401).")
         data = {
             "grant_type": "client_credentials",
             "client_id": self._app_id,
             "client_secret": self._app_secret,
         }
-        response = _with_retries(lambda: self._http.post(TOKEN_URL, data=data))
+        response = self._http.post(TOKEN_URL, data=data)
         if response.status_code in (400, 401, 403):
             raise PermissionError(
                 f"Help Scout rejected the app id/secret (HTTP {response.status_code})."
             )
-        response.raise_for_status()
+        if response.status_code >= 400:
+            raise RuntimeError(f"Help Scout token request failed (HTTP {response.status_code}).")
         self._token = response.json()["access_token"]
-        logger.info("Help Scout: obtained a new access token.")
 
 
 class _DocsKey:
@@ -290,18 +396,50 @@ class _DocsKey:
 
 
 class _Api:
-    """GET JSON with auth, one re-auth on 401, and transient-error retries."""
+    """GET JSON with auth, a host checkpoint, one re-auth on 401 and retries.
 
-    def __init__(self, http: Any, auth: Any):
+    Messages and logs carry the API name and status only, never URLs or ids.
+    """
+
+    def __init__(
+        self,
+        http: Any,
+        auth: Any,
+        stats: dict[str, int],
+        check_active: Callable[[], None] | None,
+        max_wait: float,
+        name: str,
+    ):
         self._http = http
         self._auth = auth
+        self._stats = stats
+        self._check_active = check_active
+        self._max_wait = max_wait
+        self.name = name
+        self.server_time: datetime | None = None
 
     def get(self, url: str, params: dict | None = None) -> dict:
+        try:
+            return self._get(url, params)
+        except PermissionError:
+            _count(self._stats, "failed_auth")
+            raise
+
+    def _get(self, url: str, params: dict | None) -> dict:
         renewed = False
-        while True:
-            response = _with_retries(
-                lambda: self._http.get(url, params=params, headers=self._auth.headers())
-            )
+        for attempt in range(_MAX_RETRIES):
+            if self._check_active is not None:
+                self._check_active()
+            try:
+                response = self._http.get(url, params=params, headers=self._auth.headers())
+            except PermissionError:
+                raise
+            except Exception as exc:
+                if not _is_transport_error(exc) or attempt == _MAX_RETRIES - 1:
+                    raise
+                self._sleep(float(2**attempt), f"network error ({type(exc).__name__})")
+                continue
+            self._note_server_time(response.headers)
             status = response.status_code
             if status == 401 and not renewed and self._auth.can_renew():
                 self._auth.renew()
@@ -309,62 +447,94 @@ class _Api:
                 continue
             if status in (401, 403):
                 raise PermissionError(
-                    f"Help Scout refused the request (HTTP {status}) for {url}. "
+                    f"Help Scout {self.name} refused the request (HTTP {status}). "
                     "Check the credentials and the app's permissions."
                 )
-            response.raise_for_status()
+            if status == 404:
+                raise _NotFoundError()
+            if status == 429:
+                wait = _rate_limit_wait(response.headers, attempt)
+                if wait > self._max_wait or attempt == _MAX_RETRIES - 1:
+                    raise RateLimitedError(
+                        f"{self.name} rate limit: asked to wait {wait:.0f}s "
+                        f"(limit {self._max_wait:.0f}s)."
+                    )
+                self._sleep(wait, "HTTP 429")
+                continue
+            if status in _SERVER_ERRORS and attempt < _MAX_RETRIES - 1:
+                self._sleep(float(2**attempt), f"HTTP {status}")
+                continue
+            if status >= 400:
+                raise RuntimeError(f"Help Scout {self.name} error (HTTP {status}).")
             return response.json()
+        raise RuntimeError(f"Help Scout {self.name}: retries exhausted.")  # pragma: no cover
 
+    def _sleep(self, seconds: float, why: str) -> None:
+        logger.warning("Help Scout %s: %s - retrying in %.1fs.", self.name, why, seconds)
+        time.sleep(seconds)
 
-def _with_retries(send) -> Any:
-    """Call ``send()`` and retry 429/5xx/network errors with backoff.
-
-    Returns the last response (possibly an error) once retries are exhausted so
-    the caller raises a meaningful HTTP error.
-    """
-    import httpx
-
-    for attempt in range(_MAX_RETRIES):
+    def _note_server_time(self, headers: Any) -> None:
+        if self.server_time is not None or not headers:
+            return
+        value = headers.get("Date") or headers.get("date")
+        if not value:
+            return
         try:
-            response = send()
-        except httpx.TransportError as exc:
-            if attempt == _MAX_RETRIES - 1:
-                raise
-            delay = float(2**attempt)
-            logger.warning("Help Scout: %s - retrying in %.1fs.", exc, delay)
-            time.sleep(delay)
-            continue
-        if response.status_code in _TRANSIENT_STATUS and attempt < _MAX_RETRIES - 1:
-            delay = _retry_after(response.headers, attempt)
-            logger.warning(
-                "Help Scout: HTTP %s - retrying in %.1fs (%d/%d).",
-                response.status_code,
-                delay,
-                attempt + 1,
-                _MAX_RETRIES,
-            )
-            time.sleep(delay)
-            continue
-        return response
-    raise RuntimeError("Help Scout: retry loop exited unexpectedly.")  # pragma: no cover
+            self.server_time = email.utils.parsedate_to_datetime(value).astimezone(_UTC)
+        except (TypeError, ValueError):
+            return
 
 
-def _retry_after(headers: Any, attempt: int) -> float:
-    """Seconds to wait: Help Scout's ``X-RateLimit-Retry-After``, else backoff."""
-    for name in ("X-RateLimit-Retry-After", "x-ratelimit-retry-after", "Retry-After"):
-        value = headers.get(name) if headers else None
+def _is_transport_error(exc: Exception) -> bool:
+    try:
+        import httpx
+    except ImportError:  # pragma: no cover
+        return False
+    return isinstance(exc, httpx.TransportError)
+
+
+def _rate_limit_wait(headers: Any, attempt: int) -> float:
+    """Seconds to wait on 429.
+
+    The Inbox API sends ``X-RateLimit-Retry-After`` (seconds). The Docs API sends
+    ``X-RateLimit-Reset`` instead (seconds until the window resets, or an epoch
+    time); ``Retry-After`` is accepted too.
+    """
+    headers = headers or {}
+    for name in ("X-RateLimit-Retry-After", "Retry-After"):
+        value = _header_number(headers, name)
         if value is not None:
-            try:
-                return max(float(value), 0.0)
-            except (TypeError, ValueError):
-                break
-    return float(2**attempt)
+            return max(value, 0.0)
+    reset = _header_number(headers, "X-RateLimit-Reset")
+    if reset is not None:
+        if reset > 1_000_000_000:  # epoch seconds
+            reset -= time.time()
+        return max(reset, 0.0)
+    return float(2 ** (attempt + 1))
 
 
-def _utc_now_iso() -> str:
-    # Second precision, as Help Scout's examples use; truncating moves the cursor
-    # slightly earlier, which can only re-read a change, never skip one.
-    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+def _header_number(headers: Any, name: str) -> float | None:
+    value = headers.get(name) if hasattr(headers, "get") else None
+    if value is None:
+        value = headers.get(name.lower()) if hasattr(headers, "get") else None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _iso(value: datetime) -> str:
+    return value.astimezone(_UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_time(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=_UTC)
 
 
 # ---------------------------------------------------------------------------
@@ -372,29 +542,75 @@ def _utc_now_iso() -> str:
 # ---------------------------------------------------------------------------
 
 
-def _iter_hal(api: _Api, url: str, params: dict | None, key: str) -> Iterator[dict]:
-    """Yield ``_embedded[key]`` items, following HAL ``_links.next`` links."""
-    seen: set[str] = set()
+@dataclass
+class _Listing:
+    """What a paged listing looked like, to decide whether it can be trusted."""
+
+    totals: set[int] = field(default_factory=set)
+    repeats: int = 0
+    seen: set = field(default_factory=set)
+
+    def consistent(self) -> bool:
+        return (
+            self.repeats == 0
+            and len(self.totals) <= 1
+            and (not self.totals or next(iter(self.totals)) == len(self.seen))
+        )
+
+
+def _iter_hal(
+    api: _Api, url: str, params: dict | None, key: str, listing: _Listing | None = None
+) -> Iterator[dict]:
+    """Yield ``_embedded[key]`` items, following HAL ``_links.next`` links.
+
+    A repeated ``next`` link means the listing is broken; raising keeps a short
+    listing from turning into mass deletes.
+    """
+    listing = listing if listing is not None else _Listing()
+    links_seen: set[str] = set()
     next_url, next_params = url, params
     while True:
         payload = api.get(next_url, next_params)
-        yield from (payload.get("_embedded") or {}).get(key) or []
+        total = (payload.get("page") or {}).get("totalElements")
+        if isinstance(total, int):
+            listing.totals.add(total)
+        for item in (payload.get("_embedded") or {}).get(key) or []:
+            item_id = item.get("id")
+            if item_id in listing.seen:
+                listing.repeats += 1
+                continue
+            listing.seen.add(item_id)
+            yield item
         href = ((payload.get("_links") or {}).get("next") or {}).get("href")
-        # Stop on the last page, or if a next link repeats (never loop forever).
-        if not href or href in seen:
+        if not href:
             return
-        seen.add(href)
+        if href in links_seen:
+            raise _UnstableListingError(f"{api.name} repeated a page link.")
+        links_seen.add(href)
         next_url, next_params = href, None
 
 
-def _iter_docs(api: _Api, url: str, key: str, params: dict) -> Iterator[dict]:
-    """Yield items of a Docs API list (``{key: {page, pages, items}}``)."""
+def _iter_docs(
+    api: _Api, url: str, key: str, params: dict, listing: _Listing | None = None
+) -> Iterator[dict]:
+    """Yield items of a Docs API list (``{key: {page, pages, count, items}}``)."""
+    listing = listing if listing is not None else _Listing()
     page = 1
     while True:
         block = api.get(url, {**params, "page": page}).get(key) or {}
         items = block.get("items") or []
-        yield from items
-        if not items or page >= int(block.get("pages") or 1):
+        pages = int(block.get("pages") or 1)
+        if isinstance(block.get("count"), int):
+            listing.totals.add(block["count"])
+        if not items and page < pages:
+            raise _UnstableListingError(f"{api.name} returned an empty page in the middle.")
+        for item in items:
+            if item.get("id") in listing.seen:
+                listing.repeats += 1
+                continue
+            listing.seen.add(item.get("id"))
+            yield item
+        if page >= pages:
             return
         page += 1
 
@@ -404,81 +620,142 @@ def _iter_docs(api: _Api, url: str, key: str, params: dict) -> Iterator[dict]:
 # ---------------------------------------------------------------------------
 
 
-def _sync_conversations(api: _Api, state: dict, options: _Options) -> Iterator[dict]:
-    cursor = state.get("modified_since") or options.modified_since
-    full_listing = state.get("modified_since") is None and options.modified_since is None
-    known = set(state.get("known_ids") or [])
-    run_started = _utc_now_iso()
-
+def _sync_conversations(
+    api: _Api, state: dict, options: _Options, stats: dict[str, int]
+) -> Iterator[dict]:
+    api.server_time = None  # the cursor comes from this run's first response
     url = f"{MAILBOX_API}/conversations"
+    config = options.conversation_config()
+    config_changed = "config" in state and state["config"] != config
+    cursor = None if config_changed else (state.get("modified_since") or options.modified_since)
+    full_listing = cursor is None
+    known = {int(i) for i in state.get("known_ids") or []}
+    runs = int(state.get("runs_since_reconcile") or 0) + 1
+    # A scope change always reconciles: conversations now out of scope must go.
+    do_reconcile = config_changed or (
+        options.reconcile and (full_listing or runs >= options.reconcile_every)
+    )
+
     base: dict[str, Any] = {"status": "all"}
     if options.mailbox_ids:
         base["mailbox"] = ",".join(str(m) for m in options.mailbox_ids)
-
-    inbox_names = _inbox_names(api)
     changed_params = {**base, "embed": "threads", "sortField": "modifiedAt", "sortOrder": "asc"}
     if cursor:
         changed_params["modifiedSince"] = cursor
 
+    handled: set[int] = set()
     emitted: set[int] = set()
     gone: set[int] = set()
-    thread_calls = 0
-    for conversation in _iter_hal(api, url, changed_params, "conversations"):
-        conversation_id = conversation.get("id")
-        if conversation_id is None:
-            continue
-        if _excluded(conversation, options):
-            if conversation_id in known:
+    stable = False
+    listing = _Listing()
+    # A conversation modified while we page moves to the end of the modifiedAt
+    # order and can push another one between pages. That shows up as a repeated
+    # id; the listing is then read again (already handled ids are skipped).
+    for _pass in range(3):
+        listing = _Listing()
+        for conversation in _iter_hal(api, url, changed_params, "conversations", listing):
+            conversation_id = conversation.get("id")
+            if conversation_id is None or conversation_id in handled:
+                continue
+            handled.add(conversation_id)
+            if _excluded(conversation, options):
+                if conversation_id in known:
+                    gone.add(conversation_id)
+                    yield _tombstone(conversation_id)
+                continue
+            try:
+                threads, extra = _threads_for(api, conversation)
+            except _NotFoundError:  # deleted between the list call and this one
+                if conversation_id in known:
+                    gone.add(conversation_id)
+                    yield _tombstone(conversation_id)
+                continue
+            _count(stats, "conversations_thread_requests", extra)
+            emitted.add(conversation_id)
+            _count(stats, "conversations_synced")
+            yield _conversation_row(conversation, threads, options)
+        if listing.repeats == 0:
+            stable = True
+            break
+    if not stable:
+        logger.warning("Help Scout: the listing kept moving; the cursor stays where it was.")
+
+    if do_reconcile:
+        if full_listing and stable and listing.consistent():
+            present: set[int] | None = {int(i) for i in listing.seen if i is not None}
+        else:
+            present = _list_present_ids(api, url, base)
+        if present is None:
+            _count(stats, "conversations_reconcile_skipped")
+        else:
+            candidates = sorted(known - present - gone - emitted)
+            # A scope change legitimately removes many at once, so no cap then.
+            limit = None if config_changed else MAX_VERIFY
+            for conversation_id in _confirm_gone(api, candidates, options, stats, limit):
                 gone.add(conversation_id)
-                yield _tombstone(f"conversation:{conversation_id}")
+                yield _tombstone(conversation_id)
+            runs = 0
+
+    _count(stats, "conversations_forgotten", len(gone))
+    state["known_ids"] = sorted((known | emitted) - gone)
+    state["runs_since_reconcile"] = runs
+    if stable:
+        now = api.server_time or datetime.now(_UTC)
+        state["modified_since"] = _iso(now - CURSOR_OVERLAP)
+        state["config"] = config
+    logger.info("Help Scout: %d conversation(s) synced, %d forgotten.", len(emitted), len(gone))
+
+
+def _list_present_ids(api: _Api, url: str, base: dict) -> set[int] | None:
+    """All conversation ids in scope, or ``None`` when the listing can't be trusted."""
+    listing = _Listing()
+    params = {**base, "sortField": "number", "sortOrder": "asc"}
+    try:
+        for _ in _iter_hal(api, url, params, "conversations", listing):
+            pass
+    except _UnstableListingError as exc:
+        logger.warning("Help Scout: %s Nothing is forgotten this run.", exc)
+        return None
+    if not listing.consistent():
+        logger.warning(
+            "Help Scout: the id listing changed while it was read; nothing is forgotten this run."
+        )
+        return None
+    return {int(i) for i in listing.seen if i is not None}
+
+
+def _confirm_gone(
+    api: _Api,
+    candidates: list[int],
+    options: _Options,
+    stats: dict[str, int],
+    limit: int | None = MAX_VERIFY,
+) -> Iterator[int]:
+    """Re-check each id that looks vanished; yield only the ones really gone."""
+    if limit is not None and len(candidates) > limit:
+        _count(stats, "conversations_reconcile_skipped")
+        logger.warning(
+            "Help Scout: %d conversations look vanished at once; treating the listing "
+            "as broken and forgetting nothing this run.",
+            len(candidates),
+        )
+        return
+    for conversation_id in candidates:
+        try:
+            conversation = api.get(f"{MAILBOX_API}/conversations/{conversation_id}")
+        except _NotFoundError:
+            yield conversation_id
             continue
-        threads, fetched = _threads_for(api, conversation)
-        thread_calls += fetched
-        emitted.add(conversation_id)
-        yield _conversation_row(conversation, threads, options, inbox_names)
-
-    if full_listing:
-        present: set[int] | None = set(emitted)
-    elif options.reconcile:
-        present = {
-            c["id"]
-            for c in _iter_hal(api, url, dict(base), "conversations")
-            if c.get("id") is not None and not _excluded(c, options)
-        }
-    else:
-        present = None
-
-    if present is not None:
-        # A conversation seen alive in this run is never tombstoned in the same
-        # load; if it vanished meanwhile, the next run removes it.
-        for conversation_id in sorted(known - present - gone - emitted):
-            gone.add(conversation_id)
-            yield _tombstone(f"conversation:{conversation_id}")
-        state["known_ids"] = sorted(present | emitted)
-    else:
-        state["known_ids"] = sorted((known | emitted) - gone)
-
-    state["modified_since"] = run_started
-    logger.info(
-        "Help Scout: %d conversation(s) synced (%d extra thread request(s)), %d forgotten.",
-        len(emitted),
-        thread_calls,
-        len(gone),
-    )
+        if _excluded(conversation, options) or (
+            options.mailbox_ids and conversation.get("mailboxId") not in options.mailbox_ids
+        ):
+            yield conversation_id
 
 
 def _excluded(conversation: dict, options: _Options) -> bool:
     if conversation.get("state") in ("deleted", "draft"):
         return True
     return conversation.get("status") == "spam" and not options.include_spam
-
-
-def _inbox_names(api: _Api) -> dict[int, str]:
-    return {
-        m["id"]: m.get("name") or str(m["id"])
-        for m in _iter_hal(api, f"{MAILBOX_API}/mailboxes", None, "mailboxes")
-        if m.get("id") is not None
-    }
 
 
 def _threads_for(api: _Api, conversation: dict) -> tuple[list[dict], int]:
@@ -508,27 +785,22 @@ def _needs_full_threads(conversation: dict, threads: list[dict]) -> bool:
     return isinstance(expected, int) and len(published) < expected
 
 
-def _conversation_row(
-    conversation: dict, threads: list[dict], options: _Options, inbox_names: dict[int, str]
-) -> dict:
+def _conversation_row(conversation: dict, threads: list[dict], options: _Options) -> dict:
     """Flatten a conversation and its threads into a document row.
 
-    Volatile fields (preview, waiting-since, read state) are left out so they do
-    not churn the content-hash ``data_id``.
+    Only fields that describe the conversation itself are used, in a fixed order,
+    so the content hash changes only when the conversation does.
     """
     number = conversation.get("number")
     subject = (conversation.get("subject") or "").strip()
+    tags = sorted({t.get("tag", "") for t in conversation.get("tags") or [] if t.get("tag")})
     header = []
     for label, value in (
-        ("Inbox", inbox_names.get(conversation.get("mailboxId"))),
         ("Status", conversation.get("status")),
         ("Channel", conversation.get("type")),
         ("Customer", _person(conversation.get("primaryCustomer"))),
         ("Assignee", _person(conversation.get("assignee"))),
-        (
-            "Tags",
-            ", ".join(t.get("tag", "") for t in conversation.get("tags") or [] if t.get("tag")),
-        ),
+        ("Tags", ", ".join(tags)),
         ("Created", conversation.get("createdAt")),
         ("Closed", conversation.get("closedAt")),
     ):
@@ -571,15 +843,25 @@ def _person(value: Any) -> str:
     return name or value.get("name") or ""
 
 
+def _tombstone(conversation_id: Any) -> dict:
+    return {"id": f"conversation:{conversation_id}", "_deleted": True}
+
+
 # ---------------------------------------------------------------------------
 # Docs articles
 # ---------------------------------------------------------------------------
 
 
-def _sync_articles(api: _Api, state: dict, options: _Options) -> Iterator[dict]:
-    known: dict[str, str] = dict(state.get("versions") or {})
+def _sync_articles(
+    api: _Api, state: dict, options: _Options, stats: dict[str, int]
+) -> Iterator[dict]:
+    config = options.article_config()
+    known: dict[str, str] = (
+        {} if state.get("config") not in (None, config) else dict(state.get("versions") or {})
+    )
+    previously: set[str] = set(state.get("versions") or {})
     present: dict[str, str] = {}
-    fetched = 0
+    trusted = True
 
     for collection in _iter_docs(api, f"{DOCS_API}/collections", "collections", {}):
         collection_id = collection.get("id")
@@ -587,9 +869,18 @@ def _sync_articles(api: _Api, state: dict, options: _Options) -> Iterator[dict]:
             options.collection_ids and collection_id not in options.collection_ids
         ):
             continue
+        listing = _Listing()
         url = f"{DOCS_API}/collections/{collection_id}/articles"
-        params = {"status": options.article_status, "pageSize": 100}
-        for ref in _iter_docs(api, url, "articles", params):
+        params = {"status": options.article_status, "sort": "createdAt", "order": "asc"}
+        try:
+            refs = list(_iter_docs(api, url, "articles", params, listing))
+        except _UnstableListingError as exc:
+            logger.warning("Help Scout: %s Nothing is forgotten this run.", exc)
+            trusted = False
+            continue
+        if not listing.consistent():
+            trusted = False
+        for ref in refs:
             article_id = ref.get("id")
             if not article_id:
                 continue
@@ -597,25 +888,45 @@ def _sync_articles(api: _Api, state: dict, options: _Options) -> Iterator[dict]:
             present[article_id] = marker
             if known.get(article_id) == marker:
                 continue
-            article = api.get(f"{DOCS_API}/articles/{article_id}").get("article") or {}
-            fetched += 1
-            yield _article_row(article or ref, collection)
+            try:
+                payload = api.get(f"{DOCS_API}/articles/{article_id}")
+            except _NotFoundError:
+                present.pop(article_id, None)
+                continue
+            article = payload.get("article")
+            if not article or not article.get("id"):
+                raise RuntimeError("Help Scout Docs API returned an empty article.")
+            _count(stats, "articles_synced")
+            yield _article_row(article)
 
-    for article_id in sorted(set(known) - set(present)):
-        yield _tombstone(f"article:{article_id}")
-
+    forgotten = 0
+    if trusted:
+        for article_id in sorted(previously - set(present)):
+            if _article_really_gone(api, article_id, options):
+                forgotten += 1
+                yield {"id": f"article:{article_id}", "_deleted": True}
+            else:
+                present[article_id] = (state.get("versions") or {}).get(article_id, "")
+    else:
+        for article_id in previously - set(present):
+            present[article_id] = (state.get("versions") or {}).get(article_id, "")
+    _count(stats, "articles_forgotten", forgotten)
     state["versions"] = present
-    logger.info(
-        "Help Scout Docs: %d article(s) fetched, %d forgotten.",
-        fetched,
-        len(set(known) - set(present)),
-    )
+    state["config"] = config
 
 
-def _article_row(article: dict, collection: dict) -> dict:
-    header = [f"Collection: {collection.get('name')}"] if collection.get("name") else []
-    if article.get("publicUrl"):
-        header.append(f"URL: {article['publicUrl']}")
+def _article_really_gone(api: _Api, article_id: str, options: _Options) -> bool:
+    try:
+        article = (api.get(f"{DOCS_API}/articles/{article_id}").get("article")) or {}
+    except _NotFoundError:
+        return True
+    if options.collection_ids and article.get("collectionId") not in options.collection_ids:
+        return True
+    return options.article_status == "published" and article.get("status") != "published"
+
+
+def _article_row(article: dict) -> dict:
+    header = [f"URL: {article['publicUrl']}"] if article.get("publicUrl") else []
     body = _html_to_text(article.get("text"))
     return {
         "id": f"article:{article.get('id')}",
@@ -624,10 +935,6 @@ def _article_row(article: dict, collection: dict) -> dict:
         "url": article.get("publicUrl") or None,
         "_deleted": False,
     }
-
-
-def _tombstone(row_id: str) -> dict:
-    return {"id": row_id, "_deleted": True}
 
 
 # ---------------------------------------------------------------------------

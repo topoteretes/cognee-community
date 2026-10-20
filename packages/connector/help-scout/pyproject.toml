@@ -3,12 +3,12 @@ name = "cognee-community-connector-help-scout"
 version = "0.1.0"
 description = "Help Scout data-source connector for cognee — sync conversations, threads and Docs articles into memory (incremental + forget-on-delete)"
 readme = "README.md"
-requires-python = ">=3.11,<3.14"
+requires-python = ">=3.10,<3.14"
 dependencies = [
-    # Requires cognee "document-mode" (DOCUMENT_SOURCE_ATTR + resolve_dlt_sources
-    # routing rows through cognify instead of the dlt-schema path), first shipped
-    # in cognee 1.4.0.
-    "cognee==1.4.0",
+    # cognee >= 1.6.1 ships PIPELINE_SCOPE_ATTR, guarded_rows and
+    # DOCUMENT_SYNC_VERSION (table-scoped document cleanup), which this
+    # connector relies on; it refuses to run on older cores.
+    "cognee>=1.6.1,<2",
     "dlt[sqlalchemy]>=1.9.0,<2",
     "httpx>=0.27.0",
 ]
@@ -29,7 +29,7 @@ packages = ["cognee_community_connector_help_scout"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "N", "B", "UP", "C4", "PGH", "SIM", "RUF"]

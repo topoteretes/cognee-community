@@ -1,15 +1,13 @@
 """Help Scout connector demo - turn your support inbox and help center into memory.
 
 Pull Help Scout conversations (with their threads) and, optionally, Docs articles
-into cognee, incrementally and with forget-on-delete. ``help_scout_source``
-returns a ``dlt`` source you hand to ``cognee.remember``.
+into cognee, incrementally and with forget-on-delete.
 
 First run: backfills everything. Later runs: only conversations changed since the
-last run are fetched (``modifiedSince``). Deleted conversations and deleted or
-unpublished articles are forgotten on the next run.
+last run are fetched. Deleted conversations and deleted or unpublished articles
+are forgotten.
 
 Privacy: this reads customer conversations. Nothing is fetched until you run it.
-Limit it with ``mailbox_ids=[...]`` and use a dedicated dataset.
 
 Setup:
 
@@ -33,16 +31,27 @@ DATASET_NAME = "help_scout"
 
 
 async def main() -> None:
-    if not (os.environ.get("HELPSCOUT_APP_ID") and os.environ.get("HELPSCOUT_APP_SECRET")):
+    app_id = os.environ.get("HELPSCOUT_APP_ID")
+    app_secret = os.environ.get("HELPSCOUT_APP_SECRET")
+    if not (app_id and app_secret):
         print("Set HELPSCOUT_APP_ID and HELPSCOUT_APP_SECRET to run this example.")
         return
 
-    # Limit with mailbox_ids=[...]; set include_notes=True to add internal notes.
-    source = help_scout_source()
+    source = help_scout_source(
+        resource_name="help_scout",  # one per Help Scout account; keep it fixed
+        app_id=app_id,
+        app_secret=app_secret,
+        docs_api_key=os.environ.get("HELPSCOUT_DOCS_API_KEY"),
+        # mailbox_ids=[123], include_notes=True, reconcile_every=6, ...
+    )
 
     print("Syncing Help Scout into cognee ...")
-    # write_disposition="merge" is REQUIRED: incremental runs only see changes.
-    await cognee.remember(source, dataset_name=DATASET_NAME, write_disposition="merge")
+    # primary_key="id" + write_disposition="merge" are REQUIRED: incremental runs
+    # only see changes, and tombstones remove deleted conversations by id.
+    await cognee.remember(
+        source, dataset_name=DATASET_NAME, primary_key="id", write_disposition="merge"
+    )
+    print("Run stats:", source.cognee_sync_stats)
 
     answer = await cognee.search(
         query_text="What do customers ask about most, and how did we answer?",
@@ -50,11 +59,6 @@ async def main() -> None:
         datasets=[DATASET_NAME],
     )
     print("\nSearch result:\n", answer)
-
-    print(
-        "\nReply to or delete a conversation in Help Scout, then re-run: only the "
-        "changes are fetched and deleted conversations are forgotten."
-    )
 
 
 if __name__ == "__main__":
