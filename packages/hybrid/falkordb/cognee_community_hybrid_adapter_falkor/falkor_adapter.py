@@ -96,9 +96,23 @@ class FalkorDBAdapter(VectorDBInterface, GraphDBInterface):
         database_name: str | None = "cognee_graph",
         **kwargs,
     ):
+        actual_url = url if url else graph_database_url
+        actual_port = graph_database_port if graph_database_port else 6379
+        
+        if actual_url:
+            from urllib.parse import urlparse
+            if "://" not in actual_url:
+                parsed = urlparse(f"redis://{actual_url}")
+            else:
+                parsed = urlparse(actual_url)
+            
+            actual_url = parsed.hostname or actual_url
+            if parsed.port:
+                actual_port = parsed.port
+
         self.driver = FalkorDB(
-            host=url if url else graph_database_url,
-            port=graph_database_port if graph_database_port else 6379,
+            host=actual_url,
+            port=actual_port,
             username=graph_database_username,
             password=graph_database_password,
         )
@@ -926,6 +940,40 @@ class FalkorDBAdapter(VectorDBInterface, GraphDBInterface):
             },
         )
         return result.result_set  # type: ignore
+
+
+    async def remove_belongs_to_set_tags(
+        self,
+        tags: list[str],
+        node_ids: list[str] | None = None,
+    ) -> None:
+        if not tags:
+            return
+        if node_ids is not None and not node_ids:
+            return
+
+        id_filter = "AND n.id IN $node_ids" if node_ids is not None else ""
+        node_scope_clause = "WHERE n.id IN $node_ids" if node_ids is not None else ""
+        edge_scope_keyword = "AND" if node_ids is not None else "WHERE"
+        
+        # Note: FalkorDB might not support [x IN list WHERE ...] list comprehensions fully 
+        # or size(new_tags). If tests fail, we might need to adjust.
+        # Let's try the Neo4j query first.
+        query = f"""
+        MATCH (n)
+        WHERE any(tag IN $tags WHERE tag IN coalesce(n.belongs_to_set, []))
+        {id_filter}
+        SET n.belongs_to_set = [x IN n.belongs_to_set WHERE NOT x IN $tags]
+        WITH count(*) AS _bridge
+        MATCH (n)-[r:belongs_to_set]->(ns:NodeSet)
+        {node_scope_clause}
+        {edge_scope_keyword} ns.name IN $tags
+        DELETE r
+        """
+        params: dict = {"tags": list(tags)}
+        if node_ids is not None:
+            params["node_ids"] = [str(nid) for nid in node_ids]
+        await self.query(query, params)
 
     async def extract_node(self, data_point_id: UUID) -> NodeData:
         """
