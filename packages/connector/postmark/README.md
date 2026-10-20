@@ -45,6 +45,7 @@ import os
 import cognee
 from cognee_community_connector_postmark import postmark_source
 
+
 async def main():
     # Provide token explicitly or set POSTMARK_SERVER_TOKEN environment variable
     source = postmark_source(server_token=os.environ.get("POSTMARK_SERVER_TOKEN"))
@@ -59,6 +60,7 @@ async def main():
         datasets=["postmark"],
     )
     print("Search Result:\n", results)
+
 
 if __name__ == "__main__":
     asyncio.run(main())

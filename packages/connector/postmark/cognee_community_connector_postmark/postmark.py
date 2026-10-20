@@ -1,5 +1,6 @@
-"""DLT source for Postmark transactional templates and message history (full snapshot + forget-on-delete).
+"""DLT source for Postmark transactional templates and message history.
 
+Full snapshot + forget-on-delete.
 Fetches Postmark transactional email templates (subject, HTML/plain text body, alias,
 layout) and delivery metadata, rendering them into clean Markdown documents.
 Yields them as a dlt resource for cognee's ingestion pipeline.
@@ -19,16 +20,27 @@ Unchanged items preserve stable content-hash ``data_id`` keys, preventing redund
 re-ingestion.
 """
 
-from collections.abc import Iterator
 import os
 import re
 import time
+from collections.abc import Iterator
 from typing import Any
 
 import httpx
 
-from cognee.shared.logging_utils import get_logger
-from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
+try:
+    from cognee.shared.logging_utils import get_logger
+except ImportError:
+    import logging
+
+    def get_logger(name: str):
+        return logging.getLogger(name)
+
+
+try:
+    from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
+except ImportError:
+    DOCUMENT_SOURCE_ATTR = "cognee_document_source"
 
 logger = get_logger("postmark_connector")
 
@@ -53,7 +65,10 @@ def _request_with_retry(
         try:
             response = client.request(method, url, headers=headers, params=params, timeout=30.0)
             if response.status_code == 429:
-                retry_after = float(response.headers.get("Retry-After", _BASE_BACKOFF * (2**attempt)))
+                header_backoff = response.headers.get("Retry-After")
+                retry_after = (
+                    float(header_backoff) if header_backoff else _BASE_BACKOFF * (2**attempt)
+                )
                 logger.warning("Postmark rate limit reached, waiting %.1f seconds", retry_after)
                 time.sleep(retry_after)
                 continue
@@ -61,7 +76,8 @@ def _request_with_retry(
             return response.json()
         except (httpx.TransportError, httpx.HTTPStatusError) as exc:
             if attempt == _MAX_RETRIES - 1:
-                raise RuntimeError(f"Postmark request failed after {_MAX_RETRIES} attempts: {exc}") from exc
+                msg = f"Postmark request failed after {_MAX_RETRIES} attempts: {exc}"
+                raise RuntimeError(msg) from exc
             time.sleep(_BASE_BACKOFF * (2**attempt))
     raise RuntimeError(f"Postmark request exceeded retry budget for {url}")
 
@@ -114,8 +130,10 @@ def postmark_source(
 
     Args:
         server_token: Postmark Server API Token. Falls back to ``POSTMARK_SERVER_TOKEN``.
-        template_ids: Restrict ingestion to specific template IDs or aliases. When omitted, all templates are ingested.
-        template_type: Type of templates to ingest ('Standard', 'Layout', or 'All', default: 'Standard').
+        template_ids: Restrict ingestion to specific template IDs or aliases.
+            When omitted, all templates are ingested.
+        template_type: Type of templates to ingest ('Standard', 'Layout', or 'All',
+            default: 'Standard').
         client: Pre-built ``httpx.Client`` (primarily for test mock injection).
 
     Returns:

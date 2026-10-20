@@ -1,11 +1,13 @@
-import pytest
 from unittest.mock import MagicMock, patch
+
+import pytest
+
 from cognee_community_connector_postmark.postmark import (
-    postmark_source,
+    DOCUMENT_SOURCE_ATTR,
+    POSTMARK_TABLE_NAME,
     _format_template_markdown,
     _strip_html_tags,
-    POSTMARK_TABLE_NAME,
-    DOCUMENT_SOURCE_ATTR,
+    postmark_source,
 )
 
 
@@ -19,20 +21,28 @@ def sample_template():
         "Subject": "Reset your password for {{app_name}}",
         "LayoutTemplate": "clean-layout",
         "TextBody": "Click the following link to reset your password: {{reset_url}}",
-        "HtmlBody": "<p>Click the following link to reset your password: <a href='{{reset_url}}'>Reset</a></p>",
+        "HtmlBody": (
+            "<p>Click the following link to reset your password: "
+            "<a href='{{reset_url}}'>Reset</a></p>"
+        ),
     }
 
 
 def test_missing_server_token_raises_error():
     """Verify that omitting the Postmark Server Token raises ValueError."""
-    with patch.dict("os.environ", {}, clear=True):
-        with pytest.raises(ValueError, match="Postmark Server API Token required"):
-            postmark_source(server_token=None)
+    with (
+        patch.dict("os.environ", {}, clear=True),
+        pytest.raises(ValueError, match="Postmark Server API Token required"),
+    ):
+        postmark_source(server_token=None)
 
 
 def test_strip_html_tags_clean_output():
     """Verify that HTML email tags and styles are stripped cleanly."""
-    html = "<style>.btn{color:blue;}</style><h1>Invoice Receipt</h1><p>Amount: <strong>$50.00</strong></p>"
+    html = (
+        "<style>.btn{color:blue;}</style><h1>Invoice Receipt</h1>"
+        "<p>Amount: <strong>$50.00</strong></p>"
+    )
     clean = _strip_html_tags(html)
     assert clean == "Invoice Receipt Amount: $50.00"
 
@@ -60,7 +70,13 @@ def test_postmark_source_extracts_templates(sample_template):
         if url.endswith("/templates"):
             resp.json.return_value = {
                 "TotalCount": 1,
-                "Templates": [{"TemplateId": 12345, "Name": "Customer Password Reset", "Alias": "password-reset"}],
+                "Templates": [
+                    {
+                        "TemplateId": 12345,
+                        "Name": "Customer Password Reset",
+                        "Alias": "password-reset",
+                    }
+                ],
             }
         elif "/templates/12345" in url:
             resp.json.return_value = sample_template

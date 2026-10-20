@@ -23,6 +23,7 @@ import asyncio
 import os
 
 import cognee
+
 from cognee_community_connector_postmark import postmark_source
 
 # Maintain Postmark in its own dedicated dataset for easy inspection and lifecycle management
