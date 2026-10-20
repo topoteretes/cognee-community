@@ -44,7 +44,10 @@ async def main() -> None:
 
     print("\nQuerying knowledge graph ...")
     answer = await cognee.search(
-        query_text="What email templates do we have for password resets or onboarding, and what are their subject lines?",
+        query_text=(
+            "What email templates do we have for password resets or onboarding, "
+            "and what are their subject lines?"
+        ),
         query_type=cognee.SearchType.GRAPH_COMPLETION,
         datasets=[DATASET_NAME],
     )

@@ -26,8 +26,12 @@ def sample_template():
                 "active": 1,
                 "subject": "Welcome to our platform, {{first_name}}!",
                 "editor": "code",
-                "plain_content": "Thanks for signing up! Here is your quickstart guide to get started.",
-                "html_content": "<p>Thanks for signing up! Here is your quickstart guide to get started.</p>",
+                "plain_content": (
+                    "Thanks for signing up! Here is your quickstart guide to get started."
+                ),
+                "html_content": (
+                    "<p>Thanks for signing up! Here is your quickstart guide to get started.</p>"
+                ),
             }
         ],
     }
@@ -44,9 +48,11 @@ def sample_marketing_list():
 
 def test_missing_api_key_raises_error():
     """Verify that omitting the SendGrid API key raises ValueError."""
-    with patch.dict("os.environ", {}, clear=True):
-        with pytest.raises(ValueError, match="SendGrid API key required"):
-            sendgrid_source(api_key=None)
+    with (
+        patch.dict("os.environ", {}, clear=True),
+        pytest.raises(ValueError, match="SendGrid API key required"),
+    ):
+        sendgrid_source(api_key=None)
 
 
 def test_strip_html_tags_clean_output():
@@ -57,7 +63,7 @@ def test_strip_html_tags_clean_output():
 
 
 def test_template_markdown_formatting_deterministic(sample_template):
-    """Verify Markdown rendering is deterministic, structured, and contains active version content."""
+    """Verify Markdown rendering is deterministic and contains active version content."""
     md1 = _format_template_markdown(sample_template)
     md2 = _format_template_markdown(sample_template)
 
@@ -85,7 +91,9 @@ def test_sendgrid_source_extracts_templates_and_lists(sample_template, sample_ma
         resp = MagicMock()
         resp.status_code = 200
         if url.endswith("/templates?generations=dynamic,legacy&page_size=100"):
-            resp.json.return_value = {"result": [{"id": "d-abc123456789", "name": "User Welcome & Onboarding"}]}
+            resp.json.return_value = {
+                "result": [{"id": "d-abc123456789", "name": "User Welcome & Onboarding"}]
+            }
         elif "/templates/d-abc123456789" in url:
             resp.json.return_value = sample_template
         elif "/marketing/lists" in url:

@@ -1,5 +1,6 @@
-"""DLT source for SendGrid templates, marketing lists, and email metadata (full snapshot + forget-on-delete).
+"""DLT source for SendGrid templates, marketing lists, and email metadata.
 
+Full snapshot + forget-on-delete.
 Fetches SendGrid dynamic transactional email templates, subject lines, versions,
 marketing lists, and sender identities, rendering them into clean Markdown documents.
 Yields them as a dlt resource for cognee's ingestion pipeline.
@@ -26,8 +27,20 @@ from collections.abc import Iterator
 from typing import Any
 
 import httpx
-from cognee.shared.logging_utils import get_logger
-from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
+
+try:
+    from cognee.shared.logging_utils import get_logger
+except ImportError:
+    import logging
+
+    def get_logger(name: str):
+        return logging.getLogger(name)
+
+
+try:
+    from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
+except ImportError:
+    DOCUMENT_SOURCE_ATTR = "cognee_document_source"
 
 logger = get_logger("sendgrid_connector")
 
@@ -52,7 +65,10 @@ def _request_with_retry(
         try:
             response = client.request(method, url, headers=headers, params=params, timeout=30.0)
             if response.status_code == 429:
-                retry_after = float(response.headers.get("Retry-After", _BASE_BACKOFF * (2**attempt)))
+                header_backoff = response.headers.get("Retry-After")
+                retry_after = (
+                    float(header_backoff) if header_backoff else _BASE_BACKOFF * (2**attempt)
+                )
                 logger.warning("SendGrid rate limit reached, waiting %.1f seconds", retry_after)
                 time.sleep(retry_after)
                 continue
@@ -60,7 +76,8 @@ def _request_with_retry(
             return response.json()
         except (httpx.TransportError, httpx.HTTPStatusError) as exc:
             if attempt == _MAX_RETRIES - 1:
-                raise RuntimeError(f"SendGrid request failed after {_MAX_RETRIES} attempts: {exc}") from exc
+                msg = f"SendGrid request failed after {_MAX_RETRIES} attempts: {exc}"
+                raise RuntimeError(msg) from exc
             time.sleep(_BASE_BACKOFF * (2**attempt))
     raise RuntimeError(f"SendGrid request exceeded retry budget for {url}")
 
@@ -145,12 +162,16 @@ def sendgrid_source(
     template_ids: list[str] | None = None,
     client: Any = None,
 ):
-    """Create a dlt source that yields SendGrid email templates and marketing lists as markdown documents.
+    """Create a dlt source yielding SendGrid email templates and marketing lists.
+
+    All items are ingested as structured markdown documents.
 
     Args:
         api_key: SendGrid API key (Bearer token). Falls back to ``SENDGRID_API_KEY``.
-        include_marketing_lists: Ingest marketing contact lists in addition to templates (default: True).
-        template_ids: Restrict ingestion to these specific template IDs. When omitted, all templates are ingested.
+        include_marketing_lists: Ingest marketing contact lists in addition
+            to templates (default: True).
+        template_ids: Restrict ingestion to these specific template IDs.
+            When omitted, all templates are ingested.
         client: Pre-built ``httpx.Client`` (primarily for test mock injection).
 
     Returns:
@@ -165,9 +186,7 @@ def sendgrid_source(
 
     resolved_key = api_key or os.environ.get("SENDGRID_API_KEY")
     if not resolved_key:
-        raise ValueError(
-            "SendGrid API key required: pass api_key= or set SENDGRID_API_KEY."
-        )
+        raise ValueError("SendGrid API key required: pass api_key= or set SENDGRID_API_KEY.")
 
     http_client = client or httpx.Client(timeout=30.0)
     headers = {

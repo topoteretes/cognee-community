@@ -46,6 +46,7 @@ import os
 import cognee
 from cognee_community_connector_sendgrid import sendgrid_source
 
+
 async def main():
     # Provide key explicitly or set SENDGRID_API_KEY environment variable
     source = sendgrid_source(api_key=os.environ.get("SENDGRID_API_KEY"))
@@ -60,6 +61,7 @@ async def main():
         datasets=["sendgrid"],
     )
     print("Search Result:\n", results)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
