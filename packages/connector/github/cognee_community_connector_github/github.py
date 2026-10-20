@@ -56,10 +56,12 @@ _PER_PAGE = 100  # GitHub's maximum page size for every listing used here
 _MAX_RETRIES = 5
 # The 5xx answers GitHub's docs describe as temporary.
 _TRANSIENT_STATUSES = (500, 502, 503, 504)
-# The longest single wait. cognee holds its dlt staging lock during a sync, so a
-# longer rate-limit wait (GitHub's primary window resets hourly) stops the run
-# cleanly instead; the next run carries on.
+# The longest single wait, and the most a run waits in all. cognee holds its
+# dlt staging lock during a sync, so a longer rate-limit wait (GitHub's primary
+# window resets hourly), or a wait past the budget, stops the run cleanly
+# instead; the next run carries on.
 _MAX_WAIT_SECONDS = 60
+_MAX_TOTAL_WAIT_SECONDS = 120
 # GitHub's advice for a secondary limit that says nothing about how long to wait.
 _SECONDARY_LIMIT_WAIT_SECONDS = 60.0
 
@@ -71,13 +73,26 @@ _CURSOR_OVERLAP = timedelta(minutes=5)
 _SETTLE_MARGIN = timedelta(seconds=60)
 
 # Fresh issue failures in a row (5xx or no answer, after retries) that mean
-# GitHub itself is down: the run stops cleanly. Issues already kept for a retry
-# never count.
+# GitHub itself is down: the run stops cleanly. One or two can be a single
+# broken item; three different items failing back to back are rarely a
+# coincidence, and a stop costs nothing, as the next run resumes. Issues already
+# kept for a retry never count.
 _OUTAGE_STREAK = 3
-# Runs an issue may answer 403/404 (listed, but unreadable; or missing from the
-# listing with no clear answer) before its document is forgotten. A listed one
-# is asked again once its updated_at moves.
+# An issue that cannot be read (listed but answering 403/404, or missing from
+# the listing with no clear answer) is forgotten after 3 runs AND 24 hours,
+# counting only runs that finished and, for a 403/404, showed access to work
+# (see _Run.settle): a host on a fast cron cannot forget an item in minutes, and
+# a weekly cron still needs three observations. A forgotten listed issue is
+# asked again when its updated_at moves, or after another day.
 _GIVE_UP_RUNS = 3
+_GIVE_UP_AFTER = timedelta(hours=24)
+_REASK_AFTER = timedelta(hours=24)
+# Forgotten issues asked again per run, oldest first, after everything else.
+_MAX_REASKS = 10
+# The run's clock is the later of GitHub's Date header and the local clock.
+# They differing by more than this is logged (a proxy may cache a stale Date).
+_CLOCK_TOLERANCE = timedelta(seconds=60)
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 # A pull request lists at most this many changed files: one page of /files at
 # GitHub's maximum page size, so a huge pull request costs one request.
@@ -86,13 +101,14 @@ _MAX_FILES = 100
 _STAT_KEYS = ("scanned", "skipped", "failed", "deleted", "kept", "given_up")
 # Row-id prefix -> what a warning calls that kind of item.
 _KIND_NAMES = {"issue": "issues", "pr": "pull requests"}
+_KIND_NAME = {"issue": "issue", "pr": "pull request"}
 
 
 class GitHubAPIError(RuntimeError):
     """An error answer from GitHub (``status``), or no answer at all (``status`` 0).
 
     The message names only the status and the endpoint. GitHub's own message is
-    on ``detail``; a response body or the token never is. ``rate_limited`` is
+    on ``detail``, with the token cut out; a response body never is. ``rate_limited`` is
     True when GitHub was still rate limiting (or asked for too long a wait).
     """
 
@@ -142,18 +158,36 @@ def _check_token(token: str) -> None:
 
 
 class _Client:
-    """One run's access to GitHub: the session, the host's check, and the waits."""
+    """One run's access to GitHub: the session, the host's check, the waits, the clock."""
 
-    def __init__(self, session: Any, check_active: Callable[[], None] | None = None):
+    def __init__(
+        self, session: Any, check_active: Callable[[], None] | None = None, secret: str = ""
+    ):
         self.session = session
         self.check_active = check_active
+        # The token, only to cut it out of GitHub's error messages.
+        headers = getattr(session, "headers", None)
+        bearer = (headers.get("Authorization", "") if headers else "").removeprefix("Bearer ")
+        self.secret = secret or bearer
+        # GitHub's clock at its first answer (the Date header), see _run_clock.
+        self.server_now: datetime | None = None
+        self.waited = 0.0  # seconds slept this run
+        self.out_of_time = False  # a wait was refused for the run's budget
 
     def check(self) -> None:
         if self.check_active is not None:
             self.check_active()
 
+    def can_wait(self, seconds: float) -> bool:
+        """Whether a wait fits in the run's budget (the single-wait cap is the caller's)."""
+        if self.waited + seconds > _MAX_TOTAL_WAIT_SECONDS:
+            self.out_of_time = True
+            return False
+        return True
+
     def wait(self, seconds: float) -> None:
         self.check()
+        self.waited += seconds
         time.sleep(seconds)
 
 
@@ -190,7 +224,7 @@ def _get(
     are returned. A rate limit is waited out up to ``_MAX_WAIT_SECONDS``; a
     longer one raises at once. 5xx and network errors back off, and anything
     else raises :class:`GitHubAPIError`, including a ``403`` that is not a
-    rate limit.
+    rate limit. No wait is taken past the run's ``_MAX_TOTAL_WAIT_SECONDS``.
     """
     client = _as_client(client)
     endpoint = _endpoint(url)
@@ -209,9 +243,9 @@ def _get(
             )
         except requests.RequestException as exc:
             # Only the type: the message of some requests errors holds a header.
-            if last_attempt:
-                raise GitHubAPIError(0, endpoint, type(exc).__name__) from None
             delay = float(2**attempt)
+            if last_attempt or not client.can_wait(delay):
+                raise GitHubAPIError(0, endpoint, type(exc).__name__) from None
             logger.warning(
                 "GitHub: %s on %s; retrying in %.0fs.", type(exc).__name__, endpoint, delay
             )
@@ -221,22 +255,24 @@ def _get(
 
         status = response.status_code
         if status in ok or (etag and status == 304):
+            if client.server_now is None:
+                client.server_now = _server_time(response)
             return response
         wait = _rate_limit_wait(response)
         if wait is not None:
-            if wait > _MAX_WAIT_SECONDS or last_attempt:
+            if wait > _MAX_WAIT_SECONDS or last_attempt or not client.can_wait(wait):
                 raise GitHubAPIError(status, endpoint, f"wait {wait:.0f}s", rate_limited=True)
             logger.warning("GitHub: rate limited on %s; waiting %.0fs.", endpoint, wait)
             client.wait(wait)
             attempt += 1
             continue
-        if status in _TRANSIENT_STATUSES and not last_attempt:
+        if status in _TRANSIENT_STATUSES and not last_attempt and client.can_wait(2**attempt):
             delay = float(2**attempt)
             logger.warning("GitHub: HTTP %d on %s; retrying in %.0fs.", status, endpoint, delay)
             client.wait(delay)
             attempt += 1
             continue
-        raise GitHubAPIError(status, endpoint, _error_detail(response))
+        raise GitHubAPIError(status, endpoint, _redact(_error_detail(response), client.secret))
 
 
 def _rate_limit_wait(response: Any) -> float | None:
@@ -279,6 +315,17 @@ def _error_detail(response: Any) -> str:
     return message[:200] if isinstance(message, str) else ""
 
 
+def _redact(text: str, secret: str) -> str:
+    """``text`` with the token cut out, in case GitHub echoes it back.
+
+    A token too short to replace safely (it could match ordinary words) drops
+    the whole text when it occurs in it.
+    """
+    if not secret or secret not in text:
+        return text
+    return text.replace(secret, "[token]") if len(secret) >= 8 else ""
+
+
 def _json(response: Any, shape: type) -> Any:
     """The JSON body of a ``200``, which must be a ``list`` or a ``dict`` as expected.
 
@@ -307,11 +354,16 @@ def _next_url(response: Any) -> str | None:
 
 
 def _server_time(response: Any) -> datetime | None:
-    """GitHub's clock when it answered, from the ``Date`` response header."""
+    """GitHub's clock when it answered, from the ``Date`` response header.
+
+    ``None`` when the header is missing or unreadable. A zone of ``-0000``
+    (unknown) is read as UTC, the zone HTTP dates are in.
+    """
     try:
-        return parsedate_to_datetime((response.headers or {}).get("Date"))
+        moment = parsedate_to_datetime((response.headers or {}).get("Date"))
     except (TypeError, ValueError):
         return None
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
 
 
 def _parse(stamp: str) -> datetime:
@@ -785,10 +837,12 @@ class _Run:
     """One sync over the selected repositories; ``state`` changes only at the end.
 
     State: ``known_ids`` (row ids emitted and current), ``retry`` (issue rows
-    kept after a failure), ``unreadable`` (row id -> ``{stamp, runs}`` of issues
-    answering 403/404, or missing from the sweep with no clear answer),
-    ``given_up`` (row id -> the ``updated_at`` at which a listed, unreadable
-    issue was forgotten) and, per repository, its ETags and page maps, the
+    kept after a failure), ``unreadable`` (row id -> ``{stamp, runs, since}`` of
+    issues answering 403/404, or missing from the sweep with no clear answer;
+    ``since`` is the run clock at the first counted run), ``given_up`` (row id
+    -> ``{stamp, at}``: the ``updated_at`` at which a listed, unreadable issue
+    was forgotten, and when it was last asked) and, per repository, its ETags
+    and page maps, the
     ``cursor``, ``seen`` (issues inside the overlap whose copy is final),
     ``fingerprints`` (number -> header hash) and the commit cursor and shas.
     """
@@ -802,6 +856,7 @@ class _Run:
         include_commits: bool,
         include_bots: bool,
         include_readme: bool,
+        now: datetime | None = None,
     ):
         self.client = client
         self.state = state
@@ -810,24 +865,38 @@ class _Run:
         self.include_bots = include_bots
         self.include_readme = include_readme
         self.known_ids: set[str] = set(state.get("known_ids", []))
-        self.unreadable: dict[str, dict] = {
-            row: dict(entry) for row, entry in state.get("unreadable", {}).items()
-        }
-        self.given_up: dict[str, str] = dict(state.get("given_up", {}))
+        self.unreadable: dict[str, dict] = _load_unreadable(state.get("unreadable", {}))
+        self.given_up: dict[str, dict] = _load_given_up(state.get("given_up", {}))
+        # What a run that stops early commits instead: only finished runs count.
+        self.unreadable_before = {row: dict(e) for row, e in self.unreadable.items()}
         self.retry: set[str] = set(state.get("retry", []))
         self.kept: set[str] = set()  # listed issues whose fetch failed this run
         self.unclear: set[str] = set()  # missing from the sweep, not shown to be gone
         self.rendered: set[str] = set()  # issue rows emitted this run
-        # 403s are counted toward giving up only once the run shows that items of
-        # the same kind can be read: row id -> stamp, settled in _settle_forbidden.
-        self.forbidden: dict[str, str] = {}
-        self.read_kinds: set[str] = set()  # row-id prefixes fetched successfully
+        # 403/404s are counted toward giving up only once the run shows that items
+        # of the same kind in the same repository can be read:
+        # (repo, kind) -> [(row id, stamp)], see settle().
+        self.unread: dict[tuple[str, str], list[tuple[str, str]]] = {}
+        self.counted: set[str] = set()  # rows counted as unreadable in this run
+        self.read_kinds: set[tuple[str, str]] = set()  # (repo, kind) fetched successfully
+        self.reasks: set[str] | None = None  # forgotten rows asked again this run
+        self.reask_failed: set[str] = set()
+        self.now_override = now
+        self._now: datetime | None = None
         self.emitted: set[str] = set()  # every row id emitted this run
         self.plans: list[dict] = []
         self.outage = 0
         self.listed = False
 
+    def clock(self) -> datetime:
+        """The run clock (see ``_run_clock``), read once GitHub has answered."""
+        if self._now is None:
+            self._now = (self.now_override or _run_clock(self.client)).replace(microsecond=0)
+        return self._now
+
     def stop_if_systemic(self, exc: GitHubAPIError) -> None:
+        if self.client.out_of_time:
+            raise _CutShortError("rate_limit" if exc.rate_limited else "unavailable") from None
         if exc.rate_limited:
             raise _CutShortError("rate_limit") from None
         if exc.status == 401 and self.rendered:
@@ -853,6 +922,15 @@ class _Run:
         cursor: str = previous.get("cursor", "")
 
         repo_info = _fetch_repo(self.client, repo, previous, self.include_readme)
+        if self.reasks is None:
+            # Forgotten issues not edited since are asked again after a day, a
+            # few per run, oldest first, after everything else.
+            due = sorted(
+                (entry["at"], row)
+                for row, entry in self.given_up.items()
+                if _parse(entry["at"]) <= self.clock() - _REASK_AFTER
+            )
+            self.reasks = {row for _, row in due[:_MAX_REASKS]}
 
         # The sweep: every issue and pull request that exists right now, oldest first.
         sweep_url = _url(
@@ -922,21 +1000,27 @@ class _Run:
         changed &= set(kinds)
 
         current_ids = {row_of(number) for number in kinds}
-        # A forgotten unreadable issue is asked again only once its updated_at moves.
+        # A forgotten unreadable issue is asked again once its updated_at moves,
+        # or when it is due again (``self.reasks``).
         excluded = 0
+        asked = []
         for number in sorted(kinds):
             row = row_of(number)
             if row not in self.given_up:
                 continue
-            if number in stamps and stamps[number] != self.given_up[row]:
+            if number in stamps and stamps[number] != self.given_up[row]["stamp"]:
                 del self.given_up[row]
                 changed.add(number)
+                continue
+            changed.discard(number)
+            current_ids.discard(row)
+            if row in self.reasks:
+                asked.append(number)
             else:
-                changed.discard(number)
-                current_ids.discard(row)
                 excluded += 1
         fresh_numbers = sorted(n for n in changed if row_of(n) not in self.retry)
-        order = fresh_numbers + sorted(n for n in changed if row_of(n) in self.retry)
+        retried = sorted(n for n in changed if row_of(n) in self.retry)
+        order = fresh_numbers + retried + asked
 
         # Numbers that were documents before and are not in the sweep any more.
         missing = sorted(
@@ -1028,21 +1112,24 @@ class _Run:
     def _confirm_gone(self, repo: str, row_id: str) -> bool:
         """Ask once about a number missing from the sweep; True only when it is gone.
 
-        Any answer but "gone" keeps the document; a clear one (``404`` or
-        ``403``, ``200``, a ``301`` that is not a transfer) counts toward giving
-        it up. An error that outlasts the retries counts toward nothing.
+        Any answer but "gone" keeps the document; a clear one (``200``, a ``301``
+        that is not a transfer) counts toward giving it up, and so does a ``403``
+        or ``404`` where access to that kind is shown to work (see ``settle``).
+        An error that outlasts the retries counts toward nothing.
         """
         try:
             if _is_gone(self.client, repo, int(row_id.rsplit("#", 1)[1])):
                 return True
             why, status = "answering, but not gone", 200
         except GitHubAPIError as exc:
-            if exc.rate_limited or exc.status == 401:
+            if exc.rate_limited or exc.status == 401 or self.client.out_of_time:
                 raise
             why, status = str(exc), exc.status
             self.stats["failed"] += 1
-        if status in (200, 403, 404):
-            self._count_unreadable(row_id, "missing", forbidden=status == 403)
+        if status == 200:
+            self._count_unreadable(row_id, "missing")
+        elif status in (403, 404):
+            self.unread.setdefault((repo, row_id.split(":", 1)[0]), []).append((row_id, "missing"))
         self.unclear.add(row_id)
         logger.warning("GitHub: kept %s, missing from the listing (%s).", row_id, why)
         return False
@@ -1052,6 +1139,8 @@ class _Run:
         for plan in self.plans:
             yield from self._render_repo(plan)
             plan["done"] = True
+        for repo, kind in sorted(self.unread):
+            self.settle(repo, kind)
 
     def _render_repo(self, plan: dict) -> Iterator[dict[str, Any]]:
         repo = plan["repo"]
@@ -1062,10 +1151,13 @@ class _Run:
             except GitHubAPIError as exc:
                 self._failed(plan, number, row_id, exc)
                 continue
-            if row_id not in self.retry:
+            if row_id not in self.retry | self.reasks:
                 self.outage = 0
+            if self.given_up.pop(row_id, None) is not None:
+                logger.info("GitHub: %s is readable again.", row_id)
+                plan["current_ids"].add(row_id)
             self.unreadable.pop(row_id, None)
-            self.read_kinds.add(row_id.split(":", 1)[0])
+            self.read_kinds.add((repo, row_id.split(":", 1)[0]))
             plan["rendered"].add(number)
             if is_settled:
                 plan["settled_now"].add(number)
@@ -1122,85 +1214,153 @@ class _Run:
         self.stop_if_systemic(exc)
         if exc.status == 401:
             raise exc  # nothing rendered yet: the token is bad
+        if row_id in self.reasks:
+            # Still unreadable: it stays forgotten and is asked again in a day.
+            self.reask_failed.add(row_id)
+            return
         self.kept.add(row_id)
         logger.warning("GitHub: kept %s for a retry next run (%s).", row_id, exc)
         if exc.status in (403, 404):
-            # Still listed, so not gone: a permission, or a passing glitch.
+            # Still listed, so not gone: hidden from this token, or a passing
+            # failure. settle() decides which once every repository is rendered.
             stamp = (
                 plan["stamps"].get(number)
                 or (plan["issues"].get(number) or {}).get("updated_at")
                 or (self.unreadable.get(row_id) or {}).get("stamp", "")
             )
-            self._count_unreadable(row_id, stamp, exc.status == 403)
+            key = (plan["repo"], row_id.split(":", 1)[0])
+            self.unread.setdefault(key, []).append((row_id, stamp))
         elif row_id not in self.retry:
             self.outage += 1
             if self.outage >= _OUTAGE_STREAK:
                 raise _CutShortError("unavailable")
 
-    def _count_unreadable(self, row_id: str, stamp: str, forbidden: bool) -> None:
-        """One more run in which ``row_id`` could not be read at ``stamp``.
+    def _count_unreadable(self, row_id: str, stamp: str) -> None:
+        """One more run in which ``row_id`` could not be read at ``stamp``."""
+        entry = self.unreadable.get(row_id)
+        if entry and entry["stamp"] == stamp:
+            since = entry.get("since") or _stamp(self.clock())
+            self.unreadable[row_id] = {**entry, "runs": entry["runs"] + 1, "since": since}
+        else:
+            self.unreadable[row_id] = {"stamp": stamp, "runs": 1, "since": _stamp(self.clock())}
+        self.counted.add(row_id)
 
-        A 403 is held back until the end of the run (``_settle_forbidden``): it
-        counts only if another item of its kind was read, which shows the token
-        works and this one item is hidden.
+    def settle(self, repo: str, kind: str) -> None:
+        """Count this run's 403/404s of one kind in one repository where access is shown to work.
+
+        A 403 or 404 means the item is hidden from this token, or that GitHub is
+        failing or the token lacks a permission (a fine-grained token without
+        "Pull requests: read" lists pull requests but cannot read them; a
+        private repository it cannot see answers 404). Only the first is a
+        reason to forget it. So it counts only if another item of the same kind
+        in the same repository was read in this run: access can differ per
+        repository (an organization's token policy, an app installed on some
+        repositories only). In steady state the others are unchanged and not
+        fetched, so one of them is fetched as a probe; if the probe fails too,
+        nothing counts.
         """
-        if forbidden:
-            self.forbidden[row_id] = stamp
+        pending = self.unread.pop((repo, kind), [])
+        if not pending:
             return
-        entry = self.unreadable.get(row_id) or {}
-        runs = entry.get("runs", 0) + 1 if entry.get("stamp") == stamp else 1
-        self.unreadable[row_id] = {"stamp": stamp, "runs": runs}
+        if (repo, kind) not in self.read_kinds:
+            number = self._probe_target(repo, kind)
+            target = None if number is None else (repo, number)
+            probe = None if target is None else self._probe(kind, *target)
+            if target is None or probe is False:
+                self.stats["failed_permission"] = self.stats.get("failed_permission", 0) + len(
+                    pending
+                )
+                if target is None:
+                    logger.warning(
+                        "%s %s: every fetch answered 403/404 this run and there is no other %s "
+                        "in %s to check access with; nothing counts toward forgetting it.",
+                        repo,
+                        _KIND_NAMES[kind],
+                        _KIND_NAME[kind],
+                        repo,
+                    )
+                else:
+                    logger.warning(
+                        "%s %s: every fetch answered 403/404 this run; "
+                        "check the token's permissions.",
+                        repo,
+                        _KIND_NAMES[kind],
+                    )
+            if not probe:
+                return
+        for row_id, stamp in pending:
+            self._count_unreadable(row_id, stamp)
 
-    def _settle_forbidden(self) -> None:
-        """Count each 403 of this run, unless every item of its kind answered 403.
+    def _probe_target(self, repo: str, kind: str) -> int | None:
+        """The newest item of ``kind`` in ``repo`` not fetched this run and not given up.
 
-        Then the token most likely lacks a permission (a fine-grained token
-        without "Pull requests: read" lists pull requests but cannot read
-        them), so nothing is given up; the item is kept and the run counted
-        under ``failed_permission``.
+        Items fetched this run, retries (every unreadable one) included, are in
+        the plan's order; a number missing from the sweep is in no plan.
         """
-        blind = set()
-        for row_id, stamp in sorted(self.forbidden.items()):
-            kind = row_id.split(":", 1)[0]
-            entry = self.unreadable.get(row_id) or {}
-            same = entry.get("stamp") == stamp
-            if kind in self.read_kinds:
-                runs = entry.get("runs", 0) + 1 if same else 1
-            else:
-                runs = entry.get("runs", 0) if same else 0
-                self.stats["failed_permission"] = self.stats.get("failed_permission", 0) + 1
-                blind.add(kind)
-            self.unreadable[row_id] = {"stamp": stamp, "runs": runs}
-        for kind in sorted(blind):
-            logger.warning(
-                "%s: every fetch answered 403 this run; check the token's permissions",
-                _KIND_NAMES.get(kind, kind),
-            )
-        self.forbidden = {}
+        plan = next(plan for plan in self.plans if plan["repo"] == repo)
+        in_order = set(plan["order"])
+        numbers = [
+            number
+            for number, is_pr in plan["kinds"].items()
+            if is_pr == (kind == "pr")
+            and number not in in_order
+            and _issue_row_id(repo, number, is_pr) not in self.given_up
+        ]
+        return max(numbers) if numbers else None
+
+    def _probe(self, kind: str, repo: str, number: int) -> bool | None:
+        """Read one unchanged item of ``kind``: True when it is readable.
+
+        A pull request is read through ``/pulls/N`` (what a token without pull
+        request access is refused), an issue through its comments. False when
+        it answers 403/404 too; None when GitHub is failing (5xx, no answer),
+        which proves nothing.
+        """
+        self.stats[f"probe_{kind}"] = self.stats.get(f"probe_{kind}", 0) + 1
+        if kind == "pr":
+            url = _url(f"/repos/{repo}/pulls/{number}")
+        else:
+            url = _url(f"/repos/{repo}/issues/{number}/comments", {"per_page": 1})
+        try:
+            _get(self.client, url)
+        except GitHubAPIError as exc:
+            self.stop_if_systemic(exc)
+            if exc.status == 401:
+                raise exc
+            return False if exc.status in (403, 404) else None
+        return True
 
     # -- 3. Delete and 4. Commit ------------------------------------------------
     def finish(self) -> Iterator[dict[str, Any]]:
-        self._settle_forbidden()
         current_ids: set[str] = set()
         for plan in self.plans:
             current_ids |= plan["current_ids"]
+        now = self.clock()
         for row_id, entry in sorted(self.unreadable.items()):
-            if entry["runs"] < _GIVE_UP_RUNS:
+            # Only an item counted in this run, three times, over at least a day.
+            if (
+                row_id not in self.counted
+                or entry["runs"] < _GIVE_UP_RUNS
+                or _parse(entry["since"]) > now - _GIVE_UP_AFTER
+            ):
                 continue
             if row_id in self.kept:
-                self.given_up[row_id] = entry["stamp"]
+                self.given_up[row_id] = {"stamp": entry["stamp"], "at": _stamp(now)}
                 self.kept.discard(row_id)
             elif row_id in self.unclear:
                 self.unclear.discard(row_id)
             else:
                 continue
             logger.warning(
-                "GitHub: %s could not be read in %d runs; its document is forgotten.",
+                "GitHub: %s could not be read in %d runs since %s; its document is forgotten.",
                 row_id,
                 entry["runs"],
+                entry["since"],
             )
             current_ids.discard(row_id)
             self.stats["given_up"] += 1
+        for row_id in self.reask_failed:
+            self.given_up[row_id]["at"] = _stamp(now)
         deleted = sorted(self.known_ids - current_ids)
         for row_id in deleted:
             yield _deleted_row(row_id)
@@ -1213,9 +1373,9 @@ class _Run:
         }
         self.state["known_ids"] = sorted(current_ids)
         self.state["repos"] = {plan["repo"]: plan["next_state"] for plan in self.plans}
-        self._commit_items(self.kept)
+        self._commit_items(self.kept, self.unreadable)
         self.state["given_up"] = {
-            row: stamp for row, stamp in sorted(self.given_up.items()) if row in swept
+            row: entry for row, entry in sorted(self.given_up.items()) if row in swept
         }
 
     def commit_progress(self) -> None:
@@ -1224,11 +1384,11 @@ class _Run:
         A repository finished before the stop commits its new state. The others
         keep their old cursors and ETags, so the next run lists the same changes
         again; the fingerprints and ``seen`` entries of the issues rendered here
-        make it skip those.
+        make it skip those. Nothing this run saw counts toward giving an item up,
+        nothing new is forgotten, and no forgotten item is marked as asked.
         """
         if not self.listed:
             return  # stopped while listing: nothing moved
-        self._settle_forbidden()
         repos = {}
         for plan in self.plans:
             if plan["done"]:
@@ -1246,17 +1406,59 @@ class _Run:
             repos[plan["repo"]] = kept
         self.state["known_ids"] = sorted(self.known_ids | self.emitted)
         self.state["repos"] = repos
-        self._commit_items(self.kept | (self.retry - self.rendered))
+        self._commit_items(
+            self.kept | (self.retry - self.rendered),
+            {row: e for row, e in self.unreadable_before.items() if row not in self.rendered},
+        )
         self.state["given_up"] = dict(sorted(self.given_up.items()))
 
-    def _commit_items(self, retry: set[str]) -> None:
+    def _commit_items(self, retry: set[str], unreadable: dict[str, dict]) -> None:
         self.state["retry"] = sorted(retry)
         self.state["unreadable"] = {
-            row: entry
-            for row, entry in sorted(self.unreadable.items())
+            row: {**entry, "since": entry.get("since") or _stamp(self.clock())}
+            for row, entry in sorted(unreadable.items())
             if row in retry or row in self.unclear
         }
         self.stats["kept"] = len(retry) + len(self.unclear)
+
+
+def _load_unreadable(entries: dict) -> dict[str, dict]:
+    """``unreadable`` from state. An entry of an earlier version without ``since``
+    gets one from the run clock when next written; one with no counted run
+    (``runs`` 0) is dropped."""
+    return {row: dict(entry) for row, entry in entries.items() if entry.get("runs")}
+
+
+def _load_given_up(entries: dict) -> dict[str, dict]:
+    """``given_up`` from state. An earlier version kept only the stamp: such an
+    entry is due to be asked again at once."""
+    return {
+        row: dict(entry) if isinstance(entry, dict) else {"stamp": entry, "at": _stamp(_EPOCH)}
+        for row, entry in entries.items()
+    }
+
+
+def _run_clock(client: _Client) -> datetime:
+    """The run's clock: the later of GitHub's (its first answer's Date) and the local one.
+
+    The give-up and re-ask times are read from it. The later of the two means a
+    stale Date (a caching proxy) cannot hold the clock back. A local clock that
+    runs ahead only makes a forgotten item asked again sooner.
+    """
+    local = _local_now()
+    server = client.server_now
+    if server is None:
+        return local
+    if abs(server - local) > _CLOCK_TOLERANCE:
+        logger.warning(
+            "GitHub: its Date header and the local clock differ by %.0fs; using the later one.",
+            abs((server - local).total_seconds()),
+        )
+    return max(server, local)
+
+
+def _local_now() -> datetime:
+    return datetime.now(UTC)
 
 
 def sync_repos(
@@ -1269,6 +1471,7 @@ def sync_repos(
     include_readme: bool = True,
     check_active: Callable[[], None] | None = None,
     stats: dict[str, int] | None = None,
+    now: datetime | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Yield changed documents since the last run, plus hard-delete markers.
 
@@ -1277,12 +1480,14 @@ def sync_repos(
        number missing from the sweep is asked about. A failure propagates
        before a single row.
     2. *Render.* Each changed issue and pull request (fresh first, then
-       retries), then the repository, release and commit rows that changed.
+       retries, then forgotten ones due to be asked again), then the
+       repository, release and commit rows that changed.
     3. *Delete.* A hard-delete marker for every known id that is no longer current.
     4. *Commit.* Only now is ``state`` written.
 
-    A run stopped cleanly (a ``401`` after progress, a rate limit, an outage)
-    keeps what it rendered and deletes nothing; the next run relists.
+    A run stopped cleanly (a ``401`` after progress, a rate limit, an outage,
+    the wait budget spent) keeps what it rendered and deletes nothing; the next
+    run relists. ``now`` (for tests) defaults to the run clock (``_run_clock``).
     """
     if not repos:
         raise ValueError(
@@ -1299,6 +1504,7 @@ def sync_repos(
         include_commits=include_commits,
         include_bots=include_bots,
         include_readme=include_readme,
+        now=now,
     )
     try:
         try:
@@ -1310,7 +1516,6 @@ def sync_repos(
             raise
     except _CutShortError as cut:
         run.commit_progress()
-        stats["failed"] = max(1, stats["failed"])
         stats[f"failed_{cut.reason}"] = 1
         logger.warning("GitHub sync stopped early (%s); it resumes on the next run.", cut.reason)
         return
@@ -1398,7 +1603,7 @@ def github_source(
         http = service if service is not None else _make_session(resolved_token)
         try:
             rows = sync_repos(
-                _Client(http, check_active),
+                _Client(http, check_active, resolved_token),
                 dlt.current.resource_state(),
                 repos=selected,
                 include_commits=include_commits,

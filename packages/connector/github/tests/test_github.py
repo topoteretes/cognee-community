@@ -24,6 +24,7 @@ import copy
 import hashlib
 import json
 import random
+from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
@@ -49,6 +50,8 @@ from cognee_community_connector_github.github import (
     _render_issue,
     _render_pull,
     _render_repo,
+    _server_time,
+    _stamp,
     _url,
     github_source,
     sync_repos,
@@ -283,10 +286,15 @@ def fake():
     return session
 
 
-def run_sync(session, state, repos=(REPO,), **kwargs):
+def run_sync(session, state, repos=(REPO,), now=NOW, **kwargs):
     session.calls.clear()
     session.statuses = []
-    return list(sync_repos(session, state, repos=list(repos), **kwargs))
+    return list(sync_repos(session, state, repos=list(repos), now=now, **kwargs))
+
+
+def hours(n):
+    """The run clock ``n`` hours after ``NOW``, for the give-up rule's 24 hours."""
+    return NOW + timedelta(hours=n)
 
 
 def doc_rows(rows, prefix=""):
@@ -1445,31 +1453,265 @@ def test_three_unreadable_issues_never_block_the_run_and_are_given_up(seeded):
     for run in (1, 2):
         forbid()
         stats = {}
-        rows = run_sync(seeded, state, stats=stats)
+        rows = run_sync(seeded, state, now=hours(12 * run), stats=stats)
         if run == 1:
             assert set(doc_rows(rows, "issue:")) == {"issue:acme/site#10", "issue:acme/site#14"}
+        else:
+            assert stats["probe_issue"] == 1  # 10 and 14 are unchanged: one is read as a check
         assert tombstones(rows) == []
         assert set(state["retry"]) == rows_of
         assert {row: e["runs"] for row, e in state["unreadable"].items()} == dict.fromkeys(
             rows_of, run
         )
         assert stats["kept"] == 3 and "failed_unavailable" not in stats
+        assert "failed_permission" not in stats
 
     seeded.add_issue(15, updated_at=at(9))  # created upstream meanwhile: still ingested
     forbid()
     stats = {}
-    rows = run_sync(seeded, state, stats=stats)
+    rows = run_sync(seeded, state, now=hours(36), stats=stats)
     assert "issue:acme/site#15" in doc_rows(rows)
-    assert {r["id"] for r in tombstones(rows)} == rows_of  # third run: forgotten
+    # Third run, 24 hours after the first: forgotten.
+    assert {r["id"] for r in tombstones(rows)} == rows_of
     assert stats["given_up"] == 3 and state["retry"] == [] and state["unreadable"] == {}
-    run_sync(seeded, state)
-    assert fetched_issues(seeded) == []  # no longer asked about
+    run_sync(seeded, state, now=hours(48))
+    assert fetched_issues(seeded) == []  # no longer asked about within the day
 
     # Once a given-up issue changes upstream, it is asked about (and ingested) again.
     seeded.repos[REPO].issues[12]["updated_at"] = at(20)
-    rows = run_sync(seeded, state)
+    rows = run_sync(seeded, state, now=hours(48))
     assert set(doc_rows(rows, "issue:")) == {"issue:acme/site#12"}
     assert "issue:acme/site#12" not in state["given_up"]
+
+
+def test_failing_runs_within_a_day_forget_nothing_and_a_recovery_clears_them(seeded):
+    # A host that syncs every ten minutes sees four runs of 404s in under an hour.
+    seeded.add_issue(3, updated_at=at(2))
+    state = {}
+    run_sync(seeded, state)
+    seeded.repos[REPO].issues[3]["updated_at"] = at(9)
+
+    for minutes in (10, 20, 30, 40):
+        seeded.queue(_error(404, "Not Found"), when=_on(3))
+        rows = run_sync(seeded, state, now=NOW + timedelta(minutes=minutes))
+        assert tombstones(rows) == []
+    assert state["unreadable"]["issue:acme/site#3"]["runs"] == 4
+    assert state["given_up"] == {}
+
+    # GitHub recovers: the issue is read again and its failures are forgotten.
+    rows = run_sync(seeded, state, now=hours(1))
+    assert set(doc_rows(rows, "issue:")) == {"issue:acme/site#3"}
+    assert state["unreadable"] == {} and state["retry"] == []
+
+
+def test_a_partial_outage_answering_404_everywhere_forgets_nothing(seeded, caplog):
+    # Every issue's comments answer 404, the check of an unchanged issue included.
+    for number in (3, 4):
+        seeded.add_issue(number, updated_at=at(2))
+    state = {}
+    run_sync(seeded, state)
+    for number in (1, 3):
+        seeded.repos[REPO].issues[number]["updated_at"] = at(9)
+
+    for run in (1, 2, 3, 4):
+        for number in (1, 3, 4):
+            seeded.queue(_error(404, "Not Found"), when=_on(number))
+        stats = {}
+        rows = run_sync(seeded, state, now=hours(24 * run), stats=stats)
+        assert tombstones(rows) == []
+        assert stats["probe_issue"] == 1 and stats["given_up"] == 0
+        assert stats["failed_permission"] == 2
+        assert state["unreadable"] == {}
+    assert "issues: every fetch answered 403/404 this run; check the token's" in caplog.text
+    assert {"issue:acme/site#1", "issue:acme/site#3"} <= set(state["known_ids"])
+
+
+def test_counts_from_earlier_runs_never_give_up_in_a_run_that_counted_nothing(seeded):
+    # Three counted runs within an hour; a day later the check fails too.
+    seeded.add_issue(3, updated_at=at(2))
+    state = {}
+    run_sync(seeded, state)
+    seeded.repos[REPO].issues[3]["updated_at"] = at(9)
+    for minutes in (10, 20, 30):
+        seeded.queue(_error(404, "Not Found"), when=_on(3))
+        run_sync(seeded, state, now=NOW + timedelta(minutes=minutes))
+    assert state["unreadable"]["issue:acme/site#3"]["runs"] == 3
+
+    seeded.queue(_error(403, "Forbidden"), when=_on(1))  # the check fails too
+    seeded.queue(_error(404, "Not Found"), when=_on(3))
+    stats = {}
+    rows = run_sync(seeded, state, now=hours(25), stats=stats)
+    assert tombstones(rows) == [] and stats["given_up"] == 0
+    assert stats["failed_permission"] == 1
+
+    # The same with a check that hits a server error.
+    for response in _render_failure(500):
+        seeded.queue(response, when=_on(1))
+    seeded.queue(_error(404, "Not Found"), when=_on(3))
+    stats = {}
+    rows = run_sync(seeded, state, now=hours(26), stats=stats)
+    assert tombstones(rows) == [] and stats["given_up"] == 0
+    assert "failed_permission" not in stats
+    assert state["unreadable"]["issue:acme/site#3"]["runs"] == 3
+
+
+def test_the_check_never_reads_a_given_up_issue(seeded):
+    # Issue 9 is forgotten (and still hidden); issue 4 is newly hidden. The
+    # check must read issue 3, not the newer but forgotten issue 9.
+    for number in (3, 4, 9):
+        seeded.add_issue(number, updated_at=at(2))
+    state = {}
+    run_sync(seeded, state)
+    state["given_up"] = {"issue:acme/site#9": {"stamp": at(2), "at": _stamp(NOW)}}
+    state["known_ids"].remove("issue:acme/site#9")
+    seeded.repos[REPO].issues[4]["updated_at"] = at(9)
+    seeded.queue(_error(403, "Forbidden"), when=_on(4))
+    seeded.queue(_error(404, "Not Found"), when=_on(9))
+    stats = {}
+
+    run_sync(seeded, state, now=hours(1), stats=stats)
+
+    assert "failed_permission" not in stats and stats["probe_issue"] == 1
+    assert seeded.requested("/issues/3/comments")
+    assert state["unreadable"]["issue:acme/site#4"]["runs"] == 1
+
+
+def test_a_check_answering_a_server_error_counts_nothing(seeded, caplog):
+    seeded.add_issue(3, updated_at=at(2))
+    state = {}
+    run_sync(seeded, state)
+    seeded.repos[REPO].issues[3]["updated_at"] = at(9)
+    seeded.queue(_error(404, "Not Found"), when=_on(3))
+    for response in _render_failure(500):  # the check: GitHub is failing, which proves nothing
+        seeded.queue(response, when=_on(1))
+    stats = {}
+
+    rows = run_sync(seeded, state, now=hours(12), stats=stats)
+
+    assert tombstones(rows) == []
+    assert stats["probe_issue"] == 1 and "failed_permission" not in stats
+    assert state["unreadable"] == {} and state["retry"] == ["issue:acme/site#3"]
+    assert "check the token's permissions" not in caplog.text
+
+
+def test_a_given_up_issue_is_asked_again_after_a_day(seeded):
+    seeded.add_issue(3, updated_at=at(2))
+    state = {}
+    run_sync(seeded, state)
+    seeded.repos[REPO].issues[3]["updated_at"] = at(9)
+    for run in (1, 2, 3):
+        seeded.queue(_error(404, "Not Found"), when=_on(3))
+        run_sync(seeded, state, now=hours(12 * run))
+    row = "issue:acme/site#3"
+    assert state["given_up"] == {row: {"stamp": at(9), "at": _stamp(hours(36))}}
+
+    # Not asked within the day; asked a day later, and still unreadable.
+    run_sync(seeded, state, now=hours(59))
+    assert 3 not in fetched_issues(seeded)
+    seeded.queue(_error(404, "Not Found"), when=_on(3))
+    stats = {}
+    rows = run_sync(seeded, state, now=hours(60), stats=stats)
+    assert 3 in fetched_issues(seeded) and tombstones(rows) == []
+    assert row not in doc_rows(rows)
+    assert stats["failed"] == 1 and stats["kept"] == 0
+    assert state["given_up"][row]["at"] == _stamp(hours(60))
+    assert state["retry"] == [] and state["unreadable"] == {}
+
+    # Readable again a day later, though never edited: it comes back, and stays.
+    rows = run_sync(seeded, state, now=hours(84))
+    assert set(doc_rows(rows, "issue:")) == {row}
+    assert state["given_up"] == {} and row in state["known_ids"]
+    assert tombstones(run_sync(seeded, state, now=hours(85))) == []
+
+
+def test_given_up_issues_are_asked_again_a_few_per_run_oldest_first(seeded, monkeypatch):
+    monkeypatch.setattr(github, "_MAX_REASKS", 1)
+    for number in (3, 4):
+        seeded.add_issue(number, updated_at=at(2))
+    state = {}
+    run_sync(seeded, state)
+    # Issues 3 and 4 were forgotten two and three days ago.
+    state["given_up"] = {
+        "issue:acme/site#3": {"stamp": at(2), "at": _stamp(hours(-48))},
+        "issue:acme/site#4": {"stamp": at(2), "at": _stamp(hours(-72))},
+    }
+    state["known_ids"] = [r for r in state["known_ids"] if not r.endswith(("#3", "#4"))]
+    seeded.add_issue(5, updated_at=at(9))
+
+    rows = run_sync(seeded, state)
+
+    assert fetched_issues_in_order(seeded) == [5, 4]  # new issues first, then the oldest one
+    assert set(doc_rows(rows, "issue:")) == {"issue:acme/site#4", "issue:acme/site#5"}
+    assert list(state["given_up"]) == ["issue:acme/site#3"]
+
+
+def test_a_run_that_stops_early_counts_nothing_toward_giving_up(seeded):
+    # Issues are settled before pull requests, so a stop in the pull request
+    # check comes after issue 3 was counted a third time in memory.
+    seeded.add_issue(3, updated_at=at(2))
+    seeded.add_issue(4, updated_at=at(2))
+    seeded.add_issue(5, updated_at=at(2), pr=True)
+    state = {}
+    run_sync(seeded, state)
+    seeded.repos[REPO].issues[3]["updated_at"] = at(9)
+    for run in (1, 2):
+        seeded.queue(_error(403, "Forbidden"), when=_on(3))
+        run_sync(seeded, state, now=hours(12 * run))
+    unreadable = copy.deepcopy(state["unreadable"])
+    assert unreadable["issue:acme/site#3"]["runs"] == 2
+    # Issue 4 was forgotten a day ago and is due to be asked again.
+    state["given_up"] = {"issue:acme/site#4": {"stamp": at(2), "at": _stamp(hours(24))}}
+    state["known_ids"].remove("issue:acme/site#4")
+
+    # Run 3: issue 1 is read and issue 3 answers 403 again (counted: a third
+    # run, over a day), issue 4 is still hidden, pull request 2 answers 403, and
+    # the check of pull request 5 finds the token revoked: the run stops.
+    seeded.repos[REPO].issues[1]["updated_at"] = at(10)
+    seeded.repos[REPO].issues[2]["updated_at"] = at(10)
+    seeded.queue(_error(403, "Forbidden"), when=_on(3))
+    seeded.queue(_error(404, "Not Found"), when=_on(4))
+    seeded.queue(_error(403, "Forbidden"), when=_pull_detail(2))
+    seeded.queue(_error(401, "Bad credentials"), when=_pull_detail(5))
+    stats = {}
+    rows = run_sync(seeded, state, now=hours(48), stats=stats)
+
+    assert stats["failed_auth"] == 1 and stats["probe_pr"] == 1
+    assert tombstones(rows) == [] and stats["given_up"] == 0
+    assert seeded.requested("/issues/4/comments")  # the re-ask did happen
+    assert state["unreadable"] == unreadable  # not a third run
+    assert state["given_up"] == {"issue:acme/site#4": {"stamp": at(2), "at": _stamp(hours(24))}}
+
+
+def test_state_of_the_previous_version_is_read(seeded):
+    seeded.add_issue(3, updated_at=at(2))
+    state = {}
+    run_sync(seeded, state)
+    # Round-2 shapes: given_up held only the stamp; unreadable had no since, and
+    # entries for a lost permission had runs 0.
+    state["given_up"] = {"issue:acme/site#3": at(2)}
+    state["known_ids"].remove("issue:acme/site#3")
+    state["unreadable"] = {"pr:acme/site#2": {"stamp": at(3), "runs": 0}}
+    state["retry"] = ["pr:acme/site#2"]
+    # The pull request still answers 403, with no other one to check with.
+    seeded.queue(_error(403, "Resource not accessible"), when=_pull_detail(2))
+
+    rows = run_sync(seeded, state, now=hours(1))
+
+    # The given-up issue is due at once and reads again; the runs-0 entry is
+    # dropped, though its pull request is still kept for a retry.
+    assert "issue:acme/site#3" in doc_rows(rows)
+    assert state["given_up"] == {} and state["unreadable"] == {}
+    assert state["retry"] == ["pr:acme/site#2"]
+
+    # An unreadable entry without since gets one from the run clock.
+    seeded.repos[REPO].issues[1]["updated_at"] = at(9)
+    state["unreadable"] = {"issue:acme/site#1": {"stamp": at(9), "runs": 2}}
+    seeded.queue(_error(404, "Not Found"), when=_on(1))
+    stats = {}
+    run_sync(seeded, state, now=hours(2), stats=stats)
+    entry = state["unreadable"]["issue:acme/site#1"]
+    assert entry == {"stamp": at(9), "runs": 3, "since": _stamp(hours(2))}
+    assert stats["given_up"] == 0  # three runs, but not over a day
 
 
 def test_retries_go_last_and_never_count_toward_an_outage(seeded):
@@ -1549,53 +1791,97 @@ def _pull_detail(number):
 
 def test_every_pull_request_answering_403_is_a_permission_problem_not_a_deletion(seeded, caplog):
     # A fine-grained token without "Pull requests: read": the listing shows the
-    # pull requests, but every /pulls/N answers 403. Issues still read fine.
-    seeded.add_issue(3, updated_at=at(2), pr=True)
+    # pull requests, but every /pulls/N answers 403, the check of an unchanged
+    # one (#4) included. Issues still read fine.
+    for number in (3, 4):
+        seeded.add_issue(number, updated_at=at(2), pr=True)
     state = {}
     run_sync(seeded, state)
     seeded.repos[REPO].issues[1]["updated_at"] = at(9)
     for number in (2, 3):
         seeded.repos[REPO].issues[number]["updated_at"] = at(9)
 
-    for _ in range(4):
-        for number in (2, 3):
+    for run in (1, 2, 3, 4):
+        for number in (2, 3, 4):
             seeded.queue(_error(403, "Resource not accessible"), when=_pull_detail(number))
         caplog.clear()
         stats = {}
-        rows = run_sync(seeded, state, stats=stats)
+        rows = run_sync(seeded, state, now=hours(24 * run), stats=stats)
         assert tombstones(rows) == []
-        assert stats["failed_permission"] == 2
-        assert {row: e["runs"] for row, e in state["unreadable"].items()} == {
-            "pr:acme/site#2": 0,
-            "pr:acme/site#3": 0,
-        }
+        assert stats["failed_permission"] == 2 and stats["probe_pr"] == 1
+        assert state["unreadable"] == {}
         assert (
             caplog.text.count(
-                "pull requests: every fetch answered 403 this run; check the token's permissions"
+                "pull requests: every fetch answered 403/404 this run; "
+                "check the token's permissions"
             )
             == 1
         )
-    assert {"pr:acme/site#2", "pr:acme/site#3"} <= set(state["known_ids"])
+    assert {"pr:acme/site#2", "pr:acme/site#3", "pr:acme/site#4"} <= set(state["known_ids"])
 
 
-def test_one_pull_request_answering_403_while_others_read_is_given_up(seeded):
+def test_with_no_other_item_to_check_with_nothing_counts(seeded, caplog):
+    # The only pull request answers 403 and there is none to compare with.
+    state = {}
+    run_sync(seeded, state)
+    seeded.repos[REPO].issues[2]["updated_at"] = at(9)
+    for run in (1, 2, 3, 4):
+        seeded.queue(_error(403, "Resource not accessible"), when=_pull_detail(2))
+        stats = {}
+        rows = run_sync(seeded, state, now=hours(24 * run), stats=stats)
+        assert tombstones(rows) == [] and stats["failed_permission"] == 1
+        assert "probe_pr" not in stats and state["unreadable"] == {}
+    assert (
+        "acme/site pull requests: every fetch answered 403/404 this run and there is no other "
+        "pull request in acme/site to check access with; nothing counts toward forgetting it."
+        in caplog.text
+    )
+
+
+def test_access_is_shown_per_repository_not_across_them(seeded, caplog):
+    # An organization restricts the token on acme/site only: its pull requests
+    # and the check answer 403, while those of other/app read fine. A pull
+    # request read in other/app proves nothing about acme/site.
+    other = "other/app"
+    seeded.add_repo(other)
+    seeded.add_issue(1, updated_at=at(2), pr=True, repo=other)
+    seeded.add_issue(3, updated_at=at(2), pr=True)
+    repos = (REPO, other)
+    state = {}
+    run_sync(seeded, state, repos)
+
+    for run, when in ((1, 0), (2, 12), (3, 25)):
+        seeded.repos[REPO].issues[2]["updated_at"] = at(10 + run)
+        seeded.repos[other].issues[1]["updated_at"] = at(10 + run)
+        seeded.queue(_error(403, "Resource not accessible"), when=_pull_detail(2))
+        seeded.queue(_error(403, "Resource not accessible"), when=_pull_detail(3))
+        stats = {}
+        rows = run_sync(seeded, state, repos, now=hours(when), stats=stats)
+        assert "pr:other/app#1" in doc_rows(rows)
+        assert tombstones(rows) == [] and stats["given_up"] == 0
+        assert stats["failed_permission"] == 1 and stats["probe_pr"] == 1
+    assert state["unreadable"] == {} and "pr:acme/site#2" in state["known_ids"]
+    assert "acme/site pull requests: every fetch answered 403/404 this run" in caplog.text
+
+
+def test_one_hidden_pull_request_among_unchanged_ones_is_given_up(seeded, caplog):
+    # Steady state: #2 is unchanged and skipped, so only #3 is fetched, and #2
+    # is read once per run to show that pull requests can be read.
     seeded.add_issue(3, updated_at=at(2), pr=True)
     state = {}
     run_sync(seeded, state)
+    seeded.repos[REPO].issues[3]["updated_at"] = at(9)
 
     for run in (1, 2, 3):
-        # #2 changes every run and reads fine; #3 stays hidden.
-        seeded.repos[REPO].issues[2]["updated_at"] = at(10 + run)
-        seeded.repos[REPO].issues[3]["updated_at"] = at(9)
         seeded.queue(_error(403, "Resource not accessible"), when=_pull_detail(3))
         stats = {}
-        rows = run_sync(seeded, state, stats=stats)
-        assert "failed_permission" not in stats
-        if run < 3:
-            assert tombstones(rows) == []
-            assert state["unreadable"]["pr:acme/site#3"]["runs"] == run
+        rows = run_sync(seeded, state, now=hours(12 * run), stats=stats)
+        assert stats["probe_pr"] == 1 and "failed_permission" not in stats
+        assert seeded.requested("/pulls/2") == [f"{API}/repos/{REPO}/pulls/2"]
+        assert doc_rows(rows, "pr:") == {}  # the check is not emitted
     assert tombstones(rows) == [{"id": "pr:acme/site#3", "_deleted": True}]
     assert stats["given_up"] == 1
+    assert "check the token's permissions" not in caplog.text
 
 
 def test_a_success_between_server_errors_resets_the_outage_streak(seeded):
@@ -1631,20 +1917,26 @@ def test_issue_body_of_the_wrong_shape_aborts(seeded):
 
 
 def test_missing_number_with_no_clear_answer_is_given_up_after_three_runs(seeded):
+    seeded.add_issue(3, updated_at=at(2))  # an issue to check access with
     state = {}
     run_sync(seeded, state)
     seeded.repos[REPO].issues.pop(1)  # gone from the listing, answers 404
 
     for run in (1, 2):
         stats = {}
-        rows = run_sync(seeded, state, stats=stats)
+        rows = run_sync(seeded, state, now=hours(12 * run), stats=stats)
         assert tombstones(rows) == [] and stats["kept"] == 1
-        assert state["unreadable"]["issue:acme/site#1"] == {"stamp": "missing", "runs": run}
+        assert stats["probe_issue"] == 1
+        assert state["unreadable"]["issue:acme/site#1"] == {
+            "stamp": "missing",
+            "runs": run,
+            "since": _stamp(hours(12)),
+        }
     stats = {}
-    rows = run_sync(seeded, state, stats=stats)
+    rows = run_sync(seeded, state, now=hours(36), stats=stats)
     assert tombstones(rows) == [{"id": "issue:acme/site#1", "_deleted": True}]
     assert stats["given_up"] == 1 and state["unreadable"] == {}
-    run_sync(seeded, state)
+    run_sync(seeded, state, now=hours(37))
     assert seeded.requested("/issues/1") == []  # not asked again
 
 
@@ -1745,6 +2037,14 @@ def test_the_token_is_never_in_an_error_message_or_a_log_line(fake, caplog, slee
     assert str(excinfo.value) == "GitHub /repos/acme/site: HTTP 401"
     assert SECRET not in str(excinfo.value) and SECRET not in excinfo.value.detail
     assert SECRET not in caplog.text
+
+    # A message that echoes the token: detail keeps the message, not the token.
+    fake.headers = {"Authorization": f"Bearer {SECRET}"}
+    fake.queue(_error(401, f"Bad credentials {SECRET}"))
+    with pytest.raises(GitHubAPIError) as excinfo:
+        run_sync(fake, {})
+    assert excinfo.value.detail == "Bad credentials [token]"
+    assert SECRET not in caplog.text
     assert "InvalidHeader" in caplog.text  # the retries were logged by type
 
 
@@ -1759,6 +2059,66 @@ def test_waits_are_capped_and_ask_check_active_first(fake, sleeps):
     assert excinfo.value.rate_limited
     assert sleeps == [30.0]  # the 61 s wait was not taken
     assert checks == [0, 0, 1]  # before the request, before the wait, before the retry
+
+
+def test_redact_cuts_the_token_out_and_drops_text_for_a_short_one():
+    assert github._redact(f"bad token {SECRET}", SECRET) == "bad token [token]"
+    assert github._redact("Not Found", SECRET) == "Not Found"
+    assert github._redact("anything", "") == "anything"
+    assert github._redact("bad token abc", "abc") == ""  # too short to replace safely
+
+
+def test_a_run_waits_at_most_its_budget_in_all(seeded, sleeps):
+    state = {}
+    run_sync(seeded, state)
+    seeded.repos[REPO].issues[1]["updated_at"] = at(9)
+    for _ in range(github._MAX_RETRIES):  # secondary limits, 50 s each
+        seeded.queue(_error(403, "slow down", {"Retry-After": "50"}), when=_on(1))
+    stats = {}
+
+    rows = run_sync(seeded, state, stats=stats)
+
+    assert sleeps == [50.0, 50.0]  # a third wait would pass the 120 s budget
+    assert stats["failed_rate_limit"] == 1 and stats["failed"] == 1
+    assert tombstones(rows) == []
+    seeded._queued.clear()
+    assert "issue:acme/site#1" in doc_rows(run_sync(seeded, state))  # resumed
+
+
+def test_server_errors_past_the_wait_budget_stop_the_run_cleanly(seeded, sleeps):
+    for number in range(3, 23):
+        seeded.add_issue(number, updated_at=at(2))
+    state = {}
+    run_sync(seeded, state)
+    for number in range(3, 23):
+        seeded.repos[REPO].issues[number]["updated_at"] = at(9)
+        if number % 2:  # failing issues between readable ones: no outage streak
+            for response in _render_failure(500):
+                seeded.queue(response, when=_on(number))
+    stats = {}
+
+    rows = run_sync(seeded, state, stats=stats)
+
+    assert sum(sleeps) <= github._MAX_TOTAL_WAIT_SECONDS
+    assert stats["failed_unavailable"] == 1 and tombstones(rows) == []
+
+
+def test_server_time_is_read_as_utc_and_the_run_clock_takes_the_later_one(
+    seeded, monkeypatch, caplog
+):
+    unknown_zone = _Resp(200, {}, {"Date": "Mon, 19 Oct 2026 06:00:00 -0000"})
+    assert _server_time(unknown_zone) == datetime(2026, 10, 19, 6, 0, 0, tzinfo=UTC)
+
+    # A proxy serves a Date a day old: the run clock is the local one.
+    monkeypatch.setattr(github, "_local_now", lambda: NOW)
+    seeded.clock = NOW - timedelta(days=1)
+    client = github._Client(seeded)
+    _get(client, _url(f"/repos/{REPO}"))
+    assert github._run_clock(client) == NOW
+    assert "differ by 86400s" in caplog.text
+    # A local clock that runs behind: GitHub's.
+    monkeypatch.setattr(github, "_local_now", lambda: NOW - timedelta(days=2))
+    assert github._run_clock(client) == NOW - timedelta(days=1)
 
 
 def test_empty_selection_raises(fake):
@@ -1814,3 +2174,9 @@ def test_sync_stats_count_what_a_run_did(seeded):
         "kept": 0,
         "given_up": 0,
     }
+
+    # A run stopped by a rate limit while listing says why, with no failure invented.
+    seeded.queue(_error(429, "slow down", {"Retry-After": "120"}))
+    list(source)
+    assert source.cognee_sync_stats["failed"] == 0
+    assert source.cognee_sync_stats["failed_rate_limit"] == 1
