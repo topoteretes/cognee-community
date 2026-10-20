@@ -226,3 +226,19 @@ checks) and valid model configuration to run the example. Repeat with an edit,
 an unchanged rerun, a deletion while another document remains, and deletion of the
 final document. Verify Cognee Data records, graph and vector contents as well as
 search results. An empty dataset may raise `NoDataError`, which the example handles.
+
+## Live Azure validation
+
+Validated on 20 October 2026 with real Azure Blob Storage, DeepSeek, and local
+fastembed embeddings on Cognee 1.6.5 (dlt 1.30.0, azure-storage-blob 12.31.0).
+The live matrix covered initial ingestion, unchanged reruns, overwrites, partial
+and final-document deletion, size/count limits, metadata changes, and independent
+destinations. Additional source/dlt checks covered text formats, pagination,
+conditional-read races and failure recovery. Final-document deletion left no
+staging rows, Data records, graph nodes/edges, or rows in the inspected vector tables.
+
+The automated suite passed 61 cases. Ruff lint and formatting checks passed.
+Live authentication used an account key; SAS configuration was tested offline.
+
+[Portal screenshots, measured tables, raw results, and reproduction steps](https://github.com/RK-625/cognee-community/tree/48d285cdbec52316695aed16889a5ef11b686360)
+are stored separately from the connector implementation.
