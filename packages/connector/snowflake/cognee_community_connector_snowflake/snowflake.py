@@ -29,6 +29,8 @@ and does not map Snowflake's TIMESTAMP_NTZ type.
 """
 
 import base64
+import datetime
+import decimal
 import hashlib
 import json
 import logging
@@ -413,52 +415,92 @@ def _parse_table(reference: str) -> _TableRef:
     return _TableRef(*names)
 
 
+@dataclass
+class _TableInfo:
+    """What one SHOW round tells us about a table, kept for the row sync."""
+
+    ref: _TableRef
+    description: dict
+    comment: str
+    columns: list[dict]
+    primary_key: list[str]
+    foreign_keys: list[dict]
+    change_tracking: bool
+
+
 def _describe_tables(conn, refs: list[_TableRef]) -> tuple[list[dict], list[_TableRef]]:
-    """Description rows for the tables that exist, and the refs that do not.
+    """Description rows for the tables that exist, and the refs that do not."""
+    infos, missing = _table_infos(_runner(conn), refs)
+    return [info.description for info in infos], missing
+
+
+def _runner(conn) -> Callable[..., list[dict]]:
+    """``run(sql, params=None)`` over one session: rows as dicts, friendly errors."""
+
+    def run(sql: str, params: Any = None) -> list[dict]:
+        return _query(conn, sql, params)
+
+    return run
+
+
+def _table_infos(run, refs: list[_TableRef]) -> tuple[list[_TableInfo], list[_TableRef]]:
+    """Metadata and a description document for each table that exists.
 
     A ref is only reported missing when its schema was listed completely;
     an error listing a schema raises, so it can never look like a dropped table.
     """
-    rows, missing = [], []
+    infos, missing = [], []
     schema_comments: dict[str, dict[str, str]] = {}
     for database, schema in sorted({(ref.database, ref.schema) for ref in refs}):
         if database not in schema_comments:
             schema_comments[database] = {
                 row["name"]: row.get("comment") or ""
-                for row in _query(conn, f"SHOW SCHEMAS IN DATABASE {_quote(database)}")
+                for row in run(f"SHOW SCHEMAS IN DATABASE {_quote(database)}")
             }
-        meta = _schema_metadata(conn, database, schema)
+        meta = _schema_metadata(run, database, schema)
         for ref in sorted(r for r in refs if (r.database, r.schema) == (database, schema)):
             if ref.name not in meta["tables"]:
                 missing.append(ref)
                 continue
-            rows.append(
-                _render_table(
-                    ref,
-                    meta["tables"][ref.name],
-                    schema_comments[database].get(schema, ""),
-                    meta["columns"].get(ref.name, []),
-                    meta["primary_keys"].get(ref.name, []),
-                    meta["foreign_keys"].get(ref.name, []),
+            table = meta["tables"][ref.name]
+            columns = meta["columns"].get(ref.name, [])
+            primary_key = meta["primary_keys"].get(ref.name, [])
+            foreign_keys = meta["foreign_keys"].get(ref.name, [])
+            infos.append(
+                _TableInfo(
+                    ref=ref,
+                    description=_render_table(
+                        ref,
+                        table,
+                        schema_comments[database].get(schema, ""),
+                        columns,
+                        primary_key,
+                        foreign_keys,
+                    ),
+                    comment=" ".join(str(table.get("comment") or "").split()),
+                    columns=columns,
+                    primary_key=primary_key,
+                    foreign_keys=foreign_keys,
+                    change_tracking=str(table.get("change_tracking")).upper() == "ON",
                 )
             )
-    return rows, missing
+    return infos, missing
 
 
-def _schema_metadata(conn, database: str, schema: str) -> dict:
+def _schema_metadata(run, database: str, schema: str) -> dict:
     """Tables, columns and declared keys of one schema, four SHOW calls."""
     where = f"{_quote(database)}.{_quote(schema)}"
     columns: dict[str, list[dict]] = {}
-    for row in _query(conn, f"SHOW COLUMNS IN SCHEMA {where}"):
+    for row in run(f"SHOW COLUMNS IN SCHEMA {where}"):
         columns.setdefault(row["table_name"], []).append(row)
     primary_keys: dict[str, list[dict]] = {}
-    for row in _query(conn, f"SHOW PRIMARY KEYS IN SCHEMA {where}"):
+    for row in run(f"SHOW PRIMARY KEYS IN SCHEMA {where}"):
         primary_keys.setdefault(row["table_name"], []).append(row)
     foreign_keys: dict[str, list[dict]] = {}
-    for row in _query(conn, f"SHOW IMPORTED KEYS IN SCHEMA {where}"):
+    for row in run(f"SHOW IMPORTED KEYS IN SCHEMA {where}"):
         foreign_keys.setdefault(row["fk_table_name"], []).append(row)
     return {
-        "tables": {row["name"]: row for row in _query(conn, f"SHOW TABLES IN SCHEMA {where}")},
+        "tables": {row["name"]: row for row in run(f"SHOW TABLES IN SCHEMA {where}")},
         "columns": columns,
         "primary_keys": {
             table: [r["column_name"] for r in sorted(keys, key=lambda r: int(r["key_sequence"]))]
@@ -527,3 +569,195 @@ def _column_type(data_type: Any) -> str:
         length = info.get("length")
         return f"VARCHAR({length})" if length and length < 16777216 else "VARCHAR"
     return {"REAL": "FLOAT"}.get(kind, kind)
+
+
+# ---------------------------------------------------------------------------
+# Rows: one document per row, read only when the table changed.
+#
+# Rows go down cognee's document path. On cognee 1.6.4 a relational dlt source
+# only reaches the graph on its first add: later merges, deletes included, do
+# not change it, and the documented rebuild fails with IngestionError 415. The
+# document path updates and forgets per row, like the Google Calendar connector.
+#
+# SYSTEM$LAST_CHANGE_COMMIT_TIME runs without a warehouse, so a table that did
+# not change since the last sync costs no warehouse time at all.
+# ---------------------------------------------------------------------------
+
+
+def _iter_rows(run, fetch, refs, state, stats, keys=None, full_refresh=False):
+    """Yield table and row documents, and ``_deleted`` rows for what is gone.
+
+    ``run(sql, params)`` returns all rows of a small query, ``fetch(sql)``
+    yields the rows of a large one in batches, and ``state`` is dlt's resource
+    state. A table that fails keeps its saved state and is retried on the next
+    run while the others finish. The run raises only when no table finished,
+    or on a login problem, since every table would fail the same way.
+    """
+    selected = {ref.fqn for ref in refs}
+    saved = state.setdefault("tables", {})
+    infos, missing = _table_infos(run, refs)
+
+    # A table dropped upstream, or no longer selected, takes its rows with it.
+    for fqn in sorted({ref.fqn for ref in missing} | (set(saved) - selected)):
+        if fqn in saved:
+            yield from _forget_table(fqn, saved.pop(fqn), stats)
+
+    synced, failed = 0, 0
+    for info in infos:
+        table_stats: dict[str, int] = {}
+        try:
+            # Collected per table, so a table that fails half way emits and
+            # counts nothing.
+            documents = list(
+                _sync_table(run, fetch, info, saved, table_stats, keys or {}, full_refresh)
+            )
+        except SnowflakeAuthError:
+            raise
+        except SnowflakeConnectorError as error:
+            failed += 1
+            logger.warning(
+                "Snowflake: a table failed to sync (%s); it keeps its state and is retried "
+                "on the next run.",
+                type(error).__name__,
+            )
+            continue
+        synced += 1
+        for name, count in table_stats.items():
+            stats[name] = stats.get(name, 0) + count
+        yield from documents
+
+    if failed:
+        stats["failed"] = failed
+    logger.info(
+        "Snowflake: %d table(s) synced, %d unchanged, %d row(s) read, %d forgotten, %d failed.",
+        synced,
+        stats.get("unchanged", 0),
+        stats.get("rows", 0),
+        stats.get("deleted", 0),
+        failed,
+    )
+    if failed and not synced:
+        raise SnowflakeConnectorError(
+            f"No Snowflake table could be synced: {failed} failed. Nothing was forgotten."
+        )
+
+
+def _sync_table(run, fetch, info, saved, stats, keys, full_refresh):
+    """One table: its description, then its rows if it changed since the last sync."""
+    ref = info.ref
+    yield info.description
+
+    key_columns = keys.get(ref.fqn) or info.primary_key
+    if not key_columns:
+        # Without a key a row has no stable identity, so it could never be
+        # updated or forgotten. The table is described, its rows are not read.
+        stats["no_key"] = stats.get("no_key", 0) + 1
+        logger.warning(
+            "Snowflake: a table has no primary key, so only its description is synced. "
+            "Declare one, or pass keys={...} for it."
+        )
+        return
+
+    last_change = str(
+        run("SELECT SYSTEM$LAST_CHANGE_COMMIT_TIME(%s) AS LAST_CHANGE", (ref.sql,))[0][
+            "LAST_CHANGE"
+        ]
+    )
+    before = saved.get(ref.fqn) or {}
+    unchanged = (
+        before.get("last_change") == last_change and before.get("key_columns") == key_columns
+    )
+    if unchanged and not full_refresh:
+        stats["unchanged"] = stats.get("unchanged", 0) + 1
+        return
+
+    order = ", ".join(_quote(column) for column in key_columns)
+    seen: set[str] = set()
+    for row in fetch(f"SELECT * FROM {ref.sql} ORDER BY {order}"):
+        key = _row_key(key_columns, row)
+        if key in seen:
+            continue
+        seen.add(key)
+        stats["rows"] = stats.get("rows", 0) + 1
+        yield _render_row(info, row, key)
+
+    # Only after the whole table was read: what was there before and is not now.
+    for key in sorted(set(before.get("keys", [])) - seen):
+        stats["deleted"] = stats.get("deleted", 0) + 1
+        yield {"id": _row_id(ref.fqn, key), "_deleted": True}
+
+    saved[ref.fqn] = {"last_change": last_change, "key_columns": key_columns, "keys": sorted(seen)}
+
+
+def _forget_table(fqn: str, table_state: dict, stats: dict):
+    """``_deleted`` rows for a table's description and every row it had."""
+    stats["deleted"] = stats.get("deleted", 0) + 1 + len(table_state.get("keys", []))
+    yield {"id": f"{ID_PREFIX}table:{fqn}", "_deleted": True}
+    for key in sorted(table_state.get("keys", [])):
+        yield {"id": _row_id(fqn, key), "_deleted": True}
+
+
+def _row_id(fqn: str, key: str) -> str:
+    return f"{ID_PREFIX}row:{fqn}:{key}"
+
+
+def _row_key(key_columns: list[str], row: dict) -> str:
+    """The row's primary key as text: values joined with |, which is escaped."""
+    parts = []
+    for column in key_columns:
+        value = _format_value(row.get(column))
+        parts.append(value.replace("\\", "\\\\").replace("|", "\\|"))
+    return "|".join(parts)
+
+
+def _render_row(info: _TableInfo, row: dict, key: str) -> dict:
+    """One row as a short document, with its table's description for context.
+
+    Columns follow the table's order, empty values are left out, and a column
+    with a declared foreign key names the table it points to, so cognee can
+    link an order to its customer.
+    """
+    ref = info.ref
+    lines = [f"Row of Snowflake table {ref.fqn}"]
+    if info.comment:
+        lines.append(f"Table: {info.comment}")
+    links = {}
+    for foreign_key in info.foreign_keys:
+        target = ".".join(
+            foreign_key[part] for part in ("pk_database_name", "pk_schema_name", "pk_table_name")
+        )
+        links[foreign_key["fk_column_name"]] = target
+    names = [column["column_name"] for column in info.columns] or sorted(row)
+    for name in names:
+        value = _format_value(row.get(name))
+        if value == "":
+            continue
+        line = f"{name}: {value}"
+        if name in links:
+            line += f" (references {links[name]})"
+        lines.append(line)
+    return {
+        "id": _row_id(ref.fqn, key),
+        "title": f"{ref.name} {key}",
+        "content": "\n".join(lines),
+        "_deleted": False,
+    }
+
+
+def _format_value(value: Any) -> str:
+    """A cell as stable text: same value, same text, on every sync."""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (datetime.datetime, datetime.date, datetime.time)):
+        return (
+            value.isoformat(sep=" ") if isinstance(value, datetime.datetime) else value.isoformat()
+        )
+    if isinstance(value, (bytes, bytearray)):
+        return f"({len(value)} bytes of binary data)"
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, sort_keys=True, default=str)
+    if isinstance(value, decimal.Decimal):
+        return str(value)
+    return " ".join(str(value).split())

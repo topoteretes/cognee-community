@@ -139,3 +139,62 @@ def metadata_session(schemas):
         raise AssertionError(f"unexpected SQL: {sql}")
 
     return FakeConnection(answers)
+
+
+class FakeAccount:
+    """An in-memory Snowflake account for the row sync.
+
+    It answers the SHOW commands from a ``sales_schema()``-like dict, keeps rows
+    per table, and moves a table's SYSTEM$LAST_CHANGE_COMMIT_TIME on every
+    insert, update and delete, the way a real account did.
+    """
+
+    def __init__(self, database="SALES_DB", schema="SALES", meta=None):
+        self.database, self.schema = database, schema
+        self.meta = meta or sales_schema()
+        self.rows: dict[str, dict] = {table["name"]: {} for table in self.meta["tables"]}
+        self.commits: dict[str, int] = dict.fromkeys(self.rows, 1)
+        self.sql: list[str] = []
+        self.failing: dict[str, Exception] = {}
+        self._clock = 100
+
+    # -- building and changing data ------------------------------------------
+    def key_of(self, table):
+        return [k["column_name"] for k in self.meta["primary_keys"] if k["table_name"] == table]
+
+    def _commit(self, table):
+        self._clock += 1
+        self.commits[table] = self._clock
+
+    def insert(self, table, **row):
+        key = tuple(row.get(column) for column in self.key_of(table) or sorted(row))
+        self.rows[table][key] = row
+        self._commit(table)
+
+    def update(self, table, key, **changes):
+        self.rows[table][key].update(changes)
+        self._commit(table)
+
+    def delete(self, table, key):
+        del self.rows[table][key]
+        self._commit(table)
+
+    def drop(self, table):
+        self.meta["tables"] = [t for t in self.meta["tables"] if t["name"] != table]
+        del self.rows[table]
+
+    # -- the two query functions the sync takes --------------------------------
+    def run(self, sql, params=None):
+        self.sql.append(sql)
+        if sql.startswith("SELECT SYSTEM$LAST_CHANGE_COMMIT_TIME"):
+            table = params[0].split(".")[-1].strip('"')
+            return [{"LAST_CHANGE": self.commits[table]}]
+        return metadata_session({(self.database, self.schema): self.meta}).answers(sql)
+
+    def fetch(self, sql):
+        self.sql.append(sql)
+        table = sql.split(" FROM ")[1].split(" ")[0].split(".")[-1].strip('"')
+        if table in self.failing:
+            raise self.failing[table]
+        rows = [dict(row) for _, row in sorted(self.rows[table].items(), key=lambda kv: str(kv[0]))]
+        yield from rows
