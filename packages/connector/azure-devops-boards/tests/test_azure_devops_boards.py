@@ -14,7 +14,10 @@ import pytest
 
 from cognee_community_connector_azure_devops_boards import azure_devops_boards as boards
 from cognee_community_connector_azure_devops_boards.azure_devops_boards import (
+    AzureDevOpsAccessError,
+    AzureDevOpsAuthError,
     AzureDevOpsClient,
+    AzureDevOpsError,
     _clean_html,
     _Scope,
     azure_devops_boards_source,
@@ -48,8 +51,12 @@ class FakeAzureDevOps:
     continuation token is simply the last revision number a caller has seen.
     """
 
-    def __init__(self, items=()):
+    def __init__(self, items=(), feed_page=None):
         self.organization_url = ORG_URL
+        self.feed_page = feed_page  # revisions per feed page, None = one page
+        self.stuck_feed = False
+        self.omit: set[int] = set()  # live items the batch call leaves out anyway
+        self.teams_error: Exception | None = None
         self.items: dict[int, dict] = {}
         self.comments: dict[int, list[dict]] = {}
         self.recycle_bin: set[int] = set()
@@ -57,7 +64,6 @@ class FakeAzureDevOps:
         self.revision = 0
         self.calls: list[tuple[str, str]] = []
         self.batch_sizes: list[int] = []
-        self.fail_teams = False
         self.fail_batch = False
         self.sweep_returns_nothing = False
         for item in items:
@@ -97,18 +103,28 @@ class FakeAzureDevOps:
         self.calls.append(("GET", path))
         if path.endswith("/_apis/wit/reporting/workitemrevisions"):
             since = int(params.get("continuationToken") or 0)
-            values = [
-                {"id": wid, "rev": rev, "fields": {"System.Id": wid}}
+            pending = [
+                (wid, rev)
                 for wid, rev in sorted(self.changed_at.items(), key=lambda kv: kv[1])
                 if rev > since
             ]
-            return {"values": values, "continuationToken": str(self.revision), "isLastBatch": True}
+            page = pending[: self.feed_page] if self.feed_page else pending
+            values = [
+                {"id": wid, "rev": rev, "fields": {"System.Id": wid}}
+                | ({"isDeleted": True} if wid in self.recycle_bin else {})
+                for wid, rev in page
+            ]
+            last = len(page) == len(pending)
+            token = str(page[-1][1]) if page else str(since)
+            if self.stuck_feed and not last:
+                token = params.get("continuationToken") or "0"
+            return {"values": values, "continuationToken": token, "isLastBatch": last}
         if "/comments" in path:
             wid = int(path.split("/workItems/")[1].split("/")[0])
             return {"comments": list(self.comments.get(wid, []))}
         if path.endswith("/teams"):
-            if self.fail_teams:
-                raise RuntimeError("403 Forbidden")
+            if self.teams_error:
+                raise self.teams_error
             return {"value": [{"name": "Payments team"}]}
         if path.endswith("/_apis/work/boards"):
             return {"value": [{"id": "b1", "name": "Stories"}]}
@@ -127,7 +143,9 @@ class FakeAzureDevOps:
             assert body["errorPolicy"] == "Omit"
             return {
                 "value": [
-                    self.items[i] if i in self.items and i not in self.recycle_bin else None
+                    self.items[i]
+                    if i in self.items and i not in self.recycle_bin and i not in self.omit
+                    else None
                     for i in body["ids"]
                 ]
             }
@@ -408,7 +426,7 @@ def test_board_columns_are_labelled_with_team_and_board():
 
 def test_board_columns_fall_back_to_raw_values_without_team_access():
     fake = FakeAzureDevOps([work_item(1, **{"WEF_ABC123_Kanban.Column": "Doing"})])
-    fake.fail_teams = True
+    fake.teams_error = AzureDevOpsAccessError("Azure DevOps returned HTTP 403", status=403)
 
     rows = run(fake, {})
 
@@ -504,7 +522,7 @@ def test_client_honours_retry_after_sent_on_a_200(clock):
 
 
 def test_client_backs_off_on_server_errors_then_gives_up(clock):
-    session = _Session([_Response(503) for _ in range(boards._MAX_RETRIES)])
+    session = _Session([_Response(503) for _ in range(boards._MAX_ATTEMPTS)])
     client = AzureDevOpsClient(ORG_URL, "pat", session=session)
 
     with pytest.raises(RuntimeError, match="503"):
@@ -512,13 +530,46 @@ def test_client_backs_off_on_server_errors_then_gives_up(clock):
     assert clock == [1.0, 2.0, 4.0, 8.0]
 
 
-def test_client_does_not_retry_auth_errors(clock):
+def test_client_does_not_retry_auth_errors_and_keeps_secrets_out_of_the_message(clock):
     session = _Session([_Response(401)])
-    client = AzureDevOpsClient(ORG_URL, "pat", session=session)
+    client = AzureDevOpsClient(ORG_URL, "super-secret-pat", session=session)
 
-    with pytest.raises(RuntimeError, match="401"):
-        client.get("x")
+    with pytest.raises(AzureDevOpsAuthError) as err:
+        client.get("Shop/_apis/wit/workitemsbatch")
+    message = str(err.value)
+    assert "401" in message
+    assert "super-secret-pat" not in message
+    assert "acme" not in message and "Shop" not in message  # no org or project
+    assert err.value.status == 401
+    assert err.value.url == f"{ORG_URL}/Shop/_apis/wit/workitemsbatch"
+    assert "super-secret-pat" not in repr(client)
     assert clock == []
+
+
+def test_client_maps_403_to_an_access_error(clock):
+    session = _Session([_Response(403)])
+    with pytest.raises(AzureDevOpsAccessError, match="403"):
+        AzureDevOpsClient(ORG_URL, "pat", session=session).get("x")
+
+
+def test_client_caps_retry_after_at_60_seconds(clock):
+    session = _Session([_Response(429, headers={"Retry-After": "3600"}), _Response(200, {"ok": 1})])
+
+    assert AzureDevOpsClient(ORG_URL, "pat", session=session).get("x") == {"ok": 1}
+    assert clock == [60.0]
+
+
+def test_client_retries_network_errors_then_raises_without_the_url(clock):
+    import requests
+
+    class _Down(_Session):
+        def request(self, method, url, **kwargs):
+            raise requests.ConnectionError(f"cannot reach {url}")
+
+    with pytest.raises(AzureDevOpsError) as err:
+        AzureDevOpsClient(ORG_URL, "pat", session=_Down([])).get("Shop/_apis/x")
+    assert "acme" not in str(err.value)
+    assert clock == [1.0, 2.0, 4.0, 8.0]
 
 
 # ---------------------------------------------------------------------------
@@ -554,18 +605,31 @@ def test_each_project_gets_its_own_resource_and_cursor():
     )
 
 
-def test_source_needs_an_organization_and_a_token(monkeypatch):
-    monkeypatch.delenv("AZURE_DEVOPS_PAT", raising=False)
+def test_source_needs_an_organization_and_a_token_argument(monkeypatch):
+    # the token comes in as an argument only; the env var is the example's business
+    monkeypatch.setenv("AZURE_DEVOPS_PAT", "from-env")
     with pytest.raises(ValueError, match="organization"):
         azure_devops_boards_source(project=PROJECT, pat="x")
-    with pytest.raises(ValueError, match="AZURE_DEVOPS_PAT"):
+    with pytest.raises(ValueError, match="pat="):
         azure_devops_boards_source(organization="acme", project=PROJECT)
+    assert azure_devops_boards_source(organization="acme", project=PROJECT, pat="x")
 
 
-def test_source_reads_the_token_from_the_environment(monkeypatch):
-    monkeypatch.setenv("AZURE_DEVOPS_PAT", "from-env")
-    resource = azure_devops_boards_source(organization="acme", project=PROJECT)
-    assert resource.name == "azure_devops_acme_shop"
+def test_resource_name_can_be_set_and_scopes_the_pipeline():
+    from cognee.tasks.ingestion.dlt_utils import PIPELINE_SCOPE_ATTR
+
+    resource = azure_devops_boards_source(
+        project=PROJECT, service=FakeAzureDevOps(), resource_name="shop_bugs_only"
+    )
+
+    assert resource.name == "shop_bugs_only"
+    assert getattr(resource, PIPELINE_SCOPE_ATTR) == "shop_bugs_only"
+
+
+def test_source_refuses_a_cognee_without_document_sync(monkeypatch):
+    monkeypatch.setattr(boards.dlt_utils, "DOCUMENT_SYNC_VERSION", 0)
+    with pytest.raises(RuntimeError, match=r"1\.6\.3"):
+        azure_devops_boards_source(project=PROJECT, service=FakeAzureDevOps())
 
 
 def test_tombstones_remove_rows_in_a_real_dlt_merge(tmp_path):
@@ -594,3 +658,181 @@ def test_tombstones_remove_rows_in_a_real_dlt_merge(tmp_path):
     fake.destroy(3)
     pipeline.run(azure_devops_boards_source(project=PROJECT, client=fake))
     assert table_ids() == ["1"]
+
+
+# ---------------------------------------------------------------------------
+# Review round 1
+# ---------------------------------------------------------------------------
+def test_feed_paging_across_batches_delivers_every_change():
+    fake = FakeAzureDevOps([work_item(i) for i in range(1, 8)], feed_page=3)
+    state: dict = {}
+
+    rows = run(fake, state, include_comments=False)
+
+    assert ids(rows) == [1, 2, 3, 4, 5, 6, 7]
+    assert state["continuation_token"] == str(fake.revision)
+    feed_calls = [p for _, p in fake.calls if p.endswith("/workitemrevisions")]
+    assert len(feed_calls) == 3
+
+
+def test_stuck_feed_token_raises_instead_of_skipping_changes():
+    fake = FakeAzureDevOps([work_item(i) for i in range(1, 8)], feed_page=3)
+    fake.stuck_feed = True
+    state: dict = {}
+
+    with pytest.raises(AzureDevOpsError, match="continuationToken"):
+        run(fake, state)
+    assert state == {}
+
+
+def test_item_left_out_by_the_batch_but_still_live_keeps_its_document():
+    fake = FakeAzureDevOps([work_item(1), work_item(2)])
+    state: dict = {}
+    run(fake, state)
+
+    fake.upsert(work_item(2, "Edited"))
+    fake.omit.add(2)  # e.g. a transient per-item error under errorPolicy=Omit
+    rows = run(fake, state)
+
+    assert rows == []  # no tombstone
+    assert state["known_ids"] == [1, 2]
+
+
+def test_adding_an_area_path_backfills_older_items():
+    fake = FakeAzureDevOps([work_item(1, area="Shop\\Payments"), work_item(2, area="Shop\\Search")])
+    state: dict = {}
+    assert ids(run(fake, state, area_paths=["Shop\\Payments"])) == [1]
+
+    rows = run(fake, state, area_paths=["Shop\\Payments", "Shop\\Search"])
+
+    assert 2 in ids(rows)
+    assert state["known_ids"] == [1, 2]
+
+
+def test_removing_an_area_path_forgets_its_items():
+    fake = FakeAzureDevOps([work_item(1, area="Shop\\Payments"), work_item(2, area="Shop\\Search")])
+    state: dict = {}
+    run(fake, state, area_paths=["Shop\\Payments", "Shop\\Search"])
+
+    rows = run(fake, state, area_paths=["Shop\\Payments"])
+
+    assert ids(rows, deleted=True) == [2]
+    assert state["known_ids"] == [1]
+
+
+def test_switching_comments_off_rerenders_without_them():
+    fake = FakeAzureDevOps([work_item(1)])
+    fake.add_comment(1, "a comment")
+    state: dict = {}
+    assert "a comment" in run(fake, state)[0]["content"]
+
+    rows = run(fake, state, include_comments=False)
+
+    assert ids(rows) == [1]
+    assert "a comment" not in rows[0]["content"]
+
+
+def test_shuffled_collections_render_the_same_text():
+    import random
+
+    relations = [
+        {"rel": "System.LinkTypes.Related", "url": f"{ORG_URL}/_apis/wit/workItems/{n}"}
+        for n in (7, 3, 9)
+    ] + [{"rel": "ArtifactLink", "url": f"vstfs:///Git/PullRequestId/p%2Fr%2F{n}"} for n in (5, 2)]
+    comments = [
+        {"id": n, "text": f"comment {n}", "createdDate": f"2026-10-0{n}T10:00:00Z"}
+        for n in (1, 2, 3)
+    ]
+    item = work_item(1, **{"System.Tags": "beta; alpha; gamma"})
+    item["relations"] = relations
+    first = render_work_item(item, comments)
+
+    shuffled = dict(item, relations=random.sample(relations, len(relations)))
+    shuffled["fields"] = dict(item["fields"], **{"System.Tags": "gamma; alpha; beta"})
+    assert render_work_item(shuffled, random.sample(comments, len(comments))) == first
+
+
+def test_budget_stops_cleanly_and_the_next_run_finishes():
+    fake = FakeAzureDevOps([work_item(i) for i in range(1, 451)])
+    state: dict = {}
+    stats: dict = {}
+
+    first = list(
+        sync_work_items(
+            fake, _Scope(project=PROJECT, include_comments=False), state, stats, max_requests=2
+        )
+    )
+
+    assert stats["failed_budget"] == 1 and stats["failed"] == 1
+    assert len(first) == 200  # feed (1 request) + one batch (1 request)
+    assert len(state["pending_ids"]) == 250
+    rest = run(fake, state, include_comments=False)
+    assert sorted(int(r["id"]) for r in first + rest) == list(range(1, 451))
+    assert state["pending_ids"] == []
+
+
+def test_rate_limit_that_wont_clear_stops_cleanly():
+    fake = FakeAzureDevOps([work_item(1)])
+
+    def limited(*args, **kwargs):
+        raise boards.AzureDevOpsRateLimitedError("Azure DevOps returned HTTP 429", status=429)
+
+    fake.post = limited
+    state: dict = {}
+    stats: dict = {}
+
+    rows = list(sync_work_items(fake, _Scope(project=PROJECT), state, stats))
+
+    assert rows == []
+    assert stats["failed_rate_limit"] == 1
+    assert state["pending_ids"] == [1]
+
+
+def test_check_active_runs_before_every_request():
+    fake = FakeAzureDevOps([work_item(1), work_item(2)])
+    checks = []
+
+    run_rows = list(
+        sync_work_items(
+            fake,
+            _Scope(project=PROJECT, include_comments=False),
+            {},
+            check_active=lambda: checks.append(1),
+        )
+    )
+
+    assert len(run_rows) == 2
+    assert len(checks) == len(fake.calls)
+
+
+def test_board_labels_survive_a_later_403():
+    item = work_item(1, **{"WEF_ABC123_Kanban.Column": "Doing"})
+    fake = FakeAzureDevOps([item])
+    state: dict = {}
+    first = run(fake, state)[0]["content"]
+
+    fake.teams_error = AzureDevOpsAccessError("Azure DevOps returned HTTP 403", status=403)
+    fake.upsert(item)
+    again = run(fake, state)[0]["content"]
+
+    assert "Doing (Payments team / Stories)" in first
+    assert again == first
+
+
+def test_board_label_server_error_fails_the_run_instead_of_changing_text():
+    fake = FakeAzureDevOps([work_item(1, **{"WEF_ABC123_Kanban.Column": "Doing"})])
+    fake.teams_error = AzureDevOpsError("Azure DevOps returned HTTP 500", status=500)
+
+    with pytest.raises(AzureDevOpsError, match="500"):
+        run(fake, {})
+
+
+def test_sync_stats_are_counts():
+    fake = FakeAzureDevOps([work_item(1), work_item(2, type_="Task")])
+    resource = azure_devops_boards_source(
+        project=PROJECT, service=fake, work_item_types=["Bug"], include_comments=False
+    )
+
+    list(resource)
+
+    assert resource.cognee_sync_stats == {"scanned": 2, "skipped": 1, "deleted": 0, "failed": 0}

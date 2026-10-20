@@ -117,7 +117,6 @@ are contained in one package (i.e. all tasks used in one pipeline are packaged t
 
 | Package Name                       | Type       | Description                    |
 |------------------------------------|------------|--------------------------------|
-| `cognee-community-connector-onenote` | Connector | [Selected OneNote notebooks with incremental content fetching](packages/connector/onenote/README.md) |
 | `cognee-community-pipeline-codify`     | Pipeline   | Custom codify pipeline package                                        |
 | `cognee-community-retriever-code`      | Retriever  | Custom CODE retriever package                                         |
 | `cognee-community-tasks-codify`        | Task       | Custom codify tasks package                                           |
@@ -129,14 +128,17 @@ are contained in one package (i.e. all tasks used in one pipeline are packaged t
 
 Connectors sync an external tool into cognee memory. Each one returns a `dlt` source you pass to `cognee.remember(...)`, and lives under `packages/connector/<name>/`.
 
-| Package Name                                    | Source              | Sync                         |
-|-------------------------------------------------|---------------------|------------------------------|
-| `cognee-community-connector-azure-devops-boards` | Azure DevOps Boards | Incremental, forget-on-delete |
-| `cognee-community-connector-confluence`         | Confluence          | Incremental, forget-on-delete |
-| `cognee-community-connector-gmail`              | Gmail               | Incremental, forget-on-delete |
-| `cognee-community-connector-google-drive`       | Google Drive        | Incremental, forget-on-delete |
-| `cognee-community-connector-notion`             | Notion              | Full snapshot, forget-on-delete |
-| `cognee-community-connector-slack`              | Slack export        | Full snapshot, forget-on-delete |
+| Package Name                                     | Source              | Sync                            |
+|--------------------------------------------------|---------------------|---------------------------------|
+| `cognee-community-connector-apollo`              | Apollo.io           | Incremental, forget-on-delete   |
+| `cognee-community-connector-azure-devops-boards` | Azure DevOps Boards | Incremental, forget-on-delete   |
+| `cognee-community-connector-confluence`          | Confluence          | Incremental, forget-on-delete   |
+| `cognee-community-connector-gmail`               | Gmail               | Incremental, forget-on-delete   |
+| `cognee-community-connector-google-calendar`     | Google Calendar     | Incremental, forget-on-delete   |
+| `cognee-community-connector-google-drive`        | Google Drive        | Incremental, forget-on-delete   |
+| `cognee-community-connector-notion`              | Notion              | Full snapshot, forget-on-delete |
+| `cognee-community-connector-onenote`             | OneNote             | Incremental, forget-on-delete   |
+| `cognee-community-connector-slack`               | Slack export        | Full snapshot, forget-on-delete |
 
 ## Repository Structure
 
