@@ -44,7 +44,7 @@ async def main() -> None:
         return
 
     # Narrow the sync with user_ids=[...] or since="YYYY-MM-DD" on a big account.
-    source = zoom_source()
+    source = zoom_source(*(os.environ[name] for name in required))
 
     print("Syncing Zoom cloud recordings into cognee ...")
     await cognee.remember(

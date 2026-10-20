@@ -5,6 +5,7 @@ with the LLM and embeddings mocked, and checks the graph after each sync.
 """
 
 import importlib
+from datetime import timedelta
 
 import cognee
 import pytest
@@ -59,7 +60,7 @@ async def _graph_has(token: str) -> bool:
 
 
 @pytest_asyncio.fixture
-async def clean_environment(tmp_path, monkeypatch, fixed_now):
+async def clean_environment(tmp_path, monkeypatch, clock):
     pytest.importorskip("dlt")
     pytest.importorskip("ladybug")
 
@@ -99,7 +100,7 @@ async def _sync(zoom):
 
 
 @pytest.mark.asyncio
-async def test_deleting_a_recording_forgets_its_graph_content(clean_environment, zoom):
+async def test_deleting_a_recording_forgets_its_graph_content(clean_environment, zoom, clock):
     zoom.add_meeting("m1", transcript=_vtt(f"{ALPHA} signed the logistics contract."))
     zoom.add_meeting("m2", topic="Retro", transcript=_vtt(f"{BRAVO} is moving to finance."))
 
@@ -108,6 +109,8 @@ async def test_deleting_a_recording_forgets_its_graph_content(clean_environment,
     assert await _graph_has(BRAVO), "m2 entity should be in the graph after the first sync"
 
     del zoom.meetings["m2"]
+    # Deletions are decided by the daily full listing.
+    clock[0] += timedelta(days=1)
     await _sync(zoom)
 
     assert await _graph_has(ALPHA), "the surviving meeting must stay in the graph"

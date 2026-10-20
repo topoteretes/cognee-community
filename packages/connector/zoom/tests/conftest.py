@@ -1,13 +1,13 @@
 """In-memory stand-in for the Zoom REST API, shared by the test modules."""
 
 import re
-from datetime import UTC, date, datetime
+from datetime import date, datetime, timezone
 
 import pytest
 
 from cognee_community_connector_zoom.zoom import ZoomAPIError
 
-NOW = datetime(2026, 10, 8, 12, 0, tzinfo=UTC)
+NOW = datetime(2026, 10, 8, 12, 0, tzinfo=timezone.utc)
 
 
 class FakeZoom:
@@ -20,6 +20,8 @@ class FakeZoom:
         self.calls: list[tuple[str, dict]] = []
         self.downloads: list[str] = []
         self.fail_path: str | None = None
+        self.gone_files: set[str] = set()
+        self.drop_meetings_key = False
 
     def add_meeting(
         self,
@@ -33,6 +35,8 @@ class FakeZoom:
         chat=None,
         media=True,
         status="completed",
+        file_status="completed",
+        version="",
     ):
         files = []
         if media:
@@ -40,13 +44,13 @@ class FakeZoom:
         for kind, text in (("TRANSCRIPT", transcript), ("CHAT", chat)):
             if text is None:
                 continue
-            url = f"https://zoom.test/rec/download/{uuid}/{kind.lower()}"
+            url = f"https://us02web.zoom.us/rec/download/{uuid}/{kind.lower()}{version}"
             self.files[url] = text
             files.append(
                 {
-                    "id": f"{uuid}-{kind.lower()}",
+                    "id": f"{uuid}-{kind.lower()}{version}",
                     "file_type": kind,
-                    "status": "completed",
+                    "status": file_status,
                     "file_size": len(text),
                     "download_url": url,
                     "recording_start": start,
@@ -70,17 +74,23 @@ class FakeZoom:
         if self.fail_path and self.fail_path in path:
             raise ZoomAPIError("Zoom request failed: HTTP 503", status=503)
         if path == "/users":
-            return {"users": self.users[params["status"]]}
+            users = self.users[params["status"]]
+            return {"users": users, "total_records": len(users), "next_page_token": ""}
         match = re.fullmatch(r"/users/([^/]+)/recordings", path)
         if match:
             start, stop = date.fromisoformat(params["from"]), date.fromisoformat(params["to"])
+            if (stop - start).days >= 30:
+                # Zoom rejects a range longer than one month.
+                raise ZoomAPIError("Zoom request failed: HTTP 400 (code 300)", status=400, code=300)
             meetings = [
                 m
                 for m in self.meetings.values()
                 if m["host_id"] == match.group(1)
                 and start <= date.fromisoformat(m["start_time"][:10]) <= stop
             ]
-            return {"meetings": meetings, "next_page_token": ""}
+            if self.drop_meetings_key:
+                return {"next_page_token": ""}
+            return {"meetings": meetings, "total_records": len(meetings), "next_page_token": ""}
         match = re.fullmatch(r"/users/([^/]+)", path)
         if match:
             for user in self.users["active"] + self.users["inactive"]:
@@ -91,6 +101,8 @@ class FakeZoom:
 
     def download(self, url):
         self.downloads.append(url)
+        if url in self.gone_files:
+            raise ZoomAPIError("Zoom request failed: HTTP 404", status=404)
         return self.files[url]
 
 
@@ -100,8 +112,10 @@ def zoom():
 
 
 @pytest.fixture
-def fixed_now(monkeypatch):
+def clock(monkeypatch):
+    """The source's clock, starting at ``NOW``; tests move ``clock[0]`` forward."""
     from cognee_community_connector_zoom import zoom as zoom_module
 
-    monkeypatch.setattr(zoom_module, "_utcnow", lambda: NOW)
-    return NOW
+    moment = [NOW]
+    monkeypatch.setattr(zoom_module, "_utcnow", lambda: moment[0])
+    return moment
