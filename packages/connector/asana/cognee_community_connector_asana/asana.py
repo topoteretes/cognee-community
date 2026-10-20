@@ -21,7 +21,7 @@ from __future__ import annotations
 import os
 import time
 from collections.abc import Callable, Iterable, Iterator
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import dlt
@@ -48,9 +48,11 @@ _MAX_RETRIES = 5
 # 429 is Asana's rate limit (150 requests a minute on the free plan); the 5xx
 # answers are the ones Asana's docs describe as temporary.
 _TRANSIENT_STATUSES = (429, 500, 502, 503, 504)
-# The longest single wait. cognee holds its dlt staging lock during a sync, so
-# a longer Retry-After stops the run cleanly instead (it resumes next run).
+# The longest single wait, and the most a run waits in all. cognee holds its dlt
+# staging lock during a sync, so a longer Retry-After, or a wait past the
+# budget, stops the run cleanly instead (it resumes next run).
 _MAX_WAIT_SECONDS = 60
+_MAX_TOTAL_WAIT_SECONDS = 120
 # How often a listing is restarted from its first page after an offset expired.
 # Offsets expire (Asana's docs); one restart normally suffices, two leave slack.
 _MAX_LISTING_RESTARTS = 2
@@ -65,11 +67,22 @@ _CURSOR_OVERLAP_SECONDS = 60
 # produces between runs; past it the run treats the feed as a gap.
 _MAX_EVENT_PAGES = 100
 # Fresh task failures in a row (5xx or no answer, after retries) that mean Asana
-# itself is down: the run stops cleanly. Tasks already kept for a retry never count.
+# itself is down: the run stops cleanly. One or two can be a single broken task;
+# three different tasks failing back to back are rarely a coincidence, and a stop
+# costs nothing, as the next run resumes. Tasks already kept for a retry never count.
 _OUTAGE_STREAK = 3
-# Runs a listed task may answer 403/404 at the same modified_at before its
-# document is forgotten. It is asked again once its modified_at moves.
+# A listed task that answers 403/404 at the same modified_at is forgotten after
+# 3 runs AND 24 hours, counting only runs that finished and showed access to
+# work (see _Run.settle): a host on a fast cron cannot forget a task in minutes,
+# and a weekly cron still needs three observations. A forgotten task is asked
+# again when its modified_at moves, or after another day.
 _GIVE_UP_RUNS = 3
+_GIVE_UP_AFTER = timedelta(hours=24)
+_REASK_AFTER = timedelta(hours=24)
+# Forgotten tasks asked again per run, oldest first, after everything else.
+_MAX_REASKS = 10
+# Where a forgotten task from older state, with no time of its own, sits.
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 # Asana returns compact objects unless fields are requested, and wide requests
 # count against its cost quota, so each call asks only for what is rendered
@@ -96,7 +109,7 @@ class AsanaAPIError(RuntimeError):
     """An error answer from Asana (``status``), or no answer at all (``status`` 0).
 
     The message names only the status and the endpoint. Asana's own explanation
-    is on ``detail``; a response body or the token never is.
+    is on ``detail``, with the token cut out; a response body never is.
     """
 
     def __init__(self, status: int, endpoint: str, detail: str = ""):
@@ -153,16 +166,34 @@ def _check_token(token: str) -> None:
 class _Client:
     """One run's access to Asana: the session, the host's check, and the waits."""
 
-    def __init__(self, session: Any, check_active: Callable[[], None] | None = None):
+    def __init__(
+        self, session: Any, check_active: Callable[[], None] | None = None, secret: str = ""
+    ):
         self.session = session
         self.check_active = check_active
+        # The token, only to cut it out of Asana's error messages.
+        headers = getattr(session, "headers", None)
+        bearer = headers.get("Authorization", "") if headers else ""
+        self.secret = secret or bearer.removeprefix("Bearer ")
+        self.waited = 0.0  # seconds slept this run
+        self.out_of_time = False  # a wait was refused for the run's budget
 
     def check(self) -> None:
         if self.check_active is not None:
             self.check_active()
 
+    def can_wait(self, seconds: float) -> bool:
+        """Whether a wait fits in the single-wait cap and the run's budget."""
+        if seconds > _MAX_WAIT_SECONDS:
+            return False
+        if self.waited + seconds > _MAX_TOTAL_WAIT_SECONDS:
+            self.out_of_time = True
+            return False
+        return True
+
     def wait(self, seconds: float) -> None:
         self.check()
+        self.waited += seconds
         time.sleep(seconds)
 
 
@@ -176,8 +207,9 @@ def _get(
     """GET an Asana API path and return ``(status, json)``, retrying transient errors.
 
     Rate limits (429), server errors (5xx) and network failures are retried up
-    to ``_MAX_RETRIES`` times; a wait over ``_MAX_WAIT_SECONDS`` is not taken.
-    Every other status outside ``ok`` raises :class:`AsanaAPIError`.
+    to ``_MAX_RETRIES`` times; a wait over ``_MAX_WAIT_SECONDS``, or past the
+    run's ``_MAX_TOTAL_WAIT_SECONDS``, is not taken. Every other status outside
+    ``ok`` raises :class:`AsanaAPIError`.
     """
     client = _as_client(client)
     url = f"{_API_BASE}{path}"
@@ -189,9 +221,9 @@ def _get(
             response = client.session.get(url, params=params or {}, timeout=_TIMEOUT_SECONDS)
         except requests.RequestException as exc:
             # Only the type: the message of some requests errors holds a header.
-            if last_attempt:
-                raise AsanaAPIError(0, path, type(exc).__name__) from None
             delay = float(2**attempt)
+            if last_attempt or not client.can_wait(delay):
+                raise AsanaAPIError(0, path, type(exc).__name__) from None
             logger.warning("Asana: %s on %s; retrying in %.0fs.", type(exc).__name__, path, delay)
             client.wait(delay)
             attempt += 1
@@ -202,13 +234,13 @@ def _get(
             return status, _json_object(response, path)
         if status in _TRANSIENT_STATUSES and not last_attempt:
             delay = _retry_delay(response.headers, attempt)
-            if delay > _MAX_WAIT_SECONDS:
+            if not client.can_wait(delay):
                 raise AsanaAPIError(status, path, f"asked to wait {delay:.0f}s")
             logger.warning("Asana: HTTP %d on %s; retrying in %.0fs.", status, path, delay)
             client.wait(delay)
             attempt += 1
             continue
-        raise AsanaAPIError(status, path, _error_detail(response))
+        raise AsanaAPIError(status, path, _redact(_error_detail(response), client.secret))
 
 
 def _json_object(response: Any, path: str) -> dict:
@@ -248,6 +280,17 @@ def _error_detail(response: Any) -> str:
     except (ValueError, KeyError, IndexError, TypeError):
         return ""
     return message[:200] if isinstance(message, str) else ""
+
+
+def _redact(text: str, secret: str) -> str:
+    """``text`` with the token cut out, in case Asana echoes it back.
+
+    A token too short to replace safely (it could match ordinary words) drops
+    the whole text when it occurs in it.
+    """
+    if not secret or secret not in text:
+        return text
+    return text.replace(secret, "[token]") if len(secret) >= 8 else ""
 
 
 def _list_all(client: Any, path: str, params: dict) -> list[dict]:
@@ -558,35 +601,43 @@ class _Run:
     State: ``known_ids`` (row ids emitted and current), ``subtasks`` (subtask gid
     -> the task document it is folded into), ``retry`` (tasks kept after a
     failure), ``pending`` (tasks a stopped run did not reach), ``unreadable``
-    (gid -> ``{stamp, runs}`` of tasks answering 403/404), ``given_up`` (gid ->
-    the stamp at which an unreadable task was forgotten) and, per project, the
-    ``cursor``, the tasks ``seen`` near it and the Events ``sync`` token.
+    (gid -> ``{stamp, runs, since}`` of tasks answering 403/404, ``since`` being
+    the run clock at the first counted run), ``given_up`` (gid -> ``{stamp, at}``:
+    the stamp at which an unreadable task was forgotten, and when it was last
+    asked) and, per project, the ``cursor``, the tasks ``seen`` near it and the
+    Events ``sync`` token.
     """
 
-    def __init__(self, client: _Client, state: dict, stats: dict[str, int]):
+    def __init__(
+        self, client: _Client, state: dict, stats: dict[str, int], now: datetime | None = None
+    ):
         self.client = client
         self.state = state
         self.stats = stats
+        self.now = now or _run_clock()
         self.known_ids: set[str] = set(state.get("known_ids", []))
         self.subtask_parents: dict[str, str] = dict(state.get("subtasks", {}))
         # parent -> its subtasks, so replacing one task's entries is not a full scan
         self.children: dict[str, list[str]] = {}
         for child, parent in self.subtask_parents.items():
             self.children.setdefault(parent, []).append(child)
-        self.unreadable: dict[str, dict] = {
-            gid: dict(entry) for gid, entry in state.get("unreadable", {}).items()
-        }
-        self.given_up: dict[str, str] = dict(state.get("given_up", {}))
+        self.unreadable = _load_unreadable(state.get("unreadable", {}), self.now)
+        self.given_up = _load_given_up(state.get("given_up", {}))
+        # What a run that stops early commits instead: only finished runs count.
+        self.unreadable_before = {gid: dict(entry) for gid, entry in self.unreadable.items()}
         self.retry: set[str] = set(state.get("retry", []))
         self.projects: list[str] = []
         self.next_projects: dict[str, dict[str, Any]] = {}
         self.stamps: dict[str, str] = {}  # gid -> modified_at, every swept task
-        self.order: list[str] = []  # tasks to render: fresh first, then retries
+        self.order: list[str] = []  # tasks to render: fresh, retries, then re-asks
         self.position = 0  # index in ``order`` of the next task to render
         self.kept: set[str] = set()
         self.rendered: set[str] = set()
         self.outage = 0
-        self.forbidden: list[str] = []  # tasks that answered 403 this run
+        self.unread: list[str] = []  # tasks that answered 403/404 this run
+        self.counted: set[str] = set()  # tasks whose 403/404 counted this run
+        self.reasks: set[str] = set()  # forgotten tasks asked again this run
+        self.reask_failed: set[str] = set()
         self.listed = False
 
     # -- 1. List ---------------------------------------------------------------
@@ -634,22 +685,29 @@ class _Run:
         swept = set(self.stamps)
         changed |= _documents_for(event_gids, swept, self.subtask_parents)
         changed |= set(self.state.get("pending", []))
-        # A forgotten unreadable task is asked again only once its stamp moves.
-        for gid, stamp in list(self.given_up.items()):
+        # A forgotten unreadable task is asked again once its stamp moves, or after a day.
+        for gid, entry in list(self.given_up.items()):
             if gid not in swept:
                 del self.given_up[gid]
-            elif self.stamps[gid] == stamp:
+            elif self.stamps[gid] == entry["stamp"]:
                 changed.discard(gid)
                 self.retry.discard(gid)
             else:
                 del self.given_up[gid]
                 changed.add(gid)
+        due = sorted(
+            (entry["at"], gid)
+            for gid, entry in self.given_up.items()
+            if _parse(entry["at"]) <= self.now - _REASK_AFTER
+        )
+        self.reasks = {gid for _, gid in due[:_MAX_REASKS]}
         # Only swept tasks are rendered, so every emitted id can be deleted later.
         self.retry &= swept
         fresh = (changed & swept) - self.retry
-        self.order = sorted(fresh) + sorted(self.retry)
+        self.order = sorted(fresh) + sorted(self.retry) + sorted(self.reasks)
         self.stats["scanned"] = len(swept)
-        self.stats["skipped"] = len(swept) - len(self.order) - len(self.given_up)
+        resting = len(self.given_up) - len(self.reasks)
+        self.stats["skipped"] = len(swept) - len(self.order) - resting
         self.listed = True
 
     # -- 2. Render -------------------------------------------------------------
@@ -661,13 +719,16 @@ class _Run:
             except AsanaAPIError as exc:
                 self._failed(gid, exc)
                 continue
-            if gid not in self.retry:
+            if gid not in self.retry | self.reasks:
                 self.outage = 0
+            if self.given_up.pop(gid, None) is not None:
+                logger.info("Asana: /tasks/%s is readable again.", gid)
             self.unreadable.pop(gid, None)
             self._remember_subtasks(gid, subtasks)
             self.rendered.add(gid)
             yield _task_row(gid, task, comments, subtasks, self.projects)
         self.position = len(self.order)
+        self.settle()
         # One request each; an unchanged description keeps its content hash downstream.
         for project_gid in self.projects:
             yield _project_row(self.client, project_gid)
@@ -678,46 +739,93 @@ class _Run:
         self.stop_if_systemic(exc)
         if exc.status == 401:
             raise exc  # nothing rendered yet: the token is bad
+        if gid in self.reasks:
+            # Still unreadable: it stays forgotten and is asked again in a day.
+            self.reask_failed.add(gid)
+            return
         self.kept.add(gid)
         logger.warning("Asana: kept /tasks/%s for a retry next run (%s).", gid, exc)
-        if exc.status == 403:
-            self.forbidden.append(gid)  # counted once the run knows if access works
-        elif exc.status == 404:
-            # Still listed, so not gone: a passing glitch, or hidden from this token.
-            self._count_unreadable(gid)
+        if exc.status in (403, 404):
+            # Still listed, so not gone: hidden from this token, or a passing
+            # failure. settle() decides which once the run's fetches are done.
+            self.unread.append(gid)
         elif gid not in self.retry:
             self.outage += 1
             if self.outage >= _OUTAGE_STREAK:
                 raise _CutShortError("unavailable")
 
-    def _count_unreadable(self, gid: str) -> None:
-        entry = self.unreadable.get(gid) or {}
-        stamp = self.stamps.get(gid, "")
-        runs = entry.get("runs", 0) + 1 if entry.get("stamp") == stamp else 1
-        self.unreadable[gid] = {"stamp": stamp, "runs": runs}
+    def settle(self) -> None:
+        """Count this run's 403/404s where access to tasks is shown to work.
 
-    def _settle_forbidden(self) -> None:
-        """Count this run's 403s as unreadable only where access is shown to work.
-
-        A 403 counts toward giving a task up only if another task was fetched in
-        this run: then this one is hidden on its own. If every fetch answered 403,
-        the token has lost a permission, and nothing may be forgotten for that.
+        A 403 or 404 on a listed task means it is hidden from this token, or that
+        Asana is failing or the token lost a permission; only the first is a
+        reason to forget it. So it counts only if another task was read in this
+        run. In steady state the others are unchanged and not fetched, so one of
+        them is fetched as a probe; if the probe fails too, nothing counts.
         """
-        if self.forbidden and not self.rendered:
-            self.stats["failed_permission"] = len(self.forbidden)
-            logger.warning(
-                "Asana: task: every fetch answered 403 this run; check the token's permissions."
-            )
-            for gid in self.forbidden:
-                entry = self.unreadable.get(gid)
-                if not entry or entry.get("stamp") != self.stamps.get(gid, ""):
-                    self.unreadable[gid] = {"stamp": self.stamps.get(gid, ""), "runs": 0}
-        else:
-            for gid in self.forbidden:
+        pending, self.unread = self.unread, []
+        if not pending:
+            return
+        readable = bool(self.rendered)
+        probe = None if readable else self._probe()
+        if readable or probe:
+            for gid in pending:
                 self._count_unreadable(gid)
-        self.forbidden = []
+            return
+        if probe is None:
+            return  # Asana is failing, which proves nothing either way
+        self.stats["failed_permission"] = self.stats.get("failed_permission", 0) + len(pending)
+        if self._probe_gid() is None:
+            logger.warning(
+                "Asana: task: every fetch answered 403/404 this run and there is no other "
+                "task to check access with; nothing counts toward forgetting it."
+            )
+        else:
+            logger.warning(
+                "Asana: task: every fetch answered 403/404 this run; check the token's permissions."
+            )
+
+    def _probe(self) -> bool | None:
+        """Fetch one unchanged task: True when it is readable.
+
+        False when it answers 403/404 too, or there is no other task to try;
+        None when Asana is failing (5xx, no answer), which proves nothing.
+        """
+        gid = self._probe_gid()
+        if gid is None:
+            return False
+        self.stats["probe_task"] = 1
+        path = f"/tasks/{gid}"
+        try:
+            _, body = _get(self.client, path, {"opt_fields": "gid"})
+        except AsanaAPIError as exc:
+            self.stop_if_systemic(exc)
+            if exc.status == 401:
+                raise exc
+            return False if exc.status in (403, 404) else None
+        _data(body, dict, path)
+        return True
+
+    def _probe_gid(self) -> str | None:
+        """The newest task not fetched this run and not unreadable or forgotten."""
+        unusable = set(self.order) | self.unreadable.keys() | self.given_up.keys()
+        gids = [gid for gid in self.stamps if gid not in unusable]
+        if not gids:
+            return None
+        return max(gids, key=lambda gid: (self.stamps[gid], _gid_order({"gid": gid})))
+
+    def _count_unreadable(self, gid: str) -> None:
+        entry = self.unreadable.get(gid)
+        stamp = self.stamps.get(gid, "")
+        if entry and entry["stamp"] == stamp:
+            self.unreadable[gid] = {**entry, "runs": entry["runs"] + 1}
+        else:
+            self.unreadable[gid] = {"stamp": stamp, "runs": 1, "since": _stamp(self.now)}
+        self.counted.add(gid)
 
     def stop_if_systemic(self, exc: AsanaAPIError) -> None:
+        if self.client.out_of_time:
+            raise _CutShortError("rate_limit" if exc.status == 429 else "unavailable") from None
         if exc.status == 429:
             raise _CutShortError("rate_limit") from None
         if exc.status == 401 and self.rendered:
@@ -735,42 +843,53 @@ class _Run:
 
     # -- 3. Delete and 4. Commit ------------------------------------------------
     def finish(self) -> Iterator[dict[str, Any]]:
-        self._settle_forbidden()
-        current_ids = {_task_id(gid) for gid in self.stamps if gid not in self.given_up}
-        current_ids |= {_project_id(gid) for gid in self.projects}
         for gid, entry in self.unreadable.items():
-            if gid in self.kept and entry["runs"] >= _GIVE_UP_RUNS:
+            if (
+                gid in self.counted
+                and gid in self.kept
+                and entry["runs"] >= _GIVE_UP_RUNS
+                and _parse(entry["since"]) <= self.now - _GIVE_UP_AFTER
+            ):
                 logger.warning(
-                    "Asana: /tasks/%s answered HTTP 403/404 in %d runs; its document is "
-                    "forgotten until the task changes.",
+                    "Asana: /tasks/%s answered HTTP 403/404 in %d runs since %s; its document "
+                    "is forgotten until the task changes or reads again.",
                     gid,
                     entry["runs"],
+                    entry["since"],
                 )
-                self.given_up[gid] = entry["stamp"]
+                self.given_up[gid] = {"stamp": entry["stamp"], "at": _stamp(self.now)}
                 self.kept.discard(gid)
-                current_ids.discard(_task_id(gid))
                 self.stats["given_up"] += 1
+        for gid in self.reask_failed:
+            self.given_up[gid]["at"] = _stamp(self.now)
+        current_ids = {_task_id(gid) for gid in self.stamps if gid not in self.given_up}
+        current_ids |= {_project_id(gid) for gid in self.projects}
         deleted = sorted(self.known_ids - current_ids)
         for row_id in deleted:
             yield _deleted_row(row_id)
         self.stats["deleted"] = len(deleted)
-        self._commit(current_ids, pending=[])
+        self._commit(current_ids, [], self.kept, self.unreadable)
 
     def commit_progress(self) -> None:
-        """After a clean stop: keep what was rendered, queue what was not, delete nothing."""
+        """After a clean stop: keep what was rendered, queue what was not, delete nothing.
+
+        Nothing this run saw counts toward giving a task up. A forgotten task that
+        was read again, has changed or is gone is no longer forgotten (as in any
+        run); nothing new is forgotten, and none is marked as asked. A re-ask not
+        reached is queued like any task; the next run asks it only if it is due.
+        """
         if not self.listed:
             return  # stopped while listing: nothing moved
-        self._settle_forbidden()
         rest = self.order[self.position :]
         retry = self.kept | (self.retry & set(rest))
         pending = [gid for gid in rest if gid not in retry]
         current_ids = self.known_ids | {_task_id(gid) for gid in self.rendered}
-        self._commit(current_ids, pending, retry)
+        unreadable = {g: e for g, e in self.unreadable_before.items() if g not in self.rendered}
+        self._commit(current_ids, pending, retry, unreadable)
 
     def _commit(
-        self, current_ids: set[str], pending: list[str], retry: set[str] | None = None
+        self, current_ids: set[str], pending: list[str], retry: set[str], unreadable: dict
     ) -> None:
-        retry = self.kept if retry is None else retry
         unsettled = retry | set(pending)
         for project_state in self.next_projects.values():
             # A task not rendered must not look settled inside the overlap window.
@@ -787,10 +906,48 @@ class _Run:
         self.state["retry"] = sorted(retry)
         self.state["pending"] = pending
         self.state["unreadable"] = {
-            gid: entry for gid, entry in sorted(self.unreadable.items()) if gid in unsettled
+            gid: entry for gid, entry in sorted(unreadable.items()) if gid in unsettled
         }
         self.state["given_up"] = dict(sorted(self.given_up.items()))
         self.stats["kept"] = len(retry)
+
+
+def _load_unreadable(saved: dict, now: datetime) -> dict[str, dict]:
+    """``unreadable`` from state. An entry from before ``since`` existed starts its day now."""
+    return {gid: {"since": _stamp(now), **entry} for gid, entry in saved.items()}
+
+
+def _load_given_up(saved: dict) -> dict[str, dict]:
+    """``given_up`` from state. An entry that is only a stamp (older state) is due at once."""
+    return {
+        gid: dict(entry) if isinstance(entry, dict) else {"stamp": entry, "at": _stamp(_EPOCH)}
+        for gid, entry in saved.items()
+    }
+
+
+def _parse(stamp: str) -> datetime:
+    """Parse a timestamp such as ``2026-10-09T19:14:27.123Z``."""
+    return datetime.fromisoformat(stamp)
+
+
+def _stamp(moment: datetime) -> str:
+    """Format a moment the way Asana does (UTC, milliseconds, ``Z``)."""
+    moment = moment.astimezone(UTC)
+    return moment.strftime("%Y-%m-%dT%H:%M:%S.") + f"{moment.microsecond // 1000:03d}Z"
+
+
+def _run_clock() -> datetime:
+    """The run's clock, for the give-up and re-ask times.
+
+    The local one: no Asana answer this connector reads carries the server's
+    time in a header it uses, and a few minutes of drift do not matter on a
+    scale of a day.
+    """
+    return _local_now()
+
+
+def _local_now() -> datetime:
+    return datetime.now(UTC)
 
 
 def sync_tasks(
@@ -801,17 +958,20 @@ def sync_tasks(
     include_completed: bool = True,
     check_active: Callable[[], None] | None = None,
     stats: dict[str, int] | None = None,
+    now: datetime | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Yield changed documents since the last run, plus hard-delete markers.
 
     1. *List.* Per project: poll events and list every task with its
        ``modified_at``. A failure here propagates before a single row.
-    2. *Render.* Each changed task (fresh first, then retries), then each project.
+    2. *Render.* Each changed task (fresh first, then retries, then forgotten ones
+       due to be asked again), then each project.
     3. *Delete.* A hard-delete marker for every known id that is no longer current.
     4. *Commit.* Only now is ``state`` written.
 
-    A run stopped cleanly (a ``401`` after progress, a rate limit, an outage)
-    keeps what it rendered, queues the rest in ``pending`` and deletes nothing.
+    A run stopped cleanly (a ``401`` after progress, a rate limit, an outage,
+    the wait budget spent) keeps what it rendered, queues the rest in ``pending``
+    and deletes nothing. ``now`` (for tests) defaults to the run clock.
     """
     if not project_gids:
         raise ValueError("No Asana project selected; an empty selection would forget everything")
@@ -819,7 +979,7 @@ def sync_tasks(
     for key in _STAT_KEYS:
         stats.setdefault(key, 0)
     client = session if isinstance(session, _Client) else _Client(session, check_active)
-    run = _Run(client, state, stats)
+    run = _Run(client, state, stats, now)
     try:
         try:
             run.list(project_gids, include_completed)
@@ -830,7 +990,6 @@ def sync_tasks(
             raise
     except _CutShortError as cut:
         run.commit_progress()
-        stats["failed"] = max(1, stats["failed"])
         stats[f"failed_{cut.reason}"] = 1
         logger.warning("Asana sync stopped early (%s); it resumes on the next run.", cut.reason)
         return
@@ -912,7 +1071,8 @@ def asana_source(
         stats.clear()
         http = service if service is not None else _make_session(resolved_token)
         try:
-            yield from dlt_utils.guarded_rows(_rows(_Client(http, check_active)), check_active)
+            client = _Client(http, check_active, resolved_token)
+            yield from dlt_utils.guarded_rows(_rows(client), check_active)
         finally:
             if service is None:
                 http.close()

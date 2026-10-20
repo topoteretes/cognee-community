@@ -19,6 +19,7 @@ Three layers:
 
 import copy
 import random
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from uuid import NAMESPACE_OID, uuid5
 
@@ -292,8 +293,17 @@ def fake():
     return session
 
 
-def run_sync(session, state, project_gids=("P1",), **kwargs):
-    return list(sync_tasks(session, state, project_gids=list(project_gids), **kwargs))
+# The run clock for sync_tasks: after every timestamp the tests use.
+NOW = datetime(2026, 10, 28, tzinfo=UTC)
+
+
+def hours(n):
+    """The run clock ``n`` hours after ``NOW``, for the give-up rule's 24 hours."""
+    return NOW + timedelta(hours=n)
+
+
+def run_sync(session, state, project_gids=("P1",), now=NOW, **kwargs):
+    return list(sync_tasks(session, state, project_gids=list(project_gids), now=now, **kwargs))
 
 
 def task_rows(rows):
@@ -972,37 +982,109 @@ def test_three_unreadable_tasks_never_block_the_run_and_are_given_up(fake):
     for run in (1, 2):
         forbid()
         stats = {}
-        rows = run_sync(fake, state, stats=stats)
+        rows = run_sync(fake, state, stats=stats, now=hours(12 * run))
         if run == 1:
             assert set(task_rows(rows)) == {"task:10", "task:14"}  # the others went on
+        else:
+            assert stats["probe_task"] == 1  # 10 and 14 are unchanged: one is read as a check
         assert tombstones(rows) == []
         assert state["retry"] == ["11", "12", "13"]
         runs = {gid: entry["runs"] for gid, entry in state["unreadable"].items()}
         assert runs == {"11": run, "12": run, "13": run}
         assert stats["kept"] == 3 and "failed_unavailable" not in stats
+        assert "failed_permission" not in stats
 
     # A task created upstream meanwhile is still ingested.
     fake.add_task("15", modified_at=day(5))
     forbid()
     stats = {}
-    rows = run_sync(fake, state, stats=stats)
+    rows = run_sync(fake, state, stats=stats, now=hours(36))
     assert "task:15" in task_rows(rows)
-    # Third run at the same stamp: forgotten, and no longer asked about.
+    # Third run, 24 hours after the first: forgotten, and no longer asked about.
     assert [r["id"] for r in tombstones(rows)] == ["task:11", "task:12", "task:13"]
     assert stats["given_up"] == 3 and state["retry"] == [] and state["unreadable"] == {}
     fake.calls.clear()
-    run_sync(fake, state)
+    run_sync(fake, state, now=hours(48))
     assert not fake.requested("/tasks/11")
 
     # Once a given-up task changes upstream, it is asked about (and ingested) again.
     fake.tasks["12"]["modified_at"] = day(6)
-    rows = run_sync(fake, state)
+    rows = run_sync(fake, state, now=hours(48))
     assert set(task_rows(rows)) == {"task:12"}
     assert "12" not in state["given_up"]
 
 
+def test_failing_runs_within_a_day_forget_nothing_and_a_recovery_clears_them(fake):
+    # A host that syncs every ten minutes sees four runs of 404s in under an hour.
+    for gid in ("1", "2"):
+        fake.add_task(gid, modified_at=day(1))
+    state = {}
+    run_sync(fake, state)
+    fake.tasks["2"]["modified_at"] = day(4)
+
+    for minutes in (10, 20, 30, 40):
+        fake.queue("/tasks/2", _error(404, "Not found"))
+        rows = run_sync(fake, state, now=NOW + timedelta(minutes=minutes))
+        assert tombstones(rows) == []
+    assert state["unreadable"]["2"]["runs"] == 4
+    assert state["given_up"] == {}
+
+    # Asana recovers: the task is read again and its failures are forgotten.
+    rows = run_sync(fake, state, now=hours(1))
+    assert set(task_rows(rows)) == {"task:2"}
+    assert state["unreadable"] == {} and state["retry"] == []
+
+
+@pytest.mark.parametrize("check", [403, 500])
+def test_a_run_that_cannot_count_never_gives_up_an_old_entry(fake, check, caplog):
+    # Task 2 was counted three times within an hour. A day later the check fails
+    # too: that run counts nothing, so it cannot forget task 2 either.
+    for gid in ("1", "2"):
+        fake.add_task(gid, modified_at=day(1))
+    state = {}
+    run_sync(fake, state)
+    fake.tasks["2"]["modified_at"] = day(4)
+    for minutes in (10, 20, 30):
+        fake.queue("/tasks/2", _error(404, "Not found"))
+        run_sync(fake, state, now=NOW + timedelta(minutes=minutes))
+    assert state["unreadable"]["2"]["runs"] == 3
+
+    fake.queue("/tasks/2", _error(403, "Forbidden"))
+    for path, response in _task_failure(check, "1")[: 1 if check < 500 else None]:
+        fake.queue(path, response)
+    stats = {}
+    rows = run_sync(fake, state, stats=stats, now=hours(25))
+
+    assert tombstones(rows) == [] and stats["given_up"] == 0
+    assert state["unreadable"]["2"]["runs"] == 3 and state["given_up"] == {}
+    assert ("failed_permission" in stats) == (check == 403)
+
+
+def test_a_partial_outage_answering_404_everywhere_forgets_nothing(fake, caplog):
+    # Every GET /tasks/N answers 404, the check of an unchanged task included.
+    for gid in ("1", "2", "3", "4"):
+        fake.add_task(gid, modified_at=day(1))
+    state = {}
+    run_sync(fake, state)
+    for gid in ("1", "2", "3"):
+        fake.tasks[gid]["modified_at"] = day(4)
+
+    for run in (1, 2, 3, 4):
+        for gid in ("1", "2", "3", "4"):
+            fake.queue(f"/tasks/{gid}", _error(404, "Not found"))
+        stats = {}
+        rows = run_sync(fake, state, stats=stats, now=hours(24 * run))
+        assert tombstones(rows) == []
+        assert stats["probe_task"] == 1 and stats["given_up"] == 0
+        assert stats["failed_permission"] == 3
+        assert state["unreadable"] == {}
+    assert "check the token's permissions" in caplog.text
+    assert {"task:1", "task:2", "task:3", "task:4"} <= set(state["known_ids"])
+
+
 def test_a_lost_permission_never_gives_anything_up(fake, caplog):
-    # Every task answers 403 (the token lost access): kept, never forgotten.
+    # Every task answers 403 and there is no other task to compare with: kept,
+    # never forgotten, and the log says nothing counts.
     for gid in ("1", "2", "3"):
         fake.add_task(gid, modified_at=day(1))
     state = {}
@@ -1010,34 +1092,169 @@ def test_a_lost_permission_never_gives_anything_up(fake, caplog):
     for gid in ("1", "2", "3"):
         fake.tasks[gid]["modified_at"] = day(4)
 
-    for _ in range(4):
+    for run in (1, 2, 3, 4):
         for gid in ("1", "2", "3"):
             fake.queue(f"/tasks/{gid}", _error(403, "Forbidden"))
         stats = {}
-        rows = run_sync(fake, state, stats=stats)
+        rows = run_sync(fake, state, stats=stats, now=hours(24 * run))
         assert tombstones(rows) == []
         assert stats["failed_permission"] == 3 and stats["given_up"] == 0
-        assert {entry["runs"] for entry in state["unreadable"].values()} == {0}
-    assert "task: every fetch answered 403 this run" in caplog.text
+        assert "probe_task" not in stats
+        assert state["unreadable"] == {}
+    assert "there is no other task to check access with" in caplog.text
     assert {"task:1", "task:2", "task:3"} <= set(state["known_ids"])
 
 
-def test_one_hidden_task_among_readable_ones_is_given_up(fake):
+def test_one_hidden_task_among_unchanged_ones_is_given_up(fake, caplog):
+    # Steady state: task 1 is unchanged and skipped, so only task 2 is fetched,
+    # and task 1 is read once per run to show that access works.
     for gid in ("1", "2"):
         fake.add_task(gid, modified_at=day(1))
     state = {}
     run_sync(fake, state)
-    for gid in ("1", "2"):
-        fake.tasks[gid]["modified_at"] = day(4)
+    fake.tasks["2"]["modified_at"] = day(4)
 
     for run in (1, 2, 3):
         fake.queue("/tasks/2", _error(403, "Forbidden"))
-        if run > 1:
-            fake.tasks["1"]["modified_at"] = day(4 + run)  # task 1 keeps being fetched
+        fake.calls.clear()
         stats = {}
-        rows = run_sync(fake, state, stats=stats)
-        assert "failed_permission" not in stats
+        rows = run_sync(fake, state, stats=stats, now=hours(12 * run))
+        assert fake.requested("/tasks/1") == [{"opt_fields": "gid"}]  # the check, after
+        assert stats["probe_task"] == 1 and "failed_permission" not in stats
+        assert task_rows(rows) == {}  # the check is not emitted
     assert [r["id"] for r in tombstones(rows)] == ["task:2"]
+    assert "check the token's permissions" not in caplog.text
+
+
+def test_a_check_answering_a_server_error_counts_nothing(fake, caplog):
+    for gid in ("1", "2"):
+        fake.add_task(gid, modified_at=day(1))
+    state = {}
+    run_sync(fake, state)
+    fake.tasks["2"]["modified_at"] = day(4)
+    fake.queue("/tasks/2", _error(403, "Forbidden"))
+    for path, response in _task_failure(500, "1"):  # Asana is failing: proves nothing
+        fake.queue(path, response)
+    stats = {}
+
+    rows = run_sync(fake, state, stats=stats, now=hours(12))
+
+    assert tombstones(rows) == []
+    assert stats["probe_task"] == 1 and "failed_permission" not in stats
+    assert state["unreadable"] == {} and state["retry"] == ["2"]
+    assert "check the token's permissions" not in caplog.text
+
+
+def test_a_given_up_task_is_asked_again_after_a_day(fake):
+    for gid in ("1", "2"):
+        fake.add_task(gid, modified_at=day(1))
+    state = {}
+    run_sync(fake, state)
+    fake.tasks["2"]["modified_at"] = day(4)
+    for run in (1, 2, 3):
+        fake.queue("/tasks/2", _error(404, "Not found"))
+        run_sync(fake, state, now=hours(12 * run))
+    assert state["given_up"] == {"2": {"stamp": day(4), "at": asana._stamp(hours(36))}}
+
+    # Not asked within the day; asked a day later, and still unreadable.
+    fake.calls.clear()
+    run_sync(fake, state, now=hours(59))
+    assert not fake.requested("/tasks/2")
+    fake.queue("/tasks/2", _error(404, "Not found"))
+    stats = {}
+    rows = run_sync(fake, state, stats=stats, now=hours(60))
+    assert fake.requested("/tasks/2") and task_rows(rows) == {} and tombstones(rows) == []
+    assert stats["failed"] == 1 and stats["kept"] == 0
+    assert state["given_up"]["2"]["at"] == asana._stamp(hours(60))
+    assert state["retry"] == [] and state["unreadable"] == {} and state["pending"] == []
+
+    # Readable again a day later, though never edited: it comes back, and stays.
+    rows = run_sync(fake, state, now=hours(84))
+    assert set(task_rows(rows)) == {"task:2"}
+    assert state["given_up"] == {} and "task:2" in state["known_ids"]
+    assert tombstones(run_sync(fake, state, now=hours(85))) == []
+
+
+def test_given_up_tasks_are_asked_again_a_few_per_run_oldest_first(fake, monkeypatch):
+    monkeypatch.setattr(asana, "_MAX_REASKS", 1)
+    for gid in ("1", "2", "3"):
+        fake.add_task(gid, modified_at=day(1))
+    state = {}
+    run_sync(fake, state)
+    # Tasks 2 and 3 were forgotten two and three days ago.
+    state["given_up"] = {
+        "2": {"stamp": day(1), "at": asana._stamp(hours(-48))},
+        "3": {"stamp": day(1), "at": asana._stamp(hours(-72))},
+    }
+    state["known_ids"] = ["project:P1", "task:1"]
+    fake.add_task("4", modified_at=day(5))
+    fake.calls.clear()
+
+    rows = run_sync(fake, state)
+
+    fetched = [path for path, _ in fake.calls if path in ("/tasks/2", "/tasks/3", "/tasks/4")]
+    assert fetched == ["/tasks/4", "/tasks/3"]  # new tasks first, then the oldest one
+    assert set(task_rows(rows)) == {"task:3", "task:4"}
+    assert list(state["given_up"]) == ["2"]
+
+
+def test_a_run_that_stops_early_counts_nothing_toward_giving_up(fake):
+    fake.add_project("P2")
+    for gid in ("1", "2", "3"):
+        fake.add_task(gid, modified_at=day(1))
+    state = {}
+    run_sync(fake, state, project_gids=("P1", "P2"))
+    fake.tasks["2"]["modified_at"] = day(4)
+    for run in (1, 2):
+        fake.queue("/tasks/2", _error(403, "Forbidden"))
+        run_sync(fake, state, project_gids=("P1", "P2"), now=hours(12 * run))
+    unreadable = copy.deepcopy(state["unreadable"])
+    assert unreadable["2"]["runs"] == 2
+    # Task 3 was forgotten a day ago and is due to be asked again.
+    state["given_up"] = {"3": {"stamp": day(1), "at": asana._stamp(hours(24))}}
+    state["known_ids"].remove("task:3")
+
+    # Run 3: task 1 is read, task 2 answers 403 again, task 3 is still hidden,
+    # then the token is revoked on a project and the run stops.
+    fake.tasks["1"]["modified_at"] = day(6)
+    fake.queue("/tasks/2", _error(403, "Forbidden"))
+    fake.queue("/tasks/3", _error(404, "Not found"))
+    fake.queue("/projects/P2", _error(401, "Not Authorized"))
+    stats = {}
+    rows = run_sync(fake, state, project_gids=("P1", "P2"), stats=stats, now=hours(48))
+
+    assert stats["failed_auth"] == 1 and tombstones(rows) == []
+    assert state["unreadable"] == unreadable  # not a third run
+    assert state["given_up"] == {"3": {"stamp": day(1), "at": asana._stamp(hours(24))}}
+
+
+def test_state_from_the_second_round_is_read(fake):
+    # Round-2 state: given_up held a bare stamp, unreadable had no ``since``.
+    for gid in ("1", "2", "3", "4"):
+        fake.add_task(gid, modified_at=day(1))
+    state = {}
+    run_sync(fake, state)
+    fake.tasks["2"]["modified_at"] = day(4)
+    fake.tasks["4"]["modified_at"] = day(4)
+    state["retry"] = ["2", "4"]
+    state["unreadable"] = {"2": {"stamp": day(4), "runs": 2}, "4": {"stamp": day(4), "runs": 0}}
+    state["given_up"] = {"3": day(1)}
+    state["known_ids"].remove("task:3")
+    fake.queue("/tasks/2", _error(404, "Not found"))
+    fake.queue("/tasks/4", _error(404, "Not found"))
+
+    rows = run_sync(fake, state, now=hours(1))
+
+    # Task 3 has no time of its own: it sits at the epoch, so it is asked at once.
+    assert asana._load_given_up({"3": day(1)}) == {
+        "3": {"stamp": day(1), "at": asana._stamp(asana._EPOCH)}
+    }
+    assert "task:3" in task_rows(rows)
+    assert state["given_up"] == {}
+    # Task 2's day starts now; task 4's uncounted entry counts as its first run.
+    assert state["unreadable"]["2"] == {"stamp": day(4), "runs": 3, "since": asana._stamp(hours(1))}
+    assert state["unreadable"]["4"]["runs"] == 1
+    assert tombstones(rows) == []
 
 
 def test_retries_go_last_and_never_count_toward_an_outage(fake):
@@ -1740,6 +1957,13 @@ def test_the_token_is_never_in_an_error_message_or_a_log_line(fake, caplog, slee
         _get(leaky, "/projects/P1")
     assert SECRET not in str(excinfo.value) and excinfo.value.status == 0
 
+    # An error whose message echoes the token: cut out of ``detail``.
+    fake.headers = {"Authorization": f"Bearer {SECRET}"}
+    fake.queue("/tasks", _error(400, f"bad token abcd-{SECRET}"))
+    with pytest.raises(AsanaAPIError) as excinfo:
+        run_sync(fake, {})
+    assert excinfo.value.detail == "bad token abcd-[token]"
+
     # A 401 whose body echoes the token: neither the message nor the logs carry it.
     fake.queue("/tasks", _Resp(401, f"<html>token={SECRET}</html>"))
     with pytest.raises(AsanaAPIError) as excinfo:
@@ -1761,6 +1985,33 @@ def test_waits_are_capped_and_ask_check_active_first(fake, sleeps):
     assert excinfo.value.status == 429
     assert sleeps == [30.0]  # the 61 s wait was not taken
     assert checks == [0, 0, 1]  # before the request, before the wait, before the retry
+
+
+def test_redact_cuts_the_token_out_and_drops_text_for_a_short_one():
+    assert asana._redact(f"bad token {SECRET}", SECRET) == "bad token [token]"
+    assert asana._redact("task: Unknown object", SECRET) == "task: Unknown object"
+    assert asana._redact("anything", "") == "anything"
+    assert asana._redact("bad token abc", "abc") == ""  # too short to replace safely
+
+
+def test_a_run_waits_at_most_its_budget_in_all(fake, sleeps):
+    for gid in ("1", "2"):
+        fake.add_task(gid, modified_at=day(1))
+    state = {}
+    run_sync(fake, state)
+    for gid in ("1", "2"):
+        fake.tasks[gid]["modified_at"] = day(4)
+    for _ in range(asana._MAX_RETRIES):
+        fake.queue("/tasks/1", _error(503, "Unavailable", headers={"Retry-After": "50"}))
+    stats = {}
+
+    rows = run_sync(fake, state, stats=stats)
+
+    assert sleeps == [50.0, 50.0]  # a third wait would pass the 120 s budget
+    assert stats["failed_unavailable"] == 1 and stats["failed"] == 1
+    assert task_rows(rows) == {} and tombstones(rows) == []
+    fake._queued.clear()
+    assert set(task_rows(run_sync(fake, state))) == {"task:1", "task:2"}  # resumed
 
 
 @pytest.mark.parametrize("name", ["", "Foo-Bar", "a" * 65, None])
@@ -1813,3 +2064,9 @@ def test_sync_stats_count_what_a_run_did(fake):
         "kept": 0,
         "given_up": 0,
     }
+
+    # A run stopped by a rate limit while listing says why, with no failure invented.
+    fake.queue("/events", _error(429, "Rate limited", headers={"Retry-After": "120"}))
+    list(source)
+    assert source.cognee_sync_stats["failed"] == 0
+    assert source.cognee_sync_stats["failed_rate_limit"] == 1

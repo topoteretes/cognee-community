@@ -185,12 +185,16 @@ empty listing or a task to skip.
 Only the listing decides that a task is gone. A task that is still listed but fails on its own
 keeps its previous document and is fetched again on the next run; the rest of the run goes on:
 
-- **`403` or `404`** (hidden from this token, or a passing glitch): kept. If it answers that
-  way in three runs in a row at the same `modified_at`, its document is forgotten and the task
-  is not asked about again until its `modified_at` moves. A `403` only counts toward that when
-  another task was fetched in the same run: if every task answers `403`, the token has lost a
-  permission, nothing is forgotten, a warning says so, and the stats count it as
-  `failed_permission`.
+- **`403` or `404`**: kept. The task may be hidden from this token, or Asana may be failing or
+  the token may have lost a permission; only the first is a reason to forget it. So the answer
+  counts only when access to tasks is shown to work in the same run: another task was read,
+  or, when nothing else changed, one unchanged task is read as a check (one request, and only
+  while something is unreadable). If the check answers `403`/`404` too, or there is no other
+  task to check with, nothing counts, a warning says so, and the stats count it as
+  `failed_permission`; if the check hits a server error, nothing counts either. After three
+  counted runs at the same `modified_at` **and** 24 hours since the first, the document is
+  forgotten. A forgotten task is asked again when its `modified_at` moves, and otherwise once
+  a day (at most 10 per run, after everything else); if it reads again, it comes back.
 - **A server error or no answer** that outlasts the retries: kept. Three of these in a row on
   fresh tasks means Asana itself is down, and the run stops cleanly (below).
 
@@ -199,22 +203,24 @@ streak, so tasks that keep failing cannot hold up the others.
 
 Some failures stop the run **cleanly** instead of aborting it: a `401` after at least one task
 was emitted (an expiring token on a long first sync), a rate limit that outlasts the retries or
-asks for a wait over 60 seconds, and the outage above. The run then ends normally: what it
-emitted is loaded, the tasks it did not reach are kept in state and fetched on the next run
-even if nothing changed upstream, and nothing is deleted. The cursors and sync tokens move
+asks for a wait over 60 seconds, a run that has already waited 120 seconds in all, and the
+outage above. The run then ends normally: what it emitted is loaded, the tasks it did not
+reach are kept in state and fetched on the next run even if nothing changed upstream, nothing
+is deleted, and nothing counts toward forgetting a task. The cursors and sync tokens move
 forward, so the next run does not list everything again. A `401` before any task was emitted
 still raises, since that is a bad token.
 
 Error messages name the status and the endpoint only (`Asana /tasks/123: HTTP 403`). Asana's
-own explanation is on the exception's `detail`; a response body or the token never is.
+own explanation is on the exception's `detail`, with the token cut out should Asana echo it;
+a response body never is.
 
 ### Sync stats
 
 `resource.cognee_sync_stats` holds the counts of the last run, as plain ints: `scanned` (tasks
 listed), `skipped` (unchanged), `failed` (task failures), `deleted`, `kept` (tasks waiting for a
 retry) and `given_up`, plus `failed_auth`, `failed_rate_limit` or `failed_unavailable` when the
-run stopped early for that reason, and `failed_permission` (tasks answering `403` while no
-task could be read).
+run stopped early for that reason, `failed_permission` (tasks answering `403`/`404` while no
+task could be read), and `probe_task` when a check request was made.
 
 ## Limits
 
@@ -232,7 +238,8 @@ task could be read).
 - A first sync, and a sync more than about a day after the previous one, fetch every task
   (see "Syncing less often than once a day"). Asana tokens issued through OAuth last an hour;
   a first sync longer than that stops at the `401` and finishes over the next runs.
-- A task that answers `403` or `404` in three runs in a row is forgotten until it changes.
+- A task that answers `403` or `404` while other tasks read fine, in three runs over at least
+  24 hours, is forgotten until it changes or reads again (asked once a day).
 - Deletions propagate on a foreground `remember(...)`. cognee skips orphan cleanup for
   `run_in_background=True`.
 
@@ -285,9 +292,12 @@ uv run pytest tests/ -q
 The tests mock the Asana API (no token, no network). They cover rendering (also from shuffled
 input), the cursor and its overlap, the events paths (edited comment, renamed and deleted
 subtask, 412, `has_more` paging), deletion, tasks that fail on their own (kept and retried,
-three unreadable ones not blocking a run and given up after three runs, retries going last),
-the clean stops (`401` mid-run, rate limit, long `Retry-After`, outage) and what the next run
-picks up, bodies of the wrong shape, an empty selection, pagination (expired and repeated
+retries going last, three unreadable ones not blocking a run, `403`/`404` counted only when
+access is shown to work, with a check request in steady state, nothing forgotten in a partial
+outage, within a day, after a lost permission or in a run that could not check, given-up
+tasks asked again after a day, runs that stopped early counting nothing, state from the
+previous version), the clean stops (`401` mid-run, rate limit, long `Retry-After`, the run's
+wait budget, outage) and what the next run picks up, bodies of the wrong shape, an empty selection, pagination (expired and repeated
 offsets) and retries, the token never reaching a message or a log line, and the failure paths
 that must delete nothing. A real `dlt` pipeline into a temp sqlite destination checks edits
 and deletes across runs, two sources in one dataset staying apart, a task kept and retried, a
