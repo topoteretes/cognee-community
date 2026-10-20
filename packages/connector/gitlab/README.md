@@ -44,15 +44,23 @@ The connector supports and recommends legacy personal access tokens. One
 `read_api` scope gives read access to everything the token's user can see:
 every project, with its issues, merge requests, comments, and wiki.
 
-Fine-grained tokens are not supported or tested. They grant access per project
-and per resource, so a working sync would need read permission set separately
-for every selected project and for issues, merge requests, notes (comments), and
-wiki pages. Any permission left out makes that part of the sync fail or come back
-incomplete. The connector's token check also expects the `read_api` scope in the token's
-`scopes` field, while GitLab reports fine-grained permissions in a separate
-`granular_scopes` field, so a fine-grained token is likely rejected before the
-sync starts. Supporting them would
-mean testing each permission combination; that is left as a follow-up.
+Fine-grained tokens are not supported or tested. Besides choosing which groups
+and projects the token reaches, it needs a separate read permission for each kind
+of resource the connector calls: Personal Access Token (token check), Project
+(discovery), Work Item (issues, and the comments on both issues and merge
+requests), Merge Request, and Wiki. Any permission left out makes that part of the
+sync fail or come back incomplete. The connector's token check also expects the
+`read_api` scope in the token's `scopes` field, while GitLab reports fine-grained
+permissions in a separate `granular_scopes` field, so a fine-grained token is
+likely rejected before the sync starts. Supporting them would mean testing each
+permission combination; that is left out for now.
+
+GitLab can also require fine-grained tokens from a set date. On gitlab.com, a
+top-level group that does this blocks legacy tokens from its groups and projects,
+so this connector cannot sync them. On a self-managed instance, users can no longer
+create or rotate legacy tokens, and existing ones work only until they expire. See
+GitLab's
+[fine-grained token guide](https://docs.gitlab.com/auth/tokens/fine_grained_access_tokens/).
 
 ## Run the example
 
