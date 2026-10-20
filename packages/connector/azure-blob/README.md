@@ -6,9 +6,9 @@ dlt source: documents go through normal Cognee text processing and graph extract
 Merge runs download new or changed blobs and remove previously ingested documents
 that are deleted upstream or no longer eligible.
 
-The implementation follows [GCS PR #452](https://github.com/topoteretes/cognee-community/pull/452)
-and the extraction boundary of [S3 PR #209](https://github.com/topoteretes/cognee-community/pull/209),
-using Azure's Last-Modified timestamps and ETags for change detection.
+The implementation follows the structure of the GCS and S3 connectors (see
+"Alignment with S3" below), using Azure's Last-Modified timestamps and ETags for
+change detection.
 Implements [cognee issue #4762](https://github.com/topoteretes/cognee/issues/4762).
 
 ## Install
@@ -21,9 +21,10 @@ uv sync --locked
 ```
 
 This installs the local package, `cognee==1.6.5`, dlt with SQLAlchemy, Azure's
-`azure-storage-blob` SDK, and development tools. The Cognee pin follows GCS PR #452,
-which verified final-document graph/vector cleanup on this version after finding
-stale memory with 1.4.0. Do not downgrade if you require deletion synchronization.
+`azure-storage-blob` SDK, and development tools. Cognee 1.6.5 is pinned because
+final-document graph/vector cleanup was verified on it; 1.4.0 left stale memory
+after the last document was deleted. Do not downgrade if you require deletion
+synchronization.
 
 ## Azure setup and authentication
 
@@ -127,8 +128,7 @@ async def main():
 asyncio.run(main())
 ```
 
-The factory returns a dlt source; it is no longer the temporary client-setup
-context manager from the initial scaffold.
+The factory returns a dlt source.
 
 | Argument | Default | Meaning |
 | --- | --- | --- |
@@ -221,8 +221,8 @@ They need no Azure credentials or model API calls. These tests verify connector
 and staging behavior; they do not constitute live Azure or end-to-end graph/vector
 validation.
 
-Before release, use an authorized test container (or Azurite for service-level
-checks) and valid model configuration to run the example. Repeat with an edit,
+Before release, use an authorized test container (Azurite has not been tried
+with this connector) and valid model configuration to run the example. Repeat with an edit,
 an unchanged rerun, a deletion while another document remains, and deletion of the
 final document. Verify Cognee Data records, graph and vector contents as well as
 search results. An empty dataset may raise `NoDataError`, which the example handles.
@@ -237,8 +237,44 @@ destinations. Additional source/dlt checks covered text formats, pagination,
 conditional-read races and failure recovery. Final-document deletion left no
 staging rows, Data records, graph nodes/edges, or rows in the inspected vector tables.
 
-The automated suite passed 61 cases. Ruff lint and formatting checks passed.
 Live authentication used an account key; SAS configuration was tested offline.
+Portal screenshots and measured result tables are attached to the pull request
+that introduced this connector.
 
-[Portal screenshots, measured tables, raw results, and reproduction steps](https://github.com/RK-625/cognee-community/tree/48d285cdbec52316695aed16889a5ef11b686360)
-are stored separately from the connector implementation.
+## Design notes for maintainers
+
+`azure_blob.py` exposes `azure_blob_source()` plus these private helpers:
+
+| Helper | Role |
+| --- | --- |
+| `_build_client()` | Creates a `BlobServiceClient` from the account URL and SAS token or key. |
+| `_list_objects()` | Consumes every listing page, skips empty folder placeholders, enforces `max_objects` before any download. |
+| `_is_eligible()` | Applies the text-extension allowlist (`TEXT_EXTENSIONS`) and the size limit. |
+| `_read_object()` | Downloads with an ETag `If-Match` condition; `BlobNotFound` means skipped, anything else aborts. |
+| `_decode()` | UTF-8 with optional BOM; invalid bytes are replaced. |
+| `_object_to_row()` | Builds the `id`/`url`/`title`/`content` row from the escaped blob URL. |
+| `_stamp()` | Records `last_modified` and `etag`; raises if the listing lacks either. |
+| `_scope()` | Namespaces state by account endpoint, container and prefix. |
+
+Invariants to preserve when changing the sync loop:
+
+- Finish the full listing before downloading or emitting any deletion marker.
+- Compare ETags for equality only; they are opaque and not ordered.
+- Download with the listed ETag so an overwrite mid-sync aborts instead of
+  returning mixed content.
+- Emit a deletion marker only after `get_blob_properties()` returns `BlobNotFound`;
+  a blob that still exists keeps its old inventory entry.
+- Write the new inventory to dlt state only after extraction completes.
+- Keep row `id` values stable (the escaped blob URL without SAS); they are the
+  merge and hard-delete key.
+
+Stored state: `resource_state()["inventories"][scope]` maps each blob URL to
+`{"name", "last_modified", "etag"}`, where `scope` is
+`<endpoint>/<container>/<prefix>`. Changing this shape breaks existing users'
+saved state, so treat it as a migration. `PIPELINE_SCOPE_ATTR` is set to the same
+scope so Cognee gives each scope and dataset its own dlt pipeline.
+
+To support another file type, add its extension to `TEXT_EXTENSIONS` only if it is
+plain text that UTF-8 decoding handles; the set matches the S3 and GCS allowlists
+and should stay consistent. Binary formats need an extraction step this connector
+does not have.
