@@ -10,12 +10,14 @@ from cognee_community_connector_mailchimp.mailchimp import (
     MailchimpError,
     MailchimpNotFoundError,
     _iter_rows,
+    _reset_stats,
 )
 
 
 def run(fake, state, **kwargs):
     """One sync run; returns ({row id: row}, stats). ``state`` is updated in place."""
     stats: dict[str, int] = {}
+    _reset_stats(stats)
     client = MailchimpClient(fake.api_key, http_client=fake.http_client())
     rows = _iter_rows(client, state=state, stats=stats, **kwargs)
     return {row["id"]: row for row in rows}, stats
@@ -412,18 +414,75 @@ def test_held_back_items_that_come_back_are_not_forgotten(fake):
     assert "pending_delete" not in state
 
 
-def test_a_different_mass_delete_needs_its_own_confirmation(fake):
-    _twelve_sent(fake)
+def _sent(fake, n):
+    for i in range(n):
+        fake.send(fake.add_campaign(f"Campaign {i}", "Body.")["id"])
+    return list(fake.campaigns)
+
+
+def test_a_rolling_mass_delete_is_forgotten_not_held_forever(fake):
+    # 16 of 30 deleted, then one more before every run. An exact match on the
+    # held set would hold 16, 17, 18, ... and never forget any of them.
+    ids = _sent(fake, 30)
     state: dict = {}
     run(fake, state)
-    ids = list(fake.campaigns)
+    for cid in ids[:16]:
+        fake.delete_campaign(cid)
+    _, stats = run(fake, state)
+    assert (stats["held_back"], stats["deleted"]) == (16, 0)
+    for n in range(16, 20):
+        fake.delete_campaign(ids[n])
+        _, stats = run(fake, state)
+        # The ones still gone are confirmed; the single new one is ordinary.
+        expected = 17 if n == 16 else 1
+        assert (stats["held_back"], stats["deleted"]) == (0, expected)
+    assert len(state["items"]) == 30 - 20
+
+
+def test_an_ordinary_delete_after_a_mass_delete_is_not_held(fake):
+    ids = _sent(fake, 12)
+    state: dict = {}
+    run(fake, state)
     for cid in ids[:10]:
         fake.delete_campaign(cid)
     _, stats = run(fake, state)
     assert stats["held_back"] == 10
     fake.delete_campaign(ids[10])
     _, stats = run(fake, state)
-    assert (stats["held_back"], stats["deleted"]) == (11, 0)
+    assert (stats["held_back"], stats["deleted"]) == (0, 11)
+    assert "pending_delete" not in state
+
+
+def test_confirmed_deletes_go_through_while_a_new_batch_is_held(fake):
+    # With a lower threshold a second batch can be large on its own: the first
+    # batch is confirmed and forgotten in the same run the second is held.
+    ids = _sent(fake, 30)
+    state: dict = {}
+    run(fake, state, max_delete_ratio=0.3)
+    for cid in ids[:10]:
+        fake.delete_campaign(cid)
+    _, stats = run(fake, state, max_delete_ratio=0.3)
+    assert stats["held_back"] == 10
+    for cid in ids[10:20]:
+        fake.delete_campaign(cid)
+    rows, stats = run(fake, state, max_delete_ratio=0.3)
+    assert (stats["deleted"], stats["held_back"]) == (10, 10)
+    assert sorted(rows) == sorted(f"campaign:{c}" for c in ids[:10])
+
+
+def test_held_items_that_partly_come_back_keep_the_rest_confirmed(fake):
+    ids = _sent(fake, 12)
+    state: dict = {}
+    run(fake, state)
+    _, stats = run(fake, state, folder_ids=["nope"])
+    assert stats["held_back"] == 12
+    fake.delete_campaign(ids[0])
+    fake.delete_campaign(ids[1])
+    rows, stats = run(fake, state)
+    # Ten came back; the two still gone were held last run, so they are confirmed.
+    assert (stats["deleted"], stats["held_back"], stats["unchanged"]) == (2, 0, 10)
+    assert sorted(rows) == sorted(f"campaign:{c}" for c in ids[:2])
+    assert "pending_delete" not in state
 
 
 def test_allow_mass_delete_forgets_at_once(fake):

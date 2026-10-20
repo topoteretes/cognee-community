@@ -111,12 +111,15 @@ These rules come from testing the Mailchimp API on a live account.
   is only saved when the load succeeds, and cognee only forgets things after a
   successful run, so the next sync simply retries.
 - **Mass deletes wait for a second run.** When a run finds more than half of
-  what it has synced gone (and at least 10 items), which is what a wrong
+  what it has synced newly gone (and at least 10 items), which is what a wrong
   audience or folder selection looks like, it keeps those items and reports
-  them as `held_back`. The next run forgets them if the same items are still
-  gone; anything that came back is kept. No run ever stops on this, so a
-  scheduled sync needs no manual step. `allow_mass_delete=True` forgets such a
-  batch at once; `max_delete_ratio` tunes the threshold.
+  them as `held_back`. The next run forgets every held item that is still gone
+  and keeps the ones that came back; anything gone for the first time in that
+  run is judged on its own, so ordinary deletes alongside a held batch are not
+  delayed. No run ever stops on this, so a scheduled sync needs no manual step.
+  `allow_mass_delete=True` forgets such a batch at once; `max_delete_ratio`
+  tunes the threshold. A wrong selection that lasts two runs does forget the
+  items; when it is fixed they come back as new and are ingested again.
 - **Archiving is not deleting.** An archived campaign stays in memory: as a sent
   campaign ("Sent on ...; archived in Mailchimp") when it was sent, otherwise
   as an unsent one (with `include_unsent=True`). A canceled send is handled like
@@ -127,9 +130,9 @@ These rules come from testing the Mailchimp API on a live account.
   belongs to another account.
 - **Host contract.** `cognee_sync_stats` holds counts only (scanned, changed,
   unchanged, deleted, skipped, held_back, plus failed, failed_auth and
-  failed_rate_limit set to 1 when a run stops on that kind of error). `service`
-  takes a pre-built `httpx` client (`http_client` is the same thing), and an
-  optional `check_active` callable lets a host stop a running sync.
+  failed_rate_limit set to 1 when a run stops on that kind of error).
+  `http_client` takes a pre-built `httpx` client, and an optional
+  `check_active` callable lets a host stop a running sync.
 
 ## Setup
 
@@ -161,9 +164,10 @@ and recall returns the matching passages.
   its own dataset and share it as you would the Mailchimp account itself.
 - Mailchimp allows 10 simultaneous connections per account and sends no
   rate-limit headers; the connector reads sequentially and retries 429 and 5xx
-  responses using `Retry-After` or exponential backoff. A `Retry-After` above
-  60 seconds stops the run instead (cognee holds its dlt staging lock while a
-  source runs); the next sync retries.
+  responses using `Retry-After` or exponential backoff (a zero, negative or
+  unreadable `Retry-After` uses the backoff). A `Retry-After` above 60 seconds,
+  whatever the status, stops the run as a rate limit instead (cognee holds its
+  dlt staging lock while a source runs); the next sync retries.
 
 ## Behaviour seen live, not in Mailchimp's docs
 

@@ -97,6 +97,34 @@ def test_long_retry_after_stops_instead_of_sleeping():
     assert len(seen) == 1
 
 
+def test_unusable_retry_after_falls_back_to_backoff():
+    # float("nan") parses, and max(nan, 0.0) is nan, which time.sleep rejects;
+    # 0 or a negative value would retry back to back.
+    for value in ("nan", "-inf", "-5", "0"):
+        client, _, sleeps = _scripted(
+            httpx.Response(429, headers={"retry-after": value}),
+            httpx.Response(429, headers={"retry-after": value}),
+            httpx.Response(200, json={"ok": True}),
+        )
+        assert client.request("campaigns") == {"ok": True}
+        assert sleeps == [2.0, 4.0], value
+
+
+def test_infinite_retry_after_stops_like_a_long_wait():
+    for value in ("inf", "1e9"):
+        client, seen, sleeps = _scripted(httpx.Response(429, headers={"retry-after": value}))
+        with pytest.raises(MailchimpRateLimitError, match="asked to wait"):
+            client.request("campaigns")
+        assert (sleeps, len(seen)) == ([], 1), value
+
+
+def test_long_wait_on_a_5xx_is_a_rate_limit_too():
+    client, _, sleeps = _scripted(httpx.Response(503, headers={"retry-after": "600"}))
+    with pytest.raises(MailchimpRateLimitError, match="asked to wait 600s"):
+        client.request("campaigns")
+    assert sleeps == []
+
+
 def test_429_that_never_clears_is_a_rate_limit_error():
     client, _, sleeps = _scripted(*[httpx.Response(429, headers={"retry-after": "1"})] * 5)
     with pytest.raises(MailchimpRateLimitError, match="after 5 tries"):

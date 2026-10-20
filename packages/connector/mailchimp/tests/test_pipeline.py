@@ -52,14 +52,6 @@ def test_source_declares_document_marker_and_its_own_pipeline():
     assert pipeline_name_for_source(a, "ds") != pipeline_name_for_source(b, "ds")
 
 
-def test_source_refuses_cognee_without_per_row_node_sets(monkeypatch):
-    from cognee.tasks.ingestion import dlt_utils
-
-    monkeypatch.setattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 1)
-    with pytest.raises(RuntimeError, match="DOCUMENT_SYNC_VERSION"):
-        mailchimp_source(KEY)
-
-
 def test_arguments(monkeypatch):
     # Settings come only from the arguments; the factory never reads the environment.
     monkeypatch.setenv("MAILCHIMP_API_KEY", KEY)
@@ -71,15 +63,9 @@ def test_arguments(monkeypatch):
         mailchimp_source(KEY, max_delete_ratio=0)
     with pytest.raises(TypeError, match="list of ids"):
         mailchimp_source(KEY, audience_ids="aaaaaaaaaa")
-    with pytest.raises(ValueError, match="not both"):
-        mailchimp_source(KEY, service=httpx.Client(), http_client=httpx.Client())
+    with pytest.raises(TypeError):
+        mailchimp_source(KEY, service=httpx.Client())  # one injection point: http_client
     assert mailchimp_source(KEY, audience_ids=["aaaaaaaaaa"]).name == TABLE
-
-
-def test_service_is_the_same_injection_point(seeded, tmp_path):
-    pipeline = _pipeline(tmp_path)
-    pipeline.run(mailchimp_source(seeded.api_key, service=seeded.http_client()))
-    assert len(_rows(pipeline)) == 1
 
 
 def test_first_sync_loads_campaigns_and_notes(seeded, tmp_path):
@@ -238,3 +224,33 @@ def test_missing_account_id_stops_before_syncing(seeded, tmp_path):
     seeded.handler = no_account_id
     with pytest.raises(Exception, match="no account id"):
         _pipeline(tmp_path).run(_source(seeded))
+
+
+def test_stats_start_fresh_even_when_a_run_fails_early(seeded, tmp_path):
+    source = _source(seeded, resource_name="shared")
+    _pipeline(tmp_path / "a").run(source)
+    assert source.cognee_sync_stats["scanned"] == 1
+    # Another account owns "shared" in this pipeline, so the same source object
+    # fails on the account check the second time, before reading anything.
+    pipeline = _pipeline(tmp_path / "b")
+    original = seeded.handler
+    seeded.handler = lambda r: (
+        httpx.Response(200, json={"account_id": "acct2", "account_name": "Other"})
+        if r.url.path.rstrip("/") == "/3.0"
+        else original(r)
+    )
+    pipeline.run(_source(seeded, resource_name="shared"))
+    seeded.handler = original
+    with pytest.raises(Exception, match="own resource_name"):
+        pipeline.run(source)
+    assert source.cognee_sync_stats == {
+        "scanned": 0,
+        "changed": 0,
+        "unchanged": 0,
+        "deleted": 0,
+        "skipped": 0,
+        "held_back": 0,
+        "failed": 1,
+        "failed_auth": 0,
+        "failed_rate_limit": 0,
+    }

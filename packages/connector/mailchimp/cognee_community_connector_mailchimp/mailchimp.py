@@ -56,6 +56,7 @@ Design
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 import time
 from collections.abc import Callable, Generator, Iterator
@@ -96,6 +97,9 @@ ARCHIVED = "archived"
 # choice: small enough to catch a wrong audience or folder selection, large
 # enough that ordinary cleanups never wait.
 DEFAULT_MAX_DELETE_RATIO = 0.5
+# Below 10 the ratio alone would hold back ordinary cleanups in small accounts
+# (deleting 2 of 3 campaigns is two thirds), and a wrong selection there costs
+# little to re-sync.
 MASS_DELETE_MIN_ITEMS = 10
 
 # An API key is 32 hex characters, a dash and the data centre (for example us22).
@@ -209,10 +213,12 @@ class MailchimpClient:
                         f"Mailchimp API returned {status} on {endpoint} after {attempt} tries"
                     )
                 delay = _retry_delay(response, attempt)
-                if delay > MAX_RETRY_AFTER_SECONDS:
-                    raise error(
+                if delay > MAX_RETRY_AFTER_SECONDS:  # inf included
+                    # Being told to wait this long is rate limiting, whatever the status.
+                    wait = "without limit" if math.isinf(delay) else f"{delay:.0f}s"
+                    raise MailchimpRateLimitError(
                         f"Mailchimp API returned {status} on {endpoint} and asked to wait "
-                        f"{delay:.0f}s; stopping so the next sync can retry."
+                        f"{wait}; stopping so the next sync can retry."
                     )
                 logger.warning(
                     "Mailchimp: %s on %s, retrying in %.1fs (%d/%d).",
@@ -316,9 +322,13 @@ def _retry_delay(response: httpx.Response, attempt: int) -> float:
     retry_after = response.headers.get("retry-after")
     if retry_after:
         try:
-            return max(float(retry_after), 0.0)
+            delay = float(retry_after)
         except ValueError:
-            pass
+            delay = math.nan
+        # Zero, a negative value or "nan" is no usable wait: fall back to the
+        # backoff. "inf" is kept, so the caller's cap stops the run.
+        if delay > 0:
+            return delay
     return float(2**attempt)
 
 
@@ -637,7 +647,6 @@ def _iter_rows(
     Any API error propagates and aborts the run before a tombstone is yielded;
     dlt then keeps the old state.
     """
-    _reset_stats(stats)
     previous: dict[str, list] = dict(state.get("items") or {})
     present: dict[str, list] = {}
 
@@ -691,7 +700,12 @@ def _iter_rows(
         moved = moved or notes_moved
 
     gone = sorted(set(previous) - set(present))
-    large = len(gone) >= MASS_DELETE_MIN_ITEMS and len(gone) > max_delete_ratio * len(previous)
+    # Items held back last run and still gone are confirmed. What is newly gone
+    # is judged on its own: held back if it alone looks like a mass delete.
+    pending = set(state.get("pending_delete") or [])
+    confirmed = [key for key in gone if key in pending]
+    fresh = [key for key in gone if key not in pending]
+    large = len(fresh) >= MASS_DELETE_MIN_ITEMS and len(fresh) > max_delete_ratio * len(previous)
     if gone and moved:
         # A listing changed while it was read, so an item may have been skipped.
         # This run forgets nothing; the next one decides.
@@ -703,20 +717,20 @@ def _iter_rows(
         present.update({key: previous[key] for key in gone})
         stats["held_back"] = len(gone)
         gone = []
-    elif large and not allow_mass_delete and gone != state.get("pending_delete"):
+    elif large and not allow_mass_delete:
         # A wrong audience or folder selection looks exactly like a mass delete.
-        # Hold the deletes back and forget them only when the next run sees the
-        # same items gone, so a scheduled sync never needs a manual override.
+        # Hold these back and forget them when the next run sees them gone too,
+        # so a scheduled sync never needs a manual override.
         logger.warning(
-            "Mailchimp: %d of %d synced items are gone; holding the deletes until the "
+            "Mailchimp: %d of %d synced items are newly gone; holding them until the "
             "next sync confirms them.",
-            len(gone),
+            len(fresh),
             len(previous),
         )
-        present.update({key: previous[key] for key in gone})
-        state["pending_delete"] = gone
-        stats["held_back"] = len(gone)
-        gone = []
+        present.update({key: previous[key] for key in fresh})
+        state["pending_delete"] = fresh
+        stats["held_back"] = len(fresh)
+        gone = confirmed
     else:
         state.pop("pending_delete", None)
     for key in gone:
@@ -825,7 +839,6 @@ def mailchimp_source(
     max_delete_ratio: float = DEFAULT_MAX_DELETE_RATIO,
     allow_mass_delete: bool = False,
     resource_name: str | None = None,
-    service: httpx.Client | None = None,
     http_client: httpx.Client | None = None,
     check_active: Callable[[], None] | None = None,
 ):
@@ -848,13 +861,13 @@ def mailchimp_source(
         include_contact_email: Add the contact's email address to a note. Off by
             default; the note is tied to the contact's name.
         max_delete_ratio: When a run finds more than this share of the synced
-            items gone (and at least 10 of them), it holds the deletes back until
-            the next run sees the same items gone.
+            items newly gone (and at least 10 of them), it holds those back and
+            forgets the ones the next run also finds gone.
         allow_mass_delete: Forget such a batch at once, for an intended cleanup.
         resource_name: dlt resource name, also the staging table and the key of
             the sync state. Default ``mailchimp_<data centre>``.
-        service: Pre-built ``httpx`` client (the name cognee's own connectors
-            use); ``http_client`` is the same thing. Mainly for tests.
+        http_client: Pre-built ``httpx`` client, for a host that manages its
+            own connections, and for tests.
         check_active: Optional callable a host uses to stop a running sync; it
             raises to abort.
 
@@ -864,18 +877,10 @@ def mailchimp_source(
     """
     import dlt
 
-    if getattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 0) < 2:
-        raise RuntimeError(
-            "The Mailchimp connector needs a cognee build that reads per-row node sets "
-            "(DOCUMENT_SYNC_VERSION >= 2, cognee 1.6.3 or later)."
-        )
     if not isinstance(api_key, str) or not api_key.strip():
         raise ValueError("A Mailchimp API key is required.")
     key = api_key.strip()
     dc = data_centre(key)
-    if service is not None and http_client is not None and service is not http_client:
-        raise ValueError("Pass service or http_client, not both.")
-    injected = service or http_client
     audiences = _id_list("audience_ids", audience_ids)
     folders = _id_list("folder_ids", folder_ids)
     if not 0 < max_delete_ratio <= 1:
@@ -892,10 +897,12 @@ def mailchimp_source(
         columns={"_deleted": {"data_type": "bool", "hard_delete": True}, **NODE_SET_COLUMN_HINT},
     )
     def mailchimp_items():
+        # First thing in the run, so nothing from a previous run is left over
+        # even when this one fails before reading anything.
         _reset_stats(stats)
-        owned = None if injected is not None else httpx.Client(timeout=30.0)
+        owned = None if http_client is not None else httpx.Client(timeout=30.0)
         try:
-            client = MailchimpClient(key, http_client=injected or owned)
+            client = MailchimpClient(key, http_client=http_client or owned)
             account_id = str(client.get_account().get("account_id") or "")
             if not account_id:
                 raise MailchimpError("Mailchimp API returned no account id; nothing was synced.")
