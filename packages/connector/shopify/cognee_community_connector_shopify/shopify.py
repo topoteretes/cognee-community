@@ -64,17 +64,34 @@ _TRANSIENT_STATUSES = (500, 502, 503, 504)
 # Longest single wait for the throttle bucket to refill. The standard bucket
 # holds 1,000 points and refills at 50 a second, so 20 s refills it entirely.
 _MAX_THROTTLE_WAIT_SECONDS = 20.0
-# The longest single wait of any kind. cognee holds its dlt staging lock during
-# a sync, so a longer Retry-After stops the run cleanly instead (it resumes next run).
+# The longest single wait of any kind, and the most a run waits in all (throttle
+# waits included). cognee holds its dlt staging lock during a sync, so a longer
+# Retry-After, or a wait past the budget, stops the run cleanly instead (it
+# resumes next run).
 _MAX_WAIT_SECONDS = 60
+_MAX_TOTAL_WAIT_SECONDS = 120
 # Fresh item failures in a row (5xx or no answer, after retries) that mean
-# Shopify itself is down: the run stops cleanly. Items kept from an earlier run
-# never count.
+# Shopify itself is down: the run stops cleanly. One or two can be a single
+# broken item; three different items failing back to back are rarely a
+# coincidence, and a stop costs nothing, as the next run resumes. Items kept
+# from an earlier run never count.
 _OUTAGE_STREAK = 3
-# Runs an item may stay unreadable (403, ACCESS_DENIED, or null while still
-# listed) at the same listing stamp before its document is forgotten. It is
-# asked again once its stamp moves.
+# A listed item that answers 403 or null (or a known id that left the sweep but
+# still resolves) at the same stamp is forgotten after 3 runs AND 24 hours,
+# counting only runs that finished and, for 403/null, showed access to work
+# (see _Run.settle): a host on a fast cron cannot forget an item in minutes, and
+# a weekly cron still needs three observations. A forgotten item is asked again
+# when its stamp moves, or after another day.
 _GIVE_UP_RUNS = 3
+_GIVE_UP_AFTER = timedelta(hours=24)
+_REASK_AFTER = timedelta(hours=24)
+# Forgotten items asked again per run, oldest first, after everything else.
+_MAX_REASKS = 10
+# The run's clock is the later of Shopify's Date header and the local clock.
+# They differing by more than this is logged (a proxy may cache a stale Date).
+_CLOCK_TOLERANCE = timedelta(seconds=60)
+# The "last asked" time of a forgotten item from an older state: due at once.
+_EPOCH_STAMP = "1970-01-01T00:00:00Z"
 
 # A product document lists at most this many variants (one page of them),
 # a collection at most this many products, then says how many more there are.
@@ -118,8 +135,8 @@ class ShopifyAPIError(RuntimeError):
     ``code`` is set, such as ``ACCESS_DENIED``), 0 for no answer at all.
     ``rate_limited`` is True when Shopify was still throttling. The message
     names only the status or code and the endpoint, plus the connector's own
-    advice where it has some; Shopify's explanation is on ``detail``. A
-    response body or a credential is never in either.
+    advice where it has some; Shopify's explanation is on ``detail``, with the
+    credentials cut out. A response body is never in either.
     """
 
     def __init__(
@@ -404,9 +421,10 @@ class _Client:
         # highest requested cost seen per operation; both for the logs.
         self.served_version: str | None = None
         self.requested_costs: dict[str, float] = {}
-        # Shopify's clock at its first answer this run (the Date header): the
-        # order window is measured on it, so a skewed local clock cannot move it.
+        # Shopify's clock at its first answer this run (the Date header), see _run_clock.
         self.server_now: datetime | None = None
+        self.waited = 0.0  # seconds slept this run
+        self.out_of_time = False  # a wait was refused for the run's budget
 
     @property
     def has_budget_figures(self) -> bool:
@@ -420,9 +438,25 @@ class _Client:
         if self.check_active is not None:
             self.check_active()
 
+    def can_wait(self, seconds: float) -> bool:
+        """Whether a wait fits in the single-wait cap and the run's budget."""
+        if seconds > _MAX_WAIT_SECONDS:
+            return False
+        if self.waited + seconds > _MAX_TOTAL_WAIT_SECONDS:
+            self.out_of_time = True
+            return False
+        return True
+
     def wait(self, seconds: float) -> None:
         self.check()
+        self.waited += seconds
         time.sleep(seconds)
+
+    def redact(self, text: str) -> str:
+        """``text`` with the access token and the client secret cut out."""
+        for secret in (self._token, self._static_token, self._client_secret):
+            text = _redact(text, secret or "")
+        return text
 
     def token(self) -> str:
         if self._token is None:
@@ -450,20 +484,27 @@ class _Client:
         except requests.RequestException as exc:
             raise ShopifyAPIError(0, endpoint, type(exc).__name__) from None
         if response.status_code != 200:
-            raise ShopifyAPIError(response.status_code, endpoint, _grant_error(response))
+            raise ShopifyAPIError(
+                response.status_code, endpoint, self.redact(_grant_error(response))
+            )
         token = _json_object(response).get("access_token")
         if not isinstance(token, str) or not token:
             raise ShopifyResponseError("the client credentials answer carried no access_token")
         return token
 
-    def wait_for(self, cost: float) -> None:
-        """Sleep until the throttle bucket last reported can pay for ``cost``."""
+    def wait_for(self, cost: float, operation: str) -> None:
+        """Sleep until the throttle bucket last reported can pay for ``cost``.
+
+        A wait past the run's budget is not taken: it raises as a rate limit.
+        """
         if self._bucket is None:
             return
         available, rate = self._bucket
         if available >= cost or rate <= 0:
             return
         wait = min((cost - available) / rate, _MAX_THROTTLE_WAIT_SECONDS)
+        if not self.can_wait(wait):
+            raise ShopifyAPIError(200, operation, rate_limited=True, code="THROTTLED")
         logger.info("Shopify: waiting %.1fs for the query cost budget.", wait)
         self.wait(wait)
         self._bucket = None
@@ -520,11 +561,26 @@ def _json_object(response: Any) -> dict:
 
 
 def _server_time(response: Any) -> datetime | None:
-    """Shopify's clock when it answered, from the ``Date`` response header."""
+    """Shopify's clock when it answered, from the ``Date`` response header.
+
+    A zone of ``-0000`` (unknown) is read as UTC, the zone HTTP dates are in.
+    """
     try:
-        return parsedate_to_datetime((response.headers or {}).get("Date"))
+        moment = parsedate_to_datetime((response.headers or {}).get("Date"))
     except (TypeError, ValueError):
         return None
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
+
+
+def _redact(text: str, secret: str) -> str:
+    """``text`` with ``secret`` cut out, in case Shopify echoes it back.
+
+    A secret too short to replace safely (it could match ordinary words) drops
+    the whole text when it occurs in it.
+    """
+    if not secret or secret not in text:
+        return text
+    return text.replace(secret, "[token]") if len(secret) >= 8 else ""
 
 
 def _retry_after(response: Any, attempt: int) -> float:
@@ -541,11 +597,12 @@ def _graphql(client: _Client, query: str, variables: dict) -> tuple[dict, dateti
     refreshed once (client credentials only) and the query repeated; a second
     ``401`` raises. ``429``, a ``THROTTLED`` error, 5xx answers and network
     errors are retried up to ``_MAX_RETRIES`` times; a wait over
-    ``_MAX_WAIT_SECONDS`` is not taken. Any other ``errors`` entry raises, even
-    with HTTP 200, and so does a body without a ``data`` object.
+    ``_MAX_WAIT_SECONDS``, or past the run's ``_MAX_TOTAL_WAIT_SECONDS``, is not
+    taken. Any other ``errors`` entry raises, even with HTTP 200, and so does a
+    body without a ``data`` object.
     """
     operation = _operation(query)
-    client.wait_for(_COSTS.get(query, 100))
+    client.wait_for(_COSTS.get(query, 100), operation)
     url = _admin_url(client.shop, f"api/{_API_VERSION}/graphql.json")
     refreshed = False
     attempt = 0
@@ -565,9 +622,9 @@ def _graphql(client: _Client, query: str, variables: dict) -> tuple[dict, dateti
             )
         except requests.RequestException as exc:
             # Only the type: the message of some requests errors holds a header.
-            if last_attempt:
-                raise ShopifyAPIError(0, operation, type(exc).__name__) from None
             delay = float(2**attempt)
+            if last_attempt or not client.can_wait(delay):
+                raise ShopifyAPIError(0, operation, type(exc).__name__) from None
             logger.warning(
                 "Shopify: %s on %s; retrying in %.0fs.", type(exc).__name__, operation, delay
             )
@@ -587,7 +644,7 @@ def _graphql(client: _Client, query: str, variables: dict) -> tuple[dict, dateti
             if last_attempt:
                 raise ShopifyAPIError(status, operation, rate_limited=status == 429)
             delay = _retry_after(response, attempt)
-            if delay > _MAX_WAIT_SECONDS:
+            if not client.can_wait(delay):
                 raise ShopifyAPIError(
                     status, operation, f"asked to wait {delay:.0f}s", rate_limited=status == 429
                 )
@@ -596,7 +653,7 @@ def _graphql(client: _Client, query: str, variables: dict) -> tuple[dict, dateti
             attempt += 1
             continue
         if status != 200:
-            raise ShopifyAPIError(status, operation, _error_text(response))
+            raise ShopifyAPIError(status, operation, client.redact(_error_text(response)))
 
         body = _json_object(response)
         client.note_version(response)
@@ -606,19 +663,24 @@ def _graphql(client: _Client, query: str, variables: dict) -> tuple[dict, dateti
         errors = body.get("errors")
         if errors:
             if "MAX_COST_EXCEEDED" in _error_codes(errors):
-                raise ShopifyQueryCostError(operation, _errors_text(errors))
+                raise ShopifyQueryCostError(operation, client.redact(_errors_text(errors)))
             if _is_throttled(errors):
                 if last_attempt:
                     raise ShopifyAPIError(200, operation, rate_limited=True, code="THROTTLED")
                 if client.has_budget_figures:
-                    client.wait_for(_COSTS.get(query, 100))
-                else:  # no budget figures to wait on: back off instead
+                    client.wait_for(_COSTS.get(query, 100), operation)
+                elif client.can_wait(float(2**attempt)):  # no figures: back off instead
                     client.wait(float(2**attempt))
+                else:
+                    raise ShopifyAPIError(200, operation, rate_limited=True, code="THROTTLED")
                 attempt += 1
                 continue
             codes = _error_codes(errors)
             raise ShopifyAPIError(
-                200, operation, _errors_text(errors), code=codes[0] if codes else None
+                200,
+                operation,
+                client.redact(_errors_text(errors)),
+                code=codes[0] if codes else None,
             )
         data = body.get("data")
         if not isinstance(data, dict):
@@ -988,8 +1050,10 @@ class _Run:
     again), ``texts`` (collection or order row id -> hash of its last text),
     ``orders`` (order row id -> the gids it shows by name and a hash of those
     names), ``retry`` (items kept after a failure), ``unreadable`` (row id ->
-    ``{stamp, runs}``), ``given_up`` (row id -> the stamp at which an unreadable
-    item was forgotten), ``order_cursor`` and the destroy ``event_cursor``.
+    ``{stamp, runs, since}``, ``since`` being the run clock at the first counted
+    run), ``given_up`` (row id -> ``{stamp, at}``: the stamp at which an
+    unreadable item was forgotten, and when it was last asked), ``order_cursor``
+    and the destroy ``event_cursor``.
     """
 
     def __init__(
@@ -1013,7 +1077,13 @@ class _Run:
         self.unreadable: dict[str, dict] = {
             row_id: dict(entry) for row_id, entry in state.get("unreadable", {}).items()
         }
-        self.given_up: dict[str, str] = dict(state.get("given_up", {}))
+        # An entry of an older state is a bare stamp: asked again on the first run.
+        self.given_up: dict[str, dict] = {
+            row_id: dict(entry) if isinstance(entry, dict) else {"stamp": entry, "at": _EPOCH_STAMP}
+            for row_id, entry in state.get("given_up", {}).items()
+        }
+        # What a run that stops early commits instead: only finished runs count.
+        self.unreadable_before = {row_id: dict(e) for row_id, e in self.unreadable.items()}
         self.event_cursor: str = state.get("event_cursor", "")
         self.order_cursor: str = state.get("order_cursor", "")
         self.titles: dict[str, str] = {}
@@ -1028,7 +1098,11 @@ class _Run:
         self.ambiguous: set[str] = set()  # missing from the sweep, still resolving
         self.rendered: set[str] = set()
         self.fetched_kinds: set[str] = set()  # kinds with a successful fetch this run
-        self.forbidden: dict[str, list[str]] = {}  # kind -> row ids answering HTTP 403
+        self.reached: set[str] = set()  # row ids whose fetch was attempted
+        self.unread: dict[str, list[str]] = {}  # kind -> row ids answering 403 or null
+        self.counted: set[str] = set()  # row ids counted toward giving up this run
+        self.reasks: set[str] = set()  # forgotten row ids asked again this run
+        self.reask_failed: set[str] = set()
         self.outage = 0
         self.listed = False
 
@@ -1046,6 +1120,16 @@ class _Run:
         )
         customers = _customer_sweep(self.client) if "customers" in selected else []
         self.names = {c["id"]: _text(c.get("displayName")) for c in customers}
+        self.now = (self.now or _run_clock(self.client)).replace(microsecond=0)
+        # An entry of an older state has no ``since``: its count starts now, or
+        # it is dropped if it never counted.
+        for row_id, entry in list(self.unreadable.items()):
+            if "since" in entry:
+                continue
+            if entry.get("runs"):
+                entry["since"] = _stamp(self.now)
+            else:
+                del self.unreadable[row_id]
         destroyed, self.event_cursor = _destroyed(self.client, self.event_cursor)
 
         swept: dict[str, list[dict]] = {
@@ -1080,25 +1164,31 @@ class _Run:
                     continue
                 work.append((kind, row_id, item["id"]))
         work += [("order", row_id, _gid(*row_id.split(":", 1))) for row_id in renamed]
-        # A forgotten unreadable item is asked again only once its stamp moves.
-        for row_id, stamp in list(self.given_up.items()):
-            if row_id not in self.listing:
-                del self.given_up[row_id]
-            elif self.listing[row_id] == stamp:
+        # A forgotten unreadable item is asked again once its stamp moves, or after a day.
+        for row_id, entry in list(self.given_up.items()):
+            if self.listing.get(row_id) == entry["stamp"]:
                 self.current_ids.discard(row_id)
             else:
                 del self.given_up[row_id]
+        due = sorted(
+            (entry["at"], row_id)
+            for row_id, entry in self.given_up.items()
+            if _parse(entry["at"]) <= self.now - _REASK_AFTER
+        )
+        asked = [row_id for _, row_id in due[:_MAX_REASKS]]
+        self.reasks = set(asked)
         work = [w for w in work if w[1] not in self.given_up]
         self.retry &= {row_id for _, row_id, _ in work}
-        self.work = [w for w in work if w[1] not in self.retry] + [
-            w for w in work if w[1] in self.retry
-        ]
+        self.work = (
+            [w for w in work if w[1] not in self.retry]
+            + [w for w in work if w[1] in self.retry]
+            + [(r.split(":", 1)[0], r, _gid(*r.split(":", 1))) for r in asked]
+        )
         self.stats["scanned"] = swept_count + len(self.order_rows)
         self.listed = True
 
     def _list_orders(self, destroyed: set[str]) -> list[str]:
         """List changed orders, find deleted ones, and return the unlisted ones to re-fetch."""
-        self.now = self.now or _shop_now(self.client)
         query = None
         if self.order_cursor:
             since = datetime.fromisoformat(self.order_cursor) - _ORDER_OVERLAP
@@ -1187,19 +1277,19 @@ class _Run:
     def render(self) -> Iterator[dict[str, Any]]:
         for index, (kind, row_id, gid) in enumerate(self.work):
             self.position = index
+            self.reached.add(row_id)
             try:
                 row = self._fetch(kind, row_id, gid)
             except ShopifyAPIError as exc:
                 self._failed(kind, row_id, exc)
                 continue
-            if row_id not in self.retry:
-                self.outage = 0
-            self.unreadable.pop(row_id, None)
-            self.fetched_kinds.add(kind)
+            self._succeeded(kind, row_id)
             if row is not None:
                 self.rendered.add(row_id)
                 yield row
         self.position = len(self.work)
+        for kind in sorted(self.unread):
+            self.settle(kind)
         if "orders" in self.selected:
             yield from self._order_rows()
 
@@ -1253,6 +1343,15 @@ class _Run:
             k: v for k, v in self.order_refs.items() if v.get("created", "") >= oldest
         }
 
+    def _succeeded(self, kind: str, row_id: str) -> None:
+        if row_id not in self.retry | self.reasks:
+            self.outage = 0
+        if self.given_up.pop(row_id, None) is not None:
+            logger.info("Shopify: %s is readable again.", row_id)
+            self.current_ids.add(row_id)
+        self.unreadable.pop(row_id, None)
+        self.fetched_kinds.add(kind)
+
     def _failed(self, kind: str, row_id: str, exc: ShopifyAPIError) -> None:
         """Keep an item that failed on its own, or stop if Shopify as a whole is failing."""
         self.stats["failed"] += 1
@@ -1260,46 +1359,103 @@ class _Run:
         _raise_if_access_denied(exc)
         if exc.status == 401:
             raise exc  # nothing rendered yet: the credentials are bad
+        if row_id in self.reasks:
+            # Still unreadable: it stays forgotten and is asked again in a day.
+            self.reask_failed.add(row_id)
+            return
         self.kept.add(row_id)
         if kind in ("product", "customer"):
             self.stamps[row_id] = ""  # the old document stays, and is fetched next run
         elif kind == "collection":
             self.texts[row_id] = ""
         logger.warning("Shopify: kept %s for a retry next run (%s).", row_id, exc)
-        if exc.status == 403:
-            # Counted only once the run shows others of its kind can be read (_settle_403s).
-            self.forbidden.setdefault(kind, []).append(row_id)
-        elif _is_unreadable(exc):
-            self._count_unreadable(row_id, self.listing.get(row_id, ""))
+        if exc.status == 403 or _is_unreadable(exc):
+            # Still listed, so not gone: hidden from this token, or a passing
+            # failure. settle() decides which once the kind's fetches are done.
+            self.unread.setdefault(kind, []).append(row_id)
         elif row_id not in self.retry and (exc.status == 0 or exc.status in _TRANSIENT_STATUSES):
             self.outage += 1
             if self.outage >= _OUTAGE_STREAK:
                 raise _CutShortError("unavailable")
 
     def _count_unreadable(self, row_id: str, stamp: str) -> None:
-        entry = self.unreadable.get(row_id) or {}
-        runs = entry.get("runs", 0) + 1 if entry.get("stamp") == stamp else 1
-        self.unreadable[row_id] = {"stamp": stamp, "runs": runs}
+        entry = self.unreadable.get(row_id)
+        if entry and entry["stamp"] == stamp:
+            self.unreadable[row_id] = {**entry, "runs": entry["runs"] + 1}
+        else:
+            self.unreadable[row_id] = {"stamp": stamp, "runs": 1, "since": _stamp(self.now)}
+        self.counted.add(row_id)
 
-    def _settle_403s(self) -> None:
-        """Count a 403 toward give-up only if another item of its kind was read this run.
+    def settle(self, kind: str) -> None:
+        """Count this run's 403s and nulls of one kind where access to that kind is shown to work.
 
-        When every fetch of a kind answered 403, the token lost a permission: nothing
-        moves toward forgetting, and one warning per kind says so.
+        A 403 or a null for a listed item means it is hidden from this app, or that
+        Shopify is failing or the token lost a scope; only the first is a reason
+        to forget it. So it counts only if another item of the same kind was read
+        in this run. In steady state the others are unchanged and not fetched, so
+        one of them is fetched as a probe; if the probe fails too, nothing counts.
         """
-        for kind, row_ids in sorted(self.forbidden.items()):
-            if kind in self.fetched_kinds:
-                for row_id in row_ids:
-                    self._count_unreadable(row_id, self.listing.get(row_id, ""))
-                continue
-            self.stats["failed_permission"] = self.stats.get("failed_permission", 0) + len(row_ids)
-            logger.warning(
-                "Shopify: %s: every fetch answered 403 this run; check the token's permissions.",
+        pending = self.unread.pop(kind, [])
+        if not pending:
+            return
+        readable = kind in self.fetched_kinds
+        target = None if readable else self._probe_target(kind)
+        probe = self._probe(kind, target) if target is not None else None
+        if readable or probe:
+            for row_id in pending:
+                self._count_unreadable(row_id, self.listing.get(row_id, ""))
+        elif target is None:
+            self._denied(
                 kind,
+                len(pending),
+                f"{kind}: every fetch answered 403/404 (or null) this run and there is no other "
+                f"{kind} to check access with; nothing counts toward forgetting it.",
             )
-        self.forbidden = {}
+        elif probe is False:
+            self._denied(
+                kind,
+                len(pending),
+                f"{kind}: every fetch answered 403 or null this run; "
+                "check the token's permissions.",
+            )
+
+    def _denied(self, kind: str, pending: int, message: str) -> None:
+        self.stats["failed_permission"] = self.stats.get("failed_permission", 0) + pending
+        logger.warning("Shopify: %s", message)
+
+    def _probe(self, kind: str, row_id: str) -> bool | None:
+        """Fetch one unchanged item of ``kind``: True when it is readable.
+
+        False when it answers 403 or null too; None when Shopify is failing
+        (5xx, no answer), which proves nothing.
+        """
+        self.stats[f"probe_{kind}"] = 1
+        query = {"product": _PRODUCT, "customer": _CUSTOMER, "collection": _COLLECTION}
+        try:
+            _single(self.client, query.get(kind, _ORDER), kind, _gid(*row_id.split(":", 1)))
+        except ShopifyAPIError as exc:
+            self.stop_if_systemic(exc)
+            _raise_if_access_denied(exc)
+            if exc.status == 401:
+                raise exc
+            return False if exc.status == 403 or _is_unreadable(exc) else None
+        return True
+
+    def _probe_target(self, kind: str) -> str | None:
+        """The newest known item of ``kind`` not fetched this run and not unreadable."""
+        unusable = self.reached | self.unreadable.keys() | self.given_up.keys() | self.kept
+        if kind == "order":
+            stamps = {r: v.get("created", "") for r, v in self.order_refs.items()}
+        else:
+            stamps = {r: v for r, v in self.listing.items() if r.startswith(f"{kind}:")}
+        ids = [r for r in stamps if r in self.known_ids & self.current_ids and r not in unusable]
+        if not ids:
+            return None
+        return max(ids, key=lambda r: (stamps[r], int(r.split(":", 1)[1])))
 
     def stop_if_systemic(self, exc: ShopifyAPIError) -> None:
+        if self.client.out_of_time:
+            raise _CutShortError("rate_limit" if exc.rate_limited else "unavailable") from None
         if exc.rate_limited:
             raise _CutShortError("rate_limit") from None
         if exc.status == 401 and self.rendered:
@@ -1307,26 +1463,33 @@ class _Run:
 
     # -- 3. Delete and 4. Commit ------------------------------------------------
     def finish(self) -> Iterator[dict[str, Any]]:
-        self._settle_403s()
         for row_id, entry in self.unreadable.items():
-            if row_id in self.kept | self.ambiguous and entry["runs"] >= _GIVE_UP_RUNS:
+            if (
+                row_id in self.counted
+                and row_id in self.kept | self.ambiguous
+                and entry["runs"] >= _GIVE_UP_RUNS
+                and _parse(entry["since"]) <= self.now - _GIVE_UP_AFTER
+            ):
                 logger.warning(
-                    "Shopify: %s stayed unreadable for %d runs; its document is forgotten "
-                    "until it changes.",
+                    "Shopify: %s stayed unreadable for %d runs since %s; its document is "
+                    "forgotten until it changes or reads again.",
                     row_id,
                     entry["runs"],
+                    entry["since"],
                 )
                 if row_id in self.listing and entry["stamp"] != "missing":
-                    self.given_up[row_id] = entry["stamp"]
+                    self.given_up[row_id] = {"stamp": entry["stamp"], "at": _stamp(self.now)}
                 self.kept.discard(row_id)
                 self.ambiguous.discard(row_id)
                 self.current_ids.discard(row_id)
                 self.stats["given_up"] += 1
+        for row_id in self.reask_failed:
+            self.given_up[row_id]["at"] = _stamp(self.now)
         deleted = sorted(self.known_ids - self.current_ids)
         for row_id in deleted:
             yield _deleted_row(row_id)
         self.stats["deleted"] = len(deleted)
-        self._commit(self.current_ids, self.kept)
+        self._commit(self.current_ids, self.kept, unreadable=self.unreadable)
         self.state["event_cursor"] = self.event_cursor
         self.state["order_cursor"] = self.order_cursor
 
@@ -1335,15 +1498,30 @@ class _Run:
 
         Products and customers not reached keep their old stamp and collections
         are read every run, so the next run finds them again; orders and destroy
-        events are listed again from the unchanged cursors.
+        events are listed again from the unchanged cursors. Nothing this run saw
+        counts toward giving an item up. A forgotten item that was read again, has
+        changed or is gone is no longer forgotten (as in any run); nothing new is
+        forgotten, and none is marked as asked.
         """
         if not self.listed:
             return  # stopped while listing: nothing moved
-        self._settle_403s()
         rest = {row_id for _, row_id, _ in self.work[self.position :]}
-        self._commit(self.known_ids | self.rendered, self.kept | (self.retry & rest), rest)
+        before = {r: e for r, e in self.unreadable_before.items() if r not in self.rendered}
+        self._commit(
+            self.known_ids | self.rendered,
+            self.kept | (self.retry & rest),
+            rest,
+            unreadable=before,
+        )
 
-    def _commit(self, current_ids: set[str], retry: set[str], rest: Iterable[str] = ()) -> None:
+    def _commit(
+        self,
+        current_ids: set[str],
+        retry: set[str],
+        rest: Iterable[str] = (),
+        *,
+        unreadable: dict[str, dict],
+    ) -> None:
         unsettled = retry | self.ambiguous | set(rest)
         self.state["known_ids"] = sorted(current_ids)
         self.state["stamps"] = {k: v for k, v in sorted(self.stamps.items()) if k in current_ids}
@@ -1352,9 +1530,7 @@ class _Run:
             k: v for k, v in sorted(self.order_refs.items()) if k in current_ids
         }
         self.state["retry"] = sorted(retry)
-        self.state["unreadable"] = {
-            k: v for k, v in sorted(self.unreadable.items()) if k in unsettled
-        }
+        self.state["unreadable"] = {k: v for k, v in sorted(unreadable.items()) if k in unsettled}
         self.state["given_up"] = dict(sorted(self.given_up.items()))
         self.stats["kept"] = len(retry | self.ambiguous)
         failed_items = len(self.kept)
@@ -1376,13 +1552,15 @@ def sync_store(
     1. *List.* The sweeps, the destroy events and, for orders, the change
        listing. Missing ids are confirmed gone or kept. A failure here
        propagates before a single row.
-    2. *Render.* Each changed item (fresh first, then retries), then the orders.
+    2. *Render.* Each changed item (fresh first, then retries, then forgotten
+       ones due to be asked again), then the orders.
     3. *Delete.* A hard-delete marker for every confirmed deletion.
     4. *Commit.* Only now is ``state`` written. ``now`` (for tests) defaults to
-       Shopify's clock, read from the run's first answer.
+       the run clock (see ``_run_clock``).
 
-    A run stopped cleanly (a ``401`` after progress, a rate limit, an outage)
-    keeps what it rendered and deletes nothing; the next run picks up the rest.
+    A run stopped cleanly (a ``401`` after progress, a rate limit, an outage,
+    the wait budget spent) keeps what it rendered and deletes nothing; the next
+    run picks up the rest.
     """
     selected = [r for r in RESOURCES if r in set(resources)]
     stats = {} if stats is None else stats
@@ -1400,7 +1578,6 @@ def sync_store(
             raise
     except _CutShortError as cut:
         run.commit_progress()
-        stats["failed"] = max(1, stats["failed"])
         stats[f"failed_{cut.reason}"] = 1
         logger.warning("Shopify sync stopped early (%s); it resumes on the next run.", cut.reason)
         return
@@ -1413,12 +1590,25 @@ def sync_store(
     )
 
 
-def _shop_now(client: _Client) -> datetime:
-    """Shopify's clock at the run's first answer, or the local clock (logged) without one."""
-    if client.server_now is not None:
-        return client.server_now
-    logger.warning("Shopify: no Date header seen; measuring the order window on the local clock.")
-    return _local_now()
+def _run_clock(client: _Client) -> datetime:
+    """The run's clock: the later of Shopify's (its first answer's Date) and the local one.
+
+    The order window and the give-up times are read from it. The later of the
+    two means neither a local clock that runs behind nor a stale Date (a caching
+    proxy) moves the window back, where it could ask about orders already past
+    it. A clock that runs ahead only checks fewer orders.
+    """
+    local = _local_now()
+    server = client.server_now
+    if server is None:
+        logger.warning("Shopify: no Date header seen; the run uses the local clock.")
+        return local
+    if abs(server - local) > _CLOCK_TOLERANCE:
+        logger.warning(
+            "Shopify: its Date header and the local clock differ by %.0fs; using the later one.",
+            abs((server - local).total_seconds()),
+        )
+    return max(server, local)
 
 
 def _local_now() -> datetime:
@@ -1459,6 +1649,11 @@ def _names_hash(ids: list[str], names: dict[str, str], titles: dict[str, str]) -
     customer, *products = ids or [""]
     borrowed = [names.get(customer, "")] + [titles.get(p, "") for p in products]
     return _hash("\n".join(borrowed))
+
+
+def _parse(stamp: str) -> datetime:
+    """Parse a stamp such as ``2026-10-17T12:00:00Z`` (as ``_stamp`` writes it), aware UTC."""
+    return datetime.fromisoformat(stamp)
 
 
 def _stamp(moment: datetime) -> str:

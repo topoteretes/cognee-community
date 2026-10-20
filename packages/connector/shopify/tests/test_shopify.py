@@ -22,6 +22,7 @@ import json
 import logging
 import random
 import re
+from datetime import timedelta
 from email.utils import format_datetime
 from types import SimpleNamespace
 from uuid import NAMESPACE_OID, uuid5
@@ -395,6 +396,16 @@ def run_sync_iter(fake, state, client=None, now=NOW, **kwargs):
     fake.calls.clear()
     client = client or client_for(fake)
     return sync_store(client, state, now=shopify.datetime.fromisoformat(now), **kwargs)
+
+
+def hours(n, minutes=0):
+    """The run clock ``n`` hours after ``NOW``, for the give-up rule's 24 hours."""
+    moment = shopify.datetime.fromisoformat(NOW) + timedelta(hours=n, minutes=minutes)
+    return shopify._stamp(moment)
+
+
+def null_answer(kind):
+    return _Resp(200, {"data": {kind: None}})
 
 
 def docs(rows, prefix=""):
@@ -980,6 +991,7 @@ def test_rate_limit_while_listing_stops_cleanly_with_nothing_moved(store):
 
     assert run_sync(store, state, stats=stats) == []
     assert stats["failed_rate_limit"] == 1
+    assert stats["failed"] == 0  # a stop says why, with no failure invented
     assert state == before
 
 
@@ -994,38 +1006,40 @@ def test_three_unreadable_items_never_block_the_run_and_are_given_up(store, refu
 
     def refuse():
         for n in (2, 3, 4):
-            if refusal == "403":  # counted: products 1 and 5 are read in the same run
+            if refusal == "403":
                 response = _Resp(403, {"errors": "Forbidden"})
             else:
-                response = _Resp(200, {"data": {"product": None}})
+                response = null_answer("product")
             store.queue("Product", response, when=_on(n))
 
     for run in (1, 2):
         refuse()
-        # Another product is read in the same run, so a 403 counts toward give-up.
-        store.products[gid("Product", 1)]["updatedAt"] = at(10 + run)
         stats = {}
-        rows = run_sync(store, state, stats=stats)
+        rows = run_sync(store, state, now=hours(12 * run), stats=stats)
         if run == 1:
             assert set(docs(rows, "product:")) == {"product:1", "product:5"}
+        else:  # 1 and 5 are unchanged: one is read as a check that access works
+            assert stats["probe_product"] == 1
         assert tombstones(rows) == []
         assert state["retry"] == ["product:2", "product:3", "product:4"]
         runs = {k: v["runs"] for k, v in state["unreadable"].items()}
         assert runs == {"product:2": run, "product:3": run, "product:4": run}
         assert stats["kept"] == 3 and "failed_unavailable" not in stats
+        assert "failed_permission" not in stats
 
     store.add_product(6, updated_at=at(6))  # created meanwhile: still ingested
     refuse()
     stats = {}
-    rows = run_sync(store, state, stats=stats)
+    rows = run_sync(store, state, now=hours(36), stats=stats)
     assert "product:6" in docs(rows)
+    # Third run, 24 hours after the first: forgotten.
     assert tombstones(rows) == ["product:2", "product:3", "product:4"]
     assert stats["given_up"] == 3 and state["retry"] == [] and state["unreadable"] == {}
-    run_sync(store, state)
-    assert store.fetched("Product") == []  # no longer asked about
+    run_sync(store, state, now=hours(48))
+    assert store.fetched("Product") == []  # no longer asked about within the day
 
     store.products[gid("Product", 3)]["updatedAt"] = at(7)  # it changed: asked again
-    rows = run_sync(store, state)
+    rows = run_sync(store, state, now=hours(48))
     assert set(docs(rows, "product:")) == {"product:3"}
     assert "product:3" not in state["given_up"]
 
@@ -1070,6 +1084,7 @@ def test_access_denied_on_a_deletion_check_aborts(store):
 
 
 def test_a_kind_whose_every_fetch_answers_403_never_moves_toward_give_up(store, caplog):
+    # Every product changed and answers 403: there is no other product to check with.
     state = {}
     run_sync(store, state)
     for run in range(4):
@@ -1077,13 +1092,205 @@ def test_a_kind_whose_every_fetch_answers_403_never_moves_toward_give_up(store, 
             store.products[gid("Product", n)]["updatedAt"] = at(5 + run)
             store.queue("Product", _Resp(403, {"errors": "Forbidden"}), when=_on(n))
         stats = {}
-        rows = run_sync(store, state, stats=stats)
+        rows = run_sync(store, state, now=hours(24 * run), stats=stats)
         assert tombstones(rows) == []
-        assert stats["failed_permission"] == 3
-        assert state["unreadable"] == {}  # runs never moves
+        assert stats["failed_permission"] == 3 and "probe_product" not in stats
+        assert state["unreadable"] == {}  # nothing counts
         assert state["retry"] == ["product:1", "product:2", "product:3"]
-    assert "product: every fetch answered 403 this run" in caplog.text
+    assert "there is no other product to check access with" in caplog.text
     assert {"product:1", "product:2", "product:3"} <= set(state["known_ids"])
+
+
+@pytest.mark.parametrize("refusal", ["403", "null"])
+def test_a_check_that_is_refused_too_counts_nothing(store, refusal, caplog):
+    # A lost scope (403) or a partial outage answering null everywhere: the check
+    # of the unchanged product 4 fails as well, so nothing is ever forgotten.
+    store.add_product(4)
+    state = {}
+    run_sync(store, state)
+    for run in (1, 2, 3, 4):
+        for n in (1, 2, 3, 4):
+            if n < 4:
+                store.products[gid("Product", n)]["updatedAt"] = at(5 + run)
+            refused = _Resp(403, {"errors": "Forbidden"}) if refusal == "403" else None
+            store.queue("Product", refused or null_answer("product"), when=_on(n))
+        stats = {}
+        rows = run_sync(store, state, now=hours(24 * run), stats=stats)
+        assert tombstones(rows) == []
+        assert stats["probe_product"] == 1 and stats["failed_permission"] == 3
+        assert stats["given_up"] == 0 and state["unreadable"] == {}
+    assert "product: every fetch answered 403 or null this run" in caplog.text
+    assert {"product:1", "product:2", "product:3", "product:4"} <= set(state["known_ids"])
+
+
+def test_failing_runs_within_a_day_forget_nothing_and_a_recovery_clears_them(store):
+    # A host that syncs every ten minutes sees four runs of nulls in under an hour.
+    state = {}
+    run_sync(store, state)
+    store.products[gid("Product", 2)]["updatedAt"] = at(5)
+    for minutes in (10, 20, 30, 40):
+        store.queue("Product", null_answer("product"), when=_on(2))
+        rows = run_sync(store, state, now=hours(0, minutes))
+        assert tombstones(rows) == []
+    assert state["unreadable"]["product:2"]["runs"] == 4
+    assert state["given_up"] == {}
+
+    rows = run_sync(store, state, now=hours(1))  # Shopify recovers
+    assert set(docs(rows, "product:")) == {"product:2"}
+    assert state["unreadable"] == {} and state["retry"] == []
+
+
+def test_one_hidden_product_among_unchanged_ones_is_given_up(store, caplog):
+    # Steady state: only product 2 is fetched, and product 3 (unchanged, newest
+    # by id) is read once per run to show that access works.
+    state = {}
+    run_sync(store, state)
+    store.products[gid("Product", 2)]["updatedAt"] = at(5)
+    for run in (1, 2, 3):
+        store.queue("Product", _Resp(403, {"errors": "Forbidden"}), when=_on(2))
+        stats = {}
+        rows = run_sync(store, state, now=hours(12 * run), stats=stats)
+        order = [int(v["id"].rsplit("/", 1)[1]) for v in store.ops("Product")]
+        assert order == [2, 3]  # the check comes after the failure
+        assert stats["probe_product"] == 1 and "failed_permission" not in stats
+        assert docs(rows, "product:") == {}  # the check is not emitted
+    assert tombstones(rows) == ["product:2"]
+    assert "check the token's permissions" not in caplog.text
+
+
+def test_a_check_answering_a_server_error_counts_nothing(store, caplog):
+    state = {}
+    run_sync(store, state)
+    store.products[gid("Product", 2)]["updatedAt"] = at(5)
+    store.queue("Product", _Resp(403, {"errors": "Forbidden"}), when=_on(2))
+    _fail(store, "Product", 3)  # the check: Shopify is failing, which proves nothing
+    stats = {}
+
+    rows = run_sync(store, state, now=hours(12), stats=stats)
+
+    assert tombstones(rows) == []
+    assert stats["probe_product"] == 1 and "failed_permission" not in stats
+    assert state["unreadable"] == {} and state["retry"] == ["product:2"]
+    assert "check the token's permissions" not in caplog.text
+
+
+@pytest.mark.parametrize("check", ["refused", "server error"])
+def test_an_item_counted_earlier_is_not_given_up_in_a_run_that_did_not_count_it(store, check):
+    # Three counted runs inside an hour, then a run a day later in which the check
+    # fails: that run counts nothing, so nothing may be forgotten in it.
+    state = {}
+    run_sync(store, state)
+    store.products[gid("Product", 2)]["updatedAt"] = at(5)
+    for minutes in (10, 20, 30):
+        store.queue("Product", _Resp(403, {"errors": "Forbidden"}), when=_on(2))
+        run_sync(store, state, now=hours(0, minutes))
+    assert state["unreadable"]["product:2"]["runs"] == 3
+
+    store.queue("Product", _Resp(403, {"errors": "Forbidden"}), when=_on(2))
+    if check == "refused":
+        store.queue("Product", _Resp(403, {"errors": "Forbidden"}), when=_on(3))
+    else:
+        _fail(store, "Product", 3)
+    stats = {}
+    rows = run_sync(store, state, now=hours(25), stats=stats)
+
+    assert tombstones(rows) == [] and stats["given_up"] == 0
+    assert state["unreadable"]["product:2"]["runs"] == 3
+    assert ("failed_permission" in stats) == (check == "refused")
+
+
+def test_a_given_up_product_is_asked_again_after_a_day(store):
+    state = {}
+    run_sync(store, state)
+    store.products[gid("Product", 2)]["updatedAt"] = at(5)
+    for run in (1, 2, 3):
+        store.queue("Product", null_answer("product"), when=_on(2))
+        run_sync(store, state, now=hours(12 * run))
+    assert state["given_up"] == {"product:2": {"stamp": at(5), "at": hours(36)}}
+
+    # Not asked within the day; asked a day later, and still unreadable.
+    run_sync(store, state, now=hours(59))
+    assert store.fetched("Product") == []
+    store.queue("Product", null_answer("product"), when=_on(2))
+    stats = {}
+    rows = run_sync(store, state, now=hours(60), stats=stats)
+    assert store.fetched("Product") == [2] and rows == []
+    assert stats["failed"] == 1 and stats["kept"] == 0
+    assert state["given_up"]["product:2"]["at"] == hours(60)
+    assert state["retry"] == [] and state["unreadable"] == {}
+
+    # Readable again a day later, though never edited: it comes back, and stays.
+    rows = run_sync(store, state, now=hours(84))
+    assert set(docs(rows, "product:")) == {"product:2"}
+    assert state["given_up"] == {} and "product:2" in state["known_ids"]
+    assert tombstones(run_sync(store, state, now=hours(85))) == []
+
+
+def test_given_up_items_are_asked_again_a_few_per_run_oldest_first(store, monkeypatch):
+    monkeypatch.setattr(shopify, "_MAX_REASKS", 1)
+    state = {}
+    run_sync(store, state)
+    # Products 2 and 3 were forgotten two and three days ago.
+    state["given_up"] = {
+        "product:2": {"stamp": DAY1, "at": hours(-48)},
+        "product:3": {"stamp": DAY1, "at": hours(-72)},
+    }
+    state["known_ids"] = [r for r in state["known_ids"] if r not in state["given_up"]]
+    for row_id in state["given_up"]:
+        del state["stamps"][row_id]
+    store.add_product(4, updated_at=at(6))
+
+    rows = run_sync(store, state)
+
+    order = [int(v["id"].rsplit("/", 1)[1]) for v in store.ops("Product")]
+    assert order == [4, 3]  # new products first, then the oldest forgotten one
+    assert set(docs(rows, "product:")) == {"product:3", "product:4"}
+    assert list(state["given_up"]) == ["product:2"]
+
+
+def test_a_run_that_stops_early_counts_nothing_toward_giving_up(store):
+    # Product 2 left the sweep but still resolves: counted in two finished runs.
+    state = {}
+    run_sync(store, state)
+    store.unlisted.add(gid("Product", 2))
+    for run in (1, 2):
+        run_sync(store, state, now=hours(12 * run))
+    unreadable = copy.deepcopy(state["unreadable"])
+    assert unreadable["product:2"]["runs"] == 2
+
+    # Run 3 counts it again while listing, then stops on a 401 after product 1.
+    for n in (1, 3):
+        store.products[gid("Product", n)]["updatedAt"] = at(5)
+    store.queue("Product", _Resp(401, {"errors": "Invalid"}), when=_on(3))
+    stats = {}
+    rows = run_sync(store, state, now=hours(48), stats=stats)
+
+    assert stats["failed_auth"] == 1 and tombstones(rows) == []
+    assert state["unreadable"] == unreadable  # not a third run
+    assert state["given_up"] == {}
+
+
+def test_round_2_state_is_read(store):
+    # Round 2 kept a forgotten item as a bare stamp and counts without "since".
+    state = {}
+    run_sync(store, state)
+    state["given_up"] = {"product:2": DAY1}
+    state["known_ids"].remove("product:2")
+    del state["stamps"]["product:2"]
+    for n in (1, 3):
+        store.products[gid("Product", n)]["updatedAt"] = at(5)
+    state["retry"] = ["product:3"]
+    state["stamps"]["product:3"] = ""
+    state["unreadable"] = {"product:3": {"stamp": at(5), "runs": 2}}
+    store.queue("Product", _Resp(403, {"errors": "Forbidden"}), when=_on(3))
+
+    rows = run_sync(store, state)
+
+    # The bare stamp is due at once: product 2 is asked and comes back.
+    assert set(docs(rows, "product:")) == {"product:1", "product:2"}
+    assert state["given_up"] == {}
+    # The old count goes on, starting its 24 hours now.
+    assert state["unreadable"] == {"product:3": {"stamp": at(5), "runs": 3, "since": NOW}}
 
 
 def test_missing_id_that_keeps_resolving_is_given_up_after_three_runs(store):
@@ -1091,14 +1298,14 @@ def test_missing_id_that_keeps_resolving_is_given_up_after_three_runs(store):
     run_sync(store, state)
     store.unlisted.add(gid("Product", 2))  # out of the sweep, yet nodes() finds it
 
-    for _ in range(2):
+    for run in (1, 2):
         stats = {}
-        assert tombstones(run_sync(store, state, stats=stats)) == []
+        assert tombstones(run_sync(store, state, now=hours(12 * run), stats=stats)) == []
         assert stats["kept"] == 1
     stats = {}
-    assert tombstones(run_sync(store, state, stats=stats)) == ["product:2"]
+    assert tombstones(run_sync(store, state, now=hours(36), stats=stats)) == ["product:2"]
     assert stats["given_up"] == 1
-    assert tombstones(run_sync(store, state)) == []
+    assert tombstones(run_sync(store, state, now=hours(48))) == []
 
 
 def test_retries_go_last_and_never_count_toward_an_outage(store):
@@ -1695,6 +1902,17 @@ def test_the_token_is_never_in_an_error_message_or_a_log_line(store, caplog, sle
         run_sync(store, {})
     assert str(excinfo.value) == "Shopify ProductSweep: HTTP 401"
     assert secret not in str(excinfo.value) and secret not in excinfo.value.detail
+
+    # An error that echoes the token: cut out of ``detail``, never in the logs.
+    echo = {"errors": [{"message": f"bad token {secret}"}]}
+    store.queue("Product", _Resp(200, echo))
+    with pytest.raises(ShopifyAPIError) as excinfo:
+        shopify._graphql(client_for(store), shopify._PRODUCT, {"id": gid("Product", 1)})
+    assert excinfo.value.detail == "bad token [token]"
+    store.queue("ProductSweep", _Resp(400, {"errors": f"no such token {secret}"}))
+    with pytest.raises(ShopifyAPIError) as excinfo:
+        run_sync(store, {})
+    assert excinfo.value.detail == "no such token [token]"
     assert secret not in caplog.text + " ".join(str(r.args) for r in caplog.records)
     assert "InvalidHeader" in caplog.text  # the retries were logged by type
 
@@ -1711,6 +1929,58 @@ def test_waits_are_capped_and_ask_check_active_first(fake, sleeps):
     assert excinfo.value.status == 429 and excinfo.value.rate_limited
     assert sleeps == [30.0]  # the 61 s wait was not taken
     assert checks == [0, 0, 1]  # before the request, before the wait, before the retry
+
+
+def test_redact_cuts_the_secret_out_and_drops_text_for_a_short_one():
+    assert shopify._redact("bad token shpat_static", "shpat_static") == "bad token [token]"
+    assert shopify._redact("Not found", "shpat_static") == "Not found"
+    assert shopify._redact("anything", "") == "anything"
+    assert shopify._redact("bad token abc", "abc") == ""  # too short to replace safely
+
+
+def test_a_run_waits_at_most_its_budget_in_all(store, sleeps):
+    state = {}
+    run_sync(store, state)
+    for n in (1, 2):
+        store.products[gid("Product", n)]["updatedAt"] = at(5)
+    for _ in range(shopify._MAX_RETRIES):
+        store.queue("Product", _Resp(503, {}, {"Retry-After": "50"}), when=_on(1))
+    stats = {}
+
+    rows = run_sync(store, state, stats=stats)
+
+    assert sleeps == [50.0, 50.0]  # a third wait would pass the 120 s budget
+    assert stats["failed_unavailable"] == 1 and stats["failed"] == 1
+    assert docs(rows) == {} and tombstones(rows) == []
+    store._queued.clear()
+    assert set(docs(run_sync(store, state), "product:")) == {"product:1", "product:2"}
+
+
+def test_throttle_waits_count_against_the_budget(fake, sleeps):
+    client = client_for(fake)
+    client.waited = 110.0
+    client._bucket = (0.0, 50.0)  # a 20 s refill: past the budget
+    with pytest.raises(ShopifyAPIError) as excinfo:
+        client.wait_for(1000, "Products")
+    assert excinfo.value.rate_limited and client.out_of_time and sleeps == []
+
+
+def test_the_run_clock_is_the_later_of_shopifys_and_the_local_one(fake, monkeypatch, caplog):
+    local = shopify.datetime.fromisoformat(NOW)
+    monkeypatch.setattr(shopify, "_local_now", lambda: local)
+    client = client_for(fake)
+    client.server_now = local - timedelta(days=1)  # a stale Date from a caching proxy
+    assert shopify._run_clock(client) == local
+    assert "differ by 86400s" in caplog.text
+    client.server_now = local + timedelta(minutes=5)  # a local clock that runs behind
+    assert shopify._run_clock(client) == local + timedelta(minutes=5)
+
+
+def test_server_time_reads_an_unknown_zone_as_utc():
+    response = _Resp(200, {}, {"Date": "Mon, 19 Oct 2026 06:00:00 -0000"})
+    assert shopify._server_time(response) == shopify.datetime(
+        2026, 10, 19, 6, 0, 0, tzinfo=shopify.UTC
+    )
 
 
 @pytest.mark.parametrize("name", ["", "Foo-Bar", "a" * 65, None])

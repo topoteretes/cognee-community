@@ -170,15 +170,17 @@ for a deleted product or collection, but recorded none for a deleted order (seen
 each known order that the run did not list is asked about with `nodes(ids:)` while it was
 created more than 7 days inside the window, and forgotten when it answers `null`. What
 `nodes(ids:)` answers for an order past the window was not observable, so older orders are
-not asked about. The window is measured on Shopify's clock (the `Date` header of the run's
-first answer), not the local one. An order's `destroy` event is still honoured, in case
+not asked about. The window is measured on the later of Shopify's clock (the `Date` header
+of the run's first answer) and the local one, so neither a local clock that runs behind nor a
+stale `Date` from a caching proxy moves it back; a gap of over a minute is logged. An order's `destroy` event is still honoured, in case
 Shopify ever records one.
 
 Forgotten ids are emitted with the `_deleted` hard-delete marker, dlt removes those rows on
 `merge`, and cognee's `orphan_cleanup` removes them from the graph and vector stores.
 
-An id missing from the sweep that still resolves in three runs in a row is forgotten as
-well: it is no longer listed, so it is no longer part of what the source syncs.
+An id missing from the sweep that still resolves in three finished runs over at least 24
+hours is forgotten as well: it is no longer listed, so it is no longer part of what the source
+syncs.
 
 All listings are completed before the first row is emitted, and state is saved only after the
 last one. If a listing fails (after retries), or `check_active` raises, the run aborts:
@@ -192,11 +194,17 @@ Only the sweep decides that an item is gone. An item that is still listed but fa
 own keeps its previous document and is fetched again on the next run; the rest of the run
 goes on:
 
-- **Unreadable** (`404`, or `null` for an item that is still listed, or `403` while other
-  items of its kind are read in the same run): kept. If it stays that way in three runs in a
-  row at the same `updatedAt`, its document is forgotten and the item is not asked about
-  again until its `updatedAt` moves. A `403` on every item of a kind is a permission problem:
-  kept, counted as `failed_permission`, and never moves toward forgetting.
+- **Unreadable** (`403`, `404`, or `null` for an item that is still listed): kept. The item
+  may be hidden from the app, or Shopify may be failing or the token may have lost a scope;
+  only the first is a reason to forget it. So the answer counts only when access to that kind
+  is shown to work in the same run: another item of the kind was read, or, when nothing else
+  of that kind changed, one unchanged item is read as a check (one request, and only while
+  something is unreadable). If the check answers `403` or `null` too, or there is nothing to
+  check with, nothing counts, a warning says so, and the stats count it as
+  `failed_permission`; if the check hits a server error, nothing counts either. After three
+  counted runs at the same `updatedAt` **and** 24 hours since the first, the document is
+  forgotten. A forgotten item is asked again when its `updatedAt` moves, and otherwise once a
+  day (at most 10 per run, after everything else); if it reads again, it comes back.
 - **A GraphQL `ACCESS_DENIED`** on any query aborts the run before anything is saved, with an
   error naming the field the app may not read.
 - **A server error or no answer** that outlasts the retries: kept. Three of these in a row on
@@ -207,15 +215,17 @@ streak, so items that keep failing cannot hold up the others.
 
 Some failures stop the run **cleanly** instead of aborting it: a `401` after the one token
 refresh once at least one document was emitted, a throttle or `429` that outlasts the retries
-or asks for a wait over 60 seconds, and the outage above. The run then ends normally: what it
-emitted is loaded, and nothing is deleted. The order and destroy-event cursors do not move,
+or asks for a wait over 60 seconds, a run that has already waited 120 seconds in all (throttle
+waits included), and the outage above. The run then ends normally: what it emitted is loaded,
+nothing is deleted, and nothing counts toward forgetting an item. The order and destroy-event cursors do not move,
 so the next run lists those again; products and customers not reached keep their old stamp
 and collections are read every run, so the next run fetches the rest even if nothing changed
 upstream. A `401` before any document was emitted still raises, since the credentials are bad.
 
 Error messages name the status (or GraphQL code) and the operation only
-(`Shopify Product: HTTP 503`). Shopify's own explanation is on the exception's `detail`; a
-response body or a credential never is. Retry warnings name the error type only.
+(`Shopify Product: HTTP 503`). Shopify's own explanation is on the exception's `detail`,
+with the token and the client secret cut out should Shopify echo them; a response body never
+is. Retry warnings name the error type only.
 
 ### Sync stats
 
@@ -223,7 +233,8 @@ response body or a credential never is. Retry warnings name the error type only.
 listed), `skipped` (unchanged), `failed` (item failures), `deleted`, `kept` (items waiting for a
 retry, and missing ids still resolving) and `given_up`, plus `failed_auth`,
 `failed_rate_limit` or `failed_unavailable` when the run stopped early for that reason, and
-`failed_permission` (how many items answered `403` in a kind where none could be read).
+`failed_permission` (how many items answered `403` or `null` in a kind where none could be
+read), and `probe_<kind>` when a check request was made.
 
 ## Tokens and rate limits
 
@@ -238,8 +249,9 @@ stays under the 1,000-point limit for a single query (a test checks each one); i
 still refuses one as too costly (`MAX_COST_EXCEEDED`), the run stops with an error naming the
 query. The API version is pinned (`2026-10`); if Shopify answers from another one, a warning
 says so. A `THROTTLED` error or an HTTP `429` is waited out and retried, as are 5xx answers
-and network errors, up to five attempts. No single wait is longer than 60 seconds: cognee
-holds its staging lock during a sync, so a longer `Retry-After` stops the run cleanly instead.
+and network errors, up to five attempts. No single wait is longer than 60 seconds, and a run
+waits 120 seconds at most in all: cognee holds its staging lock during a sync, so a longer
+`Retry-After`, or a wait past that budget, stops the run cleanly instead.
 
 ## Limits
 
@@ -262,12 +274,12 @@ holds its staging lock during a sync, so a longer `Retry-After` stops the run cl
   makes 40 extra requests and waits for no throttle.
 - Bulk operations are not used, so a first sync of a large store takes one request per
   product. Webhooks are not used either: changes are picked up on the next sync.
-- An item that stays unreadable for three runs in a row (a `404`, a `null` while listed, or a
-  `403` while others of its kind are read) is forgotten until it changes. A GraphQL
-  `ACCESS_DENIED` on any query (a field or scope the app may not read) aborts the run with an
-  error naming the field instead: it is the app's access, not one item. When every fetch of a
-  kind answers `403` in a run, nothing moves toward forgetting; the run counts them as
-  `failed_permission` and logs one warning per kind.
+- An item that stays unreadable (a `403`, `404` or `null` while listed) while others of its
+  kind read fine, in three runs over at least 24 hours, is forgotten until it changes or reads
+  again (asked once a day). A GraphQL `ACCESS_DENIED` on any query (a field or scope the app
+  may not read) aborts the run with an error naming the field instead: it is the app's
+  access, not one item. When no item of a kind can be read in a run, nothing moves toward
+  forgetting; the run counts them as `failed_permission` and logs one warning per kind.
 - Metafields, images, inventory, discounts, draft orders and blog content are not ingested.
 - Deletions propagate on a foreground `remember(...)`. cognee skips orphan cleanup for
   `run_in_background=True`.
@@ -328,11 +340,15 @@ shuffled input), the shop name and URL guard, `errors` with HTTP 200, throttling
 (and a wait over 60 seconds not taken), bodies of the wrong shape and a missing `pageInfo`,
 change detection, product renames re-rendering collections and orders, membership changes,
 deletion through events and `nodes()`, ids kept when not confirmed gone and given up after
-three runs, orders ageing out versus deleted (with or without a destroy event), token
+three runs over a day, orders ageing out versus deleted (with or without a destroy event), token
 refresh, the token never reaching state, logs or an error message, items kept and retried,
-three unreadable items not blocking a run and given up after three runs, retries going last,
-and the clean stops (`401` mid-run, throttle, long `Retry-After`, outage) with what the next
-run picks up. A real `dlt` pipeline into a temp sqlite destination checks edits and deletes
+three unreadable items not blocking a run, `403`/`null` counted only when access is shown to
+work, with a check request in steady state, nothing forgotten in a partial outage, within a
+day, after a lost scope, or in a run that counted nothing, given-up items asked again after a
+day, runs that stopped early counting nothing, state from round 2, retries going last, and
+the clean stops (`401` mid-run, throttle, long `Retry-After`, the run's wait budget, outage)
+with what the next run picks up, the run clock taking the later of Shopify's and the local
+one, and the token cut out of an echoed error. A real `dlt` pipeline into a temp sqlite destination checks edits and deletes
 across runs (the deleted row is gone from the table), two sources in one dataset staying
 apart, a `401` mid-run resuming on the next run, and `check_active` stopping a run with
 nothing loaded.
