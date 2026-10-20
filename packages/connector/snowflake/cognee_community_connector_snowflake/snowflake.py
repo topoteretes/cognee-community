@@ -1,31 +1,59 @@
-"""DLT source for Snowflake tables (incremental sync + forget-on-delete).
+"""Snowflake connector for cognee: a ``dlt`` source that turns tables into memory.
 
-Work in progress. The design, based on tests against a real Snowflake account:
+Sync selected Snowflake tables into cognee, incrementally and with
+forget-on-delete. The resource is handed directly to :func:`cognee.remember`::
 
-* Key-pair auth with an optional passphrase, plus a connection check that names
-  the usual setup mistakes. Key-pair login has to use the user's login name,
-  which on a trial account is the email address, not the user name shown in
-  Snowsight; with the user name, or with a key that is not registered, Snowflake
-  answers only "JWT token is invalid".
-* Table and column comments come from SHOW TABLES and SHOW COLUMNS, which run
-  without a warehouse. Each table becomes a short description document, so
-  cognee knows what the data means.
-* Whether a table changed at all comes from SYSTEM$LAST_CHANGE_COMMIT_TIME,
-  which also runs without a warehouse and moves on every insert, update and
-  delete. An unchanged table is skipped without waking the warehouse. SHOW
-  TABLES has no last altered time, and INFORMATION_SCHEMA does need a warehouse.
-* Rows of a changed table go down cognee's relational path. With change
-  tracking enabled and inside the retention window, only the changes are read
-  with CHANGES(INFORMATION => DEFAULT), deletes included. Otherwise a timestamp
-  column is the cursor (read with >=, so rows sharing the boundary timestamp
-  are never skipped) and deletes come from comparing the primary keys with the
-  last sync. A failed query never deletes.
+    import cognee
+    from cognee_community_connector_snowflake import snowflake_source
+
+    await cognee.remember(
+        snowflake_source(tables=["SALES_DB.PUBLIC.ORDERS"]),  # SNOWFLAKE_* settings
+        dataset_name="snowflake",
+        primary_key="id",
+        write_disposition="merge",   # incremental upserts and deletes
+        max_rows_per_table=0,        # no staging cap; the connector has its own
+    )
+
+Design
+------
+* **Login** - key-pair auth with an optional passphrase. Key-pair login has to
+  use the user's login name, which on a trial account is the email address, not
+  the user name shown in Snowsight; with the user name, or with a key that is
+  not registered, Snowflake answers only "JWT token is invalid", so the error
+  names both causes. ``check_connection`` reports the session before a sync.
+* **Table documents** - each table becomes a document from its comment, column
+  types and comments, primary key and declared foreign keys. SHOW TABLES, SHOW
+  COLUMNS, SHOW PRIMARY KEYS and SHOW IMPORTED KEYS run without a warehouse.
+* **Row documents** - each row becomes a short document with its table's
+  description and the tables its foreign keys point to. Rows go down the
+  document path because, on cognee 1.6.4, a relational dlt source only reaches
+  the graph on its first add: later merges and deletes do not change it, and
+  the documented rebuild fails with IngestionError 415.
+* **Only what changed** - SYSTEM$LAST_CHANGE_COMMIT_TIME runs without a
+  warehouse and moves on every insert, update and delete, so an unchanged table
+  is skipped without waking the warehouse. A changed table with change
+  tracking reads only CHANGES(INFORMATION => DEFAULT) since the last sync;
+  otherwise, or when that history has lapsed (1 day by default), it is read in
+  full and compared by primary key.
+* **Forget-on-delete** - deleted rows, rows updated out of a filter, dropped
+  tables and tables removed from ``tables`` are emitted with ``_deleted`` and
+  removed by cognee's orphan cleanup.
+* **Errors never delete** - a schema that fails to list raises, a table that
+  fails keeps its state while the others finish, and a table over ``max_rows``
+  is refused whole rather than synced in part.
 
 Rows are read with Snowflake's own connector inside a dlt resource, like the
 Google Drive and Google Calendar connectors wrap Google's client. dlt's
 sql_database source logs in with a key pair too, but it always queries (so it
 wakes the warehouse on every sync), never sees deletes, cannot express CHANGES,
 and does not map Snowflake's TIMESTAMP_NTZ type.
+
+Limitations
+-----------
+* Every row is a document that cognee reads with an LLM, so large tables need a
+  filter or a higher ``max_rows``; the default cap is 10,000 rows per table.
+* A table without a declared primary key needs ``keys=`` for its rows to sync.
+* Views are not synced yet.
 """
 
 import base64
@@ -41,6 +69,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from cognee.shared.logging_utils import get_logger
+from cognee.tasks.ingestion import dlt_utils
+from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
 
 logger = get_logger("snowflake_connector")
 
@@ -57,9 +87,93 @@ class SnowflakeWarehouseError(SnowflakeConnectorError):
     """No usable warehouse for a query that needs one."""
 
 
-def snowflake_source(*args, **kwargs):
-    """Create a dlt source that yields Snowflake rows and table descriptions."""
-    raise NotImplementedError("The Snowflake connector is still being built.")
+def snowflake_source(
+    tables: list[str] | str | None = None,
+    *,
+    keys: dict[str, list[str]] | None = None,
+    filters: dict[str, str] | None = None,
+    max_rows: int | None = None,
+    full_refresh: bool = False,
+    resource_name: str = "snowflake_tables",
+    check_active: Callable[[], None] | None = None,
+    client: Any = None,
+    **settings,
+):
+    """Return a ``dlt`` resource yielding table and row documents from Snowflake.
+
+    Hand the result to ``cognee.remember(...)`` with ``write_disposition="merge"``,
+    ``primary_key="id"`` and ``max_rows_per_table=0``.
+
+    Args:
+        tables: Tables to sync, written ``DATABASE.SCHEMA.TABLE`` as in SQL.
+            ``SNOWFLAKE_TABLES`` takes a comma-separated list.
+        keys: Key columns for tables without a declared primary key, like
+            ``{"SALES_DB.PUBLIC.EVENTS": ["EVENT_ID"]}``. Without a key a table
+            is described but its rows are not read.
+        filters: A SQL condition per table, like ``{"SALES_DB.PUBLIC.ORDERS":
+            "REGION = 'EU'"}``. Rows updated out of a filter are forgotten.
+        max_rows: Rows per table at most (default 10,000). A table over it is
+            refused whole rather than synced in part. ``0`` turns the cap off.
+        full_refresh: Read every selected table again, even if unchanged.
+        resource_name: Stable dlt resource name. Give each account its own
+            name when several sync into one dataset, so their state stays apart.
+        check_active: Optional host authorization checkpoint, run before every
+            query and every row.
+        client: An object with ``run(sql, params)`` and ``fetch(sql)``, used
+            instead of a Snowflake login (mainly for tests).
+        **settings: ``account``, ``user``, ``private_key`` or
+            ``private_key_path``, ``private_key_passphrase``, ``role`` and
+            ``warehouse``, each falling back to its ``SNOWFLAKE_*`` variable.
+    """
+    import dlt
+
+    if getattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 0) < 1:
+        raise RuntimeError(
+            "The Snowflake connector requires a cognee build with table-scoped dlt "
+            "document cleanup. Upgrade cognee before syncing."
+        )
+
+    refs = _normalize_tables(tables)
+    options = {
+        "keys": {_parse_table(t).fqn: [_column(c) for c in cs] for t, cs in (keys or {}).items()},
+        "filters": {_parse_table(t).fqn: condition for t, condition in (filters or {}).items()},
+        "max_rows": DEFAULT_MAX_ROWS if max_rows is None else max_rows,
+        "full_refresh": full_refresh,
+    }
+    # Resolved here, so a missing setting or an unreadable key fails when the
+    # source is built, not halfway through a pipeline run.
+    resolved = None if client is not None else _resolve_settings(**settings)
+
+    stats: dict[str, int] = {}
+
+    @dlt.resource(
+        name=resource_name,
+        write_disposition="merge",
+        primary_key="id",
+        # `_deleted` is a boolean hard-delete marker: rows where it is True are
+        # removed from the dlt destination on merge, and cognee's orphan
+        # cleanup then forgets their documents.
+        columns={"_deleted": {"data_type": "bool", "hard_delete": True}},
+    )
+    def snowflake_tables():
+        stats.clear()
+        session = client or _Session(resolved, check_active)
+        try:
+            run, fetch = _guarded(session, check_active)
+            rows = _iter_rows(run, fetch, refs, dlt.current.resource_state(), stats, **options)
+            yield from dlt_utils.guarded_rows(rows, check_active)
+        finally:
+            if session is not client:
+                session.close()
+
+    resource = snowflake_tables()
+    # Opt into the document ingestion path: each table and row becomes a text
+    # document that flows through normal cognify (LLM graph extraction).
+    setattr(resource, DOCUMENT_SOURCE_ATTR, "snowflake")
+    setattr(resource, dlt_utils.PIPELINE_SCOPE_ATTR, resource_name)
+    # Host-readable diagnostics: counts only, never names or values.
+    resource.cognee_sync_stats = stats
+    return resource
 
 
 def check_connection(**settings) -> dict:
@@ -265,12 +379,15 @@ def _connect(settings: _Settings, connect: Callable[..., Any] | None = None):
 def _query(conn, sql: str, params: Any = None) -> list[dict]:
     """Run one statement and return its rows as dicts, with friendly errors."""
     from snowflake.connector import DictCursor
+    from snowflake.connector.errors import Error
 
     try:
         with conn.cursor(DictCursor) as cursor:
             cursor.execute(sql, params)
             return cursor.fetchall() if cursor.description else []
-    except Exception as error:
+    except Error as error:
+        # Only Snowflake's own errors are translated; anything else, like a host
+        # revoking access, must pass through untouched.
         raise _friendly_error(error) from error
 
 
@@ -888,3 +1005,77 @@ def _format_value(value: Any) -> str:
     if isinstance(value, decimal.Decimal):
         return str(value)
     return " ".join(str(value).split())
+
+
+# ---------------------------------------------------------------------------
+# The live session behind the source.
+# ---------------------------------------------------------------------------
+
+
+class _Session:
+    """One Snowflake login for one sync, with the two query functions it needs."""
+
+    def __init__(self, settings: _Settings, check_active=None, connect=None):
+        if check_active:
+            check_active()
+        self.conn = _connect(settings, connect)
+
+    def run(self, sql: str, params: Any = None) -> list[dict]:
+        return _query(self.conn, sql, params)
+
+    def fetch(self, sql: str):
+        """Rows of a large query in batches, so a big table never sits in memory."""
+        from snowflake.connector import DictCursor
+        from snowflake.connector.errors import Error
+
+        try:
+            with self.conn.cursor(DictCursor) as cursor:
+                cursor.execute(sql)
+                while batch := cursor.fetchmany(_FETCH_BATCH):
+                    yield from batch
+        except Error as error:
+            raise _friendly_error(error) from error
+
+    def close(self) -> None:
+        self.conn.close()
+
+
+_FETCH_BATCH = 1000
+
+
+def _guarded(session, check_active):
+    """``run`` and ``fetch`` that call the host's checkpoint before every query."""
+    check = check_active or (lambda: None)
+
+    def run(sql, params=None):
+        check()
+        return session.run(sql, params)
+
+    def fetch(sql):
+        check()
+        yield from session.fetch(sql)
+
+    return run, fetch
+
+
+def _normalize_tables(tables) -> list[_TableRef]:
+    if tables is None:
+        tables = [t for t in os.environ.get("SNOWFLAKE_TABLES", "").split(",") if t.strip()]
+    elif isinstance(tables, str):
+        tables = [tables]
+    refs = list(dict.fromkeys(_parse_table(table) for table in tables if str(table).strip()))
+    if not refs:
+        # An empty selection would forget every table synced before, so refuse it.
+        raise ValueError(
+            "tables is empty. Pass tables like tables=['SALES_DB.PUBLIC.ORDERS'], or set "
+            "SNOWFLAKE_TABLES."
+        )
+    return refs
+
+
+def _column(name: str) -> str:
+    """A column name as Snowflake stores it: upper-cased unless it is quoted."""
+    name = name.strip()
+    if len(name) >= 2 and name[0] == name[-1] == '"':
+        return name[1:-1].replace('""', '"')
+    return name.upper()
