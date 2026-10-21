@@ -22,6 +22,7 @@ import base64
 import itertools
 
 from cognee_community_connector_databricks import (
+    DatabricksConnectorError,
     DatabricksNotFoundError,
     DatabricksPermissionError,
 )
@@ -55,6 +56,7 @@ class FakeWorkspace:
         # Rows per result chunk, as the Statement Execution API splits them.
         self.chunk_rows = 1000
         self._chunks: dict[str, list] = {}
+        self.warehouses = {"wh-1": {"name": "Starter", "state": "STOPPED", "auto_stop_mins": 10}}
 
     # -- building a workspace -------------------------------------------------
     def folder(self, path, kind="DIRECTORY"):
@@ -197,6 +199,13 @@ class FakeWorkspace:
         for failing, error in self.failing.items():
             if target == failing or (path.endswith(failing)):
                 raise error
+        if path.startswith("/api/2.0/sql/warehouses/"):
+            warehouse = self.warehouses.get(path.rsplit("/", 1)[1])
+            if warehouse is None:
+                raise DatabricksConnectorError(
+                    "Databricks returned HTTP 400 (INVALID_PARAMETER_VALUE)."
+                )
+            return warehouse
         if path.startswith("/api/2.0/sql/statements/"):
             statement_id, index = path.split("/")[5], int(path.rsplit("/", 1)[1])
             chunks = self._chunks[statement_id]

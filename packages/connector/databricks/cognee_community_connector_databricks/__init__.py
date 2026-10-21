@@ -3,6 +3,7 @@ from cognee_community_connector_databricks.databricks import (
     DatabricksConnectorError,
     DatabricksNotFoundError,
     DatabricksPermissionError,
+    check_connection,
     databricks_source,
 )
 
@@ -11,5 +12,6 @@ __all__ = [
     "DatabricksConnectorError",
     "DatabricksNotFoundError",
     "DatabricksPermissionError",
+    "check_connection",
     "databricks_source",
 ]

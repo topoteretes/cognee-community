@@ -192,6 +192,109 @@ def databricks_source(
     return resource
 
 
+def check_connection(
+    paths: list[str] | str | None = None,
+    tables: list[str] | str | None = None,
+    *,
+    warehouse_id: str | None = None,
+    host: str | None = None,
+    token: str | None = None,
+    client: Any = None,
+) -> dict:
+    """Check the token and the selection once, before the first sync.
+
+    Takes the same settings as the source (or the ``DATABRICKS_*`` environment
+    variables). A refused token raises ``DatabricksAuthError``. Everything else
+    is reported, never raised: each path and table selection with what it
+    holds, whether lineage answers, and the warehouse's state, which is read
+    without starting it.
+
+    Returns ``{"workspace_id", "user", "paths", "tables", "lineage",
+    "warehouse", "problems"}``.
+    """
+    if client is None:
+        resolved = token or os.environ.get("DATABRICKS_TOKEN")
+        if not resolved:
+            raise DatabricksAuthError(
+                "A Databricks personal access token is required: pass token= or set "
+                "DATABRICKS_TOKEN."
+            )
+        client = _DatabricksClient(host or os.environ.get("DATABRICKS_HOST"), resolved)
+    me = client.get("/api/2.0/preview/scim/v2/Me")
+    report: dict[str, Any] = {
+        "workspace_id": client.workspace_id,
+        "user": me.get("userName"),
+        "paths": {},
+        "tables": {},
+        "lineage": "not checked: no table selected",
+        "warehouse": "not checked: no warehouse_id",
+        "problems": [],
+    }
+    # Paths are reported as written, so ~ keeps the user's email out of the output.
+    for path in _normalize_paths(paths):
+        try:
+            found = _walk(client, _expand_home(client, [path])[0])
+            report["paths"][path] = f"ok, {len(found)} notebook(s)"
+        except DatabricksAuthError:
+            raise
+        except DatabricksConnectorError as error:
+            report["paths"][path] = _problem(error)
+            report["problems"].append(f"Notebooks under {path}: {_problem(error)}")
+
+    first_table = None
+    for scope in _normalize_scopes(tables):
+        try:
+            found, _ = _list_scope(client, scope)
+        except DatabricksAuthError:
+            raise
+        except DatabricksConnectorError as error:
+            report["tables"][scope] = _problem(error)
+            report["problems"].append(f"Tables in {scope}: {_problem(error)}")
+            continue
+        if found:
+            report["tables"][scope] = f"ok, {len(found)} table(s)"
+        else:
+            report["tables"][scope] = "does not exist or is empty"
+            report["problems"].append(f"Tables in {scope}: does not exist or is empty")
+        first_table = first_table or next((t["full_name"] for t in found.values()), None)
+
+    if first_table:
+        try:
+            client.get(
+                "/api/2.0/lineage-tracking/table-lineage",
+                {"table_name": first_table, "include_entity_lineage": "true"},
+            )
+            report["lineage"] = "ok"
+        except DatabricksAuthError:
+            raise
+        except DatabricksConnectorError as error:
+            report["lineage"] = _problem(error)
+            report["problems"].append(f"Lineage: {_problem(error)}. Pass lineage=False.")
+
+    warehouse = warehouse_id or os.environ.get("DATABRICKS_WAREHOUSE_ID")
+    if warehouse:
+        try:
+            info = client.get(f"/api/2.0/sql/warehouses/{warehouse}")
+            report["warehouse"] = (
+                f"{str(info.get('state', 'unknown')).lower()}, stops after "
+                f"{info.get('auto_stop_mins', '?')} idle minute(s)"
+            )
+        except DatabricksAuthError:
+            raise
+        except DatabricksConnectorError as error:
+            report["warehouse"] = _problem(error)
+            report["problems"].append(f"Warehouse: {_problem(error)}")
+    return report
+
+
+def _problem(error: DatabricksConnectorError) -> str:
+    if isinstance(error, DatabricksNotFoundError):
+        return "does not exist"
+    if isinstance(error, DatabricksPermissionError):
+        return "this user may not read it"
+    return str(error)
+
+
 def _iter_rows(client, paths, scopes, state, stats, full_refresh=False, lineage=True, named=None):
     """Yield every document and ``_deleted`` row of one sync.
 
