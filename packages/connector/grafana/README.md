@@ -76,9 +76,17 @@ await cognee.add(
 await cognee.cognify(datasets=["grafana_incidents"])
 ```
 
-Dashboard UID and folder selections are a union. Repeated organization annotation tags
-are ANDed, and matching dashboard-linked annotations are excluded from that organization
-selection. All selected dashboard annotations are included within the configured history.
+Dashboard UID and folder selections are a union. Organization annotation tag filters use
+case-sensitive keys and optional values: `region` (or `region:`) matches that key with
+any value; `region:EU-WEST-1` requires the exact value. ASCII spaces around keys/values
+are trimmed and equivalent filters deduplicated. Empty keys and filters with more than
+one colon are refused instead of accepting Grafana's silent truncation. Each supplied
+filter must match a returned annotation. Grafana's SQL endpoint combines filters using
+matching-row counts; overlapping filters/multiple values for one key can behave differently
+from logical AND. Prefer distinct tag keys. A provider response missing an intended
+predicate aborts the snapshot. Matching dashboard-linked annotations are excluded from
+that organization selection. All selected dashboard annotations are included within the
+configured history.
 Folder context contains its stable UID, not a separately changing folder title. Dashboard
 annotation-query configuration is not a stored annotation event and is not executed.
 

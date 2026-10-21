@@ -42,13 +42,38 @@ def _selection(value, name):
         raise ValueError(f"{name} must be a list of UIDs/tags")
     if any(not isinstance(x, str) or not x.strip() for x in value):
         raise ValueError(f"{name} entries must be nonempty strings")
-    if name != "organization_annotation_tags":
+    if name == "organization_annotation_tags":
+        normalized = set()
         for item in value:
-            try:
-                _uid(item)
-            except GrafanaSyncError:
-                raise ValueError(f"Invalid {name} entry") from None
+            # v12.3.1 trims ASCII spaces, drops empty keys and silently truncates
+            # extra colon components. Reject the latter two instead of broadening
+            # a caller's selection; normalize duplicates before SQL counts filters.
+            if item.count(":") > 1:
+                raise ValueError("Annotation tag filters may contain at most one colon")
+            key, _, tag_value = item.partition(":")
+            key, tag_value = key.strip(" "), tag_value.strip(" ")
+            if not key:
+                raise ValueError("Annotation tag filters require a nonempty key")
+            normalized.add(key + (":" + tag_value if tag_value else ""))
+        return sorted(normalized)
+    for item in value:
+        try:
+            _uid(item)
+        except GrafanaSyncError:
+            raise ValueError(f"Invalid {name} entry") from None
     return sorted(set(value))
+
+
+def _tag_matches(selected, actual):
+    key, _, value = selected.partition(":")
+    for item in actual:
+        # Grafana tag.ParseTagPairs splits at colons and uses the first two parts.
+        parts = item.split(":")
+        item_key = parts[0].strip(" ")
+        item_value = parts[1].strip(" ") if len(parts) > 1 else ""
+        if key == item_key and (not value or value == item_value):
+            return True
+    return False
 
 
 class _Reads:
@@ -201,7 +226,9 @@ def _annotation_scan(reads, queries, start, end, limit):
                 # Validate provider filtering, including rows later excluded from org-only scope.
                 if any(key == "dashboardUID" and uid != value for key, value in query):
                     raise GrafanaSyncError("Annotation belongs to another dashboard")
-                if any(key == "tags" and value not in item_tags for key, value in query):
+                if any(
+                    key == "tags" and not _tag_matches(value, item_tags) for key, value in query
+                ):
                     raise GrafanaSyncError("Annotation did not match selected tags")
                 key = str(item["id"])
                 if key in observed and observed[key] != item:

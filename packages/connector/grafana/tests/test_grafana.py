@@ -51,6 +51,27 @@ def event(identifier=1, text="Yuna lives in Kyoto.", uid="a", when=50, end=None,
     }
 
 
+def provider_tag_match(filters, actual):
+    # Model v12.3.1 ParseTagPairs + SQL OR/count independently of the connector.
+    def parsed(items):
+        pairs = set()
+        for item in items:
+            parts = item.split(":")
+            key = parts[0].strip(" ")
+            if key:
+                pairs.add((key, parts[1].strip(" ") if len(parts) > 1 else ""))
+        return pairs
+
+    wanted = parsed(filters)
+    if not wanted:
+        return True
+    matching_rows = sum(
+        any(key == actual_key and (not value or value == actual_value) for key, value in wanted)
+        for actual_key, actual_value in parsed(actual)
+    )
+    return matching_rows == len(wanted)
+
+
 class Service:
     def __init__(self):
         self.dashboards = {"a": dashboard(), "b": dashboard("b")}
@@ -108,7 +129,9 @@ class Service:
                 if item["time"] <= query["to"]
                 and item["timeEnd"] >= query["from"]
                 and (not query.get("dashboardUID") or item["dashboardUID"] == query["dashboardUID"])
-                and all(value in item["tags"] for key, value in params if key == "tags")
+                and provider_tag_match(
+                    [value for key, value in params if key == "tags"], item["tags"]
+                )
             ]
             return copy.deepcopy(selected[: query["limit"]])
         raise AssertionError(path)
@@ -692,3 +715,154 @@ def test_policy_upgrade_restores_cached_incident_prose(pipeline, monkeypatch):
     assert outcome not in json.dumps(rows(pipeline, source(service)))
     monkeypatch.undo()
     assert outcome in json.dumps(rows(pipeline, source(service)))
+
+
+@pytest.mark.parametrize(
+    "filters, expected",
+    [
+        (["region", "incident"], [1, 2]),
+        (["region:EU-WEST-1", "incident"], [1]),
+        ([" region : EU-WEST-1 ", " incident "], [1]),
+        (["region", "region:", " region ", "incident"], [1, 2]),
+        (["Region", "incident"], []),
+        (["region:eu-west-1", "incident"], []),
+    ],
+)
+def test_organization_tag_key_value_and_normalization(pipeline, filters, expected):
+    service = Service()
+    service.events = [
+        event(1, uid="", tags=["region:EU-WEST-1", "incident"]),
+        event(2, uid="", tags=["region:US-EAST-1", "incident"]),
+        event(3, uid="", tags=["regionExtra:EU-WEST-1", "incident"]),
+        event(4, uid="a", tags=["region:EU-WEST-1", "incident"]),
+    ]
+    src = grafana_source(
+        base_url="https://grafana.example",
+        token="synthetic-token-value",
+        org_id=1,
+        owner_id="tags",
+        resource_name="incidents",
+        annotation_from_ms=1,
+        annotation_to_ms=100,
+        organization_annotation_tags=filters,
+        service=service,
+    )
+    # Populate staging first so nonmatching selections exercise real replacement,
+    # rather than querying a table dlt never creates for an initially empty source.
+    initial = grafana_source(
+        base_url="https://grafana.example",
+        token="synthetic-token-value",
+        org_id=1,
+        owner_id="tags",
+        resource_name="incidents",
+        annotation_from_ms=1,
+        annotation_to_ms=100,
+        organization_annotation_tags=["incident"],
+        service=service,
+    )
+    assert len(rows(pipeline, initial)) == 3
+    selected = rows(pipeline, src)
+    assert [int(ident.rsplit(":", 1)[1]) for ident, _, _ in selected] == expected
+
+
+@pytest.mark.parametrize("filters", [[":value"], [" : "], ["region:EU:ignored"]])
+def test_ambiguous_tag_filters_refused_before_network(filters):
+    service = Service()
+    with pytest.raises(ValueError, match="tag filters"):
+        source(service, organization_annotation_tags=filters)
+    assert not service.calls
+
+
+@pytest.mark.parametrize(
+    "wrong_tags",
+    [
+        ["region:US-EAST-1", "incident"],
+        ["regionExtra:EU-WEST-1", "incident"],
+        ["region:EU-WEST-1", "other"],
+    ],
+)
+def test_invalid_tag_response_preserves_previous_rows_and_state(pipeline, wrong_tags):
+    class UnfilteredService(Service):
+        bypass = False
+
+        def get(self, path, params=None):
+            result = super().get(path, params)
+            if path == "/api/annotations" and self.bypass:
+                return copy.deepcopy(self.events)
+            return result
+
+    service = UnfilteredService()
+    service.events = [event(1, uid="", tags=["region:EU-WEST-1", "incident"])]
+
+    def selected():
+        return grafana_source(
+            base_url="https://grafana.example",
+            token="synthetic-token-value",
+            org_id=1,
+            owner_id="tags",
+            resource_name="incidents",
+            annotation_from_ms=1,
+            annotation_to_ms=100,
+            organization_annotation_tags=["region:EU-WEST-1", "incident"],
+            service=service,
+        )
+
+    before = rows(pipeline, selected())
+    state = committed(pipeline)
+    service.events[0]["tags"] = wrong_tags
+    service.bypass = True
+    with pytest.raises(Exception, match="did not match selected tags"):
+        rows(pipeline, selected())
+    assert committed(pipeline) == state
+    with pipeline.sql_client() as sql:
+        assert [
+            tuple(row)
+            for row in sql.execute_sql(
+                f"SELECT id, title, content FROM {selected().name} ORDER BY id"
+            )
+        ] == before
+
+
+def test_overlapping_tag_filters_follow_provider_sql_count(pipeline):
+    service = Service()
+    service.events = [event(1, uid="", tags=["region:EU-WEST-1"])]
+
+    def selected():
+        return grafana_source(
+            base_url="https://grafana.example",
+            token="synthetic-token-value",
+            org_id=1,
+            owner_id="tags",
+            resource_name="incidents",
+            annotation_from_ms=1,
+            annotation_to_ms=100,
+            organization_annotation_tags=["region", "region:EU-WEST-1"],
+            service=service,
+        )
+
+    service.events[0]["tags"].append("region:US-EAST-1")
+    assert len(rows(pipeline, selected())) == 1  # Two stored matching rows.
+    service.events[0]["tags"].pop()
+    assert rows(pipeline, selected()) == []  # SQL counts one row for two filters.
+    service.events[0]["tags"].append("region:US-EAST-1")
+    assert len(rows(pipeline, selected())) == 1
+
+
+def test_provider_count_false_positive_withholds_snapshot(pipeline):
+    service = Service()
+    service.events = [event(1, uid="", tags=["region:EU-WEST-1", "region:US-EAST-1"])]
+    src = grafana_source(
+        base_url="https://grafana.example",
+        token="synthetic-token-value",
+        org_id=1,
+        owner_id="tags",
+        resource_name="incidents",
+        annotation_from_ms=1,
+        annotation_to_ms=100,
+        organization_annotation_tags=["region", "incident"],
+        service=service,
+    )
+    # SQL's OR/count can return two region rows despite no incident tag. The
+    # connector still requires each intended predicate and refuses this response.
+    with pytest.raises(Exception, match="did not match selected tags"):
+        rows(pipeline, src)
