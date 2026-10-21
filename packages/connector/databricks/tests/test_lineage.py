@@ -90,6 +90,22 @@ def test_a_notebook_outside_the_synced_folders_is_counted_not_named(workspace):
     assert content(rows, ORDERS).endswith(", 1 notebook outside the synced folders")
 
 
+def test_a_deleted_notebook_leaves_the_tables_it_read(workspace):
+    state = {}
+    sync(workspace, state)
+    # Like a delete in the UI, which moves the notebook to the Trash folder.
+    workspace.move(f"{ROOT}/report", f"{HOME}/Trash/report")
+
+    rows, _, _ = sync(workspace, state)
+
+    # Lineage still lists the deleted notebook, but the document no longer does.
+    assert content(rows, ORDERS).endswith("Read by: notebook build_revenue (~/analytics)")
+
+    workspace.move(f"{HOME}/Trash/report", f"{ROOT}/report")
+    rows, _, _ = sync(workspace, state)
+    assert "notebook report (~/analytics)" in content(rows, ORDERS)
+
+
 def test_notebooks_of_another_workspace_are_left_out(workspace):
     workspace.ran("424242", reads=[ORDERS], workspace_id="9999")
 

@@ -215,6 +215,11 @@ they read) and the notebooks that read it, including notebooks that only read. S
 - Lineage names notebooks by id. Notebooks in the synced folders are named; notebooks
   elsewhere are only counted ("1 notebook outside the synced folders"), and notebooks of
   other workspaces are left out.
+- Lineage keeps listing a notebook after it is deleted (checked: still listed minutes
+  later). Notebooks the connector forgot, deleted or moved out of the synced folders,
+  are left out of table documents; a notebook restored from the Trash comes back. A
+  notebook that was never in the synced folders and was deleted since may still be
+  counted, since lineage gives only its id.
 - The `system.access.table_lineage` table stayed empty on a Free Edition workspace, so the
   connector uses the lineage API.
 
@@ -249,9 +254,9 @@ about what it does:
 
 - The documents above go to your configured LLM and embedding providers during cognify,
   like any document you add to cognee. Use local models if that matters to you.
-- dlt state stores the workspace id, and per notebook its id, path, modified time and a
-  short hash of its lineage, per table its id, name, updated time, keys and a hash of its
-  document, and per query a hash of its result. Paths under `/Users/` contain that user's
+- dlt state stores the workspace id, per notebook its id, path, modified time and a short
+  hash of its lineage, the ids of notebooks it forgot, per table its id, name, updated
+  time, keys and a hash of its document, and per query a hash of its result. Paths under `/Users/` contain that user's
   email. It stores no notebook source, column values or query results.
 - Logs and `cognee_sync_stats` contain counts and the connector's own messages. Error
   messages carry the HTTP status and Databricks' error code only, never Databricks' own

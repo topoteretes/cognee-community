@@ -689,9 +689,23 @@ def _sync_notebooks(
         for object_id in gone:
             yield from _forget_notebook(object_id, saved, root_stats)
         saved.update(updates)
+        _remember_forgotten(state, gone, updates)
         for name, count in root_stats.items():
             stats[name] = stats.get(name, 0) + count
         yield from documents
+
+
+# Lineage keeps listing a notebook after it is deleted (checked: still there
+# minutes later). The ids of notebooks this sync forgot are kept, at most this
+# many, so table documents stop naming them.
+_FORGOTTEN_KEPT = 1000
+
+
+def _remember_forgotten(state: dict, gone, listed) -> None:
+    """Note notebooks found gone; drop ids that are listed again (restored from Trash)."""
+    forgotten = [i for i in state.get("forgotten_notebooks", []) if i not in listed]
+    forgotten += [i for i in gone if i not in forgotten]
+    state["forgotten_notebooks"] = forgotten[-_FORGOTTEN_KEPT:]
 
 
 def _sync_root(
@@ -1293,6 +1307,10 @@ def _sync_workspace(
         object_id: _notebook_label(notebook["path"])
         for object_id, notebook in state.get("notebooks", {}).items()
     }
+    forgotten = set(state.get("forgotten_notebooks", []))
+    for links in (by_table or {}).values():
+        links["written_by"] -= forgotten
+        links["read_by"] -= forgotten
     yield from _sync_tables(
         client, scopes, state, stats, failed, full_refresh, listings, by_table, notebook_names
     )
