@@ -26,9 +26,10 @@ Design
   COLUMNS, SHOW PRIMARY KEYS and SHOW IMPORTED KEYS run without a warehouse.
 * **Row documents** - each row becomes a short document with its table's
   description and the tables its foreign keys point to. Rows go down the
-  document path because, on cognee 1.6.4, a relational dlt source only reaches
-  the graph on its first add: later merges and deletes do not change it, and
-  the documented rebuild fails with IngestionError 415.
+  document path because, on cognee 1.6.3 to 1.6.5, a relational dlt source
+  only reaches the graph on its first add: later merges and deletes do not
+  change it, and the documented rebuild fails with IngestionError 415
+  (topoteretes/cognee#6144).
 * **Only what changed** - SYSTEM$LAST_CHANGE_COMMIT_TIME runs without a
   warehouse and moves on every insert, update and delete, so an unchanged table
   is skipped without waking the warehouse. A changed table with change
@@ -699,10 +700,11 @@ def _column_type(data_type: Any) -> str:
 # ---------------------------------------------------------------------------
 # Rows: one document per row, read only when the table changed.
 #
-# Rows go down cognee's document path. On cognee 1.6.4 a relational dlt source
-# only reaches the graph on its first add: later merges, deletes included, do
-# not change it, and the documented rebuild fails with IngestionError 415. The
-# document path updates and forgets per row, like the Google Calendar connector.
+# Rows go down cognee's document path. On cognee 1.6.3 to 1.6.5 a relational
+# dlt source only reaches the graph on its first add: later merges, deletes
+# included, do not change it, and the documented rebuild fails with
+# IngestionError 415 (topoteretes/cognee#6144). The document path updates and
+# forgets per row, like the Google Calendar connector.
 #
 # SYSTEM$LAST_CHANGE_COMMIT_TIME runs without a warehouse, so a table that did
 # not change since the last sync costs no warehouse time at all.

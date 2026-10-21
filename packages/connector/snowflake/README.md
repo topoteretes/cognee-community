@@ -11,9 +11,9 @@ the last sync are skipped **without waking the warehouse**.
 
 ## Requirements
 
-- cognee **1.6.4** (pinned). The connector relies on table-scoped document cleanup
+- cognee **1.6.3** or newer (below 2). The connector relies on table-scoped document cleanup
   (`DOCUMENT_SYNC_VERSION`), `PIPELINE_SCOPE_ATTR` and `guarded_rows`.
-- Python 3.11 to 3.13.
+- Python 3.10 to 3.14.
 - `snowflake-connector-python` 3.12 to 4.x (installed with the package).
 - A Snowflake account (the 30 day trial works) and a warehouse for reading rows.
 
@@ -186,11 +186,11 @@ These were checked against a real Snowflake trial account:
 
 ### Why rows are documents and not relational rows
 
-On cognee 1.6.4 a relational dlt source (one without the document-mode marker) only
-reaches the graph on its **first** add: later merges, including deletes, do not change it,
-and the documented rebuild (`incremental_loading=False, data_cache=False`) fails with
-`IngestionError ... (415)`. The document path updates and forgets per row, like the Google
-Calendar connector, so rows go down it. The cost is an LLM pass per changed row, which is
+On cognee 1.6.3 to 1.6.5 a relational dlt source (one without the document-mode marker)
+only reaches the graph on its **first** add: later merges, including deletes, do not
+change it, and the documented rebuild (`incremental_loading=False, data_cache=False`)
+fails with `IngestionError ... (415)`, reported as topoteretes/cognee#6144. The document
+path updates and forgets per row, like the Google Calendar connector, so rows go down it. The cost is an LLM pass per changed row, which is
 what `max_rows` and `filters` are for.
 
 ### Login errors, explained
