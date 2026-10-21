@@ -1,0 +1,34 @@
+{
+  "next_page_token": null,
+  "items": [
+    {
+      "job_number": 22,
+      "started_at": "2026-10-07T21:33:15Z",
+      "name": "wait-for-approval",
+      "project_slug": "gh/rokadepiyush49-rgb/cognee-circleci-fixture",
+      "type": "approval",
+      "approval_request_id": "969f920a-a665-4e7f-b671-175f6dd26ec3",
+      "requires": {},
+      "status": "on_hold",
+      "id": "969f920a-a665-4e7f-b671-175f6dd26ec3",
+      "dependencies": []
+    },
+    {
+      "job_number": 23,
+      "started_at": null,
+      "name": "deploy",
+      "project_slug": "gh/rokadepiyush49-rgb/cognee-circleci-fixture",
+      "type": "build",
+      "requires": {
+        "969f920a-a665-4e7f-b671-175f6dd26ec3": [
+          "success"
+        ]
+      },
+      "status": "blocked",
+      "id": "575e9084-069e-4c27-a643-ca3b731f6c0c",
+      "dependencies": [
+        "969f920a-a665-4e7f-b671-175f6dd26ec3"
+      ]
+    }
+  ]
+}
