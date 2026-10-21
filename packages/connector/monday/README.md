@@ -11,9 +11,9 @@ core, so work items from both trackers read the same way in the graph.
 
 ## Requirements
 
-- cognee **1.6.4** (pinned). The connector relies on table-scoped document cleanup
+- cognee **1.6.3** or newer (below 2). The connector relies on table-scoped document cleanup
   (`DOCUMENT_SYNC_VERSION`), `PIPELINE_SCOPE_ATTR` and `guarded_rows`.
-- Python 3.11 to 3.13.
+- Python 3.10 to 3.14.
 - A monday.com account (the free plan works) and an API token.
 - No other libraries: the client is built on dlt's own REST toolkit.
 
