@@ -1613,7 +1613,8 @@ def test_a_given_up_issue_is_asked_again_after_a_day(seeded):
     rows = run_sync(seeded, state, now=hours(60), stats=stats)
     assert 3 in fetched_issues(seeded) and tombstones(rows) == []
     assert row not in doc_rows(rows)
-    assert stats["failed"] == 1 and stats["kept"] == 0
+    # Its document is already gone: no failure of the run, but counted and named.
+    assert stats["failed"] == 0 and stats["reask_failed"] == 1 and stats["kept"] == 0
     assert state["given_up"][row]["at"] == _stamp(hours(60))
     assert state["retry"] == [] and state["unreadable"] == {}
 
@@ -1624,25 +1625,25 @@ def test_a_given_up_issue_is_asked_again_after_a_day(seeded):
     assert tombstones(run_sync(seeded, state, now=hours(85))) == []
 
 
-def test_given_up_issues_are_asked_again_a_few_per_run_oldest_first(seeded, monkeypatch):
-    monkeypatch.setattr(github, "_MAX_REASKS", 1)
-    for number in (3, 4):
+def test_every_given_up_issue_that_is_due_is_asked_again_in_one_run(seeded):
+    numbers = range(3, 28)
+    for number in numbers:
         seeded.add_issue(number, updated_at=at(2))
     state = {}
     run_sync(seeded, state)
-    # Issues 3 and 4 were forgotten two and three days ago.
-    state["given_up"] = {
-        "issue:acme/site#3": {"stamp": at(2), "at": _stamp(hours(-48))},
-        "issue:acme/site#4": {"stamp": at(2), "at": _stamp(hours(-72))},
-    }
-    state["known_ids"] = [r for r in state["known_ids"] if not r.endswith(("#3", "#4"))]
-    seeded.add_issue(5, updated_at=at(9))
+    # Issues 3 to 27 were forgotten two days ago (or by the previous version,
+    # which wrote a bare stamp); all of them read again.
+    rows = {f"issue:acme/site#{n}" for n in numbers}
+    state["given_up"] = {row: {"stamp": at(2), "at": _stamp(hours(-48))} for row in rows}
+    state["given_up"]["issue:acme/site#27"] = at(2)
+    state["known_ids"] = [r for r in state["known_ids"] if r not in rows]
+    seeded.add_issue(30, updated_at=at(9))
 
-    rows = run_sync(seeded, state)
+    result = run_sync(seeded, state)
 
-    assert fetched_issues_in_order(seeded) == [5, 4]  # new issues first, then the oldest one
-    assert set(doc_rows(rows, "issue:")) == {"issue:acme/site#4", "issue:acme/site#5"}
-    assert list(state["given_up"]) == ["issue:acme/site#3"]
+    assert fetched_issues_in_order(seeded) == [30, *numbers]  # new issues first
+    assert set(doc_rows(result, "issue:")) == rows | {"issue:acme/site#30"}
+    assert state["given_up"] == {}
 
 
 def test_a_run_that_stops_early_counts_nothing_toward_giving_up(seeded):
@@ -2103,22 +2104,20 @@ def test_server_errors_past_the_wait_budget_stop_the_run_cleanly(seeded, sleeps)
     assert stats["failed_unavailable"] == 1 and tombstones(rows) == []
 
 
-def test_server_time_is_read_as_utc_and_the_run_clock_takes_the_later_one(
-    seeded, monkeypatch, caplog
-):
+def test_server_time_is_read_as_utc_and_the_give_up_clock_is_githubs(seeded, monkeypatch, caplog):
     unknown_zone = _Resp(200, {}, {"Date": "Mon, 19 Oct 2026 06:00:00 -0000"})
     assert _server_time(unknown_zone) == datetime(2026, 10, 19, 6, 0, 0, tzinfo=UTC)
 
-    # A proxy serves a Date a day old: the run clock is the local one.
+    # A proxy serves a Date a day old: GitHub's clock, and nothing is forgotten.
     monkeypatch.setattr(github, "_local_now", lambda: NOW)
     seeded.clock = NOW - timedelta(days=1)
     client = github._Client(seeded)
     _get(client, _url(f"/repos/{REPO}"))
-    assert github._run_clock(client) == NOW
+    assert github._run_clocks(client) == (NOW - timedelta(days=1), False)
     assert "differ by 86400s" in caplog.text
-    # A local clock that runs behind: GitHub's.
-    monkeypatch.setattr(github, "_local_now", lambda: NOW - timedelta(days=2))
-    assert github._run_clock(client) == NOW - timedelta(days=1)
+    # The clocks agree: GitHub's, and items may be forgotten.
+    monkeypatch.setattr(github, "_local_now", lambda: NOW - timedelta(days=1, seconds=30))
+    assert github._run_clocks(client) == (NOW - timedelta(days=1), True)
 
 
 def test_empty_selection_raises(fake):
@@ -2180,3 +2179,223 @@ def test_sync_stats_count_what_a_run_did(seeded):
     list(source)
     assert source.cognee_sync_stats["failed"] == 0
     assert source.cognee_sync_stats["failed_rate_limit"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Review round 4: clocks, checks, re-asks, redaction
+# ---------------------------------------------------------------------------
+ROW3 = "issue:acme/site#3"
+
+
+def _hidden_issue_3(session):
+    """Issue 3 was edited and answers 403 on its next fetch."""
+    session.repos[REPO].issues[3]["updated_at"] = at(9)
+    session.queue(_error(403, "Forbidden"), when=_on(3))
+
+
+def _clocks(session, monkeypatch, github_now, local_now):
+    session.clock = github_now
+    monkeypatch.setattr(github, "_local_now", lambda: local_now)
+
+
+def test_a_local_clock_jumping_ahead_forgets_nothing(seeded, monkeypatch, caplog):
+    # Three counted runs within three real minutes; on the third the local clock
+    # is 25 hours ahead (an NTP step, a resumed VM).
+    seeded.add_issue(3, updated_at=at(2))
+    state = {}
+    run_sync(seeded, state)
+    for minute, ahead in ((1, 0), (2, 0), (3, 25)):
+        _hidden_issue_3(seeded)
+        moment = NOW + timedelta(minutes=minute)
+        _clocks(seeded, monkeypatch, moment, moment + timedelta(hours=ahead))
+        stats = {}
+        rows = run_sync(seeded, state, now=None, stats=stats)
+
+    assert tombstones(rows) == [] and stats["given_up"] == 0 and state["given_up"] == {}
+    assert state["unreadable"][ROW3]["runs"] == 3
+    assert "no item is forgotten in this run" in caplog.text
+
+
+def test_the_give_up_times_are_read_on_githubs_clock(seeded, monkeypatch):
+    # The first counted run has a local clock 25 hours ahead: the 24 hours still
+    # start at GitHub's time, not the local one.
+    seeded.add_issue(3, updated_at=at(2))
+    state = {}
+    run_sync(seeded, state)
+    _hidden_issue_3(seeded)
+    _clocks(seeded, monkeypatch, hours(1), hours(26))
+
+    run_sync(seeded, state, now=None)
+
+    assert state["unreadable"][ROW3]["since"] == _stamp(hours(1))
+
+
+def test_without_a_date_header_the_give_up_times_are_local(seeded, monkeypatch):
+    seeded.add_issue(3, updated_at=at(2))
+    state = {}
+    run_sync(seeded, state)
+    _hidden_issue_3(seeded)
+    _clocks(seeded, monkeypatch, None, hours(3))
+
+    run_sync(seeded, state, now=None)
+
+    assert state["unreadable"][ROW3]["since"] == _stamp(hours(3))
+
+
+def test_nothing_is_forgotten_while_the_clocks_disagree(seeded, monkeypatch):
+    seeded.add_issue(3, updated_at=at(2))
+    state = {}
+    run_sync(seeded, state)
+    for run in (1, 2, 3):
+        _hidden_issue_3(seeded)
+        run_sync(seeded, state, now=hours(run))
+    assert state["given_up"] == {}  # three runs, but within a day
+
+    # Due by either clock, but they differ by two minutes: counted, not forgotten.
+    _hidden_issue_3(seeded)
+    _clocks(seeded, monkeypatch, hours(48), hours(48) + timedelta(minutes=2))
+    rows = run_sync(seeded, state, now=None)
+    assert tombstones(rows) == [] and state["unreadable"][ROW3]["runs"] == 4
+
+    # The clocks agree again: it is forgotten.
+    _hidden_issue_3(seeded)
+    _clocks(seeded, monkeypatch, hours(49), hours(49))
+    rows = run_sync(seeded, state, now=None)
+    assert [r["id"] for r in tombstones(rows)] == [ROW3]
+
+
+def test_a_reask_time_in_the_future_is_brought_back_to_now(seeded, caplog):
+    # A run with a clock 30 days ahead forgot issue 3: it is asked a day after
+    # the clock is right again, not 30 days later.
+    seeded.add_issue(3, updated_at=at(2))
+    state = {}
+    run_sync(seeded, state)
+    state["given_up"] = {ROW3: {"stamp": at(2), "at": _stamp(hours(24 * 30))}}
+    state["known_ids"].remove(ROW3)
+
+    run_sync(seeded, state, now=hours(1))
+    assert state["given_up"][ROW3]["at"] == _stamp(hours(1))
+    assert f"{ROW3} had at in the future" in caplog.text
+    run_sync(seeded, state, now=hours(24))
+    assert 3 not in fetched_issues(seeded)
+    rows = run_sync(seeded, state, now=hours(25))
+    assert set(doc_rows(rows, "issue:")) == {ROW3} and state["given_up"] == {}
+
+
+def test_a_give_up_start_in_the_future_is_brought_back_to_now(seeded):
+    seeded.add_issue(3, updated_at=at(2))
+    state = {}
+    run_sync(seeded, state)
+    _hidden_issue_3(seeded)
+    run_sync(seeded, state, now=hours(1))
+    state["unreadable"][ROW3] |= {"runs": 2, "since": _stamp(hours(24 * 30))}
+
+    _hidden_issue_3(seeded)
+    run_sync(seeded, state, now=hours(2))
+    assert state["unreadable"][ROW3] == {"stamp": at(9), "runs": 3, "since": _stamp(hours(2))}
+    _hidden_issue_3(seeded)
+    rows = run_sync(seeded, state, now=hours(25))
+    assert tombstones(rows) == []  # 23 hours since the reset
+    _hidden_issue_3(seeded)
+    rows = run_sync(seeded, state, now=hours(26))
+    assert [r["id"] for r in tombstones(rows)] == [ROW3]
+
+
+def test_a_hidden_check_issue_moves_on_to_the_next_one(fake, caplog):
+    # Issue 2 was edited and is hidden; issue 6, the newest unchanged one, is
+    # hidden too; issue 1 reads. Five runs over 48 hours.
+    for number in (1, 2, 6):
+        fake.add_issue(number, updated_at=at(1))
+    state = {}
+    run_sync(fake, state)
+    given_up = 0
+    for run in range(5):
+        fake.repos[REPO].issues[2]["updated_at"] = at(5)
+        fake.queue(_error(403, "Forbidden"), when=_on(2))
+        fake.queue(_error(403, "Forbidden"), when=_on(6))
+        stats = {}
+        run_sync(fake, state, now=hours(12 * run), stats=stats)
+        assert "failed_permission" not in stats
+        if run == 0:
+            assert fetched_issues_in_order(fake) == [2, 6, 1] and stats["probe_issue"] == 2
+        given_up += stats["given_up"]
+    assert given_up == 1 and "issue:acme/site#2" in state["given_up"]
+    assert "check the token's permissions" not in caplog.text
+
+
+def test_the_check_tries_three_items_at_most(fake, caplog):
+    for number in (1, 2, 3, 4, 5):
+        fake.add_issue(number, updated_at=at(number))
+    state = {}
+    run_sync(fake, state)
+    fake.repos[REPO].issues[5]["updated_at"] = at(9)
+    for number in (5, 4, 3, 2):
+        fake.queue(_error(403, "Forbidden"), when=_on(number))
+    stats = {}
+
+    run_sync(fake, state, now=hours(12), stats=stats)
+
+    assert fetched_issues_in_order(fake) == [5, 4, 3, 2]  # issue 1 is never tried
+    assert stats["probe_issue"] == 3 and stats["failed_permission"] == 1
+    assert state["unreadable"] == {}
+    assert "check the token's permissions" in caplog.text
+
+
+def test_a_check_answering_a_server_error_stops_the_checks(fake):
+    for number in (1, 2, 3, 4):
+        fake.add_issue(number, updated_at=at(number))
+    state = {}
+    run_sync(fake, state)
+    fake.repos[REPO].issues[4]["updated_at"] = at(9)
+    fake.queue(_error(403, "Forbidden"), when=_on(4))
+    fake.queue(_error(403, "Forbidden"), when=_on(3))
+    for response in _render_failure(500):
+        fake.queue(response, when=_on(2))
+    stats = {}
+
+    run_sync(fake, state, now=hours(12), stats=stats)
+
+    assert 1 not in fetched_issues(fake) and stats["probe_issue"] == 2
+    assert "failed_permission" not in stats and state["unreadable"] == {}
+
+
+def test_a_failed_reask_is_no_failure_of_the_run(seeded, caplog):
+    seeded.add_issue(3, updated_at=at(2))
+    state = {}
+    run_sync(seeded, state)
+    state["given_up"] = {ROW3: {"stamp": at(2), "at": _stamp(hours(-24))}}
+    state["known_ids"].remove(ROW3)
+    for day in (0, 1, 2):
+        seeded.queue(_error(404, "Not Found"), when=_on(3))
+        stats = {}
+        rows = run_sync(seeded, state, now=hours(24 * day), stats=stats)
+        assert 3 in fetched_issues(seeded) and ROW3 not in doc_rows(rows)
+        assert stats["failed"] == 0 and stats["reask_failed"] == 1
+    assert f"{ROW3} is still unreadable" in caplog.text
+
+
+def test_a_rate_limit_on_a_reask_still_stops_the_run(seeded):
+    seeded.add_issue(3, updated_at=at(2))
+    state = {}
+    run_sync(seeded, state)
+    state["given_up"] = {ROW3: {"stamp": at(2), "at": _stamp(hours(-24))}}
+    seeded.queue(_error(429, "slow down", {"Retry-After": "61"}), when=_on(3))
+    stats = {}
+
+    run_sync(seeded, state, stats=stats)
+
+    assert stats["failed_rate_limit"] == 1 and stats["failed"] == 0
+
+
+def test_the_token_is_cut_out_before_the_detail_is_shortened(fake):
+    fake.headers = {"Authorization": f"Bearer {SECRET}"}
+    fake.queue(_error(401, "x" * 195 + SECRET))
+    with pytest.raises(GitHubAPIError) as excinfo:
+        run_sync(fake, {})
+    assert SECRET[:5] not in excinfo.value.detail
+    assert excinfo.value.detail == "x" * 195 + "[toke"
+
+
+def test_redact_ignores_case():
+    assert github._redact(f"bad token {SECRET.lower()}", SECRET) == "bad token [token]"
+    assert github._redact("bad token ABC", "abc") == ""

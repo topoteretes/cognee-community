@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import time
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
@@ -78,19 +79,30 @@ _SETTLE_MARGIN = timedelta(seconds=60)
 # coincidence, and a stop costs nothing, as the next run resumes. Issues already
 # kept for a retry never count.
 _OUTAGE_STREAK = 3
-# An issue that cannot be read (listed but answering 403/404, or missing from
-# the listing with no clear answer) is forgotten after 3 runs AND 24 hours,
-# counting only runs that finished and, for a 403/404, showed access to work
-# (see _Run.settle): a host on a fast cron cannot forget an item in minutes, and
-# a weekly cron still needs three observations. A forgotten listed issue is
-# asked again when its updated_at moves, or after another day.
+# Rules for forgetting (deleting the document of) an issue or pull request that
+# cannot be read: listed but answering 403/404 at the same updated_at, or
+# missing from the listing with no clear answer. Only finished runs count, and
+# for a 403/404 only runs that showed access to the kind working in that
+# repository (see _Run.settle).
+# - 3 runs: three separate observations, so one glitch or a short incident on
+#   GitHub's side cannot do it.
+# - 24 hours: outlasts a working day of permission changes and a maintenance
+#   window. On a cron of minutes this is the floor that does the work.
+# - On a weekly cron the 3 runs take 2 to 3 weeks; accepted, because forgetting
+#   too early deletes a document that is still valid, while forgetting late only
+#   keeps a stale one a little longer.
 _GIVE_UP_RUNS = 3
 _GIVE_UP_AFTER = timedelta(hours=24)
+# A forgotten listed issue is asked again when its updated_at moves, or a day
+# after it was last asked: one request per forgotten issue per day, so one that
+# becomes readable again is back within a day without retrying hidden issues on
+# every run.
 _REASK_AFTER = timedelta(hours=24)
-# Forgotten issues asked again per run, oldest first, after everything else.
-_MAX_REASKS = 10
-# The run's clock is the later of GitHub's Date header and the local clock.
-# They differing by more than this is logged (a proxy may cache a stale Date).
+# Unchanged items read, newest first, to check access to a kind in a repository
+# (see _Run._probe): one of them may be hidden from the token itself.
+_PROBE_TRIES = 3
+# GitHub's Date header and the local clock differing by more than this is
+# logged, and no item is forgotten in that run (see _run_clocks).
 _CLOCK_TOLERANCE = timedelta(seconds=60)
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
@@ -169,7 +181,7 @@ class _Client:
         headers = getattr(session, "headers", None)
         bearer = (headers.get("Authorization", "") if headers else "").removeprefix("Bearer ")
         self.secret = secret or bearer
-        # GitHub's clock at its first answer (the Date header), see _run_clock.
+        # GitHub's clock at its first answer (the Date header), see _run_clocks.
         self.server_now: datetime | None = None
         self.waited = 0.0  # seconds slept this run
         self.out_of_time = False  # a wait was refused for the run's budget
@@ -272,7 +284,8 @@ def _get(
             client.wait(delay)
             attempt += 1
             continue
-        raise GitHubAPIError(status, endpoint, _redact(_error_detail(response), client.secret))
+        detail = _redact(_error_detail(response), client.secret)[:200]
+        raise GitHubAPIError(status, endpoint, detail)
 
 
 def _rate_limit_wait(response: Any) -> float | None:
@@ -307,23 +320,31 @@ def _rate_limit_wait(response: Any) -> float | None:
 
 
 def _error_detail(response: Any) -> str:
-    """GitHub's ``message``, or nothing. Never the raw body."""
+    """GitHub's ``message`` in full, or nothing. Never the raw body.
+
+    A caller that keeps it cuts it to length only after ``_redact``, so a token
+    that would straddle the cut is still found whole.
+    """
     try:
         message = response.json()["message"]
     except (ValueError, KeyError, TypeError):
         return ""
-    return message[:200] if isinstance(message, str) else ""
+    return message if isinstance(message, str) else ""
 
 
 def _redact(text: str, secret: str) -> str:
-    """``text`` with the token cut out, in case GitHub echoes it back.
+    """``text`` with the token cut out, in any case, in case GitHub echoes it back.
 
     A token too short to replace safely (it could match ordinary words) drops
-    the whole text when it occurs in it.
+    the whole text when it occurs in it. Only the whole token is matched: a part
+    of one cannot be told from ordinary text.
     """
-    if not secret or secret not in text:
+    if not secret:
         return text
-    return text.replace(secret, "[token]") if len(secret) >= 8 else ""
+    pattern = re.compile(re.escape(secret), re.IGNORECASE)
+    if not pattern.search(text):
+        return text
+    return pattern.sub("[token]", text) if len(secret) >= 8 else ""
 
 
 def _json(response: Any, shape: type) -> Any:
@@ -839,7 +860,7 @@ class _Run:
     State: ``known_ids`` (row ids emitted and current), ``retry`` (issue rows
     kept after a failure), ``unreadable`` (row id -> ``{stamp, runs, since}`` of
     issues answering 403/404, or missing from the sweep with no clear answer;
-    ``since`` is the run clock at the first counted run), ``given_up`` (row id
+    ``since`` is GitHub's clock at the first counted run), ``given_up`` (row id
     -> ``{stamp, at}``: the ``updated_at`` at which a listed, unreadable issue
     was forgotten, and when it was last asked) and, per repository, its ETags
     and page maps, the
@@ -883,16 +904,42 @@ class _Run:
         self.reask_failed: set[str] = set()
         self.now_override = now
         self._now: datetime | None = None
+        self.may_give_up = True
         self.emitted: set[str] = set()  # every row id emitted this run
         self.plans: list[dict] = []
         self.outage = 0
         self.listed = False
 
     def clock(self) -> datetime:
-        """The run clock (see ``_run_clock``), read once GitHub has answered."""
+        """The clock of the give-up and re-ask times (see ``_run_clocks``), read once
+        GitHub has answered."""
         if self._now is None:
-            self._now = (self.now_override or _run_clock(self.client)).replace(microsecond=0)
+            if self.now_override:
+                now, self.may_give_up = self.now_override, True
+            else:
+                now, self.may_give_up = _run_clocks(self.client)
+            self._now = now.replace(microsecond=0)
+            self._clamp_times()
         return self._now
+
+    def _clamp_times(self) -> None:
+        """Bring a time stored by a run whose clock was ahead back to now.
+
+        Such a time (written before GitHub's clock was used for these) would hold
+        a re-ask off, or start a 24 hours, as far in the future as that clock was
+        ahead.
+        """
+        latest = self._now + _CLOCK_TOLERANCE
+        for entries, key in (
+            (self.unreadable, "since"),
+            (self.unreadable_before, "since"),
+            (self.given_up, "at"),
+        ):
+            for row_id, entry in entries.items():
+                if entry.get(key) and _parse(entry[key]) > latest:
+                    if entries is not self.unreadable_before:
+                        logger.info("GitHub: %s had %s in the future; reset to now.", row_id, key)
+                    entry[key] = _stamp(self._now)
 
     def stop_if_systemic(self, exc: GitHubAPIError) -> None:
         if self.client.out_of_time:
@@ -923,14 +970,14 @@ class _Run:
 
         repo_info = _fetch_repo(self.client, repo, previous, self.include_readme)
         if self.reasks is None:
-            # Forgotten issues not edited since are asked again after a day, a
-            # few per run, oldest first, after everything else.
-            due = sorted(
-                (entry["at"], row)
+            # Forgotten issues not edited since are asked again after a day, after
+            # everything else; all that are due, as they are bounded by what was
+            # forgotten, one request a day each.
+            self.reasks = {
+                row
                 for row, entry in self.given_up.items()
                 if _parse(entry["at"]) <= self.clock() - _REASK_AFTER
-            )
-            self.reasks = {row for _, row in due[:_MAX_REASKS]}
+            }
 
         # The sweep: every issue and pull request that exists right now, oldest first.
         sweep_url = _url(
@@ -1210,12 +1257,16 @@ class _Run:
 
     def _failed(self, plan: dict, number: int, row_id: str, exc: GitHubAPIError) -> None:
         """Keep an issue that failed on its own, or stop the run if GitHub as a whole is failing."""
-        self.stats["failed"] += 1
+        if row_id not in self.reasks:
+            self.stats["failed"] += 1
         self.stop_if_systemic(exc)
         if exc.status == 401:
             raise exc  # nothing rendered yet: the token is bad
         if row_id in self.reasks:
-            # Still unreadable: it stays forgotten and is asked again in a day.
+            # Still unreadable: it stays forgotten and is asked again in a day. Its
+            # document is already gone, so this is no failure of the run.
+            self.stats["reask_failed"] = self.stats.get("reask_failed", 0) + 1
+            logger.info("GitHub: %s is still unreadable (%s); asked again in a day.", row_id, exc)
             self.reask_failed.add(row_id)
             return
         self.kept.add(row_id)
@@ -1257,20 +1308,20 @@ class _Run:
         repository (an organization's token policy, an app installed on some
         repositories only). In steady state the others are unchanged and not
         fetched, so one of them is fetched as a probe; if the probe fails too,
-        nothing counts.
+        nothing counts. One of them may be hidden from the token itself, so up to
+        ``_PROBE_TRIES`` are tried.
         """
         pending = self.unread.pop((repo, kind), [])
         if not pending:
             return
         if (repo, kind) not in self.read_kinds:
-            number = self._probe_target(repo, kind)
-            target = None if number is None else (repo, number)
-            probe = None if target is None else self._probe(kind, *target)
-            if target is None or probe is False:
+            numbers = self._probe_targets(repo, kind)
+            probe = self._probe(kind, repo, numbers)
+            if probe is False:
                 self.stats["failed_permission"] = self.stats.get("failed_permission", 0) + len(
                     pending
                 )
-                if target is None:
+                if not numbers:
                     logger.warning(
                         "%s %s: every fetch answered 403/404 this run and there is no other %s "
                         "in %s to check access with; nothing counts toward forgetting it.",
@@ -1291,8 +1342,9 @@ class _Run:
         for row_id, stamp in pending:
             self._count_unreadable(row_id, stamp)
 
-    def _probe_target(self, repo: str, kind: str) -> int | None:
-        """The newest item of ``kind`` in ``repo`` not fetched this run and not given up.
+    def _probe_targets(self, repo: str, kind: str) -> list[int]:
+        """The newest items of ``kind`` in ``repo`` not fetched this run and not given
+        up, at most ``_PROBE_TRIES``.
 
         Items fetched this run, retries (every unreadable one) included, are in
         the plan's order; a number missing from the sweep is in no plan.
@@ -1306,29 +1358,34 @@ class _Run:
             and number not in in_order
             and _issue_row_id(repo, number, is_pr) not in self.given_up
         ]
-        return max(numbers) if numbers else None
+        return sorted(numbers, reverse=True)[:_PROBE_TRIES]
 
-    def _probe(self, kind: str, repo: str, number: int) -> bool | None:
-        """Read one unchanged item of ``kind``: True when it is readable.
+    def _probe(self, kind: str, repo: str, numbers: list[int]) -> bool | None:
+        """Read unchanged items of ``kind`` in turn: True at the first that reads.
 
         A pull request is read through ``/pulls/N`` (what a token without pull
-        request access is refused), an issue through its comments. False when
-        it answers 403/404 too; None when GitHub is failing (5xx, no answer),
-        which proves nothing.
+        request access is refused), an issue through its comments. A 403/404
+        moves on to the next. False when every one answers 403/404, or there is
+        none to try; None when GitHub is failing (5xx, no answer), which proves
+        nothing.
         """
-        self.stats[f"probe_{kind}"] = self.stats.get(f"probe_{kind}", 0) + 1
-        if kind == "pr":
-            url = _url(f"/repos/{repo}/pulls/{number}")
-        else:
-            url = _url(f"/repos/{repo}/issues/{number}/comments", {"per_page": 1})
-        try:
-            _get(self.client, url)
-        except GitHubAPIError as exc:
-            self.stop_if_systemic(exc)
-            if exc.status == 401:
-                raise exc
-            return False if exc.status in (403, 404) else None
-        return True
+        for number in numbers:
+            self.stats[f"probe_{kind}"] = self.stats.get(f"probe_{kind}", 0) + 1
+            if kind == "pr":
+                url = _url(f"/repos/{repo}/pulls/{number}")
+            else:
+                url = _url(f"/repos/{repo}/issues/{number}/comments", {"per_page": 1})
+            try:
+                _get(self.client, url)
+            except GitHubAPIError as exc:
+                self.stop_if_systemic(exc)
+                if exc.status == 401:
+                    raise
+                if exc.status not in (403, 404):
+                    return None
+                continue
+            return True
+        return False
 
     # -- 3. Delete and 4. Commit ------------------------------------------------
     def finish(self) -> Iterator[dict[str, Any]]:
@@ -1339,7 +1396,8 @@ class _Run:
         for row_id, entry in sorted(self.unreadable.items()):
             # Only an item counted in this run, three times, over at least a day.
             if (
-                row_id not in self.counted
+                not self.may_give_up
+                or row_id not in self.counted
                 or entry["runs"] < _GIVE_UP_RUNS
                 or _parse(entry["since"]) > now - _GIVE_UP_AFTER
             ):
@@ -1424,7 +1482,7 @@ class _Run:
 
 def _load_unreadable(entries: dict) -> dict[str, dict]:
     """``unreadable`` from state. An entry of an earlier version without ``since``
-    gets one from the run clock when next written; one with no counted run
+    gets one from the clock of the give-up times when next written; one with no counted run
     (``runs`` 0) is dropped."""
     return {row: dict(entry) for row, entry in entries.items() if entry.get("runs")}
 
@@ -1438,23 +1496,32 @@ def _load_given_up(entries: dict) -> dict[str, dict]:
     }
 
 
-def _run_clock(client: _Client) -> datetime:
-    """The run's clock: the later of GitHub's (its first answer's Date) and the local one.
+def _run_clocks(client: _Client) -> tuple[datetime, bool]:
+    """The clock of the give-up and re-ask times, and whether an item may be
+    forgotten in this run.
 
-    The give-up and re-ask times are read from it. The later of the two means a
-    stale Date (a caching proxy) cannot hold the clock back. A local clock that
-    runs ahead only makes a forgotten item asked again sooner.
+    These times are measured on GitHub's clock (its first answer's Date) alone:
+    a local clock that jumps ahead (an NTP step, a resumed VM) must not make a
+    day pass in minutes. When the two clocks differ by more than
+    ``_CLOCK_TOLERANCE`` one of them is wrong (a stale Date from a caching
+    proxy, or the local clock), so nothing is forgotten in this run (counting
+    goes on). Without a Date header the local clock is all there is, and a jump
+    of it is not caught; that takes a proxy that strips the header. (Listings
+    end on GitHub's Date readings of their own, see _list_pages.)
     """
     local = _local_now()
     server = client.server_now
     if server is None:
-        return local
+        logger.warning("GitHub: no Date header seen; the give-up times use the local clock.")
+        return local, True
     if abs(server - local) > _CLOCK_TOLERANCE:
         logger.warning(
-            "GitHub: its Date header and the local clock differ by %.0fs; using the later one.",
+            "GitHub: its Date header and the local clock differ by %.0fs; no item is "
+            "forgotten in this run.",
             abs((server - local).total_seconds()),
         )
-    return max(server, local)
+        return server, False
+    return server, True
 
 
 def _local_now() -> datetime:
@@ -1487,7 +1554,7 @@ def sync_repos(
 
     A run stopped cleanly (a ``401`` after progress, a rate limit, an outage,
     the wait budget spent) keeps what it rendered and deletes nothing; the next
-    run relists. ``now`` (for tests) defaults to the run clock (``_run_clock``).
+    run relists. ``now`` (for tests) sets the clock of the give-up times (``_run_clocks``).
     """
     if not repos:
         raise ValueError(

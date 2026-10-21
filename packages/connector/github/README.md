@@ -202,15 +202,18 @@ its previous document and is rendered again on the next run; the rest of the run
   repository the token cannot see answers `404`); only the first is a reason to forget it. So
   the answer counts only when access to the same kind (issue, or pull request) in the same
   repository is shown to work in the same run: another item of that kind in that repository
-  was read, or, when nothing else of that kind changed there, one unchanged item is read as a
-  check (one request: an issue's first comment, or a
-  pull request's `/pulls/N`, and only while something is unreadable). If the check answers
+  was read, or, when nothing else of that kind changed there, unchanged items are read as a
+  check, newest first, until one reads (at most three requests: an issue's first comment, or a
+  pull request's `/pulls/N`, and only while something is unreadable). If all of them answer
   `403`/`404` too, or there is nothing to check with, nothing counts, the run counts the items
   under `failed_permission`, and one warning per repository and kind says so; if the check hits a server
   error, nothing counts either. After three counted runs at the same `updated_at` **and** 24
-  hours since the first, the document is forgotten. A forgotten issue is asked again when its
-  `updated_at` moves, and otherwise once a day (at most 10 per run, after everything else);
-  if it reads again, it comes back. A rate-limit `403` is not a permission `403`: it stops the
+  hours since the first, the document is forgotten. Those 24 hours are measured on GitHub's
+  clock (its `Date` header), so a local clock that jumps ahead cannot shorten them, and in a
+  run where the two clocks differ by more than a minute nothing is forgotten. A forgotten issue
+  is asked again when its `updated_at` moves, and otherwise once a day (after everything else);
+  if it reads again, it comes back. A failed re-ask is no failure of the run: it is counted
+  under `reask_failed`, not `failed`. A rate-limit `403` is not a permission `403`: it stops the
   run cleanly (see Rate limits).
 - **A server error or no answer** that outlasts the retries: kept. Three of these in a row on
   fresh issues means GitHub itself is down, and the run stops cleanly (below).
@@ -237,7 +240,8 @@ it; a response body never is.
 `resource.cognee_sync_stats` holds the counts of the last run, as plain ints: `scanned`
 (issues and pull requests listed), `skipped` (unchanged), `failed` (item failures), `deleted`,
 `kept` (issues waiting for a retry, and missing numbers not yet shown to be gone) and
-`given_up`, plus `failed_auth`, `failed_rate_limit` or `failed_unavailable` when the run stopped
+`given_up`, plus `reask_failed` (forgotten issues asked again that still could not be read),
+`failed_auth`, `failed_rate_limit` or `failed_unavailable` when the run stopped
 early for that reason, `failed_permission` (items answering `403`/`404` while nothing of the
 same kind in the same repository could be read), and `probe_issue` / `probe_pr` (how many
 check requests were made).
@@ -264,6 +268,8 @@ errors and network failures back off and retry, up to five attempts.
   are not forgotten, and the shas of all ingested commits are kept in state. Commits brought
   in by a merge commit whose own dates are older than the cursor are missed; the merge commit
   itself is ingested.
+- If GitHub's `Date` and the local clock disagree by more than a minute (a skewed host, or a
+  proxy caching `Date`), nothing is forgotten until they agree; the warning says so.
 - A renamed repository keeps syncing under its old name (GitHub redirects it) and a warning
   asks you to update `repos=`.
 - A very long thread makes a very large document, and its LLM cost grows with it. Only the
@@ -328,8 +334,9 @@ request in steady state, nothing forgotten in a partial outage, within a day, af
 permission or in a run that counted nothing, given-up issues asked again after a day, runs
 that stopped early counting nothing, state of the previous version), the clean stops (`401`
 mid-run, rate limit, an hour-long reset, the run's wait budget, outage) and what the next run
-picks up, the run clock (a stale `Date` included), rate limits versus
+picks up, the clocks (a stale `Date`, a local clock jumping ahead, times stored in the future),
+the check moving past a hidden item, rate limits versus
 permission errors, bodies of the wrong shape, the token never reaching a message or a log
-line, and the failure paths that must delete nothing. A real `dlt` pipeline into a temp sqlite
+line (in any case, and not even in part where the message is cut), and the failure paths that must delete nothing. A real `dlt` pipeline into a temp sqlite
 destination checks edits and deletes across runs, two sources in one dataset staying apart, a
 `401` mid-run resuming on the next run, and `check_active` stopping a run with nothing loaded.
