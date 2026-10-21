@@ -428,6 +428,19 @@ def test_unreadable_channel_is_left_unchanged(discord, status, code):
     assert stats["unreadable"] == 1 and state["containers"][GENERAL]["days"]
 
 
+def test_hidden_channel_counts_as_unreadable_once(discord):
+    discord.message(GENERAL, TODAY, "hello")
+    state = {}
+    _run(discord, state)
+
+    # A channel the bot cannot see refuses its thread list and its messages alike.
+    discord.errors[GENERAL] = (403, 50001)
+    discord.thread_errors[GENERAL] = (403, 50001)
+    stats = {}
+    assert _run(discord, state, stats=stats) == []
+    assert stats["unreadable"] == 1 and state["containers"][GENERAL]["days"]
+
+
 def test_deleted_channel_is_forgotten(discord):
     discord.message(GENERAL, TODAY, "hello")
     state = {}
@@ -543,19 +556,54 @@ def test_quiet_old_thread_costs_no_request(discord):
 
 
 def test_old_days_keep_only_their_key_and_are_still_forgotten(discord):
-    discord.message(GENERAL, TODAY - timedelta(days=20), "old")
+    old = TODAY - timedelta(days=20)
+    discord.message(GENERAL, old, "old")
     state = {}
     _run(discord, state)
 
     later = NOW + timedelta(days=80)
+    recent = later.replace(hour=9) - timedelta(days=1)
+    discord.message(GENERAL, recent, "recent")
     _run(discord, state, now=later)
-    assert state["containers"][GENERAL]["days"] == {
-        (TODAY - timedelta(days=20)).date().isoformat(): ""
-    }
+    days = state["containers"][GENERAL]["days"]
+    assert days[old.date().isoformat()] == "" and days[recent.date().isoformat()]
     discord.channels = [c for c in discord.channels if c["id"] != GENERAL]
     assert _run(discord, state, now=later) == [
-        {"id": _day_id(GENERAL, TODAY - timedelta(days=20)), "_deleted": True}
+        {"id": _day_id(GENERAL, old), "_deleted": True},
+        {"id": _day_id(GENERAL, recent), "_deleted": True},
     ]
+
+
+def test_rescan_never_reaches_before_since_days(discord):
+    discord.message(GENERAL, TODAY - timedelta(days=5), "too old")
+    discord.message(GENERAL, TODAY - timedelta(days=2), "inside")
+    state = {}
+    emitted = [[r["id"] for r in _run(discord, state, since_days=3)] for _ in range(3)]
+    assert emitted == [[_day_id(GENERAL, TODAY - timedelta(days=2))], [], []]
+
+
+def test_empty_channel_does_not_reach_the_day_before_since(discord):
+    state = {}
+    assert _run(discord, state, since_days=3) == []
+
+    discord.message(GENERAL, TODAY - timedelta(days=4), "before since")
+    discord.message(GENERAL, TODAY, "today")
+    assert [r["id"] for r in _run(discord, state, since_days=3)] == [_day_id(GENERAL, TODAY)]
+
+
+def test_quiet_channel_cursor_day_keeps_its_digest_after_aging_past_since(discord):
+    old = TODAY - timedelta(days=8)
+    discord.message(GENERAL, old, "before the quiet spell")
+    state = {}
+    _run(discord, state, since_days=10)
+
+    # The cursor day is now older than since_days, but a new message makes the next
+    # run re-read from it, so it must still compare as unchanged.
+    later = NOW + timedelta(days=5)
+    assert _run(discord, state, now=later, since_days=10) == []
+    discord.message(GENERAL, later.replace(hour=9), "back again")
+    rows = _run(discord, state, now=later, since_days=10)
+    assert [r["id"] for r in rows] == [_day_id(GENERAL, later)]
 
 
 def test_rate_limit_stops_cleanly_and_resumes(discord):
@@ -615,6 +663,38 @@ def test_budget_cut_runs_resume_after_the_last_finished_container(discord):
     # Seven discovery requests, then one container per run.
     emitted = [[r["id"] for r in _run(discord, state, max_requests=8)] for _ in range(3)]
     assert emitted == [[_day_id("81", TODAY)], [_day_id("82", TODAY)], [_day_id(GENERAL, TODAY)]]
+
+
+def test_refused_private_listing_only_protects_private_threads(discord):
+    discord.thread("81", GENERAL, "public", archived=True)
+    discord.message("81", TODAY, "public note")
+    discord.thread("83", GENERAL, "secret", archived=True, type_=12)
+    discord.message("83", TODAY, "private note")
+    state = {}
+    _run(discord, state, include_private_threads=True)
+
+    discord.thread_errors[f"{GENERAL}:private"] = (403, 50013)
+    discord.threads = [t for t in discord.threads if t["id"] != "81"]
+    stats = {}
+    rows = _run(discord, state, stats=stats, include_private_threads=True)
+    assert rows == [{"id": _day_id("81", TODAY), "_deleted": True}]
+    assert stats["unreadable"] == 0 and "83" in state["containers"]
+
+
+def test_budget_cut_runs_still_forget_deleted_threads(discord):
+    discord.message(GENERAL, TODAY, "hello")
+    for tid in ("81", "82", "84", "85"):
+        discord.thread(tid, GENERAL, f"thread {tid}")
+        discord.message(tid, TODAY, f"note {tid}")
+    state = {}
+    _run(discord, state)
+
+    discord.threads = [t for t in discord.threads if t["id"] != "82"]
+    stats = {}
+    rows = _run(discord, state, stats=stats, max_requests=9)
+    assert {"id": _day_id("82", TODAY), "_deleted": True} in rows
+    assert stats["failed_budget"] == 1 and stats["failed"] == 0
+    assert "82" not in state["containers"]
 
 
 def test_check_active_runs_before_every_request(discord):

@@ -25,16 +25,17 @@ Design
   re-processes that day's document, and nothing volatile is rendered.
 * **Incremental** with the message id (a snowflake, which encodes time) as the
   cursor, paged with ``after=<id>``. Each run re-reads from the start of the UTC
-  day of ``min(cursor, now - rescan_days)``, so edits and deletions inside that
-  window are caught. A channel or thread with nothing new and nothing inside the
-  window costs no request. Older days are left as they are; ``full_resync``
-  re-reads everything.
+  day of ``min(cursor, now - rescan_days)``, never before ``since_days``, so
+  edits and deletions inside that window are caught. A channel or thread with
+  nothing new and nothing inside the window costs no request. Older days are
+  left as they are; ``full_resync`` re-reads everything.
 * **Forget-on-delete.** A day whose messages were all deleted, a deleted thread
   or forum post, and a channel that is deleted or deselected are emitted as
   hard-delete tombstones. A channel the bot cannot read is left as it is.
 * **A run is bounded.** On a long rate limit or a spent request budget it stops
-  cleanly, keeps the days it finished, and reports why in ``cognee_sync_stats``;
-  deletions of whole channels and threads are only decided by a run that finished.
+  cleanly, keeps the days it finished, and reports why in ``cognee_sync_stats``.
+  Deleted channels and threads are decided right after discovery, which always
+  completes, so a run cut short by the budget still forgets them.
 
 Privacy
 -------
@@ -458,11 +459,14 @@ class _Walker:
         self.stats = stats
         self.check_active = check_active
         self.since = today - timedelta(days=config.since_days)
-        self.rescan_floor = today - timedelta(days=config.rescan_days)
+        # The re-scan never reaches further back than the first sync read.
+        self.rescan_floor = max(today - timedelta(days=config.rescan_days), self.since)
         self.known: dict[str, dict] = state.setdefault("containers", {})
         self.requests = 0
         # Set by a new day or a finished container; the budget never stops a run before that.
         self.progressed = False
+        # A hidden channel refuses both its thread list and its messages; count it once.
+        self.unreadable: set[str] = set()
         self.names = _Names(channels={}, roles={})
         self.guild: dict = {}
 
@@ -477,16 +481,18 @@ class _Walker:
         except DiscordRateLimitedError:
             raise _CutShortError("rate_limit") from None
 
-    def _refuse(self, cid: str, exc: DiscordAPIError) -> None:
+    def _refuse(self, cid: str, reason: str) -> None:
         """Leave a channel or thread list the bot cannot read as it is."""
-        logger.warning(
-            "Discord: channel %s cannot be read (code %s), left unchanged.", cid, exc.code
-        )
+        if cid in self.unreadable:
+            return
+        self.unreadable.add(cid)
+        logger.warning("Discord: channel %s cannot be read (%s), left unchanged.", cid, reason)
         self.stats["unreadable"] += 1
 
     # -- discovery ---------------------------------------------------------
-    def _discover(self) -> tuple[dict[str, dict], set[str]]:
-        """Every channel and thread to sync, and the channels whose threads could not be listed."""
+    def _discover(self) -> tuple[dict[str, dict], set[str], set[str]]:
+        """Every channel and thread to sync, the channels whose threads could not be
+        listed, and the channels whose archived private threads could not be listed."""
         flags = int((self.get("/applications/@me") or {}).get("flags") or 0)
         if not flags & (_GATEWAY_MESSAGE_CONTENT | _GATEWAY_MESSAGE_CONTENT_LIMITED):
             raise DiscordIntentError(
@@ -527,28 +533,46 @@ class _Walker:
             if c.get("type") in _TEXT_CHANNEL_TYPES
         }
         hidden: set[str] = set()
+        hidden_private: set[str] = set()
         if config.include_threads or config.include_forums:
-            containers.update(self._threads(selected, hidden))
+            containers.update(self._threads(selected, hidden, hidden_private))
 
         names = {str(c["id"]): c.get("name") or str(c["id"]) for c in channels}
         names.update({cid: c["name"] for cid, c in containers.items()})
         self.names = _Names(channels=names, roles=roles)
-        return containers, hidden
+        return containers, hidden, hidden_private
 
-    def _threads(self, selected: dict[str, dict], hidden: set[str]) -> dict[str, dict]:
+    def _threads(
+        self, selected: dict[str, dict], hidden: set[str], hidden_private: set[str]
+    ) -> dict[str, dict]:
         config = self.config
         active = self.get(f"/guilds/{config.guild_id}/threads/active") or {}
         threads = list(active.get("threads") or [])
         for cid, channel in selected.items():
             try:
                 threads.extend(_archived_threads(self, cid, private=False))
-                if config.include_private_threads and channel.get("type") == 0:
-                    threads.extend(_archived_threads(self, cid, private=True))
             except DiscordAPIError as exc:
                 if not _refused(exc):
                     raise
-                self._refuse(cid, exc)
+                self._refuse(cid, f"code {exc.code}")
                 hidden.add(cid)
+                continue
+            if not (config.include_private_threads and channel.get("type") == 0):
+                continue
+            try:
+                threads.extend(_archived_threads(self, cid, private=True))
+            except DiscordAPIError as exc:
+                if not _refused(exc):
+                    raise
+                # Listing archived private threads needs Manage Threads; the channel
+                # itself reads fine, so only its private threads are kept as they are.
+                logger.warning(
+                    "Discord: archived private threads of channel %s cannot be listed "
+                    "(code %s), left unchanged.",
+                    cid,
+                    exc.code,
+                )
+                hidden_private.add(cid)
 
         containers = {}
         for thread in threads:
@@ -573,19 +597,24 @@ class _Walker:
                 "parent_id": str(parent["id"]),
                 "tags": sorted(tag for tag in applied if tag),
                 "last_message_id": thread.get("last_message_id"),
+                "private": thread.get("type") == _PRIVATE_THREAD,
             }
         return containers
 
     # -- one channel or thread ---------------------------------------------
     def _save(self, container: dict, cursor: int, days: dict[str, str]) -> None:
-        # Days before since_days are never re-read, so only their key is kept, for forgetting.
-        old = self.since.isoformat()
+        # A run re-reads from min(cursor day, rescan_floor) and rescan_floor is never
+        # before since, so older days are never compared again: only their key is
+        # kept, for forgetting.
+        old = min(self.since, snowflake_time(cursor).date()).isoformat()
         entry: dict[str, Any] = {
             "cursor": str(cursor),
             "days": {day: (digest if day >= old else "") for day, digest in days.items()},
         }
         if container.get("parent_id"):
             entry["parent"] = container["parent_id"]
+        if container.get("private"):
+            entry["private"] = True
         previous = self.known.get(container["id"])
         if previous is None or cursor > int(previous["cursor"]):
             self.progressed = True
@@ -608,7 +637,8 @@ class _Walker:
                 self._save(container, cursor, days)
                 return
         after = time_snowflake(_midnight(start)) - 1
-        cursor = max(cursor, after)
+        # Never behind the start day, so an empty channel does not re-read the day before.
+        cursor = max(cursor, after + 1)
 
         # Days from ``low`` on that come back without messages were emptied upstream.
         low = start.isoformat()
@@ -625,8 +655,7 @@ class _Walker:
             yield from self._day(container, batch, days, low)
             low, cursor = _next_day(batch), max(cursor, int(batch[-1]["id"]))
         elif any(d >= low for d in days) and self._history_hidden(container):
-            logger.warning("Discord: no readable history in channel %s, left unchanged.", cid)
-            self.stats["unreadable"] += 1
+            self._refuse(cid, "no readable history")
             return
         yield from self._missing_days(cid, days, low, None)
         self._save(container, cursor, days)
@@ -677,15 +706,16 @@ class _Walker:
 
     # -- the run -----------------------------------------------------------
     def rows(self) -> Iterator[dict]:
-        containers, hidden = self._discover()
+        containers, hidden, hidden_private = self._discover()
+        # Discovery always finishes before the budget can stop a run, so deleted and
+        # deselected containers are decided here, even when the walk is cut short.
+        yield from self._forget(set(containers), hidden, hidden_private)
         # Start after the container a cut-short run reached, so every one gets its turn.
         order = sorted(containers)
         resume = self.state.get("resume")
         if resume:
             order = [c for c in order if c > resume] + [c for c in order if c <= resume]
-        seen: set[str] = set()
         for cid in order:
-            seen.add(cid)
             try:
                 yield from self._container(containers[cid])
             except DiscordAPIError as exc:
@@ -695,17 +725,21 @@ class _Walker:
                     raise DiscordSourceError(
                         f"Discord channel {cid} in channel_ids cannot be read (code {exc.code})"
                     ) from exc
-                self._refuse(cid, exc)
+                self._refuse(cid, f"code {exc.code}")
             self.state["resume"] = cid
             self.progressed = True
         self.state.pop("resume", None)
-        yield from self._forget(seen, hidden)
 
-    def _forget(self, seen: set[str], hidden: set[str]) -> Iterator[dict]:
-        """Deleted or deselected channels and threads; threads of a channel whose
-        thread list could not be read are kept."""
-        for cid in [cid for cid in self.known if cid not in seen]:
-            if self.known[cid].get("parent") in hidden:
+    def _forget(
+        self, discovered: set[str], hidden: set[str], hidden_private: set[str]
+    ) -> Iterator[dict]:
+        """Deleted or deselected channels and threads. Threads of a channel whose
+        thread list could not be read, and private threads of a channel whose archived
+        private list could not be read, are kept."""
+        for cid in [cid for cid in self.known if cid not in discovered]:
+            entry = self.known[cid]
+            parent = entry.get("parent")
+            if parent in hidden or (entry.get("private") and parent in hidden_private):
                 continue
             for day in sorted(self.known.pop(cid)["days"]):
                 self.stats["deleted"] += 1
@@ -728,7 +762,9 @@ def _iter_rows(
     try:
         yield from walker.rows()
     except _CutShortError as cut:
-        stats["failed"] = 1
+        # A spent budget is a planned pause, not a failure; failed_budget says why.
+        if cut.reason != "budget":
+            stats["failed"] = 1
         stats[f"failed_{cut.reason}"] = 1
         logger.warning("Discord sync stopped early (%s); it resumes on the next run.", cut.reason)
         return
@@ -779,14 +815,16 @@ def discord_source(
         include_threads: Sync active and archived public threads of text channels.
         include_forums: Sync forum and media posts.
         include_private_threads: Also sync private threads. Archived ones need the
-            Manage Threads permission.
+            Manage Threads permission; without it the known private threads are kept.
         include_bot_messages: Keep messages from bots and webhooks.
         since_days: How far back the first sync of a channel reads.
         rescan_days: Recent days re-read on every run to pick up edits and
-            deletions. With 0 only the cursor's day and newer messages are read.
+            deletions, never further back than ``since_days``. With 0 only the
+            cursor's day and newer messages are read.
         full_resync: Re-read the whole ``since_days`` history once.
         max_requests: Request budget of one run, checked before each request once a
-            new day or a whole channel is done. A bigger server finishes over several runs.
+            new day or a whole channel is done. A bigger server finishes over several
+            runs; a spent budget sets ``failed_budget`` but not ``failed``.
         resource_name: Staging table name. Use a different one per sync scope
             that shares a dataset.
         check_active: Optional host authorization checkpoint, called before each

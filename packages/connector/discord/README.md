@@ -61,10 +61,10 @@ Run the same call again to sync only what changed. See `examples/example.py`.
 | `channel_ids` | all | Channel ids to sync. By default every text, announcement, forum and media channel. A listed channel that is missing or cannot be read raises. |
 | `include_threads` | `True` | Active and archived public threads of text channels. |
 | `include_forums` | `True` | Forum and media posts (each post is a thread). |
-| `include_private_threads` | `False` | Private threads. Archived ones need **Manage Threads**. |
+| `include_private_threads` | `False` | Private threads. Archived ones need **Manage Threads**; without it the channel still syncs and its known private threads are kept. |
 | `include_bot_messages` | `False` | Messages from bots and webhooks. |
 | `since_days` | `90` | How far back the first sync of a channel reads. |
-| `rescan_days` | `7` | Recent days re-read on every run to catch edits and deletions. With `0` only the cursor's day and newer messages are read. |
+| `rescan_days` | `7` | Recent days re-read on every run to catch edits and deletions, never further back than `since_days`. With `0` only the cursor's day and newer messages are read. |
 | `full_resync` | `False` | Re-read the whole `since_days` history once. |
 | `max_requests` | `2000` | Request budget of one run, checked once a new day or a whole channel is done. A bigger server finishes over several runs. |
 | `resource_name` | `discord_messages` | Staging table. Use a different name per sync scope that shares a dataset. |
@@ -100,7 +100,8 @@ pick up the new name and older ones keep the old one until a `full_resync`.
 - **Re-scan window.** A forward cursor alone never sees a message edited or deleted
   behind it, and Discord has no "changed since" endpoint (edits and deletes only arrive
   live over the Gateway). So each run re-reads from the start of the UTC day of
-  `min(cursor, now - rescan_days)`. Edits and deletions in that window update their day,
+  `min(cursor, now - rescan_days)`, never before `since_days`, so the re-scan never
+  ingests days the first sync left out. Edits and deletions in that window update their day,
   and a new message only re-processes today's document. A channel or thread with nothing
   new and nothing inside the window costs no request, and older days are left untouched.
   Use `full_resync=True` when older edits and deletions matter.
@@ -116,9 +117,12 @@ pick up the new name and older ones keep the old one until a `full_resync`.
   after 10,000 of those responses in 10 minutes.
 - **A run is bounded.** A `retry_after` over 60 seconds (the global limit), a 429 that
   outlasts the retries, or a spent `max_requests` budget stops the run cleanly. It keeps
-  the days it finished, reports why in `cognee_sync_stats` (`failed`, plus
-  `failed_rate_limit` or `failed_budget`), and the next run starts after the last channel
-  it finished. Deleted channels and threads are only forgotten by a run that finished.
+  the days it finished, reports why in `cognee_sync_stats` (`failed` plus
+  `failed_rate_limit` for a rate limit; a spent budget is a planned pause, so it sets only
+  `failed_budget`), and the next run starts after the last channel it finished. Deleted
+  and deselected channels and threads are decided right after discovery, which always
+  completes before the budget can stop a run, so they are forgotten even on a big server
+  whose runs are cut short.
 
 `cognee_sync_stats` also counts `scanned` messages, `emitted`, `unchanged` and `deleted`
 days, `unreadable` channels, `empty` messages (no content at all, which points at a missing

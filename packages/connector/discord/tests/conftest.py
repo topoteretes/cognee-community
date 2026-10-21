@@ -99,7 +99,10 @@ class FakeDiscord:
             return {"threads": [{**t, "last_message_id": self._last(t["id"])} for t in threads]}
         match = re.fullmatch(r"/channels/(\d+)/threads/archived/(public|private)", path)
         if match:
+            # Keyed by channel id, or "<channel id>:private" for the private listing only.
             self._fail(self.thread_errors, match.group(1))
+            if match.group(2) == "private":
+                self._fail(self.thread_errors, f"{match.group(1)}:private")
             private = match.group(2) == "private"
             threads = [
                 {**t, "last_message_id": self._last(t["id"])}
