@@ -212,4 +212,6 @@ the answer, and archived and deleted items are still returned by id.
   and two accounts with their own names staying apart in one dataset.
 - `test_forget.py` runs the real cognee pipeline (LLM and embeddings mocked) over three syncs:
   deleted items and archived sub-items leave the graph, a new update enters it, and a sync
-  where a deletion is the only change still forgets.
+  where a deletion is the only change still forgets. A deleted item's Data record must be
+  removed, not replaced by an emptied document, and the items that stay keep theirs, so the
+  test fails if either the `_deleted` rows or the `hard_delete` column are taken away.

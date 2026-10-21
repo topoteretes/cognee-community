@@ -4,6 +4,10 @@ Runs the real cognee pipeline (dlt merge, document ingestion, cognify) against
 the fake monday.com, with a mocked LLM and mocked embeddings, so no network or
 API key is needed. Each item carries one distinctive company name, which the
 mocked LLM turns into exactly one graph entity.
+
+A deleted item must leave every store: its entity leaves the graph and its Data
+record is removed, rather than replaced by an emptied document, while the items
+that stay keep their Data records.
 """
 
 import importlib
@@ -23,6 +27,9 @@ try:
 except ImportError:  # cognee before 1.6.5 returns plain lists
     EmbeddingResult = None
 from cognee.infrastructure.llm import LLMGateway
+from cognee.modules.data.methods import get_authorized_existing_datasets
+from cognee.modules.data.methods.get_dataset_data import get_dataset_data
+from cognee.modules.users.methods import get_default_user
 from fake_monday import FakeMonday
 
 from cognee_community_connector_monday import monday_source
@@ -139,6 +146,19 @@ async def _in_graph(*tokens):
     return {token: await _graph_has(token) for token in tokens}
 
 
+async def _documents() -> dict[str, object]:
+    """The connector's document id -> cognee's Data record id, for the dataset."""
+    user = await get_default_user()
+    datasets = await get_authorized_existing_datasets(
+        user=user, permission_type="read", datasets=[DATASET]
+    )
+    return {
+        data.system_metadata["external_id"]: data.id
+        for data in await get_dataset_data(datasets[0].id)
+        if isinstance(data.system_metadata, dict)
+    }
+
+
 # One test with several syncs, like the Google Calendar connector's: cognee
 # caches its database engines per process, so a second test in the same
 # process would still talk to the first test's (already removed) databases.
@@ -153,6 +173,8 @@ async def test_monday_changes_reach_the_graph(clean_environment):
     assert await _in_graph(ALPHA, BRAVO, CHARLIE, ECHO) == dict.fromkeys(
         (ALPHA, BRAVO, CHARLIE, ECHO), True
     )
+    before = await _documents()
+    assert set(before) == {"monday:1", "monday:2", "monday:3", "monday:4"}
 
     # Run 2: an item deleted, a sub-item archived, and a comment posted. The
     # comment does not move its item's updated_at and must still be picked up.
@@ -168,9 +190,15 @@ async def test_monday_changes_reach_the_graph(clean_environment):
         ECHO: True,
     }
     assert source.cognee_sync_stats == {"scanned": 2, "changed": 1, "deleted": 2}
+    # The deleted item's and the archived sub-item's Data records are gone, not
+    # emptied, and the untouched item keeps its record.
+    after = await _documents()
+    assert set(after) == {"monday:1", "monday:4"}
+    assert after["monday:4"] == before["monday:4"]
 
     # Run 3: a sync where a deletion is the only change.
     monday.delete("4")
     await _sync(source)
     assert await _in_graph(ALPHA, DELTA, ECHO) == {ALPHA: True, DELTA: True, ECHO: False}
     assert source.cognee_sync_stats == {"scanned": 1, "deleted": 1}
+    assert await _documents() == {"monday:1": after["monday:1"]}
