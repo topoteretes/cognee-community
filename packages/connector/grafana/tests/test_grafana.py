@@ -866,3 +866,76 @@ def test_provider_count_false_positive_withholds_snapshot(pipeline):
     # connector still requires each intended predicate and refuses this response.
     with pytest.raises(Exception, match="did not match selected tags"):
         rows(pipeline, src)
+
+
+class OnePassRedactions:
+    def __init__(self, values):
+        self.values = values
+        self.iterations = 0
+
+    def __iter__(self):
+        self.iterations += 1
+        assert self.iterations == 1
+        return iter(self.values)
+
+
+@pytest.mark.parametrize(
+    "container", [tuple, list, iter, lambda values: (x for x in values), OnePassRedactions]
+)
+def test_explicit_redaction_iterables_are_retained_for_staging(pipeline, container):
+    secrets = ["SyntheticOpaqueKnownCredential", "AnotherOpaqueKnownValue"]
+    prose = " and ".join(secrets) + "; checkout recovered in EU-WEST-1."
+    service = Service()
+    service.dashboards = {"a": dashboard()}
+    service.dashboards["a"]["spec"]["description"] = prose
+    service.events = [event(text=prose)]
+    src = source(service, redact_values=container(secrets))
+    assert not service.calls
+    staged = rows(pipeline, src)
+    assert len(staged) == 2
+    for _, _, content in staged:
+        assert all(secret not in content for secret in secrets)
+        assert "checkout recovered in EU-WEST-1." in content
+
+
+@pytest.mark.parametrize(
+    "values",
+    ["secret", b"secret", None, 42, iter(["valid", None]), (value for value in ["valid", 7])],
+)
+def test_invalid_redaction_iterable_refused_before_network(values):
+    service = Service()
+    with pytest.raises(ValueError, match="iterable of strings"):
+        source(service, redact_values=values)
+    assert not service.calls
+
+
+def test_explicit_redactions_snapshot_mutable_input_at_construction(pipeline):
+    secret = "SyntheticOpaqueKnownCredential"
+    service = Service()
+    service.events = [event(text=secret)]
+    values = [secret]
+    src = source(service, redact_values=values)
+    values.clear()
+    assert secret not in json.dumps(rows(pipeline, src))
+
+
+def test_new_effective_redactions_refresh_cached_dashboard(pipeline, monkeypatch):
+    import cognee_community_connector_grafana.grafana as module
+
+    secret = "SyntheticOpaqueKnownCredential"
+    service, stats = Service(), SyncStats()
+    service.dashboards = {"a": dashboard()}
+    service.dashboards["a"]["spec"]["description"] = secret
+    service.events = [event(text=secret)]
+    # Reproduce the previous exhausted-iterator policy without changing rendering.
+    assert secret in json.dumps(rows(pipeline, source(service, redact_values=())))
+    corrected = rows(pipeline, source(service, redact_values=iter([secret]), stats=stats))
+    assert secret not in json.dumps(corrected) and stats.changed == 2
+    monkeypatch.setattr(
+        module, "dashboard_row", lambda *args: pytest.fail("cached row rendered again")
+    )
+    assert (
+        rows(pipeline, source(service, redact_values=(x for x in [secret]), stats=stats))
+        == corrected
+    )
+    assert stats.unchanged == 2

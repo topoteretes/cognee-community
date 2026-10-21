@@ -154,7 +154,9 @@ absent from each store. The example makes no provider writes or global prune cal
 
 Only allowlisted titles, descriptions, tags, IDs, times and provenance are rendered.
 Datasource settings, targets, variable values, raw options and secure config are omitted.
-The supplied token, explicit `redact_values` (four characters or longer), recognizable
+Explicit `redact_values` accepts an iterable of strings (including generators/iterators),
+captured once when the factory is constructed; invalid values are refused before network
+access. The supplied token, explicit redactions (four characters or longer), recognizable
 credential shapes, URL credentials and labelled secrets are filtered from rendered prose
 on a best-effort basis. Labelled secrets include API-token fields; authorization header
 credentials and parameter lists are filtered while following incident clauses are kept.

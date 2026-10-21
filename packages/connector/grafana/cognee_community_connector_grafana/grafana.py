@@ -4,7 +4,7 @@ import hashlib
 import json
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from copy import deepcopy
 from typing import Any, Protocol
 from urllib.parse import urlsplit
@@ -342,7 +342,7 @@ def grafana_source(
     stats: SyncStats | None = None,
     annotation_limit: int = 100,
     max_requests: int = 1000,
-    redact_values: tuple[str, ...] = (),
+    redact_values: Iterable[str] = (),
 ):
     """Create a network-lazy dlt document source for Grafana OSS 12.3.1.
 
@@ -395,11 +395,17 @@ def grafana_source(
         raise ValueError("annotation_limit must be between 2 and 100")
     if type(max_requests) is not int or max_requests < 10:
         raise ValueError("max_requests must be >= 10")
-    if isinstance(redact_values, (str, bytes)) or any(
-        not isinstance(x, str) for x in redact_values
-    ):
+    if isinstance(redact_values, (str, bytes)):
         raise ValueError("redact_values must be an iterable of strings")
-    redactions = tuple(redact_values) + (token,)
+    try:
+        # Snapshot once before validation: generators must not be consumed and
+        # discarded, and later caller mutations must not alter retained policy.
+        redactions = tuple(redact_values)
+    except TypeError:
+        raise ValueError("redact_values must be an iterable of strings") from None
+    if any(not isinstance(value, str) for value in redactions):
+        raise ValueError("redact_values must be an iterable of strings")
+    redactions += (token,)
     dashboards = _selection(dashboard_uids, "dashboard_uids")
     folders = _selection(folder_uids, "folder_uids")
     org_tags = _selection(organization_annotation_tags, "organization_annotation_tags")
