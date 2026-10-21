@@ -113,7 +113,7 @@ for the full flow.
 | `filters` | – | a SQL condition per table, like `{"SALES_DB.PUBLIC.ORDERS": "REGION = 'EU'"}` |
 | `max_rows` | – | `10000` rows per table; `0` turns the cap off |
 | `full_refresh` | – | `False`; `True` reads every table again |
-| `resource_name` | – | `snowflake_tables`; give each account its own name when several sync into one dataset |
+| `resource_name` | – | `snowflake_tables`; give each account its own name when several sync into one dataset. A name that already holds another account's sync is refused, so one account can never forget another's rows |
 | `check_active` | – | optional host checkpoint, run before every query and every row |
 
 After a run, `source.cognee_sync_stats` holds counts only (`rows`, `unchanged`,
@@ -219,8 +219,9 @@ This connector reads business data. Be clear about what it does:
 - The text above becomes cognee documents. During cognify it is sent to your configured LLM
   and embedding providers, like any document you add to cognee. Use local models if that
   matters to you, and use `filters` to leave out rows that should not leave Snowflake.
-- dlt state stores, per table, its name, the last change time, the key columns, the filter
-  and each row's primary key value. It does not store other column values.
+- dlt state stores the account name (`ORGANIZATION.ACCOUNT`) and, per table, its name, the
+  last change time, the key columns, the filter and each row's primary key value. It does
+  not store other column values.
 - Logs and `cognee_sync_stats` contain counts and the connector's own error messages, never
   row values. The private key and passphrase never appear in a log or an error.
 
@@ -261,7 +262,9 @@ changes Snowflake reports.
   comparison, the change feed and its fallbacks, dropped and deselected tables, tables
   without keys, the row cap, filters, and a failing table that must not stop the others.
 - `test_source.py` runs the source through a real dlt pipeline: saved state between runs, a
-  deleted row leaving staging, names typed in any case, and the host's checkpoint.
+  deleted row leaving staging, names typed in any case, the host's checkpoint, a second
+  account under the same `resource_name` being refused, and two accounts with their own
+  names staying apart in one dataset.
 - `test_forget.py` runs the real cognee pipeline (LLM and embeddings mocked) over three
   syncs: a deleted customer and the old value of an updated order leave the graph, the new
   value enters it, and a sync where a deletion is the only change still forgets.

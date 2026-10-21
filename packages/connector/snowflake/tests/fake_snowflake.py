@@ -151,8 +151,10 @@ class FakeAccount:
     insert, update and delete, the way a real account did.
     """
 
-    def __init__(self, database="SALES_DB", schema="SALES", meta=None):
+    def __init__(self, database="SALES_DB", schema="SALES", meta=None, account="ORG.ACCOUNT"):
         self.database, self.schema = database, schema
+        # ORGANIZATION.ACCOUNT, as CURRENT_ORGANIZATION_NAME() and CURRENT_ACCOUNT_NAME() say.
+        self.account = account
         self.meta = meta or sales_schema()
         self.rows: dict[str, dict] = {table["name"]: {} for table in self.meta["tables"]}
         self.commits: dict[str, int] = dict.fromkeys(self.rows, 1)
@@ -193,6 +195,9 @@ class FakeAccount:
     # -- the two query functions the sync takes --------------------------------
     def run(self, sql, params=None):
         self.sql.append(sql)
+        if sql.startswith("SELECT CURRENT_ORGANIZATION_NAME()"):
+            org, name = self.account.split(".")
+            return [{"ORG": org, "NAME": name}]
         if sql.startswith("SELECT CURRENT_TIMESTAMP()"):
             return [{"NOW": f"T{self._clock}"}]
         if sql.startswith("SELECT COUNT(*)"):

@@ -46,10 +46,20 @@ def pipeline(tmp_path):
 
 
 def run(pipeline, source):
-    pipe, database = pipeline
-    pipe.run(source)
-    with sqlite3.connect(database) as conn:
-        return sorted(row[0] for row in conn.execute("SELECT id FROM snowflake_tables"))
+    pipeline[0].run(source)
+    return staged(pipeline, source.name)
+
+
+def staged(pipeline, table="snowflake_tables"):
+    with sqlite3.connect(pipeline[1]) as conn:
+        return sorted(row[0] for row in conn.execute(f"SELECT id FROM {table}"))
+
+
+def other_account():
+    """A second account, with a table of its own."""
+    other = FakeAccount(database="OTHER_DB", account="ORG.OTHER")
+    other.insert("ORDERS", ORDER_ID=7, CUSTOMER_ID=1, STATUS="open", UPDATED_AT=WHEN)
+    return other
 
 
 TABLES = ["sales_db.sales.orders", "SALES_DB.SALES.CUSTOMERS"]
@@ -96,6 +106,36 @@ def test_a_deleted_row_leaves_the_staging_table(account, pipeline):
 
     assert "snowflake:row:SALES_DB.SALES.ORDERS:102" not in ids
     assert "snowflake:row:SALES_DB.SALES.ORDERS:101" in ids
+
+
+def test_a_second_account_under_the_same_name_is_refused_and_forgets_nothing(account, pipeline):
+    first = run(pipeline, snowflake_source(TABLES, client=account))
+    other = other_account()
+
+    with pytest.raises(Exception, match="another Snowflake account"):
+        run(pipeline, snowflake_source(["OTHER_DB.SALES.ORDERS"], client=other))
+
+    # Refused before any table was listed or read, and the first account keeps
+    # every row: without the check, its tables would look deselected.
+    assert len(other.sql) == 1
+    assert staged(pipeline) == first
+
+
+def test_two_accounts_with_their_own_names_stay_apart_in_one_dataset(account, pipeline):
+    other = snowflake_source(
+        ["OTHER_DB.SALES.ORDERS"], client=other_account(), resource_name="snowflake_b"
+    )
+    run(pipeline, snowflake_source(TABLES, client=account, resource_name="snowflake_a"))
+    run(pipeline, other)
+    account.delete("ORDERS", (102,))
+
+    run(pipeline, snowflake_source(TABLES, client=account, resource_name="snowflake_a"))
+
+    assert "snowflake:row:SALES_DB.SALES.ORDERS:102" not in staged(pipeline, "snowflake_a")
+    assert staged(pipeline, "snowflake_b") == [
+        "snowflake:row:OTHER_DB.SALES.ORDERS:7",
+        "snowflake:table:OTHER_DB.SALES.ORDERS",
+    ]
 
 
 def test_filters_and_keys_accept_names_as_typed(account, pipeline):

@@ -117,6 +117,7 @@ def snowflake_source(
         full_refresh: Read every selected table again, even if unchanged.
         resource_name: Stable dlt resource name. Give each account its own
             name when several sync into one dataset, so their state stays apart.
+            A name that already holds another account's sync is refused.
         check_active: Optional host authorization checkpoint, run before every
             query and every row.
         client: An object with ``run(sql, params)`` and ``fetch(sql)``, used
@@ -713,6 +714,24 @@ def _column_type(data_type: Any) -> str:
 DEFAULT_MAX_ROWS = 10_000
 
 
+def _claim_state(run, state) -> None:
+    """Tie the saved state to one Snowflake account, or refuse another one.
+
+    Tables in the state that are not selected get forgotten, so a second
+    account syncing under the same resource name would forget the first one's
+    tables, and the next run of the first would forget the second's. The
+    account is read as ORGANIZATION.ACCOUNT, which is the same however the
+    account identifier was written, and the query runs without a warehouse.
+    """
+    row = run("SELECT CURRENT_ORGANIZATION_NAME() AS ORG, CURRENT_ACCOUNT_NAME() AS NAME")[0]
+    account = f"{row['ORG']}.{row['NAME']}"
+    if state.setdefault("account", account) != account:
+        raise SnowflakeConnectorError(
+            "This resource_name already holds the sync of another Snowflake account. "
+            "Give each account its own resource_name. Nothing was read or forgotten."
+        )
+
+
 @dataclass(frozen=True)
 class _SyncOptions:
     keys: dict[str, list[str]] = field(default_factory=dict)
@@ -741,6 +760,7 @@ def _iter_rows(
     or on a login problem, since every table would fail the same way.
     """
     options = _SyncOptions(keys or {}, filters or {}, max_rows or None, full_refresh)
+    _claim_state(run, state)
     selected = {ref.fqn for ref in refs}
     saved = state.setdefault("tables", {})
     infos, missing = _table_infos(run, refs)
