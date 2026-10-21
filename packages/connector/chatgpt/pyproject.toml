@@ -16,12 +16,25 @@ dependencies = [
 Homepage = "https://github.com/topoteretes/cognee"
 Repository = "https://github.com/topoteretes/cognee-community"
 
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0,<9",
+    "ruff>=0.17.0,<1",
+    # cognee==1.4.0 (our pin) does not bundle fastembed by default the way
+    # current cognee does; EMBEDDING_PROVIDER=fastembed in .env needs it
+    # installed explicitly for local, no-API-key embeddings.
+    "fastembed>=0.9.0,<1",
+]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["cognee_community_connector_chatgpt"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
 
 [tool.ruff]
 line-length = 100
