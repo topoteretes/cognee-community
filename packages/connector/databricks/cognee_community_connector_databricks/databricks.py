@@ -1,7 +1,20 @@
 """DLT source for Databricks notebooks and Unity Catalog tables (incremental + forget-on-delete).
 
-Work in progress. The planned design, checked against a real Free Edition
-workspace:
+Sync notebooks and Unity Catalog tables into cognee, joined through lineage.
+The resource is handed directly to :func:`cognee.remember`::
+
+    import cognee
+    from cognee_community_connector_databricks import databricks_source
+
+    await cognee.remember(
+        databricks_source(paths=["~/analytics"], tables=["main.sales"]),
+        dataset_name="databricks",
+        primary_key="id",
+        write_disposition="merge",   # incremental upserts and deletes
+        max_rows_per_table=0,        # no staging cap
+    )
+
+The design, checked against a real Free Edition workspace:
 
 * Notebooks from the selected workspace folders are exported as source, which
   never carries cell outputs. Markdown cells stay prose and code cells stay
@@ -12,8 +25,6 @@ workspace:
 * Notebooks and tables are joined through the lineage API, which names the
   notebooks that read and write each table by their workspace id. Table names
   found in notebook text are the fallback for notebooks that never ran.
-* Query results are off by default. Only queries the user names are run, on a
-  warehouse the user names, with a row cap and a timeout.
 * Every sync lists the selected folders and schemas in full. The listing carries
   each notebook's modified time and each table's updated time, so only what
   changed is exported or re-read, and records are tracked by their permanent id
@@ -24,6 +35,7 @@ workspace:
 
 import base64
 import hashlib
+import os
 import re
 from collections import defaultdict
 from collections.abc import Callable, Iterator
@@ -31,6 +43,8 @@ from typing import Any
 from urllib.parse import urlparse
 
 from cognee.shared.logging_utils import get_logger
+from cognee.tasks.ingestion import dlt_utils
+from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
 from dlt.sources.helpers.requests.retry import Client
 from dlt.sources.helpers.rest_client.auth import BearerTokenAuth
 from dlt.sources.helpers.rest_client.client import RESTClient
@@ -60,9 +74,216 @@ class DatabricksPermissionError(DatabricksConnectorError):
     """The token works, but its user may not read this folder, schema or table."""
 
 
-def databricks_source(*args, **kwargs):
-    """Create a dlt source that yields Databricks notebooks and tables as documents."""
-    raise NotImplementedError("The Databricks connector is still being built.")
+def databricks_source(
+    paths: list[str] | str | None = None,
+    tables: list[str] | str | None = None,
+    *,
+    host: str | None = None,
+    token: str | None = None,
+    lineage: bool = True,
+    full_refresh: bool = False,
+    resource_name: str = "databricks_workspace",
+    check_active: Callable[[], None] | None = None,
+    client: Any = None,
+):
+    """Return a ``dlt`` resource yielding notebook and table documents from Databricks.
+
+    Hand the result to ``cognee.remember(...)`` with ``write_disposition="merge"``,
+    ``primary_key="id"`` and ``max_rows_per_table=0``.
+
+    Args:
+        paths: Workspace folders whose notebooks are synced, with every folder
+            below them, like ``"/Shared/analytics"`` or ``"~/projects"`` (``~``
+            is your home folder). ``DATABRICKS_PATHS`` takes a comma-separated
+            list.
+        tables: Unity Catalog tables to sync, as a catalog (``"main"``), a schema
+            (``"main.sales"``) or one table (``"main.sales.orders"``).
+            ``DATABRICKS_TABLES`` takes a comma-separated list.
+        host: The workspace URL; a URL copied from the browser works.
+            Falls back to ``DATABRICKS_HOST``.
+        token: A personal access token. Falls back to ``DATABRICKS_TOKEN``.
+        lineage: Join notebooks and tables through Unity Catalog lineage. Off,
+            notebooks list the synced tables their code mentions instead.
+        full_refresh: Export every notebook and re-send every table again.
+        resource_name: Stable dlt resource name. Give each workspace its own
+            name when several sync into one dataset, so their state stays
+            separate. A name that already holds another workspace's sync is
+            refused.
+        check_active: Optional host authorization checkpoint, run before every
+            API call and every row.
+        client: A pre-built client, mainly for tests.
+    """
+    import dlt
+
+    if getattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 0) < 1:
+        raise RuntimeError(
+            "The Databricks connector requires a cognee build with table-scoped dlt "
+            "document cleanup. Upgrade cognee before syncing."
+        )
+
+    roots, scopes = _normalize_paths(paths), _normalize_scopes(tables)
+    if not roots and not scopes:
+        # An empty selection would forget everything synced before, so refuse it.
+        raise ValueError(
+            "Nothing is selected. Pass paths=[...] for notebooks and/or tables=[...] "
+            "for Unity Catalog, or set DATABRICKS_PATHS / DATABRICKS_TABLES."
+        )
+    if client is None:
+        # Built here, so a missing host or token fails when the source is
+        # created, not halfway through a pipeline run.
+        resolved = token or os.environ.get("DATABRICKS_TOKEN")
+        if not resolved:
+            raise DatabricksAuthError(
+                "A Databricks personal access token is required: pass token= or set "
+                "DATABRICKS_TOKEN."
+            )
+        client = _DatabricksClient(
+            host or os.environ.get("DATABRICKS_HOST"), resolved, check_active=check_active
+        )
+    elif check_active is not None:
+        client = _Checked(client, check_active)
+
+    stats: dict[str, int] = {}
+
+    @dlt.resource(
+        name=resource_name,
+        write_disposition="merge",
+        primary_key="id",
+        # `_deleted` is a boolean hard-delete marker: rows where it is True are
+        # removed from the dlt destination on merge, and cognee's orphan
+        # cleanup then forgets their documents.
+        columns={"_deleted": {"data_type": "bool", "hard_delete": True}},
+    )
+    def databricks_items():
+        stats.clear()
+        rows = _iter_rows(
+            client, roots, scopes, dlt.current.resource_state(), stats, full_refresh, lineage
+        )
+        yield from dlt_utils.guarded_rows(rows, check_active)
+
+    resource = databricks_items()
+    # Opt into the document ingestion path: each notebook and table becomes a
+    # text document that flows through normal cognify (LLM graph extraction).
+    setattr(resource, DOCUMENT_SOURCE_ATTR, "databricks")
+    setattr(resource, dlt_utils.PIPELINE_SCOPE_ATTR, resource_name)
+    # Host-readable diagnostics: counts only, never names or content.
+    resource.cognee_sync_stats = stats
+    return resource
+
+
+def _iter_rows(client, paths, scopes, state, stats, full_refresh=False, lineage=True):
+    """Yield every document and ``_deleted`` row of one sync.
+
+    A folder or scope that fails keeps its saved state and is retried on the
+    next run while the others finish. Raising would make dlt drop the state of
+    the whole run, so the run only raises when nothing selected could be
+    synced, or when the token itself is refused.
+    """
+    _claim_state(client, state)
+    roots = _expand_home(client, paths)
+    failed: set[str] = set()
+    yield from _sync_workspace(client, roots, scopes, state, stats, failed, full_refresh, lineage)
+    if failed:
+        stats["failed"] = len(failed)
+    logger.info(
+        "Databricks: %d notebook(s) and %d table(s) listed, %d sent, %d forgotten, "
+        "%d folder(s) or scope(s) failed.",
+        stats.get("notebooks", 0),
+        stats.get("tables", 0),
+        stats.get("notebooks_changed", 0) + stats.get("tables_changed", 0),
+        stats.get("notebooks_deleted", 0) + stats.get("tables_deleted", 0),
+        len(failed),
+    )
+    if failed and len(failed) == len(roots) + len(scopes):
+        raise DatabricksConnectorError(
+            f"Nothing selected in Databricks could be synced: {len(failed)} folder(s) or "
+            "scope(s) failed. Nothing was forgotten."
+        )
+
+
+def _claim_state(client, state: dict) -> None:
+    """Tie the saved state to one workspace, or refuse another one.
+
+    Notebooks and tables in the state that are not selected get forgotten, so a
+    second workspace syncing under the same resource name would forget the
+    first one's, and the next run of the first would forget the second's. Every
+    response names its workspace in a header, so one cheap call is enough.
+    """
+    client.get("/api/2.0/workspace/get-status", {"path": "/"})
+    workspace = str(client.workspace_id or client.host)
+    if state.setdefault("workspace", workspace) != workspace:
+        raise DatabricksConnectorError(
+            "This resource_name already holds the sync of another Databricks workspace. "
+            "Give each workspace its own resource_name. Nothing was read or forgotten."
+        )
+
+
+def _expand_home(client, paths: list[str]) -> list[str]:
+    """Paths with ``~`` written out as the token user's home folder."""
+    if not any(path == "~" or path.startswith("~/") for path in paths):
+        return paths
+    user = client.get("/api/2.0/preview/scim/v2/Me").get("userName")
+    if not user:
+        raise DatabricksConnectorError("Databricks did not say which user the token belongs to.")
+    home = f"/Users/{user}"
+    expanded = [home + path[1:] if path == "~" or path.startswith("~/") else path for path in paths]
+    return list(dict.fromkeys(expanded))
+
+
+def _normalize_paths(paths) -> list[str]:
+    if paths is None:
+        paths = os.environ.get("DATABRICKS_PATHS", "").split(",")
+    elif isinstance(paths, str):
+        paths = [paths]
+    cleaned = []
+    for path in paths:
+        text = str(path).strip().rstrip("/")
+        if not text:
+            continue
+        if not (text.startswith("/") or text == "~" or text.startswith("~/")):
+            raise ValueError(
+                "Workspace paths start with / or ~/, like /Shared/analytics or ~/projects."
+            )
+        cleaned.append(text)
+    return list(dict.fromkeys(cleaned))
+
+
+def _normalize_scopes(tables) -> list[str]:
+    if tables is None:
+        tables = os.environ.get("DATABRICKS_TABLES", "").split(",")
+    elif isinstance(tables, str):
+        tables = [tables]
+    cleaned = []
+    for table in tables:
+        # Unity Catalog stores names in lower case; backticks only quote them.
+        name = str(table).strip().replace("`", "").lower()
+        if not name:
+            continue
+        parts = name.split(".")
+        if len(parts) > 3 or not all(re.fullmatch(r"[\w-]+", part) for part in parts):
+            raise ValueError(
+                "Tables are selected as catalog, catalog.schema or catalog.schema.table."
+            )
+        cleaned.append(name)
+    return list(dict.fromkeys(cleaned))
+
+
+class _Checked:
+    """A pre-built client with the host's checkpoint run before every request."""
+
+    def __init__(self, client, check_active: Callable[[], None]):
+        self._client, self._check_active = client, check_active
+
+    def __getattr__(self, name):
+        return getattr(self._client, name)
+
+    def get(self, path, params=None):
+        self._check_active()
+        return self._client.get(path, params)
+
+    def pages(self, path, params, items_key):
+        self._check_active()
+        yield from self._client.pages(path, params, items_key)
 
 
 # ---------------------------------------------------------------------------

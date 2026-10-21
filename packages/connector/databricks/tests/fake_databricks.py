@@ -192,6 +192,10 @@ class FakeWorkspace:
         for failing, error in self.failing.items():
             if target == failing or (path.endswith(failing)):
                 raise error
+        if path == "/api/2.0/preview/scim/v2/Me":
+            return {"userName": HOME.rsplit("/", 1)[1], "active": True}
+        if path == "/api/2.0/workspace/get-status" and target == "/":
+            return {"object_type": "DIRECTORY", "path": "/", "object_id": 0}
         if path == "/api/2.0/lineage-tracking/table-lineage":
             name = params["table_name"]
             if name not in self.tables:
