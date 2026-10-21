@@ -54,7 +54,7 @@ def test_first_sync_exports_every_notebook_in_the_tree(workspace):
     rows, stats, failed = sync(workspace, {})
 
     assert titles(rows) == ["build_revenue", "load_orders", "report"]
-    assert stats == {"scanned": 3, "changed": 3}
+    assert stats == {"notebooks": 3, "notebooks_changed": 3}
     assert failed == set()
 
 
@@ -96,7 +96,7 @@ def test_unchanged_notebooks_are_not_exported_again(workspace):
 
     assert rows == []
     assert workspace.exports() == []
-    assert stats == {"scanned": 3}
+    assert stats == {"notebooks": 3}
 
 
 def test_an_edited_notebook_is_the_only_one_exported(workspace):
@@ -108,7 +108,7 @@ def test_an_edited_notebook_is_the_only_one_exported(workspace):
 
     assert titles(rows) == ["report"]
     assert workspace.exports() == [f"{ROOT}/report"]
-    assert stats["changed"] == 1
+    assert stats["notebooks_changed"] == 1
 
 
 def test_a_new_notebook_is_exported(workspace):
@@ -160,7 +160,7 @@ def test_a_deleted_notebook_or_folder_is_forgotten_once(workspace, folder):
     again, _, _ = sync(workspace, state)
 
     assert forgotten(rows) == [gone]
-    assert stats["deleted"] == 1
+    assert stats["notebooks_deleted"] == 1
     assert forgotten(again) == []
 
 
@@ -303,7 +303,7 @@ def test_a_notebook_under_two_selected_folders_is_synced_once(workspace):
     rows, stats, _ = sync(workspace, {}, roots=(ROOT, f"{ROOT}/etl"))
 
     assert titles(rows) == ["build_revenue", "load_orders", "report"]
-    assert stats["scanned"] == 3
+    assert stats["notebooks"] == 3
 
 
 def test_logs_carry_counts_only(workspace, monkeypatch):

@@ -5,12 +5,19 @@ mimics what a real Free Edition workspace showed: a folder listing is one level
 deep and leaves ``objects`` out when the folder is empty, editing a notebook
 keeps its object_id and moves its modified_at, a missing path is a 404 with
 code RESOURCE_DOES_NOT_EXIST, and an export in SOURCE format is base64 text.
+
+Unity Catalog works the same way: a table listing carries columns, comment,
+owner and view definition but no keys, which only the table's detail has; a
+rename keeps the table_id; updated_at moves on metadata changes only; and the
+listing answers {} for an empty schema.
 """
 
 import base64
 import itertools
 
 from cognee_community_connector_databricks import DatabricksNotFoundError
+
+UC = "/api/2.1/unity-catalog"
 
 HOME = "/Users/someone@example.com"
 
@@ -30,6 +37,9 @@ class FakeWorkspace:
         self._ids = itertools.count(1000)
         self._clock = itertools.count(1_000_000)
         self.folder(HOME)
+        # Unity Catalog: schemas by full name, tables by full name.
+        self.schemas: dict[str, dict] = {}
+        self.tables: dict[str, dict] = {}
 
     # -- building a workspace -------------------------------------------------
     def folder(self, path, kind="DIRECTORY"):
@@ -66,6 +76,71 @@ class FakeWorkspace:
         for key in [k for k in self.objects if k == path or k.startswith(f"{path}/")]:
             del self.objects[key]
 
+    def schema(self, full_name, comment=""):
+        self.schemas[full_name] = {
+            "name": full_name.split(".")[1],
+            "full_name": full_name,
+            "comment": comment,
+        }
+
+    def table(self, full_name, columns, comment="", primary_key=(), foreign_keys=(), view=None):
+        """A table (or a view, given its SQL), with (name, type, comment) columns."""
+        self.schema(
+            full_name.rsplit(".", 1)[0],
+            self.schemas.get(full_name.rsplit(".", 1)[0], {}).get("comment", ""),
+        )
+        constraints = []
+        if primary_key:
+            constraints.append(
+                {"primary_key_constraint": {"name": "pk", "child_columns": list(primary_key)}}
+            )
+        for children, parent, parents in foreign_keys:
+            constraints.append(
+                {
+                    "foreign_key_constraint": {
+                        "name": "fk",
+                        "child_columns": list(children),
+                        "parent_table": parent,
+                        "parent_columns": list(parents),
+                    }
+                }
+            )
+        self.tables[full_name] = {
+            "full_name": full_name,
+            "name": full_name.rsplit(".", 1)[1],
+            "table_id": f"tbl-{next(self._ids)}",
+            "table_type": "VIEW" if view else "MANAGED",
+            "comment": comment,
+            "owner": "someone@example.com",
+            "columns": [
+                {"name": n, "type_text": t, "comment": c, "nullable": n not in primary_key}
+                for n, t, c in columns
+            ],
+            "view_definition": view,
+            "table_constraints": constraints,
+            "updated_at": next(self._clock),
+            # Real listings carry statistics with values from the data.
+            "properties": {"spark.sql.statistics.colStats.amount.max": "12000.00"},
+        }
+        return self.tables[full_name]["table_id"]
+
+    def alter(self, full_name, **changes):
+        """A metadata change, like COMMENT ON: updated_at moves."""
+        self.tables[full_name].update(changes, updated_at=next(self._clock))
+
+    def rename_table(self, old, new):
+        table = self.tables.pop(old)
+        table.update(full_name=new, name=new.rsplit(".", 1)[1], updated_at=next(self._clock))
+        self.tables[new] = table
+
+    def drop(self, full_name):
+        del self.tables[full_name]
+
+    def drop_schema(self, full_name):
+        del self.schemas[full_name]
+        for name in [t for t in self.tables if t.startswith(f"{full_name}.")]:
+            del self.tables[name]
+
     # -- the client interface ---------------------------------------------------
     def get(self, path, params=None):
         params = params or {}
@@ -74,6 +149,16 @@ class FakeWorkspace:
         for failing, error in self.failing.items():
             if target == failing or (path.endswith(failing)):
                 raise error
+        if path.startswith(f"{UC}/tables/"):
+            name = path[len(f"{UC}/tables/") :]
+            if name not in self.tables:
+                raise _not_found("TABLE_DOES_NOT_EXIST")
+            return self.tables[name]
+        if path.startswith(f"{UC}/schemas/"):
+            name = path[len(f"{UC}/schemas/") :]
+            if name not in self.schemas:
+                raise _not_found("SCHEMA_DOES_NOT_EXIST")
+            return self.schemas[name]
         if path == "/api/2.0/workspace/list":
             if target not in self.objects or self.objects[target]["object_type"] == "NOTEBOOK":
                 raise _not_found()
@@ -94,6 +179,35 @@ class FakeWorkspace:
             return {"content": base64.b64encode(obj["source"].encode()).decode(), "file_type": "py"}
         raise AssertionError(f"unexpected request {path}")
 
+    def pages(self, path, params, items_key):
+        self.calls.append((path, params))
+        for failing, error in self.failing.items():
+            if path.endswith(failing) or failing in params.values():
+                raise error
+        if path == f"{UC}/schemas":
+            catalog = params["catalog_name"]
+            if not any(name.startswith(f"{catalog}.") for name in self.schemas):
+                raise _not_found("CATALOG_DOES_NOT_EXIST")
+            schemas = [s for n, s in sorted(self.schemas.items()) if n.startswith(f"{catalog}.")]
+            return iter([*schemas, {"name": "information_schema", "comment": "auto"}])
+        if path == f"{UC}/tables":
+            schema = f"{params['catalog_name']}.{params['schema_name']}"
+            if schema not in self.schemas:
+                raise _not_found("SCHEMA_DOES_NOT_EXIST")
+            # Like the real listing: no keys, which only the detail carries.
+            return iter(
+                [
+                    {k: v for k, v in t.items() if k != "table_constraints"}
+                    for n, t in sorted(self.tables.items())
+                    if n.rsplit(".", 1)[0] == schema
+                ]
+            )
+        raise AssertionError(f"unexpected listing {path}")
+
+    def details_read(self):
+        """Tables whose detail (with keys) was read, in order."""
+        return [p[len(f"{UC}/tables/") :] for p, _ in self.calls if p.startswith(f"{UC}/tables/")]
+
     def exports(self):
         return [params["path"] for path, params in self.calls if path.endswith("/export")]
 
@@ -105,5 +219,5 @@ class FakeWorkspace:
         return status
 
 
-def _not_found():
-    return DatabricksNotFoundError("Databricks says this does not exist (RESOURCE_DOES_NOT_EXIST).")
+def _not_found(code="RESOURCE_DOES_NOT_EXIST"):
+    return DatabricksNotFoundError(f"Databricks says this does not exist ({code}).")

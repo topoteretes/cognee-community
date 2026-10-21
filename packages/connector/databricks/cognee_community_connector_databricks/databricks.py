@@ -23,6 +23,7 @@ workspace:
 """
 
 import base64
+import hashlib
 import re
 from collections.abc import Callable, Iterator
 from typing import Any
@@ -52,6 +53,10 @@ class DatabricksAuthError(DatabricksConnectorError):
 
 class DatabricksNotFoundError(DatabricksConnectorError):
     """Databricks says the folder, notebook, schema or table does not exist."""
+
+
+class DatabricksPermissionError(DatabricksConnectorError):
+    """The token works, but its user may not read this folder, schema or table."""
 
 
 def databricks_source(*args, **kwargs):
@@ -170,10 +175,17 @@ def _raise_for_errors(response, *args, **kwargs) -> None:
         return
 
     code = _error_code(response)
-    if status in (401, 403):
+    # A token that is wrong or expired gets 401, or 403 with a bare number for a
+    # code. A token that works but may not read one object gets 403 with a
+    # named code like PERMISSION_DENIED: only that object fails, not the sync.
+    if status == 401 or (status == 403 and (code.isdigit() or code == _NO_CODE)):
         raise DatabricksAuthError(
-            f"Databricks refused the token (HTTP {status}). Check that it is valid, has not "
-            "expired, and that its user can read the selected folders and schemas."
+            f"Databricks refused the token (HTTP {status}). Check that it is valid and has "
+            "not expired."
+        )
+    if status == 403:
+        raise DatabricksPermissionError(
+            f"Databricks does not let this user read it (HTTP 403, {code})."
         )
     if status == 404 and code in _NOT_FOUND_CODES:
         raise DatabricksNotFoundError(f"Databricks says this does not exist ({code}).")
@@ -184,13 +196,16 @@ def _raise_for_errors(response, *args, **kwargs) -> None:
     raise DatabricksConnectorError(f"Databricks returned HTTP {status} ({code}).")
 
 
+_NO_CODE = "no error code"
+
+
 def _error_code(response) -> str:
     try:
         body = response.json()
     except ValueError:
-        return "no error code"
+        return _NO_CODE
     code = body.get("error_code") if isinstance(body, dict) else None
-    return str(code) if code else "no error code"
+    return str(code) if code else _NO_CODE
 
 
 def _clean_host(host: str | None) -> str:
@@ -306,7 +321,7 @@ def _sync_root(client, root, saved, stats, full_refresh, claimed):
         if object_id not in claimed
     }
     claimed.update(listed)
-    stats["scanned"] = stats.get("scanned", 0) + len(listed)
+    stats["notebooks"] = stats.get("notebooks", 0) + len(listed)
 
     documents, updates = [], {}
     for object_id, entry in sorted(listed.items()):
@@ -323,7 +338,7 @@ def _sync_root(client, root, saved, stats, full_refresh, claimed):
             updates[object_id] = {**before, "root": root} if before else None
             continue
         text, redacted = _render_notebook(entry, source)
-        stats["changed"] = stats.get("changed", 0) + 1
+        stats["notebooks_changed"] = stats.get("notebooks_changed", 0) + 1
         if redacted:
             stats["redacted"] = stats.get("redacted", 0) + redacted
         documents.append(
@@ -548,5 +563,239 @@ def _scrub(text: str) -> tuple[str, int]:
 def _forget_notebook(object_id: str, saved: dict, stats: dict) -> Iterator[dict]:
     """A ``_deleted`` row, which makes cognee forget the document on merge."""
     saved.pop(object_id, None)
-    stats["deleted"] = stats.get("deleted", 0) + 1
+    stats["notebooks_deleted"] = stats.get("notebooks_deleted", 0) + 1
     yield {"id": f"{ID_PREFIX}notebook:{object_id}", "_deleted": True}
+
+
+# ---------------------------------------------------------------------------
+# Tables: one document per Unity Catalog table or view.
+#
+# A selection entry names a catalog, a schema or one table. Every sync lists the
+# selection in full. The listing carries each table's permanent table_id (kept
+# through a rename), its columns, comment, owner and view definition, but not
+# its keys: a table's detail is read only when its updated_at moved, which it
+# does on any metadata change, and its keys are kept in the state. Each table's
+# document is rendered on every sync and only sent on when its text changed.
+# Table properties are never read into a document: they hold column statistics,
+# which are real values from the data.
+# ---------------------------------------------------------------------------
+
+_SKIPPED_SCHEMAS = {"information_schema"}
+
+_TABLE_KINDS = {
+    "VIEW": "view",
+    "MATERIALIZED_VIEW": "materialized view",
+    "STREAMING_TABLE": "streaming table",
+}
+
+
+def _sync_tables(
+    client, scopes: list[str], state: dict, stats: dict, failed: set, full_refresh=False
+):
+    """Yield a document for every new or changed table in ``scopes``, and a
+    ``_deleted`` row for every table that is gone.
+
+    Each scope is synced on its own: a scope that fails to list keeps its saved
+    state and emits nothing, while the other scopes finish. Scopes that failed
+    are added to ``failed``.
+    """
+    saved = state.setdefault("tables", {})
+
+    # Tables under a scope that is no longer selected go with it.
+    for table_id in sorted(i for i, t in saved.items() if t.get("scope") not in scopes):
+        yield from _forget_table(table_id, saved, stats)
+
+    claimed: set[str] = set()
+    for scope in scopes:
+        scope_stats: dict[str, int] = {}
+        try:
+            documents, updates, gone = _sync_scope(
+                client, scope, saved, scope_stats, full_refresh, claimed
+            )
+        except DatabricksAuthError:
+            raise
+        except DatabricksConnectorError as error:
+            failed.add(scope)
+            logger.warning(
+                "Databricks: a catalog or schema failed to sync (%s); it keeps its state "
+                "and is retried on the next run.",
+                type(error).__name__,
+            )
+            continue
+        for table_id in gone:
+            yield from _forget_table(table_id, saved, scope_stats)
+        saved.update(updates)
+        for name, count in scope_stats.items():
+            stats[name] = stats.get(name, 0) + count
+        yield from documents
+
+
+def _sync_scope(client, scope, saved, stats, full_refresh, claimed):
+    """List one scope, render each table, and confirm what is gone."""
+    tables, schema_comments = _list_scope(client, scope)
+    listed = {i: info for i, info in tables.items() if i not in claimed}
+    claimed.update(listed)
+    stats["tables"] = stats.get("tables", 0) + len(listed)
+
+    documents, updates = [], {}
+    for table_id, info in sorted(listed.items()):
+        before = saved.get(table_id, {})
+        keys = before.get("keys")
+        if keys is None or full_refresh or before.get("updated_at") != info.get("updated_at"):
+            try:
+                keys = _keys(client.get(f"/api/2.1/unity-catalog/tables/{info['full_name']}"))
+            except DatabricksNotFoundError:
+                # Dropped between the listing and this read: the next sync sees it gone.
+                if before:
+                    updates[table_id] = before
+                continue
+        schema = info["full_name"].rsplit(".", 1)[0]
+        text = _render_table(info, keys, schema_comments.get(schema, ""))
+        digest = _digest(text)
+        updates[table_id] = {
+            "name": info["full_name"],
+            "scope": scope,
+            "updated_at": info.get("updated_at"),
+            "keys": keys,
+            "hash": digest,
+        }
+        if full_refresh or digest != before.get("hash"):
+            stats["tables_changed"] = stats.get("tables_changed", 0) + 1
+            documents.append(
+                {
+                    "id": f"{ID_PREFIX}table:{table_id}",
+                    "title": info["full_name"],
+                    "content": text,
+                    "_deleted": False,
+                }
+            )
+
+    missing = [i for i, t in saved.items() if t.get("scope") == scope and i not in listed]
+    gone = [i for i in sorted(missing) if _table_gone(client, i, saved[i]["name"])]
+    return documents, updates, gone
+
+
+def _list_scope(client, scope: str) -> tuple[dict[str, dict], dict[str, str]]:
+    """Every table in a scope by table_id, and the comment of each schema.
+
+    A catalog, schema or table that Databricks says does not exist is a
+    complete, empty listing: the tables saved under it are then looked up one
+    by one before they are forgotten.
+    """
+    parts = scope.split(".")
+    try:
+        if len(parts) == 3:
+            info = client.get(f"/api/2.1/unity-catalog/tables/{scope}")
+            schema = client.get(f"/api/2.1/unity-catalog/schemas/{'.'.join(parts[:2])}")
+            return {str(info["table_id"]): info}, {schema["full_name"]: schema.get("comment") or ""}
+        if len(parts) == 2:
+            schema = client.get(f"/api/2.1/unity-catalog/schemas/{scope}")
+            schemas = {scope: schema.get("comment") or ""}
+        else:
+            listing = client.pages(
+                "/api/2.1/unity-catalog/schemas", {"catalog_name": scope}, "schemas"
+            )
+            schemas = {
+                f"{scope}.{s['name']}": s.get("comment") or ""
+                for s in listing
+                if s["name"] not in _SKIPPED_SCHEMAS
+            }
+    except DatabricksNotFoundError:
+        return {}, {}
+
+    tables = {}
+    for schema in sorted(schemas):
+        catalog, name = schema.split(".")
+        params = {"catalog_name": catalog, "schema_name": name}
+        for info in client.pages("/api/2.1/unity-catalog/tables", params, "tables"):
+            tables[str(info["table_id"])] = info
+    return tables, schemas
+
+
+def _table_gone(client, table_id: str, name: str) -> bool:
+    """Whether a table missing from a complete listing is really gone.
+
+    Its last known name is looked up once more. Gone means Databricks says it
+    does not exist, or another table now has that name. A table the user may
+    no longer read raises, so the scope fails and nothing is forgotten.
+    """
+    try:
+        info = client.get(f"/api/2.1/unity-catalog/tables/{name}")
+    except DatabricksNotFoundError:
+        return True
+    return str(info.get("table_id")) != table_id
+
+
+def _keys(detail: dict) -> dict:
+    """The primary key and foreign keys of a table's detail, in a stable order."""
+    primary, foreign = [], []
+    for constraint in detail.get("table_constraints") or []:
+        if "primary_key_constraint" in constraint:
+            primary = list(constraint["primary_key_constraint"].get("child_columns") or [])
+        reference = constraint.get("foreign_key_constraint")
+        if reference:
+            foreign.append(
+                [
+                    list(reference.get("child_columns") or []),
+                    reference.get("parent_table") or "",
+                    list(reference.get("parent_columns") or []),
+                ]
+            )
+    return {"primary_key": primary, "foreign_keys": sorted(foreign)}
+
+
+def _render_table(info: dict, keys: dict, schema_comment: str) -> str:
+    """A table as text: its description, owner, columns, keys and view definition.
+
+    Only what people wrote and the table's shape go in, never row counts,
+    statistics or times, so the text changes only when the table's meaning does.
+    """
+    name = info["full_name"]
+    kind = _TABLE_KINDS.get(info.get("table_type") or "", "table")
+    parts = [f"Databricks {kind} {name}"]
+    if info.get("comment"):
+        parts.append(_one_line(info["comment"]))
+    schema = name.rsplit(".", 1)[0]
+    if schema_comment:
+        parts.append(f"Schema {schema}: {_one_line(schema_comment)}")
+    if info.get("owner"):
+        parts.append(f"Owner: {info['owner']}")
+
+    columns = []
+    for column in info.get("columns") or []:
+        details = [str(column.get("type_text") or column.get("type_name") or "unknown").lower()]
+        if column.get("nullable") is False:
+            details.append("required")
+        line = f"{column.get('name')} ({', '.join(details)})"
+        if column.get("comment"):
+            line += f": {_one_line(column['comment'])}"
+        columns.append(line)
+    if columns:
+        parts.append("Columns:\n" + "\n".join(columns))
+    if keys.get("primary_key"):
+        parts.append(f"Primary key: {', '.join(keys['primary_key'])}")
+    references = [
+        f"{', '.join(children)} references {parent} ({', '.join(parents)})"
+        for children, parent, parents in keys.get("foreign_keys") or []
+    ]
+    if references:
+        parts.append("References:\n" + "\n".join(references))
+    if info.get("view_definition"):
+        definition, _ = _scrub(info["view_definition"].strip())
+        parts.append(f"View definition:\n```sql\n{definition}\n```")
+    return "\n\n".join(parts)
+
+
+def _one_line(text: str) -> str:
+    return " ".join(str(text).split())
+
+
+def _digest(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()[:16]
+
+
+def _forget_table(table_id: str, saved: dict, stats: dict) -> Iterator[dict]:
+    """A ``_deleted`` row, which makes cognee forget the document on merge."""
+    saved.pop(table_id, None)
+    stats["tables_deleted"] = stats.get("tables_deleted", 0) + 1
+    yield {"id": f"{ID_PREFIX}table:{table_id}", "_deleted": True}

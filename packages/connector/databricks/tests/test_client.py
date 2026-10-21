@@ -16,6 +16,7 @@ from cognee_community_connector_databricks import (
     DatabricksAuthError,
     DatabricksConnectorError,
     DatabricksNotFoundError,
+    DatabricksPermissionError,
 )
 from cognee_community_connector_databricks.databricks import (
     _WORKSPACE_HEADER,
@@ -171,6 +172,24 @@ def test_a_refused_token_raises_an_auth_error(status, body):
     with pytest.raises(DatabricksAuthError, match=f"HTTP {status}") as excinfo:
         client.get("/api/2.0/workspace/list", {"path": "/"})
     assert TOKEN not in str(excinfo.value)
+
+
+def test_a_token_that_may_not_read_one_object_is_not_a_refused_token():
+    # What a real workspace answered for lineage of a table the user cannot see.
+    client, _ = make_client(
+        (403, {"error_code": "PERMISSION_DENIED", "message": "no permission on t"}, None)
+    )
+
+    with pytest.raises(DatabricksPermissionError, match="PERMISSION_DENIED") as excinfo:
+        client.get("/api/2.0/lineage-tracking/table-lineage", {"table_name": "a.b.c"})
+    assert not isinstance(excinfo.value, DatabricksAuthError)
+
+
+def test_a_403_without_a_body_is_a_refused_token():
+    client, _ = make_client((403, "", None))
+
+    with pytest.raises(DatabricksAuthError):
+        client.get("/api/2.0/workspace/list", {"path": "/"})
 
 
 @pytest.mark.parametrize(
