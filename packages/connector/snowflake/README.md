@@ -267,4 +267,7 @@ changes Snowflake reports.
   names staying apart in one dataset.
 - `test_forget.py` runs the real cognee pipeline (LLM and embeddings mocked) over three
   syncs: a deleted customer and the old value of an updated order leave the graph, the new
-  value enters it, and a sync where a deletion is the only change still forgets.
+  value enters it, and a sync where a deletion is the only change still forgets. A deleted
+  row's Data record must be removed, not replaced by an emptied document, and the rows that
+  stay keep theirs, so the test fails if either the `_deleted` rows or the `hard_delete`
+  column are taken away.

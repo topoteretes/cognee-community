@@ -5,6 +5,10 @@ the fake Snowflake account, with a mocked LLM and mocked embeddings, so no
 network or API key is needed. Each row carries one distinctive company name,
 which the mocked LLM turns into exactly one graph entity.
 
+A deleted row must leave every store: its entity leaves the graph and its Data
+record is removed, rather than replaced by an emptied document, while the rows
+that stay keep their Data records.
+
 CUSTOMERS has no change tracking, so a change there means reading the table
 and comparing keys; ORDERS has change tracking, so only its change feed is read.
 Both paths are exercised.
@@ -28,6 +32,9 @@ try:
 except ImportError:  # cognee before 1.6.5 returns plain lists
     EmbeddingResult = None
 from cognee.infrastructure.llm import LLMGateway
+from cognee.modules.data.methods import get_authorized_existing_datasets
+from cognee.modules.data.methods.get_dataset_data import get_dataset_data
+from cognee.modules.users.methods import get_default_user
 from fake_snowflake import FakeAccount
 
 from cognee_community_connector_snowflake import snowflake_source
@@ -44,6 +51,9 @@ ALPHA, BRAVO, CHARLIE, DELTA, ECHO = (
     "Echocorp",
 )
 TOKENS = (ALPHA, BRAVO, CHARLIE, DELTA, ECHO)
+CUSTOMER_1, CUSTOMER_2 = (f"snowflake:row:SALES_DB.SALES.CUSTOMERS:{key}" for key in (1, 2))
+ORDER_101, ORDER_102 = (f"snowflake:row:SALES_DB.SALES.ORDERS:{key}" for key in (101, 102))
+TABLE_DOCUMENTS = {f"snowflake:table:{table}" for table in TABLES}
 WHEN = datetime.datetime(2026, 10, 20, 9, 0)
 
 
@@ -145,6 +155,19 @@ async def _in_graph(*tokens):
     return {token: await _graph_has(token) for token in tokens}
 
 
+async def _documents() -> dict[str, object]:
+    """The connector's document id -> cognee's Data record id, for the dataset."""
+    user = await get_default_user()
+    datasets = await get_authorized_existing_datasets(
+        user=user, permission_type="read", datasets=[DATASET]
+    )
+    return {
+        data.system_metadata["external_id"]: data.id
+        for data in await get_dataset_data(datasets[0].id)
+        if isinstance(data.system_metadata, dict)
+    }
+
+
 # One test with several syncs, like the Google Calendar connector's: cognee
 # caches its database engines per process, so a second test in the same
 # process would still talk to the first test's (already removed) databases.
@@ -158,6 +181,8 @@ async def test_snowflake_changes_reach_the_graph(clean_environment):
     assert await _in_graph(ALPHA, BRAVO, CHARLIE, DELTA) == dict.fromkeys(
         (ALPHA, BRAVO, CHARLIE, DELTA), True
     )
+    before = await _documents()
+    assert set(before) == {CUSTOMER_1, CUSTOMER_2, ORDER_101, ORDER_102} | TABLE_DOCUMENTS
 
     # Run 2: a customer deleted (read in full, compared by key) and an order
     # updated (read from the change feed).
@@ -173,6 +198,12 @@ async def test_snowflake_changes_reach_the_graph(clean_environment):
         ECHO: True,  # the new value reached the graph
     }
     assert source.cognee_sync_stats == {"rows": 2, "deleted": 1, "from_changes": 1}
+    # The deleted customer's Data record is gone, not emptied, and the
+    # untouched rows keep theirs.
+    after = await _documents()
+    assert set(after) == set(before) - {CUSTOMER_2}
+    assert after[CUSTOMER_1] == before[CUSTOMER_1]
+    assert after[ORDER_102] == before[ORDER_102]
 
     # Run 3: a sync where a deletion is the only change.
     account.delete("ORDERS", (102,))
@@ -180,3 +211,4 @@ async def test_snowflake_changes_reach_the_graph(clean_environment):
     await _sync(source)
     assert await _in_graph(ALPHA, DELTA, ECHO) == {ALPHA: True, DELTA: False, ECHO: True}
     assert source.cognee_sync_stats == {"unchanged": 1, "deleted": 1, "from_changes": 1}
+    assert set(await _documents()) == set(after) - {ORDER_102}
