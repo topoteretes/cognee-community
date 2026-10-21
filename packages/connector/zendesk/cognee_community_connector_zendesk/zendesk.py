@@ -74,9 +74,11 @@ _FAILED_RUNS_BEFORE_RAISE = 3
 _SUBDOMAIN_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 # Help Center locales look like "en-us" or "pt-br"; the value goes into the URL path.
 _LOCALE_RE = re.compile(r"^[a-z]{2,3}(?:-[a-z0-9]{2,8})*$")
-# dlt snake-cases table names, so "Acme-EU" and "acme_eu" would share a table while
-# keeping separate sync states. Only names dlt leaves unchanged are accepted.
-_RESOURCE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,50}$")
+# dlt snake-cases table names and collapses repeated underscores, so "Acme-EU", "acme__eu"
+# and "acme_eu" would share a table while keeping separate sync states. Only names dlt
+# leaves unchanged are accepted: single underscores between letters and digits.
+_RESOURCE_NAME_RE = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
+_RESOURCE_NAME_MAX = 51
 _COLUMNS = {
     "_deleted": {"data_type": "bool", "hard_delete": True},
     "title": {"data_type": "text", "nullable": True},
@@ -907,7 +909,7 @@ def zendesk_source(
             large first backfill makes progress on every run. ``None`` reads the
             whole export in one run.
         resource_name: Prefix of the two table names, and the key of the sync state:
-            lowercase letters, digits and underscores. Defaults to
+            lowercase letters and digits with single underscores. Defaults to
             ``zendesk_<subdomain>``, so two Zendesk accounts in one dataset never share
             a table (their ids overlap). Keep it fixed across runs.
         check_active: Optional host authorization checkpoint, called before every
@@ -946,12 +948,17 @@ def zendesk_source(
         not isinstance(max_export_pages_per_run, int) or max_export_pages_per_run < 1
     ):
         raise ValueError("max_export_pages_per_run must be a positive number, or None.")
-    if resource_name and not _RESOURCE_NAME_RE.match(resource_name):
+    if resource_name and (
+        len(resource_name) > _RESOURCE_NAME_MAX or not _RESOURCE_NAME_RE.match(resource_name)
+    ):
         raise ValueError(
-            "resource_name must be lowercase letters, digits and underscores, starting with a "
-            "letter, so dlt uses it unchanged as the table name."
+            "resource_name must be lowercase letters and digits with single underscores, "
+            "starting with a letter and at most 51 characters, so dlt uses it unchanged as "
+            "the table name."
         )
-    resource_name = resource_name or f"zendesk_{subdomain.replace('-', '_')}"
+    # "a-b" and "a--b" both become zendesk_a_b; the account check in the sync state
+    # then refuses the second one instead of letting them share a table.
+    resource_name = resource_name or "zendesk_" + re.sub("-+", "_", subdomain)
     if client is None:
         client = ZendeskClient(
             subdomain,

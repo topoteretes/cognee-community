@@ -718,7 +718,9 @@ def test_credentials_are_arguments_only(monkeypatch):
         zendesk_source(SUB)
 
 
-@pytest.mark.parametrize("name", ["Acme-EU", "acme eu", "acmeEU", "1acme"])
+@pytest.mark.parametrize(
+    "name", ["Acme-EU", "acme eu", "acmeEU", "1acme", "acme__eu", "acme_", "a" * 52]
+)
 def test_a_resource_name_dlt_would_rename_is_refused(name):
     with pytest.raises(ValueError, match="resource_name"):
         zendesk_source(SUB, resource_name=name, client=FakeZendesk())
@@ -1064,6 +1066,28 @@ def test_sync_stats_count_rows_and_tombstones(tmp_path):
         "given_up": 0,
         "failed": 0,
     }
+
+
+def test_accepted_names_are_the_table_names_dlt_writes():
+    from dlt.common.normalizers.naming.snake_case import NamingConvention
+
+    naming = NamingConvention()
+    for source in (
+        zendesk_source("a--b", client=FakeZendesk()),
+        zendesk_source(SUB, resource_name="support_eu2", client=FakeZendesk()),
+    ):
+        for table in source.resources:
+            assert naming.normalize_table_identifier(table) == table
+
+
+def test_two_subdomains_with_the_same_default_name_are_refused(tmp_path):
+    pipeline = _pipeline(tmp_path)
+    fake = FakeZendesk()
+    fake.touch(ticket(1), [comment(1, "x")])
+    pipeline.run(zendesk_source("a-b", client=fake, resources=["tickets"]))
+    with pytest.raises(PipelineStepFailed) as failed:
+        pipeline.run(zendesk_source("a--b", client=fake, resources=["tickets"]))
+    assert "belongs to Zendesk 'a-b'" in str(_cause(failed.value, ValueError))
 
 
 def test_each_account_gets_its_own_tables_and_sync_state():

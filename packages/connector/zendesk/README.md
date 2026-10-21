@@ -64,7 +64,7 @@ Settings and credentials are arguments only; `examples/example.py` reads them fr
 | `include_emails` | `False` | Name people as `Name <email>`. By default documents carry names only. |
 | `locale` | all | Help Center locale to list articles for. |
 | `max_export_pages_per_run` | `1` | Ticket export pages read per run (up to 1000 tickets each). The next run continues from the saved cursor, so a large first backfill makes progress on every run; `None` reads the whole export in one run. |
-| `resource_name` | `zendesk_<subdomain>` | Prefix of the table names (`<resource_name>_tickets`, `<resource_name>_articles`) and key of the sync state: lowercase letters, digits and underscores. A state written for another account is refused. Keep it fixed across runs. |
+| `resource_name` | `zendesk_<subdomain>` | Prefix of the table names (`<resource_name>_tickets`, `<resource_name>_articles`) and key of the sync state: lowercase letters and digits, with single underscores between them (at most 51 characters), so dlt uses it unchanged as the table name. The default turns hyphens into underscores; when two subdomains map to the same name (`a-b`, `a--b`), the second is refused. A state written for another account is refused. Keep it fixed across runs. |
 | `check_active` | `None` | Optional callable checked before every API request, before every retry wait and around every row; raising from it stops the sync (for hosts that need to stop a sync whose access was revoked). |
 
 ## Setup and auth
@@ -98,7 +98,7 @@ enabled.
 | Several changes in one window | The export lists a ticket once per change, so one run can see it several times (for example deleted and then restored). Only the newest version is kept, so the last change wins and comments are fetched once. |
 | Articles | The Help Center has no delete feed, so articles are listed in full each run, with cursor pagination (offset pagination stops at 10,000 records). That listing already carries `updated_at`, so it also finds edits. Only published articles whose `updated_at` changed are re-emitted; drafts are skipped. Articles are keyed by id and locale, so two translations of one article are two documents. |
 | Removed articles | An article missing from a complete listing (archived or deleted), or turned back into a draft, is emitted as a tombstone. Cursor pages carry no total, so the `count` comes from one offset request first; a failed listing, or one that does not add up to that count, raises instead, so it can never forget live articles. |
-| Pagination that does not move | An export cursor, a comment page or an article page that hands back the same position stops instead of looping. |
+| Pagination that does not move | An export cursor, a comment page or an article page that hands back the same position stops instead of looping, and so does an export page with neither a cursor nor an end. |
 | Stable documents | A ticket document leaves out `updated_at`, which Zendesk bumps for metadata-only changes, so unchanged conversations keep their content hash and are not re-cognified. |
 | Large accounts | With one export page per run, an account with more than about 1000 ticket changes between syncs falls behind; when a run stops at the cap it logs a warning with how many hours behind the export is. |
 | Rate limits | 429, 5xx and dropped connections are retried, honouring `Retry-After` up to 30 s. A longer wait, or a rate limit that outlasts the retries, stops the rest of the run cleanly (no rows, no state change, `failed_rate_limit`), and the next run resumes. cognee holds a process-wide lock while a dlt source runs, so the connector does not sleep through long waits. The export allows 10 requests a minute. |
@@ -172,7 +172,7 @@ Tickets hold customer personal data. Be clear about what the connector does:
   own tables through `resource_name` (by default from the subdomain), so two accounts can
   share a dataset; do not reuse one `resource_name` for two accounts.
 - Taking `tickets` or `articles` out of `resources` stops syncing them but does not forget
-  what was already stored; forget the dataset to drop it.
+  what was already stored (see [How deletion is honoured](#privacy)).
 - Attachments are not ingested.
 
 ## Testing
@@ -195,7 +195,7 @@ with responses shaped like a real trial account's.
   redirects, plain http, other hosts, a 200 without JSON, record ids kept out of errors,
   a redacted repr), a sync through the real client, config validation (subdomain,
   `resource_name`, locale, arguments only), a state from another account, per-account
-  tables, `check_active`, tickets and articles failing separately, a part that keeps
+  tables (and two subdomains that map to the same default name), a source object run twice, `check_active`, tickets and articles failing separately, a part that keeps
   failing raising on its third run, a rate limit stopping the run cleanly, a large
   backfill saving progress every run, the lag warning, the sync stats, the row-to-document
   mapping in cognee, and an end-to-end dlt merge into SQLite.
