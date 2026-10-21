@@ -132,7 +132,26 @@ def test_list_boards_hides_subitem_boards_and_pages_through_all():
     assert boards[0] == {"id": "100", "name": "Launch plan", "workspace": "Main workspace"}
     assert len(boards) == 151
     assert "101" not in {board["id"] for board in boards}
-    assert monday.calls == ["ListBoards", "ListBoards"]
+    # Two full pages, then an empty one that ends the walk.
+    assert monday.calls == ["ListBoards", "ListBoards", "ListBoards"]
+
+
+def test_list_boards_keeps_paging_when_monday_caps_the_page_lower():
+    from cognee_community_connector_monday import list_boards
+
+    monday = FakeMonday()
+    for n in range(120):
+        monday.add_board(str(1000 + n), f"Board {n}")
+    original = monday.query
+
+    def capped(query, variables=None):
+        if "ListBoards" in query:
+            variables = {**variables, "limit": 50}
+        return original(query, variables)
+
+    monday.query = capped
+
+    assert len(list_boards(client=monday)) == 120
 
 
 def test_list_boards_needs_a_token():

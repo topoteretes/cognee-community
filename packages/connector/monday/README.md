@@ -173,6 +173,13 @@ This connector reads work data. Be clear about what it does:
 - Your API token is never logged or put in error messages. Keep it out of your code and
   repository; regenerate it on the Developers page if it leaks.
 
+**Who can read it**
+
+- Anyone who can read the cognee dataset can ask about these items, whatever their own
+  monday.com access is. With cognee's access control on (the default), that is the user who
+  ran the sync and anyone the dataset is shared with, so sync into a dataset only the people
+  allowed to see these boards can read.
+
 **How deletion is honoured**
 
 - Archived and deleted items are forgotten on the **next sync**. Run syncs in the foreground:
@@ -215,7 +222,8 @@ the answer, and archived and deleted items are still returned by id.
   must not delete), and failures (a lost board, a failing board that must not stop the others,
   a refused token, a lookup without its list of items, an item the fetch leaves out, items
   past the update limit, logs with counts only).
-- `test_source.py` covers the factory, its token and board id checks, `list_boards`, and,
+- `test_source.py` covers the factory, its token and board id checks, `list_boards` (also when
+  monday.com caps a page lower than asked), and,
   through a real dlt pipeline, a second account under the same `resource_name` being refused
   and two accounts with their own names staying apart in one dataset.
 - `test_forget.py` runs the real cognee pipeline (LLM and embeddings mocked) over three syncs:

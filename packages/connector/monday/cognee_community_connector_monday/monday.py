@@ -74,7 +74,9 @@ API_URL = "https://api.monday.com/v2"
 # current stable version, and every query in this module was checked against it.
 API_VERSION = "2026-07"
 
-# GraphQL error codes that mean the token itself is not usable.
+# GraphQL error codes that mean the token itself is not usable. A bad token got
+# NOT_AUTHENTICATED (with HTTP 401) on API 2026-07; the other two are monday.com's
+# documented codes for a token that lacks permission.
 _AUTH_ERROR_CODES = {"NOT_AUTHENTICATED", "UNAUTHORIZED", "USER_UNAUTHORIZED"}
 
 
@@ -164,6 +166,8 @@ _LIST_BOARDS_QUERY = """
 query ListBoards($page: Int!, $limit: Int!) {
   boards(page: $page, limit: $limit, state: active) { id name type workspace { name } }
 }"""
+# Boards per list_boards call. The query costs 40 complexity points at 100 or 500
+# (measured on API 2026-07), so this only sets how many boards a call returns.
 _LIST_BOARDS_PAGE_SIZE = 100
 
 
@@ -184,7 +188,11 @@ def list_boards(token: str | None = None, *, client: Any = None) -> list[dict]:
     boards, page = [], 1
     while True:
         variables = {"page": page, "limit": _LIST_BOARDS_PAGE_SIZE}
-        found = client.query(_LIST_BOARDS_QUERY, variables)["boards"] or []
+        found = _listed(client.query(_LIST_BOARDS_QUERY, variables), "boards")
+        # Stop at an empty page, not a short one, so a lower page cap on
+        # monday.com's side cannot cut the list short.
+        if not found:
+            return boards
         boards.extend(
             {
                 "id": str(board["id"]),
@@ -194,8 +202,6 @@ def list_boards(token: str | None = None, *, client: Any = None) -> list[dict]:
             for board in found
             if board.get("type") != "sub_items_board"
         )
-        if len(found) < _LIST_BOARDS_PAGE_SIZE:
-            return boards
         page += 1
 
 
