@@ -175,11 +175,16 @@ def _fake_stripe() -> tuple[FakeStripe, dict]:
         total=4900,
         amount_due=4900,
         parent={"subscription_details": {"subscription": subscription["id"]}},
+        payments={
+            "object": "list",
+            "data": [{"payment": {"type": "payment_intent", "payment_intent": "pi_alpha"}}],
+            "has_more": False,
+        },
     )
     charge = stripe.add(
         "charges",
         customer=alpha["id"],
-        invoice=invoice["id"],
+        payment_intent="pi_alpha",
         amount=4900,
         currency="usd",
         status="succeeded",
@@ -228,6 +233,10 @@ async def test_billing_is_remembered_linked_and_forgotten(clean_environment):
     assert not any(objects["bravo"]["id"] in text for text in linked)
     by_subscription = await _linked_through(f"stripe:subscription:{objects['subscription']['id']}")
     assert any(objects["invoice"]["id"] in text for text in by_subscription)
+    # Charges no longer name their invoice; they meet through the PaymentIntent.
+    by_payment = await _linked_through("stripe:payment_intent:pi_alpha")
+    assert any(objects["invoice"]["id"] in text for text in by_payment)
+    assert any(objects["charge"]["id"] in text for text in by_payment)
     by_charge = await _linked_through(f"stripe:charge:{objects['charge']['id']}")
     assert any(objects["dispute"]["id"] in text for text in by_charge)
 

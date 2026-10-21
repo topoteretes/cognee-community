@@ -22,8 +22,8 @@ source, see [Design notes](#design-notes).
 | --- | --- | --- |
 | Customer | Name, description, created, currency, balance, delinquency | itself |
 | Subscription | Status, dates (start, trial, cancellation), collection method, items with product, price, quantity and period end | customer, products |
-| Invoice | Number, status, billing reason, period, due and paid dates, totals, the invoice's own customer-name snapshot, up to 20 line items | customer, subscription, products |
-| Charge | Amount, status, captured and refunded amounts, failure reason, statement descriptor | customer, invoice |
+| Invoice | Number, status, billing reason, period, due and paid dates, totals, the invoice's own customer-name snapshot, up to 20 line items | customer, subscription, products, the payment that paid it |
+| Charge | Amount, status, captured and refunded amounts, failure reason, statement descriptor | customer, the payment it belongs to (shared with its invoice) |
 | Product | Name, description, active, default price, unit label | itself |
 | Dispute | Amount, reason, status, evidence due date | charge |
 
@@ -38,7 +38,9 @@ Links are node-set memberships, recorded in the `cognee_node_set` column: a subs
 carries `customer:cus_…`, `subscription:sub_…` and `product:prod_…`, and cognee stores them as
 `stripe:customer:cus_…` and so on. Each document's chunks get a `belongs_to_set` edge to those
 shared `NodeSet` nodes, so `customer → subscription → invoice → charge → dispute` is a path in the
-graph. It is deterministic and does not depend on the LLM. Node sets also filter search
+graph. It is deterministic and does not depend on the LLM. Since API version 2025-03-31 a charge
+no longer names its invoice, so the connector expands the invoice's `payments` and links the two
+through the PaymentIntent that paid it (`payment_intent:pi_…`). Node sets also filter search
 (`node_name=["stripe:customer:cus_…"]`).
 
 ## Requirements

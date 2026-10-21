@@ -85,9 +85,26 @@ def _billing(fake: FakeStripe) -> dict:
         total=9800,
         amount_paid=9800,
         parent={"subscription_details": {"subscription": subscription["id"]}},
+        # What paid the invoice; the charge below carries the same PaymentIntent.
+        payments={
+            "object": "list",
+            "data": [
+                {
+                    "id": "inpay_1",
+                    "object": "invoice_payment",
+                    "payment": {"type": "payment_intent", "payment_intent": "pi_1"},
+                }
+            ],
+            "has_more": False,
+        },
     )
     charge = fake.add(
-        "charges", customer=customer["id"], amount=9800, currency="usd", status="succeeded"
+        "charges",
+        customer=customer["id"],
+        payment_intent="pi_1",
+        amount=9800,
+        currency="usd",
+        status="succeeded",
     )
     dispute = fake.add(
         "disputes", charge=charge["id"], amount=9800, currency="usd", reason="fraudulent"
@@ -268,6 +285,34 @@ def test_relationships_become_node_sets():
     assert set(dispute["node_sets"]) == {"dispute:dp_1", "charge:ch_1"}
 
 
+def test_invoice_payments_link_invoices_and_charges():
+    """Charges no longer name their invoice, so both share the PaymentIntent."""
+    invoice = render_invoice(
+        {
+            "id": "in_1",
+            "customer": "cus_1",
+            "payments": {
+                "data": [
+                    {"payment": {"type": "payment_intent", "payment_intent": "pi_1"}},
+                    {"payment": {"type": "charge", "charge": "ch_9"}},
+                ]
+            },
+        },
+        RenderOptions(),
+    )
+    assert {"payment_intent:pi_1", "charge:ch_9"} <= set(invoice["node_sets"])
+    assert "Payment intent: pi_1" in invoice["content"]
+
+    charge = render_charge(
+        {"id": "ch_1", "customer": "cus_1", "payment_intent": "pi_1", "amount": 100},
+        RenderOptions(),
+    )
+    assert "payment_intent:pi_1" in charge["node_sets"]
+    # Charges from before API version 2025-03-31 name their invoice directly.
+    legacy = render_charge({"id": "ch_2", "invoice": "in_1", "amount": 100}, RenderOptions())
+    assert "invoice:in_1" in legacy["node_sets"]
+
+
 def test_rows_carry_the_document_shape():
     fake = FakeStripe()
     _billing(fake)
@@ -296,6 +341,11 @@ def test_first_run_lists_every_selected_type():
     assert _ids(rows) == {obj["id"] for obj in objects.values()}
     assert {table for table, _row in rows} == {f"stripe_{name}" for name in ALL}
     assert fake.paths() == [f"/v1/{name}" for name in ALL]
+    rows_by_id = {row["id"]: row for _table, row in rows}
+    invoice_sets = rows_by_id[objects["invoice"]["id"]]["cognee_node_set"]
+    charge_sets = rows_by_id[objects["charge"]["id"]]["cognee_node_set"]
+    assert "payment_intent:pi_1" in invoice_sets
+    assert "payment_intent:pi_1" in charge_sets
     assert state["known"]["customers"] == [objects["customer"]["id"]]
     assert state["cursor"] == fake.clock + 3600
 
@@ -313,6 +363,9 @@ def test_requests_use_connect_and_a_pinned_api_version():
         if path == "/v1/subscriptions":
             # Canceled subscriptions are only listed with status=all.
             assert query["status"] == "all"
+        if path == "/v1/invoices":
+            # Payments (how an invoice names its charge) are left out unless expanded.
+            assert query["expand[0]"] == "data.payments"
 
 
 def test_listing_pages_through_everything():
@@ -381,6 +434,13 @@ def test_edits_are_read_back_from_events():
             f"/v1/invoices/{objects['invoice']['id']}",
         ]
     )
+    [invoice_query] = [
+        query for _m, path, query, _h in fake.requests if path.startswith("/v1/invoices/")
+    ]
+    assert invoice_query["expand[0]"] == "payments"
+    # The re-read invoice still names its payment, so its link to the charge survives.
+    invoice_row = next(row for _table, row in rows if row["id"] == objects["invoice"]["id"])
+    assert "payment_intent:pi_1" in invoice_row["cognee_node_set"]
 
 
 def test_new_objects_arrive_through_events():

@@ -13,6 +13,10 @@ It mirrors the Stripe behaviour the connector relies on:
   ``status=all``;
 * every change writes an event whose ``data.object`` is the object as it
   was; events older than the retention window are gone;
+* an invoice's ``payments`` (the PaymentIntent or charge that paid it, which
+  is how invoices and charges are tied together since API version 2025-03-31)
+  are only returned when the request expands them, and charges carry no
+  ``invoice`` field;
 * a deleted customer stays retrievable as a ``deleted: true`` stub, a deleted
   product or draft invoice answers 404, and a canceled subscription stays
   listed with ``status=all``.
@@ -121,7 +125,12 @@ class FakeStripe(BaseAdapter):
                 "type": event_type,
                 "created": created or self.clock,
                 "livemode": False,
-                "data": {"object": json.loads(json.dumps(obj))},
+                # Events carry the object unexpanded, as Stripe sends it.
+                "data": {
+                    "object": {
+                        k: v for k, v in json.loads(json.dumps(obj)).items() if k != "payments"
+                    }
+                },
             }
         )
 
@@ -164,7 +173,7 @@ class FakeStripe(BaseAdapter):
         if resource not in self.objects:
             return _response(request, 404, _error("invalid_request_error", "Unrecognized URL."))
         if len(parts) == 3:
-            return self._retrieve(request, resource, parts[2])
+            return self._retrieve(request, resource, parts[2], query)
         objects = list(self.objects[resource].values())
         if resource == "subscriptions" and query.get("status") != "all":
             objects = [obj for obj in objects if obj.get("status") != "canceled"]
@@ -173,10 +182,10 @@ class FakeStripe(BaseAdapter):
     def close(self):
         pass
 
-    def _retrieve(self, request, resource: str, object_id: str):
+    def _retrieve(self, request, resource: str, object_id: str, query: dict):
         obj = self.objects[resource].get(object_id)
         if obj is not None:
-            return _response(request, 200, obj)
+            return _response(request, 200, _expanded(obj, query))
         if resource == "customers" and object_id in self.deleted_customers:
             return _response(request, 200, {"id": object_id, "object": "customer", "deleted": True})
         message = f"No such {resource}: '{object_id}'"
@@ -196,8 +205,14 @@ class FakeStripe(BaseAdapter):
             "object": "list",
             "url": path,
             "has_more": len(objects) > limit,
-            "data": objects[:limit],
+            "data": [_expanded(obj, query) for obj in objects[:limit]],
         }
+
+
+def _expanded(obj: dict, query: dict) -> dict:
+    """The object as Stripe returns it: ``payments`` only when it is expanded."""
+    expanded = any(key.startswith("expand") and "payments" in value for key, value in query.items())
+    return obj if expanded else {k: v for k, v in obj.items() if k != "payments"}
 
 
 def _error(error_type: str, message: str, code: str | None = None) -> dict:
