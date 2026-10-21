@@ -172,7 +172,9 @@ created more than 7 days inside the window, and forgotten when it answers `null`
 `nodes(ids:)` answers for an order past the window was not observable, so older orders are
 not asked about. The window is measured on the later of Shopify's clock (the `Date` header
 of the run's first answer) and the local one, so neither a local clock that runs behind nor a
-stale `Date` from a caching proxy moves it back; a gap of over a minute is logged. An order's `destroy` event is still honoured, in case
+stale `Date` from a caching proxy moves it back; a gap of over a minute is logged. The times
+that decide forgetting an unreadable item (below) are measured on Shopify's clock alone, so a
+local clock that jumps ahead cannot make a day pass in minutes. An order's `destroy` event is still honoured, in case
 Shopify ever records one.
 
 Forgotten ids are emitted with the `_deleted` hard-delete marker, dlt removes those rows on
@@ -198,13 +200,14 @@ goes on:
   may be hidden from the app, or Shopify may be failing or the token may have lost a scope;
   only the first is a reason to forget it. So the answer counts only when access to that kind
   is shown to work in the same run: another item of the kind was read, or, when nothing else
-  of that kind changed, one unchanged item is read as a check (one request, and only while
-  something is unreadable). If the check answers `403` or `null` too, or there is nothing to
-  check with, nothing counts, a warning says so, and the stats count it as
+  of that kind changed, unchanged items are read as a check, newest first, until one reads
+  (at most three requests, and only while something is unreadable). If all three answer `403`
+  or `null` too, or there is nothing to check with, nothing counts, a warning says so, and the stats count it as
   `failed_permission`; if the check hits a server error, nothing counts either. After three
   counted runs at the same `updatedAt` **and** 24 hours since the first, the document is
   forgotten. A forgotten item is asked again when its `updatedAt` moves, and otherwise once a
-  day (at most 10 per run, after everything else); if it reads again, it comes back.
+  day (every one that is due, after everything else); if it reads again, it comes back. A
+  failed re-ask does not count in `failed`; it is counted as `reask_failed` and logged.
 - **A GraphQL `ACCESS_DENIED`** on any query aborts the run before anything is saved, with an
   error naming the field the app may not read.
 - **A server error or no answer** that outlasts the retries: kept. Three of these in a row on
@@ -234,7 +237,8 @@ listed), `skipped` (unchanged), `failed` (item failures), `deleted`, `kept` (ite
 retry, and missing ids still resolving) and `given_up`, plus `failed_auth`,
 `failed_rate_limit` or `failed_unavailable` when the run stopped early for that reason, and
 `failed_permission` (how many items answered `403` or `null` in a kind where none could be
-read), and `probe_<kind>` when a check request was made.
+read), `probe_<kind>` (the check requests made), and `reask_failed` (forgotten items asked
+again that are still unreadable).
 
 ## Tokens and rate limits
 
@@ -269,6 +273,8 @@ waits 120 seconds at most in all: cognee holds its staging lock during a sync, s
   `nodes(ids:)`. If the token may not read events, the connector logs one warning and relies
   on `nodes(ids:)` alone.
 - An order deleted in its last 7 days inside the window, or after it, is never forgotten.
+- If Shopify's `Date` and the local clock disagree by more than a minute (a skewed host, or a
+  proxy caching `Date`), nothing is forgotten until they agree; the warning says so.
 - Checking orders costs one `nodes(ids:)` request per 250 known orders from the window, each
   run, at 1 cost point per request (measured live): a store with 10,000 orders in 60 days
   makes 40 extra requests and waits for no throttle.
@@ -343,12 +349,15 @@ deletion through events and `nodes()`, ids kept when not confirmed gone and give
 three runs over a day, orders ageing out versus deleted (with or without a destroy event), token
 refresh, the token never reaching state, logs or an error message, items kept and retried,
 three unreadable items not blocking a run, `403`/`null` counted only when access is shown to
-work, with a check request in steady state, nothing forgotten in a partial outage, within a
-day, after a lost scope, or in a run that counted nothing, given-up items asked again after a
-day, runs that stopped early counting nothing, state from round 2, retries going last, and
+work, with check requests in steady state (moving past a hidden one, at most three, stopping
+at a server error), nothing forgotten in a partial outage, within a day, after a lost scope, in
+a run that counted nothing, after a local clock jump or while the clocks disagree, times
+stored in the future brought back, given-up items asked again after a day (all that are due,
+without counting in `failed`), runs that stopped early counting nothing, state from round 2, retries going last, and
 the clean stops (`401` mid-run, throttle, long `Retry-After`, the run's wait budget, outage)
 with what the next run picks up, the run clock taking the later of Shopify's and the local
-one, and the token cut out of an echoed error. A real `dlt` pipeline into a temp sqlite destination checks edits and deletes
+one, and the token cut out of an echoed error (before the message is shortened, in any
+case). A real `dlt` pipeline into a temp sqlite destination checks edits and deletes
 across runs (the deleted row is gone from the table), two sources in one dataset staying
 apart, a `401` mid-run resuming on the next run, and `check_active` stopping a run with
 nothing loaded.

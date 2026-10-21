@@ -1187,8 +1187,9 @@ def test_an_item_counted_earlier_is_not_given_up_in_a_run_that_did_not_count_it(
     assert state["unreadable"]["product:2"]["runs"] == 3
 
     store.queue("Product", _Resp(403, {"errors": "Forbidden"}), when=_on(2))
-    if check == "refused":
-        store.queue("Product", _Resp(403, {"errors": "Forbidden"}), when=_on(3))
+    if check == "refused":  # every check: products 3 and 1
+        for n in (3, 1):
+            store.queue("Product", _Resp(403, {"errors": "Forbidden"}), when=_on(n))
     else:
         _fail(store, "Product", 3)
     stats = {}
@@ -1215,7 +1216,8 @@ def test_a_given_up_product_is_asked_again_after_a_day(store):
     stats = {}
     rows = run_sync(store, state, now=hours(60), stats=stats)
     assert store.fetched("Product") == [2] and rows == []
-    assert stats["failed"] == 1 and stats["kept"] == 0
+    # Its document is already gone: no failure of the run, but counted and named.
+    assert stats["failed"] == 0 and stats["reask_failed"] == 1 and stats["kept"] == 0
     assert state["given_up"]["product:2"]["at"] == hours(60)
     assert state["retry"] == [] and state["unreadable"] == {}
 
@@ -1226,26 +1228,26 @@ def test_a_given_up_product_is_asked_again_after_a_day(store):
     assert tombstones(run_sync(store, state, now=hours(85))) == []
 
 
-def test_given_up_items_are_asked_again_a_few_per_run_oldest_first(store, monkeypatch):
-    monkeypatch.setattr(shopify, "_MAX_REASKS", 1)
+def test_every_given_up_item_that_is_due_is_asked_again_in_one_run(store):
+    for n in range(4, 27):
+        store.add_product(n)
     state = {}
     run_sync(store, state)
-    # Products 2 and 3 were forgotten two and three days ago.
-    state["given_up"] = {
-        "product:2": {"stamp": DAY1, "at": hours(-48)},
-        "product:3": {"stamp": DAY1, "at": hours(-72)},
-    }
+    # Products 2 to 26 were forgotten two days ago (or by an older version, which
+    # wrote a bare stamp); all of them read again.
+    state["given_up"] = {f"product:{n}": {"stamp": DAY1, "at": hours(-48)} for n in range(2, 26)}
+    state["given_up"]["product:26"] = DAY1
     state["known_ids"] = [r for r in state["known_ids"] if r not in state["given_up"]]
     for row_id in state["given_up"]:
         del state["stamps"][row_id]
-    store.add_product(4, updated_at=at(6))
+    store.add_product(30, updated_at=at(6))
 
     rows = run_sync(store, state)
 
     order = [int(v["id"].rsplit("/", 1)[1]) for v in store.ops("Product")]
-    assert order == [4, 3]  # new products first, then the oldest forgotten one
-    assert set(docs(rows, "product:")) == {"product:3", "product:4"}
-    assert list(state["given_up"]) == ["product:2"]
+    assert order[0] == 30 and sorted(order[1:]) == list(range(2, 27))  # new ones first
+    assert set(docs(rows, "product:")) == {f"product:{n}" for n in (*range(2, 27), 30)}
+    assert state["given_up"] == {}
 
 
 def test_a_run_that_stops_early_counts_nothing_toward_giving_up(store):
@@ -1965,15 +1967,20 @@ def test_throttle_waits_count_against_the_budget(fake, sleeps):
     assert excinfo.value.rate_limited and client.out_of_time and sleeps == []
 
 
-def test_the_run_clock_is_the_later_of_shopifys_and_the_local_one(fake, monkeypatch, caplog):
+def test_the_order_window_ends_at_the_later_of_shopifys_and_the_local_clock(
+    fake, monkeypatch, caplog
+):
     local = shopify.datetime.fromisoformat(NOW)
     monkeypatch.setattr(shopify, "_local_now", lambda: local)
     client = client_for(fake)
     client.server_now = local - timedelta(days=1)  # a stale Date from a caching proxy
-    assert shopify._run_clock(client) == local
+    assert shopify._run_clocks(client) == (local, local - timedelta(days=1), False)
     assert "differ by 86400s" in caplog.text
     client.server_now = local + timedelta(minutes=5)  # a local clock that runs behind
-    assert shopify._run_clock(client) == local + timedelta(minutes=5)
+    later = local + timedelta(minutes=5)
+    assert shopify._run_clocks(client) == (later, later, False)
+    client.server_now = local + timedelta(seconds=30)  # within the tolerance
+    assert shopify._run_clocks(client) == (client.server_now, client.server_now, True)
 
 
 def test_server_time_reads_an_unknown_zone_as_utc():
@@ -2036,3 +2043,212 @@ def test_sync_stats_count_what_a_run_did(store, tmp_path):
     }
     store.destroy("Product", 3)
     assert run()["deleted"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Review round 4: clocks, checks, re-asks, redaction
+# ---------------------------------------------------------------------------
+def _edited_and_hidden(store, n=2):
+    """Product ``n`` was edited and answers 403 on its next fetch."""
+    store.products[gid("Product", n)]["updatedAt"] = at(5)
+    store.queue("Product", _Resp(403, {"errors": "Forbidden"}), when=_on(n))
+
+
+def _sync_on_clocks(store, state, monkeypatch, shop_now, local_now, **kwargs):
+    """A run as shopify_source makes it, with Shopify's Date and the local clock set apart."""
+    store.clock = shop_now
+    local = shopify.datetime.fromisoformat(local_now)
+    monkeypatch.setattr(shopify, "_local_now", lambda: local)
+    store.calls.clear()
+    return list(sync_store(client_for(store), state, **kwargs))
+
+
+def test_a_local_clock_jumping_ahead_forgets_nothing(store, monkeypatch, caplog):
+    # Three counted runs within three real minutes; on the third the local clock
+    # is 25 hours ahead (an NTP step, a resumed VM).
+    state = {}
+    run_sync(store, state)
+    for minute, ahead in ((1, 0), (2, 0), (3, 25)):
+        _edited_and_hidden(store)
+        stats = {}
+        rows = _sync_on_clocks(
+            store, state, monkeypatch, hours(0, minute), hours(ahead, minute), stats=stats
+        )
+
+    assert tombstones(rows) == [] and stats["given_up"] == 0 and state["given_up"] == {}
+    assert state["unreadable"]["product:2"]["runs"] == 3
+    assert "no item is forgotten in this run" in caplog.text
+
+
+def test_the_give_up_times_are_read_on_shopifys_clock(store, monkeypatch):
+    # The first counted run has a local clock 25 hours ahead: the 24 hours still
+    # start at Shopify's time, not the local one.
+    state = {}
+    run_sync(store, state)
+    _edited_and_hidden(store)
+
+    _sync_on_clocks(store, state, monkeypatch, hours(1), hours(26))
+
+    assert state["unreadable"]["product:2"]["since"] == hours(1)
+
+
+def test_without_a_date_header_the_give_up_times_are_local(store, monkeypatch):
+    state = {}
+    run_sync(store, state)
+    _edited_and_hidden(store)
+
+    _sync_on_clocks(store, state, monkeypatch, None, hours(3))
+
+    assert state["unreadable"]["product:2"]["since"] == hours(3)
+
+
+def test_nothing_is_forgotten_while_the_clocks_disagree(store, monkeypatch):
+    state = {}
+    run_sync(store, state)
+    for run in (1, 2, 3):
+        _edited_and_hidden(store)
+        run_sync(store, state, now=hours(run))
+    assert state["given_up"] == {}  # three runs, but within a day
+
+    # Due by either clock, but they differ by two minutes: counted, not forgotten.
+    _edited_and_hidden(store)
+    rows = _sync_on_clocks(store, state, monkeypatch, hours(48), hours(48, 2))
+    assert tombstones(rows) == [] and state["unreadable"]["product:2"]["runs"] == 4
+
+    # The clocks agree again: it is forgotten.
+    _edited_and_hidden(store)
+    rows = _sync_on_clocks(store, state, monkeypatch, hours(49), hours(49))
+    assert tombstones(rows) == ["product:2"]
+
+
+def test_a_reask_time_in_the_future_is_brought_back_to_now(store, caplog):
+    # A run with a clock 30 days ahead forgot product 2: it is asked a day after
+    # the clock is right again, not 30 days later.
+    state = {}
+    run_sync(store, state)
+    state["given_up"] = {"product:2": {"stamp": DAY1, "at": hours(24 * 30)}}
+    state["known_ids"].remove("product:2")
+    del state["stamps"]["product:2"]
+
+    run_sync(store, state, now=hours(1))
+    assert state["given_up"]["product:2"]["at"] == hours(1)
+    assert "product:2 had at in the future" in caplog.text
+    run_sync(store, state, now=hours(24))
+    assert store.fetched("Product") == []
+    rows = run_sync(store, state, now=hours(25))
+    assert set(docs(rows, "product:")) == {"product:2"} and state["given_up"] == {}
+
+
+def test_a_give_up_start_in_the_future_is_brought_back_to_now(store):
+    state = {}
+    run_sync(store, state)
+    _edited_and_hidden(store)
+    run_sync(store, state, now=hours(1))
+    state["unreadable"]["product:2"] |= {"runs": 2, "since": hours(24 * 30)}
+
+    _edited_and_hidden(store)
+    run_sync(store, state, now=hours(2))
+    assert state["unreadable"]["product:2"] == {"stamp": at(5), "runs": 3, "since": hours(2)}
+    _edited_and_hidden(store)
+    assert tombstones(run_sync(store, state, now=hours(25))) == []  # 23 hours since the reset
+    _edited_and_hidden(store)
+    assert tombstones(run_sync(store, state, now=hours(26))) == ["product:2"]
+
+
+def test_a_hidden_check_product_moves_on_to_the_next_one(store, caplog):
+    # Product 2 was edited and is hidden; product 6, the newest unchanged one, is
+    # hidden too; product 3 reads. Five runs over 48 hours.
+    store.add_product(6)
+    state = {}
+    run_sync(store, state)
+    given_up = 0
+    for run in range(5):
+        _edited_and_hidden(store)
+        store.queue("Product", _Resp(403, {"errors": "Forbidden"}), when=_on(6))
+        stats = {}
+        run_sync(store, state, now=hours(12 * run), stats=stats)
+        assert "failed_permission" not in stats
+        if run == 0:
+            order = [int(v["id"].rsplit("/", 1)[1]) for v in store.ops("Product")]
+            assert order == [2, 6, 3] and stats["probe_product"] == 2
+        given_up += stats["given_up"]
+    assert given_up == 1 and "product:2" in state["given_up"]
+    assert "check the token's permissions" not in caplog.text
+
+
+def test_the_check_tries_three_items_at_most(store, caplog):
+    for n in (4, 5):
+        store.add_product(n)
+    state = {}
+    run_sync(store, state)
+    _edited_and_hidden(store, 5)
+    for n in (4, 3, 2):
+        store.queue("Product", _Resp(403, {"errors": "Forbidden"}), when=_on(n))
+    stats = {}
+
+    run_sync(store, state, now=hours(12), stats=stats)
+
+    order = [int(v["id"].rsplit("/", 1)[1]) for v in store.ops("Product")]
+    assert order == [5, 4, 3, 2]  # product 1 is never tried
+    assert stats["probe_product"] == 3 and stats["failed_permission"] == 1
+    assert state["unreadable"] == {}
+    assert "check the token's permissions" in caplog.text
+
+
+def test_a_check_answering_a_server_error_stops_the_checks(store):
+    store.add_product(4)
+    state = {}
+    run_sync(store, state)
+    _edited_and_hidden(store, 4)
+    store.queue("Product", _Resp(403, {"errors": "Forbidden"}), when=_on(3))
+    _fail(store, "Product", 2)
+    stats = {}
+
+    run_sync(store, state, now=hours(12), stats=stats)
+
+    assert 1 not in store.fetched("Product") and stats["probe_product"] == 2
+    assert "failed_permission" not in stats and state["unreadable"] == {}
+
+
+def test_a_failed_reask_is_no_failure_of_the_run(store, caplog):
+    state = {}
+    run_sync(store, state)
+    state["given_up"] = {"product:2": {"stamp": DAY1, "at": hours(-24)}}
+    state["known_ids"].remove("product:2")
+    del state["stamps"]["product:2"]
+    for day in (0, 1, 2):
+        store.queue("Product", null_answer("product"), when=_on(2))
+        stats = {}
+        rows = run_sync(store, state, now=hours(24 * day), stats=stats)
+        assert docs(rows, "product:") == {}
+        assert stats["failed"] == 0 and stats["reask_failed"] == 1
+    assert "product:2 is still unreadable" in caplog.text
+
+
+def test_a_rate_limit_on_a_reask_still_stops_the_run(store):
+    state = {}
+    run_sync(store, state)
+    state["given_up"] = {"product:2": {"stamp": DAY1, "at": hours(-24)}}
+    store.queue("Product", _Resp(429, {}, {"Retry-After": "61"}), when=_on(2))
+    stats = {}
+
+    run_sync(store, state, stats=stats)
+
+    assert stats["failed_rate_limit"] == 1 and stats["failed"] == 0
+
+
+def test_the_secret_is_cut_out_before_the_detail_is_shortened(store):
+    secret = "shpat_static"
+    echo = {"errors": [{"message": "x" * 295 + secret}]}
+    store.queue("Product", _Resp(200, echo))
+    with pytest.raises(ShopifyAPIError) as excinfo:
+        shopify._graphql(client_for(store), shopify._PRODUCT, {"id": gid("Product", 1)})
+    assert secret[:5] not in excinfo.value.detail
+    assert excinfo.value.detail == "x" * 295 + "[toke"
+    client = _Client(store, SHOP, None, "app-id", CLIENT_SECRET)
+    assert client.redact("y" * 115 + CLIENT_SECRET, 120) == "y" * 115 + "[toke"
+
+
+def test_redact_ignores_case():
+    assert shopify._redact("bad token SHPAT_STATIC", "shpat_static") == "bad token [token]"
+    assert shopify._redact("bad token ABC", "abc") == ""
