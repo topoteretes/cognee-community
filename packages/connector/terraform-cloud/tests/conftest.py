@@ -2,7 +2,10 @@
 
 import pytest
 
-from cognee_community_connector_terraform_cloud.terraform_cloud import TerraformCloudAPIError
+from cognee_community_connector_terraform_cloud.terraform_cloud import (
+    TerraformCloudAPIError,
+    TerraformCloudRateLimitedError,
+)
 
 ORG = "acme"
 _OPERATION_FLAGS = {
@@ -25,6 +28,8 @@ class FakeTerraformCloud:
         self.calls: list[tuple[str, dict]] = []
         self.downloads: list[str] = []
         self.errors: dict[str, int] = {}
+        self.rate_limited: set[str] = set()
+        self.drop_data = False
         self.unordered = False
 
     def add_workspace(self, workspace_id, name, *, tags=(), **attributes):
@@ -133,6 +138,8 @@ class FakeTerraformCloud:
         chunk = items[(number - 1) * size : number * size]
         more = number * size < len(items)
         document = {"data": chunk, "links": {"next": f"page {number + 1}" if more else None}}
+        if self.drop_data:
+            del document["data"]
         if included is not None:
             document["included"] = included
         return document
@@ -140,6 +147,8 @@ class FakeTerraformCloud:
     def get(self, path, params=None):
         params = dict(params or {})
         self.calls.append((path, params))
+        if any(key in path for key in self.rate_limited):
+            raise TerraformCloudRateLimitedError("HCP Terraform rate limit exceeded (HTTP 429)")
         for key, status in self.errors.items():
             if key in path:
                 raise TerraformCloudAPIError(f"HTTP {status}", status=status)
@@ -174,7 +183,7 @@ class FakeTerraformCloud:
                 key=lambda d: d["data"]["attributes"]["created-at"], reverse=not self.unordered
             )
             page = self._page([d["data"] for d in runs], params)
-            ids = {r["id"] for r in page["data"]}
+            ids = {r["id"] for r in page.get("data") or []}
             page["included"] = [i for d in runs if d["data"]["id"] in ids for i in d["included"]]
             return page
         if path.startswith("/runs/"):
@@ -185,6 +194,8 @@ class FakeTerraformCloud:
         raise AssertionError(f"unexpected path {path}")
 
     def download(self, url):
+        if any(key in url for key in self.rate_limited):
+            raise TerraformCloudRateLimitedError("HCP Terraform rate limit exceeded (HTTP 429)")
         self.downloads.append(url)
         return self.logs[url]
 

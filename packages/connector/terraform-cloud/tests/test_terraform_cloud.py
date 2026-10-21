@@ -8,7 +8,7 @@
 """
 
 import json
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from uuid import NAMESPACE_OID, uuid5
 
@@ -18,10 +18,13 @@ from cognee.tasks.ingestion import dlt_utils
 from cognee.tasks.ingestion.resolve_dlt_sources import _build_document_data_item
 from conftest import ORG
 
+from cognee_community_connector_terraform_cloud import terraform_cloud as tfc_module
 from cognee_community_connector_terraform_cloud.terraform_cloud import (
     TerraformCloudAPIError,
     TerraformCloudAuthError,
     TerraformCloudClient,
+    TerraformCloudRateLimitedError,
+    TerraformCloudSourceError,
     _iter_rows,
     _TerraformCloudConfig,
     render_workspace,
@@ -29,7 +32,7 @@ from cognee_community_connector_terraform_cloud.terraform_cloud import (
     terraform_cloud_source,
 )
 
-NOW = datetime(2026, 10, 16, 12, 0, tzinfo=UTC)
+NOW = datetime(2026, 10, 16, 12, 0, tzinfo=timezone.utc)
 AWS_KEY = "AKIA" + "IOSFODNN7EXAMPLE"
 
 TEXT_LOG = (
@@ -69,12 +72,15 @@ def _config(**overrides):
 
 
 def _stats():
-    return {"emitted": 0, "deleted": 0, "pending": 0, "redacted": 0}
+    return {}
 
 
-def _run(tfc, state, stats=None, **overrides):
+def _run(tfc, state, stats=None, check_active=None, **overrides):
     stats = stats if stats is not None else _stats()
-    return list(_iter_rows(tfc, _config(**overrides), state, stats, now=lambda: NOW))
+    rows = _iter_rows(
+        tfc, _config(**overrides), state, stats, now=lambda: NOW, check_active=check_active
+    )
+    return list(rows)
 
 
 def _ids(rows):
@@ -91,7 +97,7 @@ def org(tfc):
 # ---------------------------------------------------------------------------
 # TerraformCloudClient over httpx.MockTransport
 # ---------------------------------------------------------------------------
-def _client(responses):
+def _client(responses, **kwargs):
     queue = list(responses)
     requests, sleeps = [], []
 
@@ -103,8 +109,32 @@ def _client(responses):
         "tok-1",
         http=httpx.Client(transport=httpx.MockTransport(handler)),
         sleep=sleeps.append,
+        **kwargs,
     )
     return client, requests, sleeps
+
+
+@pytest.mark.parametrize("retry_after", ["3600", "1"])
+def test_client_stops_on_a_long_or_endless_429(retry_after):
+    client, requests, sleeps = _client(
+        [httpx.Response(429, headers={"Retry-After": retry_after})], max_sleep=10_000.0
+    )
+    with pytest.raises(TerraformCloudRateLimitedError):
+        client.get(f"/organizations/{ORG}")
+    assert sleeps == ([] if retry_after == "3600" else [1.0] * 5)
+    assert len(requests) == (1 if retry_after == "3600" else 6)
+
+
+def test_client_retry_waits_stop_at_the_budget_until_reset():
+    busy = httpx.Response(503, headers={"Retry-After": "40"})
+    ok = httpx.Response(200, json={"data": []})
+    client, _, sleeps = _client([busy, ok, busy, ok, ok], max_sleep=60.0)
+    client.get("/x")
+    with pytest.raises(TerraformCloudRateLimitedError):
+        client.get("/x")
+    client.reset_sleep_budget()
+    assert client.get("/x") == {"data": []}
+    assert sleeps == [40.0]
 
 
 def test_client_sends_bearer_token_to_the_api_only():
@@ -379,6 +409,104 @@ def test_many_selected_workspaces_are_listed_in_groups(tfc):
     assert [len(group) for group in groups] == [25, 5]
 
 
+def test_answer_without_data_raises_instead_of_forgetting(org):
+    org.add_run("ws-2", "run-1", "2026-10-15T10:00:00.000Z")
+    state = {}
+    _run(org, state)
+    org.drop_data = True
+    with pytest.raises(TerraformCloudAPIError, match="data list"):
+        _run(org, state)
+    assert set(state["workspaces"]) == {"ws-1", "ws-2"}
+
+
+def test_empty_workspace_listing_waits_for_confirmation(org):
+    org.add_run("ws-2", "run-1", "2026-10-15T10:00:00.000Z")
+    state = {}
+    _run(org, state)
+    org.workspaces.clear()
+    assert _run(org, state) == []
+    assert set(state["workspaces"]) == {"ws-1", "ws-2"}
+    assert _ids(_run(org, state)) == ["run:run-1", "workspace:ws-1", "workspace:ws-2"]
+    assert "empty_listing" not in state
+
+
+def test_workspace_name_that_was_never_synced_raises(org):
+    with pytest.raises(TerraformCloudSourceError, match="netwrking-prod"):
+        _run(org, {}, workspace_names=("netwrking-prod",))
+
+
+def test_deleted_selected_workspace_is_forgotten_not_raised(org):
+    org.add_run("ws-1", "run-1", "2026-10-15T10:00:00.000Z")
+    state = {}
+    _run(org, state, workspace_names=("networking-prod", "app-staging"))
+    del org.workspaces["ws-1"]
+    rows = _run(org, state, workspace_names=("networking-prod", "app-staging"))
+    assert _ids(rows) == ["run:run-1", "workspace:ws-1"]
+
+
+def test_rate_limit_stops_cleanly_keeping_finished_runs(org):
+    org.add_run("ws-1", "run-1", _hours_ago(3), plan_log=TEXT_LOG)
+    org.add_run("ws-1", "run-2", _hours_ago(2), plan_log=TEXT_LOG)
+    state = {}
+    org.rate_limited.add("plan-run-1")  # run-2 is listed first, newest first
+    stats = {}
+    rows = _run(org, state, stats=stats)
+    assert "run:run-2" in _ids(rows) and "run:run-1" not in _ids(rows)
+    assert stats["failed"] == 1 and stats["failed_rate_limit"] == 1
+    assert "cursor" not in state
+
+    org.rate_limited.clear()
+    rows = _run(org, state)
+    assert _ids(rows) == ["run:run-1"]
+    assert state["cursor"]
+
+
+def test_budget_pauses_without_failing_and_resumes(org):
+    org.add_run("ws-1", "run-1", _hours_ago(3), plan_log=TEXT_LOG)
+    org.add_run("ws-1", "run-2", _hours_ago(2), plan_log=TEXT_LOG)
+    state = {}
+    stats = {}
+    rows = _run(org, state, stats=stats, max_requests=1)
+    assert [r["id"] for r in rows if r["id"].startswith("run:")] == ["run:run-2"]
+    assert stats["failed_budget"] == 1 and stats["failed"] == 0
+    rows = _run(org, state, max_requests=1)
+    assert [r["id"] for r in rows if r["id"].startswith("run:")] == ["run:run-1"]
+
+
+def test_budget_cut_runs_still_forget_deleted_workspaces(org):
+    org.add_run("ws-2", "run-1", _hours_ago(5))
+    state = {}
+    _run(org, state)
+    del org.workspaces["ws-2"]
+    org.add_run("ws-1", "run-2", _hours_ago(2), plan_log=TEXT_LOG)
+    org.add_run("ws-1", "run-3", _hours_ago(1), plan_log=TEXT_LOG)
+    stats = {}
+    rows = _run(org, state, stats=stats, max_requests=1)
+    assert {"id": "workspace:ws-2", "_deleted": True} in rows
+    assert stats["failed_budget"] == 1
+
+
+def test_each_run_starts_a_new_wait_budget(org):
+    resets = []
+    org.reset_sleep_budget = lambda: resets.append(1)
+    _run(org, {})
+    _run(org, {})
+    assert resets == [1, 1]
+
+
+def test_check_active_runs_before_every_request(org):
+    calls = []
+
+    def check_active():
+        calls.append(len(org.calls))
+        if len(calls) == 3:
+            raise PermissionError("revoked")
+
+    with pytest.raises(PermissionError):
+        _run(org, {}, check_active=check_active)
+    assert calls == [0, 1, 2] and len(org.calls) == 2
+
+
 def test_unknown_organization_and_bad_token_raise(org):
     with pytest.raises(TerraformCloudAPIError, match="not found"):
         _run(org, {}, organization="nope")
@@ -397,13 +525,30 @@ def test_source_declares_document_path_and_scope(tfc):
     assert source.name == "tfc_acme"
 
 
-def test_missing_settings_name_the_env_vars(monkeypatch):
-    for name in ("TFE_ORGANIZATION", "TFE_TOKEN", "TFE_HOSTNAME"):
-        monkeypatch.delenv(name, raising=False)
-    with pytest.raises(ValueError, match="TFE_ORGANIZATION"):
-        terraform_cloud_source()
-    with pytest.raises(ValueError, match="TFE_TOKEN"):
+def test_missing_settings_raise_without_reading_the_environment(monkeypatch):
+    monkeypatch.setenv("TFE_TOKEN", "from-env")
+    with pytest.raises(ValueError, match="organization"):
+        terraform_cloud_source("")
+    with pytest.raises(ValueError, match="token"):
         terraform_cloud_source(ORG)
+
+
+def test_default_resource_name_follows_the_organization(tfc):
+    assert terraform_cloud_source(ORG, service=tfc).name == "terraform_cloud_acme"
+    spaced = terraform_cloud_source("Acme Co", service=tfc).name
+    dashed = terraform_cloud_source("acme-co", service=tfc).name
+    assert spaced.startswith("terraform_cloud_acme_co_") and spaced != dashed
+    eu = terraform_cloud_source(ORG, service=tfc, hostname="app.eu.terraform.io").name
+    assert eu.startswith("terraform_cloud_app_eu_terraform_io_acme_")
+
+
+def test_client_is_built_with_keyword_arguments(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(
+        tfc_module, "TerraformCloudClient", lambda **kwargs: seen.update(kwargs) or "c"
+    )
+    terraform_cloud_source(ORG, token="tok", hostname="tfe.example.com")
+    assert seen == {"token": "tok", "hostname": "tfe.example.com"}
 
 
 # ---------------------------------------------------------------------------
@@ -424,10 +569,10 @@ def _pipeline(dlt, tmp_path):
     )
 
 
-def _staged(pipeline):
+def _staged(pipeline, table="terraform_cloud_acme"):
     with (
         pipeline.sql_client() as client,
-        client.execute_query("SELECT id FROM terraform_cloud") as cursor,
+        client.execute_query(f"SELECT id FROM {table}") as cursor,
     ):
         return {row[0] for row in cursor.fetchall()}
 
@@ -455,6 +600,22 @@ def test_pipeline_resyncs_only_changes_and_forgets_deletions(dlt_mod, tmp_path, 
     del org.workspaces["ws-2"]
     pipeline.run(terraform_cloud_source(ORG, client=org))
     assert _staged(pipeline) == {"workspace:ws-1", "run:run-1"}
+
+
+def test_two_sources_in_one_dataset_leave_each_other_alone(dlt_mod, tmp_path, org, recent):
+    from conftest import FakeTerraformCloud
+
+    other = FakeTerraformCloud()
+    other.add_workspace("ws-9", "billing")
+    pipeline = _pipeline(dlt_mod, tmp_path)
+    pipeline.run(terraform_cloud_source(ORG, service=org, resource_name="tfc_a"))
+    pipeline.run(terraform_cloud_source(ORG, service=other, resource_name="tfc_b"))
+
+    del org.workspaces["ws-2"]
+    pipeline.run(terraform_cloud_source(ORG, service=org, resource_name="tfc_a"))
+    pipeline.run(terraform_cloud_source(ORG, service=other, resource_name="tfc_b"))
+    assert _staged(pipeline, "tfc_a") == {"workspace:ws-1"}
+    assert _staged(pipeline, "tfc_b") == {"workspace:ws-9"}
 
 
 def test_failed_run_keeps_staging_and_cursor(dlt_mod, tmp_path, org, recent):

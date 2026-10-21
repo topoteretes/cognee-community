@@ -40,7 +40,11 @@ async def main() -> None:
         return
 
     # Narrow the sync with workspace_names=[...], workspace_tags=[...] or since_days=...
-    source = terraform_cloud_source()
+    source = terraform_cloud_source(
+        os.environ["TFE_ORGANIZATION"],
+        token=os.environ["TFE_TOKEN"],
+        hostname=os.environ.get("TFE_HOSTNAME") or "app.terraform.io",
+    )
 
     print("Syncing HCP Terraform into cognee ...")
     await cognee.remember(

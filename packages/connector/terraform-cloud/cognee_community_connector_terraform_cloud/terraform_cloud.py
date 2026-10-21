@@ -8,7 +8,7 @@ resource is handed directly to :func:`cognee.remember`::
     from cognee_community_connector_terraform_cloud import terraform_cloud_source
 
     await cognee.remember(
-        terraform_cloud_source(organization="acme"),  # TFE_TOKEN from env
+        terraform_cloud_source(organization="acme", token=token),
         dataset_name="terraform",
         primary_key="id",
         write_disposition="merge",  # REQUIRED, the add pipeline defaults to "replace"
@@ -33,8 +33,12 @@ Design
   in :mod:`.redact` before it is emitted.
 * **Forget-on-delete.** Runs cannot be deleted on their own, so a workspace that
   is deleted, no longer visible or no longer selected is emitted as a hard-delete
-  tombstone together with all of its runs. Any other failure raises, and dlt
-  rolls the state of a failed run back.
+  tombstone together with all of its runs. A workspace listing that comes back
+  empty is confirmed by the next run before anything is forgotten.
+* **A run is bounded.** A long rate limit, a spent retry wait budget or a spent
+  request budget stops the run cleanly, keeps the runs it finished and reports
+  why in ``cognee_sync_stats``. Any other failure raises, and dlt rolls the state
+  of a failed run back.
 
 Privacy
 -------
@@ -46,31 +50,42 @@ ingested.
 
 import hashlib
 import json
-import logging
-import os
 import re
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from cognee.shared.logging_utils import get_logger
 from cognee.tasks.ingestion import dlt_utils
 from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
 
 from cognee_community_connector_terraform_cloud.redact import scrub, strip_ansi
 
-logger = logging.getLogger(__name__)
+logger = get_logger("terraform_cloud_connector")
 
 DEFAULT_HOSTNAME = "app.terraform.io"
+# The first sync reads about one quarter of run history.
 DEFAULT_SINCE_DAYS = 90
+# Total time one run may wait on retries before it stops cleanly.
+DEFAULT_MAX_SLEEP = 300.0
+# Requests per run; bigger organizations finish over several runs.
+DEFAULT_MAX_REQUESTS = 1000
+# Largest page[size] the API accepts.
 _PAGE_SIZE = 100
+# The API usually answers in well under a second; only a stuck connection hits this.
 _TIMEOUT = 30.0
+# Attempts per request; backing off 1, 2, 4, 8 and 16 seconds gives up after about 30,
+# which rides out one window of the 30 per minute limit on run listings.
 _RETRIES = 6
+# Rate limit windows are one minute; a longer Retry-After stops the run.
 _MAX_RETRY_SLEEP = 60.0
 # A margin against runs created in the same second as the cursor.
 _CURSOR_MARGIN = timedelta(minutes=5)
+# Workspace names per run listing, so the filter stays well inside URL length limits.
 _NAMES_PER_REQUEST = 25
+# Planned changes kept per run; the rest is summarized as a count.
 _MAX_CHANGES = 200
 _RUN_INCLUDE = "plan,apply,configuration_version.ingress_attributes"
 _OPERATIONS = "plan_and_apply,save_plan,refresh_only,destroy,empty_apply,action_only"
@@ -99,6 +114,7 @@ _TEXT_CHANGE = re.compile(
 )
 _TEXT_SUMMARY = re.compile(r"^(Plan: .*|No changes\..*|Apply complete!.*)$")
 _TEXT_DIAGNOSTIC = re.compile(r"^(Error|Warning): (.+)$")
+_STATS = ("emitted", "deleted", "pending", "redacted", "failed")
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +128,10 @@ class TerraformCloudAuthError(TerraformCloudSourceError):
     """HCP Terraform rejected the token (HTTP 401)."""
 
 
+class TerraformCloudRateLimitedError(TerraformCloudSourceError):
+    """HCP Terraform kept answering 429, asked for a long wait, or the wait budget is spent."""
+
+
 class TerraformCloudAPIError(TerraformCloudSourceError):
     """HCP Terraform answered with an error, or could not be reached."""
 
@@ -123,13 +143,13 @@ class TerraformCloudAPIError(TerraformCloudSourceError):
 # ---------------------------------------------------------------------------
 # Transport
 # ---------------------------------------------------------------------------
-def _retry_delay(response: Any, attempt: int) -> float:
+def _retry_after(response: Any) -> float | None:
     for header in ("Retry-After", "X-RateLimit-Reset"):
         try:
-            return min(max(float(response.headers.get(header)), 0.0), _MAX_RETRY_SLEEP)
+            return max(float(response.headers.get(header)), 0.0)
         except (TypeError, ValueError):
             continue
-    return min(float(2**attempt), _MAX_RETRY_SLEEP)
+    return None
 
 
 class TerraformCloudClient:
@@ -147,6 +167,7 @@ class TerraformCloudClient:
         *,
         http: Any = None,
         sleep: Callable[[float], None] = time.sleep,
+        max_sleep: float = DEFAULT_MAX_SLEEP,
     ):
         token = (token or "").strip()
         # Reject early and without echoing the value: httpx would put an invalid
@@ -162,36 +183,62 @@ class TerraformCloudClient:
         }
         self._http = http or httpx.Client(timeout=_TIMEOUT)
         self._sleep = sleep
+        self._max_sleep = max_sleep
+        self._slept = 0.0
 
     def __repr__(self) -> str:
         return "TerraformCloudClient(token=<redacted>)"
 
+    def reset_sleep_budget(self) -> None:
+        """Start a new run's retry wait budget."""
+        self._slept = 0.0
+
+    def _wait(self, delay: float) -> None:
+        if self._slept + delay > self._max_sleep:
+            raise TerraformCloudRateLimitedError(
+                "HCP Terraform retries used up the wait budget of this run"
+            )
+        self._slept += delay
+        self._sleep(delay)
+
     def _send(self, url: str, params: dict[str, Any] | None, headers: dict[str, str]) -> Any:
         import httpx
 
-        for attempt in range(_RETRIES):
+        attempt = 0
+        while True:
             last = attempt == _RETRIES - 1
             try:
                 response = self._http.get(url, params=params, headers=headers)
             except httpx.TransportError as exc:
                 if last:
+                    # Not chained: log download URLs are signed, and httpx puts the URL
+                    # into its exception.
                     raise TerraformCloudAPIError(
                         f"HCP Terraform request failed: {type(exc).__name__}"
                     ) from None
-                self._sleep(float(2**attempt))
+                self._wait(float(2**attempt))
+                attempt += 1
                 continue
             status = response.status_code
-            if (status == 429 or status >= 500) and not last:
-                self._sleep(_retry_delay(response, attempt))
-                continue
-            if status == 401:
+            if status == 429:
+                wait = _retry_after(response)
+                if last or (wait is not None and wait > _MAX_RETRY_SLEEP):
+                    raise TerraformCloudRateLimitedError(
+                        "HCP Terraform rate limit exceeded (HTTP 429)"
+                    )
+                self._wait(wait if wait is not None else float(2**attempt))
+            elif status >= 500 and not last:
+                wait = _retry_after(response)
+                self._wait(min(wait if wait is not None else float(2**attempt), _MAX_RETRY_SLEEP))
+            elif status == 401:
                 raise TerraformCloudAuthError("HCP Terraform rejected the token (HTTP 401)")
-            if status != 200:
+            elif status != 200:
                 raise TerraformCloudAPIError(
                     f"HCP Terraform request failed: HTTP {status}", status=status
                 )
-            return response
-        raise TerraformCloudAPIError("HCP Terraform request failed")  # pragma: no cover
+            else:
+                return response
+            attempt += 1
 
     def get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         return self._send(self.api_url + path, params, self._headers).json()
@@ -379,6 +426,7 @@ class _TerraformCloudConfig:
     include_speculative: bool
     include_plan_output: bool
     since_days: int
+    max_requests: int = DEFAULT_MAX_REQUESTS
 
     @property
     def filtered(self) -> bool:
@@ -390,38 +438,16 @@ class _TerraformCloudConfig:
         )
 
 
+class _CutShortError(Exception):
+    """Internal: stop the run here, keeping the runs finished so far."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
 def _utcnow() -> datetime:
-    return datetime.now(UTC)
-
-
-def _pages(client: Any, path: str, params: dict[str, Any]) -> Iterator[dict]:
-    """Yield JSON:API documents page by page."""
-    page = 1
-    while True:
-        document = client.get(path, {**params, "page[number]": page, "page[size]": _PAGE_SIZE})
-        yield document
-        if not (document.get("links") or {}).get("next") or not document.get("data"):
-            return
-        page += 1
-
-
-def _workspaces(client: Any, config: _TerraformCloudConfig) -> dict[str, dict]:
-    params: dict[str, Any] = {}
-    if config.workspace_wildcard:
-        params["search[wildcard-name]"] = config.workspace_wildcard
-    if config.workspace_tags:
-        params["search[tags]"] = ",".join(config.workspace_tags)
-    if config.project_id:
-        params["filter[project][id]"] = config.project_id
-    path = f"/organizations/{config.organization}/workspaces"
-    wanted = set(config.workspace_names)
-    workspaces = {}
-    for document in _pages(client, path, params):
-        for workspace in document.get("data") or []:
-            name = (workspace.get("attributes") or {}).get("name")
-            if not wanted or name in wanted:
-                workspaces[str(workspace["id"])] = workspace
-    return workspaces
+    return datetime.now(timezone.utc)
 
 
 def _related(run: dict, included: dict[tuple[str, str], dict]) -> dict[str, dict]:
@@ -447,43 +473,222 @@ def _workspace_id(run: dict) -> str | None:
     return data.get("id")
 
 
-def _list_runs(
-    client: Any, config: _TerraformCloudConfig, names: list[str], floor: str
-) -> Iterator[tuple[dict, dict[str, dict]]]:
-    """Runs created at or after ``floor``, with their plan, apply and commit."""
-    operations = _OPERATIONS + (",plan_only" if config.include_speculative else "")
-    params: dict[str, Any] = {"include": _RUN_INCLUDE, "filter[operation]": operations}
-    groups = [names[i : i + _NAMES_PER_REQUEST] for i in range(0, len(names), _NAMES_PER_REQUEST)]
-    for group in groups or [None]:
-        if group is not None:
-            params["filter[workspace_names]"] = ",".join(group)
-        previous = None
-        ordered = True
-        for document in _pages(client, f"/organizations/{config.organization}/runs", params):
-            included = _included(document)
-            stop = False
-            for run in document.get("data") or []:
-                created = str((run.get("attributes") or {}).get("created-at") or "")
-                # Stop early only while the API keeps answering newest first.
-                ordered = ordered and (previous is None or created <= previous)
-                previous = created
-                if created < floor:
-                    stop = True
-                    continue
-                yield run, _related(run, included)
-            if stop and ordered:
-                break
+class _Walker:
+    """One run over an organization, writing progress into ``state``."""
 
+    def __init__(
+        self,
+        client: Any,
+        config: _TerraformCloudConfig,
+        state: dict,
+        stats: dict[str, int],
+        check_active: Callable[[], None] | None,
+        now: datetime,
+    ):
+        self.client = client
+        self.config = config
+        self.state = state
+        self.stats = stats
+        self.check_active = check_active
+        self.now = now
+        self.known: dict[str, dict] = state.setdefault("workspaces", {})
+        self.pending: dict[str, str] = state.setdefault("pending", {})
+        self.requests = 0
+        # Set once a run is emitted; the budget never stops a run before that.
+        self.progressed = False
+        # Rows produced so far, in step with the state changes made for them.
+        self.rows: list[dict] = []
 
-def _log_lines(client: Any, related: dict[str, dict], run: dict) -> list[str]:
-    lines = []
-    for name in ("plan", "apply"):
-        attributes = (related.get(name) or {}).get("attributes") or {}
-        url = attributes.get("log-read-url")
-        # The apply log only adds something when the apply itself failed.
-        if url and (name == "plan" or attributes.get("status") == "errored"):
-            lines.extend(summarize_log(client.download(url)))
-    return list(dict.fromkeys(lines))
+    def _call(self, method: Callable[..., Any], *args: Any) -> Any:
+        if self.check_active is not None:
+            self.check_active()
+        if self.progressed and self.requests >= self.config.max_requests:
+            raise _CutShortError("budget")
+        self.requests += 1
+        try:
+            return method(*args)
+        except TerraformCloudRateLimitedError:
+            raise _CutShortError("rate_limit") from None
+
+    def _pages(self, path: str, params: dict[str, Any]) -> Iterator[dict]:
+        """Yield JSON:API documents page by page."""
+        page = 1
+        while True:
+            query = {**params, "page[number]": page, "page[size]": _PAGE_SIZE}
+            document = self._call(self.client.get, path, query)
+            # A 200 without the list must not read as "nothing exists".
+            if not isinstance(document.get("data"), list):
+                raise TerraformCloudAPIError("HCP Terraform answered without a data list")
+            yield document
+            if not (document.get("links") or {}).get("next") or not document["data"]:
+                return
+            page += 1
+
+    # -- workspaces --------------------------------------------------------
+    def _workspaces(self) -> dict[str, dict]:
+        config = self.config
+        params: dict[str, Any] = {}
+        if config.workspace_wildcard:
+            params["search[wildcard-name]"] = config.workspace_wildcard
+        if config.workspace_tags:
+            params["search[tags]"] = ",".join(config.workspace_tags)
+        if config.project_id:
+            params["filter[project][id]"] = config.project_id
+        path = f"/organizations/{config.organization}/workspaces"
+        wanted = set(config.workspace_names)
+        workspaces = {}
+        for document in self._pages(path, params):
+            for workspace in document["data"]:
+                name = (workspace.get("attributes") or {}).get("name")
+                if not wanted or name in wanted:
+                    workspaces[str(workspace["id"])] = workspace
+        found = {(w.get("attributes") or {}).get("name") for w in workspaces.values()}
+        synced = {entry.get("name") for entry in self.known.values()}
+        never = sorted(wanted - found - synced)
+        if never:
+            # Never synced and not in the organization: most likely a typo.
+            raise TerraformCloudSourceError(
+                f"HCP Terraform workspace(s) {', '.join(never)} in workspace_names were not found"
+            )
+        return workspaces
+
+    def _forget_unlisted(self, workspaces: dict[str, dict]) -> None:
+        """Deleted, hidden or deselected workspaces: forget the workspace and its runs.
+        Decided right after the listing, so a run cut short still forgets them."""
+        gone = [wid for wid in self.known if wid not in workspaces]
+        if gone and not workspaces and not self.state.get("empty_listing"):
+            # A workspace listing that is empty as a whole is confirmed by the next run.
+            self.state["empty_listing"] = True
+            logger.warning(
+                "HCP Terraform listed no workspaces although %d were synced before; nothing "
+                "is forgotten until the next run confirms it.",
+                len(gone),
+            )
+            return
+        self.state.pop("empty_listing", None)
+        for wid in gone:
+            entry = self.known.pop(wid)
+            self.rows.extend({"id": f"run:{run_id}", "_deleted": True} for run_id in entry["runs"])
+            self.rows.append({"id": f"workspace:{wid}", "_deleted": True})
+
+    # -- runs --------------------------------------------------------------
+    def _list_runs(self, names: list[str], floor: str) -> Iterator[tuple[dict, dict[str, dict]]]:
+        """Runs created at or after ``floor``, with their plan, apply and commit."""
+        config = self.config
+        operations = _OPERATIONS + (",plan_only" if config.include_speculative else "")
+        params: dict[str, Any] = {"include": _RUN_INCLUDE, "filter[operation]": operations}
+        size = _NAMES_PER_REQUEST
+        groups = [names[i : i + size] for i in range(0, len(names), size)]
+        for group in groups or [None]:
+            if group is not None:
+                params["filter[workspace_names]"] = ",".join(group)
+            previous = None
+            ordered = True
+            for document in self._pages(f"/organizations/{config.organization}/runs", params):
+                included = _included(document)
+                stop = False
+                for run in document["data"]:
+                    created = str((run.get("attributes") or {}).get("created-at") or "")
+                    # Stop early only while the API keeps answering newest first.
+                    ordered = ordered and (previous is None or created <= previous)
+                    previous = created
+                    if created < floor:
+                        stop = True
+                        continue
+                    yield run, _related(run, included)
+                if stop and ordered:
+                    break
+
+    def _log_lines(self, related: dict[str, dict]) -> list[str]:
+        lines = []
+        for name in ("plan", "apply"):
+            attributes = (related.get(name) or {}).get("attributes") or {}
+            url = attributes.get("log-read-url")
+            # The apply log only adds something when the apply itself failed.
+            if url and (name == "plan" or attributes.get("status") == "errored"):
+                lines.extend(summarize_log(self._call(self.client.download, url)))
+        return list(dict.fromkeys(lines))
+
+    def _emit(self, run: dict, related: dict[str, dict], names: dict[str, str]) -> None:
+        config = self.config
+        wid = _workspace_id(run)
+        logs = self._log_lines(related) if config.include_plan_output else []
+        row = render_run(run, names[wid], related, logs, config.organization, config.hostname)
+        self.rows.append(_scrubbed(row, self.stats))
+        self.known[wid]["runs"].append(run["id"])
+        self.pending.pop(run["id"], None)
+        self.progressed = True
+
+    # -- the run -----------------------------------------------------------
+    def walk(self) -> None:
+        """Fill ``self.rows``; the cursor only moves once the whole walk is done."""
+        config = self.config
+        organization, hostname = config.organization, config.hostname
+        try:
+            self._call(self.client.get, f"/organizations/{organization}")
+        except TerraformCloudAPIError as exc:
+            if exc.status == 404:
+                raise TerraformCloudAPIError(
+                    "HCP Terraform organization not found or not visible to this token",
+                    status=404,
+                ) from None
+            raise
+
+        workspaces = self._workspaces()
+        self._forget_unlisted(workspaces)
+        names = {
+            wid: str((w.get("attributes") or {}).get("name") or wid)
+            for wid, w in workspaces.items()
+        }
+        for wid, workspace in workspaces.items():
+            entry = self.known.setdefault(wid, {"hash": None, "runs": []})
+            entry["name"] = names[wid]
+            row = _scrubbed(render_workspace(workspace, organization, hostname), self.stats)
+            if _digest(row) != entry["hash"]:
+                entry["hash"] = _digest(row)
+                self.rows.append(row)
+
+        cursor = self.state.get("cursor")
+        if cursor:
+            moment = datetime.fromisoformat(cursor.replace("Z", "+00:00")) - _CURSOR_MARGIN
+        else:
+            moment = self.now - timedelta(days=config.since_days)
+        floor = moment.isoformat().replace("+00:00", "Z")
+        selected_names = sorted(names.values()) if config.filtered else []
+
+        newest = cursor
+        listed: set[str] = set()
+        for run, related in self._list_runs(selected_names, floor):
+            listed.add(run["id"])
+            wid = _workspace_id(run)
+            created = str((run.get("attributes") or {}).get("created-at") or "")
+            newest = max(newest or created, created)
+            if wid not in workspaces or run["id"] in self.known[wid]["runs"]:
+                continue
+            if (run.get("attributes") or {}).get("status") in _FINAL_STATES:
+                self._emit(run, related, names)
+            else:
+                self.pending[run["id"]] = wid
+
+        # Runs that were still in progress last time and are now below the cursor.
+        for run_id, wid in list(self.pending.items()):
+            if run_id in listed:
+                continue
+            if wid not in workspaces:
+                self.pending.pop(run_id)
+                continue
+            try:
+                document = self._call(self.client.get, f"/runs/{run_id}", {"include": _RUN_INCLUDE})
+            except TerraformCloudAPIError as exc:
+                if exc.status != 404:
+                    raise
+                self.pending.pop(run_id)
+                continue
+            run = document["data"]
+            if (run.get("attributes") or {}).get("status") in _FINAL_STATES:
+                self._emit(run, _related(run, _included(document)), names)
+
+        self.state["cursor"] = newest
 
 
 def _iter_rows(
@@ -493,91 +698,29 @@ def _iter_rows(
     stats: dict[str, int],
     *,
     now: Callable[[], datetime] | None = None,
+    check_active: Callable[[], None] | None = None,
 ) -> Iterator[dict]:
     """Yield changed rows and tombstones. Pure of dlt, so tests drive it with a dict."""
-    organization, hostname = config.organization, config.hostname
+    for key in _STATS:
+        stats.setdefault(key, 0)
+    reset = getattr(client, "reset_sleep_budget", None)
+    if reset is not None:
+        reset()
+    walker = _Walker(client, config, state, stats, check_active, (now or _utcnow)())
     try:
-        client.get(f"/organizations/{organization}")
-    except TerraformCloudAPIError as exc:
-        if exc.status == 404:
-            raise TerraformCloudAPIError(
-                "HCP Terraform organization not found or not visible to this token", status=404
-            ) from None
-        raise
-
-    workspaces = _workspaces(client, config)
-    known: dict[str, dict] = state.setdefault("workspaces", {})
-    pending: dict[str, str] = state.setdefault("pending", {})
-    names = {
-        wid: str((w.get("attributes") or {}).get("name") or wid) for wid, w in workspaces.items()
-    }
-
-    rows: list[dict] = []
-    for wid, workspace in workspaces.items():
-        entry = known.setdefault(wid, {"hash": None, "runs": []})
-        row = _scrubbed(render_workspace(workspace, organization, hostname), stats)
-        if _digest(row) != entry["hash"]:
-            entry["hash"] = _digest(row)
-            rows.append(row)
-
-    cursor = state.get("cursor")
-    if cursor:
-        floor = (datetime.fromisoformat(cursor.replace("Z", "+00:00")) - _CURSOR_MARGIN).isoformat()
-    else:
-        floor = ((now or _utcnow)() - timedelta(days=config.since_days)).isoformat()
-    floor = floor.replace("+00:00", "Z")
-    selected_names = sorted(names.values()) if config.filtered else []
-
-    def emit(run: dict, related: dict[str, dict]) -> None:
-        wid = _workspace_id(run)
-        logs = _log_lines(client, related, run) if config.include_plan_output else []
-        row = render_run(run, names[wid], related, logs, organization, hostname)
-        rows.append(_scrubbed(row, stats))
-        known[wid]["runs"].append(run["id"])
-        pending.pop(run["id"], None)
-
-    newest = cursor
-    listed: set[str] = set()
-    for run, related in _list_runs(client, config, selected_names, floor):
-        listed.add(run["id"])
-        wid = _workspace_id(run)
-        created = str((run.get("attributes") or {}).get("created-at") or "")
-        newest = max(newest or created, created)
-        if wid not in workspaces or run["id"] in known[wid]["runs"]:
-            continue
-        if (run.get("attributes") or {}).get("status") in _FINAL_STATES:
-            emit(run, related)
-        else:
-            pending[run["id"]] = wid
-
-    # Runs that were still in progress last time and are now below the cursor.
-    for run_id, wid in list(pending.items()):
-        if run_id in listed:
-            continue
-        if wid not in workspaces:
-            pending.pop(run_id)
-            continue
-        try:
-            document = client.get(f"/runs/{run_id}", {"include": _RUN_INCLUDE})
-        except TerraformCloudAPIError as exc:
-            if exc.status != 404:
-                raise
-            pending.pop(run_id)
-            continue
-        run = document["data"]
-        if (run.get("attributes") or {}).get("status") in _FINAL_STATES:
-            emit(run, _related(run, _included(document)))
-
-    # Deleted, hidden or deselected workspaces: forget the workspace and its runs.
-    for wid in [wid for wid in known if wid not in workspaces]:
-        entry = known.pop(wid)
-        rows.extend({"id": f"run:{run_id}", "_deleted": True} for run_id in entry["runs"])
-        rows.append({"id": f"workspace:{wid}", "_deleted": True})
-
-    state["cursor"] = newest
+        walker.walk()
+    except _CutShortError as cut:
+        # A spent budget is a planned pause, not a failure; failed_budget says why.
+        if cut.reason != "budget":
+            stats["failed"] = 1
+        stats[f"failed_{cut.reason}"] = 1
+        logger.warning(
+            "HCP Terraform sync stopped early (%s); it resumes on the next run.", cut.reason
+        )
+    rows = walker.rows
     stats["emitted"] = sum(1 for row in rows if not row.get("_deleted"))
     stats["deleted"] = len(rows) - stats["emitted"]
-    stats["pending"] = len(pending)
+    stats["pending"] = len(walker.pending)
     logger.info(
         "HCP Terraform: %d row(s) emitted, %d deleted, %d run(s) in progress.",
         stats["emitted"],
@@ -590,11 +733,20 @@ def _iter_rows(
 # ---------------------------------------------------------------------------
 # Public factory
 # ---------------------------------------------------------------------------
+def _default_resource_name(organization: str, hostname: str) -> str:
+    scope = organization if hostname == DEFAULT_HOSTNAME else f"{hostname}_{organization}"
+    slug = re.sub(r"[^a-z0-9]+", "_", scope.lower()).strip("_")
+    if slug != scope:
+        # Keep names that differ only in case or punctuation apart.
+        slug += "_" + hashlib.sha256(scope.encode()).hexdigest()[:8]
+    return "terraform_cloud_" + slug
+
+
 def terraform_cloud_source(
-    organization: str | None = None,
+    organization: str,
     *,
     token: str | None = None,
-    hostname: str | None = None,
+    hostname: str = DEFAULT_HOSTNAME,
     workspace_names: list[str] | None = None,
     workspace_wildcard: str | None = None,
     workspace_tags: list[str] | None = None,
@@ -602,8 +754,10 @@ def terraform_cloud_source(
     include_speculative: bool = False,
     include_plan_output: bool = True,
     since_days: int = DEFAULT_SINCE_DAYS,
-    resource_name: str = "terraform_cloud",
+    max_requests: int = DEFAULT_MAX_REQUESTS,
+    resource_name: str | None = None,
     check_active: Callable[[], None] | None = None,
+    service: Any = None,
     client: Any = None,
 ):
     """Return a ``dlt`` resource that yields one document per workspace and per run.
@@ -612,11 +766,12 @@ def terraform_cloud_source(
     and ``primary_key="id"``.
 
     Args:
-        organization: Organization name (``TFE_ORGANIZATION``).
-        token: User or team API token (``TFE_TOKEN``). A read-only team token is enough.
+        organization: Organization name.
+        token: User or team API token. A read-only team token is enough.
         hostname: ``app.terraform.io`` (default), ``app.eu.terraform.io`` or a Terraform
-            Enterprise host (``TFE_HOSTNAME``).
-        workspace_names: Exact workspace names to sync.
+            Enterprise host.
+        workspace_names: Exact workspace names to sync. A name that was never synced
+            and is not in the organization raises.
         workspace_wildcard: Name pattern with ``*``, for example ``"*-prod"``.
         workspace_tags: Only workspaces with all of these tags.
         project_id: Only workspaces of this project.
@@ -624,11 +779,16 @@ def terraform_cloud_source(
         include_plan_output: Add the plan summary (resource changes, summary line,
             diagnostics) to each run.
         since_days: How far back the first sync reads runs.
-        resource_name: Staging table name. Use a different one per sync scope
-            that shares a dataset.
-        check_active: Optional host authorization checkpoint, called around each row.
-        client: Pre-built client (see :class:`TerraformCloudClient`). Mainly an
-            injection point for tests and hosts.
+        max_requests: Request budget of one run, checked once a run is emitted. A
+            bigger organization finishes over several runs; a spent budget sets
+            ``failed_budget`` but not ``failed``.
+        resource_name: Staging table name, which scopes this sync's state and
+            cleanup. Defaults to one derived from the organization (and the host,
+            when it is not the default).
+        check_active: Optional host authorization checkpoint, called before each
+            request and around each row.
+        service: Pre-built client (see :class:`TerraformCloudClient`). Mainly an
+            injection point for tests and hosts. ``client`` is accepted as an alias.
 
     Returns:
         A ``dlt`` resource configured with ``primary_key="id"``,
@@ -646,19 +806,18 @@ def terraform_cloud_source(
             "Terraform Cloud sync requires a cognee build with table-scoped DLT document cleanup."
         )
 
-    resolved_org = organization or os.getenv("TFE_ORGANIZATION")
-    if not resolved_org:
-        raise ValueError("organization is required (pass it explicitly or set TFE_ORGANIZATION).")
-    resolved_host = hostname or os.getenv("TFE_HOSTNAME") or DEFAULT_HOSTNAME
-    if client is None:
-        resolved_token = token or os.getenv("TFE_TOKEN")
-        if not resolved_token:
-            raise ValueError("An API token is required (pass token= or set TFE_TOKEN).")
-        client = TerraformCloudClient(resolved_token, resolved_host)
+    if not organization:
+        raise ValueError("organization is required.")
+    service = service or client
+    if service is None:
+        if not token:
+            raise ValueError("An API token is required: pass token=, or a pre-built service.")
+        service = TerraformCloudClient(token=token, hostname=hostname)
+    name = resource_name or _default_resource_name(organization, hostname)
 
     config = _TerraformCloudConfig(
-        organization=resolved_org,
-        hostname=resolved_host,
+        organization=organization,
+        hostname=hostname,
         workspace_names=tuple(workspace_names or ()),
         workspace_wildcard=workspace_wildcard,
         workspace_tags=tuple(workspace_tags or ()),
@@ -666,23 +825,24 @@ def terraform_cloud_source(
         include_speculative=include_speculative,
         include_plan_output=include_plan_output,
         since_days=int(since_days),
+        max_requests=int(max_requests),
     )
     stats: dict[str, int] = {}
 
     @dlt.resource(
-        name=resource_name,
+        name=name,
         primary_key="id",
         write_disposition="merge",
         columns={"_deleted": {"data_type": "bool", "hard_delete": True}},
     )
     def terraform_cloud():
         stats.clear()
-        stats.update(emitted=0, deleted=0, pending=0, redacted=0)
-        rows = _iter_rows(client, config, dlt.current.resource_state(), stats)
+        state = dlt.current.resource_state()
+        rows = _iter_rows(service, config, state, stats, check_active=check_active)
         yield from dlt_utils.guarded_rows(rows, check_active)
 
     resource = terraform_cloud()
     setattr(resource, DOCUMENT_SOURCE_ATTR, "terraform_cloud")
-    setattr(resource, dlt_utils.PIPELINE_SCOPE_ATTR, resource_name)
+    setattr(resource, dlt_utils.PIPELINE_SCOPE_ATTR, name)
     resource.cognee_sync_stats = stats
     return resource

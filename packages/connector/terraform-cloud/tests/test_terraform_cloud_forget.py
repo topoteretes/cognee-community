@@ -5,7 +5,7 @@ API, with the LLM and embeddings mocked, and checks the graph after each sync.
 """
 
 import importlib
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 
 import cognee
 import pytest
@@ -79,7 +79,7 @@ async def clean_environment(tmp_path, monkeypatch):
 
     monkeypatch.setattr(LiteLLMEmbeddingEngine, "embed_text", _mock_embed_text)
 
-    monkeypatch.setattr(module, "_utcnow", lambda: datetime(2026, 10, 16, tzinfo=UTC))
+    monkeypatch.setattr(module, "_utcnow", lambda: datetime(2026, 10, 16, tzinfo=timezone.utc))
 
     await cognee.prune.prune_data()
     await cognee.prune.prune_system(metadata=True)
