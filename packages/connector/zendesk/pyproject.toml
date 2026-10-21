@@ -3,11 +3,12 @@ name = "cognee-community-connector-zendesk"
 version = "0.1.0"
 description = "Zendesk data-source connector for cognee — sync tickets (with comments) and Help Center articles into memory (incremental + forget-on-delete)"
 readme = "README.md"
-requires-python = ">=3.11,<3.14"
+requires-python = ">=3.10,<3.14"
 dependencies = [
-    # 1.6.x: cognee 1.4 skips orphan cleanup when a table's last row is deleted, so the final
-    # deleted record was never forgotten; 1.6 handles the empty table (verified end to end).
-    "cognee==1.6.3",
+    # >=1.6.3: cognee 1.4 skips orphan cleanup when a table's last row is deleted, so the
+    # final deleted record was never forgotten; 1.6 handles the empty table (verified end
+    # to end), and DOCUMENT_SYNC_VERSION 2 scopes document cleanup per table.
+    "cognee>=1.6.3,<2",
     "dlt[sqlalchemy]>=1.9.0,<2",
 ]
 
@@ -27,7 +28,7 @@ packages = ["cognee_community_connector_zendesk"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "N", "B", "UP", "C4", "PGH", "SIM", "RUF"]

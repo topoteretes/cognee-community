@@ -23,6 +23,7 @@ import asyncio
 import os
 
 import cognee
+from cognee.modules.retrieval.exceptions.exceptions import NoDataError
 
 from cognee_community_connector_zendesk import zendesk_source
 
@@ -40,25 +41,26 @@ ZENDESK_REMEMBER_KWARGS = {
 
 
 async def main():
-    if not os.environ.get("ZENDESK_SUBDOMAIN"):
+    subdomain = os.environ.get("ZENDESK_SUBDOMAIN")
+    oauth_token = os.environ.get("ZENDESK_OAUTH_TOKEN")
+    email, api_token = os.environ.get("ZENDESK_EMAIL"), os.environ.get("ZENDESK_API_TOKEN")
+    if not subdomain or not (oauth_token or (email and api_token)):
         print("Set ZENDESK_SUBDOMAIN and credentials first (see the top of this file).")
         return
 
-    result = await cognee.remember(
-        zendesk_source(),
-        dataset_name=DATASET_NAME,
-        **ZENDESK_REMEMBER_KWARGS,
-    )
+    # The connector takes everything as arguments; only this example reads the environment.
+    source = zendesk_source(subdomain, oauth_token=oauth_token, email=email, api_token=api_token)
+    result = await cognee.remember(source, dataset_name=DATASET_NAME, **ZENDESK_REMEMBER_KWARGS)
     print(result)
+    # Counts only, never ticket text.
+    print("sync stats:", source.cognee_sync_stats)
 
     try:
         answers = await cognee.recall(
             "What problems did customers report, and how were they resolved?",
             datasets=[DATASET_NAME],
         )
-    except Exception as error:  # cognee raises NoDataError while the dataset is empty
-        if type(error).__name__ != "NoDataError":
-            raise
+    except NoDataError:  # the dataset is still empty
         print("Nothing to search yet: no tickets or published articles were found.")
         return
     for answer in answers:

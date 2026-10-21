@@ -159,7 +159,11 @@ async def test_deleted_ticket_and_archived_article_leave_the_graph(clean_environ
         assert await _graph_has(token), f"{token} should be in the graph after the first sync"
     before = await _documents()
     survivor = ("zendesk_acme_tickets", "1")
-    assert set(before) == {survivor, ("zendesk_acme_tickets", "2"), ("zendesk_acme_articles", "3")}
+    assert set(before) == {
+        survivor,
+        ("zendesk_acme_tickets", "2"),
+        ("zendesk_acme_articles", "3:en-us"),
+    }
 
     fake.touch(ticket(2, "Discount", status="deleted"))
     fake.articles = []  # archived articles disappear from the listing
