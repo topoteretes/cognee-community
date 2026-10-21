@@ -25,6 +25,7 @@ workspace:
 import base64
 import hashlib
 import re
+from collections import defaultdict
 from collections.abc import Callable, Iterator
 from typing import Any
 from urllib.parse import urlparse
@@ -271,7 +272,15 @@ _MAGIC_LANGUAGES = {
 
 
 def _sync_notebooks(
-    client, roots: list[str], state: dict, stats: dict, failed: set, full_refresh=False
+    client,
+    roots: list[str],
+    state: dict,
+    stats: dict,
+    failed: set,
+    full_refresh=False,
+    links=None,
+    links_complete=True,
+    table_names=(),
 ):
     """Yield a document for every new or changed notebook under ``roots``, and a
     ``_deleted`` row for every notebook that is gone.
@@ -279,6 +288,12 @@ def _sync_notebooks(
     Each root is synced on its own: a root that fails to list keeps its saved
     state and emits nothing, so nothing under it is forgotten, while the other
     roots finish. Roots that failed are added to ``failed``.
+
+    ``links`` maps a notebook's id to the tables lineage says it reads and
+    writes (None when lineage is off). A notebook is exported again when its
+    code changed, or when its lineage changed and every lineage call answered,
+    so a half answered lineage never rewrites a document. ``table_names`` are
+    the synced tables a notebook without lineage is searched for.
     """
     saved = state.setdefault("notebooks", {})
 
@@ -293,7 +308,15 @@ def _sync_notebooks(
             # Collected first, so a root that fails half way emits nothing and
             # its saved state stays as it was.
             documents, updates, gone = _sync_root(
-                client, root, saved, root_stats, full_refresh, claimed
+                client,
+                root,
+                saved,
+                root_stats,
+                full_refresh,
+                claimed,
+                links,
+                links_complete,
+                table_names,
             )
         except DatabricksAuthError:
             raise
@@ -313,7 +336,9 @@ def _sync_notebooks(
         yield from documents
 
 
-def _sync_root(client, root, saved, stats, full_refresh, claimed):
+def _sync_root(
+    client, root, saved, stats, full_refresh, claimed, links, links_complete, table_names
+):
     """List one root, export what changed, and confirm what is gone."""
     listed = {
         object_id: entry
@@ -326,8 +351,12 @@ def _sync_root(client, root, saved, stats, full_refresh, claimed):
     documents, updates = [], {}
     for object_id, entry in sorted(listed.items()):
         before = saved.get(object_id, {})
-        updates[object_id] = {**entry, "root": root}
-        if not full_refresh and before.get("modified_at") == entry["modified_at"]:
+        found = links.get(object_id) if links is not None else None
+        linked = _digest(_notebook_links_text(found)) if found else ""
+        updates[object_id] = {**entry, "root": root, "links": before.get("links", "")}
+        changed = full_refresh or before.get("modified_at") != entry["modified_at"]
+        relinked = links is not None and links_complete and before.get("links", "") != linked
+        if not (changed or relinked):
             # Unchanged, but a move or rename still updates the saved path.
             continue
         try:
@@ -337,7 +366,8 @@ def _sync_root(client, root, saved, stats, full_refresh, claimed):
             # so the next sync sees it gone.
             updates[object_id] = {**before, "root": root} if before else None
             continue
-        text, redacted = _render_notebook(entry, source)
+        text, redacted = _render_notebook(entry, source, found, table_names)
+        updates[object_id]["links"] = linked
         stats["notebooks_changed"] = stats.get("notebooks_changed", 0) + 1
         if redacted:
             stats["redacted"] = stats.get("redacted", 0) + redacted
@@ -409,13 +439,15 @@ def _export(client, path: str) -> str:
 _LANGUAGE_NAMES = {"PYTHON": "Python", "SQL": "SQL", "SCALA": "Scala", "R": "R"}
 
 
-def _render_notebook(entry: dict, source: str) -> tuple[str, int]:
-    """A notebook as text: its name, folder and language, then markdown cells as
-    prose and code cells as code blocks. Returns the text and how many secrets
-    were scrubbed out of it.
+def _render_notebook(entry: dict, source: str, links=None, table_names=()) -> tuple[str, int]:
+    """A notebook as text: its name, folder and language, the tables it reads
+    and writes, then markdown cells as prose and code cells as code blocks.
+    Returns the text and how many secrets were scrubbed out of it.
 
-    Only the exported source is used, never modified times or authors, so an
-    unchanged notebook renders to the same text.
+    The tables come from lineage. A notebook lineage knows nothing about (one
+    that never ran) lists the synced tables its code mentions instead. Only the
+    exported source is used, never modified times or authors, so an unchanged
+    notebook renders to the same text.
     """
     path = entry["path"]
     name = path.rsplit("/", 1)[-1]
@@ -426,6 +458,12 @@ def _render_notebook(entry: dict, source: str) -> tuple[str, int]:
         f"Language: {_LANGUAGE_NAMES.get(language, language.title() or 'unknown')}"
     )
     parts = [header]
+    if links:
+        parts.append(_notebook_links_text(links))
+    else:
+        mentioned = _mentioned_tables(source, table_names)
+        if mentioned:
+            parts.append(f"Mentions tables: {', '.join(mentioned)}")
     for kind, text in _cells(source, _LANGUAGES.get(language, "text")):
         parts.append(text if kind == "markdown" else f"```{kind}\n{text}\n```")
     return _scrub("\n\n".join(parts))
@@ -590,7 +628,15 @@ _TABLE_KINDS = {
 
 
 def _sync_tables(
-    client, scopes: list[str], state: dict, stats: dict, failed: set, full_refresh=False
+    client,
+    scopes: list[str],
+    state: dict,
+    stats: dict,
+    failed: set,
+    full_refresh=False,
+    listings=None,
+    lineage=None,
+    notebook_names=None,
 ):
     """Yield a document for every new or changed table in ``scopes``, and a
     ``_deleted`` row for every table that is gone.
@@ -598,6 +644,12 @@ def _sync_tables(
     Each scope is synced on its own: a scope that fails to list keeps its saved
     state and emits nothing, while the other scopes finish. Scopes that failed
     are added to ``failed``.
+
+    ``listings`` are the scopes as ``_list_scopes`` already read them, and
+    ``lineage`` maps a table's full name to its lineage (None when lineage is
+    off). A table whose lineage could not be read fails its scope, so its
+    document never loses its links for one sync. ``notebook_names`` name the
+    synced notebooks lineage points to.
     """
     saved = state.setdefault("tables", {})
 
@@ -609,8 +661,19 @@ def _sync_tables(
     for scope in scopes:
         scope_stats: dict[str, int] = {}
         try:
+            listing = (listings or {}).get(scope)
+            if isinstance(listing, Exception):
+                raise listing
             documents, updates, gone = _sync_scope(
-                client, scope, saved, scope_stats, full_refresh, claimed
+                client,
+                scope,
+                saved,
+                scope_stats,
+                full_refresh,
+                claimed,
+                listing,
+                lineage,
+                notebook_names or {},
             )
         except DatabricksAuthError:
             raise
@@ -630,9 +693,11 @@ def _sync_tables(
         yield from documents
 
 
-def _sync_scope(client, scope, saved, stats, full_refresh, claimed):
+def _sync_scope(
+    client, scope, saved, stats, full_refresh, claimed, listing, lineage, notebook_names
+):
     """List one scope, render each table, and confirm what is gone."""
-    tables, schema_comments = _list_scope(client, scope)
+    tables, schema_comments = listing or _list_scope(client, scope)
     listed = {i: info for i, info in tables.items() if i not in claimed}
     claimed.update(listed)
     stats["tables"] = stats.get("tables", 0) + len(listed)
@@ -649,8 +714,13 @@ def _sync_scope(client, scope, saved, stats, full_refresh, claimed):
                 if before:
                     updates[table_id] = before
                 continue
+        links = None
+        if lineage is not None:
+            links = lineage.get(info["full_name"])
+            if links is None:
+                raise DatabricksConnectorError("Databricks did not answer a table's lineage.")
         schema = info["full_name"].rsplit(".", 1)[0]
-        text = _render_table(info, keys, schema_comments.get(schema, ""))
+        text = _render_table(info, keys, schema_comments.get(schema, ""), links, notebook_names)
         digest = _digest(text)
         updates[table_id] = {
             "name": info["full_name"],
@@ -744,8 +814,12 @@ def _keys(detail: dict) -> dict:
     return {"primary_key": primary, "foreign_keys": sorted(foreign)}
 
 
-def _render_table(info: dict, keys: dict, schema_comment: str) -> str:
-    """A table as text: its description, owner, columns, keys and view definition.
+def _render_table(
+    info: dict, keys: dict, schema_comment: str, links=None, notebook_names=None
+) -> str:
+    """A table as text: its description, owner, columns, keys, view definition
+    and lineage: the tables it is built from and feeds, and the notebooks that
+    write and read it.
 
     Only what people wrote and the table's shape go in, never row counts,
     statistics or times, so the text changes only when the table's meaning does.
@@ -783,6 +857,17 @@ def _render_table(info: dict, keys: dict, schema_comment: str) -> str:
     if info.get("view_definition"):
         definition, _ = _scrub(info["view_definition"].strip())
         parts.append(f"View definition:\n```sql\n{definition}\n```")
+    if links:
+        lines = []
+        if links["from"]:
+            lines.append(f"Built from: {', '.join(sorted(links['from']))}")
+        if links["feeds"]:
+            lines.append(f"Feeds: {', '.join(sorted(links['feeds']))}")
+        for label, key in (("Written by", "written_by"), ("Read by", "read_by")):
+            if links[key]:
+                lines.append(f"{label}: {_notebook_list(links[key], notebook_names or {})}")
+        if lines:
+            parts.append("Lineage:\n" + "\n".join(lines))
     return "\n\n".join(parts)
 
 
@@ -799,3 +884,159 @@ def _forget_table(table_id: str, saved: dict, stats: dict) -> Iterator[dict]:
     saved.pop(table_id, None)
     stats["tables_deleted"] = stats.get("tables_deleted", 0) + 1
     yield {"id": f"{ID_PREFIX}table:{table_id}", "_deleted": True}
+
+
+# ---------------------------------------------------------------------------
+# Lineage: which notebooks read and write which tables.
+#
+# Unity Catalog records lineage when code runs, and its lineage API answers per
+# table without a warehouse, about two minutes after a run (checked on a Free
+# Edition workspace; the system.access.table_lineage table stayed empty there).
+# For a table, an upstream entry names a table it was built from and the
+# notebooks that wrote it; a downstream entry names a table it feeds, or no
+# table at all for a notebook that only read it. Notebooks are named by their
+# workspace object_id, the same id the folder listing gives.
+# ---------------------------------------------------------------------------
+
+
+def _sync_workspace(
+    client,
+    roots: list[str],
+    scopes: list[str],
+    state: dict,
+    stats: dict,
+    failed: set,
+    full_refresh=False,
+    lineage=True,
+):
+    """Yield notebook and table documents, joined through lineage.
+
+    Tables are listed first and their lineage read, so notebooks can name the
+    tables they touch; table documents are rendered last, so they can name the
+    notebooks. With ``lineage=False`` no lineage is read and notebooks list the
+    synced tables their code mentions.
+    """
+    listings = _list_scopes(client, scopes)
+    names = sorted(
+        {
+            info["full_name"]
+            for listing in listings.values()
+            if not isinstance(listing, Exception)
+            for info in listing[0].values()
+        }
+    )
+    by_table, by_notebook, complete = (
+        _read_lineage(client, names) if lineage else (None, None, True)
+    )
+    yield from _sync_notebooks(
+        client, roots, state, stats, failed, full_refresh, by_notebook, complete, names
+    )
+    notebook_names = {
+        object_id: _notebook_label(notebook["path"])
+        for object_id, notebook in state.get("notebooks", {}).items()
+    }
+    yield from _sync_tables(
+        client, scopes, state, stats, failed, full_refresh, listings, by_table, notebook_names
+    )
+
+
+def _list_scopes(client, scopes: list[str]) -> dict:
+    """Each scope's listing, or the error it failed with (a refused token raises)."""
+    listings = {}
+    for scope in scopes:
+        try:
+            listings[scope] = _list_scope(client, scope)
+        except DatabricksAuthError:
+            raise
+        except DatabricksConnectorError as error:
+            listings[scope] = error
+    return listings
+
+
+def _read_lineage(client, names: list[str]) -> tuple[dict, dict, bool]:
+    """Lineage for each table: by table, by notebook, and whether every call answered."""
+    by_table: dict[str, dict] = {}
+    by_notebook: dict[str, dict] = defaultdict(lambda: {"reads": set(), "writes": set()})
+    complete = True
+    for name in names:
+        try:
+            answer = client.get(
+                "/api/2.0/lineage-tracking/table-lineage",
+                {"table_name": name, "include_entity_lineage": "true"},
+            )
+        except DatabricksAuthError:
+            raise
+        except DatabricksConnectorError:
+            complete = False
+            continue
+        links = {"from": set(), "feeds": set(), "written_by": set(), "read_by": set()}
+        for entry in answer.get("upstreams") or []:
+            table = _lineage_table(entry)
+            if table:
+                links["from"].add(table)
+            for notebook in _lineage_notebooks(entry, client.workspace_id):
+                links["written_by"].add(notebook)
+                by_notebook[notebook]["writes"].add(name)
+                if table:
+                    by_notebook[notebook]["reads"].add(table)
+        for entry in answer.get("downstreams") or []:
+            table = _lineage_table(entry)
+            if table:
+                links["feeds"].add(table)
+            for notebook in _lineage_notebooks(entry, client.workspace_id):
+                links["read_by"].add(notebook)
+                by_notebook[notebook]["reads"].add(name)
+                if table:
+                    by_notebook[notebook]["writes"].add(table)
+        by_table[name] = links
+    return by_table, dict(by_notebook), complete
+
+
+def _lineage_table(entry: dict) -> str | None:
+    info = entry.get("tableInfo") or {}
+    parts = [info.get("catalog_name"), info.get("schema_name"), info.get("name")]
+    return ".".join(parts) if all(parts) else None
+
+
+def _lineage_notebooks(entry: dict, workspace_id) -> list[str]:
+    """The notebooks of one lineage entry, from this workspace only."""
+    return [
+        str(info["notebook_id"])
+        for info in entry.get("notebookInfos") or []
+        if info.get("notebook_id")
+        and (workspace_id is None or str(info.get("workspace_id")) == str(workspace_id))
+    ]
+
+
+def _notebook_links_text(links: dict) -> str:
+    lines = []
+    if links["reads"]:
+        lines.append(f"Reads tables: {', '.join(sorted(links['reads']))}")
+    if links["writes"]:
+        lines.append(f"Writes tables: {', '.join(sorted(links['writes']))}")
+    return "\n".join(lines)
+
+
+def _mentioned_tables(source: str, table_names) -> list[str]:
+    """Synced tables whose full name appears in a notebook's code."""
+    text = source.lower().replace("`", "")
+    return sorted(
+        name
+        for name in table_names
+        if re.search(rf"(?<![\w.]){re.escape(name.lower())}(?![\w])", text)
+    )
+
+
+def _notebook_label(path: str) -> str:
+    folder, _, name = path.rpartition("/")
+    return f"{name} ({_display_path(folder)})"
+
+
+def _notebook_list(ids, names: dict) -> str:
+    """Notebooks by name; those outside the synced folders only as a count."""
+    named = sorted(f"notebook {names[i]}" for i in ids if i in names)
+    outside = sum(1 for i in ids if i not in names)
+    if outside:
+        plural = "s" if outside > 1 else ""
+        named.append(f"{outside} notebook{plural} outside the synced folders")
+    return ", ".join(named)

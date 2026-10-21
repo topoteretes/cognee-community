@@ -10,12 +10,21 @@ Unity Catalog works the same way: a table listing carries columns, comment,
 owner and view definition but no keys, which only the table's detail has; a
 rename keeps the table_id; updated_at moves on metadata changes only; and the
 listing answers {} for an empty schema.
+
+Lineage is recorded per table, like the lineage API answers it: a table's
+upstream entries name the tables it was built from and the notebooks that wrote
+it, its downstream entries the tables it feeds and the notebooks that read it,
+with no table at all for a notebook that only read it. Lineage for a table that
+does not exist is a 403 PERMISSION_DENIED, as on a real workspace.
 """
 
 import base64
 import itertools
 
-from cognee_community_connector_databricks import DatabricksNotFoundError
+from cognee_community_connector_databricks import (
+    DatabricksNotFoundError,
+    DatabricksPermissionError,
+)
 
 UC = "/api/2.1/unity-catalog"
 
@@ -40,6 +49,7 @@ class FakeWorkspace:
         # Unity Catalog: schemas by full name, tables by full name.
         self.schemas: dict[str, dict] = {}
         self.tables: dict[str, dict] = {}
+        self.lineage: dict[str, dict] = {}
 
     # -- building a workspace -------------------------------------------------
     def folder(self, path, kind="DIRECTORY"):
@@ -141,6 +151,39 @@ class FakeWorkspace:
         for name in [t for t in self.tables if t.startswith(f"{full_name}.")]:
             del self.tables[name]
 
+    def ran(self, notebook, reads=(), writes=(), workspace_id=None):
+        """A notebook run: lineage from what it read to what it wrote.
+
+        ``notebook`` is a workspace path, or an object_id for a notebook that is
+        not in the fake (one outside the synced folders).
+        """
+        object_id = self.objects[notebook]["object_id"] if notebook in self.objects else notebook
+        info = {
+            "workspace_id": int(workspace_id or self.workspace_id),
+            "notebook_id": int(object_id),
+            "lineage_timestamp": "2026-10-21 16:18:04.0",
+        }
+        for written in writes:
+            for read in reads:
+                self._lineage(written, "upstreams", read, info)
+                self._lineage(read, "downstreams", written, info)
+        if not writes:
+            for read in reads:
+                self._lineage(read, "downstreams", None, info)
+
+    def _lineage(self, table, direction, other, notebook):
+        entry = {"notebookInfos": [notebook]}
+        if other:
+            catalog, schema, name = other.split(".")
+            entry["tableInfo"] = {
+                "name": name,
+                "catalog_name": catalog,
+                "schema_name": schema,
+                "table_type": "TABLE",
+                "lineage_timestamp": notebook["lineage_timestamp"],
+            }
+        self.lineage.setdefault(table, {}).setdefault(direction, []).append(entry)
+
     # -- the client interface ---------------------------------------------------
     def get(self, path, params=None):
         params = params or {}
@@ -149,6 +192,13 @@ class FakeWorkspace:
         for failing, error in self.failing.items():
             if target == failing or (path.endswith(failing)):
                 raise error
+        if path == "/api/2.0/lineage-tracking/table-lineage":
+            name = params["table_name"]
+            if name not in self.tables:
+                raise DatabricksPermissionError(
+                    "Databricks does not let this user read it (HTTP 403, PERMISSION_DENIED)."
+                )
+            return self.lineage.get(name, {})
         if path.startswith(f"{UC}/tables/"):
             name = path[len(f"{UC}/tables/") :]
             if name not in self.tables:
