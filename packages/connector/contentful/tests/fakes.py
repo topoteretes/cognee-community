@@ -29,6 +29,11 @@ class FakeContentful:
         self.initial_items: list[dict[str, Any]] = []
         self.initial_token = "t1"
         self.models: list[dict[str, Any]] = []
+        self.locales = [
+            {"sys": {"id": "english", "type": "Locale"}, "code": "en-US", "default": True},
+            {"sys": {"id": "german", "type": "Locale"}, "code": "de-DE", "default": False},
+        ]
+        self.locale_page_size = 100
         self.model_passes: list[list[dict[str, Any]]] = []
         self.model_page_size = 100
         self.model_pass_count = 0
@@ -181,6 +186,19 @@ class FakeContentful:
             if overridden is not None:
                 return overridden
         path = request.url.path
+        if path.endswith("/locales"):
+            skip = int(request.url.params.get("skip", "0"))
+            limit = min(int(request.url.params.get("limit", "100")), self.locale_page_size)
+            return httpx.Response(
+                200,
+                json={
+                    "sys": {"type": "Array"},
+                    "items": self.locales[skip : skip + limit],
+                    "total": len(self.locales),
+                    "skip": skip,
+                    "limit": limit,
+                },
+            )
         if path.endswith("/sync"):
             if request.url.params.get("initial") in {"true", "True", "1"}:
                 payload = self.sync_pages.get(

@@ -31,6 +31,8 @@ def _reference(value):
 
 
 def _rich_text(value):
+    if not isinstance(value, dict):
+        raise _invalid("an invalid rich-text node")
     node = value.get("nodeType")
     if not isinstance(node, str):
         raise _invalid("an invalid rich-text node")
@@ -48,19 +50,57 @@ def _rich_text(value):
     ):
         raise _invalid("an invalid rich-text structure")
     rendered = [_rich_text(child) for child in children]
-    if node == "unordered-list":
-        return "\n".join(f"- {child}" for child in rendered)
-    if node == "ordered-list":
-        return "\n".join(f"{index}. {child}" for index, child in enumerate(rendered, 1))
-    if node in ("document", "blockquote", "list-item", "table-cell", "table-header-cell"):
+    if node in ("unordered-list", "ordered-list"):
+        items = []
+        for index, child in enumerate(rendered, 1):
+            marker = "- " if node == "unordered-list" else f"{index}. "
+            lines = child.splitlines() or [""]
+            items.append(
+                marker
+                + lines[0]
+                + "".join("\n" + (" " * len(marker) + line if line else "") for line in lines[1:])
+            )
+        return "\n".join(items)
+    if node == "list-item":
+        body = ""
+        for child, text in zip(children, rendered, strict=True):
+            separator = (
+                "\n" if child.get("nodeType") in ("unordered-list", "ordered-list") else "\n\n"
+            )
+            if text:
+                body += (separator if body else "") + text
+    elif node in ("table-cell", "table-header-cell"):
+        # Keep multi-paragraph cells inside their row in plain-text tables.
+        body = " / ".join(" / ".join(child.splitlines()) for child in rendered if child)
+    elif node in ("document", "blockquote"):
         body = "\n\n".join(child for child in rendered if child)
     elif node == "table":
         body = "\n".join(rendered)
     elif node == "table-row":
         body = " | ".join(rendered)
-    else:
+    elif node in (
+        "paragraph",
+        "heading-1",
+        "heading-2",
+        "heading-3",
+        "heading-4",
+        "heading-5",
+        "heading-6",
+        "hyperlink",
+        "entry-hyperlink",
+        "asset-hyperlink",
+        "resource-hyperlink",
+        "embedded-entry-inline",
+        "embedded-entry-block",
+        "embedded-asset-block",
+        "embedded-resource-inline",
+        "embedded-resource-block",
+        "hr",
+    ):
         # Text and inline nodes inside a paragraph must retain their adjacency.
         body = "".join(rendered)
+    else:
+        raise _invalid("an unsupported rich-text node")
     if node == "hyperlink":
         uri = data.get("uri")
         if not isinstance(uri, str):
@@ -71,7 +111,12 @@ def _rich_text(value):
         if not isinstance(target, dict):
             raise _invalid("an invalid rich-text reference")
         reference = _reference(target)
-        return f"{body} ({reference})" if body else reference
+        result = f"{body} ({reference})" if body else reference
+        return (
+            f" {result} "
+            if node in ("embedded-entry-inline", "embedded-resource-inline")
+            else result
+        )
     return "---" if node == "hr" else body
 
 
@@ -85,9 +130,18 @@ def _value(value):
     system = value.get("sys", {})
     if isinstance(system, dict) and system.get("type") in ("Link", "ResourceLink"):
         return _reference(value)
-    if "nodeType" in value:
-        return _rich_text(value)
     return _json(value)
+
+
+def _field_value(value, field):
+    if field.get("type") != "RichText":
+        return _value(value)
+    try:
+        return _rich_text(value)
+    except (ContentfulResponseError, RecursionError):
+        # Preserve the source value and other entities instead of repeatedly
+        # failing the whole extraction or silently dropping an unknown node.
+        return "[Invalid RichText; preserved JSON]\n" + _json(value)
 
 
 def _localized(fields):
@@ -104,9 +158,18 @@ def _localized(fields):
     return fields
 
 
-def _display_title(fields, display_field, locales, fallback):
+def _field_locales(localized, locales, default_locale):
+    if locales is None:
+        return sorted(localized, key=lambda locale: (locale != default_locale, locale))
+    selected = [locale for locale in locales if locale in localized]
+    # Sync places non-localized values only under the default locale. Preserve
+    # single-locale fields, including assets, without inventing translated labels.
+    return selected or (list(localized) if len(localized) == 1 else [])
+
+
+def _display_title(fields, display_field, locales, fallback, default_locale):
     localized = fields.get(display_field, {})
-    for locale in locales if locales is not None else sorted(localized):
+    for locale in _field_locales(localized, locales, default_locale):
         title = localized.get(locale)
         if isinstance(title, str) and title.strip():
             return title.strip()
@@ -117,7 +180,16 @@ def row_id(space, environment, kind, upstream_id):
     return f"contentful:{space}:{environment}:{kind}:{upstream_id}"
 
 
-def document(item, space, environment, locales, models=None):
+def document(
+    item,
+    space,
+    environment,
+    locales,
+    models=None,
+    *,
+    default_locale=None,
+    host="cdn.contentful.com",
+):
     """Render an entity using the current content-model inventory for its title."""
     if models is not None and not isinstance(models, dict):
         raise _invalid("an invalid content-model inventory")
@@ -135,6 +207,7 @@ def document(item, space, environment, locales, models=None):
     title = upstream_id
     url = ""
     content_type = None
+    field_models = {}
     if kind == "ContentType":
         if not isinstance(item.get("name", ""), str):
             raise _invalid("an invalid model name")
@@ -175,18 +248,20 @@ def document(item, space, environment, locales, models=None):
             display_field = model.get("displayField")
             if display_field is not None and not isinstance(display_field, str):
                 raise _invalid("an invalid display field")
-            title = _display_title(fields, display_field, locales, upstream_id)
+            field_models = {field["id"]: field for field in model.get("fields", [])}
+            title = _display_title(fields, display_field, locales, upstream_id, default_locale)
+            editor = (
+                "app.eu.contentful.com" if host == "cdn.eu.contentful.com" else "app.contentful.com"
+            )
             url = (
-                f"https://app.contentful.com/spaces/{quote(space, safe='')}"
+                f"https://{editor}/spaces/{quote(space, safe='')}"
                 f"/environments/{quote(environment, safe='')}/entries/{quote(upstream_id, safe='')}"
             )
         else:
-            title = _display_title(fields, "title", locales, upstream_id)
+            title = _display_title(fields, "title", locales, upstream_id, default_locale)
         for field_id in sorted(fields):
             localized = fields[field_id]
-            for locale in sorted(localized):
-                if locales is not None and locale not in locales:
-                    continue
+            for locale in _field_locales(localized, locales, default_locale):
                 value = localized[locale]
                 if kind == "Asset" and field_id == "file":
                     if not isinstance(value, dict):
@@ -201,7 +276,8 @@ def document(item, space, environment, locales, models=None):
                         asset_url = "https://" + asset_url[len("http://") :]
                     value["url"] = asset_url
                     url = url or asset_url
-                lines.append(f"\n{field_id} [{locale}]:\n{_value(value)}")
+                rendered_value = _field_value(value, field_models.get(field_id, {}))
+                lines.append(f"\n{field_id} [{locale}]:\n{rendered_value}")
     provenance = [
         "Source: Contentful",
         f"Space: {space}",

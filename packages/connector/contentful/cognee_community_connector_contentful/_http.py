@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import math
 import re
 import time
 from urllib.parse import parse_qsl, urljoin, urlsplit
@@ -58,7 +59,16 @@ class DeliveryClient:
         if self.owned:
             self.client.close()
 
-    def get(self, endpoint, params=None, *, missing=False):
+    def _wait(self, delay):
+        # Keep cancellation responsive even during the longest permitted backoff.
+        while delay > 0:
+            step = min(delay, 0.25)
+            time.sleep(step)
+            delay -= step
+            if self.check_active is not None:
+                self.check_active()
+
+    def get(self, endpoint, params=None, *, missing=False, resume_sync=False):
         for attempt in range(_ATTEMPTS):
             if self.check_active is not None:
                 self.check_active()
@@ -75,7 +85,7 @@ class DeliveryClient:
                     raise ContentfulAPIError(
                         "Contentful request failed after bounded retries."
                     ) from None
-                time.sleep(2**attempt)
+                self._wait(2**attempt)
                 continue
             status = response.status_code
             if status == 429:
@@ -89,10 +99,12 @@ class DeliveryClient:
                     delay = float(reset) if reset is not None else float(2**attempt)
                 except ValueError:
                     delay = float(2**attempt)
+                if not math.isfinite(delay):
+                    delay = float(2**attempt)
                 if not 0 <= delay <= 60:
                     error = ContentfulRateLimitError if status == 429 else ContentfulAPIError
                     raise error("Contentful requested a retry beyond the retry budget.")
-                time.sleep(delay)
+                self._wait(delay)
                 continue
             if missing and status == 404:
                 try:
@@ -103,7 +115,7 @@ class DeliveryClient:
                 if isinstance(system, dict) and system.get("id") == "NotFound":
                     return None
             if status != 200:
-                if endpoint == "sync" and status in (400, 410) and (params or {}).get("sync_token"):
+                if endpoint == "sync" and status in (400, 410) and resume_sync:
                     raise ContentfulSyncTokenError("Contentful rejected the Sync token.")
                 error = ContentfulRateLimitError if status == 429 else ContentfulAPIError
                 raise error(f"Contentful Delivery request failed (HTTP {status}).")
@@ -188,7 +200,9 @@ class DeliveryClient:
             if marker in seen:
                 raise ContentfulResponseError("Contentful repeated a Sync continuation.")
             seen.add(marker)
-            payload = self.get("sync", params)
+            # Page tokens also appear during initial traversal. Only a cycle
+            # resumed from a saved Sync token may recover via a full refresh.
+            payload = self.get("sync", params, resume_sync=bool(token))
             items = self.items(payload)
             for item in items:
                 self.validate_item(item, {"Entry", "Asset", "DeletedEntry", "DeletedAsset"})
@@ -201,6 +215,45 @@ class DeliveryClient:
             yield items, params["sync_token"] if terminal else None
             if terminal:
                 return
+
+    def default_locale(self):
+        """Read the environment's actual default, never infer it from key order."""
+        skip, expected_total = 0, None
+        codes, defaults = set(), []
+        while True:
+            payload = self.get("locales", {"skip": skip, "limit": 100})
+            total, offset, limit = (payload.get(key) for key in ("total", "skip", "limit"))
+            if (
+                any(type(value) is not int for value in (total, offset, limit))
+                or total < 0
+                or offset != skip
+                or not 1 <= limit <= 100
+                or (expected_total is not None and total != expected_total)
+            ):
+                raise ContentfulResponseError("Contentful returned inconsistent locale pagination.")
+            expected_total = total
+            items = self.items(payload)
+            if len(items) != min(limit, max(0, total - skip)):
+                raise ContentfulResponseError("Contentful returned an incomplete locale inventory.")
+            for item in items:
+                self.validate_item(item, {"Locale"})
+                code, default = item.get("code"), item.get("default")
+                if (
+                    not isinstance(code, str)
+                    or not code
+                    or code in codes
+                    or type(default) is not bool
+                ):
+                    raise ContentfulResponseError("Contentful returned invalid locale metadata.")
+                codes.add(code)
+                if default:
+                    defaults.append(code)
+            skip += len(items)
+            if skip >= total:
+                break
+        if len(defaults) != 1:
+            raise ContentfulResponseError("Contentful must identify exactly one default locale.")
+        return defaults[0]
 
     def model_inventory(self):
         previous = None

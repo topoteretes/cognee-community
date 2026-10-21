@@ -3,11 +3,11 @@ name = "cognee-community-connector-contentful"
 version = "0.1.0"
 description = "Contentful data-source connector for Cognee with incremental sync and deletion reconciliation"
 readme = "README.md"
-requires-python = ">=3.10,<3.14"
+requires-python = ">=3.10"
 dependencies = [
     "cognee>=1.6.3,<2",
     "dlt[sqlalchemy]>=1.30,<2",
-    "httpx>=0.28,<0.29",
+    "httpx>=0.28.1",
 ]
 
 [project.urls]

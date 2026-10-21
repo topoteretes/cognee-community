@@ -5,6 +5,8 @@ Run in a separate process for each checkout/version, for example:
 
 Provider pages contain roughly 800-byte body values. This records Python allocation
 peak during extraction plus process maximum RSS; RSS includes imported dependencies.
+tracemalloc excludes native allocations (including SQLite); neither metric includes
+the on-disk spool file's size. The retained membership IDs/state remain O(N).
 It does not measure authenticated provider or destination load performance.
 """
 
@@ -27,6 +29,11 @@ os.environ["RUNTIME__DLTHUB_TELEMETRY"] = "false"
 from cognee_community_connector_contentful import contentful_source
 
 
+def rss_mib(peak, system):
+    """ru_maxrss reports bytes on macOS and KiB on Linux."""
+    return peak / (1024 * 1024 if system == "Darwin" else 1024)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--entries", type=int, default=10000)
@@ -38,6 +45,23 @@ def main():
 
     def handle(request):
         nonlocal sync_requests
+        if request.url.path.endswith("/locales"):
+            return httpx.Response(
+                200,
+                json={
+                    "sys": {"type": "Array"},
+                    "items": [
+                        {
+                            "sys": {"type": "Locale", "id": "english"},
+                            "code": "en-US",
+                            "default": True,
+                        }
+                    ],
+                    "total": 1,
+                    "skip": 0,
+                    "limit": 100,
+                },
+            )
         if request.url.path.endswith("/content_types"):
             return httpx.Response(
                 200,
@@ -130,9 +154,14 @@ def main():
                 "yielded_rows": count,
                 "sync_requests": sync_requests,
                 "first_yield_after_sync_requests": first_yield_after_requests,
-                "python_peak_mib": round(peak / (1024 * 1024), 2),
+                "python_tracemalloc_peak_mib_excluding_native": round(peak / (1024 * 1024), 2),
                 "process_peak_rss_mib": round(
-                    resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024, 2
+                    rss_mib(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss, platform.system()),
+                    2,
+                ),
+                "memory_scope": (
+                    "RSS includes native SQLite and imports; excludes on-disk spool size. "
+                    "Membership IDs/state are O(N)."
                 ),
                 "elapsed_seconds": round(elapsed, 2),
             },

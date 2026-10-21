@@ -153,6 +153,19 @@ def contentful_source(
         emitted = set()
         with transport as delivery, EventSpool() as spool:
             models, hashes = delivery.model_inventory()
+            default_locale = delivery.default_locale()
+
+            def render(item):
+                return document(
+                    item,
+                    space,
+                    environment,
+                    selection["locales"],
+                    models,
+                    default_locale=default_locale,
+                    host=host,
+                )
+
             retained_models = set()
             for model_id in state.get("models", {}):
                 if model_id not in models and selected_type(model_id):
@@ -185,8 +198,9 @@ def contentful_source(
             refresh = (
                 not state
                 or state["selection"] != selection
+                or state.get("default_locale") != default_locale
                 or any(
-                    state["display_fields"].get(key) != value
+                    key in state["display_fields"] and state["display_fields"][key] != value
                     for key, value in display_fields.items()
                 )
             )
@@ -204,9 +218,7 @@ def contentful_source(
                             if not spool.add(item) or item["sys"]["type"].startswith("Deleted"):
                                 continue
                             if selected(item):
-                                row = document(
-                                    item, space, environment, selection["locales"], models
-                                )
+                                row = render(item)
                                 emitted.add(row["id"])
                                 yield {**row, _PRIORITY: priority}
                     break
@@ -229,7 +241,7 @@ def contentful_source(
                 members.add(key)
                 synced.add(key)
                 if count > 1:
-                    row = document(item, space, environment, selection["locales"], models)
+                    row = render(item)
                     yield {**row, _PRIORITY: priority + 1}
             selected_models = {}
             for model_id in sorted(models):
@@ -241,9 +253,7 @@ def contentful_source(
                 if model_id not in retained_models and (
                     refresh or state.get("models", {}).get(model_id) != hashes[model_id]
                 ):
-                    row = document(
-                        models[model_id], space, environment, selection["locales"], models
-                    )
+                    row = render(models[model_id])
                     synced.add(key)
                     yield {**row, _PRIORITY: priority + 1}
             for model_id in state.get("models", {}):
@@ -265,8 +275,11 @@ def contentful_source(
                 members=sorted(members),
                 models=selected_models,
                 display_fields=display_fields,
+                default_locale=default_locale,
             )
-            stats.update(synced=len(synced), deleted=len(pending_deletes))
+            # Provisional rows still need tombstones, but they were never part
+            # of the previous selection and must not inflate reported removals.
+            stats.update(synced=len(synced), deleted=len(pending_deletes & old_members))
 
     result = documents()
     setattr(result, dlt_utils.DOCUMENT_SOURCE_ATTR, "contentful")

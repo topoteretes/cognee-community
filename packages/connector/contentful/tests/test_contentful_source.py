@@ -437,6 +437,7 @@ def test_failed_selection_refresh_preserves_previous_selection(pipeline, fake):
 
 
 def test_locale_selection_retains_structure_links_and_localized_metadata(pipeline, fake):
+    fake.models = [fake.model(fields=[{"id": "body", "type": "RichText"}])]
     rich_text = {
         "nodeType": "document",
         "data": {},
@@ -827,7 +828,7 @@ def test_transient_errors_retry_and_rate_limit_reset_is_honored(
     assert calls == 2
     assert waits and all(0 <= delay <= 60 for delay in waits)
     if status == 429:
-        assert waits[0] == 2
+        assert sum(waits) == 2
 
 
 def test_retries_are_bounded_and_exception_contains_no_response_body(pipeline, fake):
@@ -1210,6 +1211,7 @@ def test_exported_error_types_and_failure_statistics(pipeline, fake, status, err
 def test_display_field_title_locale_order_editor_url_and_plain_rich_text(pipeline, fake):
     model = fake.model()
     model["displayField"] = "headline"
+    model["fields"][1]["type"] = "RichText"
     fake.models = [model]
     fake.initial_items = [
         fake.entry(
@@ -1649,3 +1651,395 @@ def test_streaming_merge_rejects_hints_that_bypass_reconciliation(pipeline, fake
     with pytest.raises(PipelineStepFailed):
         pipeline.run(resource)
     assert fake.requests == []
+
+
+def test_new_empty_model_keeps_delta_and_does_not_reemit_existing_entries(pipeline, fake):
+    fake.models = [fake.model()]
+    fake.initial_items = [fake.entry(str(index), "UNCHANGED") for index in range(500)]
+    _run(pipeline, fake)
+    fake.models.append(fake.model("new_type"))
+    fake.delta("t1", [], "t2")
+    before_requests = len(_sync_requests(fake))
+    resource = _source(fake)
+    rows = []
+    resource.add_map(lambda row: rows.append(row.copy()) or row)
+    pipeline.run(resource).raise_on_failed_jobs()
+    assert [row["id"].rsplit(":", 1)[-1] for row in rows] == ["new_type"]
+    requests = _sync_requests(fake)[before_requests:]
+    assert len(requests) == 1 and requests[0].url.params.get("sync_token") == "t1"
+
+
+def test_only_changed_entry_is_rendered_on_delta(pipeline, fake, monkeypatch):
+    import importlib
+
+    module = importlib.import_module("cognee_community_connector_contentful.contentful")
+    fake.models = [fake.model()]
+    fake.initial_items = [fake.entry("one", "OLD"), fake.entry("two", "UNCHANGED")]
+    table = _run(pipeline, fake)
+    real_document = module.document
+    rendered = []
+
+    def observe(item, *args, **kwargs):
+        rendered.append((item["sys"]["type"], item["sys"]["id"]))
+        return real_document(item, *args, **kwargs)
+
+    monkeypatch.setattr(module, "document", observe)
+    fake.delta("t1", [fake.entry("one", "CHANGED")], "t2")
+    _run(pipeline, fake)
+    assert rendered == [("Entry", "one")]
+    assert "CHANGED" in _text(_rows(pipeline, table))
+
+
+def test_published_then_deleted_between_runs_clears_provisional_row_without_deleted_stat(
+    pipeline, fake
+):
+    table = _run(pipeline, fake)
+    fake.page("t1", [fake.entry("ephemeral", "MUST_DISAPPEAR")], "second")
+    fake.delta("second", [fake.deleted("ephemeral")], "t2")
+    resource = _source(fake)
+    observed = []
+    resource.add_map(lambda row: observed.append(row.copy()) or row)
+    pipeline.run(resource).raise_on_failed_jobs()
+    assert any(row.get("_deleted") for row in observed)
+    assert _rows(pipeline, table) == {}
+    assert resource.cognee_sync_stats["synced"] == 0
+    assert resource.cognee_sync_stats["deleted"] == 0
+
+
+@pytest.mark.parametrize("status", [400, 410])
+def test_recovery_same_id_overrides_partially_streamed_delta(pipeline, fake, status):
+    fake.initial_items = [fake.entry("same", "ORIGINAL")]
+    table = _run(pipeline, fake)
+    fake.page("t1", [fake.entry("same", "PROVISIONAL")], "rejected")
+    fake.initial_items = [fake.entry("same", "AUTHORITATIVE_REFRESH")]
+    fake.initial_token = "recovered"
+    fake.override = lambda request: (
+        httpx.Response(status, json={"sys": {"id": "InvalidQuery"}})
+        if request.url.params.get("sync_token") == "rejected"
+        else None
+    )
+    resource = _source(fake)
+    emitted = []
+    resource.add_map(lambda row: emitted.append(row.copy()) or row)
+    pipeline.run(resource).raise_on_failed_jobs()
+    text = _text(_rows(pipeline, table))
+    assert "AUTHORITATIVE_REFRESH" in text and "PROVISIONAL" not in text
+    priorities = {row["content"]: row["contentful_dlt_priority"] for row in emitted}
+    provisional = next(value for key, value in priorities.items() if "PROVISIONAL" in key)
+    refreshed = next(value for key, value in priorities.items() if "AUTHORITATIVE_REFRESH" in key)
+    assert refreshed > provisional
+
+
+@pytest.mark.parametrize("status", [400, 410])
+def test_initial_sync_continuation_rejection_never_triggers_full_refresh(pipeline, fake, status):
+    from cognee_community_connector_contentful import ContentfulSyncTokenError
+
+    fake.sync_pages["initial"] = {
+        "items": [fake.entry("one", "UNCOMMITTED")],
+        "nextPageUrl": fake.sync_url("broken-initial-page"),
+    }
+    fake.override = lambda request: (
+        httpx.Response(status, json={"sys": {"id": "InvalidQuery"}})
+        if request.url.params.get("sync_token") == "broken-initial-page"
+        else None
+    )
+    with pytest.raises(PipelineStepFailed) as captured:
+        _run(pipeline, fake)
+    assert len(_sync_requests(fake)) == 2
+    error = captured.value
+    while error is not None:
+        assert not isinstance(error, ContentfulSyncTokenError)
+        error = error.__cause__ or error.__context__
+    # The incomplete initial load must not advance state.
+    fake.override = None
+    fake.sync_pages.clear()
+    before = len(_sync_requests(fake))
+    _run(pipeline, fake)
+    assert _sync_requests(fake)[before].url.params.get("initial") == "true"
+
+
+def test_locale_selection_keeps_single_locale_fields_and_asset_file(pipeline, fake):
+    model = fake.model(
+        fields=[
+            {"id": "title", "type": "Symbol", "localized": False},
+            {"id": "body", "type": "Text", "localized": True},
+            {"id": "slug", "type": "Symbol", "localized": False},
+            {"id": "count", "type": "Integer", "localized": False},
+            {"id": "reference", "type": "Link", "localized": False},
+        ]
+    )
+    fake.models = [model]
+    fake.initial_items = [
+        fake.entry(
+            "one",
+            "",
+            fields={
+                "title": {"en-US": "Real Title"},
+                "slug": {"en-US": "real-slug"},
+                "count": {"en-US": 7},
+                "reference": {"en-US": {"sys": {"type": "Link", "linkType": "Entry", "id": "REF"}}},
+                "body": {"de-DE": "Deutsch", "en-US": "English"},
+            },
+        ),
+        fake.asset("image", "ASSET_METADATA"),
+    ]
+    table = _run(pipeline, fake, locales=["de-DE"])
+    rows = _rows(pipeline, table)
+    entry = next(row for row in rows.values() if ":Entry:" in row["id"])
+    asset = next(row for row in rows.values() if ":Asset:" in row["id"])
+    assert entry["title"] == "Real Title"
+    assert (
+        "real-slug" in entry["content"]
+        and "7" in entry["content"]
+        and "Entry: REF" in entry["content"]
+    )
+    assert "body [de-DE]" in entry["content"] and "English" not in entry["content"]
+    assert "slug [en-US]" in entry["content"]
+    assert asset["url"] == "https://images.ctfassets.net/space/image/image.png"
+    assert "image/png" in asset["content"] and "640" in asset["content"]
+
+
+def test_default_locale_precedes_alphabetical_order_and_uses_environment_endpoint(pipeline, fake):
+    fake.models = [fake.model()]
+    fake.locale_page_size = 1
+    fake.initial_items = [
+        fake.entry(
+            "one",
+            "",
+            fields={
+                "title": {"de-DE": "Deutsch", "en-US": "English"},
+            },
+        )
+    ]
+    table = _run(pipeline, fake)
+    row = next(row for row in _rows(pipeline, table).values() if ":Entry:" in row["id"])
+    assert row["title"] == "English"
+    requests = [request for request in fake.requests if request.url.path.endswith("/locales")]
+    assert [request.url.params["skip"] for request in requests] == ["0", "1"]
+    assert all("/environments/master/locales" in request.url.path for request in requests)
+    fake.initial_items[0]["fields"]["title"] = {"en-US": "English", "de-DE": "Deutsch"}
+    other = _run(pipeline, fake, source_id="reordered")
+    assert _rows(pipeline, other) == _rows(pipeline, table)
+
+
+@pytest.mark.parametrize(
+    "value", [{"nodeType": 5}, {"nodeType": "x", "value": "v", "secret": "KEPT"}]
+)
+def test_object_field_with_node_type_is_preserved_json(pipeline, fake, value):
+    fake.models = [fake.model(fields=[{"id": "object", "type": "Object"}])]
+    fake.initial_items = [fake.entry("one", "", fields={"object": {"en-US": value}})]
+    table = _run(pipeline, fake)
+    import json
+
+    assert json.dumps(value, sort_keys=True, separators=(",", ":")) in _text(_rows(pipeline, table))
+
+
+def test_malformed_rich_text_keeps_raw_value_and_other_entities(pipeline, fake):
+    fake.models = [fake.model(fields=[{"id": "body", "type": "RichText"}])]
+    fake.initial_items = [
+        fake.entry("broken", "", fields={"body": {"en-US": {"nodeType": 5, "value": "KEPT"}}}),
+        fake.entry("good", "OTHER_ENTITY"),
+    ]
+    table = _run(pipeline, fake)
+    text = _text(_rows(pipeline, table))
+    assert "KEPT" in text and "OTHER_ENTITY" in text
+    assert "Invalid RichText" in text
+
+
+@pytest.mark.parametrize(
+    "host,editor",
+    [
+        ("cdn.contentful.com", "app.contentful.com"),
+        ("cdn.eu.contentful.com", "app.eu.contentful.com"),
+    ],
+)
+def test_editor_url_matches_contentful_region(pipeline, host, editor):
+    fake = FakeContentful(host=host, environment="staging")
+    fake.initial_items = [fake.entry("one", "CONTENT")]
+    try:
+        table = _run(pipeline, fake)
+        assert next(iter(_rows(pipeline, table).values()))["url"] == (
+            f"https://{editor}/spaces/space/environments/staging/entries/one"
+        )
+    finally:
+        fake.client.close()
+
+
+def _node(kind, *children, **kwargs):
+    return {"nodeType": kind, "content": list(children), "data": {}, **kwargs}
+
+
+def _paragraph(text):
+    return _node("paragraph", _node("text", value=text))
+
+
+def test_rich_text_keeps_inline_spacing_nested_lists_and_multiline_cells(pipeline, fake):
+    fake.models = [fake.model(fields=[{"id": "body", "type": "RichText"}])]
+    rich = _node(
+        "document",
+        _node(
+            "paragraph",
+            _node("text", value="x"),
+            _node(
+                "embedded-entry-inline",
+                data={"target": {"sys": {"type": "Link", "linkType": "Entry", "id": "E6"}}},
+            ),
+            _node("text", value="y"),
+        ),
+        _node(
+            "unordered-list",
+            _node(
+                "list-item",
+                _paragraph("a"),
+                _node("unordered-list", _node("list-item", _paragraph("a1"))),
+            ),
+            _node("list-item", _paragraph("one"), _paragraph("two")),
+        ),
+        _node(
+            "table",
+            _node(
+                "table-row",
+                _node("table-cell", _paragraph("c1"), _paragraph("c1b")),
+                _node("table-cell", _paragraph("c2")),
+            ),
+        ),
+    )
+    fake.initial_items = [fake.entry("one", "", fields={"body": {"en-US": rich}})]
+    table = _run(pipeline, fake)
+    text = _text(_rows(pipeline, table))
+    assert "x Entry: E6 y" in text
+    assert "- a\n  - a1" in text
+    assert "- one\n\n  two" in text
+    assert "c1 / c1b | c2" in text
+
+
+@pytest.mark.parametrize("status", [429, 503, "transport"])
+def test_cancellation_interrupts_retry_backoff_without_next_request(fake, monkeypatch, status):
+    import cognee_community_connector_contentful._http as contentful_http
+    from cognee_community_connector_contentful._http import DeliveryClient
+
+    class CancelledError(RuntimeError):
+        pass
+
+    sleeps = []
+    cancelled = False
+
+    def check_active():
+        if cancelled:
+            raise CancelledError("cancelled during wait")
+
+    def sleep(delay):
+        nonlocal cancelled
+        sleeps.append(delay)
+        cancelled = True
+
+    def override(request):
+        if status == "transport":
+            raise httpx.ConnectError("unavailable", request=request)
+        return httpx.Response(status, headers={"X-Contentful-RateLimit-Reset": "60"})
+
+    fake.override = override
+    monkeypatch.setattr(contentful_http.time, "sleep", sleep)
+    with (
+        DeliveryClient(
+            fake.host, fake.space, fake.environment, "token", fake.client, check_active
+        ) as delivery,
+        pytest.raises(CancelledError),
+    ):
+        delivery.get("sync", {"initial": "true"})
+    assert len(fake.requests) == 1
+    assert sleeps and max(sleeps) <= 0.25
+
+
+@pytest.mark.parametrize("reset", ["nan", "inf", "-inf", "not-a-number"])
+def test_nonfinite_retry_reset_uses_bounded_default(fake, monkeypatch, reset):
+    import cognee_community_connector_contentful._http as contentful_http
+    from cognee_community_connector_contentful._http import DeliveryClient
+
+    sleeps = []
+    fake.override = lambda request: (
+        httpx.Response(429, headers={"X-Contentful-RateLimit-Reset": reset})
+        if len(fake.requests) == 1
+        else None
+    )
+    monkeypatch.setattr(contentful_http.time, "sleep", sleeps.append)
+    with DeliveryClient(fake.host, fake.space, fake.environment, "token", fake.client) as delivery:
+        delivery.get("sync", {"initial": "true"})
+    assert sum(sleeps) == 1.0
+    assert max(sleeps) <= 0.25
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ["no_default", "two_defaults", "duplicate", "missing_page", "changed_total", "wrong_scope"],
+)
+def test_invalid_locale_inventory_preserves_previous_staging_and_checkpoint(pipeline, fake, fault):
+    fake.initial_items = [fake.entry("retained", "RETAINED")]
+    table = _run(pipeline, fake)
+    before = _rows(pipeline, table)
+    fake.locale_page_size = 1
+    if fault == "no_default":
+        fake.locales[0]["default"] = False
+    elif fault == "two_defaults":
+        fake.locales[1]["default"] = True
+    elif fault == "duplicate":
+        fake.locales[1]["code"] = "en-US"
+    elif fault == "wrong_scope":
+        fake.locales[0]["sys"]["environment"] = {"sys": {"id": "other"}}
+    else:
+
+        def override(request):
+            if request.url.path.endswith("/locales") and request.url.params.get("skip") == "1":
+                return httpx.Response(
+                    200,
+                    json={
+                        "items": [] if fault == "missing_page" else [fake.locales[1]],
+                        "skip": 1,
+                        "limit": 1,
+                        "total": 3 if fault == "changed_total" else 2,
+                    },
+                )
+            return None
+
+        fake.override = override
+    requests_before = len(_sync_requests(fake))
+    with pytest.raises(PipelineStepFailed):
+        _run(pipeline, fake)
+    assert _rows(pipeline, table) == before
+    assert len(_sync_requests(fake)) == requests_before
+    fake.override = None
+    fake.locales = [
+        {"sys": {"id": "english", "type": "Locale"}, "code": "en-US", "default": True},
+        {"sys": {"id": "german", "type": "Locale"}, "code": "de-DE", "default": False},
+    ]
+    _run(pipeline, fake)
+    assert _sync_requests(fake)[-1].url.params["sync_token"] == "t1"
+
+
+def test_default_locale_change_refreshes_existing_titles(pipeline, fake):
+    fake.models = [fake.model()]
+    fake.initial_items = [
+        fake.entry(
+            "one",
+            "",
+            fields={
+                "title": {"de-DE": "Deutsch", "en-US": "English"},
+            },
+        )
+    ]
+    table = _run(pipeline, fake)
+    fake.locales[0]["default"] = False
+    fake.locales[1]["default"] = True
+    _run(pipeline, fake)
+    assert _sync_requests(fake)[-1].url.params["initial"] == "true"
+    assert (
+        next(row for row in _rows(pipeline, table).values() if ":Entry:" in row["id"])["title"]
+        == "Deutsch"
+    )
+
+
+@pytest.mark.parametrize("system,raw", [("Darwin", 348 * 1024 * 1024), ("Linux", 348 * 1024)])
+def test_memory_benchmark_rss_units_are_platform_specific(system, raw):
+    from benchmark_contentful_memory import rss_mib
+
+    assert rss_mib(raw, system) == 348
