@@ -224,6 +224,9 @@ _ENV = {
     "warehouse": "SNOWFLAKE_WAREHOUSE",
 }
 
+# The driver keeps retrying a failing login for 120 seconds by default
+# (DEFAULT_AUTH_CLASS_TIMEOUT in snowflake-connector-python); a minute is enough
+# for a slow network, and a wrong host or blocked network fails sooner.
 _LOGIN_TIMEOUT_SECONDS = 60
 
 
@@ -421,6 +424,8 @@ def _translate_error(error: Exception, key_fingerprint: str) -> Exception:
         )
     if "404 Not Found" in message and errno in (250001, 290404):
         # Connector 4.x reports an unknown account as 290404, 5.x as 250001.
+        # 250001 covers every failed connection, so the HTTP status in the
+        # driver's own text tells the wrong account apart.
         return SnowflakeAuthError(
             "Snowflake has no account with this identifier (HTTP 404). It has the form "
             "ORGNAME-ACCOUNTNAME, shown in Snowsight under your name, then Account, then View "
@@ -713,6 +718,8 @@ def _column_type(data_type: Any) -> str:
 
 # Every row is a document that cognee reads with an LLM, so a table is only
 # synced up to this many rows unless the caller raises or removes the cap.
+# 10,000 is not a Snowflake limit: it is our guard, since a first sync of that
+# many rows is already that many LLM passes.
 DEFAULT_MAX_ROWS = 10_000
 
 
@@ -1062,6 +1069,8 @@ class _Session:
         self.conn.close()
 
 
+# Rows taken from the cursor at a time. The driver downloads results in its own
+# chunks; this only bounds how many rows are held at once on a large table.
 _FETCH_BATCH = 1000
 
 

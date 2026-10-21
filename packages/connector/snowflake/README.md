@@ -225,6 +225,13 @@ This connector reads business data. Be clear about what it does:
 - Logs and `cognee_sync_stats` contain counts and the connector's own error messages, never
   row values. The private key and passphrase never appear in a log or an error.
 
+**Who can read it**
+
+- Anyone who can read the cognee dataset can ask about these rows, whatever their own
+  Snowflake grants are. With cognee's access control on (the default), that is the user who
+  ran the sync and anyone the dataset is shared with, so sync into a dataset only the people
+  allowed to see these tables can read.
+
 **How deletion is honoured**
 
 - Deleted rows, rows that leave a filter, and dropped tables are forgotten on the **next
@@ -238,6 +245,8 @@ This connector reads business data. Be clear about what it does:
 - A table without a declared primary key needs `keys=` for its rows to sync; otherwise only
   its description is synced.
 - Views are not synced yet.
+- A schema with more than 10,000 tables cannot be listed: Snowflake's `SHOW TABLES` returns an
+  error above 10,000 rows. Its tables fail with that error and nothing is forgotten.
 - Comment changes alone (`COMMENT ON ...`) do not move the last change time; the table
   description is still re-sent on every sync, and cognee only reprocesses it when its text
   changed.
