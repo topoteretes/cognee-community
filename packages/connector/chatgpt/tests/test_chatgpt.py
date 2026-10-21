@@ -1,17 +1,23 @@
 """Unit tests for the ChatGPT export dlt connector.
 
-Two layers, all runnable without a real ChatGPT export:
+Three layers:
 
 * Pure-function tests for conversation-tree reconstruction, message
   filtering, content rendering, and export-file discovery (zip/folder,
-  nested paths, split files).
+  nested paths, split files) -- all runnable without a real export.
 * dlt-pipeline tests (temp sqlite destination) covering the acceptance
-  criteria: an edited conversation is reflected on resync, and a
-  conversation missing from a later export drops out of the full-snapshot
-  load (forget-on-delete).
+  criteria: an edited conversation is reflected on resync, a conversation
+  missing from a later export drops out of the full-snapshot load
+  (forget-on-delete), and the stale-export guard -- also runnable without a
+  real export (synthetic fixtures).
+* One opt-in structural smoke test against a REAL export (see
+  test_real_export_parses_without_error below): skipped unless
+  CHATGPT_REAL_EXPORT_PATH points at one, so it never runs in CI and never
+  needs anyone's personal data checked into this repo.
 """
 
 import json
+import os
 import zipfile
 
 import pytest
@@ -23,6 +29,7 @@ from cognee_community_connector_chatgpt.chatgpt import (
     _conversation_to_row,
     _is_hidden,
     _iter_raw_conversations,
+    _last_activity,
     _linear_messages,
     _render_content,
     chatgpt_source,
@@ -225,10 +232,68 @@ def test_conversation_to_row_with_no_keepable_content_is_none():
     assert _conversation_to_row(conv, "c1") is None
 
 
-def test_conversation_to_row_includes_project_label():
+def test_conversation_to_row_labels_custom_gpt():
     conv = _linear_conversation("c1", "Alpha", [("user", "hi")], gizmo_id="g-123")
     row = _conversation_to_row(conv, "c1")
-    assert "Project: g-123" in row["content"]
+    assert "Custom GPT: g-123" in row["content"]
+
+
+def test_conversation_to_row_labels_project_and_custom_gpt_together():
+    conv = _linear_conversation(
+        "c1",
+        "Alpha",
+        [("user", "hi")],
+        conversation_template_id="g-p-abc",
+        gizmo_id="g-xyz",
+    )
+    header = _conversation_to_row(conv, "c1")["content"].split("\n\n")[0]
+    assert header.splitlines() == ["# Alpha", "Project: g-p-abc", "Custom GPT: g-xyz"]
+
+
+def test_conversation_to_row_same_project_id_not_repeated():
+    conv = _linear_conversation(
+        "c1", "Alpha", [("user", "hi")], conversation_template_id="g-p-abc", gizmo_id="g-p-abc"
+    )
+    assert _conversation_to_row(conv, "c1")["content"].count("g-p-abc") == 1
+
+
+def test_custom_instructions_are_rendered():
+    message = {
+        "id": "sys",
+        "author": {"role": "system"},
+        "recipient": "all",
+        "content": {
+            "content_type": "user_editable_context",
+            "user_profile": "I am a CS student.",
+            "user_instructions": "Answer briefly.",
+        },
+        "metadata": {"is_user_system_message": True},
+    }
+    conv = _linear_conversation("c1", "Alpha", [("user", "hi")])
+    conv["mapping"]["sys"] = _node("sys", None, message)
+    conv["mapping"]["root"]["parent"] = "sys"
+    content = _conversation_to_row(conv, "c1")["content"]
+    assert "Custom instructions: I am a CS student.\nAnswer briefly." in content
+    assert content.index("Custom instructions") < content.index("User: hi")
+
+
+def test_voice_transcription_is_kept_audio_bytes_are_not():
+    content = {
+        "content_type": "multimodal_text",
+        "parts": [
+            {"content_type": "audio_transcription", "text": "what is a heap", "direction": "in"},
+            {"content_type": "audio_asset_pointer", "asset_pointer": "sediment://file_1"},
+        ],
+    }
+    assert _render_content(content) == "what is a heap"
+
+
+def test_last_activity_falls_back_to_newest_timestamp():
+    conv = _linear_conversation("c1", "Alpha", [("user", "hi")], create_time=10.0)
+    conv["mapping"]["n0"]["message"]["create_time"] = 42.0
+    assert _last_activity(conv) == 42.0
+    assert _last_activity({**conv, "update_time": 7.0}) == 7.0
+    assert _last_activity({"mapping": {}}) is None
 
 
 def test_conversation_to_row_edited_branch_excluded_from_text():
@@ -370,19 +435,20 @@ def _run_sync(dlt, tmp_path, export_dir, run_id, **source_kwargs):
     return pipeline
 
 
-def _run_sync_persistent(dlt, tmp_path, export_dir, **source_kwargs):
+def _run_sync_persistent(dlt, tmp_path, export_dir, dataset_name="chatgpt_ds", **source_kwargs):
     """Like _run_sync, but reuses one pipelines_dir across every call made
     with the same tmp_path -- simulating dlt's real default behaviour
     (persisted under ~/.dlt/pipelines/, shared across separate process runs
     of cognee.remember()), which the stale-export guard's per-account state
     depends on. The plain _run_sync helper deliberately isolates each call
     into its own pipelines_dir, which is correct for testing replace/delete
-    at the destination-table level but would hide any source-state bug."""
-    db_path = (tmp_path / "chatgpt.db").as_posix()
+    at the destination-table level but would hide any source-state bug.
+    Like cognee, each dataset gets its own database file under one pipeline name."""
+    db_path = (tmp_path / f"dlt_database_{dataset_name}.db").as_posix()
     pipeline = dlt.pipeline(
         pipeline_name="chatgpt_test",
         destination=dlt.destinations.sqlalchemy(f"sqlite:///{db_path}"),
-        dataset_name="chatgpt_ds",
+        dataset_name=dataset_name,
         pipelines_dir=str(tmp_path / "state"),
     )
     pipeline.run(chatgpt_source(str(export_dir), **source_kwargs))
@@ -552,6 +618,47 @@ def test_stale_export_blocks_sync_and_raises(dlt_mod, tmp_path):
     assert "c1" in str(stale)
 
 
+def test_stale_guard_uses_message_timestamps_when_update_time_missing(dlt_mod, tmp_path):
+    recent = _linear_conversation("c1", "Recent chat", [("user", "hi")])
+    recent["mapping"]["n0"]["message"]["create_time"] = 500.0
+    quiet = _linear_conversation("c2", "Quiet chat", [("user", "yo")], create_time=100.0)
+
+    export1 = tmp_path / "export1"
+    export1.mkdir()
+    _write_conversations(export1 / "conversations.json", [recent, quiet])
+    _run_sync_persistent(dlt_mod, tmp_path, export1)
+
+    export2 = tmp_path / "export2"
+    export2.mkdir()
+    _write_conversations(export2 / "conversations.json", [quiet])
+    with pytest.raises(Exception) as exc_info:
+        _run_sync_persistent(dlt_mod, tmp_path, export2)
+    assert "c1" in str(_unwrap_stale_export_error(exc_info.value))
+
+
+def test_stale_guard_is_scoped_per_dataset(dlt_mod, tmp_path):
+    # cognee uses one pipeline name for every dataset. Returning to a dataset
+    # that already exists keeps dlt's local state, which may have been written
+    # by a different dataset's sync -- that must not trip the stale guard.
+    export_a = tmp_path / "export_a"
+    export_a.mkdir()
+    _write_conversations(
+        export_a / "conversations.json",
+        [_linear_conversation("c9", "Example chat", [("user", "yo")], update_time=100.0)],
+    )
+    export_b = tmp_path / "export_b"
+    export_b.mkdir()
+    _write_conversations(
+        export_b / "conversations.json",
+        [_linear_conversation("c1", "Real chat", [("user", "hi")], update_time=500.0)],
+    )
+
+    _run_sync_persistent(dlt_mod, tmp_path, export_a, dataset_name="ds_a")
+    _run_sync_persistent(dlt_mod, tmp_path, export_b, dataset_name="ds_b")
+    pipeline = _run_sync_persistent(dlt_mod, tmp_path, export_a, dataset_name="ds_a")
+    assert set(_read_rows(pipeline)) == {"c9"}
+
+
 def test_stale_export_guard_leaves_prior_sync_untouched(dlt_mod, tmp_path):
     export1 = tmp_path / "export1"
     export1.mkdir()
@@ -618,3 +725,40 @@ def test_deleting_the_oldest_conversation_syncs_normally(dlt_mod, tmp_path):
     _write_conversations(export2 / "conversations.json", [newer_chat])
     pipeline = _run_sync_persistent(dlt_mod, tmp_path, export2)
     assert set(_read_rows(pipeline)) == {"c2"}
+
+
+# ---------------------------------------------------------------------------
+# Opt-in: a real export, structural checks only (no content asserted)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(
+    not os.environ.get("CHATGPT_REAL_EXPORT_PATH"),
+    reason="set CHATGPT_REAL_EXPORT_PATH to a real ChatGPT export .zip/folder to run this",
+)
+def test_real_export_parses_without_error():
+    """Every conversation in a real export must parse to a non-crashing,
+    non-empty row. This intentionally asserts nothing about *what* the
+    content says -- only that parsing a real, messy, non-synthetic export
+    doesn't raise and doesn't silently produce garbage. Keeps personal data
+    out of the repo: nothing here is printed, logged, or asserted on by
+    value, and the path itself is never hardcoded or committed."""
+    export_path = os.environ["CHATGPT_REAL_EXPORT_PATH"]
+    raws = list(_iter_raw_conversations(export_path))
+    assert len(raws) > 0, "expected at least one conversation in a real export"
+
+    empty_count = 0
+    for raw in raws:
+        conv_id = raw.get("conversation_id") or raw.get("id")
+        assert conv_id, "every real conversation must have an id"
+        row = _conversation_to_row(raw, conv_id)
+        if row is None:
+            empty_count += 1
+            continue
+        assert row["id"]
+        assert row["title"]
+        assert len(row["content"]) > 0
+
+    # A handful of genuinely empty/abandoned conversations is normal; all of
+    # them being empty would mean something is actually broken.
+    assert empty_count < len(raws)

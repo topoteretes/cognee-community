@@ -47,29 +47,34 @@ Design
   ``include_archived=False`` to exclude them.
 * **Images** become a ``[image]`` placeholder; a DALL-E prompt in the image's
   metadata is kept as text (it is content the user typed), the pixel data is
-  not.
+  not. Voice-mode turns keep their transcription.
+* **Custom instructions** (the user's own system message) are kept; every
+  other system message is plumbing and is dropped.
+* **Projects / Custom GPTs** (``conversation_template_id`` / ``gizmo_id``) are
+  written as ``Project: g-p-...`` / ``Custom GPT: g-...`` header lines, so
+  conversations in the same one share that identifier in the graph.
 * **Stale-export guard.** Every conversation id seen in any export is
-  remembered (keyed by the account's own id from ``user.json``) in dlt's
+  remembered (keyed by the cognee dataset plus the account's own id from
+  ``user.json``) in dlt's
   *source* state -- resource state resets on every run of a ``replace``
   resource, so this has to live one level up -- along with its
-  ``update_time``. Before committing a sync, any previously-seen id that is
-  missing from the current export *and* whose recorded ``update_time`` is
-  newer than everything in the current export raises :class:`StaleExportError`
-  before anything is yielded, so ``write_disposition="replace"`` never gets
+  ``update_time`` (or, if an export omits it, its newest timestamp). Before
+  committing a sync, any previously-seen id that is missing from the current
+  export *and* whose recorded ``update_time`` is newer than everything in the
+  current export raises :class:`StaleExportError` before anything is
+  yielded, so ``write_disposition="replace"`` never gets
   the chance to treat an old/partial export as "everything else was deleted."
   A wrong guess here costs a skipped sync, never lost memory. Pass
   ``allow_deletes=True`` to skip the check (e.g. you are certain the export is
   current, or deliberately pointing at an older one to roll back).
 
-Limitations (v1)
-----------------
-Tool/code-interpreter output, browsing results, and model "thoughts" /
-reasoning summaries are dropped - only user and assistant conversational text
-is kept. Canvas documents (``textdocs/``) are not read. Custom-GPT /
-project grouping (``gizmo_id`` / ``conversation_template_id``) is recorded as
-a header line, not as a separate graph entity. The stale-export guard is
-best-effort: a conversation with no ``update_time`` at all cannot be checked
-and is treated as never-stale.
+Deliberately not stored
+-----------------------
+Tool plumbing (code-interpreter calls and output, browsing, canvas/DALL-E tool
+calls), scraped web pages (``sonic_webpage``), model reasoning (``thoughts`` /
+``reasoning_recap``) and raw image/audio bytes. They are machine output or
+media rather than the conversation itself, and would bloat the graph with
+text the user never wrote or read as part of the chat.
 """
 
 import json
@@ -100,6 +105,8 @@ class StaleExportError(RuntimeError):
 # personal/conversations/ (current export layout), or split into
 # conversations-000.json, conversations-001.json, ... (large accounts).
 _CONVERSATIONS_FILE_RE = re.compile(r"(^|/)conversations(-\d+)?\.json$")
+
+_SPEAKERS = {"user": "User", "assistant": "Assistant", "system": "Custom instructions"}
 
 # Roles whose text we keep. Everything else (system plumbing, tool output)
 # is dropped unless explicitly allowed below.
@@ -154,7 +161,12 @@ def chatgpt_source(
 
     export_path = str(export_path)
 
-    @dlt.resource(name=CHATGPT_TABLE_NAME, primary_key="id", write_disposition="replace")
+    @dlt.resource(
+        name=CHATGPT_TABLE_NAME,
+        primary_key="id",
+        write_disposition="replace",
+        columns={"url": {"data_type": "text", "nullable": True}},
+    )
     def chatgpt_conversations():
         # Two passes are required: the stale-export guard has to see every
         # conversation id and update_time in this export (regardless of the
@@ -164,9 +176,12 @@ def chatgpt_source(
         # partial/old export as "the rest was deleted."
         raw_conversations = list(_iter_raw_conversations(export_path))
 
-        account_key = _account_key(export_path)
+        # cognee runs every dataset through one dlt pipeline ("ingest_dlt_source"),
+        # so source state is shared across datasets: scope the watermark to the
+        # destination dataset too, or syncing one dataset blocks another.
+        scope_key = f"{dlt.current.pipeline().dataset_name}:{_account_key(export_path)}"
         source_state = dlt.current.source_state()
-        account_state = source_state.setdefault("chatgpt_seen", {}).setdefault(account_key, {})
+        account_state = source_state.setdefault("chatgpt_seen", {}).setdefault(scope_key, {})
         previously_seen = dict(account_state)
 
         current_ids: set[str] = set()
@@ -177,9 +192,9 @@ def chatgpt_source(
                 continue
             conv_id = str(conv_id)
             current_ids.add(conv_id)
-            update_time = raw.get("update_time")
-            if isinstance(update_time, (int, float)):
-                current_update_times[conv_id] = float(update_time)
+            last_activity = _last_activity(raw)
+            if last_activity is not None:
+                current_update_times[conv_id] = last_activity
         current_max_update = max(current_update_times.values(), default=0.0)
 
         if not allow_deletes:
@@ -358,10 +373,7 @@ def _conversation_to_row(raw: dict, conv_id: str) -> dict | None:
     if not body:
         return None
 
-    header_lines = [f"# {title}"]
-    project = _project_label(raw)
-    if project:
-        header_lines.append(f"Project: {project}")
+    header_lines = [f"# {title}", *_grouping_lines(raw)]
     text = "\n".join(header_lines) + "\n\n" + body
 
     return {
@@ -404,7 +416,7 @@ def _render_messages(messages: list[dict]) -> str:
         text = _render_content(message.get("content") or {})
         if not text:
             continue
-        speaker = "User" if role == "user" else "Assistant"
+        speaker = _SPEAKERS.get(role, "Assistant")
         lines.append(f"{speaker}: {text}")
     return "\n\n".join(lines)
 
@@ -437,8 +449,12 @@ def _render_content(content: dict) -> str:
         return _clean("".join(content.get("parts") or []))
     if content_type == "multimodal_text":
         return _render_multimodal_parts(content.get("parts") or [])
-    # code / execution_output / tether_quote / anything else unhandled in v1:
-    # not conversational prose, skip rather than guess at a rendering.
+    if content_type == "user_editable_context":
+        # The user's custom instructions ("about me" + "how to respond").
+        fields = (content.get("user_profile"), content.get("user_instructions"))
+        return "\n".join(text for text in map(_clean, fields) if text)
+    # code / execution_output / tether_quote only ever come from tool
+    # plumbing (python, browsing), which _is_hidden already drops.
     return ""
 
 
@@ -452,15 +468,36 @@ def _render_multimodal_parts(parts: list) -> str:
         elif isinstance(part, dict) and part.get("content_type") == "image_asset_pointer":
             prompt = _clean(((part.get("metadata") or {}).get("dalle") or {}).get("prompt"))
             rendered.append(f"[image: {prompt}]" if prompt else "[image]")
-        # Other multimodal part shapes (audio, video) are left out in v1.
+        elif isinstance(part, dict) and part.get("content_type") == "audio_transcription":
+            # Voice-mode turns: the spoken words arrive as a transcription part.
+            text = _clean(part.get("text"))
+            if text:
+                rendered.append(text)
+        # Raw audio/video asset pointers carry no text; like image pixels, not stored.
     return " ".join(r for r in rendered if r)
 
 
-def _project_label(raw: dict) -> str | None:
-    gizmo_id = raw.get("gizmo_id")
-    template_id = raw.get("conversation_template_id")
-    label = gizmo_id or template_id
-    return str(label) if label else None
+def _grouping_lines(raw: dict) -> list[str]:
+    """Header lines naming the ChatGPT project and/or Custom GPT a conversation
+    belongs to, so conversations in the same one share that identifier.
+    Project ids start with ``g-p-``; other ``g-`` ids are Custom GPTs."""
+    ids = []
+    for value in (raw.get("conversation_template_id"), raw.get("gizmo_id")):
+        if isinstance(value, str) and value.strip() and value.strip() not in ids:
+            ids.append(value.strip())
+    return [f"{'Project' if i.startswith('g-p-') else 'Custom GPT'}: {i}" for i in ids]
+
+
+def _last_activity(raw: dict) -> float | None:
+    """When a conversation was last touched: its ``update_time``, falling back
+    to ``create_time`` or the newest message timestamp for exports that omit it."""
+    if isinstance(raw.get("update_time"), (int, float)):
+        return float(raw["update_time"])
+    times = [raw.get("create_time")]
+    for node in (raw.get("mapping") or {}).values():
+        times.append(((node or {}).get("message") or {}).get("create_time"))
+    times = [float(t) for t in times if isinstance(t, (int, float))]
+    return max(times) if times else None
 
 
 def _clean(value: Any) -> str:
