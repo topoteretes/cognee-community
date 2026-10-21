@@ -12,6 +12,7 @@ import json
 import shutil
 import tempfile
 from pathlib import Path
+from uuid import uuid4
 
 import cognee
 
@@ -86,9 +87,12 @@ async def main():
         dataset_name=DATASET,
     )
 
+    # Fresh session per question: recall() otherwise shares 'default_session' and
+    # feeds its last Q&A turns into the prompt, so earlier runs' answers can leak in.
     answer = await cognee.recall(
         "What vector database did I decide to use?",
         datasets=[DATASET],
+        session_id=f"chatgpt-example-{uuid4().hex}",
     )
     for item in answer:
         print(item.text if hasattr(item, "text") else item)
@@ -100,13 +104,17 @@ async def main():
         dataset_name=DATASET,
     )
 
-    answer = await cognee.recall(
+    # Check the retrieved context, not an LLM answer: an LLM can still answer a
+    # MySQL question from general knowledge even when the chat is gone.
+    context = await cognee.recall(
         "What should I watch for in a MySQL to Postgres migration?",
         datasets=[DATASET],
+        query_type=cognee.SearchType.CHUNKS,
+        top_k=5,
     )
-    print("(expect this to find nothing useful - that conversation was forgotten):")
-    for item in answer:
-        print(item.text if hasattr(item, "text") else item)
+    still_there = any("Planning a database migration" in (item.text or "") for item in context)
+    print(f"Migration chat still in retrieved context: {still_there}")
+    print("PASS: deleted conversation was forgotten" if not still_there else "FAIL")
 
     shutil.rmtree(export_dir.parent, ignore_errors=True)
 
