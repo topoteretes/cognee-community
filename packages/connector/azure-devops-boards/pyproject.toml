@@ -17,7 +17,7 @@ Homepage = "https://github.com/topoteretes/cognee"
 Repository = "https://github.com/topoteretes/cognee-community"
 
 [dependency-groups]
-dev = ["pytest>=8", "pytest-asyncio>=0.23", "duckdb>=1.0"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "duckdb>=1.0", "ruff>=0.6"]
 
 [build-system]
 requires = ["hatchling"]

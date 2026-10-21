@@ -733,8 +733,6 @@ def test_switching_comments_off_rerenders_without_them():
 
 
 def test_shuffled_collections_render_the_same_text():
-    import random
-
     relations = [
         {"rel": "System.LinkTypes.Related", "url": f"{ORG_URL}/_apis/wit/workItems/{n}"}
         for n in (7, 3, 9)
@@ -747,9 +745,10 @@ def test_shuffled_collections_render_the_same_text():
     item["relations"] = relations
     first = render_work_item(item, comments)
 
-    shuffled = dict(item, relations=random.sample(relations, len(relations)))
+    # fixed reversed orders, so a reverted sort fails every time, not one run in six
+    shuffled = dict(item, relations=list(reversed(relations)))
     shuffled["fields"] = dict(item["fields"], **{"System.Tags": "gamma; alpha; beta"})
-    assert render_work_item(shuffled, random.sample(comments, len(comments))) == first
+    assert render_work_item(shuffled, list(reversed(comments))) == first
 
 
 def test_budget_stops_cleanly_and_the_next_run_finishes():
@@ -830,9 +829,208 @@ def test_board_label_server_error_fails_the_run_instead_of_changing_text():
 def test_sync_stats_are_counts():
     fake = FakeAzureDevOps([work_item(1), work_item(2, type_="Task")])
     resource = azure_devops_boards_source(
-        project=PROJECT, service=fake, work_item_types=["Bug"], include_comments=False
+        project=PROJECT,
+        service=fake,
+        work_item_types=["Bug"],
+        include_comments=False,
+        resource_name="stats_test",
     )
 
     list(resource)
 
     assert resource.cognee_sync_stats == {"scanned": 2, "skipped": 1, "deleted": 0, "failed": 0}
+
+
+# ---------------------------------------------------------------------------
+# Review round 2
+# ---------------------------------------------------------------------------
+def test_two_default_sources_on_one_project_refuse_instead_of_deleting():
+    fake = FakeAzureDevOps([work_item(1, area="Shop\\Pay"), work_item(2, area="Shop\\Search")])
+    state: dict = {}
+    first = list(
+        sync_work_items(
+            fake, _Scope(project=PROJECT, area_paths=["Shop\\Pay"]), state, allow_scope_change=False
+        )
+    )
+    assert ids(first) == [1]
+
+    with pytest.raises(ValueError, match="resource_name"):
+        list(
+            sync_work_items(
+                fake,
+                _Scope(project=PROJECT, area_paths=["Shop\\Search"]),
+                state,
+                allow_scope_change=False,
+            )
+        )
+    assert state["known_ids"] == [1]  # nothing was tombstoned
+
+
+def test_default_source_still_refuses_through_a_real_dlt_pipeline(tmp_path):
+    dlt = pytest.importorskip("dlt")
+    pytest.importorskip("duckdb")
+    fake = FakeAzureDevOps([work_item(1, area="Shop\\Pay"), work_item(2, area="Shop\\Search")])
+    pipeline = dlt.pipeline(
+        pipeline_name="test_boards_two_sources",
+        pipelines_dir=str(tmp_path / "pipelines"),
+        destination=dlt.destinations.duckdb(str(tmp_path / "two.duckdb")),
+        dataset_name="backlog",
+    )
+    pipeline.run(
+        azure_devops_boards_source(project=PROJECT, service=fake, area_paths=["Shop\\Pay"])
+    )
+
+    with pytest.raises(Exception, match="resource_name"):
+        pipeline.run(
+            azure_devops_boards_source(project=PROJECT, service=fake, area_paths=["Shop\\Search"])
+        )
+    with pipeline.sql_client() as client:
+        rows = client.execute_sql("SELECT id FROM azure_devops_acme_shop")
+    assert [r[0] for r in rows] == ["1"]
+
+
+def test_cosmetic_scope_differences_do_not_force_a_reread():
+    plain = _Scope(project=PROJECT, area_paths=["Shop\\Pay"], work_item_types=["Bug"])
+    for noisy in (
+        _Scope(project=PROJECT, area_paths=["shop\\pay", " Shop\\Pay\\"], work_item_types=["Bug"]),
+        _Scope(project=PROJECT, area_paths=["Shop\\Pay"], work_item_types=["Bug", "bug "]),
+        _Scope(
+            project=PROJECT, area_paths=["Shop\\Pay"], work_item_types=["Bug"], include_comments=1
+        ),
+    ):
+        assert noisy.key() == plain.key()
+
+
+def test_board_labels_come_from_the_cache_until_they_are_a_day_old():
+    item = work_item(1, **{"WEF_ABC123_Kanban.Column": "Doing"})
+    fake = FakeAzureDevOps([item])
+    state: dict = {}
+    list(sync_work_items(fake, _Scope(project=PROJECT), state, now=1_000.0))
+    fake.calls.clear()
+
+    fake.upsert(item)
+    list(sync_work_items(fake, _Scope(project=PROJECT), state, now=1_000.0 + 3600))
+    assert not any(p.endswith("/teams") for _, p in fake.calls)
+
+    fake.upsert(item)
+    list(sync_work_items(fake, _Scope(project=PROJECT), state, now=1_000.0 + 25 * 3600))
+    assert any(p.endswith("/teams") for _, p in fake.calls)
+
+
+def test_a_small_budget_is_not_spent_on_board_labels():
+    fake = FakeAzureDevOps([work_item(i, **{"WEF_ABC123_Kanban.Column": "Doing"}) for i in (1, 2)])
+    state: dict = {}
+    stats: dict = {}
+
+    rows = list(
+        sync_work_items(
+            fake, _Scope(project=PROJECT, include_comments=False), state, stats, max_requests=2
+        )
+    )
+
+    assert ids(rows) == [1, 2]  # feed + batch fit; the label calls aren't counted
+    assert "Payments team" in rows[0]["content"]
+
+
+def test_comment_order_follows_ids_not_date_strings():
+    comments = [
+        {"id": 3, "text": "third", "createdDate": "2026-10-02T10:00:00.12Z"},
+        {"id": 2, "text": "second", "createdDate": "2026-10-02T10:00:00.1Z"},
+        {"id": 1, "text": "first", "createdDate": "2026-10-02T10:00:00Z"},
+    ]
+
+    text = render_work_item(work_item(1), comments)
+
+    assert text.index("first") < text.index("second") < text.index("third")
+
+
+def test_persistent_server_error_stops_cleanly_and_keeps_the_first_batch():
+    fake = FakeAzureDevOps([work_item(i) for i in range(1, 251)])
+    real_post = fake.post
+    batches = []
+
+    def second_batch_fails(path, body, params=None):
+        if path.endswith("/workitemsbatch"):
+            batches.append(1)
+            if len(batches) == 2:
+                raise boards.AzureDevOpsServerError("Azure DevOps returned HTTP 503", status=503)
+        return real_post(path, body, params)
+
+    fake.post = second_batch_fails
+    state: dict = {}
+    stats: dict = {}
+
+    rows = list(
+        sync_work_items(fake, _Scope(project=PROJECT, include_comments=False), state, stats)
+    )
+
+    assert len(rows) == 200
+    assert stats["failed_server_error"] == 1
+    assert len(state["pending_ids"]) == 50
+    fake.post = real_post
+    assert len(run(fake, state, include_comments=False)) == 50
+
+
+def test_client_turns_exhausted_5xx_into_a_server_error(clock):
+    session = _Session([_Response(503) for _ in range(boards._MAX_ATTEMPTS)])
+    with pytest.raises(boards.AzureDevOpsServerError):
+        AzureDevOpsClient(ORG_URL, "pat", session=session).get("x")
+
+
+def test_time_spent_waiting_has_a_budget_too():
+    class Slow(FakeAzureDevOps):
+        waited = 0.0
+
+        def post(self, path, body, params=None):
+            self.waited += 60  # as if every response carried Retry-After: 60
+            return super().post(path, body, params)
+
+    fake = Slow([work_item(i) for i in range(1, 451)])
+    stats: dict = {}
+
+    rows = list(
+        sync_work_items(
+            fake, _Scope(project=PROJECT, include_comments=False), {}, stats, max_wait_seconds=100
+        )
+    )
+
+    assert stats["failed_slow_down"] == 1
+    assert len(rows) == 400  # stopped before the third batch
+
+
+def test_sign_in_page_instead_of_json_is_an_auth_error(clock):
+    html_page = _Response(203, headers={"Content-Type": "text/html; charset=utf-8"})
+    with pytest.raises(AzureDevOpsAuthError, match="sign-in"):
+        AzureDevOpsClient(ORG_URL, "pat", session=_Session([html_page])).get("x")
+
+
+def test_non_json_body_is_a_clear_error(clock):
+    class _NotJson(_Response):
+        def json(self):
+            raise ValueError("Expecting value")
+
+    with pytest.raises(AzureDevOpsError, match="isn't JSON"):
+        AzureDevOpsClient(ORG_URL, "pat", session=_Session([_NotJson(200)])).get("x")
+
+
+def test_bad_organization_url_fails_at_construction():
+    with pytest.raises(ValueError, match="full URL"):
+        AzureDevOpsClient("dev.azure.com/acme", "pat")
+
+
+def test_a_404_from_one_teams_boards_fails_the_run():
+    fake = FakeAzureDevOps([work_item(1, **{"WEF_ABC123_Kanban.Column": "Doing"})])
+    fake.teams_error = AzureDevOpsError(
+        "Azure DevOps returned HTTP 404: request failed", status=404
+    )
+
+    with pytest.raises(AzureDevOpsError, match="404"):
+        run(fake, {})
+
+
+def test_max_requests_and_wait_budget_are_validated():
+    for bad in (0, -1, 1.5):
+        with pytest.raises(ValueError, match="max_requests"):
+            azure_devops_boards_source(project=PROJECT, service=FakeAzureDevOps(), max_requests=bad)
+    with pytest.raises(ValueError, match="max_wait_seconds"):
+        azure_devops_boards_source(project=PROJECT, service=FakeAzureDevOps(), max_wait_seconds=0)

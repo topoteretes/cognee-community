@@ -11,8 +11,9 @@ One document per work item, on the document path so cognify extracts from it.
 * Changing ``area_paths``, ``work_item_types`` or ``include_comments`` re-reads
   the whole project once, so newly selected items come in and deselected ones
   are forgotten.
-* Each run has a request budget. When it runs out, or Azure DevOps keeps
-  answering 429, the run stops cleanly and the next one carries on from there.
+* Each run has a request budget and a budget for time spent waiting on
+  Retry-After. When either runs out, or Azure DevOps keeps answering 429 or 5xx,
+  the run stops cleanly and the next one carries on from there.
 * Callers must pass write_disposition="merge". cognee hands it to
   pipeline.run, which overrides the resource hint, and its default is
   "replace", which would forget every work item that didn't change.
@@ -29,7 +30,7 @@ import time
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, urlparse
 
 import dlt
 import requests
@@ -50,11 +51,15 @@ BATCH_SIZE = 200
 SWEEP_PAGE_SIZE = 19_999
 # requests per run; a bigger project finishes its first sync over several runs
 DEFAULT_MAX_REQUESTS = 5_000
+# seconds per run we're willing to spend sleeping on Retry-After before stopping cleanly
+DEFAULT_MAX_WAIT_SECONDS = 900.0
+# board layouts rarely change, so labels are refreshed once a day at most
+_LABELS_MAX_AGE_SECONDS = 24 * 3600
 # attempts per request on 429, 5xx or network errors
 _MAX_ATTEMPTS = 5
 # our own ceiling on a single Retry-After wait; Azure DevOps doesn't document one
 _MAX_RETRY_AFTER = 60.0
-_TIMEOUT = 60
+_TIMEOUT_SECONDS = 60
 
 _SECTIONS = (
     ("System.Description", "Description"),
@@ -105,6 +110,10 @@ class AzureDevOpsRateLimitedError(AzureDevOpsError):
     """HTTP 429 that didn't clear after retrying."""
 
 
+class AzureDevOpsServerError(AzureDevOpsError):
+    """HTTP 5xx, or no connection, that didn't clear after retrying."""
+
+
 _ERRORS = {
     401: (AzureDevOpsAuthError, "check the personal access token"),
     403: (AzureDevOpsAccessError, "the token is missing a scope this call needs"),
@@ -125,12 +134,18 @@ class AzureDevOpsClient:
     ):
         if not pat:
             raise ValueError("A personal access token is required")
+        parsed = urlparse(organization_url or "")
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            raise ValueError(
+                "organization_url must be a full URL, like https://dev.azure.com/my-org"
+            )
         self.organization_url = organization_url.rstrip("/")
         self.session = session or requests.Session()
         self.session.auth = ("", pat)  # PAT is the password, username is ignored
         self.session.headers.update({"Accept": "application/json"})
         self._sleep = sleep or time.sleep
         self._wait_until = 0.0
+        self.waited = 0.0  # seconds slept on Retry-After and backoff, read by the run budget
 
     def __repr__(self) -> str:
         return f"AzureDevOpsClient({self.organization_url!r}, pat=<redacted>)"
@@ -148,11 +163,20 @@ class AzureDevOpsClient:
             attempt += 1
             if (delay := self._wait_until - time.monotonic()) > 0:
                 self._sleep(delay)
+                self.waited += delay
             try:
-                resp = self.session.request(method, url, timeout=_TIMEOUT, **kwargs)
+                resp = self.session.request(method, url, timeout=_TIMEOUT_SECONDS, **kwargs)
+            except (
+                requests.exceptions.MissingSchema,
+                requests.exceptions.InvalidSchema,
+                requests.exceptions.InvalidURL,
+            ) as exc:
+                raise ValueError("The Azure DevOps URL is not valid") from exc
             except requests.RequestException as exc:
                 if attempt >= _MAX_ATTEMPTS:
-                    raise AzureDevOpsError("Azure DevOps could not be reached", url=url) from exc
+                    raise AzureDevOpsServerError(
+                        "Azure DevOps could not be reached", url=url
+                    ) from exc
                 self._wait_until = time.monotonic() + 2.0 ** (attempt - 1)
                 continue
 
@@ -167,10 +191,31 @@ class AzureDevOpsClient:
                 self._wait_until = time.monotonic() + wait
             if retryable and attempt < _MAX_ATTEMPTS:
                 continue
+            if status >= 500:
+                raise AzureDevOpsServerError(
+                    f"Azure DevOps returned HTTP {status}: server error", status=status, url=url
+                )
             if status >= 400:
                 error, hint = _ERRORS.get(status, (AzureDevOpsError, "request failed"))
                 raise error(f"Azure DevOps returned HTTP {status}: {hint}", status=status, url=url)
-            return resp.json()
+            return _json(resp, url)
+
+
+def _json(resp: Any, url: str) -> dict:
+    """A bad or expired token can get a 203 with the HTML sign-in page instead of a 401."""
+    content_type = (resp.headers or {}).get("Content-Type", "")
+    if resp.status_code == 203 or "text/html" in content_type:
+        raise AzureDevOpsAuthError(
+            "Azure DevOps returned a sign-in page instead of data: check the personal access token",
+            status=resp.status_code,
+            url=url,
+        )
+    try:
+        return resp.json()
+    except ValueError as exc:
+        raise AzureDevOpsError(
+            "Azure DevOps returned something that isn't JSON", status=resp.status_code, url=url
+        ) from exc
 
 
 def _retry_after(headers: Any) -> float | None:
@@ -189,30 +234,45 @@ class _CutShortError(Exception):
 
 
 class _Calls:
-    """Every request of one run goes through here: host check, then the budget."""
+    """Every request of one run goes through here: host check, then the request
+    budget and the time budget. Running out of either, or a 429 or 5xx that won't
+    clear, ends the run cleanly instead of losing it."""
 
-    def __init__(self, service: Any, max_requests: int, check_active: Callable[[], None] | None):
+    def __init__(
+        self,
+        service: Any,
+        max_requests: int,
+        max_wait_seconds: float,
+        check_active: Callable[[], None] | None,
+    ):
         self.service = service
         self.max_requests = max_requests
+        self.max_wait_seconds = max_wait_seconds
         self.check_active = check_active
         self.made = 0
+        self.waited_at_start = getattr(service, "waited", 0.0)
 
-    def get(self, path: str, params: dict | None = None) -> dict:
-        return self._call(self.service.get, path, params)
+    def get(self, path: str, params: dict | None = None, *, budgeted: bool = True) -> dict:
+        return self._call(budgeted, self.service.get, path, params)
 
     def post(self, path: str, body: dict, params: dict | None = None) -> dict:
-        return self._call(self.service.post, path, body, params)
+        return self._call(True, self.service.post, path, body, params)
 
-    def _call(self, method: Callable[..., dict], *args: Any) -> dict:
+    def _call(self, budgeted: bool, method: Callable[..., dict], *args: Any) -> dict:
         if self.check_active is not None:
             self.check_active()
-        if self.made >= self.max_requests:
-            raise _CutShortError("budget")
-        self.made += 1
+        if getattr(self.service, "waited", 0.0) - self.waited_at_start >= self.max_wait_seconds:
+            raise _CutShortError("slow_down")
+        if budgeted:
+            if self.made >= self.max_requests:
+                raise _CutShortError("budget")
+            self.made += 1
         try:
             return method(*args)
         except AzureDevOpsRateLimitedError:
             raise _CutShortError("rate_limit") from None
+        except AzureDevOpsServerError:
+            raise _CutShortError("server_error") from None
 
 
 def _feed_page(calls: _Calls, project: str, token: str | None) -> dict:
@@ -272,22 +332,30 @@ def _existing_ids(calls: _Calls, project: str) -> set[int]:
         last = max(page)
 
 
-def _board_labels(calls: _Calls, project: str, state: dict) -> dict[str, str]:
-    """Kanban column field name -> "team / board", cached in state.
+def _board_labels(calls: _Calls, project: str, state: dict, now: float) -> dict[str, str]:
+    """Kanban column field name -> "team / board", cached in state for a day.
 
-    Needs Project and Team (Read). Without it the last labels we had are kept, or
-    none if there never were any, so the text doesn't flip between runs. Any
-    other error fails the run rather than rendering different text.
+    The cache is read first, so a normal run makes no extra requests. A refresh
+    costs one request per team plus two per board and isn't counted in the
+    request budget, so a small budget can't get stuck refreshing labels. It needs
+    Project and Team (Read): without it the cached labels are kept, or none if
+    there never were any. Any other error, including a 404 from one team's
+    boards, fails the run rather than rendering different text.
     """
+    cached = dict(state.get("board_labels") or {})
+    if now - state.get("board_labels_at", 0) < _LABELS_MAX_AGE_SECONDS:
+        return cached
     version = {"api-version": API_VERSION}
     labels: dict[str, str] = {}
     try:
-        teams = calls.get(f"_apis/projects/{quote(project)}/teams", version).get("value") or []
-        for team in teams:
+        teams_path = f"_apis/projects/{quote(project)}/teams"
+        for team in calls.get(teams_path, version, budgeted=False).get("value") or []:
             boards = f"{quote(project)}/{quote(team['name'])}/_apis/work/boards"
-            for board in calls.get(boards, version).get("value") or []:
-                fields = calls.get(f"{boards}/{board['id']}", version).get("fields") or {}
-                if column := (fields.get("columnField") or {}).get("referenceName"):
+            for board in calls.get(boards, version, budgeted=False).get("value") or []:
+                detail = calls.get(f"{boards}/{board['id']}", version, budgeted=False)
+                if column := ((detail.get("fields") or {}).get("columnField") or {}).get(
+                    "referenceName"
+                ):
                     labels[column] = f"{team['name']} / {board['name']}"
     except (AzureDevOpsAuthError, AzureDevOpsAccessError) as exc:
         logger.warning(
@@ -295,8 +363,9 @@ def _board_labels(calls: _Calls, project: str, state: dict) -> dict[str, str]:
             "scope to label board columns by team.",
             exc,
         )
-        return dict(state.get("board_labels") or {})
+        labels = cached
     state["board_labels"] = labels
+    state["board_labels_at"] = now
     return labels
 
 
@@ -391,7 +460,9 @@ def render_work_item(item: dict, comments: list[dict], labels: dict[str, str] | 
         if text := _clean_html(f.get(name)):
             lines.append(f"\n{heading}:\n{text}")
 
-    ordered = sorted(comments, key=lambda c: (c.get("createdDate") or "", c.get("id") or 0))
+    # Comment ids grow in posting order. Dates can't be compared as strings: Azure
+    # trims trailing zeros from the fraction, so ".1Z" would sort before ".12Z".
+    ordered = sorted(comments, key=lambda c: c.get("id") or 0)
     if thread := [line for line in map(_comment_line, ordered) if line]:
         lines.append("\nComments:\n" + "\n".join(thread))
 
@@ -424,24 +495,30 @@ class _Scope:
     work_item_types: list[str] = field(default_factory=list)
     include_comments: bool = True
 
+    def __post_init__(self) -> None:
+        # Normalised so that cosmetic differences ("Shop\\", " shop", ["Bug", "Bug"],
+        # 1 vs True) don't change the key and force a full re-read.
+        self.area_paths = sorted(
+            {p.strip().rstrip("\\").lower() for p in self.area_paths if p.strip().rstrip("\\")}
+        )
+        self.work_item_types = sorted(
+            {t.strip().lower() for t in self.work_item_types if t.strip()}
+        )
+        self.include_comments = bool(self.include_comments)
+
     def key(self) -> str:
         """Changes when the selection changes, which forces one full re-read."""
-        return json.dumps(
-            [
-                sorted(p.lower() for p in self.area_paths),
-                sorted(self.work_item_types),
-                self.include_comments,
-            ]
-        )
+        return json.dumps([self.area_paths, self.work_item_types, self.include_comments])
 
     def contains(self, item: dict) -> bool:
         f = item.get("fields") or {}
-        if self.work_item_types and f.get("System.WorkItemType") not in self.work_item_types:
+        item_type = (f.get("System.WorkItemType") or "").lower()
+        if self.work_item_types and item_type not in self.work_item_types:
             return False
         area = (f.get("System.AreaPath") or "").lower()
-        # "Shop\Pay" must not match "Shop\Payments"
+        # "Shop\\Pay" must not match "Shop\\Payments"
         return not self.area_paths or any(
-            area == p.lower() or area.startswith(p.lower() + "\\") for p in self.area_paths
+            area == p or area.startswith(p + "\\") for p in self.area_paths
         )
 
 
@@ -452,7 +529,10 @@ def sync_work_items(
     stats: dict[str, int] | None = None,
     *,
     max_requests: int = DEFAULT_MAX_REQUESTS,
+    max_wait_seconds: float = DEFAULT_MAX_WAIT_SECONDS,
     check_active: Callable[[], None] | None = None,
+    allow_scope_change: bool = True,
+    now: float | None = None,
 ) -> Iterator[dict]:
     """Rows for changed work items, then tombstones.
 
@@ -464,12 +544,22 @@ def sync_work_items(
     stats = stats if stats is not None else {}
     for key in ("scanned", "skipped", "deleted", "failed"):
         stats.setdefault(key, 0)
-    calls = _Calls(service, max_requests, check_active)
+    calls = _Calls(service, max_requests, max_wait_seconds, check_active)
     project = scope.project
+    now = time.time() if now is None else now
 
     known = {int(i) for i in state.get("known_ids", [])}
     token = state.get("continuation_token")
     if state.get("scope") not in (None, scope.key()):
+        if not allow_scope_change:
+            # With the default resource_name, a second source on the same project
+            # would land here on every run and tombstone the other one's items.
+            raise ValueError(
+                "This source's state was written with a different selection (area_paths, "
+                "work_item_types or include_comments). To change the selection, pass "
+                "resource_name explicitly, the same name as before. For a second source "
+                "on this project, pass a new resource_name."
+            )
         logger.info("Azure DevOps Boards: selection changed, re-reading the whole project")
         token = None
     work: dict[int, None] = dict.fromkeys(int(i) for i in state.get("pending_ids", []))
@@ -533,7 +623,7 @@ def sync_work_items(
                         stats["skipped"] += 1
                 else:
                     if labels is None and _on_board(item):
-                        labels = _board_labels(calls, project, state)
+                        labels = _board_labels(calls, project, state, now)
                     # skip the extra request when the item says it has no comments
                     count = (item.get("fields") or {}).get("System.CommentCount", 1)
                     wants = scope.include_comments and count
@@ -591,6 +681,7 @@ def azure_devops_boards_source(
     include_comments: bool = True,
     resource_name: str | None = None,
     max_requests: int = DEFAULT_MAX_REQUESTS,
+    max_wait_seconds: float = DEFAULT_MAX_WAIT_SECONDS,
     check_active: Callable[[], None] | None = None,
     service: Any = None,
     client: Any = None,
@@ -608,10 +699,14 @@ def azure_devops_boards_source(
         work_item_types: Only these types, e.g. ``["Bug", "User Story"]``.
         include_comments: Add each work item's comments to its text.
         resource_name: Name of this source's table and sync state. Defaults to
-            ``azure_devops_<org>_<project>``. Give each source its own name when
-            one project is synced twice with different selections.
-        max_requests: Request budget of one run. A bigger project finishes over
-            several runs.
+            ``azure_devops_<org>_<project>``. With the default, a run refuses state
+            written under a different selection, so two sources can't overwrite
+            each other; pass the name explicitly to change the selection, or a new
+            name for a second source.
+        max_requests: Request budget of one run, at least 1. A bigger project
+            finishes over several runs.
+        max_wait_seconds: How long one run may spend sleeping on Retry-After and
+            backoff before it stops cleanly.
         check_active: Optional host authorization checkpoint, called before each
             request.
         service: Pre-built client, mainly for tests. ``client`` is an alias.
@@ -620,6 +715,10 @@ def azure_devops_boards_source(
         raise RuntimeError(
             "Azure DevOps Boards sync requires cognee>=1.6.3 (table-scoped document cleanup)."
         )
+    if not isinstance(max_requests, int) or max_requests < 1:
+        raise ValueError("max_requests must be a whole number of at least 1")
+    if not max_wait_seconds or max_wait_seconds <= 0:
+        raise ValueError("max_wait_seconds must be more than 0")
     service = service or client
     if service is None:
         url = organization_url or (organization and f"https://dev.azure.com/{organization}")
@@ -649,7 +748,9 @@ def azure_devops_boards_source(
             dlt.current.resource_state(),
             stats,
             max_requests=max_requests,
+            max_wait_seconds=max_wait_seconds,
             check_active=check_active,
+            allow_scope_change=resource_name is not None,
         )
         yield from dlt_utils.guarded_rows(rows, check_active)
 
