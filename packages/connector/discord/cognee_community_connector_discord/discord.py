@@ -252,8 +252,12 @@ class _Names:
     roles: dict[str, str]
 
 
+# Bots fill required embed fields with zero-width characters, which strip() keeps.
+_ZERO_WIDTH = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u2060\ufeff"))
+
+
 def _clean(value: Any) -> str:
-    return str(value or "").strip()
+    return str(value or "").translate(_ZERO_WIDTH).strip()
 
 
 def _extras(message: dict) -> list[str]:
@@ -294,7 +298,7 @@ def _extras(message: dict) -> list[str]:
 
 def _message_text(message: dict, names: _Names) -> str:
     users = {str(u.get("id")): _user_name(u) for u in message.get("mentions") or []}
-    text = str(message.get("content") or "")
+    text = _clean(message.get("content"))
     text = _USER_MENTION.sub(lambda m: "@" + users.get(m.group(1), "unknown-user"), text)
     text = _ROLE_MENTION.sub(lambda m: "@" + names.roles.get(m.group(1), "unknown-role"), text)
     text = _CHANNEL_MENTION.sub(
@@ -472,7 +476,8 @@ class _Walker:
         self.rescan_floor = max(today - timedelta(days=config.rescan_days), self.since)
         self.known: dict[str, dict] = state.setdefault("containers", {})
         self.requests = 0
-        # Set by a new day or a finished container; the budget never stops a run before that.
+        # Set by a new day or a container that finished syncing; the budget never stops a
+        # run before that.
         self.progressed = False
         # A hidden channel refuses both its thread list and its messages; count it once.
         self.unreadable: set[str] = set()
@@ -480,7 +485,15 @@ class _Walker:
         # the others, so a resync cut short by the budget resumes instead of restarting.
         self.resync: dict | None = None
         if config.full_resync:
-            self.resync = state.setdefault("resync", {"done": [], "cursors": {}})
+            resync = state.get("resync")
+            if not resync or resync.get("since_days") != config.since_days:
+                # A changed window would leave the finished containers on the old one.
+                resync = state["resync"] = {
+                    "since_days": config.since_days,
+                    "done": [],
+                    "cursors": {},
+                }
+            self.resync = resync
         else:
             # A resync given up part way must not shorten a later one.
             state.pop("resync", None)
@@ -619,9 +632,11 @@ class _Walker:
         return containers
 
     # -- one channel or thread ---------------------------------------------
-    def _save(self, container: dict, cursor: int, days: dict[str, str]) -> None:
+    def _save(
+        self, container: dict, cursor: int, days: dict[str, str], resyncing: bool = False
+    ) -> None:
         previous = self.known.get(container["id"])
-        if self.resync is not None:
+        if resyncing and self.resync is not None:
             # A resync reads from the start again: remember how far it got, and keep
             # the incremental cursor where it was.
             self.resync["cursors"][container["id"]] = str(cursor)
@@ -640,17 +655,21 @@ class _Walker:
             entry["private"] = bool(container.get("private"))
         self.known[container["id"]] = entry
 
-    def _container(self, container: dict) -> Iterator[dict]:
-        """Yield one channel's or thread's changed days, saving its state as days finish."""
+    def _container(self, container: dict, resyncing: bool) -> Iterator[dict]:
+        """Yield one channel's or thread's changed days, saving its state as days finish.
+
+        Returns whether the container was synced, so a container left unread is not
+        counted as done or as progress.
+        """
         cid = container["id"]
         entry = self.known.get(cid)
         days: dict[str, str] = dict(entry["days"]) if entry else {}
-        resumed = (self.resync or {}).get("cursors", {}).get(cid)
+        resumed = self.resync["cursors"].get(cid) if resyncing and entry else None
         if resumed:
             # A resync that a budget cut short goes on from where it stopped.
             cursor = int(resumed)
             start = snowflake_time(cursor).date()
-        elif entry is None or self.resync is not None:
+        elif entry is None or resyncing:
             start = self.since
             cursor = 0
         else:
@@ -660,7 +679,7 @@ class _Walker:
             if start < self.rescan_floor and last_id and int(last_id) <= cursor:
                 # Nothing new and nothing inside the re-scan window: no request needed.
                 self._save(container, cursor, days)
-                return
+                return True
         after = time_snowflake(_midnight(start)) - 1
         # Never behind the start day, so an empty channel does not re-read the day before.
         cursor = max(cursor, after + 1)
@@ -675,7 +694,7 @@ class _Walker:
             if batch and _day_of(message) != _day_of(batch[0]):
                 yield from self._day(container, batch, days, low)
                 low, cursor = _next_day(batch), max(cursor, int(batch[-1]["id"]))
-                self._save(container, cursor, days)
+                self._save(container, cursor, days, resyncing)
                 self.progressed = self.progressed or cursor > begin
                 batch = []
             batch.append(message)
@@ -684,9 +703,10 @@ class _Walker:
             low, cursor = _next_day(batch), max(cursor, int(batch[-1]["id"]))
         elif any(d >= low for d in days) and self._history_hidden(container):
             self._refuse(cid, "no readable history")
-            return
+            return False
         yield from self._missing_days(cid, days, low, None)
-        self._save(container, cursor, days)
+        self._save(container, cursor, days, resyncing)
+        return True
 
     def _history_hidden(self, container: dict) -> bool:
         """Whether an empty answer means missing Read Message History, not deletion.
@@ -744,10 +764,10 @@ class _Walker:
         if resume:
             order = [c for c in order if c > resume] + [c for c in order if c <= resume]
         for cid in order:
-            if self.resync is not None and cid in self.resync["done"]:
-                continue
+            # A container this resync already finished still gets its new messages.
+            resyncing = self.resync is not None and cid not in self.resync["done"]
             try:
-                yield from self._container(containers[cid])
+                synced = yield from self._container(containers[cid], resyncing)
             except DiscordAPIError as exc:
                 if not _refused(exc):
                     raise
@@ -756,10 +776,14 @@ class _Walker:
                         f"Discord channel {cid} in channel_ids cannot be read (code {exc.code})"
                     ) from exc
                 self._refuse(cid, f"code {exc.code}")
-            if self.resync is not None:
+                synced = False
+            self.state["resume"] = cid
+            if not synced:
+                # Left unread: neither done for the resync nor progress for the budget.
+                continue
+            if resyncing:
                 self.resync["done"].append(cid)
                 self.resync["cursors"].pop(cid, None)
-            self.state["resume"] = cid
             self.progressed = True
         self.state.pop("resume", None)
         if self.resync is not None:
@@ -777,6 +801,8 @@ class _Walker:
             # State saved before the flag existed has no "private" key: keep those too.
             if parent in hidden or (entry.get("private", True) and parent in hidden_private):
                 continue
+            if self.resync is not None:
+                self.resync["cursors"].pop(cid, None)
             for day in sorted(self.known.pop(cid)["days"]):
                 self.stats["deleted"] += 1
                 yield {"id": f"discord:{cid}:{day}", "_deleted": True}
@@ -799,8 +825,9 @@ def _iter_rows(
         yield from walker.rows()
     except _CutShortError as cut:
         # A spent budget is a planned pause, not a failure; failed_budget says why. The
-        # budget only stops a run after a new day or a finished container, so a run
-        # that cannot advance never ends on it.
+        # budget only stops a run after a new day was saved or a container finished
+        # syncing (a container left unread does not count), so a run that cannot
+        # advance never ends on it.
         if cut.reason != "budget":
             stats["failed"] = 1
         stats[f"failed_{cut.reason}"] = 1

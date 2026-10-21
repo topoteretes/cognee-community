@@ -267,6 +267,21 @@ def test_render_message_keeps_embed_author_fields_and_footer(discord):
     )
 
 
+def test_zero_width_text_counts_as_empty(discord):
+    embed = {
+        "type": "rich",
+        "title": "T",
+        "fields": [
+            {"name": "", "value": ""},
+            {"name": " ", "value": "\u200b"},
+            {"name": "\u200b", "value": "v"},
+        ],
+    }
+    message = discord.message(GENERAL, TODAY, "", embeds=[embed])
+    assert render_message(message, NAMES) == "[09:00] Priya Shah: [embed: T | v]"
+    assert render_message(discord.message(GENERAL, TODAY, "\u200b \ufeff"), NAMES) is None
+
+
 def test_render_day_for_a_forum_post():
     container = {
         "id": "77",
@@ -769,11 +784,14 @@ def test_cut_resync_keeps_the_incremental_cursor_and_skips_finished_channels(dis
     # The incremental position survives a resync that stopped half way.
     assert state["containers"][GENERAL]["cursor"] == cursor
 
-    # The next run finishes GENERAL and does not read the channel the resync finished.
+    # The next run finishes GENERAL; the channel the resync finished is only read
+    # incrementally, from the re-scan window, not resynced again from since_days.
     discord.calls.clear()
     _run(discord, state, full_resync=True, max_requests=50, **options)
     assert "resync" not in state
-    assert not [path for path, _ in discord.calls if path == "/channels/899/messages"]
+    reads = [p for path, p in discord.calls if path == "/channels/899/messages"]
+    rescan_floor = (NOW - timedelta(days=7)).date()
+    assert reads and all(snowflake_time(int(p["after"]) + 1).date() >= rescan_floor for p in reads)
 
 
 def test_resync_given_up_part_way_does_not_shorten_a_later_one(discord):
@@ -781,6 +799,114 @@ def test_resync_given_up_part_way_does_not_shorten_a_later_one(discord):
     state = {"resync": {"done": [GENERAL], "cursors": {}}}
     _run(discord, state)
     assert "resync" not in state
+
+
+def _busy_channel(discord, channel, days=50, per_day=5):
+    """A channel whose history spans several pages, so a small budget cuts it."""
+    if channel not in {c["id"] for c in discord.channels}:
+        discord.channels.append({"id": channel, "type": 0, "name": f"ch-{channel}"})
+    for day in range(days, 0, -1):
+        for index in range(per_day):
+            moment = TODAY - timedelta(days=day, minutes=-index)
+            discord.message(channel, moment, f"{channel} d{day} m{index}")
+
+
+RESYNC = {"include_threads": False, "include_forums": False, "since_days": 60}
+
+
+def test_forgotten_channel_takes_its_resync_cursor_with_it(discord):
+    _busy_channel(discord, "801")
+    _busy_channel(discord, "802")
+    state = {}
+    _run(discord, state, **RESYNC)
+
+    _run(discord, state, full_resync=True, max_requests=5, **RESYNC)
+    assert "801" in state["resync"]["cursors"]
+    # 801 is deselected while the resync is still under way.
+    _run(discord, state, full_resync=True, max_requests=5, channel_ids=("802",), **RESYNC)
+    assert "801" not in state["containers"] and "801" not in state["resync"]["cursors"]
+
+    rows = _run(discord, state, full_resync=True, **RESYNC)
+    assert len([r for r in rows if r["id"].startswith("discord:801:")]) == 50
+
+
+def test_resync_cursor_of_an_unknown_channel_is_ignored(discord):
+    # State saved by an earlier version can hold a cursor for a channel it forgot.
+    _busy_channel(discord, "801")
+    stale = discord.messages["801"][100]["id"]
+    state = {"resync": {"since_days": 60, "done": [], "cursors": {"801": stale}}}
+    rows = _run(discord, state, full_resync=True, **RESYNC)
+    assert len([r for r in rows if r["id"].startswith("discord:801:")]) == 50
+
+
+def test_changing_since_days_restarts_a_resync(discord):
+    discord.channels.append({"id": "899", "type": 0, "name": "small"})
+    for day in range(90, 0, -1):
+        discord.message("899", TODAY - timedelta(days=day), f"day {day}")
+    _busy_channel(discord, GENERAL)
+    state = {}
+    _run(discord, state, **RESYNC)
+    assert len(state["containers"]["899"]["days"]) == 60
+
+    _run(discord, state, full_resync=True, max_requests=5, **RESYNC)
+    assert state["resync"]["done"] == ["899"]
+    _run(discord, state, full_resync=True, **{**RESYNC, "since_days": 100})
+    assert len(state["containers"]["899"]["days"]) == 90
+
+
+def test_finished_channel_keeps_getting_new_messages_during_a_resync(discord):
+    discord.channels.append({"id": "899", "type": 0, "name": "small"})
+    discord.message("899", TODAY, "before the resync")
+    _busy_channel(discord, GENERAL)
+    state = {}
+    _run(discord, state, **RESYNC)
+
+    _run(discord, state, full_resync=True, max_requests=5, **RESYNC)
+    assert state["resync"]["done"] == ["899"]
+    assert "899" not in state["resync"]["cursors"]
+    discord.message("899", TODAY + timedelta(hours=1), "during the resync")
+    rows = _run(discord, state, full_resync=True, **RESYNC)
+    day = next(r for r in rows if r["id"] == _day_id("899", TODAY))
+    assert "during the resync" in day["content"]
+
+
+@pytest.mark.parametrize("refusal", ["forbidden", "no_history"])
+def test_refused_channel_is_not_progress_for_the_budget(discord, refusal):
+    discord.channels.append({"id": "899", "type": 0, "name": "locked"})
+    discord.message("899", YESTERDAY, "secret")
+    discord.message(GENERAL, YESTERDAY, "hello")
+    state = {}
+    options = {"include_threads": False, "include_forums": False}
+    _run(discord, state, **options)
+
+    if refusal == "forbidden":
+        discord.errors["899"] = (403, 50001)
+    else:
+        real_get = discord.get
+
+        def no_history(path, params=None):
+            result = real_get(path, params)
+            return [] if path == "/channels/899/messages" else result
+
+        discord.get = no_history
+    discord.message(GENERAL, TODAY, "new")
+    stats = {}
+    rows = _run(discord, state, stats=stats, max_requests=1, **options)
+    # The refused channel comes first and does not arm the budget, so GENERAL is read.
+    assert _day_id(GENERAL, TODAY) in [r["id"] for r in rows]
+    assert "failed_budget" not in stats and stats["unreadable"] == 1
+
+
+def test_refused_channel_is_not_marked_done_by_a_resync(discord):
+    discord.channels.append({"id": "899", "type": 0, "name": "locked"})
+    discord.message("899", YESTERDAY, "secret")
+    _busy_channel(discord, GENERAL)
+    state = {}
+    _run(discord, state, **RESYNC)
+
+    discord.errors["899"] = (403, 50001)
+    _run(discord, state, full_resync=True, max_requests=5, **RESYNC)
+    assert "899" not in state["resync"]["done"]
 
 
 def test_check_active_runs_before_every_request(discord):
