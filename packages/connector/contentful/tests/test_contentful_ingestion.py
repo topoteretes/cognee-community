@@ -12,6 +12,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 import cognee
+import httpx
 import pytest
 import pytest_asyncio
 from cognee.context_global_variables import (
@@ -41,7 +42,12 @@ DATASET = "contentful_integration"
 async def _offline_embeddings(self, texts):
     # Non-zero, fixed vectors keep the actual LanceDB indexing/search paths
     # deterministic; top_k below is large enough to inspect all small fixtures.
-    return [[0.125] * self.dimensions for _ in texts]
+    vectors = [[0.125] * self.dimensions for _ in texts]
+    embedding_module = importlib.import_module(
+        "cognee.infrastructure.databases.vector.embeddings.EmbeddingEngine"
+    )
+    result_type = getattr(embedding_module, "EmbeddingResult", None)
+    return result_type(vectors, tokens=0) if result_type is not None else vectors
 
 
 async def _offline_llm(text_input, system_prompt, response_model, **kwargs):
@@ -158,12 +164,13 @@ async def _remember(
     fake, *, dataset=DATASET, source_id="default", remember_options=None, **selection
 ):
     source = contentful_source(
-        fake.space,
+        space_id=fake.space,
+        resource_name=f"contentful_{source_id}",
         token="offline-contentful-token",
         environment=fake.environment,
         host=fake.host,
         source_id=source_id,
-        client=fake.client,
+        service=fake.client,
         **selection,
     )
     return await cognee.remember(
@@ -271,7 +278,7 @@ def _staged_documents(root):
                 "SELECT name FROM sqlite_master WHERE type='table'"
             ).fetchall()
             for (table,) in tables:
-                if table.startswith("contentful_documents_"):
+                if table.startswith("contentful_"):
                     rows.extend(connection.execute(f'SELECT id, content FROM "{table}"').fetchall())
     return rows
 
@@ -283,8 +290,7 @@ async def test_lifecycle_updates_search_deletion_and_shared_entities(local_store
     first = {_id_suffix(record): record for record in await _records()}
     assert set(first) == {"alpha", "beta", "article"}
     assert all(
-        record.system_metadata["table_name"].startswith("contentful_documents_")
-        for record in first.values()
+        record.system_metadata["table_name"] == "contentful_default" for record in first.values()
     )
     await _assert_present("CATALOGALPHA", "CATALOGBETA", "SharedCatalog")
     await _assert_indexed_document_ids()
@@ -506,3 +512,44 @@ async def test_unchanged_delta_retries_logged_individual_cleanup_failure(
     assert "beta" not in {_id_suffix(record) for record in await _records()}
     await _assert_absent("CATALOGBETA")
     await _assert_present("CATALOGALPHA", "SharedCatalog")
+
+
+@pytest.mark.asyncio
+async def test_conflict_and_token_refresh_keep_unchanged_document_identity(local_stores):
+    """Internal extraction priorities never become content or keep deleted memory alive."""
+    fake = _catalog()
+    await _remember(fake)
+    current = fake.entry("alpha", "CATALOGRESOLVED", revision=2, updated_at="2026-03-01T00:00:00Z")
+    fake.delta("t1", [fake.initial_items[0], current], "t2")
+    fake.live[("Entry", "alpha")] = current
+    await _remember(fake)
+    after_conflict = {_id_suffix(record): record.id for record in await _records()}
+    await _assert_present("CATALOGRESOLVED", "CATALOGBETA", "SharedCatalog")
+    await _assert_absent("CATALOGALPHA")
+
+    fake.delta("t2", [current], "expired")
+    await _remember(fake)
+    assert {_id_suffix(record): record.id for record in await _records()} == after_conflict
+
+    fake.initial_items = [current]
+    fake.initial_token = "recovered"
+    fake.override = lambda request: (
+        httpx.Response(400, json={"sys": {"id": "InvalidQuery"}})
+        if request.url.params.get("sync_token") == "expired"
+        else None
+    )
+    await _remember(fake)
+    recovered = {_id_suffix(record): record.id for record in await _records()}
+    assert recovered == {key: value for key, value in after_conflict.items() if key != "beta"}
+    await _assert_absent("CATALOGBETA")
+    await _assert_present("CATALOGRESOLVED", "SharedCatalog")
+    await _assert_indexed_document_ids()
+    await _remember(fake)
+    assert {_id_suffix(record): record.id for record in await _records()} == recovered
+
+    fake.delta("recovered", [fake.deleted("alpha", deleted_at="2026-04-01T00:00:00Z")])
+    fake.models = []
+    await _remember(fake)
+    assert await _records() == []
+    await _assert_absent("CATALOGRESOLVED", "SharedCatalog")
+    assert all(not rows for rows in (await _snapshot())[2].values())

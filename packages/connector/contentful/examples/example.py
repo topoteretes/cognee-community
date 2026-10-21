@@ -1,4 +1,4 @@
-"""Sync published Contentful content into a dedicated Cognee dataset and search it.
+"""Sync Contentful twice into one Cognee dataset, report extraction counts, then search.
 
 Set CONTENTFUL_SPACE_ID and CONTENTFUL_DELIVERY_TOKEN, plus your usual Cognee
 model configuration. See the package README for optional selection variables.
@@ -20,7 +20,9 @@ def _selection(name: str) -> list[str] | None:
 
 
 async def main() -> None:
-    if not os.environ.get("CONTENTFUL_SPACE_ID") or not os.environ.get("CONTENTFUL_DELIVERY_TOKEN"):
+    space_id = os.environ.get("CONTENTFUL_SPACE_ID")
+    token = os.environ.get("CONTENTFUL_DELIVERY_TOKEN")
+    if not space_id or not token:
         print("Set CONTENTFUL_SPACE_ID and CONTENTFUL_DELIVERY_TOKEN to run this example.")
         return
 
@@ -33,23 +35,32 @@ async def main() -> None:
         raise ValueError("CONTENTFUL_INCLUDE_ASSETS must be true or false")
 
     dataset_name = os.environ.get("CONTENTFUL_DATASET", "contentful")
-    source = contentful_source(
-        content_type_ids=_selection("CONTENTFUL_CONTENT_TYPE_IDS"),
-        locales=_selection("CONTENTFUL_LOCALES"),
-        include_assets=include_assets == "true",
-        source_id=os.environ.get("CONTENTFUL_SOURCE_ID", "default"),
-        host=os.environ.get("CONTENTFUL_DELIVERY_HOST", "cdn.contentful.com"),
-    )
-    print(f"Synchronizing Contentful into dataset {dataset_name!r} ...")
-    await cognee.remember(
-        source,
-        dataset_name=dataset_name,
-        primary_key="id",
-        write_disposition="merge",
-        run_in_background=False,
-        max_rows_per_table=0,
-        self_improvement=False,
-    )
+    configuration = {
+        "space_id": space_id,
+        "token": token,
+        "resource_name": os.environ.get("CONTENTFUL_RESOURCE_NAME", "contentful_documents"),
+        "environment": os.environ.get("CONTENTFUL_ENVIRONMENT_ID", "master"),
+        "content_type_ids": _selection("CONTENTFUL_CONTENT_TYPE_IDS"),
+        "locales": _selection("CONTENTFUL_LOCALES"),
+        "include_assets": include_assets == "true",
+        "source_id": os.environ.get("CONTENTFUL_SOURCE_ID", "default"),
+        "host": os.environ.get("CONTENTFUL_DELIVERY_HOST", "cdn.contentful.com"),
+    }
+    # New resource instances use the same name and identity, so the second run
+    # resumes the first run's managed checkpoint and retained staging table.
+    for run_number in (1, 2):
+        resource = contentful_source(**configuration)
+        print(f"Sync {run_number}/2 into dataset {dataset_name!r} ...")
+        await cognee.remember(
+            resource,
+            dataset_name=dataset_name,
+            primary_key="id",
+            write_disposition="merge",
+            run_in_background=False,
+            max_rows_per_table=0,
+            self_improvement=False,
+        )
+        print("Extraction statistics:", resource.cognee_sync_stats)
 
     answer = await cognee.search(
         query_text=os.environ.get("CONTENTFUL_QUERY", "Summarize this Contentful content."),
@@ -57,7 +68,6 @@ async def main() -> None:
         datasets=[dataset_name],
     )
     print("\nSearch result:\n", answer)
-    print("\nEdit, unpublish, or delete content and rerun to synchronize this source again.")
 
 
 if __name__ == "__main__":

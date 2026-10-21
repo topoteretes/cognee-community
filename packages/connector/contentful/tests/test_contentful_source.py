@@ -43,19 +43,21 @@ def pipeline(tmp_path):
 
 def _source(fake, **kwargs):
     return contentful_source(
-        fake.space,
+        space_id=fake.space,
         token="SECRET_DELIVERY_TOKEN",
+        resource_name=kwargs.pop(
+            "resource_name", "contentful_" + kwargs.get("source_id", "default")
+        ),
         environment=fake.environment,
         host=fake.host,
-        client=fake.client,
+        service=fake.client,
         **kwargs,
     )
 
 
 def _run(pipeline, fake, **kwargs):
     source = _source(fake, **kwargs)
-    resource = next(iter(source.selected_resources.values()))
-    table = resource.name
+    table = source.name
     result = pipeline.run(source)
     result.raise_on_failed_jobs()
     return table
@@ -89,7 +91,12 @@ def _lookup_requests(fake, endpoint):
 
 @pytest.mark.parametrize("parameter", ["token", "space_id"])
 def test_missing_configuration_fails_before_any_request(fake, parameter):
-    arguments = {"space_id": fake.space, "token": "test", "client": fake.client}
+    arguments = {
+        "space_id": fake.space,
+        "token": "test",
+        "resource_name": "contentful_default",
+        "service": fake.client,
+    }
     arguments[parameter] = None
     with pytest.raises(ValueError):
         contentful_source(**arguments)
@@ -104,7 +111,8 @@ def test_explicit_empty_configuration_never_falls_back_to_environment(fake, monk
         "space_id": fake.space,
         "environment": fake.environment,
         "token": "test",
-        "client": fake.client,
+        "resource_name": "contentful_default",
+        "service": fake.client,
     }
     arguments[parameter] = ""
     with pytest.raises(ValueError):
@@ -115,20 +123,25 @@ def test_explicit_empty_configuration_never_falls_back_to_environment(fake, monk
 @pytest.mark.parametrize("token", ["test\x00value", "test\x7fvalue"])
 def test_token_control_characters_are_rejected_before_request(fake, token):
     with pytest.raises(ValueError):
-        contentful_source(fake.space, token=token, client=fake.client)
+        contentful_source(
+            space_id=fake.space,
+            token=token,
+            resource_name="contentful_default",
+            service=fake.client,
+        )
     assert fake.requests == []
 
 
-def test_environment_configuration_defaults_and_token_rotation(pipeline, fake, monkeypatch):
-    monkeypatch.setenv("CONTENTFUL_SPACE_ID", fake.space)
-    monkeypatch.setenv("CONTENTFUL_DELIVERY_TOKEN", "FIRST_TOKEN")
-    monkeypatch.setenv("CONTENTFUL_ENVIRONMENT_ID", "master")
-    source = contentful_source(client=fake.client)
-    table = next(iter(source.selected_resources.values())).name
-    pipeline.run(source)
-    monkeypatch.setenv("CONTENTFUL_DELIVERY_TOKEN", "SECOND_TOKEN")
-    second = contentful_source(client=fake.client)
-    assert next(iter(second.selected_resources.values())).name == table
+def test_explicit_credentials_rotate_without_changing_resource_or_checkpoint(pipeline, fake):
+    first = contentful_source(
+        space_id=fake.space, token="FIRST_TOKEN", resource_name="articles", service=fake.client
+    )
+    assert first.name == "articles"
+    pipeline.run(first)
+    second = contentful_source(
+        space_id=fake.space, token="SECOND_TOKEN", resource_name="articles", service=fake.client
+    )
+    assert second.name == first.name
     pipeline.run(second)
     assert _sync_requests(fake)[-1].url.params["sync_token"] == "t1"
     assert fake.requests[0].headers["authorization"] == "Bearer FIRST_TOKEN"
@@ -145,7 +158,12 @@ def test_empty_selection_is_rejected(fake, parameter):
 @pytest.mark.parametrize("parameter", ["space_id", "environment"])
 @pytest.mark.parametrize("value", [".", ".."])
 def test_dot_segments_are_rejected_before_http_path_normalization(fake, parameter, value):
-    arguments = {"space_id": fake.space, "token": "test", "client": fake.client}
+    arguments = {
+        "space_id": fake.space,
+        "token": "test",
+        "resource_name": "contentful_default",
+        "service": fake.client,
+    }
     arguments[parameter] = value
     with pytest.raises(ValueError):
         contentful_source(**arguments)
@@ -166,7 +184,13 @@ def test_dot_segments_are_rejected_before_http_path_normalization(fake, paramete
 )
 def test_unsafe_hosts_are_rejected_before_request(fake, host):
     with pytest.raises(ValueError):
-        contentful_source(fake.space, token="secret", host=host, client=fake.client)
+        contentful_source(
+            space_id=fake.space,
+            token="secret",
+            resource_name="contentful_default",
+            host=host,
+            service=fake.client,
+        )
     assert fake.requests == []
 
 
@@ -321,17 +345,44 @@ def test_failed_later_sync_page_preserves_previous_rows_and_checkpoint(pipeline,
     assert "UNCOMMITTED_PAYLOAD" in _text(_rows(pipeline, table))
 
 
-def test_invalid_sync_token_keeps_memory_and_reuses_old_checkpoint(pipeline, fake):
-    fake.initial_items = [fake.entry("one", "RETAINED_PAYLOAD")]
+def test_rejected_sync_token_recovers_with_full_refresh_in_same_dataset(pipeline, fake):
+    fake.initial_items = [fake.entry("one", "OLD_PAYLOAD"), fake.entry("removed", "REMOVED")]
     table = _run(pipeline, fake)
+    fake.initial_items = [fake.entry("one", "REFRESHED_PAYLOAD"), fake.entry("new", "NEW")]
+    fake.initial_token = "refreshed"
     fake.override = lambda request: (
         httpx.Response(400, json={"sys": {"id": "InvalidQuery"}, "message": "bad token"})
         if request.url.params.get("sync_token") == "t1"
         else None
     )
+    before = len(_sync_requests(fake))
+    assert _run(pipeline, fake) == table
+    requests = _sync_requests(fake)[before:]
+    assert requests[0].url.params["sync_token"] == "t1"
+    assert requests[1].url.params.get("initial") in {"true", "True", "1"}
+    text = _text(_rows(pipeline, table))
+    assert "REFRESHED_PAYLOAD" in text and "NEW" in text
+    assert "OLD_PAYLOAD" not in text and "REMOVED" not in text
+    _run(pipeline, fake)
+    assert _sync_requests(fake)[-1].url.params["sync_token"] == "refreshed"
+
+
+def test_failed_token_refresh_preserves_rows_and_previous_checkpoint(pipeline, fake):
+    fake.initial_items = [fake.entry("one", "RETAINED_PAYLOAD")]
+    table = _run(pipeline, fake)
+    before = _rows(pipeline, table)
+
+    def fail_refresh(request):
+        if request.url.params.get("sync_token") == "t1":
+            return httpx.Response(400, json={"sys": {"id": "InvalidQuery"}})
+        if request.url.params.get("initial"):
+            return httpx.Response(401, json={"sys": {"id": "AccessTokenInvalid"}})
+        return None
+
+    fake.override = fail_refresh
     with pytest.raises(PipelineStepFailed):
         _run(pipeline, fake)
-    assert "RETAINED_PAYLOAD" in _text(_rows(pipeline, table))
+    assert _rows(pipeline, table) == before
     fake.override = None
     _run(pipeline, fake)
     assert _sync_requests(fake)[-1].url.params["sync_token"] == "t1"
@@ -423,7 +474,7 @@ def test_locale_selection_retains_structure_links_and_localized_metadata(pipelin
     assert "ENGLISH_PAYLOAD" not in content
     assert "RICH_TEXT_PAYLOAD" in content and "LINKED_ENTRY" in content
     assert "body" in content and "reference" in content
-    assert "paragraph" in content and "bold" in content
+    assert "[paragraph]" not in content and "[bold]" not in content
 
 
 def test_asset_metadata_normalizes_urls_without_fetching_binary(pipeline, fake):
@@ -495,7 +546,10 @@ def test_changing_model_inventory_aborts_without_loading_or_checkpointing(pipeli
     assert _sync_requests(fake)[requests_before].url.params["sync_token"] == "t1"
 
 
-@pytest.mark.parametrize("fault", ["duplicate", "repeated_cursor", "missing_items", "bad_pages"])
+@pytest.mark.parametrize(
+    "fault",
+    ["duplicate", "wrong_skip", "missing_items", "bad_total", "bad_limit", "short_page"],
+)
 def test_unreliable_model_inventory_never_deletes_previous_models(pipeline, fake, fault):
     fake.models = [fake.model()]
     table = _run(pipeline, fake)
@@ -504,16 +558,20 @@ def test_unreliable_model_inventory_never_deletes_previous_models(pipeline, fake
     def override(request):
         if not request.url.path.endswith("/content_types"):
             return None
-        payloads = {
-            "duplicate": {"items": [fake.model(), fake.model()], "pages": {}},
-            "repeated_cursor": {
-                "items": [],
-                "pages": {"next": (f"{fake.url('content_types')}?pageNext=loop")},
-            },
-            "missing_items": {"pages": {}},
-            "bad_pages": {"items": [], "pages": []},
-        }
-        return httpx.Response(200, json=payloads[fault])
+        payload = {"sys": {"type": "Array"}, "items": [], "total": 0, "skip": 0, "limit": 100}
+        if fault == "duplicate":
+            payload.update(items=[fake.model(), fake.model()], total=2)
+        elif fault == "wrong_skip":
+            payload["skip"] = 1
+        elif fault == "missing_items":
+            del payload["items"]
+        elif fault == "bad_total":
+            payload["total"] = -1
+        elif fault == "bad_limit":
+            payload["limit"] = 0
+        else:
+            payload.update(total=2, limit=1)
+        return httpx.Response(200, json=payload)
 
     fake.override = override
     with pytest.raises(PipelineStepFailed):
@@ -531,7 +589,7 @@ def test_model_disappearance_requires_confirmed_not_found(pipeline, fake):
     assert len(_lookup_requests(fake, "content_types")) == 1
 
 
-@pytest.mark.parametrize("status", [200, 401, 503])
+@pytest.mark.parametrize("status", [401, 503])
 def test_incomplete_inventory_probe_preserves_rows_and_checkpoint(pipeline, fake, status):
     model = fake.model()
     fake.models = [model]
@@ -609,7 +667,7 @@ def test_update_delete_republish_repeated_across_runs(pipeline, fake):
     assert not _lookup_requests(fake, "entries")
 
 
-@pytest.mark.parametrize("resolution", ["stale", "wrong_id", "wrong_environment", "failure"])
+@pytest.mark.parametrize("resolution", ["wrong_id", "wrong_environment", "failure"])
 def test_contradictory_conflict_resolution_aborts_before_checkpoint(pipeline, fake, resolution):
     fake.initial_items = [fake.entry("one", "ORIGINAL_PAYLOAD")]
     table = _run(pipeline, fake)
@@ -651,10 +709,9 @@ def test_conflict_resolved_not_found_removes_document(pipeline, fake):
     assert _rows(pipeline, table) == {}
 
 
-def test_conflict_not_found_cannot_erase_newer_republish_evidence(pipeline, fake):
+def test_stale_not_found_keeps_newer_republished_sync_event(pipeline, fake):
     fake.initial_items = [fake.entry("one", "RETAINED_PAYLOAD")]
     table = _run(pipeline, fake)
-    before = _rows(pipeline, table)
     fake.delta(
         "t1",
         [
@@ -664,13 +721,11 @@ def test_conflict_not_found_cannot_erase_newer_republish_evidence(pipeline, fake
         "t2",
     )
     fake.live[("Entry", "one")] = None
-    with pytest.raises(PipelineStepFailed):
-        _run(pipeline, fake)
-    assert _rows(pipeline, table) == before
-    fake.delta("t1", [], "recovered")
-    requests_before = len(_sync_requests(fake))
     _run(pipeline, fake)
-    assert _sync_requests(fake)[requests_before].url.params["sync_token"] == "t1"
+    assert "REPUBLISHED_PAYLOAD" in _text(_rows(pipeline, table))
+    assert len(_lookup_requests(fake, "entries")) == 2
+    _run(pipeline, fake)
+    assert _sync_requests(fake)[-1].url.params["sync_token"] == "t2"
 
 
 def test_interrupted_load_keeps_package_and_recovers_before_fresh_extraction(
@@ -821,11 +876,776 @@ def test_scd2_merge_strategy_rejected_before_extraction(pipeline, fake):
 
 def test_normalized_selection_order_does_not_refresh_or_change_source_identity(pipeline, fake):
     first = _source(fake, content_type_ids=["product", "article"], locales=["fr-FR", "en-US"])
-    first_table = next(iter(first.selected_resources.values())).name
+    first_table = first.name
     pipeline.run(first)
     second = _source(
-        fake, content_type_ids=["article", "product", "article"], locales=["en-US", "fr-FR"]
+        fake, content_type_ids=["article", "product", "article"], locales=["fr-FR", "en-US"]
     )
-    assert next(iter(second.selected_resources.values())).name == first_table
+    assert second.name == first_table
     pipeline.run(second)
     assert _sync_requests(fake)[-1].url.params.get("sync_token") == "t1"
+
+
+def test_factory_arguments_are_keyword_only_and_do_not_read_environment(
+    pipeline, fake, monkeypatch
+):
+    import inspect
+
+    signature = inspect.signature(contentful_source)
+    assert all(
+        argument.kind is inspect.Parameter.KEYWORD_ONLY
+        for argument in signature.parameters.values()
+    )
+    for name in ("space_id", "token", "resource_name"):
+        assert signature.parameters[name].default is inspect.Parameter.empty
+    monkeypatch.setenv("CONTENTFUL_SPACE_ID", fake.space)
+    monkeypatch.setenv("CONTENTFUL_DELIVERY_TOKEN", "ENV_TOKEN")
+    monkeypatch.setenv("CONTENTFUL_ENVIRONMENT_ID", "from_environment")
+    with pytest.raises(TypeError):
+        contentful_source(service=fake.client)
+    with pytest.raises(ValueError):
+        contentful_source(space_id=None, token=None, resource_name="articles", service=fake.client)
+    resource = contentful_source(
+        space_id=fake.space, token="EXPLICIT_TOKEN", resource_name="articles", service=fake.client
+    )
+    list(resource)
+    assert all("/environments/master/" in request.url.path for request in fake.requests)
+    assert all(
+        request.headers["authorization"] == "Bearer EXPLICIT_TOKEN" for request in fake.requests
+    )
+
+
+def test_hosted_resource_has_document_contract_and_integer_statistics(pipeline, fake):
+    from cognee.tasks.ingestion import dlt_utils
+    from dlt.extract.resource import DltResource
+
+    fake.initial_items = [fake.entry("one", "ONE"), fake.entry("one", "ONE")]
+    resource = _source(fake, resource_name="articles")
+    assert isinstance(resource, DltResource)
+    assert resource.name == "articles"
+    assert getattr(resource, dlt_utils.DOCUMENT_SOURCE_ATTR) == "contentful"
+    assert getattr(resource, dlt_utils.PIPELINE_SCOPE_ATTR)
+    assert resource.cognee_sync_stats == {
+        "synced": 0,
+        "deleted": 0,
+        "failed_rate_limit": 0,
+        "failed_auth": 0,
+    }
+    pipeline.run(resource)
+    assert resource.cognee_sync_stats == {
+        "synced": 1,
+        "deleted": 0,
+        "failed_rate_limit": 0,
+        "failed_auth": 0,
+    }
+    fake.delta("t1", [fake.deleted("one"), fake.deleted("one")], "t2")
+    pipeline.run(resource)
+    assert resource.cognee_sync_stats == {
+        "synced": 0,
+        "deleted": 1,
+        "failed_rate_limit": 0,
+        "failed_auth": 0,
+    }
+    pipeline.run(resource)
+    assert resource.cognee_sync_stats == {
+        "synced": 0,
+        "deleted": 0,
+        "failed_rate_limit": 0,
+        "failed_auth": 0,
+    }
+    assert all(type(count) is int for count in resource.cognee_sync_stats.values())
+
+
+@pytest.mark.parametrize("change", ["source_id", "environment", "space_id", "host"])
+def test_resource_name_cannot_adopt_another_source_ownership(pipeline, fake, change):
+    fake.initial_items = [fake.entry("one", "RETAINED")]
+    table = _run(pipeline, fake, resource_name="articles")
+    before = _rows(pipeline, table)
+    arguments = {
+        "space_id": fake.space,
+        "environment": fake.environment,
+        "host": fake.host,
+        "source_id": "default",
+        "token": "SECRET_DELIVERY_TOKEN",
+        "resource_name": "articles",
+        "service": fake.client,
+    }
+    arguments[change] = "cdn.eu.contentful.com" if change == "host" else "different"
+    before_requests = len(fake.requests)
+    with pytest.raises(PipelineStepFailed):
+        pipeline.run(contentful_source(**arguments))
+    assert len(fake.requests) == before_requests
+    assert _rows(pipeline, table) == before
+
+
+def test_content_types_use_offset_pages_with_real_delivery_response_shape(pipeline, fake):
+    fake.models = [fake.model("article"), fake.model("product"), fake.model("news")]
+    fake.model_page_size = 2
+    table = _run(pipeline, fake)
+    assert len(_rows(pipeline, table)) == 3
+    requests = [request for request in fake.requests if request.url.path.endswith("/content_types")]
+    assert [int(request.url.params["skip"]) for request in requests] == [0, 2, 0, 2]
+    assert all(int(request.url.params["limit"]) > 0 for request in requests)
+    assert all(
+        "cursor" not in request.url.params and "pageNext" not in request.url.params
+        for request in requests
+    )
+
+
+def test_total_change_mid_inventory_aborts_without_deleting_previous_models(pipeline, fake):
+    fake.models = [fake.model(), fake.model("product")]
+    fake.model_page_size = 1
+    table = _run(pipeline, fake)
+    before = _rows(pipeline, table)
+
+    def changing_total(request):
+        if request.url.path.endswith("/content_types") and request.url.params.get("skip") == "1":
+            return httpx.Response(
+                200,
+                json={
+                    "sys": {"type": "Array"},
+                    "items": [fake.model("product")],
+                    "total": 3,
+                    "skip": 1,
+                    "limit": 1,
+                },
+            )
+        return None
+
+    fake.override = changing_total
+    with pytest.raises(PipelineStepFailed):
+        _run(pipeline, fake)
+    assert _rows(pipeline, table) == before
+
+
+def test_model_omitted_from_inventory_but_found_at_detail_is_retained(pipeline, fake):
+    model = fake.model()
+    fake.models = [model]
+    table = _run(pipeline, fake)
+    before = _rows(pipeline, table)
+    fake.models = []
+    fake.live[("ContentType", "article")] = model
+    _run(pipeline, fake)
+    assert _rows(pipeline, table) == before
+    probes = _lookup_requests(fake, "content_types")
+    assert 1 <= len(probes) <= 2
+
+
+@pytest.mark.parametrize("kind", ["Entry", "Asset"])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_stale_cdn_detail_retries_once_then_keeps_newest_sync_event(pipeline, fake, kind, reverse):
+    constructor = fake.entry if kind == "Entry" else fake.asset
+    old = constructor("same", "OLD", updated_at="2026-01-01T00:00:00Z")
+    new = constructor("same", "CURRENT", updated_at="2026-03-01T00:00:00Z")
+    events = [old, fake.deleted("same", kind=kind, deleted_at="2026-02-01T00:00:00Z"), new]
+    if reverse:
+        events.reverse()
+    fake.initial_items = events
+    fake.live[(kind, "same")] = old
+    table = _run(pipeline, fake)
+    assert "CURRENT" in _text(_rows(pipeline, table))
+    assert "OLD" not in _text(_rows(pipeline, table))
+    assert len(_lookup_requests(fake, "entries" if kind == "Entry" else "assets")) == 2
+
+
+def test_conflict_with_equal_timestamps_and_no_authoritative_payload_aborts(pipeline, fake):
+    fake.initial_items = [fake.entry("one", "FIRST"), fake.entry("one", "DIFFERENT")]
+    fake.live[("Entry", "one")] = fake.entry("one", "STALE", updated_at="2025-01-01T00:00:00Z")
+    with pytest.raises(PipelineStepFailed):
+        _run(pipeline, fake)
+
+
+def test_first_live_row_is_yielded_before_final_sync_page(pipeline, fake):
+    fake.sync_pages["initial"] = {
+        "items": [fake.entry("one", "FIRST")],
+        "nextPageUrl": fake.sync_url("later"),
+    }
+    fake.delta("later", [fake.entry("two", "SECOND")], "terminal")
+    iterator = iter(_source(fake))
+    first = next(iterator)
+    assert first["id"].endswith(":Entry:one")
+    assert not first.get("_deleted", False)
+    assert len(_sync_requests(fake)) == 1
+    remaining = list(iterator)
+    assert any(row["id"].endswith(":Entry:two") for row in remaining)
+    assert len(_sync_requests(fake)) == 2
+
+
+def test_tombstones_are_emitted_only_after_terminal_sync_page(pipeline, fake):
+    fake.initial_items = [fake.entry("one", "ONE")]
+    _run(pipeline, fake)
+    fake.page("t1", [fake.deleted("one")], "later")
+    fake.delta("later", [fake.entry("two", "TWO")], "terminal")
+    before = len(_sync_requests(fake))
+    resource = _source(fake)
+    saw_tombstone = False
+    for row in resource:
+        if row.get("_deleted"):
+            saw_tombstone = True
+            assert len(_sync_requests(fake)) - before == 2
+    assert saw_tombstone
+
+
+def test_shared_httpx_logger_filters_and_records_remain_untouched(pipeline, fake):
+    resource = _source(fake)  # Initialize Cognee's own logging before taking the baseline.
+    shared_logger = logging.getLogger("httpx")
+    messages = []
+
+    class Capture(logging.Handler):
+        def emit(self, record):
+            messages.append(record.getMessage())
+
+    capture = Capture()
+    marker = logging.Filter()
+    shared_logger.addFilter(marker)
+    shared_logger.addHandler(capture)
+    previous_level = shared_logger.level
+    shared_logger.setLevel(logging.WARNING)
+    original_filters = tuple(shared_logger.filters)
+
+    def observe(request):
+        assert tuple(shared_logger.filters) == original_filters
+        shared_logger.warning("Unrelated URL access_token=other-project-token")
+        return None
+
+    fake.override = observe
+    try:
+        shared_logger.warning("Unrelated URL access_token=other-project-token")
+        baseline = messages.pop()
+        pipeline.run(resource)
+        assert messages == [baseline] * len(fake.requests)
+        assert tuple(shared_logger.filters) == original_filters
+    finally:
+        shared_logger.removeFilter(marker)
+        shared_logger.removeHandler(capture)
+        shared_logger.setLevel(previous_level)
+
+
+def test_check_active_runs_before_every_request_including_retries_and_lookups(pipeline, fake):
+    checks = []
+    fake.initial_items = [
+        fake.entry("one", "OLD"),
+        fake.entry("one", "NEW", updated_at="2026-03-01T00:00:00Z"),
+    ]
+    fake.live[("Entry", "one")] = fake.initial_items[-1]
+    rate_limited = False
+
+    def check_active():
+        checks.append(len(fake.requests))
+
+    def override(request):
+        nonlocal rate_limited
+        assert len(checks) == len(fake.requests)
+        if request.url.path.endswith("/sync") and not rate_limited:
+            rate_limited = True
+            return httpx.Response(429, headers={"X-Contentful-RateLimit-Reset": "0"})
+        return None
+
+    fake.override = override
+    resource = _source(fake, check_active=check_active)
+    pipeline.run(resource)
+    assert checks == [*range(len(fake.requests)), len(fake.requests)]
+    assert _lookup_requests(fake, "entries")
+    assert resource.cognee_sync_stats["failed_rate_limit"] == 1
+
+
+def test_cancellation_between_requests_does_not_advance_checkpoint(pipeline, fake):
+    fake.initial_items = [fake.entry("one", "RETAINED")]
+    table = _run(pipeline, fake)
+    before = _rows(pipeline, table)
+    fake.page("t1", [fake.entry("one", "UNCOMMITTED")], "later")
+    fake.delta("later", [], "t2")
+    initial_request_count = len(fake.requests)
+
+    class CancelledError(Exception):
+        pass
+
+    def check_active():
+        if any(
+            request.url.params.get("sync_token") == "t1"
+            for request in fake.requests[initial_request_count:]
+        ):
+            raise CancelledError("cancelled before next request")
+
+    with pytest.raises(PipelineStepFailed) as captured:
+        pipeline.run(_source(fake, check_active=check_active))
+    assert "cancelled before next request" in str(captured.value)
+    assert _rows(pipeline, table) == before
+    assert all(
+        request.url.params.get("sync_token") != "later"
+        for request in fake.requests[initial_request_count:]
+    )
+    count = len(_sync_requests(fake))
+    _run(pipeline, fake)
+    assert _sync_requests(fake)[count].url.params["sync_token"] == "t1"
+
+
+@pytest.mark.parametrize(
+    "status,error_name,counter",
+    [
+        (401, "ContentfulAuthError", "failed_auth"),
+        (403, "ContentfulAuthError", "failed_auth"),
+        (429, "ContentfulRateLimitError", "failed_rate_limit"),
+        (503, "ContentfulAPIError", None),
+    ],
+)
+def test_exported_error_types_and_failure_statistics(pipeline, fake, status, error_name, counter):
+    import cognee_community_connector_contentful as connector
+
+    fake.override = lambda request: httpx.Response(status, text="SECRET_DELIVERY_TOKEN")
+    resource = _source(fake)
+    with pytest.raises(Exception) as captured:
+        list(resource)
+    error = captured.value
+    chain = []
+    while error is not None and error not in chain:
+        chain.append(error)
+        error = error.__cause__ or error.__context__
+    assert any(isinstance(error, getattr(connector, error_name)) for error in chain)
+    assert all("SECRET_DELIVERY_TOKEN" not in str(error) for error in chain)
+    if counter:
+        assert resource.cognee_sync_stats[counter] == len(fake.requests)
+
+
+def test_display_field_title_locale_order_editor_url_and_plain_rich_text(pipeline, fake):
+    model = fake.model()
+    model["displayField"] = "headline"
+    fake.models = [model]
+    fake.initial_items = [
+        fake.entry(
+            "one",
+            "",
+            fields={
+                "headline": {"en-US": "English headline", "fr-FR": "Titre français"},
+                "body": {
+                    "en-US": {
+                        "nodeType": "document",
+                        "data": {},
+                        "content": [
+                            {
+                                "nodeType": "paragraph",
+                                "data": {},
+                                "content": [
+                                    {
+                                        "nodeType": "text",
+                                        "value": "First paragraph.",
+                                        "marks": [{"type": "bold"}],
+                                        "data": {},
+                                    }
+                                ],
+                            },
+                            {
+                                "nodeType": "paragraph",
+                                "data": {},
+                                "content": [
+                                    {
+                                        "nodeType": "text",
+                                        "value": "Second paragraph.",
+                                        "marks": [],
+                                        "data": {},
+                                    }
+                                ],
+                            },
+                        ],
+                    }
+                },
+            },
+        )
+    ]
+    table = _run(pipeline, fake, locales=["fr-FR", "en-US"])
+    row = next(row for row in _rows(pipeline, table).values() if row["id"].endswith(":Entry:one"))
+    assert row["title"] == "Titre français"
+    assert row["url"] == "https://app.contentful.com/spaces/space/environments/master/entries/one"
+    assert row["content"].startswith("Titre français")
+    assert "First paragraph.\n\nSecond paragraph." in row["content"]
+    assert "[paragraph]" not in row["content"] and "[bold]" not in row["content"]
+    assert row["content"].index("First paragraph.") < row["content"].index("Space:")
+    _run(pipeline, fake, locales=["en-US", "fr-FR"])
+    changed = _rows(pipeline, table)[row["id"]]
+    assert changed["title"] == "English headline"
+
+
+def test_model_display_field_change_refreshes_entry_title_without_delta(pipeline, fake):
+    fake.models = [fake.model()]
+    fake.initial_items = [
+        fake.entry(
+            "one", "", fields={"title": {"en-US": "Old title"}, "headline": {"en-US": "New title"}}
+        )
+    ]
+    table = _run(pipeline, fake)
+    before = _rows(pipeline, table)
+    entry_id = next(identifier for identifier in before if identifier.endswith(":Entry:one"))
+    assert before[entry_id]["title"] == "Old title"
+    fake.models[0]["displayField"] = "headline"
+    _run(pipeline, fake)
+    assert _rows(pipeline, table)[entry_id]["title"] == "New title"
+
+
+def test_shuffled_events_models_and_field_mappings_produce_identical_documents(pipeline, fake):
+    first = fake.entry(
+        "one",
+        "",
+        fields={
+            "zeta": {"fr-FR": "FR", "en-US": "EN"},
+            "alpha": {"en-US": "A"},
+            "ordered": {"en-US": ["first", "second"]},
+        },
+    )
+    second = fake.entry("two", "SECOND")
+    models = [fake.model("article"), fake.model("product")]
+    fake.initial_items = [first, second]
+    fake.models = models
+    table = _run(pipeline, fake, source_id="original")
+    original = _rows(pipeline, table)
+    shuffled = deepcopy(first)
+    shuffled["fields"] = {
+        key: dict(reversed(list(value.items())))
+        for key, value in reversed(list(first["fields"].items()))
+    }
+    fake.initial_items = [second, shuffled]
+    fake.models = list(reversed(models))
+    for model in fake.models:
+        model["fields"].reverse()
+    other = _run(pipeline, fake, source_id="shuffled")
+    assert _rows(pipeline, other) == original
+    assert "first" in _text(original) and "second" in _text(original)
+
+
+def test_token_rejection_after_provisional_rows_refreshes_without_leaking_them(pipeline, fake):
+    fake.initial_items = [fake.entry("retained", "ORIGINAL"), fake.entry("removed", "REMOVED")]
+    table = _run(pipeline, fake)
+    fake.page("t1", [fake.entry("provisional", "MUST_NOT_SURVIVE")], "expired-page")
+    fake.initial_items = [fake.entry("retained", "REFRESHED")]
+    fake.initial_token = "recovered"
+    fake.override = lambda request: (
+        httpx.Response(400, json={"sys": {"id": "InvalidQuery"}})
+        if request.url.params.get("sync_token") == "expired-page"
+        else None
+    )
+    _run(pipeline, fake)
+    rows = _rows(pipeline, table)
+    assert len(rows) == 1
+    assert "REFRESHED" in _text(rows)
+    assert "REMOVED" not in _text(rows) and "MUST_NOT_SURVIVE" not in _text(rows)
+    _run(pipeline, fake)
+    assert _sync_requests(fake)[-1].url.params["sync_token"] == "recovered"
+
+
+def test_second_rejected_token_during_refresh_aborts_without_endless_recovery(pipeline, fake):
+    fake.initial_items = [fake.entry("one", "RETAINED")]
+    table = _run(pipeline, fake)
+    before = _rows(pipeline, table)
+    fake.sync_pages["initial"] = {
+        "items": [fake.entry("one", "UNCOMMITTED")],
+        "nextPageUrl": fake.sync_url("expired-refresh-page"),
+    }
+    fake.override = lambda request: (
+        httpx.Response(400, json={"sys": {"id": "InvalidQuery"}})
+        if request.url.params.get("sync_token") in {"t1", "expired-refresh-page"}
+        else None
+    )
+    requests_before = len(_sync_requests(fake))
+    with pytest.raises(PipelineStepFailed):
+        _run(pipeline, fake)
+    assert _rows(pipeline, table) == before
+    assert len(_sync_requests(fake)) - requests_before == 3
+
+
+def test_error_hierarchy_is_exported_with_distinct_response_and_token_errors(pipeline, fake):
+    import cognee_community_connector_contentful as connector
+
+    assert issubclass(connector.ContentfulAPIError, connector.ContentfulSourceError)
+    assert issubclass(connector.ContentfulAuthError, connector.ContentfulAPIError)
+    assert issubclass(connector.ContentfulRateLimitError, connector.ContentfulAPIError)
+    assert issubclass(connector.ContentfulSyncTokenError, connector.ContentfulAPIError)
+    assert issubclass(connector.ContentfulResponseError, connector.ContentfulSourceError)
+    fake.sync_pages["initial"] = {"items": []}
+    resource = _source(fake)
+    with pytest.raises(Exception) as captured:
+        list(resource)
+    error = captured.value
+    while error is not None and not isinstance(error, connector.ContentfulResponseError):
+        error = error.__cause__ or error.__context__
+    assert isinstance(error, connector.ContentfulResponseError)
+
+
+def test_display_field_absent_or_non_text_falls_back_to_entry_id(pipeline, fake):
+    fake.models = [fake.model()]
+    fake.initial_items = [
+        fake.entry("missing", "", fields={"other": {"en-US": "Not the display field"}}),
+        fake.entry("number", "", fields={"title": {"en-US": 42}}),
+    ]
+    table = _run(pipeline, fake)
+    entries = [row for row in _rows(pipeline, table).values() if ":Entry:" in row["id"]]
+    assert {row["title"] for row in entries} == {"missing", "number"}
+
+
+def test_default_display_locale_selection_is_stable_across_mapping_order(pipeline, fake):
+    fake.models = [fake.model()]
+    fake.initial_items = [
+        fake.entry("one", "", fields={"title": {"fr-FR": "French", "en-US": "English"}})
+    ]
+    table = _run(pipeline, fake, source_id="first")
+    first = _rows(pipeline, table)
+    fake.initial_items[0]["fields"]["title"] = {"en-US": "English", "fr-FR": "French"}
+    other = _run(pipeline, fake, source_id="second")
+    assert _rows(pipeline, other) == first
+    assert next(row for row in first.values() if ":Entry:" in row["id"])["title"] == "English"
+
+
+def test_example_runs_two_foreground_syncs_then_searches_with_mocked_provider(
+    pipeline, fake, monkeypatch, capsys
+):
+    import asyncio
+    import runpy
+    from pathlib import Path
+
+    import cognee
+
+    import cognee_community_connector_contentful as connector
+
+    fake.initial_items = [fake.entry("one", "FIRST"), fake.entry("removed", "REMOVED")]
+    fake.delta("t1", [fake.entry("one", "SECOND"), fake.deleted("removed")], "t2")
+    monkeypatch.setenv("CONTENTFUL_SPACE_ID", fake.space)
+    monkeypatch.setenv("CONTENTFUL_DELIVERY_TOKEN", "offline-example-token")
+    monkeypatch.setenv("CONTENTFUL_ENVIRONMENT_ID", fake.environment)
+    monkeypatch.setenv("CONTENTFUL_RESOURCE_NAME", "example_documents")
+    monkeypatch.setenv("CONTENTFUL_DATASET", "example_dataset")
+    monkeypatch.setenv("CONTENTFUL_QUERY", "Summarize the second sync")
+    for name in (
+        "CONTENTFUL_CONTENT_TYPE_IDS",
+        "CONTENTFUL_LOCALES",
+        "CONTENTFUL_INCLUDE_ASSETS",
+        "CONTENTFUL_SOURCE_ID",
+        "CONTENTFUL_DELIVERY_HOST",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    resources = []
+    calls = []
+
+    def source_with_mocked_service(**kwargs):
+        resource = contentful_source(**kwargs, service=fake.client)
+        resources.append(resource)
+        return resource
+
+    async def remember(resource, **kwargs):
+        assert kwargs["dataset_name"] == "example_dataset"
+        assert kwargs["primary_key"] == "id"
+        assert kwargs["write_disposition"] == "merge"
+        assert kwargs["run_in_background"] is False
+        assert kwargs["max_rows_per_table"] == 0
+        pipeline.run(resource).raise_on_failed_jobs()
+        calls.append("remember")
+
+    async def search(**kwargs):
+        assert calls == ["remember", "remember"]
+        assert kwargs["query_text"] == "Summarize the second sync"
+        assert kwargs["datasets"] == ["example_dataset"]
+        calls.append("search")
+        return ["Mocked model answer"]
+
+    monkeypatch.setattr(connector, "contentful_source", source_with_mocked_service)
+    monkeypatch.setattr(cognee, "remember", remember)
+    monkeypatch.setattr(cognee, "search", search)
+    example = Path(__file__).resolve().parents[1] / "examples" / "example.py"
+    namespace = runpy.run_path(str(example), run_name="contentful_example_test")
+    asyncio.run(namespace["main"]())
+    assert calls == ["remember", "remember", "search"]
+    assert len(resources) == 2 and resources[0].name == resources[1].name
+    rows = _rows(pipeline, "example_documents")
+    assert len(rows) == 1 and "SECOND" in _text(rows) and "REMOVED" not in _text(rows)
+    output = capsys.readouterr().out
+    assert "Sync 1/2" in output and "Sync 2/2" in output
+    assert output.count("Extraction statistics:") == 2
+    assert "Mocked model answer" in output
+
+
+def test_failed_refresh_after_provisional_rows_preserves_staging_and_checkpoint(pipeline, fake):
+    fake.initial_items = [fake.entry("one", "RETAINED")]
+    table = _run(pipeline, fake)
+    before = _rows(pipeline, table)
+    fake.page("t1", [fake.entry("provisional", "UNCOMMITTED")], "expired")
+
+    def fail_after_provisional(request):
+        if request.url.params.get("sync_token") == "expired":
+            return httpx.Response(400, json={"sys": {"id": "InvalidQuery"}})
+        if request.url.params.get("initial"):
+            return httpx.Response(401, json={"sys": {"id": "AccessTokenInvalid"}})
+        return None
+
+    fake.override = fail_after_provisional
+    with pytest.raises(PipelineStepFailed):
+        _run(pipeline, fake)
+    assert _rows(pipeline, table) == before
+    fake.override = None
+    fake.delta("expired", [], "t2")
+    requests_before = len(_sync_requests(fake))
+    _run(pipeline, fake)
+    assert _sync_requests(fake)[requests_before].url.params["sync_token"] == "t1"
+    assert "UNCOMMITTED" in _text(_rows(pipeline, table))
+
+
+@pytest.mark.parametrize("change", ["upsert", "dedup_sort", "table_name"])
+def test_merge_dedup_and_resource_table_hints_are_required_before_requests(pipeline, fake, change):
+    resource = _source(fake)
+    if change == "upsert":
+        resource.apply_hints(write_disposition={"disposition": "merge", "strategy": "upsert"})
+    elif change == "dedup_sort":
+        resource.apply_hints(columns={"contentful_dlt_priority": {"dedup_sort": "asc"}})
+    else:
+        resource.apply_hints(table_name="another_table")
+    with pytest.raises(PipelineStepFailed):
+        pipeline.run(resource)
+    assert fake.requests == []
+
+
+def test_shuffled_conflicting_pages_converge_to_identical_final_documents(pipeline, fake):
+    old = fake.entry("same", "OLD", updated_at="2026-01-01T00:00:00Z")
+    new = fake.entry("same", "CURRENT", updated_at="2026-03-01T00:00:00Z")
+    deleted = fake.deleted("same", deleted_at="2026-02-01T00:00:00Z")
+    fake.live[("Entry", "same")] = new
+    fake.sync_pages["initial"] = {
+        "items": [old, deepcopy(old)],
+        "nextPageUrl": fake.sync_url("page2"),
+    }
+    fake.delta("page2", [deleted, new], "terminal")
+    table = _run(pipeline, fake, source_id="first")
+    before = _rows(pipeline, table)
+    fake.sync_pages["initial"] = {"items": [new], "nextPageUrl": fake.sync_url("page2")}
+    fake.delta("page2", [deleted, old, deepcopy(new)], "terminal")
+    second = _run(pipeline, fake, source_id="second")
+    assert _rows(pipeline, second) == before
+    assert len(before) == 1 and "CURRENT" in _text(before) and "OLD" not in _text(before)
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_equal_timestamp_conflicts_accept_authoritative_lookup_in_either_order(
+    pipeline, fake, reverse
+):
+    from cognee_community_connector_contentful._http import fingerprint
+
+    candidates = [fake.entry("same", "FIRST_PAYLOAD"), fake.entry("same", "SECOND_PAYLOAD")]
+    # The matching detail must be the second fingerprint, guarding against
+    # selecting one arbitrary equal-timestamp event before consulting the CDN.
+    authoritative = sorted(candidates, key=fingerprint)[1]
+    expected = authoritative["fields"]["body"]["en-US"]
+    fake.live[("Entry", "same")] = authoritative
+    fake.initial_items = list(reversed(candidates)) if reverse else candidates
+    table = _run(pipeline, fake)
+    rows = _rows(pipeline, table)
+    assert len(rows) == 1
+    assert expected in _text(rows)
+    assert len(_lookup_requests(fake, "entries")) == 1
+
+
+@pytest.mark.parametrize("invalid_type", [[], {}])
+@pytest.mark.parametrize("endpoint", ["sync", "models"])
+def test_malformed_entity_type_has_named_response_error_not_type_error(
+    pipeline, fake, invalid_type, endpoint
+):
+    from cognee_community_connector_contentful import ContentfulResponseError
+
+    entity = fake.entry("one", "INVALID") if endpoint == "sync" else fake.model()
+    entity["sys"]["type"] = invalid_type
+    if endpoint == "sync":
+        fake.initial_items = [entity]
+    else:
+        fake.models = [entity]
+    with pytest.raises(PipelineStepFailed) as captured:
+        _run(pipeline, fake)
+    error = captured.value
+    chain = []
+    while error is not None and error not in chain:
+        chain.append(error)
+        error = error.__cause__ or error.__context__
+    assert any(isinstance(error, ContentfulResponseError) for error in chain)
+    assert not any(isinstance(error, TypeError) for error in chain)
+
+
+def test_retained_model_preserves_title_policy_until_complete_inventory_confirms_change(
+    pipeline, fake
+):
+    original_model = fake.model()
+    fake.models = [original_model]
+    one = fake.entry(
+        "one",
+        "",
+        fields={
+            "title": {"en-US": "ONE_OLD_TITLE"},
+            "headline": {"en-US": "ONE_NEW_TITLE"},
+            "body": {"en-US": "ONE_ORIGINAL_BODY"},
+        },
+    )
+    two = fake.entry(
+        "two",
+        "",
+        fields={
+            "title": {"en-US": "TWO_OLD_TITLE"},
+            "headline": {"en-US": "TWO_NEW_TITLE"},
+            "body": {"en-US": "TWO_BODY"},
+        },
+    )
+    fake.initial_items = [one, two]
+    table = _run(pipeline, fake)
+    before = _rows(pipeline, table)
+    model_id = next(identifier for identifier in before if ":ContentType:" in identifier)
+    one_id = next(identifier for identifier in before if identifier.endswith(":Entry:one"))
+    two_id = next(identifier for identifier in before if identifier.endswith(":Entry:two"))
+    assert before[one_id]["title"] == "ONE_OLD_TITLE"
+    assert before[two_id]["title"] == "TWO_OLD_TITLE"
+
+    changed_model = deepcopy(original_model)
+    changed_model["displayField"] = "headline"
+    changed_model["sys"]["revision"] = 2
+    fake.models = []
+    fake.live[("ContentType", "article")] = changed_model
+    updated_one = deepcopy(one)
+    updated_one["fields"]["body"]["en-US"] = "ONE_UPDATED_BODY"
+    fake.delta("t1", [updated_one], "t2")
+    _run(pipeline, fake)
+    retained = _rows(pipeline, table)
+    assert retained[model_id] == before[model_id]
+    assert retained[one_id]["title"] == "ONE_OLD_TITLE"
+    assert retained[two_id]["title"] == "TWO_OLD_TITLE"
+    assert "ONE_UPDATED_BODY" in retained[one_id]["content"]
+    assert "ONE_ORIGINAL_BODY" not in retained[one_id]["content"]
+    assert retained[two_id] == before[two_id]
+    assert _sync_requests(fake)[-1].url.params["sync_token"] == "t1"
+
+    fake.models = [changed_model]
+    fake.initial_items = [updated_one, two]
+    fake.initial_token = "confirmed"
+    sync_count = len(_sync_requests(fake))
+    _run(pipeline, fake)
+    confirmed = _rows(pipeline, table)
+    assert _sync_requests(fake)[sync_count].url.params.get("initial") in {"true", "True", "1"}
+    assert confirmed[one_id]["title"] == "ONE_NEW_TITLE"
+    assert confirmed[two_id]["title"] == "TWO_NEW_TITLE"
+    assert confirmed[model_id] != before[model_id]
+    _run(pipeline, fake)
+    assert _sync_requests(fake)[-1].url.params["sync_token"] == "confirmed"
+
+
+@pytest.mark.parametrize("hint", ["pre_deduplicated", "disabled_delete", "text_delete"])
+def test_streaming_merge_rejects_hints_that_bypass_reconciliation(pipeline, fake, hint):
+    resource = _source(fake)
+    if hint == "pre_deduplicated":
+        resource.apply_hints(
+            write_disposition={
+                "disposition": "merge",
+                "strategy": "delete-insert",
+                "deduplicated": True,
+            }
+        )
+    else:
+        resource.apply_hints(
+            columns={
+                "_deleted": {
+                    "data_type": "text" if hint == "text_delete" else "bool",
+                    "hard_delete": hint == "text_delete",
+                }
+            }
+        )
+    with pytest.raises(PipelineStepFailed):
+        pipeline.run(resource)
+    assert fake.requests == []

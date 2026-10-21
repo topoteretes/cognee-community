@@ -3,10 +3,10 @@ name = "cognee-community-connector-contentful"
 version = "0.1.0"
 description = "Contentful data-source connector for Cognee with incremental sync and deletion reconciliation"
 readme = "README.md"
-requires-python = ">=3.11,<3.14"
+requires-python = ">=3.10,<3.14"
 dependencies = [
-    "cognee>=1.6.3,<1.7",
-    "dlt[sqlalchemy]>=1.30,<1.31",
+    "cognee>=1.6.3,<2",
+    "dlt[sqlalchemy]>=1.30,<2",
     "httpx>=0.28,<0.29",
 ]
 
@@ -36,7 +36,7 @@ testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "N", "B", "UP", "C4", "PGH", "SIM", "RUF"]

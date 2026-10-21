@@ -197,21 +197,25 @@ class FakeContentful:
                 )
             return httpx.Response(200, json=deepcopy(payload))
         if path.endswith("/content_types"):
-            token = request.url.params.get("pageNext")
-            if token:
-                pass_id, offset = map(int, token.split("-"))
-            else:
+            offset = int(request.url.params.get("skip", "0"))
+            requested_limit = int(request.url.params.get("limit", "100"))
+            limit = min(requested_limit, self.model_page_size)
+            if offset == 0:
                 self.model_pass_count += 1
-                pass_id, offset = self.model_pass_count, 0
-                index = min(pass_id - 1, len(self.model_passes) - 1)
+                index = min(self.model_pass_count - 1, len(self.model_passes) - 1)
                 snapshot = self.model_passes[index] if self.model_passes else self.models
-                self._model_snapshots[pass_id] = deepcopy(snapshot)
-            snapshot = self._model_snapshots[pass_id]
-            end = offset + self.model_page_size
-            pages = {}
-            if end < len(snapshot):
-                pages["next"] = f"{self.url('content_types')}?pageNext={pass_id}-{end}"
-            return httpx.Response(200, json={"items": snapshot[offset:end], "pages": pages})
+                self._model_snapshots[self.model_pass_count] = deepcopy(snapshot)
+            snapshot = self._model_snapshots[self.model_pass_count]
+            return httpx.Response(
+                200,
+                json={
+                    "sys": {"type": "Array"},
+                    "items": snapshot[offset : offset + limit],
+                    "total": len(snapshot),
+                    "skip": offset,
+                    "limit": limit,
+                },
+            )
         for endpoint, kind in (
             ("entries", "Entry"),
             ("assets", "Asset"),
