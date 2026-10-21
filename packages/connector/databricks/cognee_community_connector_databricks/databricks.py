@@ -39,6 +39,7 @@ import os
 import re
 from collections import defaultdict
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlparse
 
@@ -81,6 +82,10 @@ def databricks_source(
     host: str | None = None,
     token: str | None = None,
     lineage: bool = True,
+    queries: dict[str, str] | None = None,
+    warehouse_id: str | None = None,
+    max_query_rows: int = 100,
+    query_timeout: int = 30,
     full_refresh: bool = False,
     resource_name: str = "databricks_workspace",
     check_active: Callable[[], None] | None = None,
@@ -104,6 +109,14 @@ def databricks_source(
         token: A personal access token. Falls back to ``DATABRICKS_TOKEN``.
         lineage: Join notebooks and tables through Unity Catalog lineage. Off,
             notebooks list the synced tables their code mentions instead.
+        queries: Named read-only queries whose results are synced, like
+            ``{"open_orders": "SELECT ... ORDER BY order_id"}``. Off by
+            default: each one runs on every sync and wakes the warehouse.
+        warehouse_id: The SQL warehouse the queries run on. Falls back to
+            ``DATABRICKS_WAREHOUSE_ID``.
+        max_query_rows: Rows kept from each query's result (default 100).
+        query_timeout: Seconds a query may run before Databricks cancels it,
+            5 to 50 (default 30).
         full_refresh: Export every notebook and re-send every table again.
         resource_name: Stable dlt resource name. Give each workspace its own
             name when several sync into one dataset, so their state stays
@@ -122,11 +135,12 @@ def databricks_source(
         )
 
     roots, scopes = _normalize_paths(paths), _normalize_scopes(tables)
-    if not roots and not scopes:
+    named = _named_queries(queries, warehouse_id, max_query_rows, query_timeout)
+    if not roots and not scopes and not named.queries:
         # An empty selection would forget everything synced before, so refuse it.
         raise ValueError(
-            "Nothing is selected. Pass paths=[...] for notebooks and/or tables=[...] "
-            "for Unity Catalog, or set DATABRICKS_PATHS / DATABRICKS_TABLES."
+            "Nothing is selected. Pass paths=[...] for notebooks, tables=[...] for Unity "
+            "Catalog and/or queries={...}, or set DATABRICKS_PATHS / DATABRICKS_TABLES."
         )
     if client is None:
         # Built here, so a missing host or token fails when the source is
@@ -157,7 +171,14 @@ def databricks_source(
     def databricks_items():
         stats.clear()
         rows = _iter_rows(
-            client, roots, scopes, dlt.current.resource_state(), stats, full_refresh, lineage
+            client,
+            roots,
+            scopes,
+            dlt.current.resource_state(),
+            stats,
+            full_refresh,
+            lineage,
+            named,
         )
         yield from dlt_utils.guarded_rows(rows, check_active)
 
@@ -171,7 +192,7 @@ def databricks_source(
     return resource
 
 
-def _iter_rows(client, paths, scopes, state, stats, full_refresh=False, lineage=True):
+def _iter_rows(client, paths, scopes, state, stats, full_refresh=False, lineage=True, named=None):
     """Yield every document and ``_deleted`` row of one sync.
 
     A folder or scope that fails keeps its saved state and is retried on the
@@ -182,22 +203,24 @@ def _iter_rows(client, paths, scopes, state, stats, full_refresh=False, lineage=
     _claim_state(client, state)
     roots = _expand_home(client, paths)
     failed: set[str] = set()
+    named = named or _NamedQueries()
     yield from _sync_workspace(client, roots, scopes, state, stats, failed, full_refresh, lineage)
+    yield from _sync_queries(client, named, state, stats, failed, full_refresh)
     if failed:
         stats["failed"] = len(failed)
+    kinds = ("notebooks", "tables", "queries")
     logger.info(
-        "Databricks: %d notebook(s) and %d table(s) listed, %d sent, %d forgotten, "
-        "%d folder(s) or scope(s) failed.",
-        stats.get("notebooks", 0),
-        stats.get("tables", 0),
-        stats.get("notebooks_changed", 0) + stats.get("tables_changed", 0),
-        stats.get("notebooks_deleted", 0) + stats.get("tables_deleted", 0),
+        "Databricks: %d notebook(s), %d table(s) and %d query(ies), %d sent, %d forgotten, "
+        "%d folder(s), scope(s) or query(ies) failed.",
+        *(stats.get(kind, 0) for kind in kinds),
+        sum(stats.get(f"{kind}_changed", 0) for kind in kinds),
+        sum(stats.get(f"{kind}_deleted", 0) for kind in kinds),
         len(failed),
     )
-    if failed and len(failed) == len(roots) + len(scopes):
+    if failed and len(failed) == len(roots) + len(scopes) + len(named.queries):
         raise DatabricksConnectorError(
-            f"Nothing selected in Databricks could be synced: {len(failed)} folder(s) or "
-            "scope(s) failed. Nothing was forgotten."
+            f"Nothing selected in Databricks could be synced: {len(failed)} folder(s), "
+            "scope(s) or query(ies) failed. Nothing was forgotten."
         )
 
 
@@ -281,6 +304,10 @@ class _Checked:
         self._check_active()
         return self._client.get(path, params)
 
+    def post(self, path, body):
+        self._check_active()
+        return self._client.post(path, body)
+
     def pages(self, path, params, items_key):
         self._check_active()
         yield from self._client.pages(path, params, items_key)
@@ -335,6 +362,13 @@ class _DatabricksClient:
         """One GET request, returning its JSON object."""
         self._check_active()
         response = self._rest.get(path, params=params or {})
+        self._on_response(response)
+        return response.json()
+
+    def post(self, path: str, body: dict) -> dict:
+        """One POST request with a JSON body, returning its JSON object."""
+        self._check_active()
+        response = self._rest.post(path, json=body)
         self._on_response(response)
         return response.json()
 
@@ -1261,3 +1295,142 @@ def _notebook_list(ids, names: dict) -> str:
         plural = "s" if outside > 1 else ""
         named.append(f"{outside} notebook{plural} outside the synced folders")
     return ", ".join(named)
+
+
+# ---------------------------------------------------------------------------
+# Named queries: off by default. Only the queries the user names are run, on
+# the warehouse the user names, never SQL found in a notebook. Each one runs on
+# every sync through the Statement Execution API, with a row cap, a byte cap and
+# a timeout after which Databricks cancels it, since a running query keeps a
+# warehouse awake. A result becomes one document, sent on only when it changed.
+# ---------------------------------------------------------------------------
+
+# A guard against a typo, not a sandbox: the token's permissions decide what can
+# run. The Statement Execution API runs one statement per call.
+_READ_ONLY = re.compile(r"^\s*(?:--[^\n]*\n\s*)*(?:select|with|show|describe|desc)\b", re.I)
+
+# Bytes of results kept at most, whatever the row cap; the API cuts the result
+# there and marks it truncated.
+_QUERY_BYTE_LIMIT = 1_000_000
+
+
+@dataclass(frozen=True)
+class _NamedQueries:
+    queries: dict[str, str] = field(default_factory=dict)
+    warehouse_id: str | None = None
+    max_rows: int = 100
+    timeout: int = 30
+
+
+def _named_queries(queries, warehouse_id, max_rows, timeout) -> _NamedQueries:
+    """Check the named queries when the source is built, not halfway through a run."""
+    queries = dict(queries or {})
+    for name, sql in queries.items():
+        if not re.fullmatch(r"[\w-]+", str(name)):
+            raise ValueError("Query names are letters, digits, _ and -, like open_orders.")
+        if not isinstance(sql, str) or not _READ_ONLY.match(sql):
+            raise ValueError(
+                "Only read-only queries are run: SELECT, WITH, SHOW or DESCRIBE statements."
+            )
+    warehouse = warehouse_id or os.environ.get("DATABRICKS_WAREHOUSE_ID")
+    if queries and not warehouse:
+        raise ValueError(
+            "Named queries need a SQL warehouse: pass warehouse_id= or set DATABRICKS_WAREHOUSE_ID."
+        )
+    if max_rows < 1:
+        raise ValueError("max_query_rows must be at least 1.")
+    # The Statement Execution API waits 5 to 50 seconds for a statement.
+    if not 5 <= timeout <= 50:
+        raise ValueError("query_timeout is 5 to 50 seconds.")
+    return _NamedQueries(queries, warehouse, max_rows, timeout)
+
+
+def _sync_queries(client, named: _NamedQueries, state, stats, failed, full_refresh=False):
+    """Yield a document for every query whose result changed, and a ``_deleted``
+    row for every query no longer named. A query that fails keeps its last result.
+    """
+    saved = state.setdefault("queries", {})
+    for name in sorted(set(saved) - set(named.queries)):
+        saved.pop(name)
+        stats["queries_deleted"] = stats.get("queries_deleted", 0) + 1
+        yield {"id": f"{ID_PREFIX}query:{name}", "_deleted": True}
+
+    for name, sql in sorted(named.queries.items()):
+        stats["queries"] = stats.get("queries", 0) + 1
+        try:
+            columns, rows, truncated = _run_query(client, named, sql)
+        except DatabricksAuthError:
+            raise
+        except DatabricksConnectorError as error:
+            failed.add(f"query:{name}")
+            logger.warning(
+                "Databricks: a query failed (%s); its last result is kept.",
+                type(error).__name__,
+            )
+            continue
+        text = _render_query(name, sql, columns, rows, truncated)
+        digest = _digest(text)
+        if full_refresh or digest != saved.get(name, {}).get("hash"):
+            stats["queries_changed"] = stats.get("queries_changed", 0) + 1
+            yield {
+                "id": f"{ID_PREFIX}query:{name}",
+                "title": f"Query {name}",
+                "content": text,
+                "_deleted": False,
+            }
+        saved[name] = {"hash": digest}
+
+
+def _run_query(client, named: _NamedQueries, sql: str):
+    """Run one query; return its column names, rows, and whether it was cut."""
+    answer = client.post(
+        "/api/2.0/sql/statements",
+        {
+            "warehouse_id": named.warehouse_id,
+            "statement": sql,
+            "wait_timeout": f"{named.timeout}s",
+            # Cancelled at the timeout, so a slow query never keeps running.
+            "on_wait_timeout": "CANCEL",
+            "row_limit": named.max_rows,
+            "byte_limit": _QUERY_BYTE_LIMIT,
+            "format": "JSON_ARRAY",
+            "disposition": "INLINE",
+        },
+    )
+    status = answer.get("status") or {}
+    if status.get("state") != "SUCCEEDED":
+        code = (status.get("error") or {}).get("error_code") or status.get("state")
+        raise DatabricksConnectorError(f"A query did not finish ({code}).")
+    manifest = answer.get("manifest") or {}
+    columns = [c.get("name", "") for c in (manifest.get("schema") or {}).get("columns") or []]
+    chunk = answer.get("result") or {}
+    rows = list(chunk.get("data_array") or [])
+    # A large result comes in chunks; the rest are read so nothing is cut quietly.
+    while chunk.get("next_chunk_index") is not None:
+        chunk = client.get(
+            f"/api/2.0/sql/statements/{answer['statement_id']}/result/chunks/"
+            f"{chunk['next_chunk_index']}"
+        )
+        rows.extend(chunk.get("data_array") or [])
+    return columns, rows, bool(manifest.get("truncated"))
+
+
+def _render_query(name: str, sql: str, columns, rows, truncated: bool) -> str:
+    """A query as text: its SQL, then its result as a table."""
+    if truncated:
+        summary = f"Result: the first {len(rows)} rows, more not shown"
+    else:
+        summary = f"Result: {len(rows)} row{'' if len(rows) == 1 else 's'}"
+    lines = [summary]
+    if columns:
+        lines.append("| " + " | ".join(_cell(c) for c in columns) + " |")
+        lines.append("|" + " --- |" * len(columns))
+        lines.extend("| " + " | ".join(_cell(v) for v in row) + " |" for row in rows)
+    text, _ = _scrub(
+        f"Databricks query {name}\n\nSQL:\n```sql\n{sql.strip()}\n```\n\n" + "\n".join(lines)
+    )
+    return text
+
+
+def _cell(value) -> str:
+    return "" if value is None else " ".join(str(value).split()).replace("|", "\\|")

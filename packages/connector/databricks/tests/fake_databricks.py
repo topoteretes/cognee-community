@@ -50,6 +50,11 @@ class FakeWorkspace:
         self.schemas: dict[str, dict] = {}
         self.tables: dict[str, dict] = {}
         self.lineage: dict[str, dict] = {}
+        # SQL -> (columns, rows), or a final state like "FAILED" or "CANCELED".
+        self.results: dict[str, object] = {}
+        # Rows per result chunk, as the Statement Execution API splits them.
+        self.chunk_rows = 1000
+        self._chunks: dict[str, list] = {}
 
     # -- building a workspace -------------------------------------------------
     def folder(self, path, kind="DIRECTORY"):
@@ -192,6 +197,13 @@ class FakeWorkspace:
         for failing, error in self.failing.items():
             if target == failing or (path.endswith(failing)):
                 raise error
+        if path.startswith("/api/2.0/sql/statements/"):
+            statement_id, index = path.split("/")[5], int(path.rsplit("/", 1)[1])
+            chunks = self._chunks[statement_id]
+            chunk = {"data_array": chunks[index]}
+            if index + 1 < len(chunks):
+                chunk["next_chunk_index"] = index + 1
+            return chunk
         if path == "/api/2.0/preview/scim/v2/Me":
             return {"userName": HOME.rsplit("/", 1)[1], "active": True}
         if path == "/api/2.0/workspace/get-status" and target == "/":
@@ -232,6 +244,35 @@ class FakeWorkspace:
                 raise _not_found()
             return {"content": base64.b64encode(obj["source"].encode()).decode(), "file_type": "py"}
         raise AssertionError(f"unexpected request {path}")
+
+    def post(self, path, body):
+        """The Statement Execution API, answering from ``results``."""
+        self.calls.append((path, body))
+        assert path == "/api/2.0/sql/statements"
+        result = self.results[body["statement"]]
+        statement_id = f"stmt-{next(self._ids)}"
+        if isinstance(result, str):
+            error = {"error_code": "BAD_REQUEST"} if result == "FAILED" else None
+            return {"statement_id": statement_id, "status": {"state": result, "error": error}}
+        columns, rows = result
+        kept = rows[: body["row_limit"]]
+        chunks = [kept[i : i + self.chunk_rows] for i in range(0, len(kept), self.chunk_rows)] or [
+            []
+        ]
+        self._chunks[statement_id] = chunks
+        first = {"data_array": chunks[0]}
+        if len(chunks) > 1:
+            first["next_chunk_index"] = 1
+        return {
+            "statement_id": statement_id,
+            "status": {"state": "SUCCEEDED"},
+            "manifest": {
+                "schema": {"columns": [{"name": c, "type_name": "STRING"} for c in columns]},
+                "total_chunk_count": len(chunks),
+                "truncated": len(rows) > body["row_limit"],
+            },
+            "result": first,
+        }
 
     def pages(self, path, params, items_key):
         self.calls.append((path, params))
