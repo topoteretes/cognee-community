@@ -109,6 +109,7 @@ def monday_source(
             descriptions. Unchanged documents are not re-processed by cognee.
         resource_name: Stable dlt resource name. Give each account its own name
             when several sync into one dataset, so their state stays separate.
+            A name that already holds another account's sync is refused.
         check_active: Optional host authorization checkpoint, run before every
             API call and every row.
         client: A pre-built client, mainly for tests.
@@ -608,6 +609,9 @@ query ItemStamps($board: [ID!], $limit: Int!, $cursor: String) {
   }
 }"""
 
+# The account the token belongs to, which the saved state is tied to.
+_ACCOUNT_QUERY = "query Account { account { id } }"
+
 _ITEM_STATES_QUERY = """
 query ItemStates($ids: [ID!], $limit: Int!) {
   items(ids: $ids, limit: $limit, exclude_nonactive: false) { id state board { id } }
@@ -646,6 +650,7 @@ def _iter_rows(client, board_ids: list[str], state: dict, stats: dict, full_refr
     raises when no board finished, or when the token itself is refused.
     """
     selected = list(dict.fromkeys(str(board_id) for board_id in board_ids))
+    _claim_state(client, state)
     saved = state.setdefault("boards", {})
     boards, failed = _load_boards(client, selected), set()
     failed.update(board_id for board_id in selected if board_id not in boards)
@@ -697,6 +702,23 @@ def _iter_rows(client, board_ids: list[str], state: dict, stats: dict, full_refr
         raise MondayAPIError(
             f"No monday.com board could be synced: {len(failed)} board(s) were not found, "
             "are not shared with this token, or failed. Nothing was forgotten."
+        )
+
+
+def _claim_state(client, state: dict) -> None:
+    """Tie the saved state to one monday.com account, or refuse another one.
+
+    Boards in the state that are not selected get forgotten, so a second account
+    syncing under the same resource name would forget the first one's boards,
+    and the next run of the first would forget the second's.
+    """
+    account = (client.query(_ACCOUNT_QUERY).get("account") or {}).get("id")
+    if not account:
+        raise MondayAPIError("monday.com did not say which account the token belongs to.")
+    if state.setdefault("account", str(account)) != str(account):
+        raise MondayAPIError(
+            "This resource_name already holds the sync of another monday.com account. "
+            "Give each account its own resource_name. Nothing was read or forgotten."
         )
 
 

@@ -18,7 +18,8 @@ def _now() -> str:
 
 
 class FakeMonday:
-    def __init__(self):
+    def __init__(self, account_id="1"):
+        self.account_id = account_id
         self.boards: dict[str, dict] = {}
         self.items: dict[str, dict] = {}
         self.calls: list[str] = []
@@ -105,6 +106,8 @@ class FakeMonday:
         name = _operation(query)
         self.calls.append(name)
         variables = variables or {}
+        if name == "Account":
+            return {"account": {"id": self.account_id}}
         if name == "Boards":
             assert "state: all" in query
             return {"boards": [self.boards[i] for i in variables["ids"] if i in self.boards]}

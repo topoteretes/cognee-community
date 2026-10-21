@@ -64,7 +64,7 @@ the full flow.
 | `board_ids` | `MONDAY_BOARD_IDS` (comma-separated) | required; sub-item boards are added automatically |
 | `token` | `MONDAY_API_TOKEN` | required |
 | `full_refresh` | – | `False`; `True` re-reads every item (see Limitations) |
-| `resource_name` | – | `monday_items`; give each account its own name when several sync into one dataset |
+| `resource_name` | – | `monday_items`; give each account its own name when several sync into one dataset. A name that already holds another account's sync is refused, so one account can never forget another's items |
 | `check_active` | – | optional host checkpoint, run before every API call and every row |
 
 After a run, `source.cognee_sync_stats` holds counts only (`scanned`, `changed`, `deleted`,
@@ -162,8 +162,8 @@ This connector reads work data. Be clear about what it does:
 - The text above becomes cognee documents. During cognify it is sent to your configured LLM
   and embedding providers, like any document you add to cognee. Use local models if that
   matters to you.
-- dlt state stores board ids and, per item, its id and a short hash of its stamps. It does not
-  store names, column values or update text.
+- dlt state stores the account id, board ids and, per item, its id and a short hash of its
+  stamps. It does not store names, column values or update text.
 - Logs and `cognee_sync_stats` contain counts only, never names, ids or content.
 - Your API token is never logged or put in error messages. Keep it out of your code and
   repository; regenerate it on the Developers page if it leaks.
@@ -207,7 +207,9 @@ the answer, and archived and deleted items are still returned by id.
   purged and moved items, archived, deleted and deselected boards, a contradicted listing that
   must not delete), and failures (a lost board, a failing board that must not stop the others,
   a refused token, logs with counts only).
-- `test_source.py` covers the factory, its token and board id checks, and `list_boards`.
+- `test_source.py` covers the factory, its token and board id checks, `list_boards`, and,
+  through a real dlt pipeline, a second account under the same `resource_name` being refused
+  and two accounts with their own names staying apart in one dataset.
 - `test_forget.py` runs the real cognee pipeline (LLM and embeddings mocked) over three syncs:
   deleted items and archived sub-items leave the graph, a new update enters it, and a sync
   where a deletion is the only change still forgets.
