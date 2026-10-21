@@ -59,7 +59,7 @@ Design
 import os
 import time
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from typing import Any
 
@@ -146,6 +146,9 @@ class _ObjectType:
     windowed: bool
     list_params: dict[str, Any]
     render: Callable[[dict, "RenderOptions"], dict[str, Any]]
+    # Extra parameters for retrieving one object (the list form of ``expand``
+    # is prefixed with ``data.``, so each endpoint spells it out).
+    retrieve_params: dict[str, Any] = field(default_factory=dict)
 
     @property
     def table_name(self) -> str:
@@ -395,7 +398,7 @@ def _sync_changed(
     """Re-read the objects events named; tombstone the ones that are gone."""
     service = _service(client, object_type)
     for object_id in sorted(ids):
-        obj = _retrieve(service, object_id)
+        obj = _retrieve(service, object_id, object_type.retrieve_params)
         out_of_window = (
             obj is not None
             and object_type.windowed
@@ -445,10 +448,10 @@ def list_all(service: Any, params: dict[str, Any]) -> Iterator[dict]:
         starting_after = data[-1]["id"]
 
 
-def _retrieve(service: Any, object_id: str) -> dict | None:
+def _retrieve(service: Any, object_id: str, params: dict[str, Any]) -> dict | None:
     """The object as a dict, or None when it was deleted."""
     try:
-        obj = service.retrieve(object_id).to_dict()
+        obj = service.retrieve(object_id, params=params).to_dict()
     except stripe.InvalidRequestError as error:
         if error.http_status == 404:
             return None
@@ -582,6 +585,20 @@ def render_invoice(invoice: dict, options: RenderOptions) -> dict[str, Any]:
         _node("invoice", invoice["id"]),
         _node("subscription", subscription_id),
     ]
+    # Since API version 2025-03-31 a charge no longer names its invoice. The
+    # invoice's payments name the PaymentIntent (or charge) that paid it, and the
+    # charge names its PaymentIntent, so both documents share that node set.
+    payment_intents = []
+    for invoice_payment in (invoice.get("payments") or {}).get("data") or []:
+        payment = invoice_payment.get("payment") or {}
+        payment_intent_id = _id(payment.get("payment_intent"))
+        if payment_intent_id:
+            payment_intents.append(payment_intent_id)
+        node_sets += [
+            _node("payment_intent", payment_intent_id),
+            _node("charge", _id(payment.get("charge"))),
+        ]
+    lines.append(_field("Payment intent", ", ".join(payment_intents)))
     line_items = invoice.get("lines") or {}
     entries = line_items.get("data") or []
     if entries:
@@ -611,7 +628,9 @@ def render_invoice(invoice: dict, options: RenderOptions) -> dict[str, Any]:
 
 def render_charge(charge: dict, options: RenderOptions) -> dict[str, Any]:
     customer_id = _id(charge.get("customer"))
+    # Charges before API version 2025-03-31 name their invoice directly.
     invoice_id = _id(charge.get("invoice"))
+    payment_intent_id = _id(charge.get("payment_intent"))
     currency = charge.get("currency")
     amount = _money(charge.get("amount"), currency)
     of_customer = f" of customer {customer_id}" if customer_id else ""
@@ -620,6 +639,7 @@ def render_charge(charge: dict, options: RenderOptions) -> dict[str, Any]:
         _field("Status", charge.get("status")),
         _field("Description", charge.get("description")),
         _field("Invoice", invoice_id),
+        _field("Payment intent", payment_intent_id),
         _field("Created", _day(charge.get("created"))),
         _field("Captured", _money(charge.get("amount_captured"), currency)),
         _field("Refunded", _money(charge.get("amount_refunded") or None, currency)),
@@ -635,6 +655,7 @@ def render_charge(charge: dict, options: RenderOptions) -> dict[str, Any]:
             _node("charge", charge["id"]),
             _node("customer", customer_id),
             _node("invoice", invoice_id),
+            _node("payment_intent", payment_intent_id),
         ],
     }
 
@@ -700,7 +721,10 @@ OBJECT_TYPES: dict[str, _ObjectType] = {
             stripe_object="invoice",
             dashboard_path="invoices",
             windowed=True,
-            list_params={},
+            # An invoice names the charge that paid it only through its payments,
+            # which Stripe leaves out unless asked.
+            list_params={"expand": ["data.payments"]},
+            retrieve_params={"expand": ["payments"]},
             render=render_invoice,
         ),
         _ObjectType(
