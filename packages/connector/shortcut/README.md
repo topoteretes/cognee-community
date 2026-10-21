@@ -191,14 +191,20 @@ their own.
 - **`403` or `404`**: kept. The item may be hidden from this token, or Shortcut may be failing
   or the token may have lost a permission; only the first is a reason to forget it. So the
   answer counts only when access to that kind is shown to work in the same run: another
-  story (or iteration) was read, or, when nothing else of that kind changed, one unchanged
-  item is read as a check (one request, and only while something is unreadable). If the
-  check answers `403`/`404` too, or there is nothing to check with, nothing counts, a warning
-  names the token's permissions, and the stats count it as `failed_permission`; if the check
-  hits a server error, nothing counts either. After three counted runs at the same
-  `updated_at` **and** 24 hours since the first, the document is forgotten. A forgotten item
-  is asked again when its `updated_at` moves, and otherwise once a day (at most 10 per run,
-  after everything else); if it reads again, it comes back.
+  story (or iteration) was read, or, when nothing else of that kind changed, unchanged items
+  are read as a check, newest first, until one reads (at most three requests, and only while
+  something is unreadable; the newest may be hidden itself). If all of them answer
+  `403`/`404`, or there is nothing to check with, nothing counts, a warning names the token's
+  permissions, and the stats count it as `failed_permission`; if a check hits a server error,
+  nothing counts either. After three counted runs at the same `updated_at` **and** 24 hours
+  since the first, the document is forgotten. A forgotten item is asked again when its
+  `updated_at` moves, and otherwise once a day (every one that is due, after everything
+  else); if it reads again, it comes back, and if not, the stats count it as `reask_failed`,
+  not `failed`.
+- **The 24 hours** are measured on Shortcut's clock (the `Date` header), so a local clock that
+  jumps ahead cannot make a day pass in minutes. When the two clocks differ by over a minute,
+  nothing is forgotten in that run (counting goes on); a time stored in the future is brought
+  back to now. Without a `Date` header the local clock is all there is.
 - **A server error or no answer** that outlasts the retries: kept. Three of these in a row on
   fresh items means Shortcut itself is down, and the run stops cleanly (below).
 
@@ -224,8 +230,9 @@ echo it; a response body never is.
 (stories listed), `skipped` (unchanged), `failed` (item failures), `deleted`, `kept` (items
 waiting for a retry) and `given_up`, plus `failed_auth`, `failed_rate_limit` or
 `failed_unavailable` when the run stopped early for that reason, `failed_permission` (items
-answering `403`/`404` while nothing of their kind could be read), and `probe_story` /
-`probe_iteration` when a check request was made.
+answering `403`/`404` while nothing of their kind could be read), `reask_failed` (forgotten
+items asked again that are still unreadable), and `probe_story` / `probe_iteration` (check
+requests made).
 
 ## Limits
 
@@ -241,8 +248,10 @@ answering `403`/`404` while nothing of their kind could be read), and `probe_sto
   until that story changes for another reason.
 - Epic comments and iteration-level discussion are not read.
 - A story or iteration that answers `403` or `404` while others of its kind read fine, in
-  three runs over at least 24 hours, is forgotten until it changes or reads again (asked
-  once a day).
+  three runs over at least 24 hours of Shortcut's clock, is forgotten until it changes or
+  reads again (asked once a day).
+- If Shortcut's `Date` and the local clock disagree by more than a minute (a skewed host, or a
+  proxy caching `Date`), nothing is forgotten until they agree; the warning says so.
 - Deletions propagate on a foreground `remember(...)`. cognee skips orphan cleanup for
   `run_in_background=True`.
 
@@ -301,13 +310,16 @@ fingerprint, the date-window splitting, the cursor and its overlap, one-second t
 renames and deletions of epics, iterations, labels, states and owners, iterations fetched
 only on change, story deletion, stories and iterations that fail on their own (kept and
 retried, retries going last, three unreadable ones not blocking a run, `403`/`404` counted
-only when access is shown to work, with a check request in steady state, nothing forgotten
-in a partial outage, within a day, or after a lost permission, given-up items asked again
-after a day, runs that stopped early counting nothing), the clean stops (`401` mid-run, rate
+only when access is shown to work, with check requests in steady state that move past a
+hidden one, nothing forgotten in a partial outage, within a day, after a lost permission or
+on a local clock that jumps ahead, times stored in the future brought back, given-up items
+all asked again after a day without counting as failures, runs that stopped early counting
+nothing), the clean stops (`401` mid-run, rate
 limit, long `Retry-After`, the run's wait budget, outage) and what the next run picks up,
 the sweep ending at the later of Shortcut's and the local clock (a stale `Date` included),
 bodies of the wrong shape (also on the split path), retries, the token never reaching a
-message, a log line or an error's `detail`, state written by the previous version, and the
+message, a log line or an error's `detail` (in any case, and where the message is cut),
+state written by the previous version, and the
 failure paths that must delete nothing. A real `dlt` pipeline into a temp sqlite destination
 checks edits, renames and deletes across runs (the deleted row is gone from the table), two
 sources in one dataset staying apart (also for deletions), a story kept and retried, a `401`

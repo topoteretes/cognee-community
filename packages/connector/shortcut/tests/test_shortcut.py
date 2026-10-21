@@ -1464,7 +1464,8 @@ def test_a_given_up_story_is_asked_again_after_a_day(fake):
     stats = {}
     rows = run_sync(fake, state, now=hours(60), stats=stats)
     assert 2 in fake.fetched_stories() and rows == []
-    assert stats["failed"] == 1 and stats["kept"] == 0
+    # Its document is already gone: no failure of the run, but counted and named.
+    assert stats["failed"] == 0 and stats["reask_failed"] == 1 and stats["kept"] == 0
     assert state["given_up"]["story:2"]["at"] == _stamp(hours(60))
     assert state["retry"] == [] and state["unreadable"] == {}
 
@@ -1475,28 +1476,27 @@ def test_a_given_up_story_is_asked_again_after_a_day(fake):
     assert tombstones(run_sync(fake, state, now=hours(85))) == []
 
 
-def test_given_up_items_are_asked_again_a_few_per_run_oldest_first(fake, monkeypatch):
-    monkeypatch.setattr(shortcut, "_MAX_REASKS", 1)
-    for story_id in (1, 2, 3):
+def test_every_given_up_item_that_is_due_is_asked_again_in_one_run(fake):
+    for story_id in range(1, 27):
         fake.add_story(story_id, updated_at=at(1))
     state = {}
     run_sync(fake, state)
-    # Stories 2 and 3 were forgotten two and three days ago.
+    # Stories 2 to 26 were forgotten two days ago (or by the previous version,
+    # which wrote a bare stamp); all of them read again.
     state["given_up"] = {
-        "story:2": {"stamp": at(1), "at": _stamp(hours(-48))},
-        "story:3": {"stamp": at(1), "at": _stamp(hours(-72))},
-    }
+        f"story:{i}": {"stamp": at(1), "at": _stamp(hours(-48))} for i in range(2, 26)
+    } | {"story:26": at(1)}
     state["known_ids"] = ["story:1"]
-    for key in ("2", "3"):
-        del state["fingerprints"][key]
-    fake.add_story(4, updated_at=at(6))
+    for i in range(2, 27):
+        del state["fingerprints"][str(i)]
+    fake.add_story(30, updated_at=at(6))
     fake.calls.clear()
 
     rows = run_sync(fake, state)
 
-    assert fake.fetched_stories() == [4, 3]  # new stories first, then the oldest one
-    assert set(story_rows(rows)) == {"story:3", "story:4"}
-    assert list(state["given_up"]) == ["story:2"]
+    assert fake.fetched_stories() == [30, *range(2, 27)]  # new stories first
+    assert set(story_rows(rows)) == {f"story:{i}" for i in (*range(2, 27), 30)}
+    assert state["given_up"] == {}
 
 
 def test_a_run_that_stops_early_counts_nothing_toward_giving_up(fake):
@@ -2258,3 +2258,249 @@ def test_sync_stats_count_what_a_run_did(fake):
     list(source)
     assert source.cognee_sync_stats["failed"] == 0
     assert source.cognee_sync_stats["failed_rate_limit"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Review round 4: clocks, checks, re-asks, redaction
+# ---------------------------------------------------------------------------
+def _edited_and_hidden(fake, story_id=2):
+    """Story ``story_id`` was edited and answers 403 on its next fetch."""
+    fake.stories[story_id]["updated_at"] = at(5)
+    fake.queue(f"/stories/{story_id}", _error(403, "Forbidden"))
+
+
+def _clocks(fake, monkeypatch, shortcut_now, local_now):
+    fake.clock = shortcut_now
+    monkeypatch.setattr(shortcut, "_local_now", lambda: local_now)
+
+
+def test_a_local_clock_jumping_ahead_forgets_nothing(fake, monkeypatch, caplog):
+    # Three counted runs within three real minutes; on the third the local clock
+    # is 25 hours ahead (an NTP step, a resumed VM).
+    for story_id in (1, 2):
+        fake.add_story(story_id, updated_at=at(1))
+    state = {}
+    run_sync(fake, state)
+    for minute, ahead in ((1, 0), (2, 0), (3, 25)):
+        _edited_and_hidden(fake)
+        moment = NOW + timedelta(minutes=minute)
+        _clocks(fake, monkeypatch, moment, moment + timedelta(hours=ahead))
+        stats = {}
+        rows = list(sync_stories(fake, state, stats=stats))
+
+    assert tombstones(rows) == [] and stats["given_up"] == 0 and state["given_up"] == {}
+    assert state["unreadable"]["story:2"]["runs"] == 3
+    assert "no item is forgotten in this run" in caplog.text
+
+
+def test_the_give_up_times_are_read_on_shortcuts_clock(fake, monkeypatch):
+    # The first counted run has a local clock 25 hours ahead: the 24 hours still
+    # start at Shortcut's time, not the local one.
+    for story_id in (1, 2):
+        fake.add_story(story_id, updated_at=at(1))
+    state = {}
+    run_sync(fake, state)
+    _edited_and_hidden(fake)
+    _clocks(fake, monkeypatch, hours(1), hours(26))
+
+    list(sync_stories(fake, state))
+
+    assert state["unreadable"]["story:2"]["since"] == _stamp(hours(1))
+
+
+def test_without_a_date_header_the_give_up_times_are_local(fake, monkeypatch):
+    for story_id in (1, 2):
+        fake.add_story(story_id, updated_at=at(1))
+    state = {}
+    run_sync(fake, state)
+    _edited_and_hidden(fake)
+    _clocks(fake, monkeypatch, None, hours(3))
+
+    list(sync_stories(fake, state))
+
+    assert state["unreadable"]["story:2"]["since"] == _stamp(hours(3))
+
+
+def test_nothing_is_forgotten_while_the_clocks_disagree(fake, monkeypatch):
+    for story_id in (1, 2):
+        fake.add_story(story_id, updated_at=at(1))
+    state = {}
+    run_sync(fake, state)
+    for run in (1, 2, 3):
+        _edited_and_hidden(fake)
+        run_sync(fake, state, now=hours(run))
+    assert state["given_up"] == {}  # three runs, but within a day
+
+    # Due by either clock, but they differ by two minutes: counted, not forgotten.
+    _edited_and_hidden(fake)
+    _clocks(fake, monkeypatch, hours(48), hours(48) + timedelta(minutes=2))
+    rows = list(sync_stories(fake, state))
+    assert tombstones(rows) == [] and state["unreadable"]["story:2"]["runs"] == 4
+
+    # The clocks agree again: it is forgotten.
+    _edited_and_hidden(fake)
+    _clocks(fake, monkeypatch, hours(49), hours(49))
+    rows = list(sync_stories(fake, state))
+    assert [r["id"] for r in tombstones(rows)] == ["story:2"]
+
+
+def test_a_reask_time_in_the_future_is_brought_back_to_now(fake, caplog):
+    # A run with a clock 30 days ahead forgot story 2: it is asked a day after
+    # the clock is right again, not 30 days later.
+    for story_id in (1, 2):
+        fake.add_story(story_id, updated_at=at(1))
+    state = {}
+    run_sync(fake, state)
+    state["given_up"] = {"story:2": {"stamp": at(1), "at": _stamp(hours(24 * 30))}}
+    state["known_ids"].remove("story:2")
+    del state["fingerprints"]["2"]
+
+    run_sync(fake, state, now=hours(1))
+    assert state["given_up"]["story:2"]["at"] == _stamp(hours(1))
+    assert "story:2 had at in the future" in caplog.text
+    fake.calls.clear()
+    run_sync(fake, state, now=hours(24))
+    assert fake.fetched_stories() == []
+    rows = run_sync(fake, state, now=hours(25))
+    assert set(story_rows(rows)) == {"story:2"} and state["given_up"] == {}
+
+
+def test_a_give_up_start_in_the_future_is_brought_back_to_now(fake):
+    for story_id in (1, 2):
+        fake.add_story(story_id, updated_at=at(1))
+    state = {}
+    run_sync(fake, state)
+    _edited_and_hidden(fake)
+    run_sync(fake, state, now=hours(1))
+    state["unreadable"]["story:2"] |= {"runs": 2, "since": _stamp(hours(24 * 30))}
+
+    _edited_and_hidden(fake)
+    run_sync(fake, state, now=hours(2))
+    assert state["unreadable"]["story:2"] == {"stamp": at(5), "runs": 3, "since": _stamp(hours(2))}
+    _edited_and_hidden(fake)
+    rows = run_sync(fake, state, now=hours(25))
+    assert tombstones(rows) == []  # 23 hours since the reset
+    _edited_and_hidden(fake)
+    rows = run_sync(fake, state, now=hours(26))
+    assert [r["id"] for r in tombstones(rows)] == ["story:2"]
+
+
+def test_a_hidden_check_story_moves_on_to_the_next_one(fake, caplog):
+    # Story 2 was edited and is hidden; story 6, the newest unchanged one, is
+    # hidden too; story 1 reads. Five runs over 48 hours.
+    fake.add_story(1, updated_at=at(1))
+    fake.add_story(2, updated_at=at(1))
+    fake.add_story(6, updated_at=at(3))
+    state = {}
+    run_sync(fake, state)
+    given_up = 0
+    for run in range(5):
+        _edited_and_hidden(fake)
+        fake.queue("/stories/6", _error(403, "Forbidden"))
+        fake.calls.clear()
+        stats = {}
+        run_sync(fake, state, now=hours(12 * run), stats=stats)
+        assert "failed_permission" not in stats
+        if run == 0:
+            assert fake.fetched_stories() == [2, 6, 1] and stats["probe_story"] == 2
+        given_up += stats["given_up"]
+    assert given_up == 1 and "story:2" in state["given_up"]
+    assert "check the token's permissions" not in caplog.text
+
+
+def test_a_hidden_check_iteration_moves_on_to_the_next_one(fake):
+    fake.add_iteration(3)
+    fake.add_iteration(4, name="Sprint 13", updated_at=at(2))
+    fake.add_iteration(5, name="Sprint 14")
+    state = {}
+    run_sync(fake, state)
+    fake.iterations[5]["updated_at"] = at(5)
+    for run in (1, 2, 3):
+        fake.queue("/iterations/5", _error(403, "Forbidden"))
+        fake.queue("/iterations/4", _error(403, "Forbidden"))
+        stats = {}
+        rows = run_sync(fake, state, now=hours(12 * run), stats=stats)
+        assert stats["probe_iteration"] == 2 and "failed_permission" not in stats
+    assert [r["id"] for r in tombstones(rows)] == ["iteration:5"]
+
+
+def test_the_check_tries_three_items_at_most(fake, caplog):
+    for story_id in (1, 2, 3, 4, 5):
+        fake.add_story(story_id, updated_at=at(story_id))
+    state = {}
+    run_sync(fake, state)
+    fake.stories[5]["updated_at"] = at(9)
+    for story_id in (5, 4, 3, 2):
+        fake.queue(f"/stories/{story_id}", _error(403, "Forbidden"))
+    fake.calls.clear()
+    stats = {}
+
+    run_sync(fake, state, now=hours(12), stats=stats)
+
+    assert fake.fetched_stories() == [5, 4, 3, 2]  # story 1 is never tried
+    assert stats["probe_story"] == 3 and stats["failed_permission"] == 1
+    assert state["unreadable"] == {}
+    assert "check the token's permissions" in caplog.text
+
+
+def test_a_check_answering_a_server_error_stops_the_checks(fake):
+    for story_id in (1, 2, 3, 4):
+        fake.add_story(story_id, updated_at=at(story_id))
+    state = {}
+    run_sync(fake, state)
+    fake.stories[4]["updated_at"] = at(9)
+    fake.queue("/stories/4", _error(403, "Forbidden"))
+    fake.queue("/stories/3", _error(403, "Forbidden"))
+    _fail(fake, "/stories/2")
+    fake.calls.clear()
+    stats = {}
+
+    run_sync(fake, state, now=hours(12), stats=stats)
+
+    assert 1 not in fake.fetched_stories() and stats["probe_story"] == 2
+    assert "failed_permission" not in stats and state["unreadable"] == {}
+
+
+def test_a_failed_reask_is_no_failure_of_the_run(fake, caplog):
+    for story_id in (1, 2):
+        fake.add_story(story_id, updated_at=at(1))
+    state = {}
+    run_sync(fake, state)
+    state["given_up"] = {"story:2": {"stamp": at(1), "at": _stamp(hours(-24))}}
+    state["known_ids"].remove("story:2")
+    del state["fingerprints"]["2"]
+    for day in (0, 1, 2):
+        fake.queue("/stories/2", _error(404, "Resource not found."))
+        stats = {}
+        rows = run_sync(fake, state, now=hours(24 * day), stats=stats)
+        assert story_rows(rows) == {}
+        assert stats["failed"] == 0 and stats["reask_failed"] == 1
+    assert "story:2 is still unreadable" in caplog.text
+
+
+def test_a_rate_limit_on_a_reask_still_stops_the_run(fake):
+    for story_id in (1, 2):
+        fake.add_story(story_id, updated_at=at(1))
+    state = {}
+    run_sync(fake, state)
+    state["given_up"] = {"story:2": {"stamp": at(1), "at": _stamp(hours(-24))}}
+    fake.queue("/stories/2", _error(429, "Too Many Requests", headers={"Retry-After": "61"}))
+    stats = {}
+
+    run_sync(fake, state, stats=stats)
+
+    assert stats["failed_rate_limit"] == 1 and stats["failed"] == 0
+
+
+def test_the_token_is_cut_out_before_the_detail_is_shortened(fake):
+    fake.headers = {"Shortcut-Token": SECRET}
+    fake.queue("/epics", _Resp(401, {"message": "x" * 195 + SECRET}))
+    with pytest.raises(ShortcutAPIError) as excinfo:
+        run_sync(fake, {})
+    assert SECRET[:5] not in excinfo.value.detail
+    assert excinfo.value.detail == "x" * 195 + "[toke"
+
+
+def test_redact_ignores_case():
+    assert shortcut._redact(f"bad token {SECRET.lower()}", SECRET) == "bad token [token]"
+    assert shortcut._redact("bad token ABC", "abc") == ""

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import time
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
@@ -59,18 +60,27 @@ _MAX_TOTAL_WAIT_SECONDS = 120
 # coincidence, and a stop costs nothing, as the next run resumes. Items already
 # kept for a retry never count.
 _OUTAGE_STREAK = 3
-# A listed story or iteration that answers 403/404 at the same stamp is
-# forgotten after 3 runs AND 24 hours, counting only runs that finished and
-# showed access to work (see _Run.settle): a host on a fast cron cannot forget
-# an item in minutes, and a weekly cron still needs three observations. A
-# forgotten item is asked again when its stamp moves, or after another day.
+# Rules for forgetting (deleting the document of) a listed story or iteration that
+# answers 403/404 at the same stamp. Only finished runs that showed access to the
+# kind working count (see _Run.settle).
+# - 3 runs: three separate observations, so one glitch or a short incident on
+#   Shortcut's side cannot do it.
+# - 24 hours: outlasts a working day of permission changes and a maintenance
+#   window. On a cron of minutes this is the floor that does the work.
+# - On a weekly cron the 3 runs take 2 to 3 weeks; accepted, because forgetting
+#   too early deletes a document that is still valid, while forgetting late only
+#   keeps a stale one a little longer.
 _GIVE_UP_RUNS = 3
 _GIVE_UP_AFTER = timedelta(hours=24)
+# A forgotten item is asked again when its stamp moves, or a day after it was
+# last asked: one GET per forgotten item per day, so one that becomes readable
+# again is back within a day without retrying hidden items on every run.
 _REASK_AFTER = timedelta(hours=24)
-# Forgotten items asked again per run, oldest first, after everything else.
-_MAX_REASKS = 10
-# The run's clock is the later of Shortcut's Date header and the local clock.
-# They differing by more than this is logged (a proxy may cache a stale Date).
+# Unchanged items read, newest first, to check access to a kind (see
+# _Run._probe): one of them may be hidden from the token itself.
+_PROBE_TRIES = 3
+# Shortcut's Date header and the local clock differing by more than this is
+# logged, and no item is forgotten in that run (see _run_clocks).
 _CLOCK_TOLERANCE = timedelta(seconds=60)
 
 # A story listing with this many results or more is treated as possibly
@@ -159,7 +169,7 @@ class _Client:
         # The token, only to cut it out of Shortcut's error messages.
         headers = getattr(session, "headers", None)
         self.secret = secret or (headers.get("Shortcut-Token", "") if headers else "")
-        # Shortcut's clock at its first answer (the Date header), see _run_clock.
+        # Shortcut's clock at its first answer (the Date header), see _run_clocks.
         self.server_now: datetime | None = None
         self.waited = 0.0  # seconds slept this run
         self.out_of_time = False  # a wait was refused for the run's budget
@@ -232,7 +242,7 @@ def _send(
             client.wait(delay)
             attempt += 1
             continue
-        raise ShortcutAPIError(status, path, _redact(_error_detail(response), client.secret))
+        raise ShortcutAPIError(status, path, _redact(_error_detail(response), client.secret)[:200])
 
 
 def _request(
@@ -275,23 +285,31 @@ def _retry_delay(headers: Any, attempt: int) -> float:
 
 
 def _error_detail(response: Any) -> str:
-    """Shortcut's ``message``, or nothing. Never the raw body."""
+    """Shortcut's ``message`` in full, or nothing. Never the raw body.
+
+    The caller cuts it to length only after ``_redact``, so a token that would
+    straddle the cut is still found whole.
+    """
     try:
         message = response.json()["message"]
     except (ValueError, KeyError, TypeError):
         return ""
-    return message[:200] if isinstance(message, str) else ""
+    return message if isinstance(message, str) else ""
 
 
 def _redact(text: str, secret: str) -> str:
-    """``text`` with the token cut out, in case Shortcut echoes it back.
+    """``text`` with the token cut out, in any case, in case Shortcut echoes it back.
 
     A token too short to replace safely (it could match ordinary words) drops
-    the whole text when it occurs in it.
+    the whole text when it occurs in it. Only the whole token is matched: a part
+    of one cannot be told from ordinary text.
     """
-    if not secret or secret not in text:
+    if not secret:
         return text
-    return text.replace(secret, "[token]") if len(secret) >= 8 else ""
+    pattern = re.compile(re.escape(secret), re.IGNORECASE)
+    if not pattern.search(text):
+        return text
+    return pattern.sub("[token]", text) if len(secret) >= 8 else ""
 
 
 # ---------------------------------------------------------------------------
@@ -610,7 +628,7 @@ class _Run:
     ``fingerprints`` (story id -> hash of its header lines), ``iterations``
     (iteration id -> its mark when last rendered), ``retry`` (row ids kept after a
     failure), ``unreadable`` (row id -> ``{stamp, runs, since}`` of items answering
-    403/404, ``since`` being the run clock at the first counted run) and
+    403/404, ``since`` being Shortcut's clock at the first counted run) and
     ``given_up`` (row id -> ``{stamp, at}``: the stamp at which one was forgotten,
     and when it was last asked).
     """
@@ -646,7 +664,8 @@ class _Run:
         self.reask_failed: set[str] = set()
         self.listed = False
         # Filled by list():
-        self.now = _EPOCH  # the run clock (see _run_clock)
+        self.now = _EPOCH  # the clock of the give-up and re-ask times (see _run_clocks)
+        self.may_give_up = True
         self.names: dict[str, dict] = {}
         self.epics: list[dict] = []
         self.iterations: list[dict] = []
@@ -680,8 +699,8 @@ class _Run:
         }
         self.epics = [e for e in all_epics if _in_scope(e, group_ids, epic_ids, include_archived)]
 
-        self.now = (now or _run_clock(self.client)).replace(microsecond=0)
-        end = self.now
+        end, self.now, self.may_give_up = (now, now, True) if now else _run_clocks(self.client)
+        end, self.now = end.replace(microsecond=0), self.now.replace(microsecond=0)
         # Entries written before ``since`` existed start their 24 hours now; one
         # that never counted is dropped.
         for entries in (self.unreadable, self.unreadable_before):
@@ -691,6 +710,20 @@ class _Run:
                         entry["since"] = _stamp(self.now)
                     else:
                         del entries[row_id]
+        # A time stored by a run whose clock was ahead (before Shortcut's clock was
+        # used for these) is brought back to now: it would hold a re-ask off, or
+        # start a 24 hours, as far in the future as that clock was ahead.
+        latest = self.now + _CLOCK_TOLERANCE
+        for entries, key in (
+            (self.unreadable, "since"),
+            (self.unreadable_before, "since"),
+            (self.given_up, "at"),
+        ):
+            for row_id, entry in entries.items():
+                if _parse(entry[key]) > latest:
+                    if entries is not self.unreadable_before:
+                        logger.info("Shortcut: %s had %s in the future; reset to now.", row_id, key)
+                    entry[key] = _stamp(self.now)
         filters = _scope_filters(group_ids, epic_ids, include_archived)
         # The sweep: every in-scope story that exists right now. created_at never
         # changes, so a story cannot move between windows while they are queried.
@@ -746,12 +779,13 @@ class _Run:
                 del self.given_up[row_id]
                 kind, key = row_id.split(":", 1)
                 (self.fingerprints if kind == "story" else self.marks).pop(key, None)
-        due = sorted(
-            (entry["at"], row_id)
+        # Every one that is due: they are bounded by what was forgotten, one GET a
+        # day each.
+        self.reasks = {
+            row_id
             for row_id, entry in self.given_up.items()
             if _parse(entry["at"]) <= self.now - _REASK_AFTER
-        )
-        self.reasks = {row_id for _, row_id in due[:_MAX_REASKS]}
+        }
         self.stamp_of = stamp_of
         # Only stories in the sweep are rendered, so every emitted id can be deleted.
         changed &= self.swept.keys()
@@ -824,12 +858,16 @@ class _Run:
 
     def _failed(self, row_id: str, exc: ShortcutAPIError) -> None:
         """Keep an item that failed on its own, or stop the run if Shortcut is failing."""
-        self.stats["failed"] += 1
+        if row_id not in self.reasks:
+            self.stats["failed"] += 1
         self.stop_if_systemic(exc)
         if exc.status == 401:
             raise exc  # nothing rendered yet: the token is bad
         if row_id in self.reasks:
-            # Still unreadable: it stays forgotten and is asked again in a day.
+            # Still unreadable: it stays forgotten and is asked again in a day. Its
+            # document is already gone, so this is no failure of the run.
+            self.stats["reask_failed"] = self.stats.get("reask_failed", 0) + 1
+            logger.info("Shortcut: %s is still unreadable (%s); asked again in a day.", row_id, exc)
             self.reask_failed.add(row_id)
             return
         self.kept.add(row_id)
@@ -851,7 +889,8 @@ class _Run:
         reason to forget it. So it counts only if another item of the same kind
         was read in this run. In steady state the others are unchanged and not
         fetched, so one of them is fetched as a probe; if the probe fails too,
-        nothing counts.
+        nothing counts. One of them may be hidden from the token itself, so up to
+        ``_PROBE_TRIES`` are tried.
         """
         pending = self.unread.pop(kind, [])
         if not pending:
@@ -863,7 +902,7 @@ class _Run:
                 self._count_unreadable(row_id)
         elif probe is False:
             self.stats["failed_permission"] = self.stats.get("failed_permission", 0) + len(pending)
-            if self._probe_path(kind) is None:
+            if not self._probe_paths(kind):
                 logger.warning(
                     "Shortcut: %s: every fetch answered 403/404 this run and there is no other "
                     "%s to check access with; nothing counts toward forgetting it.",
@@ -878,38 +917,37 @@ class _Run:
                 )
 
     def _probe(self, kind: str) -> bool | None:
-        """Fetch one unchanged item of ``kind``: True when it is readable.
+        """Fetch unchanged items of ``kind``, newest first: True at the first that reads.
 
-        False when it answers 403/404 too, or there is no other item to try;
-        None when Shortcut is failing (5xx, no answer), which proves nothing.
+        A 403/404 moves on to the next. False when every one answers 403/404, or
+        there is no other item to try; None when Shortcut is failing (5xx, no
+        answer), which proves nothing.
         """
-        path = self._probe_path(kind)
-        if path is None:
-            return False
-        self.stats[f"probe_{kind}"] = 1
-        try:
-            _fetch(self.client, path)
-        except ShortcutAPIError as exc:
-            self.stop_if_systemic(exc)
-            if exc.status == 401:
-                raise exc
-            return False if exc.status in (403, 404) else None
-        return True
+        for path in self._probe_paths(kind):
+            self.stats[f"probe_{kind}"] = self.stats.get(f"probe_{kind}", 0) + 1
+            try:
+                _fetch(self.client, path)
+            except ShortcutAPIError as exc:
+                self.stop_if_systemic(exc)
+                if exc.status == 401:
+                    raise
+                if exc.status not in (403, 404):
+                    return None
+                continue
+            return True
+        return False
 
-    def _probe_path(self, kind: str) -> str | None:
-        """The newest item of ``kind`` not fetched this run and not unreadable."""
+    def _probe_paths(self, kind: str) -> list[str]:
+        """The newest items of ``kind`` not fetched this run and not unreadable, at most
+        ``_PROBE_TRIES``."""
         unusable = self.reached | self.unreadable.keys() | self.given_up.keys()
         if kind == "story":
             ids = [i for i in self.swept if _story_id(i) not in unusable]
-            if not ids:
-                return None
-            best = max(ids, key=lambda i: (self.swept[i].get("updated_at") or "", i))
-            return f"/stories/{best}"
+            ids.sort(key=lambda i: (self.swept[i].get("updated_at") or "", i), reverse=True)
+            return [f"/stories/{i}" for i in ids[:_PROBE_TRIES]]
         items = [i for i in self.iterations if _iteration_id(i["id"]) not in unusable]
-        if not items:
-            return None
-        best = max(items, key=lambda i: (i.get("updated_at") or "", i["id"]))
-        return f"/iterations/{best['id']}"
+        items.sort(key=lambda i: (i.get("updated_at") or "", i["id"]), reverse=True)
+        return [f"/iterations/{i['id']}" for i in items[:_PROBE_TRIES]]
 
     def _count_unreadable(self, row_id: str) -> None:
         self.counted.add(row_id)
@@ -937,7 +975,8 @@ class _Run:
             # Only a run that counted this item's failure can give it up: one where
             # access was not shown to work (a lost permission) never does.
             if (
-                row_id in self.counted
+                self.may_give_up
+                and row_id in self.counted
                 and entry["runs"] >= _GIVE_UP_RUNS
                 and _parse(entry["since"]) <= self.now - _GIVE_UP_AFTER
             ):
@@ -1015,25 +1054,35 @@ class _Run:
         self.stats["kept"] = len(retry)
 
 
-def _run_clock(client: _Client) -> datetime:
-    """The run's clock: the later of Shortcut's (its first answer's Date) and the local one.
+def _run_clocks(client: _Client) -> tuple[datetime, datetime, bool]:
+    """Where the sweep ends, the clock of the give-up and re-ask times, and whether
+    an item may be forgotten in this run.
 
-    The sweep ends there, and the give-up times are read from it. The later of
-    the two means neither a local clock that runs behind nor a stale Date (a
-    caching proxy) ends the sweep early, which would make the newest stories look
-    deleted. A clock that runs ahead only widens the windows.
+    The sweep ends at the later of Shortcut's clock (its first answer's Date) and
+    the local one, so neither a local clock that runs behind nor a stale Date (a
+    caching proxy) ends it early, which would make the newest stories look
+    deleted; a clock that runs ahead only widens the window.
+
+    The times that decide forgetting are measured on Shortcut's clock alone: a
+    local clock that jumps ahead (an NTP step, a resumed VM) must not make a day
+    pass in minutes. When the two clocks differ by more than ``_CLOCK_TOLERANCE``
+    one of them is wrong, so nothing is forgotten in this run (counting goes on).
+    Without a Date header the local clock is all there is, and a jump of it is not
+    caught; that takes a proxy that strips the header.
     """
     local = _local_now()
     server = client.server_now
     if server is None:
         logger.warning("Shortcut: no Date header seen; the run uses the local clock.")
-        return local
+        return local, local, True
     if abs(server - local) > _CLOCK_TOLERANCE:
         logger.warning(
-            "Shortcut: its Date header and the local clock differ by %.0fs; using the later one.",
+            "Shortcut: its Date header and the local clock differ by %.0fs; the sweep uses "
+            "the later one, and no item is forgotten in this run.",
             abs((server - local).total_seconds()),
         )
-    return max(server, local)
+        return max(server, local), server, False
+    return max(server, local), server, True
 
 
 def _local_now() -> datetime:
@@ -1062,7 +1111,7 @@ def sync_stories(
 
     A run stopped cleanly (a ``401`` after progress, a rate limit, an outage,
     the wait budget spent) keeps what it rendered and its cursor, and deletes
-    nothing. ``now`` (for tests) defaults to the run clock (see ``_run_clock``).
+    nothing. ``now`` (for tests) sets both run clocks (see ``_run_clocks``).
     """
     stats = {} if stats is None else stats
     for key in _STAT_KEYS:
