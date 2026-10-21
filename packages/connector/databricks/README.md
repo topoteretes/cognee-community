@@ -281,6 +281,9 @@ about what it does:
 - A notebook without lineage lists the synced tables its code mentions by full name; a
   table named without its catalog, or built from a variable, is not found. Those
   mentions are refreshed when the notebook changes.
+- Opening a notebook in Databricks' notebook editor can save it and move its modified
+  time without any edit (seen on a Free Edition workspace). The notebook is then exported
+  again, but cognee does not process a document again when its text did not change.
 - Workspace files (`.py`, `.sql` files that are not notebooks), dashboards and jobs are
   not synced.
 - Named queries run on every sync and wake the warehouse each time. Give them an
