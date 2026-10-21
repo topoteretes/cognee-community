@@ -45,7 +45,7 @@ answer = await cognee.search(
 
 Always pass `write_disposition="merge"`. cognee's default for this call is `"replace"`, and later runs only send PRs that changed, so under replace every other PR would be forgotten.
 
-Each project keeps its own state, so you can sync several projects into one dataset or separate ones. If you sync the same project twice with different selections, give each source its own `resource_name`.
+Each project keeps its own state, so you can sync several projects into one dataset or separate ones. If you sync the same project twice with different selections, give each source its own `resource_name`. With the default name, a run refuses state that was written with different options, so two sources can't quietly overwrite each other. To change the options of an existing source, pass `resource_name` explicitly with the same name as before (`azure_repos_<org>_<project>` by default).
 
 ### Options
 
@@ -61,7 +61,8 @@ Each project keeps its own state, so you can sync several projects into one data
 | `created_after` | Skip PRs created before this `date` |
 | `recheck_closed_days` | Read the threads of PRs closed in the last N days on every run (default `30`). `None` reads every PR's threads every run |
 | `resource_name` | Name of the table and sync state. Defaults to `azure_repos_<org>_<project>` |
-| `max_requests` | Request budget per run (default 5,000). A big first sync finishes over several runs |
+| `max_requests` | Request budget per run (default 5,000, at least 1). A big first sync finishes over several runs |
+| `max_wait_seconds` | Time one run may spend sleeping on `Retry-After` and backoff (default 900) |
 | `check_active` | Optional callback run before every request, for hosts that need to stop a sync |
 
 ## What a pull request looks like in memory
@@ -101,9 +102,9 @@ The trade-off is that a comment left on a PR closed more than 30 days ago is pic
 
 Changing `include_commits` re-renders every PR once on the next run, since it changes the text without changing anything the fingerprints look at.
 
-Each run stops after `max_requests` requests, or when Azure DevOps keeps answering 429. It stops cleanly: PRs already synced keep their new fingerprints, nothing is deleted because the listing didn't finish, and the next run skips what's done and carries on. `cognee_sync_stats` then has `failed: 1` plus `failed_budget` or `failed_rate_limit`.
+Each run stops after `max_requests` requests, after `max_wait_seconds` of waiting, or when Azure DevOps keeps answering 429 or 5xx after retries. It stops cleanly: PRs already synced keep their new fingerprints, nothing is deleted because the listing didn't finish, and the next run skips what's done and carries on. `cognee_sync_stats` then has `failed: 1` plus one of `failed_budget`, `failed_slow_down`, `failed_rate_limit` or `failed_server_error`.
 
-Requests honour `Retry-After`, including when Azure DevOps sends it on a normal 200 as an early warning, capped at 60 seconds per wait. Errors are raised as `AzureDevOpsAuthError` (401), `AzureDevOpsAccessError` (403) or `AzureDevOpsError`, with the status in the message and the URL only on the exception's `url` attribute. If a listing or commit page keeps coming back the same, the run fails instead of looping.
+Requests honour `Retry-After`, including when Azure DevOps sends it on a normal 200 as an early warning, capped at 60 seconds per wait and at `max_wait_seconds` per run. Errors are raised as `AzureDevOpsAuthError` (401, or a 203 with the HTML sign-in page that a bad token can get), `AzureDevOpsAccessError` (403) or `AzureDevOpsError`, with the status in the message and the URL only on the exception's `url` attribute. An `organization_url` without `https://` is rejected straight away instead of being retried. If a listing or commit page keeps coming back the same, the run fails instead of looping.
 
 Some API details it handles for you. The PR list only returns active PRs unless asked for every status, it cuts descriptions at 400 characters, and long commit messages come back truncated. Each of these would silently lose content.
 

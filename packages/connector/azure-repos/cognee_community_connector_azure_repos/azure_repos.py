@@ -14,9 +14,10 @@ commits, review threads) on the document path, so cognify extracts from it.
 * PRs can't be deleted, only abandoned. What disappears is a repo (deleted,
   deselected, no longer visible), and its PRs are tombstoned with it. That
   only happens after a complete listing.
-* Each run has a request budget. When it runs out, or Azure DevOps keeps
-  answering 429, the run stops cleanly: what's synced stays, nothing is
-  deleted, and the next run picks up the rest.
+* Each run has a request budget and a budget for time spent waiting on
+  Retry-After. When either runs out, or Azure DevOps keeps answering 429 or
+  5xx, the run stops cleanly: what's synced stays, nothing is deleted, and the
+  next run picks up the rest.
 * Callers must pass write_disposition="merge". cognee hands it to
   pipeline.run, which overrides the resource hint, and its default is
   "replace", which would forget every PR that didn't change.
@@ -32,7 +33,7 @@ from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import dlt
 import requests
@@ -50,11 +51,13 @@ _PR_PAGE = 500
 _COMMIT_PAGE = 100
 # requests per run; listing costs about one per 500 PRs, each open PR costs two
 DEFAULT_MAX_REQUESTS = 5_000
+# seconds per run we're willing to spend sleeping on Retry-After before stopping cleanly
+DEFAULT_MAX_WAIT_SECONDS = 900.0
 # attempts per request on 429, 5xx or network errors
 _MAX_ATTEMPTS = 5
 # our own ceiling on a single Retry-After wait; Azure DevOps doesn't document one
 _MAX_RETRY_AFTER = 60.0
-_TIMEOUT = 60
+_TIMEOUT_SECONDS = 60
 
 # reviewer vote values, from the GitPullRequest reviewers docs
 _VOTES = {
@@ -98,6 +101,10 @@ class AzureDevOpsRateLimitedError(AzureDevOpsError):
     """HTTP 429 that didn't clear after retrying."""
 
 
+class AzureDevOpsServerError(AzureDevOpsError):
+    """HTTP 5xx, or no connection, that didn't clear after retrying."""
+
+
 _ERRORS = {
     401: (AzureDevOpsAuthError, "check the personal access token"),
     403: (AzureDevOpsAccessError, "the token is missing a scope this call needs"),
@@ -118,23 +125,29 @@ class AzureDevOpsClient:
     ):
         if not pat:
             raise ValueError("A personal access token is required")
+        parsed = urlparse(organization_url or "")
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            raise ValueError(
+                "organization_url must be a full URL, like https://dev.azure.com/my-org"
+            )
         self.organization_url = organization_url.rstrip("/")
         self.session = session or requests.Session()
         self.session.auth = ("", pat)  # PAT is the password, username is ignored
         self.session.headers.update({"Accept": "application/json"})
         self._sleep = sleep or time.sleep
         self._wait_until = 0.0
+        self.waited = 0.0  # seconds slept on Retry-After and backoff, read by the run budget
 
     def __repr__(self) -> str:
         return f"AzureDevOpsClient({self.organization_url!r}, pat=<redacted>)"
 
     def get(self, path: str, params: dict | None = None) -> dict:
-        return self._request("GET", path, params=params).json()
+        return self.get_page(path, params)[0]
 
     def get_page(self, path: str, params: dict | None = None) -> tuple[dict, str | None]:
         """For endpoints that page with an x-ms-continuationtoken header."""
-        resp = self._request("GET", path, params=params)
-        return resp.json(), resp.headers.get("x-ms-continuationtoken")
+        resp, url = self._request("GET", path, params=params)
+        return _json(resp, url), resp.headers.get("x-ms-continuationtoken")
 
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         url = path if path.startswith("http") else f"{self.organization_url}/{path.lstrip('/')}"
@@ -143,11 +156,20 @@ class AzureDevOpsClient:
             attempt += 1
             if (delay := self._wait_until - time.monotonic()) > 0:
                 self._sleep(delay)
+                self.waited += delay
             try:
-                resp = self.session.request(method, url, timeout=_TIMEOUT, **kwargs)
+                resp = self.session.request(method, url, timeout=_TIMEOUT_SECONDS, **kwargs)
+            except (
+                requests.exceptions.MissingSchema,
+                requests.exceptions.InvalidSchema,
+                requests.exceptions.InvalidURL,
+            ) as exc:
+                raise ValueError("The Azure DevOps URL is not valid") from exc
             except requests.RequestException as exc:
                 if attempt >= _MAX_ATTEMPTS:
-                    raise AzureDevOpsError("Azure DevOps could not be reached", url=url) from exc
+                    raise AzureDevOpsServerError(
+                        "Azure DevOps could not be reached", url=url
+                    ) from exc
                 self._wait_until = time.monotonic() + 2.0 ** (attempt - 1)
                 continue
 
@@ -162,10 +184,31 @@ class AzureDevOpsClient:
                 self._wait_until = time.monotonic() + wait
             if retryable and attempt < _MAX_ATTEMPTS:
                 continue
+            if status >= 500:
+                raise AzureDevOpsServerError(
+                    f"Azure DevOps returned HTTP {status}: server error", status=status, url=url
+                )
             if status >= 400:
                 error, hint = _ERRORS.get(status, (AzureDevOpsError, "request failed"))
                 raise error(f"Azure DevOps returned HTTP {status}: {hint}", status=status, url=url)
-            return resp
+            return resp, url
+
+
+def _json(resp: Any, url: str) -> dict:
+    """A bad or expired token can get a 203 with the HTML sign-in page instead of a 401."""
+    content_type = (resp.headers or {}).get("Content-Type", "")
+    if resp.status_code == 203 or "text/html" in content_type:
+        raise AzureDevOpsAuthError(
+            "Azure DevOps returned a sign-in page instead of data: check the personal access token",
+            status=resp.status_code,
+            url=url,
+        )
+    try:
+        return resp.json()
+    except ValueError as exc:
+        raise AzureDevOpsError(
+            "Azure DevOps returned something that isn't JSON", status=resp.status_code, url=url
+        ) from exc
 
 
 def _retry_after(headers: Any) -> float | None:
@@ -184,13 +227,23 @@ class _CutShortError(Exception):
 
 
 class _Calls:
-    """Every request of one run goes through here: host check, then the budget."""
+    """Every request of one run goes through here: host check, then the request
+    budget and the time budget. Running out of either, or a 429 or 5xx that won't
+    clear, ends the run cleanly instead of losing it."""
 
-    def __init__(self, service: Any, max_requests: int, check_active: Callable[[], None] | None):
+    def __init__(
+        self,
+        service: Any,
+        max_requests: int,
+        max_wait_seconds: float,
+        check_active: Callable[[], None] | None,
+    ):
         self.service = service
         self.max_requests = max_requests
+        self.max_wait_seconds = max_wait_seconds
         self.check_active = check_active
         self.made = 0
+        self.waited_at_start = getattr(service, "waited", 0.0)
 
     def get(self, path: str, params: dict | None = None) -> dict:
         return self._call(self.service.get, path, params)
@@ -201,6 +254,8 @@ class _Calls:
     def _call(self, method: Callable[..., Any], *args: Any) -> Any:
         if self.check_active is not None:
             self.check_active()
+        if getattr(self.service, "waited", 0.0) - self.waited_at_start >= self.max_wait_seconds:
+            raise _CutShortError("slow_down")
         if self.made >= self.max_requests:
             raise _CutShortError("budget")
         self.made += 1
@@ -208,6 +263,8 @@ class _Calls:
             return method(*args)
         except AzureDevOpsRateLimitedError:
             raise _CutShortError("rate_limit") from None
+        except AzureDevOpsServerError:
+            raise _CutShortError("server_error") from None
 
 
 def _repos(calls: _Calls, project: str) -> list[dict]:
@@ -355,7 +412,9 @@ def _thread_block(thread: dict) -> str | None:
             and not c.get("isDeleted")
             and (c.get("content") or "").strip()
         ),
-        key=lambda c: (c.get("publishedDate") or "", c.get("id") or 0),
+        # Comment ids grow in posting order. Dates can't be compared as strings:
+        # Azure trims trailing zeros from the fraction, so ".1Z" sorts before ".12Z".
+        key=lambda c: c.get("id") or 0,
     )
     if not comments:
         return None
@@ -379,6 +438,15 @@ def _commit_line(commit: dict) -> str:
     if body.strip():
         line += "\n" + "\n".join(f"  {b}" for b in body.strip().splitlines())
     return line
+
+
+def _commit_order(commit: dict) -> tuple:
+    date_text = (commit.get("author") or {}).get("date")
+    try:
+        when = _parse_time(date_text).timestamp() if date_text else 0.0
+    except ValueError:
+        when = 0.0
+    return (when, commit.get("commitId") or "")
 
 
 def render_pull_request(repo: dict, pr: dict, threads: list[dict], commits: list[dict]) -> str:
@@ -406,9 +474,7 @@ def render_pull_request(repo: dict, pr: dict, threads: list[dict], commits: list
 
     if description := (pr.get("description") or "").strip():
         lines.append(f"\nDescription:\n{description}")
-    ordered_commits = sorted(
-        commits, key=lambda c: ((c.get("author") or {}).get("date") or "", c.get("commitId") or "")
-    )
+    ordered_commits = sorted(commits, key=_commit_order)
     if ordered_commits:
         lines.append("\nCommits:\n" + "\n".join(map(_commit_line, ordered_commits)))
     ordered_threads = sorted(threads, key=lambda t: t.get("id") or 0)
@@ -445,15 +511,25 @@ class _Scope:
     created_after: date | None = None
     recheck_closed_days: int | None = 30
 
+    def __post_init__(self) -> None:
+        # Normalised so cosmetic differences (" Shop-API", duplicates, 1 vs True)
+        # don't look like a different selection.
+        self.repositories = sorted({r.strip().lower() for r in self.repositories if r.strip()})
+        self.include_abandoned = bool(self.include_abandoned)
+        self.include_commits = bool(self.include_commits)
+
+    def selection_key(self) -> str:
+        """Which PRs this source covers."""
+        created = self.created_after.isoformat() if self.created_after else None
+        return json.dumps([self.repositories, self.include_abandoned, created])
+
     def render_key(self) -> str:
         """Options that change a PR's text without changing its fingerprint. When
         this changes, every PR is rendered again once."""
         return json.dumps([self.include_commits])
 
     def wants_repo(self, repo: dict) -> bool:
-        return not self.repositories or repo.get("name", "").lower() in {
-            r.lower() for r in self.repositories
-        }
+        return not self.repositories or repo.get("name", "").lower() in self.repositories
 
     def warm(self, pr: dict, now: datetime) -> bool:
         """Whether to read the full PR and threads this run. Activity mostly lands on
@@ -474,7 +550,9 @@ def sync_pull_requests(
     *,
     now: datetime | None = None,
     max_requests: int = DEFAULT_MAX_REQUESTS,
+    max_wait_seconds: float = DEFAULT_MAX_WAIT_SECONDS,
     check_active: Callable[[], None] | None = None,
+    allow_scope_change: bool = True,
 ) -> Iterator[dict]:
     """Rows for new or changed PRs, then tombstones.
 
@@ -488,16 +566,28 @@ def sync_pull_requests(
     stats = stats if stats is not None else {}
     for key in ("scanned", "skipped", "deleted", "failed"):
         stats.setdefault(key, 0)
-    calls = _Calls(service, max_requests, check_active)
+    calls = _Calls(service, max_requests, max_wait_seconds, check_active)
     org_url = service.organization_url
 
     known: dict[str, str] = dict(state.get("fingerprints", {}))
+    stored = (state.get("selection"), state.get("render"))
+    current = (scope.selection_key(), scope.render_key())
+    if not allow_scope_change and stored[0] is not None and stored != current:
+        # With the default resource_name, a second source on the same project would
+        # land here on every run and tombstone the other one's pull requests.
+        raise ValueError(
+            "This source's state was written with different options (repositories, "
+            "include_abandoned, created_after or include_commits). To change them, pass "
+            "resource_name explicitly, the same name as before. For a second source on "
+            "this project, pass a new resource_name."
+        )
     if state.get("render") not in (None, scope.render_key()):
         logger.info("Azure Repos: rendering options changed, re-rendering every pull request")
         known = dict.fromkeys(known, "")
 
     def save() -> None:
         state["fingerprints"] = known
+        state["selection"] = scope.selection_key()
         state["render"] = scope.render_key()
 
     seen: set[str] = set()
@@ -583,6 +673,7 @@ def azure_repos_source(
     recheck_closed_days: int | None = 30,
     resource_name: str | None = None,
     max_requests: int = DEFAULT_MAX_REQUESTS,
+    max_wait_seconds: float = DEFAULT_MAX_WAIT_SECONDS,
     check_active: Callable[[], None] | None = None,
     service: Any = None,
     client: Any = None,
@@ -604,10 +695,14 @@ def azure_repos_source(
         recheck_closed_days: Read the full PR and threads of PRs closed within this
             many days on every run. ``None`` reads every PR's, two requests per PR.
         resource_name: Name of this source's table and sync state. Defaults to
-            ``azure_repos_<org>_<project>``. Give each source its own name when one
-            project is synced twice with different selections.
-        max_requests: Request budget of one run. A bigger project finishes over
-            several runs.
+            ``azure_repos_<org>_<project>``. With the default, a run refuses state
+            written with different options, so two sources can't overwrite each
+            other; pass the name explicitly to change the options, or a new name
+            for a second source.
+        max_requests: Request budget of one run, at least 1. A bigger project
+            finishes over several runs.
+        max_wait_seconds: How long one run may spend sleeping on Retry-After and
+            backoff before it stops cleanly.
         check_active: Optional host authorization checkpoint, called before each
             request.
         service: Pre-built client, mainly for tests. ``client`` is an alias.
@@ -616,6 +711,10 @@ def azure_repos_source(
         raise RuntimeError(
             "Azure Repos sync requires cognee>=1.6.3 (table-scoped document cleanup)."
         )
+    if not isinstance(max_requests, int) or max_requests < 1:
+        raise ValueError("max_requests must be a whole number of at least 1")
+    if not max_wait_seconds or max_wait_seconds <= 0:
+        raise ValueError("max_wait_seconds must be more than 0")
     service = service or client
     if service is None:
         url = organization_url or (organization and f"https://dev.azure.com/{organization}")
@@ -652,7 +751,9 @@ def azure_repos_source(
             dlt.current.resource_state(),
             stats,
             max_requests=max_requests,
+            max_wait_seconds=max_wait_seconds,
             check_active=check_active,
+            allow_scope_change=resource_name is not None,
         )
         yield from dlt_utils.guarded_rows(rows, check_active)
 

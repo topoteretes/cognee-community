@@ -767,8 +767,6 @@ def test_check_active_runs_before_every_request():
 
 
 def test_shuffled_threads_and_commits_render_the_same_text():
-    import random
-
     threads = [
         {"id": n, "comments": [text_comment(f"note {n}", publishedDate=f"2026-10-0{n}")]}
         for n in (3, 1, 2)
@@ -785,8 +783,7 @@ def test_shuffled_threads_and_commits_render_the_same_text():
     first = render_pull_request(repo(), pr, threads, commits)
 
     assert (
-        render_pull_request(repo(), pr, random.sample(threads, 3), random.sample(commits, 3))
-        == first
+        render_pull_request(repo(), pr, list(reversed(threads)), list(reversed(commits))) == first
     )
 
 
@@ -807,3 +804,158 @@ def test_resource_name_version_guard_and_stats(monkeypatch):
     monkeypatch.setattr(repos_mod.dlt_utils, "DOCUMENT_SYNC_VERSION", 0)
     with pytest.raises(RuntimeError, match=r"1\.6\.3"):
         azure_repos_source(project=PROJECT, service=fake)
+
+
+# ---------------------------------------------------------------------------
+# Second review round on the Boards connector, applied here too
+# ---------------------------------------------------------------------------
+def test_two_default_sources_on_one_project_refuse_instead_of_deleting():
+    fake = FakeAzureRepos([repo("r1", "shop-api"), repo("r2", "shop-web")])
+    fake.add("r1", pull_request(1))
+    fake.add("r2", pull_request(2))
+    state: dict = {}
+    first = list(
+        sync_pull_requests(
+            fake,
+            _Scope(project=PROJECT, repositories=["shop-api"]),
+            state,
+            now=NOW,
+            allow_scope_change=False,
+        )
+    )
+    assert keys(first) == ["r1/1"]
+
+    with pytest.raises(ValueError, match="resource_name"):
+        list(
+            sync_pull_requests(
+                fake,
+                _Scope(project=PROJECT, repositories=["shop-web"]),
+                state,
+                now=NOW,
+                allow_scope_change=False,
+            )
+        )
+    assert set(state["fingerprints"]) == {"r1/1"}  # nothing was tombstoned
+
+
+def test_cosmetic_option_differences_are_the_same_selection():
+    plain = _Scope(project=PROJECT, repositories=["shop-api"])
+    noisy = _Scope(project=PROJECT, repositories=[" Shop-API", "shop-api"], include_abandoned=1)
+    assert (noisy.selection_key(), noisy.render_key()) == (
+        plain.selection_key(),
+        plain.render_key(),
+    )
+
+
+def test_comment_order_follows_ids_not_date_strings():
+    thread = {
+        "id": 1,
+        "comments": [
+            text_comment("third", id=3, publishedDate="2026-10-02T10:00:00.12Z"),
+            text_comment("second", id=2, publishedDate="2026-10-02T10:00:00.1Z"),
+            text_comment("first", id=1, publishedDate="2026-10-02T10:00:00Z"),
+        ],
+    }
+
+    text = render_pull_request(repo(), pull_request(1), [thread], [])
+
+    assert text.index("first") < text.index("second") < text.index("third")
+
+
+def test_commits_order_by_real_time_not_date_strings():
+    commits = [
+        {"commitId": "c3", "comment": "third", "author": {"date": "2026-10-02T10:00:00.12Z"}},
+        {"commitId": "c2", "comment": "second", "author": {"date": "2026-10-02T10:00:00.1Z"}},
+        {"commitId": "c1", "comment": "first", "author": {"date": "2026-10-02T10:00:00Z"}},
+    ]
+
+    text = render_pull_request(repo(), pull_request(1), [], commits)
+
+    assert text.index("first") < text.index("second") < text.index("third")
+
+
+def test_persistent_server_error_stops_cleanly_and_keeps_progress():
+    fake = FakeAzureRepos([repo()])
+    for pid in range(1, 4):
+        fake.add("r1", pull_request(pid))
+    real_get = fake.get
+
+    def third_pr_fails(path, params=None):
+        if path.endswith("/pullrequests/3"):
+            raise repos_mod.AzureDevOpsServerError("Azure DevOps returned HTTP 503", status=503)
+        return real_get(path, params)
+
+    fake.get = third_pr_fails
+    state: dict = {}
+    stats: dict = {}
+
+    rows = list(
+        sync_pull_requests(
+            fake, _Scope(project=PROJECT, include_commits=False), state, stats, now=NOW
+        )
+    )
+
+    assert keys(rows) == ["r1/1", "r1/2"]
+    assert stats["failed_server_error"] == 1
+    fake.get = real_get
+    assert keys(run(fake, state, include_commits=False)) == ["r1/3"]
+
+
+def test_time_spent_waiting_has_a_budget_too():
+    class Slow(FakeAzureRepos):
+        waited = 0.0
+
+        def get(self, path, params=None):
+            self.waited += 60  # as if every response carried Retry-After: 60
+            return super().get(path, params)
+
+    fake = Slow([repo()])
+    for pid in range(1, 6):
+        fake.add("r1", pull_request(pid))
+    stats: dict = {}
+
+    rows = list(
+        sync_pull_requests(
+            fake,
+            _Scope(project=PROJECT, include_commits=False),
+            {},
+            stats,
+            now=NOW,
+            max_wait_seconds=200,
+        )
+    )
+
+    assert stats["failed_slow_down"] == 1
+    assert len(rows) < 5
+
+
+def test_client_turns_exhausted_5xx_into_a_server_error(clock):
+    session = _Session([_Response(503) for _ in range(repos_mod._MAX_ATTEMPTS)])
+    with pytest.raises(repos_mod.AzureDevOpsServerError):
+        AzureDevOpsClient(ORG_URL, "pat", session=session).get("x")
+
+
+def test_sign_in_page_and_non_json_bodies_are_clear_errors(clock):
+    html_page = _Response(203, headers={"Content-Type": "text/html; charset=utf-8"})
+    with pytest.raises(AzureDevOpsAuthError, match="sign-in"):
+        AzureDevOpsClient(ORG_URL, "pat", session=_Session([html_page])).get("x")
+
+    class _NotJson(_Response):
+        def json(self):
+            raise ValueError("Expecting value")
+
+    with pytest.raises(AzureDevOpsError, match="isn't JSON"):
+        AzureDevOpsClient(ORG_URL, "pat", session=_Session([_NotJson(200)])).get("x")
+
+
+def test_bad_organization_url_fails_at_construction():
+    with pytest.raises(ValueError, match="full URL"):
+        AzureDevOpsClient("dev.azure.com/acme", "pat")
+
+
+def test_max_requests_and_wait_budget_are_validated():
+    for bad in (0, -1, 1.5):
+        with pytest.raises(ValueError, match="max_requests"):
+            azure_repos_source(project=PROJECT, service=FakeAzureRepos(), max_requests=bad)
+    with pytest.raises(ValueError, match="max_wait_seconds"):
+        azure_repos_source(project=PROJECT, service=FakeAzureRepos(), max_wait_seconds=0)
