@@ -68,7 +68,7 @@ the full flow.
 | `check_active` | – | optional host checkpoint, run before every API call and every row |
 
 After a run, `source.cognee_sync_stats` holds counts only (`scanned`, `changed`, `deleted`,
-`failed`), never names or content.
+`failed`, and `updates_cut` for items past the 100 update limit), never names or content.
 
 ## What an item looks like in cognee
 
@@ -134,14 +134,19 @@ pins):
     is refused.
   - monday.com reports most errors inside an HTTP 200 response; every response is checked, so
     an error can never look like an empty result.
+  - An answer without its list of items, or a listing page without its items or cursor,
+    raises for that board instead of reading as empty, since an empty lookup would make every
+    item asked about look gone.
+  - A changed item that the fetch does not return keeps its old stamp, so the next sync asks
+    for it again instead of taking it as delivered.
 - **Rate limits.** When the per-minute complexity budget runs out, monday.com answers HTTP 429
   with an HTML page and no `Retry-After`; the wait is only in its `RateLimit` header. The
   client waits exactly that long, and also honors `retry_in_seconds` on in-body rate limits.
   Listing queries are sized to stay inside the budget.
 
-**API usage.** A sync where nothing changed costs two calls to read the boards, plus one
-listing call per board and per sub-item board for every 500 items: 4 calls for one board with
-sub-items. Each hundred changed items add one call, and each hundred missing items one lookup.
+**API usage.** A sync where nothing changed costs one call for the account and two to read
+the boards, plus one listing call per board and per sub-item board for every 500 items: 5
+calls for one board with sub-items. Each hundred changed items add one call, and each hundred missing items one lookup.
 The free plan allows 1,000 calls a day.
 
 ## Privacy
@@ -182,7 +187,8 @@ This connector reads work data. Be clear about what it does:
   re-read whenever its item changes for any other reason, or when you pass
   `full_refresh=True`. A full refresh re-reads every item, but cognee does not re-process
   documents whose text did not change.
-- The newest 100 updates of an item are read.
+- The newest 100 updates of an item are read, so an edit to an older one is not picked up.
+  Items past the limit are counted in `updates_cut` and logged as a warning on every sync.
 - Files are not ingested.
 
 ## Testing
@@ -198,7 +204,8 @@ the answer, and archived and deleted items are still returned by id.
 
 - `test_client.py` covers paging through the cursor, retries on HTTP 429, 5xx and in-body
   rate limits, waiting as long as the `RateLimit` header says, errors inside a 200, a failure
-  on a later page, refused and malformed tokens, and `check_active` before every request.
+  on a later page, a listing page without its items or cursor, refused and malformed tokens,
+  and `check_active` before every request.
 - `test_render.py` covers the Linear-shaped document, volatile columns left out, formula
   values, sub-items, item descriptions, and text that stays the same when columns or people
   are reordered.
@@ -206,7 +213,8 @@ the answer, and archived and deleted items are still returned by id.
   replies, new items, a full refresh, chunked fetches), forget-on-delete (archived, deleted,
   purged and moved items, archived, deleted and deselected boards, a contradicted listing that
   must not delete), and failures (a lost board, a failing board that must not stop the others,
-  a refused token, logs with counts only).
+  a refused token, a lookup without its list of items, an item the fetch leaves out, items
+  past the update limit, logs with counts only).
 - `test_source.py` covers the factory, its token and board id checks, `list_boards`, and,
   through a real dlt pipeline, a second account under the same `resource_name` being refused
   and two accounts with their own names staying apart in one dataset.

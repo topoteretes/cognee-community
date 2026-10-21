@@ -62,6 +62,7 @@ import requests
 from cognee.shared.logging_utils import get_logger
 from cognee.tasks.ingestion import dlt_utils
 from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
+from dlt.common.jsonpath import find_values
 from dlt.sources.helpers.requests.retry import Client
 from dlt.sources.helpers.rest_client.client import RESTClient
 from dlt.sources.helpers.rest_client.paginators import JSONResponseCursorPaginator
@@ -259,13 +260,22 @@ class _MondayClient:
         paginator = JSONResponseCursorPaginator(
             cursor_path=cursor_path, cursor_body_path="variables.cursor"
         )
+
+        def require_page(response, *args, **kwargs):
+            # A page without its items list or its cursor would quietly end the
+            # walk, so it raises. A null cursor is fine: it marks the last page.
+            body = _json(response)
+            items = find_values(items_path, body)
+            if not find_values(cursor_path, body) or [type(i) for i in items] != [list]:
+                raise MondayAPIError("monday.com answered a listing page without its items.")
+
         pages = self._rest.paginate(
             "",
             method="POST",
             json={"query": query, "variables": dict(variables)},
             paginator=paginator,
             data_selector=items_path,
-            hooks={"response": [_raise_for_errors]},
+            hooks={"response": [_raise_for_errors, require_page]},
         )
         while True:
             # Pages are requested lazily, so this runs before each request.
@@ -587,6 +597,9 @@ def _update_line(update: dict) -> str:
 # monday.com's maximum page size for items_page, and for items(ids).
 _LISTING_PAGE_SIZE = 500
 _FETCH_CHUNK = 100
+# The updates(limit: 100) in the queries below: monday.com's largest page of
+# updates. Updates come newest first, so an item with more has its oldest left out.
+_UPDATES_LIMIT = 100
 
 # state: all, because an archived or deleted board otherwise vanishes from the
 # answer exactly like a board the token cannot see, and its items still report
@@ -691,6 +704,14 @@ def _iter_rows(client, board_ids: list[str], state: dict, stats: dict, full_refr
 
     if failed:
         stats["failed"] = len(failed)
+    if stats.get("updates_cut"):
+        logger.warning(
+            "monday.com: %d item(s) have %d or more updates; only the newest %d are read, "
+            "so edits to older ones are not picked up.",
+            stats["updates_cut"],
+            _UPDATES_LIMIT,
+            _UPDATES_LIMIT,
+        )
     logger.info(
         "monday.com: %d item(s) scanned, %d changed, %d forgotten, %d board(s) failed.",
         stats.get("scanned", 0),
@@ -746,8 +767,10 @@ def _load_boards(client, board_ids: list[str]) -> dict[str, dict]:
     """
     if not board_ids:
         return {}
-    found = client.query(_BOARDS_QUERY, {"ids": board_ids})["boards"] or []
-    boards = {str(board["id"]): board for board in found}
+    boards = {
+        str(board["id"]): board
+        for board in _listed(client.query(_BOARDS_QUERY, {"ids": board_ids}), "boards")
+    }
     return {board_id: boards[board_id] for board_id in board_ids if board_id in boards}
 
 
@@ -767,7 +790,7 @@ def _subitem_board_ids(board: dict) -> list[str]:
 
 def _sync_board(client, board, board_state, stats, full_refresh, boards):
     board_id = str(board["id"])
-    stamps = _list_stamps(client, board_id)
+    stamps = _list_stamps(client, board_id, stats)
     seen = board_state.setdefault("items", {})
     changed = [i for i, stamp in stamps.items() if full_refresh or seen.get(i) != stamp]
     stats["scanned"] = stats.get("scanned", 0) + len(stamps)
@@ -779,7 +802,9 @@ def _sync_board(client, board, board_state, stats, full_refresh, boards):
         del seen[item_id]
     yield from _forget_items({item_id: seen.pop(item_id) for item_id in gone}, stats)
 
+    returned = set()
     for item in _fetch_items(client, changed):
+        returned.add(str(item["id"]))
         # An item archived, deleted or moved after the listing is left for the
         # next sync, which will see it gone from this board.
         if item.get("state") != "active" or str((item.get("board") or {}).get("id")) != board_id:
@@ -787,10 +812,12 @@ def _sync_board(client, board, board_state, stats, full_refresh, boards):
         stats["changed"] = stats.get("changed", 0) + 1
         yield _render_item(item, board, item.get("updates") or [])
 
-    seen.update(stamps)
+    # A changed item the fetch did not return keeps its old stamp, so the next
+    # sync asks for it again instead of taking it as delivered.
+    seen.update({i: stamp for i, stamp in stamps.items() if i in returned or i not in changed})
 
 
-def _list_stamps(client, board_id: str) -> dict[str, str]:
+def _list_stamps(client, board_id: str, stats: dict) -> dict[str, str]:
     """Every active item on a board, mapped to a short hash of its stamps."""
     items = client.paginate(
         _STAMPS_QUERY,
@@ -798,7 +825,12 @@ def _list_stamps(client, board_id: str) -> dict[str, str]:
         cursor_path="data.boards[0].items_page.cursor",
         items_path="data.boards[0].items_page.items",
     )
-    return {str(item["id"]): _stamp(item) for item in items}
+    stamps = {}
+    for item in items:
+        stamps[str(item["id"])] = _stamp(item)
+        if len(item.get("updates") or []) >= _UPDATES_LIMIT:
+            stats["updates_cut"] = stats.get("updates_cut", 0) + 1
+    return stamps
 
 
 def _stamp(item: dict) -> str:
@@ -813,7 +845,9 @@ def _stamp(item: dict) -> str:
 def _fetch_items(client, item_ids: list[str]) -> Iterator[dict]:
     for start in range(0, len(item_ids), _FETCH_CHUNK):
         chunk = item_ids[start : start + _FETCH_CHUNK]
-        yield from client.query(_ITEMS_QUERY, {"ids": chunk, "limit": _FETCH_CHUNK})["items"] or []
+        yield from _listed(
+            client.query(_ITEMS_QUERY, {"ids": chunk, "limit": _FETCH_CHUNK}), "items"
+        )
 
 
 def _confirm_gone(client, item_ids: list[str], board_id: str, boards: dict[str, dict]):
@@ -829,7 +863,7 @@ def _confirm_gone(client, item_ids: list[str], board_id: str, boards: dict[str, 
     for start in range(0, len(item_ids), _FETCH_CHUNK):
         chunk = item_ids[start : start + _FETCH_CHUNK]
         answer = client.query(_ITEM_STATES_QUERY, {"ids": chunk, "limit": _FETCH_CHUNK})
-        found.update({str(item["id"]): item for item in answer["items"] or []})
+        found.update({str(item["id"]): item for item in _listed(answer, "items")})
 
     for item_id in item_ids:
         item = found.get(item_id)
@@ -844,6 +878,18 @@ def _confirm_gone(client, item_ids: list[str], board_id: str, boards: dict[str, 
         else:
             gone.append(item_id)
     return gone, moved
+
+
+def _listed(data: dict, key: str) -> list[dict]:
+    """The list under ``key`` in a query's data, or an error.
+
+    An answer without that list must never read as an empty one: an empty
+    lookup makes every item asked about look gone.
+    """
+    found = data.get(key)
+    if not isinstance(found, list):
+        raise MondayAPIError(f"monday.com answered without a list of {key}.")
+    return found
 
 
 def _forget_items(items: dict, stats: dict) -> Iterator[dict]:

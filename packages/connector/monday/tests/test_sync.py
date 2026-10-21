@@ -296,6 +296,67 @@ def test_an_error_during_the_lookup_forgets_nothing(monday):
     assert stats["failed"] == 1
 
 
+def answer_with(monday, operation, change):
+    """Pass every answer to ``operation`` queries through ``change`` first."""
+    original = monday.query
+
+    def query(query, variables=None):
+        answer = original(query, variables)
+        return change(answer) if f"query {operation}" in query else answer
+
+    monday.query = query
+    return original
+
+
+@pytest.mark.parametrize("broken", [{"items": None}, {}])
+def test_a_lookup_without_an_items_list_forgets_nothing(monday, broken):
+    state = {}
+    sync(monday, state)
+    monday.delete("2")
+    answer_with(monday, "ItemStates", lambda answer: broken)
+
+    rows, stats = sync(monday, state)
+
+    # Read as an empty answer, it would make every item asked about look gone.
+    assert forgotten(rows) == []
+    assert "2" in state["boards"][BOARD]["items"]
+    assert stats["failed"] == 1
+
+
+def test_an_item_the_fetch_leaves_out_is_asked_for_again(monday):
+    state = {}
+    sync(monday, state)
+    monday.set_status("1", "Stuck")
+    original = answer_with(
+        monday,
+        "ItemDetails",
+        lambda answer: {"items": [i for i in answer["items"] if i["id"] != "1"]},
+    )
+
+    rows, _ = sync(monday, state)
+    assert titles(rows) == []
+
+    monday.query = original
+    rows, _ = sync(monday, state)
+    assert titles(rows) == ["Ship the beta"]
+
+
+def test_items_past_the_update_limit_are_counted_and_warned_about(monday, monkeypatch):
+    import cognee_community_connector_monday.monday as module
+
+    warnings = []
+    monkeypatch.setattr(
+        module.logger, "warning", lambda message, *args: warnings.append(message % args)
+    )
+    for n in range(module._UPDATES_LIMIT):
+        monday.post_update("1", f"Update {n}")
+
+    _, stats = sync(monday, {})
+
+    assert stats["updates_cut"] == 1
+    assert any("1 item(s) have 100 or more updates" in warning for warning in warnings)
+
+
 def test_an_empty_board_still_forgets_its_last_item(monday):
     state = {}
     sync(monday, state)

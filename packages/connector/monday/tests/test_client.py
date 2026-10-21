@@ -115,6 +115,24 @@ def test_paginate_writes_the_cursor_into_the_variables():
     ]
 
 
+@pytest.mark.parametrize(
+    "broken",
+    [
+        {"boards": []},
+        {"boards": [{"items_page": {"items": [{"id": "3"}]}}]},
+        {"boards": [{"items_page": {"cursor": None}}]},
+        {"boards": [{"items_page": {"cursor": None, "items": None}}]},
+    ],
+    ids=["no board", "no cursor", "no items", "null items"],
+)
+def test_a_listing_page_without_its_items_or_cursor_raises(broken):
+    client, _ = make_client(page("C1", "1", "2"), ok(broken))
+
+    # Ending the walk quietly would make every item after it look gone.
+    with pytest.raises(MondayAPIError, match="without its items"):
+        list(client.paginate(ITEMS_QUERY, {"board": 7}, CURSOR_PATH, ITEMS_PATH))
+
+
 def test_http_429_is_retried():
     client, fake = make_client((429, {"errors": [{"message": "slow down"}]}, None), ok({"x": 1}))
 
