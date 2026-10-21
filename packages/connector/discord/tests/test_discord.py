@@ -254,6 +254,19 @@ def test_messages_without_text_are_counted(discord):
     assert (stats["skipped_no_text"], stats["empty"], stats["scanned"]) == (1, 1, 3)
 
 
+def test_render_message_keeps_embed_author_fields_and_footer(discord):
+    embed = {
+        "type": "rich",
+        "author": {"name": "CI"},
+        "fields": [{"name": "commit", "value": "deadbeef"}, {"name": "status", "value": "passed"}],
+        "footer": {"text": "GitHub Actions"},
+    }
+    message = discord.message(GENERAL, TODAY, "", embeds=[embed])
+    assert render_message(message, NAMES) == (
+        "[09:00] Priya Shah: [embed: CI | commit: deadbeef; status: passed | GitHub Actions]"
+    )
+
+
 def test_render_day_for_a_forum_post():
     container = {
         "id": "77",
@@ -695,6 +708,79 @@ def test_budget_cut_runs_still_forget_deleted_threads(discord):
     assert {"id": _day_id("82", TODAY), "_deleted": True} in rows
     assert stats["failed_budget"] == 1 and stats["failed"] == 0
     assert "82" not in state["containers"]
+
+
+def test_threads_saved_before_the_private_flag_are_kept(discord):
+    discord.thread("83", GENERAL, "secret", archived=True, type_=12)
+    discord.message("83", TODAY, "private note")
+    state = {}
+    _run(discord, state, include_private_threads=True)
+    # State written before the flag existed has no "private" key.
+    del state["containers"]["83"]["private"]
+
+    discord.thread_errors[f"{GENERAL}:private"] = (403, 50013)
+    assert _run(discord, state, include_private_threads=True) == []
+    assert "83" in state["containers"]
+
+
+def test_full_resync_cut_by_the_budget_resumes_where_it_stopped(discord):
+    for day in range(50, 0, -1):
+        for index in range(5):
+            discord.message(
+                GENERAL, TODAY - timedelta(days=day, minutes=-index), f"d{day} m{index}"
+            )
+    old = discord.messages[GENERAL][0]
+    state = {}
+    options = {"include_threads": False, "include_forums": False, "since_days": 60}
+    _run(discord, state, **options)
+
+    old["content"] = "edited long ago"
+    emitted, runs = [], 0
+    while True:
+        runs += 1
+        assert runs <= 6, "the resync must make progress on every run"
+        stats = {}
+        emitted += _run(discord, state, stats=stats, full_resync=True, max_requests=5, **options)
+        # A budget stop always comes after progress, so it is never a failure.
+        assert stats["failed"] == 0
+        if "resync" not in state:
+            break
+        assert state["resync"]["cursors"][GENERAL]
+    assert runs > 1
+    assert [r["id"] for r in emitted] == [_day_id(GENERAL, TODAY - timedelta(days=50))]
+    assert "edited long ago" in emitted[0]["content"]
+
+
+def test_cut_resync_keeps_the_incremental_cursor_and_skips_finished_channels(discord):
+    discord.channels.append({"id": "899", "type": 0, "name": "small"})
+    discord.message("899", TODAY, "small channel")
+    for day in range(50, 0, -1):
+        for index in range(5):
+            discord.message(
+                GENERAL, TODAY - timedelta(days=day, minutes=-index), f"d{day} m{index}"
+            )
+    options = {"include_threads": False, "include_forums": False, "since_days": 60}
+    state = {}
+    _run(discord, state, **options)
+    cursor = state["containers"][GENERAL]["cursor"]
+
+    _run(discord, state, full_resync=True, max_requests=6, **options)
+    assert state["resync"]["done"] == ["899"]
+    # The incremental position survives a resync that stopped half way.
+    assert state["containers"][GENERAL]["cursor"] == cursor
+
+    # The next run finishes GENERAL and does not read the channel the resync finished.
+    discord.calls.clear()
+    _run(discord, state, full_resync=True, max_requests=50, **options)
+    assert "resync" not in state
+    assert not [path for path, _ in discord.calls if path == "/channels/899/messages"]
+
+
+def test_resync_given_up_part_way_does_not_shorten_a_later_one(discord):
+    discord.message(GENERAL, TODAY, "hello")
+    state = {"resync": {"done": [GENERAL], "cursors": {}}}
+    _run(discord, state)
+    assert "resync" not in state
 
 
 def test_check_active_runs_before_every_request(discord):

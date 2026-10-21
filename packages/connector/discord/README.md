@@ -65,7 +65,7 @@ Run the same call again to sync only what changed. See `examples/example.py`.
 | `include_bot_messages` | `False` | Messages from bots and webhooks. |
 | `since_days` | `90` | How far back the first sync of a channel reads. |
 | `rescan_days` | `7` | Recent days re-read on every run to catch edits and deletions, never further back than `since_days`. With `0` only the cursor's day and newer messages are read. |
-| `full_resync` | `False` | Re-read the whole `since_days` history once. |
+| `full_resync` | `False` | Re-read the whole `since_days` history once. A resync the budget cuts short resumes where it stopped on the next run with the flag still set. |
 | `max_requests` | `2000` | Request budget of one run, checked once a new day or a whole channel is done. A bigger server finishes over several runs. |
 | `resource_name` | `discord_messages` | Staging table. Use a different name per sync scope that shares a dataset. |
 
@@ -86,8 +86,9 @@ Date: 2026-10-02
 
 Mentions are resolved to names, custom emoji to `:name:`, and attachments are kept as
 file names only, since Discord's attachment links are signed and expire. Embeds from bots
-and webhooks (title, description and link), sticker names and polls are kept as text; link
-previews are left out, since they repeat a URL already in the message. Forum posts start
+and webhooks (author, title, description, link, fields and footer), sticker names and polls
+are kept as text; link previews are left out, since they repeat a URL already in the
+message. Forum posts start
 with the post title and its tags. System messages (joins, pins, boosts) are skipped.
 
 The server name is part of every document. After a rename, days inside the re-scan window
@@ -105,6 +106,12 @@ pick up the new name and older ones keep the old one until a `full_resync`.
   and a new message only re-processes today's document. A channel or thread with nothing
   new and nothing inside the window costs no request, and older days are left untouched.
   Use `full_resync=True` when older edits and deletions matter.
+- **Known limits of the window.** Deleting every message of a day older than the window
+  keeps that day's document until a `full_resync`: the channel's `last_message_id` can
+  still point at the deleted message, so the channel looks unchanged and is skipped, and
+  checking every quiet channel's newest message would cost a request each. Raising
+  `since_days` later re-emits a day that had aged out of the old window once, since only
+  its key was kept.
 - **Forget-on-delete.** A day whose messages were all deleted, a deleted thread or forum
   post, a channel that is deleted (gone from the server's channel list), and a channel you
   remove from `channel_ids` are all removed from memory on the next sync.
