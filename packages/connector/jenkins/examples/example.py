@@ -6,8 +6,9 @@ forget-on-delete, then ask why builds failed.
 ``jenkins_source`` returns a ``dlt`` resource that you hand straight to
 ``cognee.remember``. The first run ingests each job and its most recent builds
 (with the tail of every failed build's console log); re-running ``remember``
-fetches only builds that finished since, and jobs or builds deleted in Jenkins
-are forgotten on the next sync.
+fetches builds that finished since. Complete listings automatically remove
+deleted jobs and rotated builds. Incomplete listings never authorize deletion.
+Cognee >=1.6.5,<2 is required; confirm_deleted is an optional extra guard.
 
 ────────────────────────────────────────────────────────────────────────────
 One-time setup
@@ -70,10 +71,6 @@ async def main():
         )
         return
 
-    # Start from a clean slate so the demo is reproducible.
-    await cognee.prune.prune_data()
-    await cognee.prune.prune_system(metadata=True)
-
     def build_source():
         return jenkins_source(
             base_url=base_url,
@@ -85,7 +82,9 @@ async def main():
 
     # ── First sync: jobs + recent builds ───────────────────────────────────
     print("\n=== Jenkins sync #1 ===")
-    print(await cognee.remember(build_source(), dataset_name=DATASET_NAME, **JENKINS_REMEMBER_KWARGS))
+    print(
+        await cognee.remember(build_source(), dataset_name=DATASET_NAME, **JENKINS_REMEMBER_KWARGS)
+    )
 
     answer = await cognee.search(
         query_text="Which builds failed, and what does the console log say caused it?",
@@ -94,9 +93,11 @@ async def main():
     )
     print("Failures:", answer)
 
-    # ── Second sync: only new builds; deleted jobs/builds are forgotten ────
+    # ── Second sync: new builds and complete-list deletion ────────
     print("\n=== Jenkins sync #2 (incremental) ===")
-    print(await cognee.remember(build_source(), dataset_name=DATASET_NAME, **JENKINS_REMEMBER_KWARGS))
+    print(
+        await cognee.remember(build_source(), dataset_name=DATASET_NAME, **JENKINS_REMEMBER_KWARGS)
+    )
 
 
 if __name__ == "__main__":
