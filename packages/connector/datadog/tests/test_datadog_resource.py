@@ -50,6 +50,15 @@ def test_bad_arguments_are_rejected_when_the_resource_is_built(kwargs):
         datadog_source(**kwargs)
 
 
+def test_a_cognee_without_table_scoped_cleanup_is_refused(monkeypatch):
+    from cognee.tasks.ingestion import dlt_utils
+
+    monkeypatch.setattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 0)
+
+    with pytest.raises(RuntimeError, match="table-scoped"):
+        datadog_source(service=client_for(FakeDatadog()), resource_name=TABLE)
+
+
 def test_resource_name_has_no_default():
     with pytest.raises(TypeError, match="resource_name"):
         datadog_source(api_key=API_KEY, app_key=APP_KEY)

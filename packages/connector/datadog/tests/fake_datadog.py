@@ -33,6 +33,8 @@ class FakeDatadog(BaseAdapter):
         self.statuses: dict[str, int] = {}
         # "list:<kind>" or "get:<kind>" -> x-ratelimit-remaining to report
         self.remaining: dict[str, int] = {}
+        # "list:<kind>" or "get:<kind>" -> extra response headers, like Retry-After
+        self.headers: dict[str, dict[str, str]] = {}
         self.calls: list[str] = []
         self._clock = 0
 
@@ -169,6 +171,7 @@ class FakeDatadog(BaseAdapter):
         response.headers["Content-Type"] = "application/json"
         if key is not None:
             response.headers["x-ratelimit-remaining"] = str(self.remaining.get(key, 100))
+            response.headers.update(self.headers.get(key, {}))
         response.request = request
         response.url = request.url
         response.reason = "OK" if status == 200 else "Error"

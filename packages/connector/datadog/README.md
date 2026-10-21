@@ -131,13 +131,16 @@ are left in its window.
   is read on the next run. Deletions are still applied.
 - `max_requests` (500 by default) caps a whole run. A large org finishes over several runs.
 
-Network errors and 5xx answers are retried twice. A list that still fails is treated like one
-that stopped early: that kind is skipped for the run and nothing of it is forgotten. Only a
-rejected API key (HTTP 401) fails the whole run.
+Network errors and 5xx answers are retried twice, waiting at most 60 seconds between tries
+whatever `Retry-After` says, since cognee holds its staging lock for the whole run. A list that
+still fails is treated like one that stopped early: that kind is skipped for the run and
+nothing of it is forgotten. A rejected API key (HTTP 401) fails the run if nothing was read
+yet; if the key is revoked mid-run, the run stops and keeps what it already read.
 
 Progress is reported in `source.cognee_sync_stats` (`scanned`, `skipped`, `deferred`, `deleted`,
-`failed`, and a `failed_<reason>_<kind>` entry, reason `rate_limit`, `access` or `error`, for a
-kind that stopped early or was refused).
+`failed`, a `failed_<reason>_<kind>` entry, reason `rate_limit`, `access` or `error`, for a
+kind that stopped early or was refused, and `failed_budget` or `failed_auth` for a run that
+stopped early).
 
 ## Limitations
 

@@ -372,6 +372,33 @@ def test_a_server_error_on_one_listing_skips_that_kind_without_forgetting_it():
     )
 
 
+def test_a_key_revoked_mid_run_keeps_the_rows_already_read():
+    fake = _org()
+    fake.statuses["list:notebooks"] = 401
+    state: dict = {}
+    rows, stats = _run(fake, state)
+
+    assert {"monitor:1", "monitor:2", "dashboard:abc-123"} <= set(rows)
+    assert "notebook:10" not in rows
+    assert stats["failed_auth"] == 1
+    assert set(state["rows"]) == set(rows), "the state matches what was emitted"
+
+    del fake.statuses["list:notebooks"]
+    rows, _ = _run(fake, state)
+    assert set(rows) == {"notebook:10", "slo:slo1", "incident:inc-1"}, "the next run finishes"
+
+
+def test_a_key_revoked_before_anything_is_read_fails_loudly():
+    fake = _org()
+    state: dict = {}
+    _run(fake, state)
+
+    # a quiet run emits nothing before the 401, so there is nothing to keep
+    fake.statuses["list:notebooks"] = 401
+    with pytest.raises(DatadogAuthError):
+        _run(fake, state)
+
+
 def test_a_rejected_api_key_fails_the_run():
     fake = _org()
     fake.statuses["list:monitors"] = 401

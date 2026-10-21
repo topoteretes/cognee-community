@@ -1,10 +1,13 @@
 """The HTTP client: site routing, auth headers, error mapping, and keys kept out of errors."""
 
+import time
+
 import pytest
 from fake_datadog import API_KEY, APP_KEY, FakeDatadog, client_for
 
 from cognee_community_connector_datadog.datadog import (
     DatadogAccessError,
+    DatadogAPIError,
     DatadogClient,
     DatadogNotFoundError,
     DatadogRateLimitedError,
@@ -86,6 +89,36 @@ def test_error_statuses_map_to_their_errors_without_keys_in_the_message(status, 
         client.get("monitors", "1")
     for raised in (listed, fetched):
         assert API_KEY not in str(raised.value) and APP_KEY not in str(raised.value)
+
+
+def test_a_server_error_is_retried_twice_and_a_long_retry_after_is_capped(monkeypatch):
+    fake = FakeDatadog()
+    fake.statuses["list:monitors"] = 503
+    fake.headers["list:monitors"] = {"Retry-After": "86400"}
+    sleeps: list[float] = []
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+    # the default session carries dlt's retry; the fake replaces only its transport
+    client = DatadogClient(API_KEY, APP_KEY)
+    client._rest.session.mount("https://", fake)
+
+    with pytest.raises(DatadogAPIError):
+        list(client.pages("monitors"))
+
+    assert len(fake.calls) == 3
+    assert sleeps and max(sleeps) <= 60, "cognee's staging lock is held while it sleeps"
+
+
+def test_a_429_is_not_retried(monkeypatch):
+    fake = FakeDatadog()
+    fake.statuses["list:monitors"] = 429
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+    client = DatadogClient(API_KEY, APP_KEY)
+    client._rest.session.mount("https://", fake)
+
+    with pytest.raises(DatadogRateLimitedError):
+        list(client.pages("monitors"))
+
+    assert len(fake.calls) == 1, "a spent window stops the kind instead of waiting it out"
 
 
 def test_the_rate_limit_window_is_read_per_endpoint():

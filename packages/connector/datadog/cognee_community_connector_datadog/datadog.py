@@ -47,6 +47,7 @@ SITES = {
     "ap2.datadoghq.com": "ap2.datadoghq.com",
     "ddog-gov.com": "app.ddog-gov.com",
 }
+# the human-written kinds this source syncs; metrics, logs and traces stay out
 KINDS = ("monitors", "dashboards", "notebooks", "slos", "incidents")
 # the row id prefix of each kind
 _PREFIX = {
@@ -67,13 +68,17 @@ _SCOPES = {
 # lists don't carry a dashboard's widgets or a notebook's cells, so these two
 # are fetched one by one, and only when the list says they changed
 _DETAIL_KINDS = ("dashboards", "notebooks")
+# the incident list allows at most 100 per page, and 100 is the dashboard and notebook default
 _PAGE_SIZE = 100
 # a full listing of every kind plus a few hundred changed dashboards or notebooks
 DEFAULT_MAX_REQUESTS = 500
 # requests left untouched in each endpoint's rate-limit window, for the keys' other users
 _REQUESTS_RESERVE = 5
-# (connect, read) seconds
+# (connect, read) seconds; our own choice, datadog documents no expected latency
 _TIMEOUT = (10, 30)
+# longest wait between retries, whatever Retry-After says: cognee holds its dlt staging
+# lock for the whole run, so a long sleep would block every other sync
+_MAX_RETRY_DELAY = 60
 
 
 class DatadogSourceError(RuntimeError):
@@ -188,6 +193,7 @@ class DatadogClient:
             session = Client(
                 request_timeout=_TIMEOUT,
                 request_max_attempts=3,
+                request_max_retry_delay=_MAX_RETRY_DELAY,
                 status_codes=(500, 502, 503, 504),
                 raise_for_status=False,
             ).session
@@ -731,12 +737,23 @@ def _iter_rows(
         max_requests=max_requests,
         check_active=check_active,
     )
+    emitted = 0
     try:
-        yield from walker.rows_out()
+        for row in walker.rows_out():
+            emitted += 1
+            yield row
     except _BudgetSpentError:
         stats["failed"] = max(1, stats.get("failed", 0))
         stats["failed_budget"] = 1
         logger.warning("Datadog sync used its request budget; it resumes on the next run.")
+    except DatadogAuthError:
+        if not emitted:
+            raise
+        # a key revoked mid-run: keep the rows already emitted and the state behind them,
+        # and let the next run fail loudly on its first request
+        stats["failed"] = max(1, stats.get("failed", 0))
+        stats["failed_auth"] = 1
+        logger.warning("Datadog rejected the API key mid-run; the rows read so far are kept.")
 
 
 # ---------------------------------------------------------------------------
@@ -779,6 +796,9 @@ def datadog_source(
     """
     import dlt
 
+    # version 1 of cognee's document sync scopes cleanup by staging table, which keeps
+    # one org's tombstones from touching another table; the later versions add columns
+    # this source doesn't write
     if getattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 0) < 1:
         raise RuntimeError("Datadog sync requires cognee>=1.6.3 (table-scoped document cleanup).")
     if not isinstance(resource_name, str) or not resource_name.strip():
