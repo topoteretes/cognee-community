@@ -8,7 +8,7 @@ The resource is handed directly to :func:`cognee.remember`::
     from cognee_community_connector_trello import trello_source
 
     await cognee.remember(
-        trello_source(board_ids=["<board id>"]),  # TRELLO_API_KEY / TRELLO_TOKEN from env
+        trello_source(board_ids=["<board id>"], api_key=key, token=token),
         dataset_name="trello",
         primary_key="id",
         write_disposition="merge",  # REQUIRED, the add pipeline defaults to "replace"
@@ -30,14 +30,15 @@ Design
   by card, which also catches the action types Trello leaves out of the feed
   (checklist items, labels, deleted comments through the comment count).
   Comments are read only for the cards that changed.
-* **Forget-on-delete.** Deleted cards and boards are emitted as hard-delete
-  tombstones, decided once per run across all selected boards, so a card moved
-  between two of them is never lost. A board listed in ``board_ids`` that cannot
-  be read raises instead of being forgotten.
+* **Forget-on-delete.** A deleted, hidden or deselected board is forgotten right
+  after the board listing. Card tombstones are decided once a pass has visited
+  every selected board, which can span several runs when the budget cuts them
+  short, so a card moved between two boards is never lost. A board listed in
+  ``board_ids`` that cannot be read raises instead of being forgotten.
 * **A run is bounded.** On a rate limit, an expired token after progress, or a
-  spent request budget it stops cleanly, keeps the boards and cards it finished, and
-  reports why in ``cognee_sync_stats``; deletions are only decided by a run
-  that finished.
+  spent request budget it stops cleanly, keeps the boards and cards it finished,
+  and reports why in ``cognee_sync_stats``; the next run starts after the last
+  board it finished.
 
 Privacy
 -------
@@ -49,18 +50,17 @@ that anyone with read access to the target dataset can read what was ingested.
 import copy
 import hashlib
 import json
-import logging
-import os
 import re
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Any
 
+from cognee.shared.logging_utils import get_logger
 from cognee.tasks.ingestion import dlt_utils
 from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR, NODE_SET_COLUMN
 
-logger = logging.getLogger(__name__)
+logger = get_logger("trello_connector")
 
 API_URL = "https://api.trello.com/1"
 # Largest ``limit`` the board actions endpoint accepts.
@@ -361,6 +361,9 @@ class _Walker:
             boards = self._get(f"/organizations/{self.config.workspace_id}/boards", params)
         else:
             boards = self._get("/members/me/boards", params)
+        # A 200 that is not a list must not read as "no boards".
+        if not isinstance(boards, list):
+            raise TrelloAPIError("Trello answered without a board list")
         return [str(board["id"]) for board in boards]
 
     def _newest_action(self, board_id: str, cursor: str | None) -> str | None:
@@ -549,8 +552,28 @@ class _Walker:
         self._get("/members/me", {"fields": "id"})
         boards: dict[str, dict] = self.state.setdefault("boards", {})
         configured = bool(self.config.board_ids)
-        present: dict[str, set[str]] = {}
-        for board_id in self._board_ids():
+        # Card deletions are decided once a pass has visited every board, which can
+        # take several runs when the budget cuts them short.
+        visit = self.state.setdefault("pass", {"present": {}, "orphans": []})
+        ids = self._board_ids()
+        if not configured and not ids and boards and not self.state.get("empty_listing"):
+            # A board listing that is empty as a whole is confirmed by the next run.
+            self.state["empty_listing"] = True
+            logger.warning(
+                "Trello listed no boards although %d were synced before; nothing is "
+                "forgotten until the next run confirms it.",
+                len(boards),
+            )
+            return
+        self.state.pop("empty_listing", None)
+        for board_id in [b for b in boards if b not in ids]:
+            yield from self._drop_board(board_id, boards, visit)
+        # Start after the board a cut-short run reached, so every one gets its turn.
+        resume = self.state.get("resume")
+        order = sorted(ids)
+        if resume:
+            order = [b for b in order if b > resume] + [b for b in order if b <= resume]
+        for board_id in order:
             # Work on a copy, so a board that fails keeps its previous state.
             entry = copy.deepcopy(boards.get(board_id)) or {
                 "cursor": None,
@@ -577,12 +600,21 @@ class _Walker:
                     ) from None
                 logger.warning("Trello board %s answered 404.", board_id)
                 self.stats["gone"] += 1
+                yield from self._drop_board(board_id, boards, visit)
+                ids.remove(board_id)
                 continue
             boards[board_id] = entry
-            present[board_id] = cards
+            visit["present"][board_id] = sorted(cards)
+            self.state["resume"] = board_id
             self.saved = True
             yield from self._emit(rows)
-        yield from self._forget(boards, present)
+            # Checked after every board, since a budget stop can end the run at the next.
+            if set(ids) <= set(visit["present"]):
+                yield from self._forget(boards, visit, ids)
+                visit = self.state["pass"] = {"present": {}, "orphans": []}
+        if not ids and visit["orphans"]:
+            yield from self._forget(boards, visit, ids)
+            self.state["pass"] = {"present": {}, "orphans": []}
 
     def _emit(self, rows: list[dict]) -> Iterator[dict]:
         for row in rows:
@@ -590,23 +622,33 @@ class _Walker:
             self.stats["emitted"] += 1
             yield row
 
-    def _forget(self, boards: dict[str, dict], present: dict[str, set[str]]) -> Iterator[dict]:
-        """Tombstones, decided once across all boards so a card moved between two
-        selected boards is never deleted."""
+    def _drop_board(self, board_id: str, boards: dict[str, dict], visit: dict) -> Iterator[dict]:
+        """A deleted, hidden or deselected board: its document goes now, its cards wait
+        for the end of the pass, in case one moved to another selected board."""
+        logger.warning("Forgetting Trello board %s and its cards.", board_id)
+        entry = boards.pop(board_id)
+        visit["present"].pop(board_id, None)
+        visit["orphans"] = sorted(set(visit["orphans"]) | set(entry["cards"]))
+        if entry["board"]:
+            self.stats["deleted"] += 1
+            yield {"id": f"board:{board_id}", "_deleted": True}
+
+    def _forget(self, boards: dict[str, dict], visit: dict, ids: list[str]) -> Iterator[dict]:
+        """Card tombstones, decided once a pass has seen every board, so a card moved
+        between two selected boards is never deleted."""
+        present = {board_id: set(visit["present"][board_id]) for board_id in ids}
         live = set().union(*present.values())
-        for board_id in list(boards):
+        for board_id in ids:
             entry = boards[board_id]
-            if board_id not in present:
-                logger.warning("Forgetting Trello board %s and its cards.", board_id)
-                boards.pop(board_id)
-                if entry["board"]:
-                    self.stats["deleted"] += 1
-                    yield {"id": f"board:{board_id}", "_deleted": True}
-            for cid in [cid for cid in entry["cards"] if cid not in present.get(board_id, ())]:
+            for cid in [cid for cid in entry["cards"] if cid not in present[board_id]]:
                 del entry["cards"][cid]
                 if cid not in live:
                     self.stats["deleted"] += 1
                     yield {"id": f"card:{cid}", "_deleted": True}
+        for cid in visit["orphans"]:
+            if cid not in live:
+                self.stats["deleted"] += 1
+                yield {"id": f"card:{cid}", "_deleted": True}
 
 
 def _iter_rows(
@@ -621,7 +663,9 @@ def _iter_rows(
     try:
         yield from walker.rows()
     except _CutShortError as cut:
-        stats["failed"] = 1
+        # A spent budget is a planned pause, not a failure; failed_budget says why.
+        if cut.reason != "budget":
+            stats["failed"] = 1
         stats[f"failed_{cut.reason}"] = 1
         logger.warning("Trello sync stopped early (%s); it resumes on the next run.", cut.reason)
 
@@ -668,14 +712,16 @@ def trello_source(
         board_ids: Boards to sync. A listed board that cannot be read raises. Defaults
             to every board of ``workspace_id``, or every board the token's user belongs to.
         workspace_id: Sync every board of this workspace (id or name).
-        api_key: Trello API key (``TRELLO_API_KEY``).
-        token: Trello user token (``TRELLO_TOKEN``).
+        api_key: Trello API key.
+        token: Trello user token.
         include_archived: Also ingest archived cards, lists and boards, marked as archived.
         include_comments: Add each card's comments to its document.
         include_checklists: Add each card's checklists to its document.
         full_resync: Re-render every card, reading all comments again.
         max_requests: Request budget of one run, checked before each request once a
-            card or board is saved. A bigger account finishes over several runs.
+            card or board is saved. A bigger account finishes over several runs, which
+            visit the boards in turn; a spent budget sets ``failed_budget`` but not
+            ``failed``.
         resource_name: Stable name of this sync, which scopes its state and cleanup.
             Defaults to one derived from the board or workspace; required when
             ``board_ids`` lists several boards.
@@ -700,14 +746,11 @@ def trello_source(
     name = resource_name or _default_resource_name(board_ids, workspace_id)
     service = service or client
     if service is None:
-        resolved_key = api_key or os.getenv("TRELLO_API_KEY")
-        resolved_token = token or os.getenv("TRELLO_TOKEN")
-        if not (resolved_key and resolved_token):
+        if not (api_key and token):
             raise ValueError(
-                "Trello credentials missing: pass api_key and token or set "
-                "TRELLO_API_KEY and TRELLO_TOKEN."
+                "Trello credentials missing: pass api_key and token, or a pre-built service."
             )
-        service = TrelloClient(resolved_key, resolved_token)
+        service = TrelloClient(api_key=api_key, token=token)
 
     config = _TrelloConfig(
         board_ids=tuple(str(b) for b in board_ids or ()),

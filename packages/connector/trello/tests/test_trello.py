@@ -520,13 +520,67 @@ def test_request_budget_stops_inside_a_board_and_resumes(trello):
         for note in range(700):
             trello.comment(f"c{index}", f"note {note}")
     state = {}
-    emitted, failed = [], []
+    emitted, paused = [], []
     for _ in range(4):
         stats = _stats()
         emitted.append(_ids(_run(trello, state, stats=stats, max_requests=10)))
-        failed.append(stats["failed"])
+        paused.append(stats.get("failed_budget", 0))
+        # A spent budget is a pause, not a failure.
+        assert stats["failed"] == 0
     assert emitted == [[f"board:{BOARD}", "card:c0"], ["card:c1"], ["card:c2"], []]
-    assert failed == [1, 1, 0, 0]
+    assert paused == [1, 1, 0, 0]
+
+
+def test_deleted_card_is_forgotten_even_when_every_run_is_cut_short(trello):
+    trello.add_board("b2", "Ops")
+    trello.add_card("c1", "Export")
+    trello.add_card("c2", "Deploy", board_id="b2")
+    state = {}
+    _run(trello, state, board_ids=("b1", "b2"))
+
+    trello.boards[BOARD]["cards"].clear()
+    trello.act(BOARD, "deleteCard", card={"id": "c1"})
+    trello.act("b2", "updateCard", card={"id": "c2"})
+    # Each run finishes one board before the budget stops it; the pass spans both runs.
+    first = _run(trello, state, board_ids=("b1", "b2"), max_requests=5)
+    assert {"id": "card:c1", "_deleted": True} not in first
+    second = _run(trello, state, board_ids=("b1", "b2"), max_requests=5)
+    assert {"id": "card:c1", "_deleted": True} in second
+    assert state["pass"] == {"present": {}, "orphans": []}
+
+
+def test_card_moved_off_a_removed_board_survives(trello):
+    trello.add_board("b2", "Ops")
+    trello.add_card("c1", "Export")
+    state = {}
+    _run(trello, state, board_ids=("b1", "b2"))
+
+    trello.move_card("c1", BOARD, "b2")
+    rows = _run(trello, state, board_ids=("b2",))
+    assert {"id": f"board:{BOARD}", "_deleted": True} in rows
+    assert {"id": "card:c1", "_deleted": True} not in rows
+    assert "c1" in state["boards"]["b2"]["cards"]
+
+
+def test_empty_board_listing_waits_for_confirmation(trello):
+    trello.add_card("c1", "Export")
+    state = {}
+    _run(trello, state, board_ids=())
+    trello.boards.clear()
+    assert _run(trello, state, board_ids=()) == []
+    assert BOARD in state["boards"]
+    assert _ids(_run(trello, state, board_ids=())) == [f"board:{BOARD}", "card:c1"]
+    assert "empty_listing" not in state
+
+
+def test_board_listing_that_is_not_a_list_raises(trello):
+    trello.add_card("c1", "Export")
+    state = {}
+    _run(trello, state, board_ids=())
+    trello.get = lambda path, params=None: {"error": "nope"} if path.endswith("/boards") else {}
+    with pytest.raises(TrelloAPIError, match="board list"):
+        _run(trello, state, board_ids=())
+    assert BOARD in state["boards"]
 
 
 def test_deselected_board_is_forgotten(trello):
@@ -617,11 +671,19 @@ def test_several_boards_need_a_resource_name(trello):
     )
 
 
-def test_missing_credentials_name_the_env_vars(monkeypatch):
-    monkeypatch.delenv("TRELLO_API_KEY", raising=False)
-    monkeypatch.delenv("TRELLO_TOKEN", raising=False)
-    with pytest.raises(ValueError, match="TRELLO_TOKEN"):
+def test_missing_credentials_raise_without_reading_the_environment(monkeypatch):
+    monkeypatch.setenv("TRELLO_TOKEN", "from-env")
+    with pytest.raises(ValueError, match="api_key and token"):
         trello_source([BOARD], api_key="key")
+
+
+def test_client_is_built_with_keyword_arguments(monkeypatch):
+    from cognee_community_connector_trello import trello as trello_module
+
+    seen = {}
+    monkeypatch.setattr(trello_module, "TrelloClient", lambda **kwargs: seen.update(kwargs) or "c")
+    trello_source([BOARD], api_key="key", token="tok")
+    assert seen == {"api_key": "key", "token": "tok"}
 
 
 # ---------------------------------------------------------------------------

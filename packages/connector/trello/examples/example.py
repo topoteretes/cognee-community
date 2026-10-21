@@ -37,7 +37,11 @@ DATASET_NAME = "trello"
 
 
 async def sync(board_id: str) -> None:
-    source = trello_source(board_ids=[board_id])
+    source = trello_source(
+        board_ids=[board_id],
+        api_key=os.environ["TRELLO_API_KEY"],
+        token=os.environ["TRELLO_TOKEN"],
+    )
     await cognee.remember(
         source,
         dataset_name=DATASET_NAME,
