@@ -20,24 +20,27 @@ cd packages/connector/coda && uv sync
 
 1. Create an API token under **My account** in Coda. You can restrict it to read-only
    access and to the docs you want to sync, which is all this connector needs.
-2. Export it, together with your `LLM_API_KEY` like any other cognee run:
+2. Pass it as `token=`. The example reads it from `CODA_API_TOKEN`, together with your
+   `LLM_API_KEY` like any other cognee run:
 
 ```bash
 export CODA_API_TOKEN="..."
 ```
 
 Coda's API is now served by Superhuman Docs. The connector uses `https://coda.io/apis/v1`
-by default; set `CODA_API_BASE_URL=https://docs.superhuman.com/apis/v1` to use the new
-address instead.
+by default; pass `base_url="https://docs.superhuman.com/apis/v1"` to use the new address
+instead (the example reads `CODA_API_BASE_URL`).
 
 ## Usage
 
 ```python
+import os
+
 import cognee
 from cognee_community_connector_coda import coda_source
 
 await cognee.remember(
-    coda_source(doc_ids=["<doc id>"]),  # CODA_API_TOKEN from env
+    coda_source(doc_ids=["<doc id>"], token=os.environ["CODA_API_TOKEN"]),
     dataset_name="coda",
     primary_key="id",
     write_disposition="merge",  # REQUIRED, the add pipeline defaults to "replace"
@@ -55,14 +58,15 @@ id `AbCDeFGH`). Run the same call again to sync only what changed. See `examples
 
 | Argument | Default | Meaning |
 | --- | --- | --- |
-| `doc_ids` | all your docs | Docs to sync. Without it, every doc the token can see, narrowed by `workspace_id` and `folder_id`. |
+| `doc_ids` | all your docs | Docs to sync. Without it, every doc the token can see, narrowed by `workspace_id` and `folder_id`. A listed doc that cannot be read on its first sync raises. |
 | `workspace_id` | none | Only docs of this workspace. |
 | `folder_id` | none | Only docs of this folder. |
 | `include_tables` | `True` | Ingest each table as one document. Views are always skipped. |
 | `include_hidden_pages` | `False` | Also ingest hidden pages. |
 | `include_sync_pages` | `False` | Also ingest sync pages, which mirror a page of another doc. |
-| `base_url` | `https://coda.io/apis/v1` | API address (`CODA_API_BASE_URL`). |
-| `resource_name` | `coda_documents` | Staging table. Use a different name per sync scope that shares a dataset. |
+| `base_url` | `https://coda.io/apis/v1` | API address. |
+| `max_requests` | `1000` | Request budget of one run (a page export counts as one). A bigger account finishes over several runs. |
+| `resource_name` | derived | Staging table, which scopes this sync's state and cleanup. Derived from the doc, the workspace and folder, or `coda_my_docs`; **required** when `doc_ids` lists several docs, since two sources sharing one would delete each other's documents. |
 
 ## What a table looks like
 
@@ -91,11 +95,24 @@ pages carry no content of their own and are skipped too.
   waits for it and downloads the result), and only changed tables have their rows read
   again. Unchanged documents keep their id and are not processed again. Renaming a doc
   re-renders its pages and tables, since each document names its doc.
-- **Forget-on-delete.** A page or table that disappears from its doc, and a doc that is
-  deleted, no longer shared with the token, or no longer selected, are removed from memory
-  on the next sync.
-- **Failures.** A rejected token always raises. Other errors raise after retries (429 and
-  5xx), so dlt keeps the previous state and a failed listing never looks like a deletion.
+- **Forget-on-delete.** A page or table that disappears from its doc, a doc that answers
+  404 or 410, a doc that leaves the `/docs` listing, and a doc you remove from `doc_ids`
+  are removed from memory on the next sync. Removed and deselected docs are decided right
+  after the doc listing, so a run cut short by the budget still forgets them.
+- **Access removed is not deletion.** A doc or page that answers 403 (the token lost
+  access) is left unchanged and counted in `unreadable`. A `/docs` listing that comes back
+  empty while docs were synced before forgets nothing until the next run confirms it, an
+  empty page listing keeps the doc's pages (every Coda doc has at least one page), and an
+  answer without its `items` list raises.
+- **A run is bounded.** 429 and 5xx are retried, honoring `Retry-After`. A `Retry-After`
+  over 60 seconds, a 429 that outlasts the retries, or more than five minutes of retry
+  waits stops the run cleanly with `failed` and `failed_rate_limit`; a spent
+  `max_requests` budget is a planned pause and sets only `failed_budget`. Either way the
+  finished docs are kept and the next run starts after the last one. A rejected token
+  always raises, and any other error raises so dlt keeps the previous state.
+
+`cognee_sync_stats` counts `emitted`, `unchanged`, `deleted` and `gone` documents,
+`exported` pages, `unreadable` docs, and `failed` plus `failed_*` for a stopped run.
 
 The export download link is a short-lived signed URL; the token is never sent to it.
 
@@ -113,7 +130,9 @@ uv run pytest tests/
 ```
 
 The tests need no Coda account. They run the client against a mocked HTTP transport
-(the page export flow, retries, no token sent to the download link), check page and table
-rendering, drive the sync against a fake Coda API through a real dlt pipeline (changed and
-unchanged pages and tables, renames, deletions, failed runs), and run `cognee.remember`
-end to end to prove a deleted page leaves the graph.
+(the page export flow, retries and their limits, no token sent to the download link),
+check page and table rendering, drive the sync against a fake Coda API (changed and
+unchanged pages and tables, renames, deletions, access removed, empty answers, rate limit
+and budget stops, `check_active`) and through a real dlt pipeline (two sources in one
+dataset, failed runs), and run `cognee.remember` end to end to prove a deleted page leaves
+the graph.

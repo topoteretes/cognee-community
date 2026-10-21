@@ -18,10 +18,13 @@ from cognee.tasks.ingestion import dlt_utils
 from cognee.tasks.ingestion.resolve_dlt_sources import _build_document_data_item
 from conftest import DOC, FakeCoda, columns, row
 
+from cognee_community_connector_coda import coda as coda_module
 from cognee_community_connector_coda.coda import (
     CodaAPIError,
     CodaAuthError,
     CodaClient,
+    CodaRateLimitedError,
+    CodaSourceError,
     _CodaConfig,
     _iter_rows,
     coda_source,
@@ -45,13 +48,9 @@ def _config(**overrides):
     return _CodaConfig(**values)
 
 
-def _stats():
-    return {"emitted": 0, "unchanged": 0, "exported": 0, "deleted": 0, "gone": 0}
-
-
-def _run(coda, state, stats=None, **overrides):
-    stats = stats if stats is not None else _stats()
-    return list(_iter_rows(coda, _config(**overrides), state, stats))
+def _run(coda, state, stats=None, check_active=None, **overrides):
+    stats = stats if stats is not None else {}
+    return list(_iter_rows(coda, _config(**overrides), state, stats, check_active))
 
 
 def _ids(rows):
@@ -77,7 +76,7 @@ def doc(coda):
 # ---------------------------------------------------------------------------
 # CodaClient over httpx.MockTransport
 # ---------------------------------------------------------------------------
-def _client(handler, clock=lambda: 0.0):
+def _client(handler, clock=lambda: 0.0, **kwargs):
     requests, sleeps = [], []
 
     def record(request):
@@ -89,6 +88,7 @@ def _client(handler, clock=lambda: 0.0):
         http=httpx.Client(transport=httpx.MockTransport(record)),
         sleep=sleeps.append,
         clock=clock,
+        **kwargs,
     )
     return client, requests, sleeps
 
@@ -155,6 +155,33 @@ def test_client_retries_429_and_raises_status_only_errors():
     with pytest.raises(CodaAPIError) as info:
         client.get(f"/docs/{DOC}")
     assert info.value.status == 404 and DOC not in str(info.value)
+
+
+@pytest.mark.parametrize("retry_after", ["3600", "1"])
+def test_client_stops_on_a_long_or_endless_429(retry_after):
+    client, requests, sleeps = _client(
+        lambda request: httpx.Response(429, headers={"Retry-After": retry_after}),
+        max_sleep=10_000.0,
+    )
+    with pytest.raises(CodaRateLimitedError):
+        client.get("/docs")
+    assert sleeps == ([] if retry_after == "3600" else [1.0] * 4)
+    assert len(requests) == (1 if retry_after == "3600" else 5)
+
+
+def test_client_retry_waits_stop_at_the_budget_until_reset():
+    busy, ok = (
+        httpx.Response(503, headers={"Retry-After": "40"}),
+        httpx.Response(200, json={"items": []}),
+    )
+    responses = iter([busy, ok, busy, ok])
+    client, _, sleeps = _client(lambda request: next(responses), max_sleep=60.0)
+    client.get("/docs")
+    with pytest.raises(CodaRateLimitedError):
+        client.get("/docs")
+    client.reset_sleep_budget()
+    assert client.get("/docs") == {"items": []}
+    assert sleeps == [40.0]
 
 
 def test_client_rejects_bad_tokens_without_echoing_them():
@@ -269,7 +296,7 @@ def test_touched_but_unchanged_content_is_not_emitted(doc):
     state = {}
     _run(doc, state)
     doc.touch(doc.pages[DOC][0])
-    stats = _stats()
+    stats = {}
     assert _run(doc, state, stats=stats) == []
     assert stats["exported"] == 1
 
@@ -284,9 +311,10 @@ def test_renamed_doc_reprocesses_everything(doc):
 
 
 def test_deleted_page_and_table_are_forgotten(doc):
+    doc.add_page("canvas-2", "Notes", "kept")
     state = {}
     _run(doc, state)
-    doc.pages[DOC].clear()
+    doc.pages[DOC] = [p for p in doc.pages[DOC] if p["id"] != "canvas-1"]
     doc.tables[DOC].clear()
     assert _run(doc, state) == [
         {"id": f"page:{DOC}:canvas-1", "_deleted": True},
@@ -309,21 +337,137 @@ def test_page_deleted_during_the_sync_forgets_only_that_page(doc):
     assert set(state["docs"][DOC]["tables"]) == {"grid-1"}
 
 
-@pytest.mark.parametrize("status", [404, 403, 410])
-def test_deleted_or_unshared_doc_is_forgotten(doc, status):
+@pytest.mark.parametrize("status", [404, 410])
+def test_deleted_doc_is_forgotten(doc, status):
     state = {}
     _run(doc, state)
     doc.errors[f"/docs/{DOC}"] = status
-    stats = _stats()
-    assert _ids(_run(doc, state, stats=stats)) == [f"page:{DOC}:canvas-1", f"table:{DOC}:grid-1"]
+    assert _ids(_run(doc, state)) == [f"page:{DOC}:canvas-1", f"table:{DOC}:grid-1"]
     assert state["docs"] == {}
+
+
+def test_doc_whose_access_was_removed_is_left_unchanged(doc):
+    state = {}
+    _run(doc, state)
+    doc.errors[f"/docs/{DOC}"] = 403
+    stats = {}
+    assert _run(doc, state, stats=stats) == []
+    assert stats["unreadable"] == 1 and state["docs"][DOC]["pages"]
+
+    # Access removed between the doc read and its page listing: same answer.
+    doc.errors = {f"/docs/{DOC}/pages": 403}
+    stats = {}
+    assert _run(doc, state, stats=stats) == []
+    assert stats["unreadable"] == 1 and state["docs"][DOC]["pages"]
+
+
+def test_page_whose_access_was_removed_is_kept(doc):
+    state = {}
+    _run(doc, state)
+    doc.touch(doc.pages[DOC][0])
+    doc.export_errors["canvas-1"] = 403
+    assert _run(doc, state) == []
+    assert "canvas-1" in state["docs"][DOC]["pages"]
+
+
+def test_selected_doc_that_was_never_readable_raises(coda):
+    with pytest.raises(CodaSourceError, match="Nope1234"):
+        _run(coda, {}, doc_ids=("Nope1234",))
+
+
+def test_answer_without_items_raises_instead_of_forgetting(doc):
+    state = {}
+    _run(doc, state)
+    doc.drop_items = True
+    with pytest.raises(CodaAPIError, match="items list"):
+        _run(doc, state)
+    assert state["docs"][DOC]["pages"]
+
+
+def test_empty_doc_listing_waits_for_confirmation(doc):
+    state = {}
+    _run(doc, state, doc_ids=())
+    del doc.docs[DOC]
+    assert _run(doc, state, doc_ids=()) == []
+    assert DOC in state["docs"]
+    assert _ids(_run(doc, state, doc_ids=())) == [f"page:{DOC}:canvas-1", f"table:{DOC}:grid-1"]
+    assert "empty_listing" not in state
+
+
+def test_empty_page_listing_keeps_the_pages(doc):
+    state = {}
+    _run(doc, state)
+    doc.pages[DOC].clear()
+    assert _run(doc, state) == []
+    assert "canvas-1" in state["docs"][DOC]["pages"]
+
+
+def test_rate_limit_stops_cleanly_keeping_finished_docs(doc):
+    doc.add_doc("ZzOther1", "Other")
+    doc.add_page("p-other", "Notes", "text", doc_id="ZzOther1")
+    state = {}
+    doc.rate_limited.add("/docs/ZzOther1/pages")
+    stats = {}
+    rows = _run(doc, state, stats=stats, doc_ids=(DOC, "ZzOther1"))
+    assert _ids(rows) == [f"page:{DOC}:canvas-1", f"table:{DOC}:grid-1"]
+    assert stats["failed"] == 1 and stats["failed_rate_limit"] == 1
+    assert DOC in state["docs"] and "ZzOther1" not in state["docs"]
+
+    doc.rate_limited.clear()
+    rows = _run(doc, state, doc_ids=(DOC, "ZzOther1"))
+    assert _ids(rows) == ["page:ZzOther1:p-other"]
+
+
+def test_budget_pauses_without_failing_and_resumes(doc):
+    doc.add_doc("ZzOther1", "Other")
+    doc.add_page("p-other", "Notes", "text", doc_id="ZzOther1")
+    state = {}
+    stats = {}
+    rows = _run(doc, state, stats=stats, doc_ids=(DOC, "ZzOther1"), max_requests=1)
+    assert _ids(rows) == [f"page:{DOC}:canvas-1", f"table:{DOC}:grid-1"]
+    assert stats["failed_budget"] == 1 and stats["failed"] == 0
+    rows = _run(doc, state, doc_ids=(DOC, "ZzOther1"), max_requests=1)
+    assert _ids(rows) == ["page:ZzOther1:p-other"]
+
+
+def test_budget_cut_runs_still_forget_removed_docs(doc):
+    doc.add_doc("ZzOther1", "Other")
+    doc.add_page("p-other", "Notes", "text", doc_id="ZzOther1")
+    state = {}
+    _run(doc, state, doc_ids=())
+    del doc.docs["ZzOther1"]
+    doc.touch(doc.pages[DOC][0])
+    doc.markdown["canvas-1"] = "changed"
+    rows = _run(doc, state, doc_ids=(), max_requests=1)
+    assert {"id": "page:ZzOther1:p-other", "_deleted": True} in rows
+
+
+def test_each_run_starts_a_new_wait_budget(doc):
+    resets = []
+    doc.reset_sleep_budget = lambda: resets.append(1)
+    _run(doc, {})
+    _run(doc, {})
+    assert resets == [1, 1]
+
+
+def test_check_active_runs_before_every_request(doc):
+    calls = []
+
+    def check_active():
+        calls.append(len(doc.calls))
+        if len(calls) == 3:
+            raise PermissionError("revoked")
+
+    with pytest.raises(PermissionError):
+        _run(doc, {}, check_active=check_active)
+    assert calls == [0, 1, 2] and len(doc.calls) == 2
 
 
 def test_doc_deleted_during_the_sync_is_forgotten(doc):
     state = {}
     _run(doc, state)
     doc.errors[f"/docs/{DOC}/pages"] = 404  # found, then gone before its pages are read
-    stats = _stats()
+    stats = {}
     rows = _run(doc, state, stats=stats)
     assert _ids(rows) == [f"page:{DOC}:canvas-1", f"table:{DOC}:grid-1"]
     assert stats["gone"] == 1 and state["docs"] == {}
@@ -331,9 +475,10 @@ def test_doc_deleted_during_the_sync_is_forgotten(doc):
 
 def test_doc_left_out_of_the_selection_is_forgotten(doc):
     doc.add_doc("XyZ12345", "Other")
+    doc.add_page("p-x", "Notes", "text", doc_id="XyZ12345")
     state = {}
     _run(doc, state)
-    rows = _run(doc, state, doc_ids=("XyZ12345",))
+    rows = [r for r in _run(doc, state, doc_ids=("XyZ12345",)) if r.get("_deleted")]
     assert all(r["_deleted"] for r in rows) and len(rows) == 2
 
 
@@ -372,16 +517,36 @@ def test_other_errors_raise_instead_of_forgetting(doc):
 # coda_source factory
 # ---------------------------------------------------------------------------
 def test_source_declares_document_path_and_scope(coda):
-    source = coda_source([DOC], client=coda, resource_name="coda_team_a")
+    source = coda_source([DOC], service=coda, resource_name="coda_team_a")
     assert getattr(source, dlt_utils.DOCUMENT_SOURCE_ATTR) == "coda"
     assert getattr(source, dlt_utils.PIPELINE_SCOPE_ATTR) == "coda_team_a"
     assert source.name == "coda_team_a"
 
 
-def test_missing_token_names_the_env_var(monkeypatch):
-    monkeypatch.delenv("CODA_API_TOKEN", raising=False)
-    with pytest.raises(ValueError, match="CODA_API_TOKEN"):
+def test_default_resource_name_follows_the_scope(coda):
+    assert coda_source(["abc123"], client=coda).name == "coda_abc123"
+    upper, lower = (
+        coda_source(["AbC123"], client=coda).name,
+        coda_source(["abc123"], client=coda).name,
+    )
+    assert upper.startswith("coda_abc123_") and upper != lower
+    assert coda_source(service=coda, workspace_id="ws-1").name.startswith("coda_ws_1_")
+    assert coda_source(service=coda).name == "coda_my_docs"
+    with pytest.raises(ValueError, match="resource_name"):
+        coda_source([DOC, "other"], service=coda)
+
+
+def test_missing_token_raises_without_reading_the_environment(monkeypatch):
+    monkeypatch.setenv("CODA_API_TOKEN", "from-env")
+    with pytest.raises(ValueError, match="token"):
         coda_source([DOC])
+
+
+def test_client_is_built_with_keyword_arguments(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(coda_module, "CodaClient", lambda **kwargs: seen.update(kwargs) or "c")
+    coda_source([DOC], token="tok", base_url="https://docs.superhuman.com/apis/v1")
+    assert seen == {"token": "tok", "base_url": "https://docs.superhuman.com/apis/v1"}
 
 
 # ---------------------------------------------------------------------------
@@ -402,40 +567,58 @@ def _pipeline(dlt, tmp_path):
     )
 
 
-def _staged(pipeline):
+def _staged(pipeline, table="coda_documents"):
     with (
         pipeline.sql_client() as client,
-        client.execute_query("SELECT id FROM coda_documents") as cursor,
+        client.execute_query(f"SELECT id FROM {table}") as cursor,
     ):
         return {r[0] for r in cursor.fetchall()}
 
 
+def _source(coda, name="coda_documents"):
+    return coda_source([DOC], service=coda, resource_name=name)
+
+
 def test_pipeline_resyncs_only_changes_and_forgets_deletions(dlt_mod, tmp_path, doc):
     pipeline = _pipeline(dlt_mod, tmp_path)
-    pipeline.run(coda_source([DOC], client=doc))
+    pipeline.run(_source(doc))
     assert _staged(pipeline) == {f"page:{DOC}:canvas-1", f"table:{DOC}:grid-1"}
 
     # The state lives in dlt, so a fresh source object resumes from it.
     doc.exports.clear()
-    source = coda_source([DOC], client=doc)
+    source = _source(doc)
     pipeline.run(source)
     assert doc.exports == [] and source.cognee_sync_stats["emitted"] == 0
 
     doc.tables[DOC].clear()
-    pipeline.run(coda_source([DOC], client=doc))
+    pipeline.run(_source(doc))
     assert _staged(pipeline) == {f"page:{DOC}:canvas-1"}
+
+
+def test_two_sources_in_one_dataset_leave_each_other_alone(dlt_mod, tmp_path, doc):
+    other = FakeCoda()
+    other.add_page("p-b", "Plan B", "text")
+    pipeline = _pipeline(dlt_mod, tmp_path)
+    pipeline.run(_source(doc, "coda_a"))
+    pipeline.run(_source(other, "coda_b"))
+
+    doc.tables[DOC].clear()
+    pipeline.run(_source(doc, "coda_a"))
+    pipeline.run(_source(other, "coda_b"))
+    assert _staged(pipeline, "coda_a") == {f"page:{DOC}:canvas-1"}
+    assert _staged(pipeline, "coda_b") == {f"page:{DOC}:p-b"}
 
 
 def test_failed_run_keeps_staging_and_state(dlt_mod, tmp_path, doc):
     pipeline = _pipeline(dlt_mod, tmp_path)
-    pipeline.run(coda_source([DOC], client=doc))
+    pipeline.run(_source(doc))
 
     doc.tables[DOC].clear()
     doc.errors[f"/docs/{DOC}/pages"] = 500
     with pytest.raises(Exception, match="500"):
-        pipeline.run(coda_source([DOC], client=doc))
+        pipeline.run(_source(doc))
     assert _staged(pipeline) == {f"page:{DOC}:canvas-1", f"table:{DOC}:grid-1"}
 
     doc.errors.clear()
-    pipeline.run(coda_source([DOC], client=doc))
+    pipeline.run(_source(doc))
     assert _staged(pipeline) == {f"page:{DOC}:canvas-1"}

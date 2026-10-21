@@ -39,7 +39,11 @@ async def main() -> None:
         print(f"Set {', '.join(required)} to run this example.")
         return
 
-    source = coda_source(doc_ids=[os.environ["CODA_DOC_ID"]])
+    source = coda_source(
+        doc_ids=[os.environ["CODA_DOC_ID"]],
+        token=os.environ["CODA_API_TOKEN"],
+        base_url=os.environ.get("CODA_API_BASE_URL"),
+    )
 
     print("Syncing Coda into cognee ...")
     await cognee.remember(

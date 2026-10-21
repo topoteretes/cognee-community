@@ -5,7 +5,11 @@ import re
 
 import pytest
 
-from cognee_community_connector_coda.coda import CodaAPIError, CodaAuthError
+from cognee_community_connector_coda.coda import (
+    CodaAPIError,
+    CodaAuthError,
+    CodaRateLimitedError,
+)
 
 DOC = "AbCDeFGH"
 
@@ -25,6 +29,9 @@ class FakeCoda:
         self.calls: list[tuple[str, dict]] = []
         self.bad_token = False
         self.errors: dict[str, int] = {}
+        self.export_errors: dict[str, int] = {}
+        self.rate_limited: set[str] = set()
+        self.drop_items = False
         self._clock = itertools.count(1)
         self.add_doc(DOC, "Launch plan")
 
@@ -77,6 +84,8 @@ class FakeCoda:
         start = int(params.get("pageToken") or 0)
         chunk = items[start : start + self.page_size]
         more = start + self.page_size < len(items)
+        if self.drop_items:
+            return {"nextPageToken": None}
         return {"items": chunk, "nextPageToken": str(start + self.page_size) if more else None}
 
     def get(self, path, params=None):
@@ -84,6 +93,8 @@ class FakeCoda:
         self.calls.append((path, params))
         if self.bad_token:
             raise CodaAuthError("Coda rejected the API token (HTTP 401)")
+        if any(key in path for key in self.rate_limited):
+            raise CodaRateLimitedError("Coda rate limit exceeded (HTTP 429)")
         for key, status in self.errors.items():
             if key in path:
                 raise CodaAPIError(f"Coda request failed: HTTP {status}", status=status)
@@ -114,6 +125,9 @@ class FakeCoda:
     def export_markdown(self, doc_id, page_id):
         if self.bad_token:
             raise CodaAuthError("Coda rejected the API token (HTTP 401)")
+        if page_id in self.export_errors:
+            status = self.export_errors[page_id]
+            raise CodaAPIError(f"Coda request failed: HTTP {status}", status=status)
         if page_id not in self.markdown:
             raise CodaAPIError("Coda request failed: HTTP 404", status=404)
         self.exports.append(page_id)
