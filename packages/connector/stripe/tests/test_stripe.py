@@ -253,8 +253,8 @@ def test_relationships_become_node_sets():
         "product:prod_1",
     }
 
-    # The subscription moved under parent.subscription_details in API version
-    # 2025-03-31, and line items name their product under pricing.
+    # The invoice names its subscription under parent.subscription_details, and
+    # line items name their product under pricing.
     invoice = render_invoice(
         {
             "id": "in_1",
@@ -275,12 +275,6 @@ def test_relationships_become_node_sets():
     assert {"customer:cus_1", "invoice:in_1", "subscription:sub_1", "product:prod_1"} <= set(
         invoice["node_sets"]
     )
-    # Older API versions kept it on the invoice itself.
-    legacy = render_invoice(
-        {"id": "in_2", "customer": "cus_1", "subscription": "sub_1"}, RenderOptions()
-    )
-    assert "subscription:sub_1" in legacy["node_sets"]
-
     dispute = render_dispute({"id": "dp_1", "charge": "ch_1"}, RenderOptions())
     assert set(dispute["node_sets"]) == {"dispute:dp_1", "charge:ch_1"}
 
@@ -308,9 +302,16 @@ def test_invoice_payments_link_invoices_and_charges():
         RenderOptions(),
     )
     assert "payment_intent:pi_1" in charge["node_sets"]
-    # Charges from before API version 2025-03-31 name their invoice directly.
-    legacy = render_charge({"id": "ch_2", "invoice": "in_1", "amount": 100}, RenderOptions())
-    assert "invoice:in_1" in legacy["node_sets"]
+
+
+def test_objects_without_a_customer_do_not_render_none():
+    for rendered in (
+        render_subscription({"id": "sub_1", "status": "active"}, RenderOptions()),
+        render_invoice({"id": "in_1", "status": "open"}, RenderOptions()),
+        render_charge({"id": "ch_1", "amount": 100}, RenderOptions()),
+    ):
+        assert "None" not in rendered["content"]
+        assert not any(node.endswith(":None") for node in rendered["node_sets"])
 
 
 def test_rows_carry_the_document_shape():
@@ -441,6 +442,28 @@ def test_edits_are_read_back_from_events():
     # The re-read invoice still names its payment, so its link to the charge survives.
     invoice_row = next(row for _table, row in rows if row["id"] == objects["invoice"]["id"])
     assert "payment_intent:pi_1" in invoice_row["cognee_node_set"]
+
+
+def test_a_dispute_refreshes_its_charge():
+    """A charge's document says whether it is disputed, but the dispute's events name only
+    the dispute."""
+    fake = FakeStripe()
+    objects = _billing(fake)
+    state: dict = {}
+    _run(fake, state)
+    fake.tick(7200)
+    new_charge = fake.add("charges", customer=objects["customer"]["id"], amount=500)
+    _run(fake, state)
+    fake.tick(7200)
+    # Stripe flags the charge without an event of its own for it, and opens the dispute.
+    fake.objects["charges"][new_charge["id"]]["disputed"] = True
+    fake.add("disputes", charge=new_charge["id"], amount=500, currency="usd", reason="general")
+
+    rows = _run(fake, state)
+
+    charge_row = next(row for table, row in rows if table == "stripe_charges")
+    assert charge_row["id"] == new_charge["id"]
+    assert "Disputed: yes" in charge_row["content"]
 
 
 def test_new_objects_arrive_through_events():
@@ -612,6 +635,21 @@ def test_empty_selection_forgets_everything():
 
     assert _tombstones(rows) == {obj["id"] for obj in objects.values()}
     assert state["known"] == {}
+
+
+def test_an_empty_selection_never_reads_events():
+    fake = FakeStripe()
+    _billing(fake)
+    state: dict = {}
+    _run(fake, state)
+    _run(fake, state, objects=[])
+    fake.tick(7200)
+    fake.clear_requests()
+
+    rows = _run(fake, state, objects=[])
+
+    assert rows == []
+    assert fake.paths() == []
 
 
 def test_changing_render_options_re_renders_everything():

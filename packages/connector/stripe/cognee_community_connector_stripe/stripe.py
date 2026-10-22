@@ -19,19 +19,20 @@ Design
 * **Built on the dlt verified source**: Stripe I/O uses the official
   ``stripe`` client and the verified source's paging loop (``limit=100`` +
   ``starting_after``, ``status=all`` for subscriptions). It differs where
-  cognee needs it to: requests carry the key per client instead of setting
-  ``stripe.api_key`` globally, so two connected accounts can sync in one
-  process; objects are rendered through allowlists instead of being yielded
-  whole; and lists are not windowed by ``created`` alone, which misses edits.
+  cognee needs it to: each source carries its own credentials in a client
+  instead of setting ``stripe.api_key`` globally; objects are rendered through
+  allowlists instead of being yielded whole; and lists are not windowed by
+  ``created`` alone, which misses edits.
 * **Stripe Connect**: requests use the platform's secret key with the
   ``Stripe-Account`` header of the connected account, as Stripe recommends
   over the deprecated per-account OAuth access token.
 * **Documents, linked by node sets**: one row per object in
   ``stripe_<object>`` tables (the id is Stripe's own, ``cus_...``,
   ``sub_...``). The source declares ``cognee_document_source = "stripe"``. A
-  relational dlt source would get no row-to-row edges, because dlt creates no
-  foreign keys in the staging database that cognee reads them from. Instead
-  every row names its related objects in ``cognee_node_set``
+  relational dlt source would get no row-to-row edges: cognee reads them from
+  foreign keys in the staging database, and dlt's SQLite staging tables carry
+  none, even when the resource declares ``references``. Instead every row
+  names its related objects in ``cognee_node_set``
   (``customer:cus_1``, ``subscription:sub_1``, ...), so a customer, its
   subscriptions, their invoices, the charges and the disputes are joined
   through shared ``NodeSet`` nodes in the graph.
@@ -123,9 +124,6 @@ _ZERO_DECIMAL_CURRENCIES = {
     "xpf",
 }
 _THREE_DECIMAL_CURRENCIES = {"bhd", "jod", "kwd", "omr", "tnd"}
-
-# Invoices list at most this many of their line items inline.
-_MAX_INVOICE_LINES = 20
 
 
 @dataclass(frozen=True)
@@ -328,7 +326,10 @@ def sync_objects(
     stats = {} if stats is None else stats
     stats.clear()
     stats.update(written=0, deleted=0)
-    changed = _changed_ids(client, cursor - _CURSOR_OVERLAP_SECONDS) if incremental else {}
+    # With nothing selected there is nothing to refresh, so the events are not read.
+    changed = (
+        _changed_ids(client, cursor - _CURSOR_OVERLAP_SECONDS) if incremental and objects else {}
+    )
 
     for name in objects:
         object_type = OBJECT_TYPES[name]
@@ -426,6 +427,10 @@ def _changed_ids(client: stripe.StripeClient, since: int) -> dict[str, set[str]]
         # An upcoming invoice has no id yet; there is nothing to re-read.
         if obj.get("id") and obj.get("object") in _STRIPE_OBJECTS:
             changed.setdefault(obj["object"], set()).add(obj["id"])
+        # A charge's document says whether it is disputed, but a dispute's events
+        # name only the dispute, so its charge is refreshed with it.
+        if obj.get("object") == "dispute" and _id(obj.get("charge")):
+            changed.setdefault("charge", set()).add(_id(obj["charge"]))
     return changed
 
 
@@ -510,8 +515,9 @@ def render_customer(customer: dict, options: RenderOptions) -> dict[str, Any]:
 def render_subscription(subscription: dict, options: RenderOptions) -> dict[str, Any]:
     customer_id = _id(subscription.get("customer"))
     items = (subscription.get("items") or {}).get("data") or []
+    of_customer = f" of customer {customer_id}" if customer_id else ""
     lines = [
-        f"Stripe subscription {subscription['id']} of customer {customer_id}.",
+        f"Stripe subscription {subscription['id']}{of_customer}.",
         _field("Status", subscription.get("status")),
         _field("Description", subscription.get("description")),
         _field("Created", _day(subscription.get("created"))),
@@ -552,16 +558,14 @@ def render_subscription(subscription: dict, options: RenderOptions) -> dict[str,
 
 def render_invoice(invoice: dict, options: RenderOptions) -> dict[str, Any]:
     customer_id = _id(invoice.get("customer"))
-    # Before API version 2025-03-31 the subscription sat on the invoice itself.
     subscription_details = (invoice.get("parent") or {}).get("subscription_details") or {}
-    subscription_id = _id(invoice.get("subscription")) or _id(
-        subscription_details.get("subscription")
-    )
+    subscription_id = _id(subscription_details.get("subscription"))
     currency = invoice.get("currency")
     label = invoice.get("number") or invoice["id"]
     transitions = invoice.get("status_transitions") or {}
+    for_customer = f" for customer {customer_id}" if customer_id else ""
     lines = [
-        f"Stripe invoice {label} ({invoice['id']}) for customer {customer_id}.",
+        f"Stripe invoice {label} ({invoice['id']}){for_customer}.",
         # The invoice's own snapshot of the name, taken when it was finalized.
         _field("Customer name", invoice.get("customer_name")),
         _field("Subscription", subscription_id),
@@ -585,9 +589,10 @@ def render_invoice(invoice: dict, options: RenderOptions) -> dict[str, Any]:
         _node("invoice", invoice["id"]),
         _node("subscription", subscription_id),
     ]
-    # Since API version 2025-03-31 a charge no longer names its invoice. The
-    # invoice's payments name the PaymentIntent (or charge) that paid it, and the
-    # charge names its PaymentIntent, so both documents share that node set.
+    # A charge does not name its invoice. The invoice's payments name the
+    # PaymentIntent (or charge) that paid it, and the charge names its
+    # PaymentIntent, so both documents share that node set. Stripe returns an
+    # invoice's first 10 payments inline, so a longer retry history links only those.
     payment_intents = []
     for invoice_payment in (invoice.get("payments") or {}).get("data") or []:
         payment = invoice_payment.get("payment") or {}
@@ -603,7 +608,7 @@ def render_invoice(invoice: dict, options: RenderOptions) -> dict[str, Any]:
     entries = line_items.get("data") or []
     if entries:
         lines.append("Lines:")
-    for entry in entries[:_MAX_INVOICE_LINES]:
+    for entry in entries:
         product_id = _line_product(entry)
         node_sets.append(_node("product", product_id))
         quantity = entry.get("quantity")
@@ -616,7 +621,7 @@ def render_invoice(invoice: dict, options: RenderOptions) -> dict[str, Any]:
                 _money(entry.get("amount"), entry.get("currency") or currency),
             )
         )
-    if line_items.get("has_more") or len(entries) > _MAX_INVOICE_LINES:
+    if line_items.get("has_more"):
         lines.append("- (more lines in Stripe)")
     lines += _metadata(invoice, options)
     return {
@@ -628,8 +633,6 @@ def render_invoice(invoice: dict, options: RenderOptions) -> dict[str, Any]:
 
 def render_charge(charge: dict, options: RenderOptions) -> dict[str, Any]:
     customer_id = _id(charge.get("customer"))
-    # Charges before API version 2025-03-31 name their invoice directly.
-    invoice_id = _id(charge.get("invoice"))
     payment_intent_id = _id(charge.get("payment_intent"))
     currency = charge.get("currency")
     amount = _money(charge.get("amount"), currency)
@@ -638,7 +641,6 @@ def render_charge(charge: dict, options: RenderOptions) -> dict[str, Any]:
         f"Stripe charge {charge['id']}{of_customer} for {amount}.",
         _field("Status", charge.get("status")),
         _field("Description", charge.get("description")),
-        _field("Invoice", invoice_id),
         _field("Payment intent", payment_intent_id),
         _field("Created", _day(charge.get("created"))),
         _field("Captured", _money(charge.get("amount_captured"), currency)),
@@ -654,7 +656,6 @@ def render_charge(charge: dict, options: RenderOptions) -> dict[str, Any]:
         "node_sets": [
             _node("charge", charge["id"]),
             _node("customer", customer_id),
-            _node("invoice", invoice_id),
             _node("payment_intent", payment_intent_id),
         ],
     }
@@ -774,9 +775,8 @@ def _id(value: Any) -> str | None:
 
 
 def _line_product(entry: dict) -> str | None:
-    # Older API versions put the price on the line; newer ones under pricing.
     price_details = (entry.get("pricing") or {}).get("price_details") or {}
-    return _id(price_details.get("product")) or _id((entry.get("price") or {}).get("product"))
+    return _id(price_details.get("product"))
 
 
 def _field(label: str, value: Any) -> str:
