@@ -208,8 +208,13 @@ async def test_disconnect_deauthorizes_the_account(stripe_server):
     }
 
 
-def test_dataset_name_is_stable_and_disambiguated():
-    first = dataset_name_for_account("Alphacorp", "acct_1")
-    assert first == dataset_name_for_account("Alphacorp", "acct_1")
-    assert first.startswith("stripe_alphacorp_")
-    assert first != dataset_name_for_account("Alphacorp", "acct_2")
+def test_dataset_name_comes_from_the_account_id_alone():
+    """A renamed account keeps its dataset, so its data is neither orphaned nor duplicated."""
+    before = SimpleNamespace(provider_account_id="acct_1", provider_metadata={"display_name": "A"})
+    renamed = SimpleNamespace(provider_account_id="acct_1", provider_metadata={"display_name": "B"})
+    other = SimpleNamespace(provider_account_id="acct_2", provider_metadata={"display_name": "A"})
+
+    assert StripeIntegration().dataset_name(before) == "stripe_acct_1"
+    assert StripeIntegration().dataset_name(renamed) == StripeIntegration().dataset_name(before)
+    assert StripeIntegration().dataset_name(other) != StripeIntegration().dataset_name(before)
+    assert dataset_name_for_account("acct_1") == "stripe_acct_1"

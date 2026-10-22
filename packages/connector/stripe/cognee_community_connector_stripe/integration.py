@@ -28,7 +28,6 @@ so importing the connector never touches the integrations registry.
 
 import base64
 import re
-from hashlib import sha256
 from typing import Any
 from urllib.parse import urlencode
 
@@ -206,10 +205,7 @@ class StripeIntegration(OAuthIntegration):
         await sync_stripe(credential, http_client=self._http_client)
 
     def dataset_name(self, credential: IntegrationCredential) -> str:
-        metadata = credential.provider_metadata or {}
-        return dataset_name_for_account(
-            str(metadata.get("display_name") or ""), str(credential.provider_account_id)
-        )
+        return dataset_name_for_account(str(credential.provider_account_id))
 
     async def revoke_remote(self, credential: IntegrationCredential) -> None:
         """Deauthorize the connected account at Stripe."""
@@ -227,11 +223,9 @@ class StripeIntegration(OAuthIntegration):
 # ---------------------------------------------------------------------------
 
 
-def dataset_name_for_account(label: str, account_id: str = "") -> str:
-    """Keep the account's dataset stable and disambiguate slug collisions."""
-    slug = re.sub(r"[^A-Za-z0-9_]+", "_", label or "").strip("_").lower()
-    name = f"{STRIPE_DATASET_PREFIX}_{slug or 'account'}"
-    return f"{name}_{sha256(account_id.encode()).hexdigest()[:10]}" if account_id else name
+def dataset_name_for_account(account_id: str) -> str:
+    """The account's dataset, named from its id so a renamed account keeps its data."""
+    return f"{STRIPE_DATASET_PREFIX}_{re.sub(r'[^A-Za-z0-9_]+', '_', account_id).lower()}"
 
 
 def selected_objects(credential: IntegrationCredential) -> list[str]:
