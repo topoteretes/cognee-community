@@ -2043,3 +2043,133 @@ def test_memory_benchmark_rss_units_are_platform_specific(system, raw):
     from benchmark_contentful_memory import rss_mib
 
     assert rss_mib(raw, system) == 348
+
+
+@pytest.mark.parametrize("failed_refresh", [False, True])
+def test_late_model_repairs_previously_rendered_entries(pipeline, fake, failed_refresh):
+    fake.initial_items = [
+        fake.entry(
+            "late",
+            "",
+            fields={
+                "title": {"en-US": "Recovered title"},
+                "body": {
+                    "en-US": _node(
+                        "document", _node("paragraph", _node("text", value="Readable body"))
+                    )
+                },
+            },
+        )
+    ]
+    table = _run(pipeline, fake)
+    assert next(iter(_rows(pipeline, table).values()))["title"] == "late"
+    fake.models = [
+        fake.model(
+            fields=[
+                {"id": "title", "type": "Symbol", "localized": True},
+                {"id": "body", "type": "RichText", "localized": True},
+            ]
+        )
+    ]
+    fake.delta("t1", [], "t2")
+    if failed_refresh:
+        before = _rows(pipeline, table)
+        fake.override = lambda request: (
+            httpx.Response(503) if request.url.path.endswith("/sync") else None
+        )
+        with pytest.raises(PipelineStepFailed):
+            _run(pipeline, fake)
+        assert _rows(pipeline, table) == before
+        fake.override = None
+    _run(pipeline, fake)
+    row = next(row for row in _rows(pipeline, table).values() if ":Entry:" in row["id"])
+    assert row["title"] == "Recovered title"
+    assert "body [en-US]:\nReadable body" in row["content"]
+    assert '"nodeType"' not in row["content"]
+
+
+@pytest.mark.parametrize("locale", ["de-DE", "fr-FR"])
+def test_locale_selection_uses_field_schema_not_value_count(pipeline, fake, locale):
+    fake.models = [
+        fake.model(
+            fields=[
+                {"id": "title", "type": "Symbol", "localized": True},
+                {"id": "untranslated", "type": "Text", "localized": True},
+                {"id": "summary", "type": "Text", "localized": False},
+            ]
+        )
+    ]
+    fake.initial_items = [
+        fake.entry(
+            "one",
+            "",
+            fields={
+                "title": {"en-US": "English title", "de-DE": "Deutscher Titel"},
+                "untranslated": {"en-US": "ENGLISH_ONLY"},
+                "summary": {"en-US": "SHARED_SUMMARY"},
+            },
+        )
+    ]
+    table = _run(pipeline, fake, locales=[locale])
+    row = next(row for row in _rows(pipeline, table).values() if ":Entry:" in row["id"])
+    assert row["title"] == ("Deutscher Titel" if locale == "de-DE" else "one")
+    assert "ENGLISH_ONLY" not in row["content"]
+    assert "summary [en-US]:\nSHARED_SUMMARY" in row["content"]
+    assert "English title" not in row["content"]
+
+
+def test_object_with_valid_rich_text_shape_stays_json(pipeline, fake):
+    import json
+
+    value = _node("document", _node("paragraph", _node("text", value="Object text")))
+    fake.models = [fake.model(fields=[{"id": "object", "type": "Object"}])]
+    fake.initial_items = [fake.entry("one", "", fields={"object": {"en-US": value}})]
+    table = _run(pipeline, fake)
+    row = next(row for row in _rows(pipeline, table).values() if ":Entry:" in row["id"])
+    assert (
+        "object [en-US]:\n" + json.dumps(value, sort_keys=True, separators=(",", ":"))
+        in row["content"]
+    )
+    assert "Invalid RichText" not in row["content"]
+
+
+def test_missing_model_from_delta_is_remembered_until_inventory_catches_up(pipeline, fake):
+    fake.models = [fake.model()]
+    fake.initial_items = [fake.entry("existing", "unchanged")]
+    table = _run(pipeline, fake)
+    late = fake.entry(
+        "late", "", content_type="late_type", fields={"title": {"en-US": "Late title"}}
+    )
+    fake.delta("t1", [late], "t2")
+    _run(pipeline, fake)
+    fake.delta("t2", [], "t3")
+    _run(pipeline, fake)
+    assert _sync_requests(fake)[-1].url.params["sync_token"] == "t2"
+    fake.initial_items.append(late)
+    fake.models.append(fake.model("late_type"))
+    _run(pipeline, fake)
+    assert _sync_requests(fake)[-1].url.params.get("initial") == "true"
+    assert (
+        next(row for row in _rows(pipeline, table).values() if row["id"].endswith(":Entry:late"))[
+            "title"
+        ]
+        == "Late title"
+    )
+
+
+def test_old_checkpoint_without_missing_model_tracking_refreshes_once(pipeline, fake):
+    import dlt
+
+    fake.initial_items = [fake.entry("one", "body")]
+    table = _run(pipeline, fake)
+
+    @dlt.resource(name=table)
+    def old_checkpoint():
+        dlt.current.resource_state().pop("missing_models")
+        yield from ()
+
+    pipeline.run(old_checkpoint())
+    _run(pipeline, fake)
+    assert _sync_requests(fake)[-1].url.params.get("initial") == "true"
+    _run(pipeline, fake)
+    assert _sync_requests(fake)[-1].url.params.get("sync_token") == "t1"

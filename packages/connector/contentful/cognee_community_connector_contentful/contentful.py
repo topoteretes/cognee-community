@@ -199,6 +199,9 @@ def contentful_source(
                 not state
                 or state["selection"] != selection
                 or state.get("default_locale") != default_locale
+                # Old checkpoints cannot identify entries rendered without a schema.
+                or "missing_models" not in state
+                or bool(set(display_fields) & set(state["missing_models"]))
                 or any(
                     key in state["display_fields"] and state["display_fields"][key] != value
                     for key, value in display_fields.items()
@@ -208,6 +211,7 @@ def contentful_source(
             for attempt in range(2):
                 priority = attempt * 2
                 members = set() if refresh else old_members.copy()
+                missing_models = set() if refresh else set(state.get("missing_models", []))
                 synced = set()
                 spool.clear()
                 terminal_token = None
@@ -239,6 +243,10 @@ def contentful_source(
                         pending_deletes.add(key)
                     continue
                 members.add(key)
+                if kind == "Entry":
+                    model_id = item["sys"]["contentType"]["sys"]["id"]
+                    if model_id not in models:
+                        missing_models.add(model_id)
                 synced.add(key)
                 if count > 1:
                     row = render(item)
@@ -276,6 +284,7 @@ def contentful_source(
                 models=selected_models,
                 display_fields=display_fields,
                 default_locale=default_locale,
+                missing_models=sorted(missing_models),
             )
             # Provisional rows still need tombstones, but they were never part
             # of the previous selection and must not inflate reported removals.

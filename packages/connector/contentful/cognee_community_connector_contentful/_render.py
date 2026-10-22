@@ -158,18 +158,20 @@ def _localized(fields):
     return fields
 
 
-def _field_locales(localized, locales, default_locale):
+def _field_locales(localized, locales, default_locale, field, *, asset=False):
     if locales is None:
         return sorted(localized, key=lambda locale: (locale != default_locale, locale))
     selected = [locale for locale in locales if locale in localized]
-    # Sync places non-localized values only under the default locale. Preserve
-    # single-locale fields, including assets, without inventing translated labels.
-    return selected or (list(localized) if len(localized) == 1 else [])
+    # Entry localization is a schema property, not a count of translations.
+    if field.get("localized") is False and default_locale in localized:
+        return [default_locale]
+    # Assets have no content-type field schema; retain their single-locale metadata.
+    return selected or (list(localized) if asset and len(localized) == 1 else [])
 
 
-def _display_title(fields, display_field, locales, fallback, default_locale):
+def _display_title(fields, display_field, locales, fallback, default_locale, field, *, asset=False):
     localized = fields.get(display_field, {})
-    for locale in _field_locales(localized, locales, default_locale):
+    for locale in _field_locales(localized, locales, default_locale, field, asset=asset):
         title = localized.get(locale)
         if isinstance(title, str) and title.strip():
             return title.strip()
@@ -249,7 +251,14 @@ def document(
             if display_field is not None and not isinstance(display_field, str):
                 raise _invalid("an invalid display field")
             field_models = {field["id"]: field for field in model.get("fields", [])}
-            title = _display_title(fields, display_field, locales, upstream_id, default_locale)
+            title = _display_title(
+                fields,
+                display_field,
+                locales,
+                upstream_id,
+                default_locale,
+                field_models.get(display_field, {}),
+            )
             editor = (
                 "app.eu.contentful.com" if host == "cdn.eu.contentful.com" else "app.contentful.com"
             )
@@ -258,10 +267,18 @@ def document(
                 f"/environments/{quote(environment, safe='')}/entries/{quote(upstream_id, safe='')}"
             )
         else:
-            title = _display_title(fields, "title", locales, upstream_id, default_locale)
+            title = _display_title(
+                fields, "title", locales, upstream_id, default_locale, {}, asset=True
+            )
         for field_id in sorted(fields):
             localized = fields[field_id]
-            for locale in _field_locales(localized, locales, default_locale):
+            for locale in _field_locales(
+                localized,
+                locales,
+                default_locale,
+                field_models.get(field_id, {}),
+                asset=kind == "Asset",
+            ):
                 value = localized[locale]
                 if kind == "Asset" and field_id == "file":
                     if not isinstance(value, dict):

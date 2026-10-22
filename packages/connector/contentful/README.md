@@ -100,7 +100,7 @@ contentful_source(
 | `resource_name` | Required staging table and pipeline scope name. Use lowercase snake case starting with a letter; names beginning with `_dlt` are reserved. Keep this name unique per logical source in a dataset. |
 | `environment` | Concrete environment ID, default `master`. |
 | `content_type_ids` | Select entry types and their model documents. Omitted means all types; an empty selection is invalid. |
-| `locales` | Select locale keys in preferred title order. Omitted means all locales, with the environment default first and remaining keys sorted. A field with only one locale value is always retained under its original label, including non-localized fields and asset files. Multi-locale fields use the selected keys without following fallback chains. An empty selection is invalid. |
+| `locales` | Select locale keys in preferred title order. Omitted means all locales, with the environment default first and remaining keys sorted. Entry fields marked `localized: false` in the model retain their default-locale value under its original label. Localized fields (including titles) use only selected keys, even when only one translation exists; unknown fields also use only selected keys. Asset fields with a single locale retain their metadata. No locale fallback chains are followed. An empty selection is invalid. |
 | `include_assets` | Include all published asset metadata by default; binaries are never downloaded. |
 | `source_id` | Stable logical source identifier, default `default`. Use distinct IDs and resource names for independently managed selections. |
 | `host` | Either `cdn.contentful.com` or `cdn.eu.contentful.com`. |
@@ -123,7 +123,11 @@ Invalid identities, resource scopes, and collection metadata still fail extracti
 Asset documents contain localized titles/descriptions, filenames, MIME types, HTTPS URLs,
 sizes, and available dimensions. Models are separate documents; unchanged models are not
 rendered again. Changing an existing model's display field triggers a full refresh to update
-entry titles; adding an unrelated model keeps the incremental Sync token. A changed environment
+entry titles; adding an unrelated model keeps the incremental Sync token. If selected entries
+arrive before their model, the checkpoint records the missing model ID. When that model
+appears, a full refresh repairs their titles and field rendering. Failed refreshes leave
+this repair pending. Older checkpoints without this tracking perform one full refresh to establish it
+and apply the corrected locale-selection policy. A changed environment
 default locale also refreshes titles. This connector
 reads published Delivery content; drafts, Preview access, binary extraction, and built-in
 scheduling are outside its scope.
