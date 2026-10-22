@@ -48,12 +48,19 @@ _DELETED = {
     "you deleted this message.",
 }
 _EDITED_SUFFIX = re.compile(r"\s*<This message was edited>\s*$")
-# iPhone media placeholders ("image omitted") and the Android one ("<Media omitted>").
-_OMITTED = re.compile(
+# "Name: text", or "Name:" with the text starting on the next line. The name
+# can't hold a colon or a line break, and is at most 80 characters.
+_SENDER = re.compile(r"^(?P<sender>[^:\n]{1,80}):(?:[ \t]+|(?=\n)|$)")
+# Media placeholders. A caption, when there is one, follows on the same line:
+#   Android, no media:   "<Media omitted> caption", "<View once voice message omitted>"
+#   Android, with media: "IMG-20261014-WA0001.jpg (file attached) caption"
+#   iPhone:              "image omitted", "<attached: 00000012-PHOTO-....jpg> caption"
+_ANDROID_OMITTED = re.compile(r"^<(?P<kind>[^<>\n]{1,40}?) omitted>")
+_IPHONE_OMITTED = re.compile(
     r"^(?P<kind>image|video|audio|sticker|GIF|document|Contact card) omitted$", re.IGNORECASE
 )
-_ATTACHED_IPHONE = re.compile(r"^<attached: (?P<name>[^>]+)>$")
-_ATTACHED_ANDROID = re.compile(r"^(?P<name>\S+\.\w{2,5}) \(file attached\)$")
+_ATTACHED_IPHONE = re.compile(r"^<attached: (?P<name>[^>\n]+)>")
+_ATTACHED_ANDROID = re.compile(r"^(?P<name>[^\n]+?\.\w{1,5}) \(file attached\)")
 
 
 @dataclass(frozen=True)
@@ -94,11 +101,16 @@ def read_export(path: str | Path, date_order: str | None = None) -> ChatExport:
     unless a file only has dates where day and month are both 12 or less.
     """
     path = Path(path)
+    chat_name = _chat_name(path.name)
     if path.suffix.lower() == ".zip":
-        text = _read_zip(path)
+        text, inner = _read_zip(path)
+        # A zip renamed by hand ("WhatsApp.zip") still holds the export's own
+        # file name ("WhatsApp Chat with Suppliers.txt"), which names the chat.
+        if not _is_export_name(path.name) and _is_export_name(inner):
+            chat_name = _chat_name(inner)
     else:
         text = path.read_text(encoding="utf-8-sig")
-    return parse_export(text, chat_name=_chat_name(path), date_order=date_order)
+    return parse_export(text, chat_name=chat_name, date_order=date_order)
 
 
 def parse_export(text: str, chat_name: str, date_order: str | None = None) -> ChatExport:
@@ -133,7 +145,8 @@ def parse_export(text: str, chat_name: str, date_order: str | None = None) -> Ch
     return export
 
 
-def _read_zip(path: Path) -> str:
+def _read_zip(path: Path) -> tuple[str, str]:
+    """Return the chat text and the name of the file it came from."""
     with zipfile.ZipFile(path) as archive:
         names = [n for n in archive.namelist() if n.lower().endswith(".txt")]
         if not names:
@@ -144,11 +157,15 @@ def _read_zip(path: Path) -> str:
             if len(names) > 1:
                 raise ExportFormatError("zip has several .txt files and no _chat.txt")
             chosen = names[0]
-        return archive.read(chosen).decode("utf-8-sig")
+        return archive.read(chosen).decode("utf-8-sig"), Path(chosen).name
 
 
-def _chat_name(path: Path) -> str:
-    stem = path.name
+def _is_export_name(file_name: str) -> bool:
+    return file_name.startswith(_FILE_NAME_PREFIXES)
+
+
+def _chat_name(file_name: str) -> str:
+    stem = file_name
     for suffix in (".zip", ".txt"):
         if stem.lower().endswith(suffix):
             stem = stem[: -len(suffix)]
@@ -224,25 +241,29 @@ def _parse_time(value: str) -> time:
 
 def _message(sent_at: datetime, body: str) -> Message | None:
     """Turn a line's body into a message, a system event, or nothing (deleted)."""
-    sender, sep, text = body.partition(": ")
-    # System events have no "Name: " prefix. A quote before the colon means the
+    match = _SENDER.match(body)
+    sender = match.group("sender").strip() if match else ""
+    # System events have no "Name:" prefix. A quote before the colon means the
     # colon belongs to quoted text ('Asha changed the subject to "Trip: Goa"').
-    if not sep or '"' in sender or "\u201c" in sender or not sender.strip():
+    if not sender or '"' in sender or "\u201c" in sender:
         return Message(sent_at=sent_at, sender=None, text=body)
 
-    text = _EDITED_SUFFIX.sub("", text).strip()
+    text = _EDITED_SUFFIX.sub("", body[match.end() :]).strip()
     if text.lower() in _DELETED:
         return None
-    return Message(sent_at=sent_at, sender=sender.strip(), text=_media_marker(text))
+    return Message(sent_at=sent_at, sender=sender, text=_media_marker(text))
 
 
 def _media_marker(text: str) -> str:
-    if text == "<Media omitted>":
-        return "[media]"
-    if (m := _OMITTED.match(text)) is not None:
+    """Replace a leading media placeholder with a short marker, keeping any caption."""
+    if (m := _IPHONE_OMITTED.match(text)) is not None:
         return f"[{m.group('kind').lower()}]"
-    if (m := _ATTACHED_IPHONE.match(text)) is not None:
-        return f"[attachment: {m.group('name')}]"
-    if (m := _ATTACHED_ANDROID.match(text)) is not None:
-        return f"[attachment: {m.group('name')}]"
+    for pattern, marker in (
+        (_ANDROID_OMITTED, lambda m: f"[{m.group('kind').lower()}]"),
+        (_ATTACHED_IPHONE, lambda m: f"[attachment: {m.group('name')}]"),
+        (_ATTACHED_ANDROID, lambda m: f"[attachment: {m.group('name')}]"),
+    ):
+        if (m := pattern.match(text)) is not None:
+            caption = text[m.end() :].strip()
+            return f"{marker(m)} {caption}" if caption else marker(m)
     return text

@@ -137,6 +137,40 @@ def test_read_iphone_zip_finds_chat_txt(tmp_path):
     assert len(export.messages) == 5
 
 
+def test_media_placeholders_keep_their_captions():
+    # Shapes seen in real Android exports: the caption follows the placeholder on the same line.
+    text = (
+        "3/18/26, 10:00 - Asha: <Media omitted> Lift is under repair till Friday\n"
+        "3/18/26, 10:01 - Ravi: IMG-20260318-WA0007.jpg (file attached) Notice from the office\n"
+        "3/18/26, 10:02 - Meera: <View once voice message omitted>\n"
+        "3/18/26, 10:03 - Asha: <Media omitted>\n"
+        "3/18/26, 10:04 - Ravi: Society rules 2026 (1).pdf (file attached)\n"
+    )
+    texts = [m.text for m in parse_export(text, chat_name="x").messages]
+    assert texts == [
+        "[media] Lift is under repair till Friday",
+        "[attachment: IMG-20260318-WA0007.jpg] Notice from the office",
+        "[view once voice message]",
+        "[media]",
+        "[attachment: Society rules 2026 (1).pdf]",
+    ]
+
+
+def test_sender_with_the_text_starting_on_the_next_line():
+    # Real exports write "Name:" alone when a message begins with a line break.
+    text = "3/18/26, 10:00 - +91 98765 43210:\nWater supply off tomorrow\n9am to 1pm\n"
+    message = parse_export(text, chat_name="x").messages[0]
+    assert message.sender == "+91 98765 43210"
+    assert message.text == "Water supply off tomorrow\n9am to 1pm"
+
+
+def test_renamed_zip_takes_the_chat_name_from_the_file_inside(tmp_path):
+    path = tmp_path / "WhatsApp.zip"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("WhatsApp Chat with Residents Block 5.txt", ANDROID)
+    assert read_export(path).chat_name == "Residents Block 5"
+
+
 def test_zip_without_chat_text_raises(tmp_path):
     path = tmp_path / "broken.zip"
     with zipfile.ZipFile(path, "w") as archive:
