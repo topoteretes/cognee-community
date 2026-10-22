@@ -191,11 +191,28 @@ def _iter_pages(client, page_ids, database_ids):
 
     if database_ids:
         for database_id in database_ids:
-            yield from _paginate(client.databases.query, database_id=database_id)
+            yield from _paginate(_database_query(client, database_id))
         return
 
     # No explicit scope: search every page the integration can see.
     yield from _paginate(client.search, filter={"property": "object", "value": "page"})
+
+
+def _database_query(client, database_id):
+    """Return a ``databases/{id}/query`` callable for ``_paginate``.
+
+    notion-client 2.6.0 removed ``DatabasesEndpoint.query`` in the data-source
+    endpoints refactor, so this goes through the SDK's generic ``request``
+    method instead. It is the exact HTTP call the old method made, so it works
+    on every notion-client 2.x while keeping the pinned ``Notion-Version:
+    2022-06-28`` semantics (``data_sources/...`` is the newer API-version
+    naming and must not be used under the pinned version).
+    """
+
+    def query(**kwargs):
+        return client.request(path=f"databases/{database_id}/query", method="POST", body=kwargs)
+
+    return query
 
 
 def _paginate(method, **kwargs):
