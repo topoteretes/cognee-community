@@ -174,6 +174,14 @@ days, 24-hour clock, month-first dates, 164 senders of whom 161 appear as phone 
 - A renamed zip (`WhatsApp.zip`) keeps the original `WhatsApp Chat with <group>.txt` inside.
 - The narrow no-break space (U+202F), no-break space (U+00A0) and left-to-right mark (U+200E)
   all occur in the file.
+- The connector end to end through `cognee.remember`, with cognee's default OpenAI models
+  (`gpt-5.6-luna`, OpenAI embeddings):
+  - First sync: 239 days in, 239 documents, about 14 minutes.
+  - The same export again: nothing emitted (239 days unchanged), 15 seconds.
+  - A copy of the export where every message on one day was deleted for everyone: one
+    `_deleted` row, and cognee's orphan cleanup took the dataset from 239 to 238 documents.
+  - Questions scoped to the group's node set returned dated answers ("water supply for one
+    hour on August 8") with senders masked as `+…3640`.
 
 Taken from WhatsApp's documented behaviour and other exports, not yet reproduced on a real
 iPhone export: the bracketed iPhone line format, `_chat.txt` inside the zip, `image omitted`
