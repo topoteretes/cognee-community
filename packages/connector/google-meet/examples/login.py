@@ -25,7 +25,7 @@ def main():
     if not credentials_path:
         raise SystemExit("Set GOOGLE_MEET_CREDENTIALS_PATH to your OAuth client JSON file.")
 
-    services = build_meet_services(credentials_path, token_path)
+    services = build_meet_services(credentials_path, token_path, login=True)
     print(f"Signed in. Token cached at {token_path}\n")
 
     response = services.meet.conferenceRecords().list(pageSize=10).execute()

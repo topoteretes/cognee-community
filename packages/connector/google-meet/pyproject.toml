@@ -3,7 +3,7 @@ name = "cognee-community-connector-google-meet"
 version = "0.1.0"
 description = "Google Meet data-source connector for cognee — sync attendance and transcripts (incremental + forget-on-delete)"
 readme = "README.md"
-requires-python = ">=3.10,<3.14"
+requires-python = ">=3.10,<3.15"
 dependencies = [
     # Requires table-scoped document cleanup (DOCUMENT_SYNC_VERSION),
     # PIPELINE_SCOPE_ATTR and guarded_rows, and reuses cognee's Google OAuth settings
@@ -31,7 +31,7 @@ line-length = 100
 target-version = "py310"
 
 [tool.ruff.lint]
-select = ["E", "W", "F", "I", "N", "B", "UP", "C4", "PGH", "SIM", "RUF"]
+select = ["E", "W", "F", "I", "N", "B", "BLE", "UP", "C4", "PGH", "SIM", "RUF"]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]

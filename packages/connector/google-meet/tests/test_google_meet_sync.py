@@ -107,11 +107,13 @@ def test_conference_row_shape_and_content(meet, drive):
     assert stats == {
         "conferences": 1,
         "transcripts": 0,
+        "transcripts_given_up": 0,
         "deleted": 0,
         "pending": 0,
         "failed": 0,
         "failed_auth": 0,
         "failed_rate_limit": 0,
+        "failed_network": 0,
         "failed_conference": 0,
         "failed_transcript_check": 0,
         "failed_conference_list": 0,
@@ -704,11 +706,13 @@ def test_stats_start_every_run_with_zero_failures(meet, drive):
     assert stats == {
         "conferences": 1,
         "transcripts": 0,
+        "transcripts_given_up": 0,
         "deleted": 0,
         "pending": 0,
         "failed": 0,
         "failed_auth": 0,
         "failed_rate_limit": 0,
+        "failed_network": 0,
         "failed_conference": 0,
         "failed_transcript_check": 0,
         "failed_conference_list": 0,
@@ -840,3 +844,106 @@ def test_a_repeated_page_token_raises_instead_of_looping():
         _list_all(lambda **_params: _Stuck(), "conferenceRecords", None)
 
     assert len(calls) == 2
+
+
+# ---------------------------------------------------------------------------
+# Review round: connection errors, spaces, stuck transcripts, streaming
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("error", [ConnectionError("reset"), TimeoutError("slow")])
+def test_a_lost_connection_ends_the_run_but_keeps_what_finished(meet, drive, error):
+    space = meet.add_space()
+    first = meeting(meet, space, start=0, end=10)
+    second = meeting(meet, space, start=20, end=30)
+    third = meeting(meet, space, start=40, end=50)
+    meet.errors[second] = error
+    state: dict = {}
+
+    upserts, _, stats = sync(meet, drive, state)
+
+    assert set(upserts) == {conf_id(first)}
+    assert stats["failed_network"] == 1
+    assert set(state["pending"]) == {second, third}
+    assert not any(third in str(params) for _method, params in meet.calls)
+
+
+def test_a_lost_connection_with_nothing_finished_raises_without_its_text(meet, drive):
+    conference = meeting(meet)
+    meet.errors[conference] = ConnectionError(f"https://meet.googleapis.com/{conference}")
+    state: dict = {}
+
+    with pytest.raises(GoogleMeetError, match="network error") as caught:
+        sync(meet, drive, state)
+
+    assert conference not in str(caught.value) and caught.value.network
+    assert state == {}
+
+
+def test_a_revoked_refresh_token_counts_as_auth_and_ends_the_run(meet, drive):
+    from google.auth.exceptions import RefreshError
+
+    space = meet.add_space()
+    first = meeting(meet, space, start=0, end=10)
+    second = meeting(meet, space, start=20, end=30)
+    meet.errors[second] = RefreshError("invalid_grant")
+
+    upserts, _, stats = sync(meet, drive, {})
+
+    assert set(upserts) == {conf_id(first)}
+    assert stats["failed_auth"] == 1
+
+
+@pytest.mark.parametrize("status", [403, 404])
+def test_a_space_we_cannot_read_still_syncs_the_conference_without_a_link(meet, drive, status):
+    space = meet.add_space()
+    conference = meeting(meet, space)
+    meet.errors[space] = status
+
+    upserts, _, stats = sync(meet, drive, {})
+
+    row = upserts[conf_id(conference)]
+    assert "Meeting link" not in row["content"] and row["url"] is None
+    assert row["title"] == f"Meet {conference}, 2026-10-17"
+    assert stats["failed"] == 0
+
+
+def test_a_rate_limited_space_fails_its_conference(meet, drive):
+    space = meet.add_space()
+    meeting(meet, space)
+    meet.errors[space] = (403, "rateLimitExceeded")
+    state: dict = {}
+
+    with pytest.raises(GoogleMeetError):
+        sync(meet, drive, state)
+
+    assert state == {}
+
+
+def test_a_transcript_never_written_is_given_up_after_a_day(meet, drive):
+    conference = meeting(meet)
+    meet.add_transcript(conference, state="ENDED")
+    state: dict = {}
+
+    upserts, _, stats = sync(meet, drive, state)
+    assert conference in state["pending"] and stats["transcripts_given_up"] == 0
+    assert "Transcript: being generated" in upserts[conf_id(conference)]["content"]
+
+    later = NOW + timedelta(days=1)
+    upserts, _, stats = sync(meet, drive, state, now=later)
+
+    assert conference not in state["pending"] and conference in state["done"]
+    assert stats["transcripts_given_up"] == 1
+    assert "Transcript: no" in upserts[conf_id(conference)]["content"]
+    upserts, _, _ = sync(meet, drive, state, now=later + timedelta(hours=1))
+    assert upserts == {}
+
+
+def test_rows_are_yielded_per_conference_not_held_until_the_end(meet, drive):
+    space = meet.add_space()
+    first = meeting(meet, space, start=0, end=10)
+    second = meeting(meet, space, start=20, end=30)
+    rows = _iter_rows(MeetServices(meet=meet, drive=drive), _MeetConfig(), {}, {}, now=NOW)
+
+    assert next(rows)["id"] == conf_id(first)
+    # The second conference has not been read yet.
+    assert not any(second in str(params) for params in meet.calls_to("participants"))
+    assert [row["id"] for row in rows] == [conf_id(second)]

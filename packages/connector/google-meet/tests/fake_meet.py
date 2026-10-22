@@ -83,7 +83,7 @@ class FakeMeet:
         self.recordings: dict[str, list[dict]] = {}
         self.fail_next: list[int] = []
         # Any request naming one of these ids (a conference id, say) fails:
-        # id -> status, or (status, reason).
+        # id -> status, (status, reason), or an exception to raise as is.
         self.errors: dict[str, int | tuple[int, str]] = {}
         self.calls: list[tuple[str, dict]] = []
         self._pages: dict[str, list[dict]] = {}
@@ -240,6 +240,8 @@ class FakeMeet:
             raise HttpError(self.fail_next.pop(0), uri)
         for target, error in self.errors.items():
             if target in str(params):
+                if isinstance(error, BaseException):
+                    raise error
                 status, reason = error if isinstance(error, tuple) else (error, None)
                 raise HttpError(status, uri, reason)
         return fn(params)

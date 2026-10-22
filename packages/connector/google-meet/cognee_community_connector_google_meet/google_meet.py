@@ -47,7 +47,14 @@ UTC = timezone.utc
 # already normalized and short enough to be part of a file name.
 _RESOURCE_NAME = re.compile(r"[a-z][a-z0-9_]{0,63}")
 # Every failure reason _Failures can count, published as plain int counts.
-_FAILURE_REASONS = ("auth", "rate_limit", "conference", "transcript_check", "conference_list")
+_FAILURE_REASONS = (
+    "auth",
+    "rate_limit",
+    "network",
+    "conference",
+    "transcript_check",
+    "conference_list",
+)
 
 MEET_READONLY_SCOPE = "https://www.googleapis.com/auth/meetings.space.readonly"
 DRIVE_MEET_READONLY_SCOPE = "https://www.googleapis.com/auth/drive.meet.readonly"
@@ -63,6 +70,9 @@ NUM_RETRIES = 5
 OVERLAP = timedelta(hours=1)
 # Meet deletes a conference record this long after it ends.
 RETENTION = timedelta(days=30)
+# A transcript still not written this long after its conference ended is
+# given up on, so the conference stops being read again every run.
+TRANSCRIPT_WAIT = timedelta(days=1)
 ID_PREFIX = "gmeet:"
 # Google's reasons for a 403 that is a quota rejection. Same list as cognee's gmail.py.
 _RATE_LIMIT_REASONS = ("rateLimitExceeded", "userRateLimitExceeded")
@@ -95,7 +105,7 @@ class MeetServices:
     drive: Any = None
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class _MeetConfig:
     include_transcripts: bool = True
     check_drive_deletes: bool = True
@@ -145,14 +155,20 @@ def _granted_scopes(token_path: str) -> set[str]:
 
 
 def build_meet_services(
-    credentials_path: str, token_path: str, check_drive_deletes: bool = True
+    credentials_path: str,
+    token_path: str,
+    check_drive_deletes: bool = True,
+    *,
+    login: bool = False,
 ) -> MeetServices:
-    """Build the Meet (and Drive) clients through the OAuth installed-app flow.
+    """Build the Meet (and Drive) clients from the token cached at ``token_path``.
 
-    The first run opens a browser for consent and caches the token at
-    ``token_path`` (written 0600); later runs reuse and refresh it.  A cached
-    token that lacks a needed scope asks for consent again.  Mirrors cognee's
-    ``build_gmail_service``, with only the read-only Meet scopes.
+    Reuses and refreshes the cached token.  With ``login=True``, as in
+    ``examples/login.py``, a missing token, or one that lacks a needed scope,
+    opens a browser for consent and the new token is cached (written 0600).
+    A sync never passes it, so it never waits for a person: it raises
+    ``GoogleAuthError`` instead.  Mirrors cognee's ``build_gmail_service``,
+    with only the read-only Meet scopes.
     """
     request, credentials_cls, installed_app_flow, build = _google_libraries()
     scopes = _scopes(check_drive_deletes)
@@ -165,6 +181,8 @@ def build_meet_services(
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(request())
         else:
+            if not login:
+                raise GoogleAuthError("meet sign-in", "login_required")
             if not os.path.exists(credentials_path):
                 raise FileNotFoundError(
                     f"Google OAuth client secrets not found at '{credentials_path}'. "
@@ -209,6 +227,13 @@ def _build_services_from_refresh_token(
     return _services(build, credentials, check_drive_deletes)
 
 
+def _close(services: MeetServices) -> None:
+    """Close the clients' connections: httplib2 leaves its sockets open."""
+    for client in (services.meet, services.drive):
+        if client is not None:
+            client.close()
+
+
 # ---------------------------------------------------------------------------
 # Google API calls
 # ---------------------------------------------------------------------------
@@ -219,20 +244,32 @@ class GoogleMeetError(RuntimeError):
     the request URL that googleapiclient puts in its own error text.
     """
 
-    def __init__(self, message: str, status: int | None = None, rate_limited: bool = False):
+    def __init__(
+        self,
+        message: str,
+        status: int | None = None,
+        rate_limited: bool = False,
+        network: bool = False,
+    ):
         super().__init__(message)
         self.status = status
         # Set where the HttpError is still in hand: its text must not be kept, so the
         # reason Google gave for a 403 would otherwise be lost.
         self.rate_limited = rate_limited
+        self.network = network
 
 
-def _http_error() -> Any:
-    # Evaluated only when a request has failed, so a source built on pre-made
-    # services (tests, hosts) never needs the Google libraries.
+def _google_errors() -> tuple[Any, Any, tuple[type[BaseException], ...]]:
+    """Google's HTTP error, its refresh error, and the connection errors.
+
+    Imported per request, so a source built on pre-made services (tests,
+    hosts) only needs what is installed.
+    """
+    from google.auth.exceptions import RefreshError, TransportError
     from googleapiclient.errors import HttpError
+    from httplib2 import HttpLib2Error
 
-    return HttpError
+    return HttpError, RefreshError, (OSError, HttpLib2Error, TransportError)
 
 
 def _execute(request: Any, check_active: Callable[[], None] | None) -> Any:
@@ -245,13 +282,20 @@ def _execute(request: Any, check_active: Callable[[], None] | None) -> Any:
     """
     if check_active is not None:
         check_active()
+    http_error, refresh_error, transport_errors = _google_errors()
     try:
         return request.execute(num_retries=NUM_RETRIES)
-    except _http_error() as error:
+    except http_error as error:
         status = error.resp.status
         raise GoogleMeetError(
             f"Google request failed: HTTP {status}", status, _is_rate_limited(error)
         ) from None
+    except refresh_error:
+        # The refresh token was revoked or expired: every later call fails too.
+        raise GoogleMeetError("Google sign-in was rejected", 401) from None
+    except transport_errors:
+        # googleapiclient already retried; the connection itself is down.
+        raise GoogleMeetError("Google request failed: network error", network=True) from None
 
 
 def _is_rate_limited(error: Any) -> bool:
@@ -306,6 +350,20 @@ def _get_record(meet: Any, conference_id: str, check_active) -> dict | None:
         return None
 
 
+def _get_space(meet: Any, space_name: str, check_active) -> dict:
+    """The conference's meeting space, or ``{}`` when it is gone or not shared with us.
+
+    The space only adds the meeting link and code, so losing it must not keep
+    the attendance and transcript out of memory.
+    """
+    try:
+        return _execute(meet.spaces().get(name=space_name), check_active)
+    except GoogleMeetError as error:
+        if error.status not in (403, 404) or error.rate_limited:
+            raise
+        return {}
+
+
 def _doc_exists(drive: Any, doc_id: str, check_active) -> bool:
     """False when the transcript Doc is trashed or gone. Other errors raise."""
     try:
@@ -327,6 +385,7 @@ class _Conference:
     rows: list[dict]
     transcripts: dict[str, str]  # new transcript row id -> Docs file id
     waiting: bool  # a transcript is still being written
+    gave_up: bool = False  # a transcript was still not written after TRANSCRIPT_WAIT
 
 
 class _Failures:
@@ -347,8 +406,8 @@ class _Failures:
             kind.replace("_", " "),
             error.status,
         )
-        # Auth and rate limits hit every later call the same way.
-        if reason in ("auth", "rate_limit"):
+        # Auth, rate limits and a lost connection hit every later call the same way.
+        if reason in ("auth", "rate_limit", "network"):
             self.stopped = True
 
 
@@ -357,6 +416,8 @@ def _failure_reason(error: GoogleMeetError) -> str | None:
         return "auth"
     if error.rate_limited:
         return "rate_limit"
+    if error.network:
+        return "network"
     return None
 
 
@@ -371,13 +432,17 @@ def _iter_rows(
     """Yield one row per new or finished conference and transcript, plus tombstones.
 
     ``state`` is a plain dict standing in for dlt's resource state, so this is
-    directly unit-testable.  Every API call happens before the first yield and
-    the state is written after the last one.  A conference that fails stays
-    pending and is retried; the run raises only when nothing finished, because
-    dlt drops the state of a failed run and would throw the finished work away.
+    directly unit-testable.  Rows are yielded as each conference finishes, so
+    only one conference is held in memory, and the state is written after the
+    last row.  A conference that fails stays pending and is retried; the run
+    raises only when nothing finished, which is before anything was yielded,
+    because dlt drops the state of a failed run and would throw the finished
+    work away.
     """
     stats.clear()
-    stats.update(conferences=0, transcripts=0, deleted=0, pending=0, failed=0)
+    stats.update(
+        conferences=0, transcripts=0, transcripts_given_up=0, deleted=0, pending=0, failed=0
+    )
     stats.update({f"failed_{reason}": 0 for reason in _FAILURE_REASONS})
     now = now or datetime.now(UTC)
     meet = services.meet
@@ -390,8 +455,6 @@ def _iter_rows(
     # A conference that fails or is not reached this run stays pending.
     pending: dict[str, str] = dict(state.get("pending", {}))
     known: dict[str, str] = dict(state.get("transcripts", {}))
-    rows: list[dict] = []
-    deletes: list[str] = []
     failures = _Failures(stats)
     finished = 0
 
@@ -403,7 +466,9 @@ def _iter_rows(
 
     if not config.include_transcripts:
         # Transcripts are out of scope now: forget the ones already synced.
-        deletes.extend(sorted(known))
+        for row_id in sorted(known):
+            stats["deleted"] += 1
+            yield {"id": row_id, "_deleted": True}
         known = {}
     elif config.uses_drive:
         # Meet still lists a transcript after its Doc is deleted; Drive does not.
@@ -419,7 +484,8 @@ def _iter_rows(
                 continue
             finished += 1
             if not exists:
-                deletes.append(row_id)
+                stats["deleted"] += 1
+                yield {"id": row_id, "_deleted": True}
                 del known[row_id]
 
     records = {_conference_id(r["name"]): r for r in listed}
@@ -456,16 +522,17 @@ def _iter_rows(
             finished += 1
             continue
         try:
-            result = _sync_conference(services, config, record, spaces, known, check_active)
+            result = _sync_conference(services, config, record, spaces, known, check_active, now)
         except GoogleMeetError as error:
             failures.record(error, "conference")
             pending[conference_id] = expire_time
             continue
         finished += 1
-        rows.extend(result.rows)
+        yield from result.rows
         known.update(result.transcripts)
         stats["conferences"] += 1
         stats["transcripts"] += len(result.transcripts)
+        stats["transcripts_given_up"] += result.gave_up
         if result.waiting:
             pending[conference_id] = expire_time
         else:
@@ -478,15 +545,10 @@ def _iter_rows(
         # Nothing finished, so there is no state to save and nothing is lost by raising.
         last = failures.last
         raise GoogleMeetError(
-            f"Google Meet sync failed: {last}", last.status, last.rate_limited
+            f"Google Meet sync failed: {last}", last.status, last.rate_limited, last.network
         ) from last
 
-    stats["deleted"] = len(deletes)
     stats["pending"] = len(pending)
-    for row_id in deletes:
-        yield {"id": row_id, "_deleted": True}
-    yield from rows
-
     if newest is not None:
         state["since"] = _stamp(newest)
     state["done"] = done
@@ -512,15 +574,14 @@ def _sync_conference(
     spaces: dict[str, dict],
     known: dict[str, str],
     check_active: Callable[[], None] | None,
+    now: datetime,
 ) -> _Conference:
     """The rows of one finished conference: itself plus its new transcripts."""
     meet = services.meet
     space_name = record.get("space", "")
     if space_name not in spaces:
         # A recurring meeting reuses its link, so many conferences share a space.
-        spaces[space_name] = (
-            _execute(meet.spaces().get(name=space_name), check_active) if space_name else {}
-        )
+        spaces[space_name] = _get_space(meet, space_name, check_active) if space_name else {}
     space = spaces[space_name]
     participants = _participants(meet, record["name"], check_active)
 
@@ -566,6 +627,10 @@ def _sync_conference(
             )
             new_transcripts[row_id] = doc_id
 
+    gave_up = waiting and _parse_time(record["endTime"]) + TRANSCRIPT_WAIT <= now
+    if gave_up:
+        # Google never finished writing it: stop reading this conference every run.
+        waiting = False
     recordings = _execute(
         meet.conferenceRecords().recordings().list(parent=record["name"], pageSize=1),
         check_active,
@@ -579,7 +644,7 @@ def _sync_conference(
     conference_row = _conference_row(
         record, space, participants, transcript_status, bool(recordings.get("recordings"))
     )
-    return _Conference([conference_row, *transcript_rows], new_transcripts, waiting)
+    return _Conference([conference_row, *transcript_rows], new_transcripts, waiting, gave_up)
 
 
 def _participants(meet: Any, record_name: str, check_active) -> list[tuple[dict, list[dict]]]:
@@ -801,6 +866,16 @@ def google_meet_source(
             'starting with a letter, like "work_meet".'
         )
 
+    for option, value in (
+        ("include_transcripts", include_transcripts),
+        ("check_drive_deletes", check_drive_deletes),
+    ):
+        # A string like "false" would otherwise be read as True.
+        if not isinstance(value, bool):
+            raise TypeError(f"{option} must be True or False.")
+    if check_active is not None and not callable(check_active):
+        raise TypeError("check_active must be a function or None.")
+
     config = _MeetConfig(
         include_transcripts=include_transcripts, check_drive_deletes=check_drive_deletes
     )
@@ -847,10 +922,16 @@ def google_meet_source(
         columns={"_deleted": {"data_type": "bool", "hard_delete": True}},
     )
     def google_meet_rows():
-        rows = _iter_rows(
-            make_services(), config, dlt.current.resource_state(), stats, check_active
-        )
-        yield from dlt_utils.guarded_rows(rows, check_active)
+        # Built per run, so every run gets a fresh token and its own connections.
+        run_services = make_services()
+        try:
+            rows = _iter_rows(
+                run_services, config, dlt.current.resource_state(), stats, check_active
+            )
+            yield from dlt_utils.guarded_rows(rows, check_active)
+        finally:
+            if services is None:
+                _close(run_services)
 
     resource = google_meet_rows()
     # Opt into the document ingestion path: each row becomes a text document

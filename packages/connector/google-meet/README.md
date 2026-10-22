@@ -15,7 +15,7 @@ and its calendar event end up linked in the graph.
 - cognee **1.6.3 or newer** (below 2). The connector relies on table-scoped document cleanup
   (`DOCUMENT_SYNC_VERSION`), `PIPELINE_SCOPE_ATTR`, `guarded_rows`, and reuses cognee's
   Google OAuth settings (`cognee.modules.integrations.google.GoogleSettings`).
-- Python 3.10 to 3.13.
+- Python 3.10 to 3.14.
 - A Google account that **organizes** the meetings: Meet only lists conferences where the
   signed-in user was the organizer.
 - Transcripts need a Google Workspace edition that can transcribe. On a personal Gmail
@@ -48,8 +48,11 @@ cd packages/connector/google-meet && uv sync
    ```
 
    A browser opens for consent. The token is cached in that file, written private, and
-   refreshed on later runs. Apps left in **Testing** get refresh tokens that expire after 7
-   days; publish the app, or sign in again, for longer use.
+   refreshed on later runs. Only this script ever opens a browser: a sync whose token is
+   missing, or lacks a scope it needs, raises `GoogleAuthError` with `login_required`
+   instead of waiting for a person, so run it again then. Apps left in **Testing** get
+   refresh tokens that expire after 7 days; publish the app, or sign in again, for longer
+   use.
 5. Set your `LLM_API_KEY` like any other cognee run.
 
 **Headless or hosted:** instead of the browser flow, set `GOOGLE_MEET_REFRESH_TOKEN` with
@@ -91,9 +94,9 @@ the attendance from Meet, and the shared `Meeting link` line joins them.
 | `resource_name` | – | `google_meet`. Lowercase letters, digits and underscores, up to 64. **Two Google accounts in one dataset need different names**, or they would share one table and one sync state |
 
 After a run, `source.cognee_sync_stats` holds counts only, never names or content:
-conferences, transcripts, deleted, pending and failed, plus `failed_auth`,
-`failed_rate_limit`, `failed_conference`, `failed_transcript_check` and
-`failed_conference_list` saying why. All of them are present on every run, as 0 when
+conferences, transcripts, transcripts_given_up, deleted, pending and failed, plus
+`failed_auth`, `failed_rate_limit`, `failed_network`, `failed_conference`,
+`failed_transcript_check` and `failed_conference_list` saying why. All of them are present on every run, as 0 when
 nothing failed. A conference that keeps failing stays pending and costs one request per
 run until it succeeds or Meet expires it.
 
@@ -137,7 +140,9 @@ A transcript is its own document, one line per spoken entry:
   finished one, and skip the ones already synced. The cursor only moves forward.
 - **Pending:** a conference that is still running, or whose transcript is still being
   written, is not final. It waits in a pending list, is read again by id on every run, and is
-  synced once it is done.
+  synced once it is done. A transcript Google still has not written a day after the
+  conference ended is given up on: the conference is saved with `Transcript: no`, counted in
+  `transcripts_given_up`, and no longer read every run.
 - **Two kinds of rows:** a conference document and a transcript document. They are separate
   on purpose: deleting a transcript forgets the words but keeps the attendance record.
 - **Deleted transcripts:** Meet keeps listing a transcript after its Google Doc is deleted, so
@@ -149,13 +154,18 @@ A transcript is its own document, one line per spoken entry:
   connector then stops tracking it, and what cognee learned stays. A transcript keeps being
   watched after that, because its Doc lives on in Drive.
 - **Errors never delete.** A conference that fails stays pending and is read again on the
-  next run; a transcript Doc that cannot be checked stays watched. Every API call happens
-  before the first row is yielded.
+  next run; a transcript Doc that cannot be checked stays watched.
+- **Streaming:** rows are yielded as each conference finishes, so a first sync of 30 days
+  holds one conference in memory, not all of them. The sync state is saved after the last row.
 - **One bad conference does not block the others.** When Google answers with an HTTP error,
   the other conferences finish and save their state. The run raises only when nothing
   finished, because dlt rolls back the state of a failed run. A 401, a 429 and a 403 with a
-  rate-limit reason end the run, since every later call would fail the same way; any other
-  403 only fails its own conference. A failing conference list always raises.
+  rate-limit reason end the run, since every later call would fail the same way; so do a
+  revoked refresh token and a connection that is still down after googleapiclient's retries.
+  Any other 403 only fails its own conference. A failing conference list always raises.
+- **The meeting space is optional.** It only adds the link and code, so a space that answers
+  403 or 404 leaves them out and the conference still syncs.
+- **Connections are closed** after every run, unless you passed your own `services`.
 - **Host checkpoint:** `check_active` runs before every Google request, so a revoked
   connection stops the sync between two calls.
 
@@ -225,14 +235,17 @@ manual check: lists come newest first, an empty list is `{}`, and every list cal
   transcripts, several transcripts, a deleted or trashed Doc forgotten while the conference
   stays, expiry that deletes nothing, Meet and Drive errors that never delete including one
   on a later page, a failing conference that stays pending while the others finish, auth and
-  rate limits (also a 403 with a rate-limit reason) that end the run but keep what finished,
+  rate limits (also a 403 with a rate-limit reason), a lost connection and a revoked refresh
+  token that end the run but keep what finished, a space that cannot be read, a transcript
+  given up on after a day, rows yielded per conference,
   `check_active` before every request, a participant order that does not depend on Google's,
   no ids or names in logs or errors, no Drive calls when checks are off, turning
   transcripts off, failure counts present on every run, and a page token Google repeats
   stopping instead of looping.
 - `test_google_meet_source.py` covers the settings inherited from cognee, the installed-app
-  flow and its private token file, the scopes for each option, a cached token that lacks a
-  scope, the auth choices, an unsafe `resource_name` refused, and the resource markers.
+  flow and its private token file, a sync that never opens a browser, the scopes for each
+  option, a cached token that lacks a scope, the auth choices, an unsafe `resource_name` and
+  options of the wrong type refused, clients closed after a run, and the resource markers.
 - `test_google_meet_forget.py` runs the real cognee pipeline (LLM and embeddings mocked,
   working with both cognee model variants) and checks that a transcript whose Doc was
   deleted leaves the graph and the dataset, while the other transcript and the attendance

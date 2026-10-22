@@ -109,7 +109,7 @@ def test_first_login_writes_a_private_token_file_with_only_the_readonly_scopes(
     secrets.write_text("{}")
     token = tmp_path / "token.json"
 
-    services = build_meet_services(str(secrets), str(token))
+    services = build_meet_services(str(secrets), str(token), login=True)
 
     assert services == MeetServices(meet="meet-service", drive="drive-service")
     assert calls["built"] == [("meet", "v2"), ("drive", "v3")]
@@ -124,7 +124,7 @@ def test_without_drive_checks_only_the_meet_scope_is_asked(tmp_path, monkeypatch
     secrets = tmp_path / "client_secret.json"
     secrets.write_text("{}")
 
-    services = build_meet_services(str(secrets), str(tmp_path / "t.json"), False)
+    services = build_meet_services(str(secrets), str(tmp_path / "t.json"), False, login=True)
 
     assert calls["scopes"] == [MEET_SCOPE]
     assert services == MeetServices(meet="meet-service", drive=None)
@@ -150,17 +150,34 @@ def test_cached_token_missing_the_drive_scope_asks_for_consent_again(tmp_path, m
     token = tmp_path / "token.json"
     token.write_text(json.dumps({"scopes": [MEET_SCOPE]}))
 
-    build_meet_services(str(secrets), str(token))
+    build_meet_services(str(secrets), str(token), login=True)
 
     assert calls["browser"] is True
     assert json.loads(token.read_text())["scopes"] == [MEET_SCOPE, DRIVE_SCOPE]
+
+
+@pytest.mark.parametrize("cached_scopes", [None, [MEET_SCOPE]])
+def test_a_sync_never_opens_a_browser(tmp_path, monkeypatch, cached_scopes):
+    # No token, or one missing the Drive scope: only examples/login.py may ask.
+    calls: dict = {}
+    monkeypatch.setattr(module, "_google_libraries", _fake_libraries(calls))
+    secrets = tmp_path / "client_secret.json"
+    secrets.write_text("{}")
+    token = tmp_path / "token.json"
+    if cached_scopes:
+        token.write_text(json.dumps({"scopes": cached_scopes}))
+
+    with pytest.raises(GoogleAuthError, match="login_required"):
+        build_meet_services(str(secrets), str(token))
+
+    assert "browser" not in calls
 
 
 def test_missing_client_secrets_file_is_a_clear_error(tmp_path, monkeypatch):
     monkeypatch.setattr(module, "_google_libraries", _fake_libraries({}))
 
     with pytest.raises(FileNotFoundError, match="GOOGLE_MEET_CREDENTIALS_PATH"):
-        build_meet_services(str(tmp_path / "nope.json"), str(tmp_path / "token.json"))
+        build_meet_services(str(tmp_path / "nope.json"), str(tmp_path / "token.json"), login=True)
 
 
 @pytest.mark.parametrize(
@@ -234,3 +251,55 @@ def test_access_token_scopes_follow_the_drive_setting(monkeypatch):
 
     assert calls["credentials"]["scopes"] == [MEET_SCOPE]
     assert services.drive is None
+
+
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [("include_transcripts", "false"), ("check_drive_deletes", 0), ("check_active", "yes")],
+)
+def test_options_of_the_wrong_type_are_refused(option, value):
+    services = MeetServices(meet=FakeMeet(), drive=FakeDrive())
+
+    with pytest.raises(TypeError, match=option):
+        google_meet_source(services=services, **{option: value})
+
+
+class _ClosingClient:
+    def __init__(self, client):
+        self.client = client
+        self.closed = 0
+
+    def __getattr__(self, name):
+        return getattr(self.client, name)
+
+    def close(self):
+        self.closed += 1
+
+
+def _run(resource, pipelines_dir) -> None:
+    import dlt
+
+    dlt.pipeline(pipeline_name="meet_close_test", pipelines_dir=str(pipelines_dir)).extract(
+        resource
+    )
+
+
+def test_clients_built_for_a_run_are_closed_after_it(monkeypatch, tmp_path):
+    meet, drive = _ClosingClient(FakeMeet()), _ClosingClient(FakeDrive())
+    monkeypatch.setattr(
+        module,
+        "build_meet_services_from_access_token",
+        lambda token, uses_drive: MeetServices(meet=meet, drive=drive),
+    )
+
+    _run(google_meet_source(access_token="t"), tmp_path)
+
+    assert (meet.closed, drive.closed) == (1, 1)
+
+
+def test_clients_passed_in_are_left_open_for_their_owner(tmp_path):
+    meet, drive = _ClosingClient(FakeMeet()), _ClosingClient(FakeDrive())
+
+    _run(google_meet_source(services=MeetServices(meet=meet, drive=drive)), tmp_path)
+
+    assert (meet.closed, drive.closed) == (0, 0)
