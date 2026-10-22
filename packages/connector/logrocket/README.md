@@ -10,8 +10,9 @@ and HAR data are not ingested.
 ## Requirements
 
 Python `>=3.11,<3.14`, a LogRocket API key with access to the selected project, and
-Cognee LLM/embedding configuration. The package pins `cognee==1.4.0` and requires
-DLT `>=1.31.0,<2` for its merge-safety checks.
+Cognee LLM/embedding configuration. Requires `cognee>=1.6.3,<2` and
+DLT `>=1.30,<1.31`. The DLT floor preserves destination fingerprinting for
+ownership checks while staying within Cognee's compatible range.
 
 ## Install
 
@@ -50,6 +51,29 @@ Optional `session_query` and `issue_query` further restrict searches.
 
 See [examples/ingest_logrocket.py](examples/ingest_logrocket.py) for the full flow.
 
+The public API is `logrocket_source` and `remember_logrocket`. Read-only development
+diagnostics live in `examples/diagnostics.py`, outside the installed connector. From
+the package checkout, run `uv run python examples/inspect_capabilities.py --help`.
+This replaces the previous `cognee-logrocket` console command.
+
+Hosts can pass a synchronous `check_active` callback to stop extraction when access
+is revoked. It is checked before extraction and publishing rows, and before each
+built-in MCP request/retry. Callback failures propagate; they are not retried as
+transport errors. Injected clients must implement their own in-request checkpoints.
+
+`source.cognee_sync_stats` contains counters keyed by `sessions` and `issues`.
+Each resource also exposes its own counter dictionary. Counters reset when that
+resource starts extraction: `scanned`, `emitted`, `skipped` (exact duplicates),
+`deleted` (always zero), `failed`, `requests` (logical search calls, excluding
+transport retries/discovery), and `request_complete`. The last flag means only
+that extraction of that resource's returned response finished; it does not mean
+exhaustive retrieval, committed loading, or successful cognification. Unselected
+resources are not run. Read each resource's latest counters separately.
+
+The connector uses Cognee's shared pipeline-scope marker and guarded-row helper.
+The ownership registry remains necessary: pipeline names alone do not prevent
+two different projects from targeting the same staging dataset.
+
 ## How sync and deletion work
 
 Each run requests the configured window and merges returned records by ID. Session
@@ -82,7 +106,7 @@ use their original project and resource selection when upgrading.
 When `dataset_name` is omitted, the helper selects a deterministic name derived from
 the organization, project and resource selection.
 
-See [API_INTEGRATION.md](API_INTEGRATION.md) for extending synchronization when
+See [future API integration guide](examples/API_INTEGRATION.md) for extending synchronization when
 supported retrieval, update and deletion APIs become available.
 
 ## Setup
@@ -96,7 +120,9 @@ supported retrieval, update and deletion APIs become available.
    uv run --env-file .env python examples/ingest_logrocket.py
    ```
 
-   `.env` is local and ignored; it is loaded only when explicitly requested.
+   `.env` is local and ignored. Cognee may also discover and load a project `.env`
+   during import. For environment-only configuration, set `PYTHON_DOTENV_DISABLED=1`
+   before starting Python; the connector itself does not parse dotenv files.
 3. Alternatively configure the key in local `.dlt/secrets.toml`:
 
    ```toml

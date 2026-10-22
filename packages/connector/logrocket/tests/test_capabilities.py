@@ -1,10 +1,13 @@
-from cognee_community_connector_logrocket.capabilities import inspect_snapshot
-from cognee_community_connector_logrocket.client import CapabilitySnapshot, ToolDefinition
+from examples.diagnostics import (
+    _CapabilitySnapshot,
+    _ToolDefinition,
+    inspect_snapshot,
+)
 
 
 def schema_backed_tool(name):
     singular = name.removeprefix("find_").removesuffix("s")
-    return ToolDefinition(
+    return _ToolDefinition(
         name=name,
         description=f"List {singular}s",
         input_schema={
@@ -35,7 +38,7 @@ def schema_backed_tool(name):
 
 
 def snapshot(*tools):
-    return CapabilitySnapshot(
+    return _CapabilitySnapshot(
         endpoint="offline-test",
         protocol_version="test",
         server_info=None,
@@ -57,7 +60,7 @@ def test_complete_schema_evidence_still_requires_live_behavior_checks():
 
 
 def test_limit_alone_does_not_get_mistaken_for_pagination():
-    tool = ToolDefinition(
+    tool = _ToolDefinition(
         name="find_sessions",
         description="Find sessions",
         input_schema={
@@ -86,7 +89,7 @@ def test_limit_alone_does_not_get_mistaken_for_pagination():
 
 
 def test_missing_output_schema_does_not_assume_response_shape_or_deletion():
-    undocumented = ToolDefinition(
+    undocumented = _ToolDefinition(
         name="find_sessions",
         description="Find sessions",
         input_schema={"type": "object", "properties": {}},
@@ -103,13 +106,13 @@ def test_missing_output_schema_does_not_assume_response_shape_or_deletion():
 
 
 def test_deletion_sounding_tool_name_is_not_evidence_without_schema():
-    audit_tool = ToolDefinition(
+    audit_tool = _ToolDefinition(
         name="audit_session_deletions",
         description="Name alone is not a contract",
         input_schema={"type": "object", "properties": {}},
         output_schema=None,
     )
-    sessions = ToolDefinition(
+    sessions = _ToolDefinition(
         name="find_sessions",
         description="Find sessions",
         input_schema={"type": "object", "properties": {}},
@@ -128,6 +131,6 @@ def test_deletion_sounding_tool_name_is_not_evidence_without_schema():
 def test_snapshot_round_trip_preserves_raw_schemas():
     original = snapshot(schema_backed_tool("find_sessions"), schema_backed_tool("find_issues"))
 
-    restored = CapabilitySnapshot.from_dict(original.to_dict())
+    restored = _CapabilitySnapshot.from_dict(original.to_dict())
 
     assert restored == original

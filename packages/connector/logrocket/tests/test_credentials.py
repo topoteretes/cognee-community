@@ -13,16 +13,20 @@ import dlt
 import httpx2
 import pytest
 
-from cognee_community_connector_logrocket.client import LogRocketMCPClient, LogRocketMCPError
-from cognee_community_connector_logrocket.credentials import CredentialError, resolve_api_key
-from cognee_community_connector_logrocket.rest import LogRocketRESTClient
+from cognee_community_connector_logrocket.logrocket import (
+    LogRocketMCPError,
+    _CredentialError,
+    _LogRocketMCPClient,
+    _resolve_api_key,
+)
+from examples.diagnostics import LogRocketRESTClient
 
 
 def test_explicit_key_wins_without_reading_other_providers(monkeypatch):
     monkeypatch.setenv("LOGROCKET_API_KEY", "environment-fixture")
     getter = Mock(side_effect=AssertionError("DLT should not be consulted"))
     monkeypatch.setattr(dlt, "secrets", SimpleNamespace(get=getter))
-    assert resolve_api_key("explicit-fixture") == "explicit-fixture"
+    assert _resolve_api_key("explicit-fixture") == "explicit-fixture"
     getter.assert_not_called()
 
 
@@ -31,7 +35,7 @@ def test_selected_environment_wins_over_dlt(monkeypatch, env_name):
     monkeypatch.setenv(env_name, "environment-fixture")
     getter = Mock(side_effect=AssertionError("DLT should not be consulted"))
     monkeypatch.setattr(dlt, "secrets", SimpleNamespace(get=getter))
-    assert resolve_api_key(None, env_name) == "environment-fixture"
+    assert _resolve_api_key(None, env_name) == "environment-fixture"
     getter.assert_not_called()
 
 
@@ -39,7 +43,7 @@ def test_fallback_uses_namespaced_dlt_secret(monkeypatch):
     monkeypatch.delenv("LOGROCKET_API_KEY", raising=False)
     getter = Mock(return_value="provider-fixture")
     monkeypatch.setattr(dlt, "secrets", SimpleNamespace(get=getter))
-    assert resolve_api_key(None) == "provider-fixture"
+    assert _resolve_api_key(None) == "provider-fixture"
     getter.assert_called_once_with("sources.logrocket.api_key")
 
 
@@ -48,16 +52,16 @@ def test_fallback_uses_namespaced_dlt_secret(monkeypatch):
 )
 def test_invalid_explicit_values_fail_without_fallback(monkeypatch, value):
     monkeypatch.setenv("LOGROCKET_API_KEY", "otherwise-valid")
-    with pytest.raises(CredentialError, match="invalid_api_key"):
-        resolve_api_key(value)
+    with pytest.raises(_CredentialError, match="invalid_api_key"):
+        _resolve_api_key(value)
 
 
 @pytest.mark.parametrize("value", [" ", 123, True])
 def test_invalid_dlt_values_are_rejected(monkeypatch, value):
     monkeypatch.delenv("LOGROCKET_API_KEY", raising=False)
     monkeypatch.setattr(dlt, "secrets", SimpleNamespace(get=lambda _: value))
-    with pytest.raises(CredentialError, match="invalid_api_key"):
-        resolve_api_key(None)
+    with pytest.raises(_CredentialError, match="invalid_api_key"):
+        _resolve_api_key(None)
 
 
 def test_provider_errors_are_sanitized_for_both_clients(monkeypatch):
@@ -66,7 +70,7 @@ def test_provider_errors_are_sanitized_for_both_clients(monkeypatch):
     getter = Mock(side_effect=ValueError(private_detail))
     monkeypatch.setattr(dlt, "secrets", SimpleNamespace(get=getter))
     with pytest.raises(LogRocketMCPError, match="credential_provider_failure") as error:
-        LogRocketMCPClient("org", "project")._resolve_api_key()
+        _LogRocketMCPClient("org", "project")._resolve_api_key()
     assert private_detail not in "".join(traceback.format_exception(error.value))
     report = asyncio.run(LogRocketRESTClient("org", "project").probe("audit", since_ms=0))
     assert report["error_code"] == "credential_provider_failure"
@@ -101,14 +105,15 @@ def test_actual_dlt_providers_in_isolated_process(tmp_path, provider):
             f'[sources.logrocket]\napi_key = "{fixture_key}"\n', encoding="utf-8"
         )
     env["EXPECTED_FIXTURE_KEY"] = fixture_key
+    env["PYTHON_DOTENV_DISABLED"] = "1"
     result = subprocess.run(
         [
             sys.executable,
             "-c",
             (
                 "import os; "
-                "from cognee_community_connector_logrocket.client import LogRocketMCPClient; "
-                "assert LogRocketMCPClient('org', 'project')._resolve_api_key() "
+                "from cognee_community_connector_logrocket.logrocket import _LogRocketMCPClient; "
+                "assert _LogRocketMCPClient('org', 'project')._resolve_api_key() "
                 "== os.environ['EXPECTED_FIXTURE_KEY']; print('PROVIDER_OK')"
             ),
         ],

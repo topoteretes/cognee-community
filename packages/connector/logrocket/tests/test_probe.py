@@ -7,15 +7,20 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from cognee_community_connector_logrocket.client import CapabilitySnapshot, LogRocketMCPError
-from cognee_community_connector_logrocket.probe import probe_tool, response_shape, validate_request
+from examples.diagnostics import (
+    LogRocketMCPError,
+    _CapabilitySnapshot,
+    probe_tool,
+    response_shape,
+    validate_request,
+)
 
 FIXTURE = Path(__file__).parent / "fixtures" / "live-required-tool-schemas-2026-10-16.json"
 
 
 @pytest.fixture
 def snapshot():
-    return CapabilitySnapshot.from_dict(json.loads(FIXTURE.read_text()))
+    return _CapabilitySnapshot.from_dict(json.loads(FIXTURE.read_text()))
 
 
 def test_shape_excludes_values_and_preserves_empty_array_uncertainty():
@@ -132,7 +137,7 @@ def test_probe_against_official_sdk_in_process():
     from mcp import Client
     from mcp.server import MCPServer
 
-    from cognee_community_connector_logrocket.client import _collect_snapshot
+    from examples.diagnostics import _collect_snapshot
 
     server = MCPServer("offline-response-probe")
 

@@ -4,12 +4,11 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from cognee_community_connector_logrocket.client import (
-    LogRocketMCPClient,
+from cognee_community_connector_logrocket.logrocket import (
     LogRocketMCPError,
-    _collect_snapshot,
-    project_endpoint,
+    _project_endpoint,
 )
+from examples.diagnostics import _collect_snapshot, _LogRocketMCPClient
 
 
 class FakeMCPClient:
@@ -36,7 +35,7 @@ def tool(name, *, input_schema=None, output_schema=None):
 
 
 def test_project_endpoint_is_project_scoped_and_limits_toolsets():
-    endpoint = project_endpoint("my org", "web/app")
+    endpoint = _project_endpoint("my org", "web/app")
 
     assert endpoint == (
         "https://mcp.logrocket.com/mcp/my%20org/web%2Fapp?toolsets=sessions%2Cissues"
@@ -45,7 +44,7 @@ def test_project_endpoint_is_project_scoped_and_limits_toolsets():
 
 def test_project_endpoint_rejects_ambiguous_base_url():
     with pytest.raises(ValueError, match="query string"):
-        project_endpoint("org", "project", base_url="https://example.test/mcp?x=1")
+        _project_endpoint("org", "project", base_url="https://example.test/mcp?x=1")
 
 
 @pytest.mark.parametrize(
@@ -57,13 +56,13 @@ def test_project_endpoint_rejects_ambiguous_base_url():
 )
 def test_project_endpoint_requires_secret_safe_https(url):
     with pytest.raises(ValueError, match="HTTPS URL without credentials"):
-        project_endpoint("org", "project", base_url=url)
+        _project_endpoint("org", "project", base_url=url)
 
 
 @pytest.mark.parametrize("organization,project", [(".", "app"), ("org", "..")])
 def test_project_endpoint_rejects_scope_traversal(organization, project):
     with pytest.raises(ValueError, match="path traversal"):
-        project_endpoint(organization, project)
+        _project_endpoint(organization, project)
 
 
 def test_missing_api_key_fails_before_network(monkeypatch):
@@ -71,7 +70,7 @@ def test_missing_api_key_fails_before_network(monkeypatch):
 
     monkeypatch.delenv("LOGROCKET_API_KEY", raising=False)
     monkeypatch.setattr(dlt, "secrets", SimpleNamespace(get=lambda _: None))
-    client = LogRocketMCPClient("org", "project")
+    client = _LogRocketMCPClient("org", "project")
 
     with pytest.raises(LogRocketMCPError, match="LOGROCKET_API_KEY"):
         client._resolve_api_key()
@@ -110,7 +109,7 @@ def test_inspection_withholds_credentials_and_error_details(monkeypatch, stage, 
         transport_module, "streamable_http_client", lambda *args, **kwargs: "offline"
     )
     monkeypatch.setattr(mcp, "Client", connect)
-    client = LogRocketMCPClient("org", "project", api_key=secret)
+    client = _LogRocketMCPClient("org", "project", api_key=secret)
     with pytest.raises(LogRocketMCPError, match="inspection failed") as caught:
         asyncio.run(client.inspect_capabilities())
 
@@ -265,7 +264,7 @@ def search_transport(monkeypatch):
     sleep = AsyncMock()
     monkeypatch.setattr(asyncio, "sleep", sleep)
     return SimpleNamespace(
-        client=LogRocketMCPClient("org", "project", api_key="fixture-secret"),
+        client=_LogRocketMCPClient("org", "project", api_key="fixture-secret"),
         attempts=attempts,
         calls=calls,
         outcomes=outcomes,
@@ -305,6 +304,49 @@ def test_search_validates_against_live_schema_before_call(search_transport):
         asyncio.run(fake.client.search("find_sessions", {"query": "test", "limit": 5}))
     assert fake.calls == []
     assert len(fake.attempts) == 1
+
+
+@pytest.mark.parametrize("checkpoint", [1, 2, 3, 4])
+def test_search_preserves_callback_failures_without_retry(search_transport, checkpoint):
+    import asyncio
+
+    fake = search_transport
+    calls = 0
+    failure = PermissionError("host access revoked")
+
+    def check_active():
+        nonlocal calls
+        calls += 1
+        if calls == checkpoint:
+            raise failure
+
+    fake.client._check_active = check_active
+    fake.outcomes.append(result({"sessionDefinitions": []}))
+    with pytest.raises(PermissionError) as caught:
+        asyncio.run(fake.client.search("find_sessions", {"query": "test", "limit": 5}))
+    assert caught.value is failure
+    assert len(fake.attempts) <= 1
+    fake.sleep.assert_not_called()
+
+
+def test_revocation_during_backoff_prevents_next_transport_attempt(search_transport):
+    import asyncio
+
+    import httpx2
+
+    fake = search_transport
+    failure = PermissionError("revoked during backoff")
+
+    def check_active():
+        if fake.sleep.await_count:
+            raise failure
+
+    fake.client._check_active = check_active
+    fake.outcomes.append(httpx2.ConnectError("synthetic connection failure"))
+    with pytest.raises(PermissionError) as caught:
+        asyncio.run(fake.client.search("find_sessions", {"query": "test", "limit": 5}))
+    assert caught.value is failure
+    assert len(fake.attempts) == len(fake.calls) == 1
 
 
 @pytest.mark.parametrize(
@@ -458,7 +500,7 @@ def test_inspection_has_overall_deadline(monkeypatch):
     import mcp
     import mcp.client.streamable_http as transport_module
 
-    import cognee_community_connector_logrocket.client as client_module
+    import examples.diagnostics as client_module
 
     @asynccontextmanager
     async def connect(transport):
@@ -469,4 +511,4 @@ def test_inspection_has_overall_deadline(monkeypatch):
     monkeypatch.setattr(mcp, "Client", connect)
     monkeypatch.setattr(client_module, "INSPECTION_TIMEOUT", 0.01)
     with pytest.raises(LogRocketMCPError, match="TimeoutError"):
-        asyncio.run(LogRocketMCPClient("org", "project", api_key="fixture").inspect_capabilities())
+        asyncio.run(_LogRocketMCPClient("org", "project", api_key="fixture").inspect_capabilities())

@@ -1,8 +1,9 @@
-"""Bounded LogRocket MCP document source for cognee.
+"""DLT source for LogRocket session metadata and issue documents.
 
-The MCP search tools cap results without data pagination. This source therefore
-fails when a response reaches its configured cap, never treats absence as a
-deletion, and requires explicit acknowledgement of those limitations.
+Search results are merged into retained staging rows. Search absence is never
+treated as deletion, and no incremental watermark assumes exhaustive results.
+Live MCP input schemas are validated before querying; record parsers validate
+the response fields used to build deterministic, redacted documents.
 """
 
 from __future__ import annotations
@@ -11,16 +12,393 @@ import asyncio
 import hashlib
 import json
 import math
+import os
+import re
 import sqlite3
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from types import MethodType
 from typing import Any
-from urllib.parse import parse_qsl, unquote, urlsplit
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit
 
-from cognee_community_connector_logrocket.client import LogRocketMCPClient
-from cognee_community_connector_logrocket.redact import redact_text
+import httpx2
+from cognee.shared.logging_utils import get_logger
+from cognee.tasks.ingestion import dlt_utils
+from jsonschema import validators
+from jsonschema.exceptions import SchemaError, ValidationError
+
+logger = get_logger("logrocket_connector")
+
+
+class _CallbackError(Exception):
+    """Keep host cancellation failures out of transport retry/redaction handlers."""
+
+
+def _invoke_callback(callback):
+    if callback is not None:
+        try:
+            callback()
+        except Exception as exc:
+            raise _CallbackError from exc
+
+
+# Authentication
+# ----------------------------------------------------------------------------
+
+
+class _CredentialError(RuntimeError):
+    """Only a fixed error code may leave credential-provider resolution."""
+
+    def __init__(self, code: str):
+        self.code = code
+        super().__init__(f"LogRocket credential resolution failed: {code}; details withheld.")
+
+
+def _resolve_api_key(api_key: str | None, api_key_env: str = "LOGROCKET_API_KEY") -> str:
+    """Resolve explicit value, selected environment variable, then DLT secrets.
+
+    DLT's ``sources.logrocket.api_key`` key supports its normal providers, including
+    ``SOURCES__LOGROCKET__API_KEY`` and ``.dlt/secrets.toml``. Do not cache secrets,
+    log provider errors, or fall through after an invalid higher-priority value.
+    """
+    value = api_key
+    if value is None:
+        value = os.environ.get(api_key_env) or None
+    if value is None:
+        try:
+            import dlt
+
+            value = dlt.secrets.get("sources.logrocket.api_key")
+        except Exception:
+            raise _CredentialError("credential_provider_failure") from None
+    if value is None:
+        raise _CredentialError("missing_api_key")
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or any(ord(char) < 32 or ord(char) == 127 for char in value)
+    ):
+        raise _CredentialError("invalid_api_key")
+    return value
+
+
+# Transport retries
+# ----------------------------------------------------------------------------
+
+TRANSIENT_STATUS = {408, 429, 500, 502, 503, 504}
+
+
+def _leaves(error: BaseException):
+    if isinstance(error, BaseExceptionGroup):
+        for child in error.exceptions:
+            yield from _leaves(child)
+    else:
+        yield error
+
+
+def _retryable(error: BaseException) -> bool:
+    return all(
+        (isinstance(item, httpx2.HTTPStatusError) and item.response.status_code in TRANSIENT_STATUS)
+        or isinstance(item, (httpx2.TransportError, TimeoutError))
+        for item in _leaves(error)
+    )
+
+
+def _retry_after(value: str | None, *, now: datetime | None = None) -> float:
+    if not value:
+        return 0
+    if value.isascii() and value.isdigit():
+        # Huge valid delays should fail the caller's deadline, not overflow.
+        return float(value) if len(value) < 15 else float("inf")
+    try:
+        date = parsedate_to_datetime(value)
+        if date.tzinfo is None:
+            return 0
+        return max(0, (date - (now or datetime.now(UTC))).total_seconds())
+    except (ValueError, TypeError, OverflowError):
+        return 0
+
+
+def _retry_delay(error: BaseException, attempt: int) -> float:
+    return max(
+        [float(2**attempt)]
+        + [
+            _retry_after(item.response.headers.get("Retry-After"))
+            for item in _leaves(error)
+            if isinstance(item, httpx2.HTTPStatusError)
+        ]
+    )
+
+
+# Content redaction
+# ----------------------------------------------------------------------------
+
+_EMAIL = re.compile(r"(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+", re.IGNORECASE)
+_IPV4 = re.compile(r"(?<!\d)(?:\d{1,3}\.){3}\d{1,3}(?!\d)")
+_BEARER = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
+_LOGROCKET_KEY = re.compile(r"\bpat:[^\s:'\"]+:[^\s:'\"]+:[A-Za-z0-9_-]+\b")
+
+
+def _redact_text(value: object, *, limit: int = 20_000) -> str:
+    """Return bounded text with common credentials and direct identifiers removed."""
+    if not isinstance(value, str):
+        return ""
+    text = value[:limit]
+    text = _LOGROCKET_KEY.sub("[redacted-logrocket-key]", text)
+    text = _BEARER.sub("Bearer [redacted]", text)
+    text = _EMAIL.sub("[redacted-email]", text)
+    return _IPV4.sub("[redacted-ip]", text)
+
+
+# MCP transport and runtime schema validation
+# ----------------------------------------------------------------------------
+
+DEFAULT_MCP_URL = "https://mcp.logrocket.com/mcp"
+DEFAULT_API_KEY_ENV = "LOGROCKET_API_KEY"
+DEFAULT_TOOLSETS = ("sessions", "issues")
+
+
+def _reject_json_constant(value: str):
+    raise ValueError("Non-finite JSON number.")
+
+
+class LogRocketMCPError(RuntimeError):
+    """A secret-safe LogRocket MCP connection or protocol error."""
+
+
+@dataclass(frozen=True)
+class _ToolDefinition:
+    """Advertised tool schemas used to validate requests before data access."""
+
+    name: str
+    description: str | None
+    input_schema: dict[str, Any]
+    output_schema: dict[str, Any] | None
+
+
+def _project_endpoint(
+    organization_id: str,
+    project_id: str,
+    *,
+    base_url: str = DEFAULT_MCP_URL,
+    toolsets: tuple[str, ...] = DEFAULT_TOOLSETS,
+) -> str:
+    """Build a least-privilege, project-scoped LogRocket MCP endpoint."""
+    if not organization_id.strip() or not project_id.strip():
+        raise ValueError("organization_id and project_id are required.")
+    if organization_id.strip() in {".", ".."} or project_id.strip() in {".", ".."}:
+        raise ValueError("organization_id and project_id cannot be path traversal segments.")
+    parsed = urlsplit(base_url)
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError("base_url must be an absolute HTTPS URL without credentials.")
+    if parsed.query or parsed.fragment:
+        raise ValueError("base_url must not contain a query string or fragment.")
+    path = (
+        f"{base_url.rstrip('/')}/{quote(organization_id.strip(), safe='')}"
+        f"/{quote(project_id.strip(), safe='')}"
+    )
+    return f"{path}?{urlencode({'toolsets': ','.join(toolsets)})}"
+
+
+def _exception_type_names(exc: BaseException) -> str:
+    """Return exception class names only, including nested exception groups."""
+    nested = getattr(exc, "exceptions", None)
+    if isinstance(nested, tuple):
+        names = sorted({_exception_type_names(item) for item in nested})
+        return ",".join(names)
+    return type(exc).__name__
+
+
+async def _collect_tools(mcp_client: Any, check_active=None) -> tuple[_ToolDefinition, ...]:
+    """Collect every tools/list page from an already-connected MCP client."""
+    tools: list[_ToolDefinition] = []
+    cursor: str | None = None
+    seen_cursors: set[str] = set()
+    seen_tools: set[str] = set()
+
+    while True:
+        if len(seen_cursors) >= 100:
+            raise LogRocketMCPError("tools/list exceeded the 100-page inspection budget.")
+        _invoke_callback(check_active)
+        page = await mcp_client.list_tools(cursor=cursor, cache_mode="bypass")
+        for tool in page.tools:
+            if tool.name in seen_tools:
+                raise LogRocketMCPError("tools/list returned duplicate tool definitions.")
+            seen_tools.add(tool.name)
+            tools.append(
+                _ToolDefinition(
+                    name=tool.name,
+                    description=getattr(tool, "description", None),
+                    input_schema=dict(tool.input_schema),
+                    output_schema=(
+                        dict(tool.output_schema)
+                        if getattr(tool, "output_schema", None) is not None
+                        else None
+                    ),
+                )
+            )
+
+        next_cursor = getattr(page, "next_cursor", None)
+        if next_cursor is None:
+            break
+        if not isinstance(next_cursor, str) or not next_cursor:
+            raise LogRocketMCPError("tools/list returned an invalid continuation cursor.")
+        if next_cursor in seen_cursors:
+            raise LogRocketMCPError(
+                "tools/list repeated a continuation cursor; inspection aborted."
+            )
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
+
+    return tuple(tools)
+
+
+class _LogRocketMCPClient:
+    """Read-only wrapper around the official MCP SDK's Streamable HTTP client."""
+
+    def __init__(
+        self,
+        organization_id: str,
+        project_id: str,
+        *,
+        api_key: str | None = None,
+        api_key_env: str = DEFAULT_API_KEY_ENV,
+        base_url: str = DEFAULT_MCP_URL,
+        check_active: Callable[[], None] | None = None,
+    ) -> None:
+        self.endpoint = _project_endpoint(organization_id, project_id, base_url=base_url)
+        self._api_key = api_key
+        self._api_key_env = api_key_env
+        self._check_active = check_active
+
+    def _resolve_api_key(self) -> str:
+        try:
+            return _resolve_api_key(self._api_key, self._api_key_env)
+        except _CredentialError as exc:
+            raise LogRocketMCPError(
+                f"LogRocket API key unavailable ({exc.code}). Pass api_key, set "
+                "LOGROCKET_API_KEY (or the selected --api-key-env), or configure "
+                "sources.logrocket.api_key with DLT secrets; details withheld."
+            ) from None
+
+    async def search(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Run one bounded session or issue search and return its JSON object.
+
+        Output validation belongs to the resource-specific parser because the
+        live tools advertise no MCP output schema.
+        """
+        import asyncio
+
+        if name not in {"find_sessions", "find_issues"}:
+            raise ValueError("Only find_sessions and find_issues are supported.")
+        limit = arguments.get("limit")
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("Searches require an explicit integer limit between 1 and 100.")
+        api_key = self._resolve_api_key()
+        import httpx2
+        from mcp import Client
+        from mcp.client.streamable_http import streamable_http_client
+
+        async def search_once():
+            async with httpx2.AsyncClient(
+                headers={"Authorization": f"Bearer {api_key}"}, timeout=30.0
+            ) as http_client:
+                transport = streamable_http_client(self.endpoint, http_client=http_client)
+                async with Client(transport) as mcp_client:
+                    tools = await _collect_tools(mcp_client, self._check_active)
+                    matches = [tool for tool in tools if tool.name == name]
+                    if len(matches) != 1:
+                        raise LogRocketMCPError(
+                            "Required LogRocket search tool is missing or duplicated."
+                        )
+                    schema = matches[0].input_schema
+                    validator = validators.validator_for(schema)
+                    validator.check_schema(schema)
+                    validator(schema).validate(arguments)
+                    _invoke_callback(self._check_active)
+                    result = await mcp_client.call_tool(name, arguments)
+                    _invoke_callback(self._check_active)
+                    if result.is_error:
+                        raise LogRocketMCPError(
+                            "LogRocket returned a search error; response content withheld."
+                        )
+                    payload = result.structured_content
+                    if payload is None:
+                        blocks = result.content
+                        if len(blocks) != 1 or getattr(blocks[0], "type", None) != "text":
+                            raise LogRocketMCPError(
+                                "LogRocket search response is not one JSON value."
+                            )
+                        try:
+                            payload = json.loads(
+                                blocks[0].text, parse_constant=_reject_json_constant
+                            )
+                        except ValueError:
+                            raise LogRocketMCPError(
+                                "LogRocket search response contains malformed JSON; "
+                                "response content withheld."
+                            ) from None
+                    if not isinstance(payload, dict):
+                        raise LogRocketMCPError("LogRocket search response must be an object.")
+                    return payload
+
+        last_error: BaseException | None = None
+        try:
+            async with asyncio.timeout(100) as deadline:
+                for attempt in range(3):
+                    _invoke_callback(self._check_active)
+                    try:
+                        return await search_once()
+                    except _CallbackError:
+                        raise
+                    except LogRocketMCPError:
+                        raise
+                    except ValueError:
+                        raise LogRocketMCPError(
+                            "LogRocket search failed (ValueError); error details withheld."
+                        ) from None
+                    except (SchemaError, ValidationError):
+                        raise LogRocketMCPError(
+                            "Search arguments no longer conform to the live LogRocket schema."
+                        ) from None
+                    except Exception as exc:
+                        last_error = exc
+                        if not _retryable(exc):
+                            raise LogRocketMCPError(
+                                f"LogRocket search failed ({_exception_type_names(exc)}); "
+                                "error details withheld."
+                            ) from None
+                        if attempt < 2:
+                            delay = _retry_delay(exc, attempt)
+                            if delay >= deadline.when() - asyncio.get_running_loop().time():
+                                raise LogRocketMCPError(
+                                    "LogRocket retry delay exceeds the search deadline."
+                                ) from None
+                            await asyncio.sleep(delay)
+                raise LogRocketMCPError(
+                    f"LogRocket search failed ({_exception_type_names(last_error)}); "
+                    "error details withheld."
+                )
+        except _CallbackError as exc:
+            raise exc.__cause__ from None
+        except LogRocketMCPError:
+            raise
+        except TimeoutError:
+            raise LogRocketMCPError("LogRocket search timed out after bounded retries.") from None
+        except Exception as exc:
+            last_error = last_error or exc
+            raise LogRocketMCPError(
+                f"LogRocket search failed ({_exception_type_names(last_error)}); "
+                "error details withheld."
+            ) from None
+
+
+# Document rendering and ingestion
+# ----------------------------------------------------------------------------
 
 SOURCE_NAME = "logrocket"
 SESSION_RESOURCE = "logrocket_sessions"
@@ -54,7 +432,7 @@ def _provenance_url(record: dict[str, Any], key: str) -> str:
             or parsed.password is not None
             or parsed.port not in (None, 443)
             or any(ord(char) <= 32 for char in value)
-            or redact_text(unquote(value)) != unquote(value)
+            or _redact_text(unquote(value)) != unquote(value)
         )
         sensitive = {
             "token",
@@ -76,7 +454,7 @@ def _provenance_url(record: dict[str, Any], key: str) -> str:
         decoded_components = [
             component for name, value in parameters for component in (name, value)
         ]
-        unsafe |= any(redact_text(component) != component for component in decoded_components)
+        unsafe |= any(_redact_text(component) != component for component in decoded_components)
     except ValueError:
         unsafe = True
     if unsafe:
@@ -152,7 +530,7 @@ def _optional_string(record: dict[str, Any], key: str) -> str:
         return ""
     if not isinstance(value, str):
         raise ValueError(f"LogRocket field {key!r} must be a string when present.")
-    return redact_text(value)
+    return _redact_text(value)
 
 
 def _canonical_identifier(value: str, name: str) -> str:
@@ -189,7 +567,7 @@ def _default_dataset_name(source: Any) -> str:
     return f"logrocket_{hashlib.sha256(repr(scope).encode()).hexdigest()[:16]}"
 
 
-def session_to_row(
+def _session_to_row(
     record: dict[str, Any],
     organization_id: str,
     project_id: str,
@@ -205,7 +583,7 @@ def session_to_row(
     if not isinstance(record, dict):
         raise ValueError("Every LogRocket session must be an object.")
     recording_id = _required_string(record, "recordingID")
-    if redact_text(recording_id) != recording_id:
+    if _redact_text(recording_id) != recording_id:
         raise ValueError("LogRocket recordingID contains sensitive text; value withheld.")
     session_id = record.get("sessionID")
     if not isinstance(session_id, int) or isinstance(session_id, bool):
@@ -265,7 +643,7 @@ def session_to_row(
     }
 
 
-def issue_to_row(record: dict[str, Any], organization_id: str, project_id: str) -> dict[str, str]:
+def _issue_to_row(record: dict[str, Any], organization_id: str, project_id: str) -> dict[str, str]:
     """Validate and render one observed `find_issues` entry.
 
     LogRocket exposes no explicit issue ID in the observed response. A hash of
@@ -305,9 +683,9 @@ def issue_to_row(record: dict[str, Any], organization_id: str, project_id: str) 
     stable_id = f"logrocket:{organization_id}:{project_id}:issue-url-sha256:{digest}"
     lines = [
         "Type: LogRocket issue",
-        f"Issue type: {redact_text(issue_type)}",
-        f"First observed: {redact_text(earliest)}",
-        f"Last observed: {redact_text(latest)}",
+        f"Issue type: {_redact_text(issue_type)}",
+        f"First observed: {_redact_text(earliest)}",
+        f"Last observed: {_redact_text(latest)}",
         f"Event count: {event_count}",
     ]
     for label, key in (("Platform", "platformType"), ("Triage status", "triageStatus")):
@@ -318,7 +696,7 @@ def issue_to_row(record: dict[str, Any], organization_id: str, project_id: str) 
         lines.extend(["Messages:", *(f"- {message}" for message in rendered_messages)])
     return {
         "id": stable_id,
-        "title": title or f"LogRocket {redact_text(issue_type)} issue",
+        "title": title or f"LogRocket {_redact_text(issue_type)} issue",
         "content": "\n".join(lines),
         "url": url,
     }
@@ -360,6 +738,7 @@ def _fetch_rows(
     include_user_id: bool,
     include_location: bool,
     now: datetime | None = None,
+    stats: dict[str, int] | None = None,
 ):
     """Validate the entire response before yielding; never read or write a cursor.
 
@@ -386,17 +765,21 @@ def _fetch_rows(
     else:  # pragma: no cover - guarded by factory
         raise ValueError(f"Unsupported LogRocket resource: {resource}")
 
+    if stats is not None:
+        stats["requests"] += 1
     response = _run(client.search(f"find_{resource}", arguments))
     if not isinstance(response, dict) or not isinstance(response.get(container), list):
         raise ValueError(f"LogRocket find_{resource} response has an unexpected structure.")
     records = response[container]
+    if stats is not None:
+        stats["scanned"] = len(records)
     if len(records) >= limit:
         raise IncompleteLogRocketResultError(
             f"find_{resource} returned the configured limit ({limit}); result may be truncated. "
             "Narrow the query or time window before retrying."
         )
 
-    parser = session_to_row if resource == "sessions" else issue_to_row
+    parser = _session_to_row if resource == "sessions" else _issue_to_row
     rows = [
         parser(
             record,
@@ -421,7 +804,14 @@ def _fetch_rows(
                 "LogRocket returned conflicting versions of the same record; values withheld."
             )
         unique[row["id"]] = row
+    if stats is not None:
+        stats["skipped"] = len(rows) - len(unique)
     yield from unique.values()
+    logger.info("LogRocket: emitted %d %s document(s) for merge.", len(unique), resource)
+
+
+# Public source factory
+# ----------------------------------------------------------------------------
 
 
 def logrocket_source(
@@ -431,6 +821,7 @@ def logrocket_source(
     resources: Iterable[str] = ("sessions", "issues"),
     api_key: str | None = None,
     client: Any = None,
+    check_active: Callable[[], None] | None = None,
     session_query: str | None = None,
     issue_query: str | None = None,
     session_lookback_days: int = 7,
@@ -442,7 +833,7 @@ def logrocket_source(
     include_location: bool = False,
     acknowledge_bounded_results: bool = False,
 ):
-    """Return a bounded LogRocket document source for ``cognee.remember``.
+    """Create a DLT source for LogRocket session and issue documents.
 
     Each run requests the full configured window, without a cursor or hash cache.
     Explicit timezone-aware boundaries allow repeatable historical imports.
@@ -450,7 +841,35 @@ def logrocket_source(
     retained window makes old issues eligible for updated triage and content.
     Search absence is never emitted as a tombstone. Pass this source to
     ``remember_logrocket`` or use ``cognee.remember(..., write_disposition="merge")``.
+
+    Args:
+        organization_id: LogRocket organization identifier.
+        project_id: Project identifier within the organization.
+        resources: Select sessions, issues, or both.
+        api_key: API key; falls back to LOGROCKET_API_KEY, then DLT secrets.
+        client: Injected async search client, primarily for offline tests.
+        check_active: Synchronous host authorization/cancellation callback. Checked
+            before extraction, each built-in transport attempt, and publishing rows.
+        session_query: Additional natural-language session search criteria.
+        issue_query: Additional natural-language issue search criteria.
+        session_lookback_days: Session occurrence window when start is omitted.
+        issue_lookback_days: Issue occurrence window when start is omitted.
+        window_start: Explicit timezone-aware start for both resource windows.
+        window_end: Explicit timezone-aware end; defaults to the current time.
+        limit: Maximum requested results per resource, between 1 and 100.
+        include_user_id: Include user identifiers in session documents (opt-in).
+        include_location: Include location in session documents (opt-in).
+        acknowledge_bounded_results: Accept that search is not exhaustive and
+            cannot discover deletion; must be True before extraction.
+
+    Returns:
+        A document-tagged DLT source with stable primary keys and merge writes.
+        Use remember_logrocket to preserve merge semantics at the Cognee boundary.
     """
+    if getattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 0) < 1:
+        raise RuntimeError("LogRocket requires Cognee table-scoped document sync support.")
+    if check_active is not None and not callable(check_active):
+        raise ValueError("check_active must be callable.")
     acknowledge_bounded_results = _require_boolean(
         acknowledge_bounded_results, "acknowledge_bounded_results"
     )
@@ -485,10 +904,43 @@ def logrocket_source(
             "Install the LogRocket connector with its declared dependencies."
         ) from exc
 
-    search_client = client or LogRocketMCPClient(organization_id, project_id, api_key=api_key)
+    search_client = client or _LogRocketMCPClient(
+        organization_id, project_id, api_key=api_key, check_active=check_active
+    )
+    stats = {name: {} for name in selected}
 
-    def require_merge():
-        if dlt.current.resource().write_disposition != "merge":
+    def extract(name, **options):
+        counters = stats[name]
+        counters.clear()
+        counters.update(
+            dict.fromkeys(
+                (
+                    "scanned",
+                    "emitted",
+                    "skipped",
+                    "deleted",
+                    "failed",
+                    "requests",
+                    "request_complete",
+                ),
+                0,
+            )
+        )
+        try:
+            if check_active is not None:
+                check_active()
+            require_merge(f"logrocket_{name}")
+            rows = _fetch_rows(search_client, name, stats=counters, **options)
+            for row in dlt_utils.guarded_rows(rows, check_active):
+                counters["emitted"] += 1
+                yield row
+            counters["request_complete"] = 1
+        except BaseException:
+            counters["failed"] = 1
+            raise
+
+    def require_merge(resource_name):
+        if dlt.current.source().resources[resource_name].write_disposition != "merge":
             raise ValueError(
                 "LogRocket bounded imports require write_disposition='merge'. "
                 "Use remember_logrocket or pass write_disposition='merge' to Cognee."
@@ -513,9 +965,7 @@ def logrocket_source(
 
     @dlt.resource(name=SESSION_RESOURCE, primary_key="id", write_disposition="merge")
     def sessions():
-        require_merge()
-        yield from _fetch_rows(
-            search_client,
+        yield from extract(
             "sessions",
             organization_id=organization_id,
             project_id=project_id,
@@ -530,9 +980,7 @@ def logrocket_source(
 
     @dlt.resource(name=ISSUE_RESOURCE, primary_key="id", write_disposition="merge")
     def issues():
-        require_merge()
-        yield from _fetch_rows(
-            search_client,
+        yield from extract(
             "issues",
             organization_id=organization_id,
             project_id=project_id,
@@ -555,9 +1003,14 @@ def logrocket_source(
         DOCUMENT_SOURCE_ATTR: SOURCE_NAME,
         "_logrocket_organization": organization_id,
         "_logrocket_project": project_id,
+        dlt_utils.PIPELINE_SCOPE_ATTR: "logrocket_"
+        + hashlib.sha256(json.dumps([organization_id, project_id]).encode()).hexdigest()[:32],
+        "cognee_sync_stats": stats,
     }
 
     def attach_metadata(source: Any) -> None:
+        # DLT source cloning reconstructs the source without custom attributes.
+        # Preserve Cognee's shared scope marker and host counters on with_resources().
         original_clone = source.clone
 
         def clone_with_metadata(source: Any, with_name: str | None = None):
@@ -567,6 +1020,8 @@ def logrocket_source(
 
         for key, value in metadata.items():
             setattr(source, key, value)
+        for name in selected:
+            source.resources[f"logrocket_{name}"].cognee_sync_stats = stats[name]
         source.clone = MethodType(clone_with_metadata, source)
 
     attach_metadata(result)
@@ -578,6 +1033,15 @@ async def remember_logrocket(source: Any, *, dataset_name: str | None = None, **
 
     Cognee otherwise overrides resource hints with its default ``replace``.
     Re-read retained staging rows so absent search results cannot trigger cleanup.
+
+    Args:
+        source: Source returned by logrocket_source, optionally resource-selected.
+        dataset_name: Dedicated dataset; defaults to a project/resource-scoped name.
+        **kwargs: Additional cognee.remember options. Conflicting write disposition
+            or primary key overrides are rejected before ingestion.
+
+    Returns:
+        The result of cognee.remember.
     """
     import cognee
     from cognee.tasks.ingestion.dlt_utils import document_source_tag

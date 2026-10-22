@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock
 import httpx2
 import pytest
 
-from cognee_community_connector_logrocket.rest import (
+from examples.diagnostics import (
     LogRocketRESTClient,
     LogRocketRESTError,
     parse_audit_page,
@@ -167,7 +167,7 @@ def test_http_success_does_not_imply_usable_data(response, code):
 
 def test_transient_status_retries_are_bounded(monkeypatch):
     sleep = AsyncMock()
-    monkeypatch.setattr("cognee_community_connector_logrocket.rest.asyncio.sleep", sleep)
+    monkeypatch.setattr("examples.diagnostics.asyncio.sleep", sleep)
     statuses = [429, 503, 200]
 
     def handler(request):
@@ -183,7 +183,7 @@ def test_transient_status_retries_are_bounded(monkeypatch):
 @pytest.mark.parametrize("delay", ["7", "1000"])
 def test_rest_honors_retry_after_or_fails_without_early_retry(monkeypatch, delay):
     sleep = AsyncMock()
-    monkeypatch.setattr("cognee_community_connector_logrocket.rest.asyncio.sleep", sleep)
+    monkeypatch.setattr("examples.diagnostics.asyncio.sleep", sleep)
     calls = []
 
     def handler(request):
@@ -205,7 +205,7 @@ def test_rest_honors_retry_after_or_fails_without_early_retry(monkeypatch, delay
 
 def test_transport_failures_are_retried_and_sanitized_in_traceback(monkeypatch):
     sleep = AsyncMock()
-    monkeypatch.setattr("cognee_community_connector_logrocket.rest.asyncio.sleep", sleep)
+    monkeypatch.setattr("examples.diagnostics.asyncio.sleep", sleep)
     private_cursor = "-".join(["private", "cursor"])
 
     def handler(request):
@@ -356,7 +356,7 @@ def test_project_cannot_escape_scope(project):
 
 def test_transport_timeouts_are_bounded(monkeypatch):
     sleep = AsyncMock()
-    monkeypatch.setattr("cognee_community_connector_logrocket.rest.asyncio.sleep", sleep)
+    monkeypatch.setattr("examples.diagnostics.asyncio.sleep", sleep)
 
     def handler(request):
         raise httpx2.ReadTimeout("synthetic-secret", request=request)

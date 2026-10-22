@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from cognee_community_connector_logrocket.cli import main
+from examples.diagnostics import main
 
 FIXTURE = Path(__file__).parent / "fixtures" / "public-docs-baseline.json"
 LIVE_FIXTURE = Path(__file__).parent / "fixtures" / "live-required-tool-schemas-2026-10-16.json"
@@ -58,7 +58,7 @@ def test_malformed_tool_snapshot_returns_error(tmp_path, capsys):
 
 
 def test_probe_cli_prints_structure_report(tmp_path, monkeypatch, capsys):
-    from cognee_community_connector_logrocket.client import LogRocketMCPClient
+    from examples.diagnostics import _LogRocketMCPClient
 
     arguments = tmp_path / "arguments.json"
     arguments.write_text(json.dumps({"query": "test", "limit": 1}))
@@ -69,7 +69,7 @@ def test_probe_cli_prints_structure_report(tmp_path, monkeypatch, capsys):
         assert baseline.tools
         return {"sync_implementation_allowed": False, "response_shape": {"type": "object"}}
 
-    monkeypatch.setattr(LogRocketMCPClient, "probe", fake_probe)
+    monkeypatch.setattr(_LogRocketMCPClient, "probe", fake_probe)
     assert (
         main(
             [
@@ -92,7 +92,7 @@ def test_probe_cli_prints_structure_report(tmp_path, monkeypatch, capsys):
 
 
 def test_rest_probe_cli_forwards_bounded_read_parameters(monkeypatch, capsys):
-    from cognee_community_connector_logrocket.rest import LogRocketRESTClient
+    from examples.diagnostics import LogRocketRESTClient
 
     async def fake_probe(self, resource, **kwargs):
         assert resource == "audit"
@@ -122,7 +122,7 @@ def test_rest_probe_cli_forwards_bounded_read_parameters(monkeypatch, capsys):
 
 
 def test_rest_probe_cli_reports_safe_failure(monkeypatch, capsys):
-    from cognee_community_connector_logrocket.rest import LogRocketRESTClient
+    from examples.diagnostics import LogRocketRESTClient
 
     async def fake_probe(self, resource, **kwargs):
         return {"status": "error", "error_code": "http_failure", "http_status": 403}

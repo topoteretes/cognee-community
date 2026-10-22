@@ -33,8 +33,11 @@ these contracts. Such changes require an explicit architectural/scope decision.
 
 From the package directory, inspect the advertised tool schemas:
 
+These checkout-only development commands are not part of the installed connector API.
+The connector retains live request-schema validation independently of these tools.
+
 ```bash
-uv run --env-file .env cognee-logrocket inspect-capabilities \
+uv run --env-file .env python examples/inspect_capabilities.py inspect-capabilities \
   --organization YOUR_ORG --project YOUR_PROJECT \
   --output logrocket-capabilities.json --require-sync-ready
 ```
@@ -46,7 +49,7 @@ separate from session/issue data pagination.
 Review the snapshot, then use a small explicit search to verify response structure:
 
 ```bash
-uv run --env-file .env cognee-logrocket probe-response \
+uv run --env-file .env python examples/inspect_capabilities.py probe-response \
   --organization YOUR_ORG --project YOUR_PROJECT \
   --baseline tests/fixtures/live-required-tool-schemas-2026-10-16.json \
   --tool find_sessions --arguments-file examples/probe-arguments.json
@@ -69,14 +72,14 @@ then confirm the sessions/errors are visible in LogRocket before probing.
 
 | File | Change when the contract is verified |
 |---|---|
-| `client.py` | Add supported tool arguments, complete data pagination and update retrieval; retain schema validation and sanitized failures |
-| `rest.py` | Extend only documented, verified REST routes if they are supported for connector users |
-| `capabilities.py`, `probe.py`, `cli.py` | Recognize new evidence and expose reproducible read-only checks without treating schemas as runtime guarantees |
+| `logrocket.py` (MCP transport section) | Add supported tool arguments, complete data pagination and update retrieval; retain schema validation and sanitized failures |
+| `examples/diagnostics.py` (REST checks) | Extend only documented, verified REST routes if they are supported for connector users |
+| `examples/diagnostics.py` | Recognize new evidence and expose reproducible read-only checks without treating schemas as runtime guarantees |
 | `logrocket.py` | Normalize verified fields; add incremental state and confirmed deletion handling while preserving document-mode routing |
 | `tests/` | Add synthetic contract fixtures, failure tests and real Cognee ingestion/cleanup acceptance |
 
 Keep explicit keys, environment variables and DLT secret providers working through
-`credentials.py`. MCP uses Bearer authentication; existing REST routes use `token`.
+`logrocket.py` (authentication section). MCP uses Bearer authentication; existing REST routes use `token`.
 Never forward credentials to export URLs, redirects or untrusted hosts.
 
 ## Incremental state

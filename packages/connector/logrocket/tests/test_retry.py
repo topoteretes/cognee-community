@@ -3,7 +3,7 @@ from datetime import UTC, datetime
 import httpx2
 import pytest
 
-from cognee_community_connector_logrocket.retry import retry_after, retryable
+from cognee_community_connector_logrocket.logrocket import _retry_after, _retryable
 
 
 @pytest.mark.parametrize(
@@ -20,10 +20,10 @@ from cognee_community_connector_logrocket.retry import retry_after, retryable
     ],
 )
 def test_retry_after(value, expected):
-    assert retry_after(value, now=datetime(2026, 10, 21, 10, tzinfo=UTC)) == expected
+    assert _retry_after(value, now=datetime(2026, 10, 21, 10, tzinfo=UTC)) == expected
 
 
 def test_mixed_group_with_permanent_failure_is_not_retried():
-    assert not retryable(
+    assert not _retryable(
         ExceptionGroup("private", [httpx2.ConnectError("private"), ValueError("private")])
     )

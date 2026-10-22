@@ -28,10 +28,11 @@ def run_worker(tmp_path, mode):
             "CACHING": "false",
             "ENABLE_BACKEND_ACCESS_CONTROL": "false",
             "TELEMETRY_DISABLED": "true",
+            "PYTHON_DOTENV_DISABLED": "1",
         }
     )
     env.pop("LOG_FILE_NAME", None)
-    # No .env is loaded from the package: the subprocess runs in a temporary cwd.
+    # Disable dependency-level dotenv loading as well as using a temporary cwd.
     if mode == "offline":
         env["COGNEE_SKIP_CONNECTION_TEST"] = "true"
         for key in tuple(env):
@@ -118,7 +119,7 @@ async def acceptance_worker(mode):
     first = await stored()
     assert len(first) == 2
     first_ids = {row.id for row in first}
-    assert {row.external_metadata["source"] for row in first} == {"logrocket"}
+    assert {row.system_metadata["source"] for row in first} == {"logrocket"}
 
     await ingest([session(durationMs=1000)], [report])
     assert {row.id for row in await stored()} == first_ids
@@ -129,7 +130,7 @@ async def acceptance_worker(mode):
     updated = await stored()
     assert len(updated) == 2
     assert len(first_ids & {row.id for row in updated}) == 1
-    assert any(row.external_metadata["title"] == f"{marker} payment failure" for row in updated)
+    assert any(row.system_metadata["title"] == f"{marker} payment failure" for row in updated)
 
     await ingest([], [])
     assert {row.id for row in await stored()} == {row.id for row in updated}

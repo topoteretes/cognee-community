@@ -16,4 +16,4 @@ logrocket-capabilities.json
 # Other Markdown notes remain local, including the test-data walkthrough.
 *.md
 !/README.md
-!/API_INTEGRATION.md
+!/examples/API_INTEGRATION.md

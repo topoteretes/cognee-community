@@ -6,10 +6,10 @@ import pytest
 from cognee_community_connector_logrocket.logrocket import (
     IncompleteLogRocketResultError,
     _fetch_rows,
-    issue_to_row,
+    _issue_to_row,
+    _session_to_row,
     logrocket_source,
     remember_logrocket,
-    session_to_row,
 )
 
 
@@ -99,7 +99,7 @@ def fetch(client, resource, **kwargs):
 
 
 def test_session_row_has_stable_identity_and_private_defaults():
-    row = session_to_row(session(), "org", "project")
+    row = _session_to_row(session(), "org", "project")
     assert row["id"] == "logrocket:org:project:session:rec-1:7"
     assert row["url"].endswith("/rec-1/7")
     serialized = json.dumps(row)
@@ -110,7 +110,7 @@ def test_session_row_has_stable_identity_and_private_defaults():
 
 
 def test_session_privacy_options_include_only_selected_fields():
-    row = session_to_row(session(), "org", "project", include_user_id=True, include_location=True)
+    row = _session_to_row(session(), "org", "project", include_user_id=True, include_location=True)
     assert "User ID: test-user" in row["content"]
     assert "City: Pune" in row["content"]
     assert "203.0.113.10" not in row["content"]
@@ -128,12 +128,12 @@ def test_session_privacy_options_include_only_selected_fields():
 )
 def test_session_parser_fails_closed_on_shape_changes(updates, message):
     with pytest.raises(ValueError, match=message):
-        session_to_row(session(**updates), "org", "project")
+        _session_to_row(session(**updates), "org", "project")
 
 
 def test_issue_row_uses_repeatable_url_hash_and_redacts_free_text():
-    first = issue_to_row(issue(), "org", "project")
-    second = issue_to_row(issue(), "org", "project")
+    first = _issue_to_row(issue(), "org", "project")
+    second = _issue_to_row(issue(), "org", "project")
     assert first["id"] == second["id"]
     assert "issue-url-sha256" in first["id"]
     serialized = json.dumps(first)
@@ -145,7 +145,7 @@ def test_issue_row_uses_repeatable_url_hash_and_redacts_free_text():
 
 def test_issue_parser_requires_observed_shape():
     with pytest.raises(ValueError, match="eventCount"):
-        issue_to_row(issue(eventCount=None), "org", "project")
+        _issue_to_row(issue(eventCount=None), "org", "project")
 
 
 def test_issue_document_is_identical_for_every_message_order():
@@ -156,10 +156,10 @@ def test_issue_document_is_identical_for_every_message_order():
         {"title": "Zulu failure", "message": "Payment secret@example.test failed"},
         {"title": "Alpha failure", "eventMessage": "Request failed"},
     ]
-    expected = issue_to_row(issue(messages=messages), "org", "project")
+    expected = _issue_to_row(issue(messages=messages), "org", "project")
     assert expected["title"] == "Alpha failure"
     for reordered in permutations(messages):
-        assert issue_to_row(issue(messages=list(reordered)), "org", "project") == expected
+        assert _issue_to_row(issue(messages=list(reordered)), "org", "project") == expected
     assert expected["content"].count("Request failed") == 1
     assert "secret@example.test" not in expected["content"]
 
@@ -167,9 +167,9 @@ def test_issue_document_is_identical_for_every_message_order():
 @pytest.mark.parametrize("field", ["title", "message", "eventMessage"])
 def test_issue_title_fallback_is_deterministic(field):
     messages = [{field: "Zulu failure"}, {field: "Alpha failure"}]
-    expected = issue_to_row(issue(messages=messages), "org", "project")
+    expected = _issue_to_row(issue(messages=messages), "org", "project")
     assert expected["title"] == "Alpha failure"
-    assert issue_to_row(issue(messages=messages[::-1]), "org", "project") == expected
+    assert _issue_to_row(issue(messages=messages[::-1]), "org", "project") == expected
 
 
 def test_bounded_session_import_requests_full_window():
@@ -231,6 +231,31 @@ def test_issue_import_uses_retained_window_and_all_statuses():
     assert len(arguments["triageStatuses"]) == 4
 
 
+def test_ingestion_logs_counts_without_record_content(monkeypatch):
+    from unittest.mock import Mock
+
+    from cognee_community_connector_logrocket import logrocket as implementation
+
+    logger = Mock()
+    monkeypatch.setattr(implementation, "logger", logger)
+    fetch(FakeClient([{"issues": [issue()]}]), "issues")
+    logger.info.assert_called_once_with(
+        "LogRocket: emitted %d %s document(s) for merge.", 1, "issues"
+    )
+
+
+def test_invalid_response_does_not_log_success(monkeypatch):
+    from unittest.mock import Mock
+
+    from cognee_community_connector_logrocket import logrocket as implementation
+
+    logger = Mock()
+    monkeypatch.setattr(implementation, "logger", logger)
+    with pytest.raises(ValueError):
+        fetch(FakeClient([{"issues": [{}]}]), "issues")
+    logger.info.assert_not_called()
+
+
 def test_old_issue_triage_change_is_refetched_next_day():
     client = FakeClient(
         [
@@ -287,7 +312,7 @@ def test_issue_messages_preserve_distinct_fields_and_redact_every_field():
             {"message": "Checkout error"},
         ]
     )
-    row = issue_to_row(record, "org", "project")
+    row = _issue_to_row(record, "org", "project")
     assert row["title"] == "Checkout error"
     assert row["content"].count("Checkout error") == 1
     assert "Payment [redacted-email] failed" in row["content"]
@@ -313,6 +338,101 @@ def test_source_declares_document_marker_and_merge_resources():
     assert document_source_tag(source) == "logrocket"
     assert list(source.resources) == ["logrocket_sessions"]
     assert source.resources["logrocket_sessions"].write_disposition == "merge"
+
+
+def test_shared_pipeline_scope_survives_selection_and_isolates_connections():
+    from cognee.tasks.ingestion.dlt_utils import pipeline_name_for_source
+
+    first = logrocket_source("org", "a", acknowledge_bounded_results=True)
+    other = logrocket_source("org", "b", acknowledge_bounded_results=True)
+    selected = first.with_resources("logrocket_sessions")
+    assert pipeline_name_for_source(first, "data") == pipeline_name_for_source(selected, "data")
+    assert pipeline_name_for_source(first, "data") != pipeline_name_for_source(other, "data")
+    assert pipeline_name_for_source(first, "data") != pipeline_name_for_source(first, "other")
+
+
+def test_old_core_fails_before_network(monkeypatch):
+    from cognee.tasks.ingestion import dlt_utils
+
+    monkeypatch.setattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 0)
+    with pytest.raises(RuntimeError, match="table-scoped"):
+        logrocket_source("org", "a", acknowledge_bounded_results=True)
+
+
+def test_resource_counters_reset_and_do_not_claim_exhaustiveness(tmp_path):
+    import dlt
+
+    client = FakeClient([{"issues": [issue(), issue()]}, {"issues": []}])
+    source = logrocket_source(
+        "org",
+        "project",
+        resources=("issues",),
+        client=client,
+        acknowledge_bounded_results=True,
+    )
+    pipeline = _pipeline(dlt, tmp_path)
+    pipeline.run(source)
+    stats = source.cognee_sync_stats["issues"]
+    assert stats == {
+        "scanned": 2,
+        "emitted": 1,
+        "skipped": 1,
+        "deleted": 0,
+        "failed": 0,
+        "requests": 1,
+        "request_complete": 1,
+    }
+    assert source.resources["logrocket_issues"].cognee_sync_stats is stats
+    pipeline.run(source)
+    assert stats["scanned"] == stats["emitted"] == stats["skipped"] == 0
+    assert stats["requests"] == stats["request_complete"] == 1
+    assert "complete" not in stats
+
+
+def test_revoked_access_aborts_before_search_and_marks_failure(tmp_path):
+    import dlt
+
+    def revoked():
+        raise PermissionError("revoked")
+
+    client = FakeClient([])
+    source = logrocket_source(
+        "org",
+        "project",
+        resources=("issues",),
+        client=client,
+        check_active=revoked,
+        acknowledge_bounded_results=True,
+    )
+    with pytest.raises(Exception, match="revoked"):
+        _pipeline(dlt, tmp_path).run(source)
+    assert client.calls == []
+    assert source.cognee_sync_stats["issues"]["failed"] == 1
+    assert source.cognee_sync_stats["issues"]["request_complete"] == 0
+
+
+def test_revocation_after_search_prevents_publishing(tmp_path):
+    import dlt
+
+    client = FakeClient([{"issues": [issue()]}])
+
+    def active():
+        if client.calls:
+            raise PermissionError("revoked after search")
+
+    source = logrocket_source(
+        "org",
+        "project",
+        resources=("issues",),
+        client=client,
+        check_active=active,
+        acknowledge_bounded_results=True,
+    )
+    with pytest.raises(Exception, match="revoked after search"):
+        _pipeline(dlt, tmp_path).run(source)
+    assert len(client.calls) == 1
+    assert source.cognee_sync_stats["issues"]["emitted"] == 0
+    assert source.cognee_sync_stats["issues"]["failed"] == 1
 
 
 def test_remember_helper_enforces_merge_at_cognee_boundary(monkeypatch):
@@ -441,7 +561,7 @@ def test_dlt_rejects_disposition_override_before_search_or_load(tmp_path, dispos
 
 @pytest.mark.parametrize("value", ["synthetic@example.test", "Bearer synthetic-secret"])
 def test_fallback_title_redacted(value):
-    row = issue_to_row(issue(issueType=value, messages=[]), "org", "project")
+    row = _issue_to_row(issue(issueType=value, messages=[]), "org", "project")
     assert value not in row["title"]
 
 
@@ -457,9 +577,9 @@ def test_fallback_title_redacted(value):
 @pytest.mark.parametrize("kind", ["session", "issue"])
 def test_sensitive_provenance_is_rejected_without_disclosing_value(suffix, kind):
     parser, factory, key = (
-        (session_to_row, session, "sessionURL")
+        (_session_to_row, session, "sessionURL")
         if kind == "session"
-        else (issue_to_row, issue, "url")
+        else (_issue_to_row, issue, "url")
     )
     with pytest.raises(ValueError, match="safe HTTPS") as caught:
         parser(factory(**{key: "https://app.logrocket.com/org/project" + suffix}), "org", "project")
@@ -468,18 +588,18 @@ def test_sensitive_provenance_is_rejected_without_disclosing_value(suffix, kind)
 
 def test_identity_bearing_query_is_preserved():
     url = "https://app.logrocket.com/org/project/issues?issue=123"
-    row = issue_to_row(issue(url=url), "org", "project")
+    row = _issue_to_row(issue(url=url), "org", "project")
     assert row["url"] == url
-    assert row["id"] != issue_to_row(issue(url=url + "4"), "org", "project")["id"]
+    assert row["id"] != _issue_to_row(issue(url=url + "4"), "org", "project")["id"]
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf"), 10**400])
 @pytest.mark.parametrize("field", ["date", "durationMs", "eventCount"])
 def test_nonfinite_numbers_rejected(field, value):
     parser, record = (
-        (issue_to_row, issue(eventCount=value))
+        (_issue_to_row, issue(eventCount=value))
         if field == "eventCount"
-        else (session_to_row, session(**{field: value}))
+        else (_session_to_row, session(**{field: value}))
     )
     with pytest.raises(ValueError, match=field):
         parser(record, "org", "project")
@@ -587,12 +707,12 @@ def test_dataset_resource_selection_change_rejected(tmp_path):
 @pytest.mark.parametrize("value", [-1, 1.5, True])
 def test_event_count_requires_nonnegative_integer_value(value):
     with pytest.raises(ValueError, match="eventCount"):
-        issue_to_row(issue(eventCount=value), "org", "project")
+        _issue_to_row(issue(eventCount=value), "org", "project")
 
 
 def test_negative_duration_rejected():
     with pytest.raises(ValueError, match="durationMs"):
-        session_to_row(session(durationMs=-1), "org", "project")
+        _session_to_row(session(durationMs=-1), "org", "project")
 
 
 def test_ownership_reservation_serializes_competing_projects(tmp_path):
@@ -695,7 +815,7 @@ def test_destination_identity_includes_dataset_name():
 @pytest.mark.parametrize("name", ["include_user_id", "include_location"])
 def test_privacy_flags_require_real_booleans(name, value):
     with pytest.raises(ValueError, match=name):
-        session_to_row(session(), "org", "project", **{name: value})
+        _session_to_row(session(), "org", "project", **{name: value})
 
 
 @pytest.mark.parametrize("value", ["true", 1, None])
@@ -711,12 +831,12 @@ def test_scope_whitespace_is_canonical_for_direct_parsers_and_factory(monkeypatc
     import cognee
 
     assert (
-        session_to_row(session(), " org ", " project ")["id"]
-        == session_to_row(session(), "org", "project")["id"]
+        _session_to_row(session(), " org ", " project ")["id"]
+        == _session_to_row(session(), "org", "project")["id"]
     )
     assert (
-        issue_to_row(issue(), " org ", " project ")["id"]
-        == issue_to_row(issue(), "org", "project")["id"]
+        _issue_to_row(issue(), " org ", " project ")["id"]
+        == _issue_to_row(issue(), "org", "project")["id"]
     )
     remember = AsyncMock()
     monkeypatch.setattr(cognee, "remember", remember)
@@ -737,6 +857,6 @@ def test_scope_whitespace_is_canonical_for_direct_parsers_and_factory(monkeypatc
 )
 def test_encoded_or_fragment_credentials_in_provenance_are_rejected(suffix):
     with pytest.raises(ValueError, match="safe HTTPS"):
-        issue_to_row(
+        _issue_to_row(
             issue(url="https://app.logrocket.com/org/project/issues" + suffix), "org", "project"
         )
