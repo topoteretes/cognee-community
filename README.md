@@ -107,6 +107,12 @@ poetry run python ./examples/example.py
 | `cognee-community-hybrid-adapter-duckdb`     | Hybrid   | DuckDB hybrid database adapter for cognee          |
 | `cognee-community-hybrid-adapter-falkor`     | Hybrid   | FalkorDB hybrid database adapter for cognee        |
 
+## Data Source Connectors
+
+| Package Name                                | Type       | Description                                                      |
+|---------------------------------------------|------------|------------------------------------------------------------------|
+| `cognee-community-connector-google-chat`    | Connector  | Sync selected Google Chat spaces as thread documents             |
+
 ## Custom Packages
 
 Custom packages are also a part of this repo, containing, for example, custom pipelines, tasks, and retrievers.
