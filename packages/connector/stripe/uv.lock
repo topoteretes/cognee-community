@@ -595,7 +595,7 @@ dependencies = [
 requires-dist = [
     { name = "cognee", specifier = "==1.6.4" },
     { name = "dlt", extras = ["sqlalchemy"], specifier = ">=1.9.0,<2" },
-    { name = "stripe", specifier = ">=12,<17" },
+    { name = "stripe", specifier = ">=16,<17" },
 ]
 
 [[package]]

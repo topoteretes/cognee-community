@@ -12,7 +12,7 @@ dependencies = [
     "cognee==1.6.4",
     "dlt[sqlalchemy]>=1.9.0,<2",
     # The client library the dlt verified Stripe source is built on.
-    "stripe>=12,<17",
+    "stripe>=16,<17",
 ]
 
 [project.urls]
