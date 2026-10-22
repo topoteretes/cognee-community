@@ -1,0 +1,51 @@
+[
+  {
+    "_id": "post-001",
+    "_type": "post",
+    "_createdAt": "2026-09-15T10:00:00Z",
+    "_updatedAt": "2026-09-20T14:30:00Z",
+    "_rev": "iYtJ8c0wPq",
+    "title": "Getting Started with Our Platform",
+    "slug": {"current": "getting-started"},
+    "status": "published",
+    "body": [
+      {
+        "_type": "block",
+        "_key": "a1b2c3",
+        "style": "h2",
+        "children": [{"_type": "span", "text": "Welcome to the Platform"}]
+      },
+      {
+        "_type": "block",
+        "_key": "d4e5f6",
+        "style": "normal",
+        "children": [{"_type": "span", "text": "This guide will walk you through the core concepts and help you get productive quickly."}]
+      },
+      {
+        "_type": "block",
+        "_key": "g7h8i9",
+        "style": "h3",
+        "children": [{"_type": "span", "text": "Key Concepts"}]
+      },
+      {
+        "_type": "block",
+        "_key": "j0k1l2",
+        "style": "normal",
+        "children": [{"_type": "span", "text": "Before diving in, understand these three foundational ideas: authentication, data modeling, and query patterns."}]
+      }
+    ],
+    "author": {"_ref": "author-alice", "_type": "reference"},
+    "tags": ["guide", "onboarding", "beginner"]
+  },
+  {
+    "_id": "page-002",
+    "_type": "page",
+    "_createdAt": "2026-09-10T08:00:00Z",
+    "_updatedAt": "2026-09-18T11:15:00Z",
+    "_rev": "hGf7Dc2pRq",
+    "name": "API Reference",
+    "description": "Complete reference documentation for the REST API.",
+    "status": "published",
+    "tags": ["api", "reference", "docs"]
+  }
+]
