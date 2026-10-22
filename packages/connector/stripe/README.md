@@ -22,7 +22,7 @@ source, see [Design notes](#design-notes).
 | --- | --- | --- |
 | Customer | Name, description, created, currency, balance, delinquency | itself |
 | Subscription | Status, dates (start, trial, cancellation), collection method, items with product, price, quantity and period end | customer, products |
-| Invoice | Number, status, billing reason, period, due and paid dates, totals, the invoice's own customer-name snapshot, up to 20 line items | customer, subscription, products, the payment that paid it |
+| Invoice | Number, status, billing reason, period, due and paid dates, totals, the invoice's own customer-name snapshot, line items | customer, subscription, products, the payment that paid it |
 | Charge | Amount, status, captured and refunded amounts, failure reason, statement descriptor | customer, the payment it belongs to (shared with its invoice) |
 | Product | Name, description, active, default price, unit label | itself |
 | Dispute | Amount, reason, status, evidence due date | charge |
@@ -91,6 +91,34 @@ any other disposition before reading anything.
 
 Use one Stripe account per dataset. See `examples/example.py` for the full flow.
 
+## Try it on a free test account
+
+Stripe's test mode is free and needs no business verification or Connect.
+
+1. In the Dashboard, switch to **test mode** and copy your secret test key (`sk_test_…`) from
+   Developers → API keys.
+2. Seed some billing history: a paid subscription, a disputed payment and an open invoice. Run
+   it once from `packages/connector/stripe`; it stops if the account is already seeded.
+
+   ```bash
+   export STRIPE_SEED_KEY="sk_test_..."
+   uv run python examples/seed_test_data.py
+   ```
+
+3. Create a **restricted key** (Developers → API keys → Create restricted key) with **Read**
+   access to customers, subscriptions, invoices, charges, products, disputes and events, and
+   nothing else. The connector needs no write access.
+4. Sync and search with that key, and leave `STRIPE_ACCOUNT_ID` unset to read your own account:
+
+   ```bash
+   export STRIPE_API_KEY="rk_test_..."
+   export LLM_API_KEY="sk-..."
+   uv run python examples/example.py
+   ```
+
+Then rename a customer, delete another or void an invoice in the Dashboard and run it again: the
+change is picked up from Stripe's events and the deleted customer leaves the graph.
+
 ## Setup: Stripe Connect
 
 Users connect with **Stripe Connect OAuth** and the `read_only` scope; nobody pastes a secret
@@ -104,18 +132,12 @@ per-account access token, so nothing secret is stored per connection.
    `https://<your cognee host>/api/v1/integrations/stripe/callback`).
 3. Copy the **client ID** (`ca_…`, test and live are separate) and your platform's **secret key**
    (`sk_…`, same mode).
-4. Stripe grants `read_only` only to platforms set up as
-   [extensions](https://docs.stripe.com/connect/oauth-changes-for-standard-platforms). If Stripe
-   returns any other scope, the integration refuses the connection rather than keeping broader
-   access than the user agreed to.
+4. The integration asks for `read_only`. Stripe's docs list that scope for
+   [extensions](https://docs.stripe.com/connect/oauth-changes-for-standard-platforms), so check
+   how your platform is registered. If Stripe returns any other scope, the integration refuses
+   the connection rather than keeping broader access than the user agreed to.
 
-To try the connector on **your own** account without Connect, create a
-[restricted key](https://dashboard.stripe.com/apikeys) with **Read** access to Customers,
-Subscriptions, Invoices, Charges, Products, Disputes and Events, and leave the account id unset:
-
-```bash
-export STRIPE_API_KEY="rk_test_..."
-```
+To try the connector without Connect, see [Try it on a free test account](#try-it-on-a-free-test-account).
 
 ## Connect from cognee (OAuth + object-type picker)
 
@@ -183,9 +205,9 @@ types.
 
 **Document path, not the relational path.** Stripe objects are structured, so the relational dlt
 path looks like the natural fit, and it was the first plan. But cognee builds row-to-row edges on
-that path only from foreign keys declared in the dlt staging database, and dlt's destinations
-never create foreign keys, not even from a `references` hint. On the relational path,
-customer → subscription → invoice would therefore not be connected. The document path with
+that path only from foreign keys declared in the dlt staging database. dlt's SQLite staging tables
+carry none, even when the resource declares `references` (checked with dlt 1.30), so on the
+relational path customer → subscription → invoice would not be connected. The document path with
 per-row node sets gives those edges deterministically, and also gives each object prose that
 cognify can extract entities from.
 
@@ -193,16 +215,22 @@ cognify can extract entities from.
 
 | Verified source | This connector | Why |
 | --- | --- | --- |
-| Sets `stripe.api_key` globally | One `StripeClient` per source | Several connected accounts can sync in one API process |
+| Sets `stripe.api_key` globally | One `StripeClient` per source | Each source carries its own credentials |
 | Secret key from `dlt.secrets` | Platform key + `Stripe-Account` (Connect) | The issue asks for Connect, and Stripe deprecates per-account tokens |
 | Yields whole objects (`to_dict()`) | Allowlisted rendering | Charges carry `payment_method_details`, and invoices carry addresses and hosted links |
 | `replace` windowed by `created`, or `append` for immutable types | `merge` driven by events, with tombstones | `created` misses edits, and deletions need a feed |
-| API version `2022-11-15` | `2025-03-31.basil` | Current object shapes; both invoice shapes are handled |
+| API version `2022-11-15` | `2025-03-31.basil` | Current object shapes, pinned so every account returns the same ones |
 
-**Limitations.** Product renames reach a subscription's document only through its link, not its
-text: documents render ids for related objects, so one rename does not re-render thousands of
-documents. Prices are rendered inside subscriptions and invoices, not synced on their own. An
-invoice lists at most 20 line items. Only one Stripe account per dataset.
+**Limitations.**
+
+- Product renames reach a subscription's document only through its link, not its text: documents
+  render ids for related objects, so one rename does not re-render thousands of documents.
+- Prices are rendered inside subscriptions and invoices, not synced on their own.
+- An invoice shows the line items Stripe returns inline (the first 10) and links the first 10
+  payment attempts.
+- The sync state keeps the id of every synced object (a few dozen bytes each) to detect
+  deletions, so it grows with the account.
+- One Stripe account per dataset.
 
 ## Testing
 
@@ -212,10 +240,11 @@ uv run --with pytest --with pytest-asyncio pytest tests/
 
 The tests need no Stripe account. Stripe is served by an in-memory fake mounted as a `requests`
 transport adapter behind the official client, so the real headers, paging and error mapping run.
-They cover:
+The fake follows the response shapes of a real test account: a charge carries no `invoice` field,
+and an invoice's `payments` come back only when the request expands them. The tests cover:
 
 - rendering of every object type, amounts in zero- and three-decimal currencies, and node sets
-  across both invoice shapes
+  including the PaymentIntent that ties an invoice to its charge
 - a sweep that fills every card, billing, address and link field with a marker and checks it
   never reaches a row, plus the opt-in contact details and metadata
 - the full listing (paging, `status=all`, the `Stripe-Account` and pinned version headers) and
