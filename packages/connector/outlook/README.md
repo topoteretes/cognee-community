@@ -125,8 +125,9 @@ totals the other connectors publish; and `failed_auth`, `failed_rate_limit`,
   twice stops that folder instead of looping. 429 throttling, 5xx errors and dropped
   connections are retried at most 3 times per request, waiting `Retry-After` but never
   more than 60 seconds, and all waits of one run share 2 minutes, since cognee holds its
-  dlt staging lock during a sync. After that the request fails and the next run picks it
-  up.
+  dlt staging lock during a sync. With a `check_active`, waits are slept in 1 second steps
+  and it is asked between them and before the retry, so a revoked connection stops a wait
+  within a second. After that the request fails and the next run picks it up.
 - **The token only goes to Graph.** The bearer token is attached only to requests for
   the `base_url` host; a page link that points anywhere else fails that folder instead.
 - **Rows stream page by page.** New and changed messages and events are handed to cognee
@@ -275,7 +276,8 @@ folder and for the calendar and replays it through delta tokens.
   version, `Retry-After` capped at a minute, a repeated page link, times in a chosen
   zone, all-day events east and west of UTC, a stable attendee order, mail and calendar
   failing separately without leaking a half-finished round, auth, throttling and a lost
-  connection ending the run, `check_active` before every request, and no ids or delta
+  connection ending the run, `check_active` before every request and retry and between
+  the steps of a wait, and no ids or delta
   tokens in the connector's logs or errors.
 - `test_outlook_source.py` covers the device-code login only through `login()`, a sync
   that needs a new login raising instead of waiting, several accounts in one cache, the

@@ -365,8 +365,8 @@ class _ClosingFakeGraph:
         self.closed = []
         real = outlook_module.build_graph_client
 
-        def build(auth, base_url):
-            client = real(auth, base_url)
+        def build(auth, base_url, check_active=None):
+            client = real(auth, base_url, check_active)
             self.built.append(client)
             original_close = client.session.close
 
@@ -378,6 +378,31 @@ class _ClosingFakeGraph:
             return client
 
         monkeypatch.setattr(outlook_module, "build_graph_client", build)
+
+
+def test_the_built_client_asks_check_active_during_waits(monkeypatch, tmp_path):
+    import dlt
+
+    clients = _ClosingFakeGraph(monkeypatch)
+    graph = FakeGraph()
+    graph.put_message("inbox", "Hello")
+    monkeypatch.setenv("DLT_DATA_DIR", str(tmp_path))
+
+    def check_active():
+        return None
+
+    resource = outlook_source(
+        ["inbox"],
+        include_calendar=False,
+        access_token="t",
+        base_url=BASE,
+        check_active=check_active,
+    )
+    with responses.RequestsMock(assert_all_requests_are_fired=False) as mock:
+        graph.install(mock)
+        dlt.pipeline("outlook_check_test", dev_mode=True).extract(resource)
+
+    assert clients.built[0].session.check_active is check_active
 
 
 def test_each_run_builds_its_own_client_and_closes_it(monkeypatch, tmp_path):

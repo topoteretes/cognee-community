@@ -65,15 +65,22 @@ GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
 MAX_RETRY_WAIT_SECONDS = 60
 MAX_REQUEST_ATTEMPTS = 3
 WAIT_BUDGET_SECONDS = 120
+# With a check_active, waits are slept in steps this long and it is asked
+# between them, so a revoked connection stops a wait within a second.
+WAIT_STEP_SECONDS = 1
 RETRY_STATUSES = frozenset({429, *range(500, 600)})
 RETRY_EXCEPTIONS = (
     requests.ConnectionError,
     requests.Timeout,
     requests.exceptions.ChunkedEncodingError,
 )
-# Runs an event lookup may fail before the connector stops asking.
+# Runs an event lookup may fail before the connector stops asking.  Three
+# runs are a day or more on a daily sync, longer than a Graph outage usually
+# lasts, and a lookup costs one request per run.
 MAX_LOOKUP_ATTEMPTS = 3
-# Runs a forget may wait for a mail folder that keeps failing.
+# Runs a forget may wait for a mail folder that keeps failing.  The same three
+# runs: long enough for a passing error, short enough that a deleted message
+# does not stay in memory for weeks.
 MAX_HELD_RUNS = 3
 # dlt uses the resource name as a table name and a state key, so it has to be
 # already normalized and short enough to be part of a file name.
@@ -155,7 +162,7 @@ class OutlookError(RuntimeError):
     folder id, nor the request URL that requests puts in its own error text.
     """
 
-    def __init__(self, message: str, status: int | None = None, connection: bool = False):
+    def __init__(self, message: str, status: int | None = None, connection: bool = False) -> None:
         super().__init__(message)
         self.status = status
         # Graph could not be reached at all, so every later call would fail too.
@@ -189,16 +196,18 @@ class _GraphSession(Session):
     """A requests session that retries 429, 5xx and dropped connections.
 
     Each wait follows ``Retry-After``, capped at a minute, and every wait of
-    the session shares one budget.  A session lives for one run.  Once the
-    attempts or the budget are used up, the last response or error is returned
-    as it is and the caller decides what fails.
+    the session shares one budget.  ``check_active`` is asked between the
+    steps of a wait and before the retry.  A session lives for one run.  Once
+    the attempts or the budget are used up, the last response or error is
+    returned as it is and the caller decides what fails.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, check_active: Callable[[], None] | None = None) -> None:
         super().__init__(raise_for_status=False)
         self.wait_left = float(WAIT_BUDGET_SECONDS)
+        self.check_active = check_active
 
-    def send(self, request, **kwargs):
+    def send(self, request: requests.PreparedRequest, **kwargs: Any) -> requests.Response:
         attempt = 1
         while True:
             try:
@@ -230,12 +239,24 @@ class _GraphSession(Session):
         self.wait_left -= seconds
         if response is not None:
             response.close()
-        _sleep(seconds)
+        if self.check_active is None:
+            _sleep(seconds)
+            return True
+        while seconds > 0:
+            step = min(seconds, WAIT_STEP_SECONDS)
+            _sleep(step)
+            seconds -= step
+            # Raised outside any retry handling, so it reaches the host as it is.
+            self.check_active()
         return True
 
 
-def build_graph_client(auth: Any, base_url: str = GRAPH_BASE_URL) -> RESTClient:
-    return RESTClient(base_url=base_url, auth=auth, session=_GraphSession())
+def build_graph_client(
+    auth: Any,
+    base_url: str = GRAPH_BASE_URL,
+    check_active: Callable[[], None] | None = None,
+) -> RESTClient:
+    return RESTClient(base_url=base_url, auth=auth, session=_GraphSession(check_active))
 
 
 def _check(check_active: Callable[[], None] | None) -> None:
@@ -251,7 +272,7 @@ class _ODataNextLinkPaginator(BaseNextUrlPaginator):
         super().__init__()
         self._seen: set[str] = set()
 
-    def update_state(self, response, data=None) -> None:
+    def update_state(self, response: requests.Response, data: Any = None) -> None:
         link = response.json().get("@odata.nextLink")
         if link in self._seen:
             # The link carries the delta token, so it stays out of the message.
@@ -1073,7 +1094,7 @@ def outlook_source(
     token_provider: GraphTokenProvider | None = None,
     base_url: str = GRAPH_BASE_URL,
     service: RESTClient | None = None,
-):
+) -> Any:
     """Return a ``dlt`` resource yielding Outlook mail and calendar documents.
 
     Hand the result to ``cognee.remember(...)`` with ``write_disposition="merge"``
@@ -1195,13 +1216,13 @@ def outlook_source(
         # deletion through cognee's orphan_cleanup.
         columns={"_deleted": {"data_type": "bool", "hard_delete": True}},
     )
-    def outlook_items():
+    def outlook_items() -> Iterator[dict]:
         # A client per run: its retry wait budget is per run, and it is closed
         # when the run ends.
         client = (
             service
             if service is not None
-            else build_graph_client(GraphAuth(provider, base_url), base_url)
+            else build_graph_client(GraphAuth(provider, base_url), base_url, check_active)
         )
         try:
             rows = _iter_rows(

@@ -54,7 +54,7 @@ class GraphTokenProvider:
         access_token: str | None = None,
         account: str | None = None,
         msal_app: Any = None,
-    ):
+    ) -> None:
         if not access_token and not client_id and msal_app is None:
             raise ValueError(
                 "Microsoft Graph credentials are missing. Pass client_id, your Entra "
@@ -163,11 +163,11 @@ class GraphAuth(requests.auth.AuthBase):
     that points anywhere else is refused before it is sent.
     """
 
-    def __init__(self, provider: GraphTokenProvider, base_url: str = GRAPH_ORIGIN):
+    def __init__(self, provider: GraphTokenProvider, base_url: str = GRAPH_ORIGIN) -> None:
         self.provider = provider
         self._origin = _origin(base_url)
 
-    def __call__(self, request):
+    def __call__(self, request: requests.PreparedRequest) -> requests.PreparedRequest:
         if _origin(request.url) != self._origin:
             raise GraphHostError("Refusing to send the Microsoft Graph token to another host.")
         request.headers["Authorization"] = f"Bearer {self.provider.token()}"

@@ -737,6 +737,45 @@ def test_a_long_retry_after_is_capped_and_retried_only_a_few_times(graph, monkey
     assert stats["failed_rate_limit"] == 1
 
 
+def test_a_wait_is_slept_in_steps_and_cancelled_by_check_active(graph, monkeypatch):
+    graph.put_message("inbox", "Hello")
+    waits: list[float] = []
+    monkeypatch.setattr(outlook_module, "_sleep", waits.append)
+    graph.fail_next.append((429, {"error": {"code": "TooManyRequests"}}, {"Retry-After": "30"}))
+
+    def check_active():
+        if len(waits) == 3:
+            raise PermissionError("revoked")
+
+    client = build_graph_client(
+        GraphAuth(GraphTokenProvider(access_token="test-token"), BASE), BASE, check_active
+    )
+    config = make_config(include_calendar=False, mail_folders=("inbox",))
+
+    with pytest.raises(PermissionError):
+        list(_iter_rows(client, config, {}, {}, now=NOW, check_active=check_active))
+
+    assert waits == [1, 1, 1], "stopped 3 s into a 30 s wait"
+
+
+def test_check_active_is_asked_before_a_retried_request(graph, monkeypatch):
+    graph.put_message("inbox", "Hello")
+    monkeypatch.setattr(outlook_module, "_sleep", lambda _seconds: None)
+    graph.fail_next.append((503, {"error": {"code": "ServiceUnavailable"}}, {"Retry-After": "1"}))
+    checks: list[int] = []
+    client = build_graph_client(
+        GraphAuth(GraphTokenProvider(access_token="test-token"), BASE),
+        BASE,
+        lambda: checks.append(len(graph.requests)),
+    )
+    config = make_config(include_calendar=False, mail_folders=("inbox",))
+
+    rows = list(_iter_rows(client, config, {}, {}, now=NOW))
+
+    assert [row["title"] for row in rows] == ["Hello"]
+    assert checks == [1], "asked once, after the 503 and before the retry"
+
+
 def test_a_repeated_page_link_fails_its_part_instead_of_looping(graph):
     graph.put_message("inbox", "One")
     graph.put_message("inbox", "Two")
