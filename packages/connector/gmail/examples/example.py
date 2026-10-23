@@ -42,7 +42,6 @@ import asyncio
 import os
 
 import cognee
-
 from cognee_community_connector_gmail import gmail_source
 
 # Keep the inbox in its own dataset so it is easy to inspect and forget.
