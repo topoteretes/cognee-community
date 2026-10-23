@@ -392,6 +392,22 @@ def test_created_since_windows_history_objects_only():
     assert _ids(rows) == {old_customer["id"], recent["id"]}
 
 
+def test_narrowing_created_since_forgets_older_history():
+    fake = FakeStripe()
+    customer = fake.add("customers", name="Alphacorp")
+    old = fake.add("invoices", customer=customer["id"], created=START - 400 * DAY)
+    recent = fake.add("invoices", customer=customer["id"])
+    state: dict = {}
+    _run(fake, state, objects=["invoices"])
+    fake.tick(7200)
+
+    rows = _run(fake, state, objects=["invoices"], created_since=START - DAY)
+
+    assert _tombstones(rows) == {old["id"]}
+    assert _ids(rows) == {recent["id"]}
+    assert state["known"]["invoices"] == [recent["id"]]
+
+
 # ---------------------------------------------------------------------------
 # Incremental cursor
 # ---------------------------------------------------------------------------
