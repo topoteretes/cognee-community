@@ -49,6 +49,6 @@ jobs:
           uv run --locked ruff check .
           uv run --locked ruff format --check .
       - name: Offline tests against declared DLT minimum
-        run: uv run --locked --with 'dlt[sqlalchemy]==1.31.0' python -m pytest -q
+        run: uv run --locked --with 'dlt[sqlalchemy]==1.30.0' python -m pytest -q
       - name: Build distributions
         run: uv build
