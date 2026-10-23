@@ -14,7 +14,7 @@ Two layers, all runnable in CI without a live incident.io token:
 
 from typing import Any, Dict, List
 from unittest.mock import MagicMock
-
+import os
 import pytest
 
 from cognee_community_connector_incident_io.incident_io import (
@@ -43,6 +43,7 @@ def _incident(
     resolved_at: str = "2026-10-10T14:45:00Z",
     summary: str = "Primary Postgres pool was saturated causing 504 Gateway Timeouts.",
     permalink: str = "https://app.incident.io/incidents/inc_01",
+    role_assignments: List[Dict[str, Any]] | None = None,
 ) -> Dict[str, Any]:
     return {
         "id": incident_id,
@@ -54,7 +55,7 @@ def _incident(
         "resolved_at": resolved_at,
         "summary": summary,
         "permalink": permalink,
-        "incident_role_assignments": [],
+        "incident_role_assignments": role_assignments or [],
     }
 
 
@@ -151,6 +152,99 @@ def test_render_markdown_empty_updates_and_actions_omits_sections():
     assert "## Remediation Actions" not in md
 
 
+# --- Extended Rendering Tests ---
+
+def test_render_markdown_role_assignments_section():
+    roles = [
+        {"role": {"name": "Incident Lead"}, "assignee": {"name": "Alice"}},
+        {"role": {"name": "Communications"}, "assignee": {"name": "Bob"}},
+    ]
+    inc = _incident(role_assignments=roles)
+    md = _render_markdown(inc, [], [])
+    assert "## Role Assignments" in md
+    assert "- Incident Lead: Alice" in md
+    assert "- Communications: Bob" in md
+
+
+def test_render_markdown_no_role_assignments_omits_section():
+    inc = _incident(role_assignments=[])
+    md = _render_markdown(inc, [], [])
+    assert "## Role Assignments" not in md
+
+
+def test_render_markdown_severity_string_fallback():
+    inc = _incident()
+    inc["severity"] = "Critical"
+    md = _render_markdown(inc, [], [])
+    assert "- **Severity:** Critical" in md
+
+
+def test_render_markdown_status_string_fallback():
+    inc = _incident()
+    inc["incident_status"] = "resolved"
+    md = _render_markdown(inc, [], [])
+    assert "- **Status:** Resolved" in md
+
+
+def test_render_markdown_status_identified():
+    inc = _incident(status_name="identified")
+    md = _render_markdown(inc, [], [])
+    assert "- **Status:** Cause Identified" in md
+
+
+def test_render_markdown_status_monitoring():
+    inc = _incident(status_name="monitoring")
+    md = _render_markdown(inc, [], [])
+    assert "- **Status:** Monitoring (fix applied)" in md
+
+
+def test_render_markdown_status_triage():
+    inc = _incident(status_name="triage")
+    md = _render_markdown(inc, [], [])
+    assert "- **Status:** Triage (investigating cause)" in md
+
+
+def test_render_markdown_status_declined():
+    inc = _incident(status_name="declined")
+    md = _render_markdown(inc, [], [])
+    assert "- **Status:** Declined" in md
+
+
+def test_render_markdown_action_completed_before_outstanding():
+    actions = [
+        _action("Task A - outstanding", status="outstanding"),
+        _action("Task B - completed", status="completed"),
+    ]
+    md = _render_markdown(_incident(), [], actions)
+    assert md.index("- [x] Task B - completed") < md.index("- [ ] Task A - outstanding")
+
+
+def test_render_markdown_creator_email_fallback():
+    inc = _incident()
+    inc["creator"] = {"user": {"email": "lead@ops.com"}}
+    md = _render_markdown(inc, [], [])
+    assert "- **Lead Responder:** lead@ops.com" in md
+
+
+def test_render_markdown_no_creator_defaults_unassigned():
+    inc = _incident()
+    inc["creator"] = None
+    md = _render_markdown(inc, [], [])
+    assert "- **Lead Responder:** Unassigned" in md
+
+
+def test_render_markdown_unknown_summary():
+    inc = _incident(summary=None)
+    md = _render_markdown(inc, [], [])
+    assert "No summary provided." in md
+
+
+def test_render_markdown_no_permalink_omits_link():
+    inc = _incident(permalink="")
+    md = _render_markdown(inc, [], [])
+    assert "- **Link:**" not in md
+
+
 # ---------------------------------------------------------------------------
 # _action_assignee
 # ---------------------------------------------------------------------------
@@ -204,13 +298,53 @@ def test_incident_to_row_no_sub_resources():
     assert row["id"] == "inc_01"
 
 
+def test_incident_to_row_ingest_updates_false_only():
+    client = _mock_client([_incident()], updates=[], actions=[])
+    row = _incident_to_row(client, _incident(), ingest_updates=False, ingest_actions=True)
+
+    client.get_incident_updates.assert_not_called()
+    client.get_incident_actions.assert_called_once_with("inc_01")
+    assert row["id"] == "inc_01"
+
+
+# ---------------------------------------------------------------------------
+# IncidentIOClient helpers
+# ---------------------------------------------------------------------------
+
+
+def test_build_url_no_params():
+    url = IncidentIOClient._build_url("/incidents", None)
+    assert url == "https://api.incident.io/v2/incidents"
+
+
+def test_build_url_with_scalar_params():
+    url = IncidentIOClient._build_url("/incidents", {"page_size": 50})
+    assert "https://api.incident.io/v2/incidents?page_size=50" == url
+
+
+def test_build_url_with_list_param():
+    url = IncidentIOClient._build_url("/incidents", {"status[]": ["investigating", "resolved"]})
+    assert "status%5B%5D=investigating" in url
+    assert "status%5B%5D=resolved" in url
+
+
+def test_retry_delay_with_header():
+    assert IncidentIOClient._retry_delay({"Retry-After": "4.5"}, 1) == 4.5
+    assert IncidentIOClient._retry_delay({"retry-after": "10"}, 2) == 10.0
+
+
+def test_retry_delay_no_header_exponential():
+    assert IncidentIOClient._retry_delay({}, 0) == 1.0
+    assert IncidentIOClient._retry_delay({}, 1) == 2.0
+    assert IncidentIOClient._retry_delay({}, 3) == 8.0
+
+
 # ---------------------------------------------------------------------------
 # incident_io_source factory
 # ---------------------------------------------------------------------------
 
 
 def test_incident_io_source_requires_api_key():
-    import os
     old = os.environ.pop("INCIDENT_IO_API_KEY", None)
     try:
         with pytest.raises(ValueError, match="INCIDENT_IO_API_KEY"):
@@ -218,6 +352,20 @@ def test_incident_io_source_requires_api_key():
     finally:
         if old is not None:
             os.environ["INCIDENT_IO_API_KEY"] = old
+
+
+def test_incident_io_source_env_key_used():
+    old = os.environ.get("INCIDENT_IO_API_KEY")
+    os.environ["INCIDENT_IO_API_KEY"] = "test_env_key"
+    try:
+        client = _mock_client([_incident()])
+        source = incident_io_source(client=client)
+        assert getattr(source, "cognee_document_source", None) == INCIDENT_IO_SOURCE_NAME
+    finally:
+        if old is not None:
+            os.environ["INCIDENT_IO_API_KEY"] = old
+        else:
+            os.environ.pop("INCIDENT_IO_API_KEY", None)
 
 
 def test_incident_io_source_document_source_attribute():
@@ -231,11 +379,15 @@ def test_incident_io_source_yields_row_per_incident():
     client = _mock_client(incidents)
     source = incident_io_source(api_key="dummy", client=client)
 
-    # Collect rows from the dlt resource
-    rows = list(source.resources[INCIDENT_IO_SOURCE_NAME.replace("_", "-") if "-" in "incident_io_incidents" else "incident_io_incidents"]())
-    # dlt resource name comes from the @dlt.resource name parameter
     resource_name = "incident_io_incidents"
     rows = list(source.resources[resource_name]())
     assert len(rows) == 2
     assert rows[0]["id"] == "inc_01"
     assert rows[1]["id"] == "inc_02"
+
+
+def test_incident_io_source_status_filter_passed():
+    client = _mock_client([_incident()])
+    source = incident_io_source(api_key="dummy", status=["investigating"], client=client)
+    list(source.resources["incident_io_incidents"]())
+    client.iter_incidents.assert_called_once_with(status=["investigating"])
