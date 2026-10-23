@@ -95,6 +95,26 @@ async def mocked_llm(clean_environment, monkeypatch):
     return graph_extractions
 
 
+@pytest.fixture(autouse=True)
+def no_real_docusign_credentials(monkeypatch):
+    """Tests talk to the fake only: never pick up DOCUSIGN_* from a developer's .env.
+
+    cognee loads the repo ``.env`` on import, so a real integration key there
+    would otherwise leak into every ``docusign_source()`` built from env fallbacks.
+    """
+    for name in (
+        "DOCUSIGN_INTEGRATION_KEY",
+        "DOCUSIGN_USER_ID",
+        "DOCUSIGN_PRIVATE_KEY",
+        "DOCUSIGN_PRIVATE_KEY_PATH",
+        "DOCUSIGN_ACCESS_TOKEN",
+        "DOCUSIGN_ACCOUNT_ID",
+        "DOCUSIGN_BASE_URI",
+        "DOCUSIGN_ENVIRONMENT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
 @pytest.fixture(scope="session")
 def rsa_keys() -> tuple[str, str]:
     """A throwaway RSA key pair: (private PEM, public PEM)."""
