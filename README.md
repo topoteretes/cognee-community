@@ -107,6 +107,13 @@ poetry run python ./examples/example.py
 | `cognee-community-hybrid-adapter-duckdb`     | Hybrid   | DuckDB hybrid database adapter for cognee          |
 | `cognee-community-hybrid-adapter-falkor`     | Hybrid   | FalkorDB hybrid database adapter for cognee        |
 
+## Data-source Connectors
+
+The [GitLab connector](packages/connector/gitlab/) imports issues, merge requests,
+comments, and wiki pages from gitlab.com or a self-managed instance, with
+personal-access-token authentication, incremental sync, and downstream cleanup
+when items are deleted upstream. See its README for setup and examples.
+
 ## Custom Packages
 
 Custom packages are also a part of this repo, containing, for example, custom pipelines, tasks, and retrievers.
