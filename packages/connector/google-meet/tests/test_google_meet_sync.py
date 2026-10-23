@@ -12,9 +12,11 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from fake_meet import FakeDrive, FakeMeet, HttpError, install_google_errors
 
+from cognee_community_connector_google_meet import google_meet as meet_module
 from cognee_community_connector_google_meet.google_meet import (
     GoogleMeetError,
     MeetServices,
+    _Calls,
     _iter_rows,
     _list_all,
     _MeetConfig,
@@ -32,6 +34,14 @@ def at(minutes: int, seconds: int = 0) -> datetime:
 @pytest.fixture(autouse=True)
 def _google_errors(monkeypatch):
     install_google_errors(monkeypatch)
+
+
+@pytest.fixture(autouse=True)
+def waits(monkeypatch):
+    """Retry waits, recorded instead of slept."""
+    slept: list[float] = []
+    monkeypatch.setattr(meet_module, "_sleep", slept.append)
+    return slept
 
 
 @pytest.fixture
@@ -475,7 +485,8 @@ def test_a_drive_error_with_nothing_else_finished_raises_and_changes_nothing(mee
     sync(meet, drive, state)
     before = snapshot(state)
 
-    drive.fail_next.append(status)
+    # Every attempt fails, so the retries cannot save it.
+    drive.fail_next.extend([status] * 4)
     with pytest.raises(GoogleMeetError, match=f"HTTP {status}"):
         sync(meet, drive, state)
 
@@ -561,7 +572,8 @@ def test_a_failing_conference_list_raises_and_is_counted(meet, drive, status, ke
     before = snapshot(state)
     stats: dict = {}
 
-    meet.fail_next.append(status)
+    # Every attempt fails, so the retries cannot save it.
+    meet.fail_next.extend([status] * 4)
     with pytest.raises(GoogleMeetError, match=f"HTTP {status}"):
         list(_iter_rows(MeetServices(meet, drive), _MeetConfig(), state, stats, now=NOW))
 
@@ -832,6 +844,100 @@ def test_no_ids_or_names_reach_logs_or_error_text(meet, drive, caplog):
     assert chain is not None and other not in str(chain) and "doc-secret-plan" not in str(chain)
 
 
+# ---------------------------------------------------------------------------
+# Retries: the connector's own, with one wait budget per run
+# ---------------------------------------------------------------------------
+class _Failing:
+    """A request that fails with ``errors`` in turn, then answers ``{}``.
+
+    An error is a status, or a status and the reason Google gave.
+    """
+
+    def __init__(self, *errors):
+        self.errors = list(errors)
+        self.retries_asked: list[int] = []
+
+    def execute(self, num_retries=0):
+        self.retries_asked.append(num_retries)
+        if self.errors:
+            error = self.errors.pop(0)
+            status, reason = error if isinstance(error, tuple) else (error, None)
+            raise HttpError(status, "https://meet.googleapis.com/v2/secret-id", reason)
+        return {}
+
+
+def test_a_passing_5xx_is_retried_and_the_sync_goes_on(meet, drive, waits):
+    meeting(meet)
+    meet.fail_next.append(503)
+
+    upserts, _, stats = sync(meet, drive, {})
+
+    assert len(upserts) == 1
+    assert waits == [1]
+    assert stats["failed"] == 0
+
+
+def test_a_5xx_that_never_ends_fails_after_three_retries(waits):
+    request = _Failing(500, 500, 500, 500)
+
+    with pytest.raises(GoogleMeetError, match="HTTP 500"):
+        _Calls(None).execute(request)
+
+    assert sum(waits) == 1 + 2 + 4
+    assert request.retries_asked == [0] * 4, "googleapiclient never retries on its own"
+
+
+@pytest.mark.parametrize("status", [400, 403, 404])
+def test_an_error_that_will_not_pass_is_not_retried(waits, status):
+    with pytest.raises(GoogleMeetError, match=f"HTTP {status}"):
+        _Calls(None).execute(_Failing(status))
+
+    assert waits == []
+
+
+def test_a_quota_403_is_retried(waits):
+    request = _Failing((403, "rateLimitExceeded"))
+
+    assert _Calls(None).execute(request) == {}
+    assert waits == [1]
+
+
+def test_a_dropped_connection_is_retried(waits):
+    class _Dropped:
+        def __init__(self):
+            self.attempts = 0
+
+        def execute(self, num_retries=0):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise ConnectionResetError("reset by peer")
+            return {}
+
+    assert _Calls(None).execute(_Dropped()) == {}
+    assert waits == [1]
+
+
+def test_every_wait_of_a_run_comes_out_of_one_budget(waits):
+    calls = _Calls(None)
+    calls.wait_left = 3
+
+    with pytest.raises(GoogleMeetError, match="HTTP 503"):
+        calls.execute(_Failing(503, 503, 503, 503))
+
+    assert sum(waits) == 1 + 2, "the 4 s wait did not fit in what was left"
+
+
+def test_a_wait_is_slept_in_steps_and_cancelled_by_check_active(waits):
+    def check_active():
+        if len(waits) == 2:
+            raise PermissionError("revoked")
+
+    with pytest.raises(PermissionError):
+        _Calls(check_active).execute(_Failing(429, 429, 429, 429))
+
+    assert waits == [1, 1], "stopped 1 s into the 2 s wait"
+
+
 def test_a_repeated_page_token_raises_instead_of_looping():
     calls: list = []
 
@@ -841,7 +947,7 @@ def test_a_repeated_page_token_raises_instead_of_looping():
             return {"conferenceRecords": [{"name": "conferenceRecords/x"}], "nextPageToken": "same"}
 
     with pytest.raises(GoogleMeetError, match="same page token"):
-        _list_all(lambda **_params: _Stuck(), "conferenceRecords", None)
+        _list_all(lambda **_params: _Stuck(), "conferenceRecords", _Calls(None))
 
     assert len(calls) == 2
 

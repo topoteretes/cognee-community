@@ -28,6 +28,7 @@ failure counts in ``cognee_sync_stats`` and the limitations.
 import json
 import os
 import re
+import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -64,8 +65,17 @@ DEFAULT_TOKEN_PATH = "~/.cognee_google_meet_token.json"
 RECORD_PAGE_SIZE = 100
 PARTICIPANT_PAGE_SIZE = 250
 ARTIFACT_PAGE_SIZE = 100
-# googleapiclient retries 429 and 5xx with exponential backoff this many times.
-NUM_RETRIES = 5
+# 429, 5xx, a quota 403 and a dropped connection are retried here, not by
+# googleapiclient, whose own retries sleep up to a minute per request without
+# asking check_active while cognee holds its dlt staging lock.  Three retries
+# after 1, 2 and 4 seconds ride out a passing burst, and every wait of a run
+# shares a budget of two minutes; past either the request fails and the next
+# run picks it up.
+MAX_RETRIES = 3
+WAIT_BUDGET_SECONDS = 120
+# check_active is asked between steps of a wait, so a long wait can be
+# cancelled within a second.
+WAIT_STEP_SECONDS = 1
 # Later runs list from this long before the newest finished conference.
 OVERLAP = timedelta(hours=1)
 # Meet deletes a conference record this long after it ends.
@@ -122,7 +132,7 @@ def _scopes(uses_drive: bool) -> list[str]:
 # ---------------------------------------------------------------------------
 # Auth / service construction
 # ---------------------------------------------------------------------------
-def _google_libraries():
+def _google_libraries() -> tuple[Any, Any, Any, Any]:
     try:
         from google.auth.transport.requests import Request
         from google.oauth2.credentials import Credentials
@@ -136,7 +146,7 @@ def _google_libraries():
     return Request, Credentials, InstalledAppFlow, build
 
 
-def _services(build, credentials, uses_drive: bool) -> MeetServices:
+def _services(build: Callable[..., Any], credentials: Any, uses_drive: bool) -> MeetServices:
     meet = build("meet", "v2", credentials=credentials, cache_discovery=False)
     drive = (
         build("drive", "v3", credentials=credentials, cache_discovery=False) if uses_drive else None
@@ -237,6 +247,10 @@ def _close(services: MeetServices) -> None:
 # ---------------------------------------------------------------------------
 # Google API calls
 # ---------------------------------------------------------------------------
+# Patched in tests so retry waits take no time.
+_sleep = time.sleep
+
+
 class GoogleMeetError(RuntimeError):
     """A Google Meet or Drive request failed.
 
@@ -250,7 +264,7 @@ class GoogleMeetError(RuntimeError):
         status: int | None = None,
         rate_limited: bool = False,
         network: bool = False,
-    ):
+    ) -> None:
         super().__init__(message)
         self.status = status
         # Set where the HttpError is still in hand: its text must not be kept, so the
@@ -272,30 +286,60 @@ def _google_errors() -> tuple[Any, Any, tuple[type[BaseException], ...]]:
     return HttpError, RefreshError, (OSError, HttpLib2Error, TransportError)
 
 
-def _execute(request: Any, check_active: Callable[[], None] | None) -> Any:
-    """Run one API request after the host's authorization checkpoint.
+class _Calls:
+    """One run's Google requests: the host checkpoint and the retry wait budget."""
 
-    The checkpoint sits before the call and outside the ``try``, so a revoked
-    connection stops the sync between API calls and is never turned into a
-    conference failure.  Google's HTTP errors become ``GoogleMeetError``: their
-    own text contains the request URL, and with it the conference or Doc id.
-    """
-    if check_active is not None:
-        check_active()
-    http_error, refresh_error, transport_errors = _google_errors()
-    try:
-        return request.execute(num_retries=NUM_RETRIES)
-    except http_error as error:
-        status = error.resp.status
-        raise GoogleMeetError(
-            f"Google request failed: HTTP {status}", status, _is_rate_limited(error)
-        ) from None
-    except refresh_error:
-        # The refresh token was revoked or expired: every later call fails too.
-        raise GoogleMeetError("Google sign-in was rejected", 401) from None
-    except transport_errors:
-        # googleapiclient already retried; the connection itself is down.
-        raise GoogleMeetError("Google request failed: network error", network=True) from None
+    def __init__(self, check_active: Callable[[], None] | None) -> None:
+        self.check_active = check_active
+        self.wait_left: float = WAIT_BUDGET_SECONDS
+
+    def execute(self, request: Any) -> Any:
+        """Run one API request after the host's authorization checkpoint.
+
+        The checkpoint sits before the call and outside the ``try``, so a
+        revoked connection stops the sync between API calls and is never
+        turned into a conference failure.  Google's HTTP errors become
+        ``GoogleMeetError``: their own text contains the request URL, and with
+        it the conference or Doc id.
+        """
+        http_error, refresh_error, transport_errors = _google_errors()
+        for attempt in range(MAX_RETRIES + 1):
+            self._check()
+            try:
+                return request.execute(num_retries=0)
+            except http_error as error:
+                status = error.resp.status
+                rate_limited = _is_rate_limited(error)
+                failure = GoogleMeetError(
+                    f"Google request failed: HTTP {status}", status, rate_limited
+                )
+                retryable = rate_limited or status >= 500
+            except refresh_error:
+                # The refresh token was revoked or expired: every later call fails too.
+                raise GoogleMeetError("Google sign-in was rejected", 401) from None
+            except transport_errors:
+                failure = GoogleMeetError("Google request failed: network error", network=True)
+                retryable = True
+            # 1, 2, then 4 seconds.
+            wait = 2**attempt
+            if not retryable or attempt == MAX_RETRIES or wait > self.wait_left:
+                raise failure
+            self._wait(wait)
+        raise AssertionError("unreachable: the last attempt returns or raises")
+
+    def _check(self) -> None:
+        if self.check_active is not None:
+            self.check_active()
+
+    def _wait(self, seconds: float) -> None:
+        """Sleep out of the run's budget, asking ``check_active`` between steps."""
+        self.wait_left -= seconds
+        while seconds > 0:
+            step = min(seconds, WAIT_STEP_SECONDS)
+            _sleep(step)
+            seconds -= step
+            if seconds > 0:
+                self._check()
 
 
 def _is_rate_limited(error: Any) -> bool:
@@ -317,9 +361,7 @@ def _is_rate_limited(error: Any) -> bool:
     return any(reason in str(error) for reason in _RATE_LIMIT_REASONS)
 
 
-def _list_all(
-    list_call: Any, key: str, check_active: Callable[[], None] | None, **params: Any
-) -> list[dict]:
+def _list_all(list_call: Any, key: str, calls: _Calls, **params: Any) -> list[dict]:
     """Every item of a paged list call.
 
     Meet leaves the list key out when there is nothing to return, so an empty
@@ -329,7 +371,7 @@ def _list_all(
     page_token = None
     seen: set[str] = set()
     while True:
-        response = _execute(list_call(pageToken=page_token, **params), check_active)
+        response = calls.execute(list_call(pageToken=page_token, **params))
         items.extend(response.get(key, []))
         page_token = response.get("nextPageToken")
         if not page_token:
@@ -339,35 +381,35 @@ def _list_all(
         seen.add(page_token)
 
 
-def _get_record(meet: Any, conference_id: str, check_active) -> dict | None:
+def _get_record(meet: Any, conference_id: str, calls: _Calls) -> dict | None:
     """One conference record, or None once Meet has expired it."""
     request = meet.conferenceRecords().get(name=f"conferenceRecords/{conference_id}")
     try:
-        return _execute(request, check_active)
+        return calls.execute(request)
     except GoogleMeetError as error:
         if error.status != 404:
             raise
         return None
 
 
-def _get_space(meet: Any, space_name: str, check_active) -> dict:
+def _get_space(meet: Any, space_name: str, calls: _Calls) -> dict:
     """The conference's meeting space, or ``{}`` when it is gone or not shared with us.
 
     The space only adds the meeting link and code, so losing it must not keep
     the attendance and transcript out of memory.
     """
     try:
-        return _execute(meet.spaces().get(name=space_name), check_active)
+        return calls.execute(meet.spaces().get(name=space_name))
     except GoogleMeetError as error:
         if error.status not in (403, 404) or error.rate_limited:
             raise
         return {}
 
 
-def _doc_exists(drive: Any, doc_id: str, check_active) -> bool:
+def _doc_exists(drive: Any, doc_id: str, calls: _Calls) -> bool:
     """False when the transcript Doc is trashed or gone. Other errors raise."""
     try:
-        file = _execute(drive.files().get(fileId=doc_id, fields="id,trashed"), check_active)
+        file = calls.execute(drive.files().get(fileId=doc_id, fields="id,trashed"))
     except GoogleMeetError as error:
         if error.status != 404:
             raise
@@ -391,7 +433,7 @@ class _Conference:
 class _Failures:
     """Counts failed units of work, and stops the run when the rest would fail too."""
 
-    def __init__(self, stats: dict[str, int]):
+    def __init__(self, stats: dict[str, int]) -> None:
         self.stats = stats
         self.last: GoogleMeetError | None = None
         self.stopped = False
@@ -424,7 +466,7 @@ def _failure_reason(error: GoogleMeetError) -> str | None:
 def _iter_rows(
     services: MeetServices,
     config: _MeetConfig,
-    state: dict,
+    state: dict[str, Any],
     stats: dict[str, int],
     check_active: Callable[[], None] | None = None,
     now: datetime | None = None,
@@ -446,6 +488,7 @@ def _iter_rows(
     stats.update({f"failed_{reason}": 0 for reason in _FAILURE_REASONS})
     now = now or datetime.now(UTC)
     meet = services.meet
+    calls = _Calls(check_active)
 
     since = state.get("since")
     newest = _parse_time(since) if since else None
@@ -459,7 +502,7 @@ def _iter_rows(
     finished = 0
 
     try:
-        listed = _list_records(meet, since, check_active)
+        listed = _list_records(meet, since, calls)
     except GoogleMeetError as error:
         failures.record(error, "conference_list")
         raise
@@ -478,7 +521,7 @@ def _iter_rows(
             if not doc_id:
                 continue
             try:
-                exists = _doc_exists(services.drive, doc_id, check_active)
+                exists = _doc_exists(services.drive, doc_id, calls)
             except GoogleMeetError as error:
                 failures.record(error, "transcript_check")  # errors never delete
                 continue
@@ -496,7 +539,7 @@ def _iter_rows(
         if conference_id in records:
             continue
         try:
-            record = _get_record(meet, conference_id, check_active)
+            record = _get_record(meet, conference_id, calls)
         except GoogleMeetError as error:
             failures.record(error, "conference")
             continue
@@ -522,7 +565,7 @@ def _iter_rows(
             finished += 1
             continue
         try:
-            result = _sync_conference(services, config, record, spaces, known, check_active, now)
+            result = _sync_conference(services, config, record, spaces, known, calls, now)
         except GoogleMeetError as error:
             failures.record(error, "conference")
             pending[conference_id] = expire_time
@@ -557,14 +600,14 @@ def _iter_rows(
     logger.info("Google Meet: sync stats %s", stats)
 
 
-def _list_records(meet: Any, since: str | None, check_active) -> list[dict]:
+def _list_records(meet: Any, since: str | None, calls: _Calls) -> list[dict]:
     """Conferences that started since the cursor, minus the overlap."""
     params: dict[str, Any] = {"pageSize": RECORD_PAGE_SIZE}
     if since:
         # The overlap catches a conference that started just before the newest
         # finished one but was still running last time; `done` stops repeats.
         params["filter"] = f'start_time>="{_stamp(_parse_time(since) - OVERLAP)}"'
-    return _list_all(meet.conferenceRecords().list, "conferenceRecords", check_active, **params)
+    return _list_all(meet.conferenceRecords().list, "conferenceRecords", calls, **params)
 
 
 def _sync_conference(
@@ -573,7 +616,7 @@ def _sync_conference(
     record: dict,
     spaces: dict[str, dict],
     known: dict[str, str],
-    check_active: Callable[[], None] | None,
+    calls: _Calls,
     now: datetime,
 ) -> _Conference:
     """The rows of one finished conference: itself plus its new transcripts."""
@@ -581,9 +624,9 @@ def _sync_conference(
     space_name = record.get("space", "")
     if space_name not in spaces:
         # A recurring meeting reuses its link, so many conferences share a space.
-        spaces[space_name] = _get_space(meet, space_name, check_active) if space_name else {}
+        spaces[space_name] = _get_space(meet, space_name, calls) if space_name else {}
     space = spaces[space_name]
-    participants = _participants(meet, record["name"], check_active)
+    participants = _participants(meet, record["name"], calls)
 
     transcript_rows: list[dict] = []
     new_transcripts: dict[str, str] = {}
@@ -593,7 +636,7 @@ def _sync_conference(
         for transcript in _list_all(
             meet.conferenceRecords().transcripts().list,
             "transcripts",
-            check_active,
+            calls,
             parent=record["name"],
             pageSize=ARTIFACT_PAGE_SIZE,
         ):
@@ -607,17 +650,13 @@ def _sync_conference(
                 has_transcript = True
                 continue
             doc_id = (transcript.get("docsDestination") or {}).get("document", "")
-            if (
-                doc_id
-                and config.uses_drive
-                and not _doc_exists(services.drive, doc_id, check_active)
-            ):
+            if doc_id and config.uses_drive and not _doc_exists(services.drive, doc_id, calls):
                 # Deleted before we ever stored it: keep it out of memory.
                 continue
             entries = _list_all(
                 meet.conferenceRecords().transcripts().entries().list,
                 "transcriptEntries",
-                check_active,
+                calls,
                 parent=transcript["name"],
                 pageSize=ARTIFACT_PAGE_SIZE,
             )
@@ -631,9 +670,8 @@ def _sync_conference(
     if gave_up:
         # Google never finished writing it: stop reading this conference every run.
         waiting = False
-    recordings = _execute(
-        meet.conferenceRecords().recordings().list(parent=record["name"], pageSize=1),
-        check_active,
+    recordings = calls.execute(
+        meet.conferenceRecords().recordings().list(parent=record["name"], pageSize=1)
     )
     if not config.include_transcripts:
         transcript_status = None
@@ -647,7 +685,7 @@ def _sync_conference(
     return _Conference([conference_row, *transcript_rows], new_transcripts, waiting, gave_up)
 
 
-def _participants(meet: Any, record_name: str, check_active) -> list[tuple[dict, list[dict]]]:
+def _participants(meet: Any, record_name: str, calls: _Calls) -> list[tuple[dict, list[dict]]]:
     """Each participant with their sessions, in a stable order.
 
     Meet returns both lists newest first and does not promise any order, and
@@ -657,14 +695,14 @@ def _participants(meet: Any, record_name: str, check_active) -> list[tuple[dict,
     for participant in _list_all(
         meet.conferenceRecords().participants().list,
         "participants",
-        check_active,
+        calls,
         parent=record_name,
         pageSize=PARTICIPANT_PAGE_SIZE,
     ):
         sessions = _list_all(
             meet.conferenceRecords().participants().participantSessions().list,
             "participantSessions",
-            check_active,
+            calls,
             parent=participant["name"],
             pageSize=PARTICIPANT_PAGE_SIZE,
         )
@@ -704,7 +742,13 @@ PARTICIPANT_KINDS = (
 )
 
 
-def _conference_row(record, space, participants, transcript_status, recorded) -> dict:
+def _conference_row(
+    record: dict,
+    space: dict,
+    participants: list[tuple[dict, list[dict]]],
+    transcript_status: str | None,
+    recorded: bool,
+) -> dict:
     lines = ["Google Meet conference"]
     lines.extend(_link_lines(space))
     lines.append(f"Started: {_stamp(_parse_time(record['startTime']))}")
@@ -728,7 +772,13 @@ def _conference_row(record, space, participants, transcript_status, recorded) ->
     }
 
 
-def _transcript_row(record, space, transcript, entries, participants) -> dict:
+def _transcript_row(
+    record: dict,
+    space: dict,
+    transcript: dict,
+    entries: list[dict],
+    participants: list[tuple[dict, list[dict]]],
+) -> dict:
     speakers = {p["name"]: _participant_name(p)[0] for p, _sessions in participants}
     # Meet lists entries oldest first; sorting keeps that even if a page comes back shuffled.
     entries = sorted(entries, key=lambda e: (_sort_time(e.get("startTime")), e.get("name", "")))
@@ -829,7 +879,7 @@ def google_meet_source(
     access_token: str | None = None,
     settings: GoogleMeetSettings | None = None,
     services: MeetServices | None = None,
-):
+) -> Any:
     """Return a ``dlt`` resource yielding conference and transcript rows.
 
     Hand the result to ``cognee.remember(...)`` with ``write_disposition="merge"``
@@ -921,7 +971,7 @@ def google_meet_source(
         # deletion through cognee's orphan_cleanup.
         columns={"_deleted": {"data_type": "bool", "hard_delete": True}},
     )
-    def google_meet_rows():
+    def google_meet_rows() -> Iterator[dict]:
         # Built per run, so every run gets a fresh token and its own connections.
         run_services = make_services()
         try:

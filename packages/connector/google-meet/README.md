@@ -161,8 +161,14 @@ A transcript is its own document, one line per spoken entry:
   the other conferences finish and save their state. The run raises only when nothing
   finished, because dlt rolls back the state of a failed run. A 401, a 429 and a 403 with a
   rate-limit reason end the run, since every later call would fail the same way; so do a
-  revoked refresh token and a connection that is still down after googleapiclient's retries.
+  revoked refresh token and a connection that is still down after the retries below.
   Any other 403 only fails its own conference. A failing conference list always raises.
+- **Retries.** A 429, a 5xx, a 403 with a rate-limit reason and a dropped connection are
+  retried after 1, 2 and 4 seconds. All waits of a run share a budget of 2 minutes, and are
+  slept in 1 second steps with `check_active` asked between them, so a revoked connection
+  stops a wait within a second. googleapiclient's own retries are turned off, since they
+  sleep up to a minute per request without asking while cognee holds its dlt staging lock.
+  Past the retries or the budget the request fails as above, and the next run picks it up.
 - **The meeting space is optional.** It only adds the link and code, so a space that answers
   403 or 404 leaves them out and the conference still syncs.
 - **Connections are closed** after every run, unless you passed your own `services`.
@@ -238,7 +244,8 @@ manual check: lists come newest first, an empty list is `{}`, and every list cal
   rate limits (also a 403 with a rate-limit reason), a lost connection and a revoked refresh
   token that end the run but keep what finished, a space that cannot be read, a transcript
   given up on after a day, rows yielded per conference,
-  `check_active` before every request, a participant order that does not depend on Google's,
+  `check_active` before every request, retries with one wait budget per run that a revoked
+  connection can cancel, errors that will not pass never retried, a participant order that does not depend on Google's,
   no ids or names in logs or errors, no Drive calls when checks are off, turning
   transcripts off, failure counts present on every run, and a page token Google repeats
   stopping instead of looping.
