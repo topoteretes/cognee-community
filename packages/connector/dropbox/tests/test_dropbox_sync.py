@@ -11,7 +11,7 @@ import logging
 import pytest
 import requests
 from dropbox import files
-from dropbox.exceptions import AuthError, RateLimitError
+from dropbox.exceptions import AuthError, BadInputError, InternalServerError, RateLimitError
 from fake_dropbox import FakeDropbox, api_error, make_pdf
 
 from cognee_community_connector_dropbox import dropbox as dropbox_module
@@ -416,10 +416,11 @@ def test_short_rate_limit_waits_and_retries_the_same_request(fake, waits):
     upserts, _, stats = sync(fake, {}, check_active=lambda: checks.append(1))
 
     assert set(upserts) == {a}
-    assert waits == [2]
+    assert waits == [1, 1], "the 2 s wait is slept in 1 s steps"
     assert stats["failed_rate_limit"] == 0
-    # Asked before the listing, the first download and the retried download.
-    assert len(checks) == 3
+    # Asked before the listing, the first download, between the two steps of
+    # the wait and before the retried download.
+    assert len(checks) == 4
 
 
 def test_long_rate_limit_stops_cleanly_and_resumes_next_run(fake, waits):
@@ -434,6 +435,7 @@ def test_long_rate_limit_stops_cleanly_and_resumes_next_run(fake, waits):
     assert set(upserts) == {a}
     assert waits == []  # an hour is never slept through
     assert stats["failed_rate_limit"] == 2
+    assert stats["failed"] == 0, "a rate-limit stop is a pause, not a failure"
     assert list(state["retry"]) == [b, c]
 
     fake.downloads.clear()
@@ -455,6 +457,55 @@ def test_rate_limit_that_never_ends_gives_up_after_a_few_short_waits(fake, waits
     assert waits == [1, 1, 1]
     assert stats["failed_rate_limit"] == 1
     assert list(state["retry"]) == [a]
+
+
+def test_a_long_wait_is_cancelled_by_check_active_between_steps(fake, waits):
+    a = fake.put("/a.md", "alpha")
+    fake.download_errors_once[a] = RateLimitError("request-id", None, 30)
+
+    def check_active():
+        if len(waits) == 3:
+            raise PermissionError("revoked")
+
+    with pytest.raises(PermissionError):
+        sync(fake, {}, check_active=check_active)
+
+    assert sum(waits) == 3, "stopped 3 s into a 30 s wait"
+
+
+def test_a_5xx_is_retried_with_short_waits_from_the_budget(fake, waits):
+    a = fake.put("/a.md", "alpha")
+    fake.download_errors_once[a] = InternalServerError("request-id", 503, None)
+
+    upserts, _, stats = sync(fake, {})
+
+    assert set(upserts) == {a}
+    assert waits == [1]
+    assert fake.downloads == [a, a]
+    assert stats["failed"] == 0
+
+
+def test_a_5xx_that_never_ends_fails_the_file_after_three_retries(fake, waits):
+    a = fake.put("/a.md", "alpha")
+    fake.download_errors[a] = InternalServerError("request-id", 500, None)
+    state: dict = {}
+
+    upserts, _, stats = sync(fake, state)
+
+    assert upserts == {}
+    assert sum(waits) == 1 + 2 + 4
+    assert fake.downloads == [a] * 4
+    assert stats["failed"] == 1 and state["retry"] == {a: 1}
+
+
+def test_a_4xx_is_not_retried(fake, waits):
+    a = fake.put("/a.md", "alpha")
+    fake.download_errors[a] = BadInputError("request-id", "bad input")
+
+    sync(fake, {})
+
+    assert waits == []
+    assert fake.downloads == [a]
 
 
 def test_expired_token_mid_run_stops_keeps_progress_and_resumes(fake):
@@ -798,7 +849,15 @@ def test_os_errors_from_check_active_stop_the_run_and_are_not_counted(fake, erro
 
     stats: dict = {}
     with pytest.raises(error):
-        list(_iter_rows(fake, _DropboxConfig(("",), 25), {}, stats, check_active))
+        list(
+            _iter_rows(
+                fake,
+                _DropboxConfig(folder_paths=("",), max_file_size_mb=25),
+                {},
+                stats,
+                check_active,
+            )
+        )
 
     assert stats["failed"] == 0
     assert "download" not in fake.api_calls
@@ -838,7 +897,8 @@ def test_rate_limit_waits_share_one_budget_per_run(fake, waits):
 
     upserts, _, stats = sync(fake, state)
 
-    assert waits == [60, 60], "two minutes for the whole run, not per call"
+    assert sum(waits) == 120, "two minutes for the whole run, not per call"
+    assert max(waits) == 1, "slept in short steps, so check_active can stop it"
     assert set(upserts) == set(ids[:2])
     assert stats["failed_rate_limit"] == 18
     assert list(state["retry"]) == ids[2:]
@@ -981,7 +1041,7 @@ def test_a_bad_token_while_listing_raises_and_is_counted(fake):
     stats: dict = {}
 
     with pytest.raises(AuthError):
-        list(_iter_rows(fake, _DropboxConfig(("",), 25), {}, stats))
+        list(_iter_rows(fake, _DropboxConfig(folder_paths=("",), max_file_size_mb=25), {}, stats))
 
     assert stats["failed_auth"] == 1
 

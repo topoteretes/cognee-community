@@ -89,7 +89,7 @@ Run the same `remember` call again whenever you want to sync. See
 | `refresh_token` + `app_key` | – |
 | `app_secret` | unset, not needed for PKCE tokens |
 | `access_token` | short-lived, for quick tries only |
-| `max_file_size_mb` | 25 |
+| `max_file_size_mb` | 25. Must be above 0, since 0 would skip every file and forget what is stored |
 | `resource_name` | `dropbox_files`. Lowercase letters, digits and single underscores, up to 64, not ending in an underscore: a name dlt keeps as it is, since dlt would turn `work__dbx` into the table of `work_dbx`. **Two Dropbox accounts in one dataset need different names**, or they would share one table and one sync state |
 | `check_active` | optional host callback, asked before every Dropbox request |
 | `service` | a pre-built Dropbox client, mainly for tests (`client` still works) |
@@ -97,6 +97,8 @@ Run the same `remember` call again whenever you want to sync. See
 After a run, `source.cognee_sync_stats` holds counts only, never file names or content:
 `scanned`, `skipped` (plus `skipped_<reason>`), `failed`, `deleted`, and `failed_auth` /
 `failed_rate_limit` for files left for the next run because of a 401 or a rate limit.
+A rate-limit stop is a pause, not a failure, so it leaves `failed` alone; a 401 counts
+in both.
 
 ## How sync and forget-on-delete work
 
@@ -140,10 +142,13 @@ After a run, `source.cognee_sync_stats` holds counts only, never file names or c
 - **What is stored is tracked.** The state keeps the ids that are in cognee right now,
   apart from the index, which also holds skipped and failed files. Only those get a
   tombstone when they are skipped later, so `deleted` counts real deletes.
-- **Rate limits.** A 429 is waited out up to 60 seconds, at most 3 times per request,
-  with `check_active` asked again before each retry, and all waits of a run share a
-  budget of 2 minutes. A longer wait is never slept through, since cognee holds its dlt
-  staging lock during a sync. During downloads the run stops, keeps what it stored, and
+- **Rate limits and 5xx errors.** A 429 is waited out up to 60 seconds, and a 5xx after
+  1, 2 and 4 seconds, at most 3 times per request. All waits of a run share a budget of
+  2 minutes, and are slept in 1 second steps with `check_active` asked between them, so
+  a revoked connection stops a wait within a second. The SDK's own retries are turned
+  off, since they sleep without asking. A longer wait is never slept through, since
+  cognee holds its dlt staging lock during a sync. A 5xx that outlasts its retries fails
+  that file, which is retried next run as above. During downloads the run stops, keeps what it stored, and
   the remaining files are fetched next run without counting as one of their 3 attempts.
   During listing nothing has been emitted yet, so the run ends with `failed_rate_limit`
   and the state untouched, and the next run lists again from the same place.
@@ -198,7 +203,7 @@ through cursors.
   and out of synced folders), file and folder deletes, a path reused by a new file,
   cursor reset, a vanished folder, listing errors that must not delete, failed downloads
   retried by id and given up after 3 runs, short and long rate limits and one wait budget
-  per run, an expired token mid-run, a repeated cursor, a file written over an old path
+  per run, 5xx retries, a long wait cancelled by `check_active`, an expired token mid-run, a repeated cursor, a file written over an old path
   and a folder created on one, a stored file that is skipped now, UTF-16 and binary text,
   a change without a path, `check_active` raising an `OSError`, unsupported files,
   restricted files, PDF and Paper export, skip reasons, folder
@@ -206,7 +211,8 @@ through cursors.
   downloads) and never swallowed by the download error handling, and no file names, paths
   or ids in the logs.
 - `test_dropbox_source.py` covers `dropbox_source()` itself: credentials as arguments only,
-  refusing an empty folder list and an unsafe `resource_name`, folder normalization and
+  refusing an empty folder list, an unsafe `resource_name` and a `max_file_size_mb` of 0
+  or less, the SDK's own retries turned off, folder normalization and
   the document-mode and pipeline-scope markers.
 - `test_dropbox_forget.py` runs the real cognee pipeline (LLM and embeddings mocked,
   working with both cognee model variants, including the one used with Gemini) and checks

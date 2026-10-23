@@ -98,6 +98,14 @@ def test_refresh_token_goes_to_the_sdk_as_a_refresh_token(monkeypatch):
     assert "oauth2_access_token" not in built[0]
     assert built[1]["oauth2_access_token"] == "access"
     assert all(kwargs["max_retries_on_rate_limit"] == 0 for kwargs in built)
+    # The SDK's own 5xx retries sleep without asking check_active.
+    assert all(kwargs["max_retries_on_error"] == 0 for kwargs in built)
+
+
+@pytest.mark.parametrize("size", [0, -1, True, float("nan"), "25"])
+def test_a_file_size_limit_that_would_skip_everything_is_refused(size):
+    with pytest.raises(ValueError, match="max_file_size_mb"):
+        dropbox_source(max_file_size_mb=size, service=FakeDropbox())
 
 
 def test_names_dlt_keeps_as_they_are_are_accepted():
