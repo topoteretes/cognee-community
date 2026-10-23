@@ -3,7 +3,7 @@
 Two layers, all runnable in CI without a live Better Stack token:
 
 * **Rendering tests** — verify that ``_render_markdown`` produces the correct
-  Markdown output from synthetic data.  Zero I/O, no dlt required.
+  Markdown output from synthetic data. Zero I/O, no dlt required.
 
 * **Integration tests** — verify the ``better_stack_source`` factory:
   the dlt source is constructed correctly, ``cognee_document_source`` is set,
@@ -13,7 +13,7 @@ Two layers, all runnable in CI without a live Better Stack token:
 
 from typing import Any, Dict, List
 from unittest.mock import MagicMock
-
+import os
 import pytest
 
 from cognee_community_connector_better_stack.better_stack import (
@@ -98,14 +98,16 @@ def test_render_markdown_basic_fields():
 
 
 def test_render_markdown_ongoing_incident():
-    attrs = _incident(resolved_at=None, status="down")["attributes"]
+    attrs = dict(_incident()["attributes"])
     attrs["resolved_at"] = None
+    attrs["status"] = "down"
     md = _render_markdown(attrs, [])
     assert "- **Resolved At:** Ongoing" in md
 
 
 def test_render_markdown_unknown_status_passthrough():
-    attrs = _incident(status="custom_check_failed")["attributes"]
+    attrs = dict(_incident()["attributes"])
+    attrs["status"] = "custom_check_failed"
     md = _render_markdown(attrs, [])
     assert "custom_check_failed" in md
 
@@ -145,6 +147,57 @@ def test_render_markdown_no_affected_url():
     assert "Affected URL" not in md
 
 
+# --- Extended Rendering Tests ---
+
+def test_render_markdown_status_up():
+    attrs = dict(_incident()["attributes"])
+    attrs["status"] = "up"
+    md = _render_markdown(attrs, [])
+    assert "- **Status:** Up (operational)" in md
+
+
+def test_render_markdown_status_paused():
+    attrs = dict(_incident()["attributes"])
+    attrs["status"] = "paused"
+    md = _render_markdown(attrs, [])
+    assert "- **Status:** Paused" in md
+
+
+def test_render_markdown_status_pending():
+    attrs = dict(_incident()["attributes"])
+    attrs["status"] = "pending"
+    md = _render_markdown(attrs, [])
+    assert "- **Status:** Pending first check" in md
+
+
+def test_render_markdown_status_maintenance():
+    attrs = dict(_incident()["attributes"])
+    attrs["status"] = "maintenance"
+    md = _render_markdown(attrs, [])
+    assert "- **Status:** Under Maintenance" in md
+
+
+def test_render_markdown_timeline_no_comment():
+    event = _timeline_event("2026-10-12T08:00:00Z", "acknowledged", "")
+    md = _render_markdown(_incident()["attributes"], [event])
+    assert "- **[2026-10-12T08:00:00Z]** Acknowledged\n" in md or "- **[2026-10-12T08:00:00Z]** Acknowledged" in md
+    assert " — " not in md
+
+
+def test_render_markdown_no_cause_shows_default():
+    attrs = dict(_incident()["attributes"])
+    attrs["cause"] = None
+    md = _render_markdown(attrs, [])
+    assert "Root cause not specified." in md
+
+
+def test_render_markdown_name_missing_uses_fallback():
+    attrs = dict(_incident()["attributes"])
+    attrs["name"] = None
+    md = _render_markdown(attrs, [])
+    assert "# Better Stack Incident: Outage" in md
+
+
 # ---------------------------------------------------------------------------
 # _incident_to_row
 # ---------------------------------------------------------------------------
@@ -181,13 +234,43 @@ def test_incident_to_row_missing_url_uses_fallback():
     assert row["url"] == "https://uptime.betterstack.com/incidents/123456"
 
 
+def test_incident_to_row_missing_name_uses_id():
+    inc = _incident()
+    inc["attributes"]["name"] = ""
+    client = _mock_client([inc])
+    row = _incident_to_row(client, inc)
+    assert row["title"] == "Better Stack Outage: Incident 123456"
+
+
+def test_incident_to_row_content_not_empty():
+    client = _mock_client([_incident()])
+    row = _incident_to_row(client, _incident())
+    assert isinstance(row["content"], str)
+    assert len(row["content"]) > 50
+
+
+# ---------------------------------------------------------------------------
+# BetterStackClient helpers
+# ---------------------------------------------------------------------------
+
+
+def test_retry_delay_header_takes_precedence():
+    assert BetterStackClient._retry_delay({"Retry-After": "5.0"}, 1) == 5.0
+    assert BetterStackClient._retry_delay({"retry-after": "12"}, 2) == 12.0
+
+
+def test_retry_delay_fallback_exponential():
+    assert BetterStackClient._retry_delay({}, 0) == 1.0
+    assert BetterStackClient._retry_delay({}, 2) == 4.0
+    assert BetterStackClient._retry_delay({}, 4) == 16.0
+
+
 # ---------------------------------------------------------------------------
 # better_stack_source factory
 # ---------------------------------------------------------------------------
 
 
 def test_better_stack_source_requires_token():
-    import os
     old = os.environ.pop("BETTER_STACK_API_TOKEN", None)
     try:
         with pytest.raises(ValueError, match="BETTER_STACK_API_TOKEN"):
@@ -195,6 +278,20 @@ def test_better_stack_source_requires_token():
     finally:
         if old is not None:
             os.environ["BETTER_STACK_API_TOKEN"] = old
+
+
+def test_better_stack_source_env_token_used():
+    old = os.environ.get("BETTER_STACK_API_TOKEN")
+    os.environ["BETTER_STACK_API_TOKEN"] = "test_env_token"
+    try:
+        client = _mock_client([_incident()])
+        source = better_stack_source(client=client)
+        assert getattr(source, "cognee_document_source", None) == BETTER_STACK_SOURCE_NAME
+    finally:
+        if old is not None:
+            os.environ["BETTER_STACK_API_TOKEN"] = old
+        else:
+            os.environ.pop("BETTER_STACK_API_TOKEN", None)
 
 
 def test_better_stack_source_document_source_attribute():
@@ -212,3 +309,12 @@ def test_better_stack_source_yields_row_per_incident():
     assert len(rows) == 2
     assert rows[0]["id"] == "1"
     assert rows[1]["id"] == "2"
+
+
+def test_better_stack_source_ingest_timeline_false():
+    incidents = [_incident(incident_id="1")]
+    client = _mock_client(incidents)
+    source = better_stack_source(api_token="dummy", ingest_timeline=False, client=client)
+    rows = list(source.resources["better_stack_incidents"]())
+    assert len(rows) == 1
+    client.get_incident_timeline.assert_not_called()
