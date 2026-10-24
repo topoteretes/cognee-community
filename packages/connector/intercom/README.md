@@ -71,6 +71,17 @@ Choose what to sync with `include_conversations`, `include_articles`,
 `include_draft_articles` and `include_contact_notes`. See `examples/example.py` for a
 runnable version.
 
+| Argument | Meaning | Default |
+|---|---|---|
+| `token` | Access token (a pasted trailing newline is stripped) | `INTERCOM_ACCESS_TOKEN` |
+| `base_url` | API host for the workspace's data region | `https://api.intercom.io` |
+| `check_active` | Host checkpoint, called before every request and before every row is published | none |
+| `service` (alias `session`) | Pre-built `requests`-compatible session (tests, proxies); not closed by the source | one per run, closed afterwards |
+
+After a run, `source.cognee_sync_stats` holds counts only, summed over the three
+content types: `scanned`, `changed`, `deleted`, `failed` (items without an id),
+`requests`, and `complete` (1 once all three finished).
+
 ## How sync and forget-on-delete work
 
 Pass `write_disposition="merge"` to `remember`. cognee applies the caller's write
@@ -91,8 +102,11 @@ deletions are emitted as `_deleted` tombstone rows; both only work under `merge`
   example `include_contact_notes`), its documents are tombstoned and forgotten on the
   next sync rather than left in memory.
 - **Failures.** Rate limits (429) and server errors are retried, honouring
-  `Retry-After` / `X-RateLimit-Reset`. Any other failed request aborts the run, so a
-  broken listing never looks like a deletion.
+  `Retry-After` / `X-RateLimit-Reset` (capped at 60 seconds). Any other failed request
+  aborts the run, so a broken listing never looks like a deletion. A page cursor that
+  repeats also fails the run instead of ending the listing early.
+- **Safety net.** If a listing that had items comes back empty, the run stops instead
+  of forgetting everything. To really forget a content type, switch it off.
 
 **Limits:**
 

@@ -13,11 +13,15 @@ Two layers, all runnable without an Intercom workspace:
 import pytest
 import requests
 
+import cognee_community_connector_intercom.intercom as ic
 from cognee_community_connector_intercom.intercom import (
     INTERCOM_SOURCE_NAME,
     IntercomAPI,
+    IntercomSyncError,
+    _check_token,
     article_to_row,
     conversation_to_row,
+    forget_all,
     html_to_text,
     intercom_source,
     sync_articles,
@@ -83,6 +87,9 @@ class FakeResponse:
 
 class FakeIntercomSession:
     """Stand-in for a ``requests`` session talking to the Intercom REST API."""
+
+    def close(self):
+        self.closed = True
 
     def __init__(self, conversations=(), articles=(), contacts=None, page_size=2):
         self.conversations = {c["id"]: c for c in conversations}
@@ -252,12 +259,54 @@ def test_paginate_follows_starting_after():
     assert [call[2].get("starting_after") for call in session.calls] == [None, "c1", "c3"]
 
 
-def test_paginate_stops_on_repeated_cursor():
+def test_paginate_fails_on_repeated_cursor():
     session = FakeIntercomSession()
     stuck = FakeResponse(200, {"data": [{"id": "x"}], "pages": {"next": {"starting_after": "x"}}})
     session.scripted = [stuck, stuck]
-    ids = [i["id"] for i in IntercomAPI(session, BASE).paginate("GET", "/contacts", "data")]
-    assert ids == ["x", "x"]  # second identical cursor ends the loop instead of spinning
+    # Stopping quietly would make the partial listing look complete and tombstone
+    # everything after it, so a cursor that does not move fails the run instead.
+    with pytest.raises(IntercomSyncError, match="repeated a page cursor"):
+        list(IntercomAPI(session, BASE).paginate("GET", "/contacts", "data"))
+
+
+def test_emptied_listing_forgets_nothing_until_the_type_is_switched_off():
+    session = _workspace()
+    state = {}
+    list(sync_articles(IntercomAPI(session, BASE), False, state))
+
+    session.articles.clear()
+    with pytest.raises(IntercomSyncError, match="Refusing to forget"):
+        list(sync_articles(IntercomAPI(session, BASE), False, state))
+    assert state["known_ids"] == ["a1", "a2"]
+
+    rows = list(forget_all(state))  # what include_articles=False does
+    assert rows == [{"id": "a1", "_deleted": True}, {"id": "a2", "_deleted": True}]
+
+
+def test_stats_and_check_active():
+    session = _workspace()
+    stats, calls = {}, []
+    list(sync_articles(IntercomAPI(session, BASE), False, {}, stats, lambda: calls.append(1)))
+    assert (stats["scanned"], stats["deleted"], stats.get("failed", 0)) == (2, 0, 0)
+    assert len(calls) == 2  # once per published row
+
+    def revoked():
+        raise PermissionError("revoked")
+
+    with pytest.raises(PermissionError):
+        list(sync_articles(IntercomAPI(session, BASE), False, {}, {}, revoked))
+
+
+def test_malformed_token_is_rejected_without_echoing_it():
+    assert _check_token(" tok\n") == "tok"
+    with pytest.raises(ValueError) as error:
+        _check_token("to k")
+    assert "to k" not in str(error.value)
+
+
+def test_service_and_session_are_one_client():
+    with pytest.raises(ValueError, match="not both"):
+        intercom_source(service=FakeIntercomSession(), session=FakeIntercomSession())
 
 
 def test_paginate_follows_numbered_pages():
@@ -469,7 +518,10 @@ def _read(pipeline, table):
 def _workspace():
     return FakeIntercomSession(
         conversations=[_conversation("c1", 100), _conversation("c2", 200)],
-        articles=[_article("a1", "Refund policy", "<p>Within 30 days.</p>")],
+        articles=[
+            _article("a1", "Refund policy", "<p>Within 30 days.</p>"),
+            _article("a2", "Invoices", "<p>Download them from Billing.</p>"),
+        ],
     )
 
 
@@ -528,6 +580,27 @@ def test_switching_a_content_type_off_forgets_it(dlt_mod, tmp_path):
     assert set(_read(pipeline, "intercom_conversations")) == {"c1", "c2"}  # others untouched
 
 
+def test_source_closes_its_sessions_and_reports_stats(dlt_mod, tmp_path, monkeypatch):
+    session = _workspace()
+    tokens = []
+    monkeypatch.setattr(ic, "_make_session", lambda token: tokens.append(token) or session)
+    db_path = (tmp_path / "own.db").as_posix()
+    pipeline = dlt_mod.pipeline(
+        pipeline_name="intercom_own",
+        destination=dlt_mod.destinations.sqlalchemy(f"sqlite:///{db_path}"),
+        dataset_name="intercom_ds",
+        pipelines_dir=str(tmp_path / "state"),
+    )
+    source = intercom_source(token="tok\n")
+
+    pipeline.run(source, write_disposition="merge", primary_key="id")
+
+    assert tokens == ["tok", "tok"]  # conversations and articles; notes are off
+    assert getattr(session, "closed", False)
+    assert source.cognee_sync_stats["complete"] == 1
+    assert source.cognee_sync_stats["scanned"] == 4  # 2 conversations + 2 articles
+
+
 def test_deleted_conversation_and_unpublished_article_are_removed(dlt_mod, tmp_path):
     session = _workspace()
     _run_sync(dlt_mod, tmp_path, session)
@@ -539,4 +612,17 @@ def test_deleted_conversation_and_unpublished_article_are_removed(dlt_mod, tmp_p
     # Tombstoned rows are hard-deleted by the merge, so cognee's read-back no
     # longer sees them and orphan cleanup forgets them.
     assert set(_read(pipeline, "intercom_conversations")) == {"c2"}
-    assert _read(pipeline, "intercom_articles") == {}
+    assert set(_read(pipeline, "intercom_articles")) == {"a2"}
+
+
+def test_complete_waits_for_every_content_type():
+    stats = {}
+    run = ic._RunStats(stats, ("conversations", "articles", "contact_notes"))
+    for name in ("conversations", "articles"):
+        run.start(name)["scanned"] = 2
+        run.finish(name)
+    assert (stats["scanned"], stats["complete"]) == (4, 0)
+
+    run.start("contact_notes")
+    run.finish("contact_notes")
+    assert stats["complete"] == 1
