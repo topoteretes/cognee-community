@@ -1,0 +1,17 @@
+{
+  "v": 1,
+  "id": "env_prod_cluster",
+  "name": "Production Cluster",
+  "variables": [
+    {
+      "key": "baseUrl",
+      "value": "https://api.acme-corp.internal",
+      "secret": false
+    },
+    {
+      "key": "idempotencyKey",
+      "value": "idem_live_sample_key",
+      "secret": false
+    }
+  ]
+}
