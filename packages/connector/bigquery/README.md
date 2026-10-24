@@ -79,6 +79,19 @@ answer = await cognee.search(
 `tables=["dataset.table", ...]` narrows metadata to specific tables, and can be
 combined with `datasets`. See `examples/example.py` for a runnable version.
 
+| Argument | Meaning | Default |
+|---|---|---|
+| `project`, `credentials_path` | Project and service-account key | the key's project; `GOOGLE_APPLICATION_CREDENTIALS`, then Application Default Credentials |
+| `datasets`, `tables` | Narrow the metadata sync | the whole project |
+| `row_syncs` | Tables whose rows become documents, one `RowSync` each | none |
+| `maximum_bytes_billed` | Per-query byte cap | 1 GB |
+| `check_active` | Host checkpoint, called before every BigQuery API call and before every row is published | none |
+| `service` (alias `client`) | Pre-built `google.cloud.bigquery.Client` (tests, proxies); not closed by the source | one per run, closed afterwards |
+
+After a run, `source.cognee_sync_stats` holds counts only, summed over metadata and rows:
+`scanned`, `changed`, `deleted`, `failed` (rows with a NULL key), `requests` (API calls),
+and `complete` (1 once both finished).
+
 ## How sync and forget-on-delete work
 
 Pass `write_disposition="merge"` to `remember`. cognee applies the caller's write
@@ -102,6 +115,9 @@ disposition to every table the source produces, and this source deletes by emitt
   the same cap is set on the real query so BigQuery enforces it too.
 - Errors other than "not found" (permissions, network) abort the run, so a failed
   listing never looks like a deletion.
+- **Safety net.** If listing a whole project that had datasets returns none (a key for
+  another project looks like this), the run stops instead of forgetting everything.
+  To forget them, name the selection with `datasets=` or `tables=`.
 
 **Limits:** the row deletion sweep keeps each synced table's keys in dlt state, so row
 sync is meant for tables up to roughly a few hundred thousand rows. Metadata sync has

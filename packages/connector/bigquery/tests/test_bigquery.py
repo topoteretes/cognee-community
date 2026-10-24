@@ -18,8 +18,10 @@ import pytest
 from google.api_core.exceptions import Forbidden, NotFound
 from google.cloud.bigquery import SchemaField
 
+import cognee_community_connector_bigquery.bigquery as bq
 from cognee_community_connector_bigquery.bigquery import (
     BIGQUERY_SOURCE_NAME,
+    BigQuerySyncError,
     RowSync,
     _build_scope,
     bigquery_source,
@@ -97,6 +99,10 @@ class FakeBigQueryClient:
         self.rows = rows or {}  # {"dataset.table": [row dict, ...]}
         self.bytes_per_query = bytes_per_query
         self.queries = []  # (sql, {param: value}, dry_run)
+        self.closed = False
+
+    def close(self):
+        self.closed = True
 
     def list_datasets(self, project=None):
         return [SimpleNamespace(dataset_id=d) for d in self.datasets]
@@ -509,3 +515,84 @@ def test_dropped_table_and_deleted_row_are_removed_on_resync(dlt_mod, tmp_path):
     # longer sees them and orphan cleanup forgets them.
     assert "proj.sales.returns" not in _read(pipeline, "bigquery_metadata")
     assert set(_read(pipeline, "bigquery_rows")) == {"proj.sales.orders:2"}
+
+
+# ---------------------------------------------------------------------------
+# Host hooks and safety net
+# ---------------------------------------------------------------------------
+def test_service_and_client_are_one_client():
+    with pytest.raises(ValueError, match="not both"):
+        bigquery_source(service=_orders_client(), client=_orders_client())
+
+
+def test_emptied_project_listing_forgets_nothing():
+    client = _orders_client()
+    state = {}
+    list(sync_metadata(client, PROJECT, None, state))
+
+    client.datasets = {}  # e.g. credentials for another project
+    with pytest.raises(BigQuerySyncError, match="Refusing to forget"):
+        list(sync_metadata(client, PROJECT, None, state))
+    assert len(state["known_ids"]) == 2
+
+    # Naming the selection explicitly forgets what is gone.
+    rows = list(sync_metadata(client, PROJECT, {"sales": None}, state))
+    assert len(rows) == 2 and all(row["_deleted"] for row in rows)
+
+
+def test_stats_count_rows_and_null_keys():
+    rows = [_order(1, "new", 1), _order(None, "new", 1)]
+    stats = {}
+    list(sync_rows(_orders_client(rows=rows), PROJECT, [ORDERS_SYNC], 10**9, {}, stats))
+    assert (stats["scanned"], stats["changed"], stats["failed"]) == (1, 1, 1)
+
+
+def test_check_active_is_asked_per_call_and_per_row():
+    calls = []
+
+    def check_active():
+        calls.append(1)
+        if len(calls) == 4:  # get_table, dry run, query; the first row is refused
+            raise PermissionError("revoked")
+
+    client = bq._CheckedClient(_orders_client(rows=[_order(1, "new", 1)]), check_active, {})
+    with pytest.raises(PermissionError):
+        list(sync_rows(client, PROJECT, [ORDERS_SYNC], 10**9, {}, {}, check_active))
+    assert len(calls) == 4
+
+
+def test_source_closes_the_clients_it_builds_and_reports_stats(dlt_mod, tmp_path, monkeypatch):
+    built = []
+
+    def make_client(project, credentials_path):
+        built.append(_orders_client(rows=[_order(1, "new", 1)]))
+        return built[-1]
+
+    monkeypatch.setattr(bq, "_make_client", make_client)
+    db_path = (tmp_path / "own.db").as_posix()
+    pipeline = dlt_mod.pipeline(
+        pipeline_name="bigquery_own",
+        destination=dlt_mod.destinations.sqlalchemy(f"sqlite:///{db_path}"),
+        dataset_name="bigquery_ds",
+        pipelines_dir=str(tmp_path / "state"),
+    )
+    source = bigquery_source(row_syncs=[ORDERS_SYNC])
+
+    pipeline.run(source, write_disposition="merge", primary_key="id")
+
+    assert built and all(client.closed for client in built)  # probe, metadata and rows
+    stats = source.cognee_sync_stats
+    assert (stats["complete"], stats["changed"]) == (1, 3)  # dataset, table and one row
+    assert stats["requests"] > 0
+
+
+def test_complete_waits_for_metadata_and_rows():
+    stats = {}
+    run = bq._RunStats(stats, ("metadata", "rows"))
+    run.start("metadata")["scanned"] = 2
+    run.finish("metadata")
+    assert (stats["scanned"], stats["complete"]) == (2, 0)
+
+    run.start("rows")
+    run.finish("rows")
+    assert stats["complete"] == 1

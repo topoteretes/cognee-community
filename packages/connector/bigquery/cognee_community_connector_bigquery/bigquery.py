@@ -64,11 +64,12 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
 
+import dlt
 from cognee.shared.logging_utils import get_logger
 from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR, PIPELINE_SCOPE_ATTR
 
@@ -81,12 +82,9 @@ ROWS_TABLE_NAME = "bigquery_rows"
 # Default per-query cap: 1 GB, well inside BigQuery's free monthly query tier.
 DEFAULT_MAXIMUM_BYTES_BILLED = 1_000_000_000
 
-_EXTRA_HINT = (
-    "The BigQuery connector requires google-cloud-bigquery and dlt: "
-    'pip install google-cloud-bigquery "dlt[sqlalchemy]"'
-)
-
 # Column types a row cursor may use, mapped to the BigQuery query-parameter type.
+_STAT_KEYS = ("scanned", "changed", "deleted", "failed", "requests")
+
 _CURSOR_PARAM_TYPES = {
     "TIMESTAMP": "TIMESTAMP",
     "DATETIME": "DATETIME",
@@ -132,6 +130,8 @@ def bigquery_source(
     row_syncs: Sequence[RowSync] | None = None,
     credentials_path: str | None = None,
     maximum_bytes_billed: int = DEFAULT_MAXIMUM_BYTES_BILLED,
+    check_active: Callable[[], None] | None = None,
+    service: Any = None,
     client: Any = None,
 ):
     """Create a dlt source that yields BigQuery metadata (and opt-in rows) as documents.
@@ -145,24 +145,45 @@ def bigquery_source(
         credentials_path: Service-account key file. Falls back to
             ``GOOGLE_APPLICATION_CREDENTIALS``, then Application Default Credentials.
         maximum_bytes_billed: Per-query byte cap for row queries.
-        client: Pre-built ``google.cloud.bigquery.Client`` (mainly a test-injection
-            point); when omitted one is built from the arguments above.
+        check_active: Optional host checkpoint, called before every BigQuery API call
+            and before every row is published; raising from it stops the run.
+        service: Pre-built ``google.cloud.bigquery.Client`` (tests, proxies). It is used
+            as is and not closed; when omitted, each run builds and closes its own.
+        client: Alias of ``service``. Give at most one.
 
     Returns:
-        A dlt source for ``cognee.remember(..., write_disposition="merge")``.
+        A dlt source for ``cognee.remember(..., write_disposition="merge")``. After a
+        run, ``source.cognee_sync_stats`` holds counts only, summed over metadata and
+        rows: ``scanned``, ``changed``, ``deleted``, ``failed`` (rows with a NULL key),
+        ``requests`` (API calls), and ``complete`` (1 once both finished).
     """
-    try:
-        import dlt
-    except ImportError as exc:
-        raise ImportError(_EXTRA_HINT) from exc
-
-    if client is None:
-        client = _make_client(project, credentials_path)
-    project = project or client.project
+    if service is not None and client is not None:
+        raise ValueError("Pass service= or client=, not both.")
+    injected = service if service is not None else client
+    if project is None:
+        if injected is not None:
+            project = injected.project
+        else:
+            probe = _make_client(None, credentials_path)
+            project = probe.project
+            probe.close()
     if not project:
         raise ValueError("BigQuery project required: pass project= or use credentials with one.")
     scope = _build_scope(datasets, tables)
     row_specs = list(row_syncs or [])
+    stats: dict[str, int] = {}
+    run = _RunStats(stats, ("metadata", "rows"))
+
+    def _run(name: str, sync: Callable[[Any, dict, dict], Iterator[dict]]) -> Iterator[dict]:
+        part = run.start(name)
+        state = dlt.current.resource_state()
+        bq = injected if injected is not None else _make_client(project, credentials_path)
+        try:
+            yield from sync(_CheckedClient(bq, check_active, part), state, part)
+        finally:
+            if injected is None:
+                bq.close()
+        run.finish(name)
 
     @dlt.resource(
         name=METADATA_TABLE_NAME,
@@ -171,7 +192,10 @@ def bigquery_source(
         columns=_TOMBSTONE_COLUMNS,
     )
     def bigquery_metadata():
-        yield from sync_metadata(client, project, scope, dlt.current.resource_state())
+        def sync(bq, state, part):
+            return sync_metadata(bq, project, scope, state, part, check_active)
+
+        yield from _run("metadata", sync)
 
     @dlt.resource(
         name=ROWS_TABLE_NAME,
@@ -180,9 +204,12 @@ def bigquery_source(
         columns=_TOMBSTONE_COLUMNS,
     )
     def bigquery_rows():
-        yield from sync_rows(
-            client, project, row_specs, maximum_bytes_billed, dlt.current.resource_state()
-        )
+        def sync(bq, state, part):
+            return sync_rows(
+                bq, project, row_specs, maximum_bytes_billed, state, part, check_active
+            )
+
+        yield from _run("rows", sync)
 
     @dlt.source(name=BIGQUERY_SOURCE_NAME)
     def _bigquery():
@@ -198,15 +225,71 @@ def bigquery_source(
     # Scoped by project, not by the selection, so narrowing datasets/tables or
     # removing a RowSync tombstones what dropped out instead of orphaning it.
     setattr(source, PIPELINE_SCOPE_ATTR, f"{BIGQUERY_SOURCE_NAME}:{project}")
+    source.cognee_sync_stats = stats
     return source
+
+
+class BigQuerySyncError(RuntimeError):
+    """The run cannot be trusted (an emptied project listing) and stops."""
+
+
+class _CheckedClient:
+    """Proxy that asks the host checkpoint and counts calls before each client method."""
+
+    def __init__(self, client: Any, check_active: Callable[[], None] | None, stats: dict):
+        self._client = client
+        self._check_active = check_active
+        self._stats = stats
+
+    def __getattr__(self, name: str) -> Any:
+        attr = getattr(self._client, name)
+        if not callable(attr):
+            return attr
+
+        def call(*args: Any, **kwargs: Any) -> Any:
+            if self._check_active is not None:
+                self._check_active()
+            self._stats["requests"] = self._stats.get("requests", 0) + 1
+            return attr(*args, **kwargs)
+
+        return call
+
+
+class _RunStats:
+    """Per-resource counts, published as flat totals on the source after each step."""
+
+    def __init__(self, stats: dict, names: tuple[str, ...]):
+        self.stats = stats
+        self.parts: dict[str, dict] = {name: {} for name in names}
+
+    def start(self, name: str) -> dict:
+        part = self.parts[name]
+        part.clear()
+        part.update(dict.fromkeys(_STAT_KEYS, 0), complete=0)
+        self._publish()
+        return part
+
+    def finish(self, name: str) -> None:
+        self.parts[name]["complete"] = 1
+        self._publish()
+
+    def _publish(self) -> None:
+        totals = {key: sum(part.get(key, 0) for part in self.parts.values()) for key in _STAT_KEYS}
+        self.stats.clear()
+        self.stats.update(totals)
+        self.stats["complete"] = int(all(part.get("complete") for part in self.parts.values()))
+
+
+def _checked(row: dict, check_active: Callable[[], None] | None) -> dict:
+    """Ask the host checkpoint before a row is published."""
+    if check_active is not None:
+        check_active()
+    return row
 
 
 def _make_client(project: str | None, credentials_path: str | None) -> Any:
     """Build a BigQuery client from a key file, or from Application Default Credentials."""
-    try:
-        from google.cloud import bigquery
-    except ImportError as exc:
-        raise ImportError(_EXTRA_HINT) from exc
+    from google.cloud import bigquery
 
     key_path = credentials_path or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
     if key_path:
@@ -242,6 +325,8 @@ def sync_metadata(
     project: str,
     scope: dict[str, list[str] | None] | None,
     state: dict,
+    stats: dict | None = None,
+    check_active: Callable[[], None] | None = None,
 ) -> Iterator[dict]:
     """Yield one document row per dataset and table, then tombstones for vanished ones.
 
@@ -250,11 +335,20 @@ def sync_metadata(
     previous run is emitted with ``_deleted=True``. Errors other than "not found"
     propagate and abort the run, leaving state and memory untouched.
     """
+    stats = {} if stats is None else stats
     known_ids = set(state.get("known_ids", []))
     current_ids: set[str] = set()
 
     if scope is None:
         dataset_ids = sorted(item.dataset_id for item in client.list_datasets(project=project))
+        if not dataset_ids and known_ids and state.get("whole_project"):
+            # Listing a whole project that had datasets and getting none back is far
+            # likelier a credentials or project mix-up than a project emptied overnight.
+            raise BigQuerySyncError(
+                f"BigQuery listed no datasets in {project}, but the last run synced "
+                f"{len(known_ids)} documents from it. Refusing to forget them; check the "
+                "credentials and project. To forget them, pass datasets= or tables=."
+            )
     else:
         dataset_ids = sorted(scope)
 
@@ -284,13 +378,17 @@ def sync_metadata(
         dataset_row = dataset_to_row(dataset, [row["id"] for row in table_rows])
         for row in [dataset_row, *table_rows]:
             current_ids.add(row["id"])
-            yield row
+            yield _checked(row, check_active)
 
     deleted = known_ids - current_ids
     for doc_id in sorted(deleted):
-        yield {"id": doc_id, "_deleted": True}
+        yield _checked({"id": doc_id, "_deleted": True}, check_active)
 
     state["known_ids"] = sorted(current_ids)
+    state["whole_project"] = scope is None
+    for key, value in (("scanned", len(current_ids)), ("changed", len(current_ids))):
+        stats[key] = stats.get(key, 0) + value
+    stats["deleted"] = stats.get("deleted", 0) + len(deleted)
     logger.info(
         "BigQuery: %d metadata document(s), %d deletion(s).", len(current_ids), len(deleted)
     )
@@ -397,21 +495,32 @@ def sync_rows(
     row_specs: list[RowSync],
     maximum_bytes_billed: int,
     state: dict,
+    stats: dict | None = None,
+    check_active: Callable[[], None] | None = None,
 ) -> Iterator[dict]:
     """Yield changed rows of every configured table, then tombstones for deleted keys.
 
     Tables that were synced before but are no longer configured have all their
     rows tombstoned, so dropping a RowSync forgets its rows.
     """
+    stats = {} if stats is None else stats
     tables_state = state.setdefault("tables", {})
     configured = {_qualify(project, spec.table) for spec in row_specs}
     for full_id in sorted(set(tables_state) - configured):
-        for key in tables_state.pop(full_id).get("keys", []):
-            yield {"id": _row_id(full_id, key), "_deleted": True}
+        keys = tables_state.pop(full_id).get("keys", [])
+        for key in keys:
+            yield _checked({"id": _row_id(full_id, key), "_deleted": True}, check_active)
+        stats["deleted"] = stats.get("deleted", 0) + len(keys)
     for spec in row_specs:
         full_id = _qualify(project, spec.table)
         yield from _sync_table_rows(
-            client, full_id, spec, maximum_bytes_billed, tables_state.setdefault(full_id, {})
+            client,
+            full_id,
+            spec,
+            maximum_bytes_billed,
+            tables_state.setdefault(full_id, {}),
+            stats,
+            check_active,
         )
 
 
@@ -421,14 +530,18 @@ def _sync_table_rows(
     spec: RowSync,
     maximum_bytes_billed: int,
     table_state: dict,
+    stats: dict | None = None,
+    check_active: Callable[[], None] | None = None,
 ) -> Iterator[dict]:
+    stats = {} if stats is None else stats
     known_keys = set(table_state.get("keys", []))
     table = _get_or_none(client.get_table, full_id)
     if table is None:
         # The table itself was dropped: every row synced from it is gone.
         logger.warning("BigQuery: row table %s not found; forgetting its rows.", full_id)
         for key in sorted(known_keys):
-            yield {"id": _row_id(full_id, key), "_deleted": True}
+            yield _checked({"id": _row_id(full_id, key), "_deleted": True}, check_active)
+        stats["deleted"] = stats.get("deleted", 0) + len(known_keys)
         table_state.clear()
         return
 
@@ -463,7 +576,7 @@ def _sync_table_rows(
             value = row[spec.cursor_column]
             if value is not None and (newest is None or value > newest):
                 newest = value
-        yield row_to_document(full_id, table.table_id, spec, row, columns)
+        yield _checked(row_to_document(full_id, table.table_id, spec, row, columns), check_active)
         changed += 1
 
     if spec.cursor_column and last_cursor is not None:
@@ -484,8 +597,15 @@ def _sync_table_rows(
         )
     deleted = known_keys - current_keys
     for key in sorted(deleted):
-        yield {"id": _row_id(full_id, key), "_deleted": True}
+        yield _checked({"id": _row_id(full_id, key), "_deleted": True}, check_active)
 
+    for key, value in (
+        ("scanned", len(current_keys)),
+        ("changed", changed),
+        ("deleted", len(deleted)),
+        ("failed", skipped),
+    ):
+        stats[key] = stats.get(key, 0) + value
     table_state["keys"] = sorted(current_keys)
     if newest is not None:
         table_state["cursor"] = _encode_cursor(newest)
