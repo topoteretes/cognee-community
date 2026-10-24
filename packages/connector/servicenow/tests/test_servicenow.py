@@ -13,9 +13,11 @@ Two layers, all runnable without an instance:
 import pytest
 import requests
 
+import cognee_community_connector_servicenow.servicenow as sn
 from cognee_community_connector_servicenow.servicenow import (
     SERVICENOW_SOURCE_NAME,
     ServiceNowAPI,
+    ServiceNowSyncError,
     html_to_text,
     record_to_row,
     servicenow_source,
@@ -93,6 +95,9 @@ class FakeServiceNowSession:
         self.page_size = page_size
         self.calls = []  # (table, params)
         self.scripted = []
+
+    def close(self):
+        self.closed = True
 
     def request(self, method, url, params=None, timeout=None):
         table = url.removeprefix(f"{BASE}/api/now/table/")
@@ -250,7 +255,10 @@ def test_first_sync_fetches_everything_with_display_values():
     assert listing[1]["sysparm_fields"] == "sys_id,sys_updated_on,sys_mod_count"  # cheap listing
     assert fetch[1]["sysparm_query"] == "sys_idINs1,s2"
     assert fetch[1]["sysparm_display_value"] == "true"
-    assert state == {"tables": {"incident": {"s1": "t1/0", "s2": "t1/0"}}}
+    assert state == {
+        "tables": {"incident": {"s1": "t1/0", "s2": "t1/0"}},
+        "queries": {"incident": ""},
+    }
 
 
 def test_only_changed_records_are_fetched_again():
@@ -351,7 +359,95 @@ def test_failed_listing_aborts_before_any_tombstone():
     state = {"tables": {"incident": {"s1": "t1"}}}
     with pytest.raises(requests.HTTPError):
         list(sync_records(_api(session), ONLY_INCIDENTS, False, state))
-    assert state == {"tables": {"incident": {"s1": "t1"}}}
+    assert state["tables"] == {"incident": {"s1": "t1"}}
+
+
+def test_every_table_empty_with_the_same_queries_forgets_nothing():
+    incidents = [_incident("s1", "INC001", "VPN down", "t1")]
+    session = FakeServiceNowSession({"incident": incidents})
+    state = {}
+    list(sync_records(_api(session), ONLY_INCIDENTS, False, state))
+
+    incidents.clear()  # what a user who lost the itil role sees: an empty 200
+    with pytest.raises(ServiceNowSyncError, match="Refusing to forget"):
+        list(sync_records(_api(session), ONLY_INCIDENTS, False, state))
+
+
+def test_one_emptied_table_is_a_normal_deletion():
+    articles = [_article("k1", "KB001", "VPN", "t1")]
+    incidents = [_incident("s1", "INC001", "VPN down", "t1")]
+    session = FakeServiceNowSession({"kb_knowledge": articles, "incident": incidents})
+    scope = {"kb_knowledge": "workflow_state=published", "incident": ""}
+    state = {}
+    list(sync_records(_api(session), scope, False, state))
+
+    articles[0]["workflow_state"] = "retired"  # the only published article
+    rows = list(sync_records(_api(session), scope, False, state))
+
+    assert rows == [{"id": "kb_knowledge:k1", "_deleted": True}]
+
+
+def test_listing_that_does_not_advance_stops_the_run():
+    session = FakeServiceNowSession({"incident": [_incident("s1", "INC001", "VPN", "t1")]})
+    session.scripted = [FakeResponse(200, {"result": [{"sys_id": "s1"}]})] * 3
+
+    with pytest.raises(ServiceNowSyncError, match="same page"):
+        list(_api(session).table("incident", {}, page_size=1))
+
+
+def test_listing_rows_without_a_sys_id_are_skipped_and_counted():
+    session = FakeServiceNowSession({"incident": [_incident("s1", "INC001", "VPN", "t1")]})
+    listing = [{"sys_id": "s1", "sys_updated_on": "t1", "sys_mod_count": "0"}]
+    listing.append({"sys_updated_on": "t1"})  # a row without a sys_id
+    session.scripted = [FakeResponse(200, {"result": listing})]
+    stats = {}
+
+    rows = list(sync_records(_api(session), ONLY_INCIDENTS, False, {}, stats=stats))
+
+    assert [r["id"] for r in rows] == ["incident:s1"]
+    assert stats["failed"] == 1
+
+
+def test_stats_count_what_a_run_did():
+    incidents = [_incident("s1", "INC001", "VPN", "t1"), _incident("s2", "INC002", "Mail", "t1")]
+    session = FakeServiceNowSession({"incident": incidents})
+    state, stats = {}, {}
+    list(sync_records(_api(session), ONLY_INCIDENTS, False, state, stats=stats))
+    assert stats == {
+        "scanned": 2,
+        "skipped": 0,
+        "changed": 2,
+        "deleted": 0,
+        "failed": 0,
+        "requests": 2,  # the listing and one fetch batch
+        "complete": 1,
+    }
+
+    del incidents[1]
+    list(sync_records(_api(session), ONLY_INCIDENTS, False, state, stats=stats))
+    assert (stats["scanned"], stats["skipped"], stats["deleted"], stats["requests"]) == (1, 1, 1, 1)
+
+
+def test_check_active_can_stop_a_run_before_anything_is_published():
+    session = FakeServiceNowSession({"incident": [_incident("s1", "INC001", "VPN", "t1")]})
+    state = {}
+    calls = []
+
+    def check_active():
+        calls.append(1)
+        if len(calls) == 3:  # listing and fetch requests pass, the first row does not
+            raise PermissionError("revoked")
+
+    api = ServiceNowAPI(session, BASE, check_active=check_active)
+    with pytest.raises(PermissionError):
+        list(sync_records(api, ONLY_INCIDENTS, False, state, check_active=check_active))
+    assert state["tables"]["incident"] == {}
+
+
+def test_service_and_session_are_one_client():
+    pytest.importorskip("dlt")
+    with pytest.raises(ValueError, match="not both"):
+        servicenow_source(instance_url=BASE, service=object(), session=object())
 
 
 def test_fetch_is_batched():
@@ -407,6 +503,29 @@ def _instance():
             ],
         }
     )
+
+
+def test_source_closes_the_session_it_opens_and_reports_stats(dlt_mod, tmp_path, monkeypatch):
+    session = _instance()
+    built = []
+    monkeypatch.setattr(
+        sn, "_make_session", lambda user, password: built.append(password) or session
+    )
+    db_path = (tmp_path / "own.db").as_posix()
+    pipeline = dlt_mod.pipeline(
+        pipeline_name="servicenow_own",
+        destination=dlt_mod.destinations.sqlalchemy(f"sqlite:///{db_path}"),
+        dataset_name="servicenow_ds",
+        pipelines_dir=str(tmp_path / "state"),
+    )
+    source = servicenow_source(instance_url=BASE, username=" reader ", password="pw\n")
+
+    pipeline.run(source, write_disposition="merge", primary_key="id")
+
+    assert built == ["pw"]  # a pasted trailing newline is dropped
+    assert getattr(session, "closed", False)
+    assert source.cognee_sync_stats["complete"] == 1
+    assert source.cognee_sync_stats["changed"] == 3
 
 
 def test_first_sync_loads_articles_and_incidents(dlt_mod, tmp_path):

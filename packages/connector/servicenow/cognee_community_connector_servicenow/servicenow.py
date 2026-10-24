@@ -65,9 +65,11 @@ import html
 import os
 import re
 import time
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any
 
+import dlt
+import requests
 from cognee.shared.logging_utils import get_logger
 from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR, PIPELINE_SCOPE_ATTR
 
@@ -131,14 +133,12 @@ _TABLE_LABELS = {
 }
 
 _LIST_PAGE_SIZE = 1000
+_MAX_PAGES = 100_000
 _FETCH_BATCH_SIZE = 100
 _MAX_RETRIES = 5
 _MAX_RETRY_DELAY_SECONDS = 60.0
 _REQUEST_TIMEOUT_SECONDS = 60
 
-_EXTRA_HINT = (
-    'The ServiceNow connector requires requests and dlt: pip install requests "dlt[sqlalchemy]"'
-)
 _TOMBSTONE_COLUMNS = {"_deleted": {"data_type": "bool", "hard_delete": True}}
 
 _BLOCK_END_RE = re.compile(r"(?i)<br\s*/?>|</(p|div|li|h[1-6]|tr|blockquote|pre)>")
@@ -156,6 +156,8 @@ def servicenow_source(
     password: str | None = None,
     tables: Mapping[str, str] | None = None,
     include_journal: bool = False,
+    check_active: Callable[[], None] | None = None,
+    service: Any = None,
     session: Any = None,
 ):
     """Create a dlt source that yields ServiceNow records as documents.
@@ -169,16 +171,20 @@ def servicenow_source(
             Defaults to :data:`DEFAULT_TABLES`. Supported tables: ``kb_knowledge``,
             ``incident``, ``problem``, ``change_request``.
         include_journal: Append work notes and comments to each record.
-        session: Pre-built ``requests`` session (mainly a test-injection point);
-            when omitted one is built from the credentials above.
+        check_active: Optional host checkpoint, called before every request and before
+            every row is published; raising from it stops the run.
+        service: Pre-built ``requests``-compatible session (tests, proxies). It is
+            used as is and not closed; when omitted, each run opens and closes its own
+            from the credentials above.
+        session: Alias of ``service``. Give at most one.
 
     Returns:
-        A dlt source for ``cognee.remember(..., write_disposition="merge")``.
+        A dlt source for ``cognee.remember(..., write_disposition="merge")``. After a
+        run, ``source.cognee_sync_stats`` holds counts only: ``scanned`` (records
+        listed), ``skipped`` (unchanged), ``changed``, ``deleted``, ``failed``
+        (listing rows without a sys_id), ``requests``, and ``complete`` (1 once the
+        run finished).
     """
-    try:
-        import dlt
-    except ImportError as exc:
-        raise ImportError(_EXTRA_HINT) from exc
 
     base_url = (instance_url or os.environ.get("SERVICENOW_INSTANCE_URL") or "").rstrip("/")
     if not base_url:
@@ -189,16 +195,18 @@ def servicenow_source(
     unsupported = sorted(set(scope) - set(_TABLE_FIELDS))
     if unsupported:
         raise ValueError(f"Unsupported tables {unsupported}; choose from {sorted(_TABLE_FIELDS)}.")
-    if session is None:
-        user = username or os.environ.get("SERVICENOW_USERNAME")
-        secret = password or os.environ.get("SERVICENOW_PASSWORD")
-        if not (user and secret):
-            raise ValueError(
-                "ServiceNow credentials required: pass username= and password= or set "
-                "SERVICENOW_USERNAME and SERVICENOW_PASSWORD."
-            )
-        session = _make_session(user, secret)
-    api = ServiceNowAPI(session, base_url)
+    if service is not None and session is not None:
+        raise ValueError("Pass service= or session=, not both.")
+    client = service if service is not None else session
+    # A value pasted from a password manager or a file often ends in a newline.
+    user = (username or os.environ.get("SERVICENOW_USERNAME") or "").strip()
+    secret = (password or os.environ.get("SERVICENOW_PASSWORD") or "").rstrip("\r\n")
+    if client is None and not (user and secret):
+        raise ValueError(
+            "ServiceNow credentials required: pass username= and password= or set "
+            "SERVICENOW_USERNAME and SERVICENOW_PASSWORD."
+        )
+    stats: dict[str, int] = {}
 
     @dlt.resource(
         name=RECORDS_TABLE_NAME,
@@ -207,7 +215,16 @@ def servicenow_source(
         columns=_TOMBSTONE_COLUMNS,
     )
     def servicenow_records():
-        yield from sync_records(api, scope, include_journal, dlt.current.resource_state())
+        http = client if client is not None else _make_session(user, secret)
+        try:
+            api = ServiceNowAPI(http, base_url, check_active=check_active, stats=stats)
+            state = dlt.current.resource_state()
+            yield from sync_records(
+                api, scope, include_journal, state, stats=stats, check_active=check_active
+            )
+        finally:
+            if client is None:
+                http.close()
 
     @dlt.source(name=SERVICENOW_SOURCE_NAME)
     def _servicenow():
@@ -220,15 +237,15 @@ def servicenow_source(
     # One dlt state (known records and their versions) per instance and cognee
     # dataset, so syncing other sources or datasets on the machine can't reset it.
     setattr(source, PIPELINE_SCOPE_ATTR, f"{SERVICENOW_SOURCE_NAME}:{base_url}")
+    source.cognee_sync_stats = stats
     return source
 
 
-def _make_session(username: str, password: str) -> Any:
-    try:
-        import requests
-    except ImportError as exc:
-        raise ImportError(_EXTRA_HINT) from exc
+class ServiceNowSyncError(RuntimeError):
+    """The run cannot be trusted (stuck paging, an emptied table, a bad response) and stops."""
 
+
+def _make_session(username: str, password: str) -> Any:
     session = requests.Session()
     session.auth = (username, password)
     session.headers.update({"Accept": "application/json"})
@@ -241,17 +258,26 @@ def _make_session(username: str, password: str) -> Any:
 class ServiceNowAPI:
     """Thin read-only wrapper over the Table API: retries and offset paging."""
 
-    def __init__(self, session: Any, base_url: str):
+    def __init__(
+        self,
+        session: Any,
+        base_url: str,
+        check_active: Callable[[], None] | None = None,
+        stats: dict | None = None,
+    ):
         self.session = session
         self.base_url = base_url.rstrip("/")
+        self.check_active = check_active
+        self.stats = stats if stats is not None else {}
 
     def request(self, path: str, params: dict) -> dict:
         """GET a Table API path, retrying 429/5xx and network errors; others raise."""
-        import requests
-
         url = f"{self.base_url}{path}"
         attempt = 0
         while True:
+            if self.check_active is not None:
+                self.check_active()
+            self.stats["requests"] = self.stats.get("requests", 0) + 1
             try:
                 response = self.session.request(
                     "GET", url, params=params, timeout=_REQUEST_TIMEOUT_SECONDS
@@ -273,22 +299,28 @@ class ServiceNowAPI:
     def table(self, table: str, params: dict, page_size: int = _LIST_PAGE_SIZE) -> Iterator[dict]:
         """Yield every record of ``/api/now/table/{table}`` across offset pages."""
         offset = 0
-        while True:
+        previous_first = None
+        for _ in range(_MAX_PAGES):
             page = self.request(
                 f"/api/now/table/{table}",
                 {**params, "sysparm_limit": page_size, "sysparm_offset": offset},
             )
             records = page.get("result") or []
+            first = records[0].get("sys_id") if records else None
+            if first is not None and first == previous_first:
+                # An instance that ignores the offset would page forever; a listing
+                # that cannot move forward must not look finished.
+                raise ServiceNowSyncError(f"ServiceNow returned the same page of {table} twice.")
+            previous_first = first
             yield from records
             if len(records) < page_size:
                 return
             offset += page_size
+        raise ServiceNowSyncError(f"ServiceNow listing of {table} exceeded {_MAX_PAGES} pages.")
 
 
 def _parse(response: Any, path: str) -> dict:
     """Raise on a failed response with a hint for the common causes; else decode JSON."""
-    import requests
-
     if response.status_code == 401:
         raise requests.HTTPError(
             "ServiceNow rejected the credentials (HTTP 401). Check the username and "
@@ -300,7 +332,7 @@ def _parse(response: Any, path: str) -> dict:
     try:
         return response.json()
     except ValueError:
-        raise RuntimeError(
+        raise ServiceNowSyncError(
             f"ServiceNow answered {path} with a web page instead of JSON (HTTP "
             f"{response.status_code}). A Personal Developer Instance does this while it is "
             "hibernating: wake it at developer.servicenow.com and run the sync again."
@@ -326,17 +358,49 @@ def sync_records(
     scope: Mapping[str, str],
     include_journal: bool,
     state: dict,
+    stats: dict | None = None,
+    check_active: Callable[[], None] | None = None,
 ) -> Iterator[dict]:
     """Yield new/changed records of every scoped table, then tombstones for vanished ones."""
+    if stats is None:
+        stats = api.stats
+    api.stats = stats  # requests are counted in the same dictionary
+    stats.clear()
+    stats.update(scanned=0, skipped=0, changed=0, deleted=0, failed=0, requests=0, complete=0)
+
     tables_state = state.setdefault("tables", {})
+    queries = state.setdefault("queries", {})
+    known_before = sum(len(tables_state.get(table, {})) for table in scope)
+    same_selection = all(queries.get(table) == query for table, query in scope.items())
     for table in sorted(set(tables_state) - set(scope)):
         # The table was removed from the configuration: forget what it synced.
+        queries.pop(table, None)
         for sys_id in sorted(tables_state.pop(table)):
-            yield {"id": _record_id(table, sys_id), "_deleted": True}
+            stats["deleted"] += 1
+            yield _checked({"id": _record_id(table, sys_id), "_deleted": True}, check_active)
     for table, query in scope.items():
         yield from _sync_table(
-            api, table, query, include_journal, tables_state.setdefault(table, {})
+            api,
+            table,
+            query,
+            include_journal,
+            tables_state.setdefault(table, {}),
+            stats=stats,
+            check_active=check_active,
         )
+        queries[table] = query
+    if stats["scanned"] == 0 and known_before and same_selection:
+        # ACLs hide rows silently: a user who lost a role or whose credentials changed
+        # gets empty 200s, not errors. Every table empty with the same queries as last
+        # time is far likelier that than an emptied instance, so fail the run: dlt keeps
+        # nothing from a failed run, so the tombstones above are discarded too.
+        raise ServiceNowSyncError(
+            f"ServiceNow listed no records in any table for the same queries as the last "
+            f"run, which synced {known_before}. Refusing to forget them; check the "
+            "integration user's roles. If the tables really are empty now, remove them "
+            "from tables= to forget their records."
+        )
+    stats["complete"] = 1
 
 
 def _sync_table(
@@ -345,21 +409,28 @@ def _sync_table(
     query: str,
     include_journal: bool,
     known: dict,
+    stats: dict | None = None,
+    check_active: Callable[[], None] | None = None,
 ) -> Iterator[dict]:
+    stats = {} if stats is None else stats
     # 1. Cheap listing: every in-scope sys_id with its version. sys_updated_on (raw,
     # UTC) has one-second precision, so sys_mod_count, which every update bumps,
     # catches a second edit within the same second as the last sync.
     listing_query = f"{query}^ORDERBYsys_id" if query else "ORDERBYsys_id"
-    current = {
-        record["sys_id"]: f"{record['sys_updated_on']}/{record.get('sys_mod_count', '')}"
-        for record in api.table(
-            table,
-            {
-                "sysparm_query": listing_query,
-                "sysparm_fields": "sys_id,sys_updated_on,sys_mod_count",
-            },
+    current = {}
+    for record in api.table(
+        table,
+        {
+            "sysparm_query": listing_query,
+            "sysparm_fields": "sys_id,sys_updated_on,sys_mod_count",
+        },
+    ):
+        if not record.get("sys_id"):
+            stats["failed"] = stats.get("failed", 0) + 1
+            continue
+        current[record["sys_id"]] = (
+            f"{record.get('sys_updated_on', '')}/{record.get('sys_mod_count', '')}"
         )
-    }
     changed = sorted(sys_id for sys_id, updated in current.items() if known.get(sys_id) != updated)
 
     # 2. Fetch only new/changed records, in batches, with display values.
@@ -381,18 +452,33 @@ def _sync_table(
         )
         journal = _journal_entries(api, table, batch) if include_journal else {}
         for record in records:
-            yield record_to_row(api.base_url, table, record, journal.get(record["sys_id"], []))
+            row = record_to_row(api.base_url, table, record, journal.get(record["sys_id"], []))
+            yield _checked(row, check_active)
 
     # 3. Anything known before but no longer listed is gone (or out of scope).
     deleted = sorted(set(known) - set(current))
     for sys_id in deleted:
-        yield {"id": _record_id(table, sys_id), "_deleted": True}
+        yield _checked({"id": _record_id(table, sys_id), "_deleted": True}, check_active)
 
     known.clear()
     known.update(current)
+    for key, value in (
+        ("scanned", len(current)),
+        ("skipped", len(current) - len(changed)),
+        ("changed", len(changed)),
+        ("deleted", len(deleted)),
+    ):
+        stats[key] = stats.get(key, 0) + value
     logger.info(
         "ServiceNow: %s — %d changed record(s), %d deletion(s).", table, len(changed), len(deleted)
     )
+
+
+def _checked(row: dict, check_active: Callable[[], None] | None) -> dict:
+    """Ask the host checkpoint before a row is published."""
+    if check_active is not None:
+        check_active()
+    return row
 
 
 def _journal_entries(

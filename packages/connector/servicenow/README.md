@@ -70,6 +70,18 @@ await cognee.remember(
 
 See `examples/example.py` for a runnable version.
 
+| Argument | Meaning | Default |
+|---|---|---|
+| `instance_url`, `username`, `password` | Instance and integration user | `SERVICENOW_*` variables |
+| `tables` | `{table: encoded_query}` to sync | published `kb_knowledge`, `incident`, `problem`, `change_request` |
+| `include_journal` | Append work notes and comments | `False` |
+| `check_active` | Host checkpoint, called before every request and before every row is published | none |
+| `service` (alias `session`) | Pre-built `requests`-compatible session (tests, proxies); not closed by the source | one per run, closed afterwards |
+
+After a run, `source.cognee_sync_stats` holds counts only: `scanned` (records listed),
+`skipped` (unchanged), `changed`, `deleted`, `failed` (listing rows without a `sys_id`),
+`requests`, and `complete` (1 once the run finished).
+
 ## How sync and forget-on-delete work
 
 Pass `write_disposition="merge"` to `remember`: this source only emits records that
@@ -91,6 +103,11 @@ changed and deletes by emitting `_deleted` tombstone rows, which only `merge` ap
   failed request aborts the run, so a broken listing never looks like a deletion. A 401
   error names the role and setting above, and a web page in place of JSON points at a
   hibernating instance.
+- **Safety net.** ACLs hide rows silently, so a user who lost a role gets empty
+  results, not errors. If every table comes back empty with the same queries as the
+  last run, the run stops instead of forgetting everything (remove the tables from
+  `tables` if they really are empty). One emptied table is a normal deletion. A
+  listing that returns the same page twice stops the run instead of paging forever.
 
 **Limits:** the listing reads three small fields of every in-scope record each run and
 the state keeps one version string per record, so narrow very large tables with a query.
