@@ -22,6 +22,7 @@ class FakeZoom:
         self.fail_path: str | None = None
         self.gone_files: set[str] = set()
         self.drop_meetings_key = False
+        self.missing_user_scope = False
 
     def add_meeting(
         self,
@@ -92,6 +93,9 @@ class FakeZoom:
                 return {"next_page_token": ""}
             return {"meetings": meetings, "total_records": len(meetings), "next_page_token": ""}
         match = re.fullmatch(r"/users/([^/]+)", path)
+        if match and self.missing_user_scope:
+            # What a live app without user:read:user:admin gets back.
+            raise ZoomAPIError("Zoom request failed: HTTP 400 (code 4711)", status=400, code=4711)
         if match:
             for user in self.users["active"] + self.users["inactive"]:
                 if user["id"] == match.group(1):

@@ -455,9 +455,23 @@ def _paginate(client: Any, path: str, params: dict[str, Any], key: str) -> Itera
         token = next_token
 
 
+# Zoom's error code for a token that lacks a scope the request needs.
+_MISSING_SCOPE = 4711
+
+
 def _resolve_users(client: Any, user_ids: tuple[str, ...]) -> list[dict]:
     if user_ids:
-        return [client.get(f"/users/{quote(user_id, safe='@')}") for user_id in user_ids]
+        try:
+            return [client.get(f"/users/{quote(user_id, safe='@')}") for user_id in user_ids]
+        except ZoomAPIError as exc:
+            if exc.code != _MISSING_SCOPE:
+                raise
+            raise ZoomAPIError(
+                "Looking up user_ids needs the user:read:user:admin scope on the Zoom app "
+                f"(HTTP {exc.status}, code {exc.code})",
+                status=exc.status,
+                code=exc.code,
+            ) from exc
     # Deactivated users keep their recordings. Listing only active users would
     # make deactivating someone look like all of their meetings were deleted.
     users: dict[str, dict] = {}

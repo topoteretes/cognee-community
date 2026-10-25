@@ -676,6 +676,13 @@ def test_unknown_selected_user_raises(zoom):
         _run(zoom, {}, user_ids=("nobody",))
 
 
+def test_selected_users_without_the_lookup_scope_name_it(zoom):
+    zoom.missing_user_scope = True
+    with pytest.raises(ZoomAPIError, match="user:read:user:admin") as caught:
+        _run(zoom, {}, user_ids=("u1",))
+    assert caught.value.code == 4711
+
+
 def test_stored_window_is_reused_and_moving_it_forgets_older_meetings(zoom):
     zoom.add_meeting("old", start="2026-09-20T10:00:00Z", transcript=VTT)
     zoom.add_meeting("new", start="2026-10-05T10:00:00Z", transcript=VTT)
