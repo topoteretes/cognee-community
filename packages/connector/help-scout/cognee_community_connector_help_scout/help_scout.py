@@ -762,9 +762,7 @@ def _list_present_ids(api: _Api, url: str, base: dict) -> set[int] | None:
         logger.warning("Help Scout: %s No deletes inferred from this listing.", exc)
         return None
     if not listing.consistent():
-        logger.warning(
-            "Help Scout: the id listing changed; no deletes inferred from this listing."
-        )
+        logger.warning("Help Scout: the id listing changed; no deletes inferred from this listing.")
         return None
     return {int(i) for i in listing.seen if i is not None}
 
