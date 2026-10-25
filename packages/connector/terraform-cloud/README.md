@@ -110,6 +110,8 @@ sent to it.
   `planned_and_finished`, `errored`, `discarded`, `canceled`, ...). Runs still in progress
   are kept in state and checked again on the next sync, so one run is never processed
   once per status. A run waiting for confirmation appears once it is applied or discarded.
+  The organization run listing cannot include a run's plan and apply (it answers HTTP 400
+  for them), so each new finished run is read once on its own, which brings them along.
 - **Workspaces** are listed on every sync. Their documents leave out fields that change on
   every run (resource count, lock state), so they are only processed again when the
   workspace itself changes.

@@ -87,6 +87,8 @@ _CURSOR_MARGIN = timedelta(minutes=5)
 _NAMES_PER_REQUEST = 25
 # Planned changes kept per run; the rest is summarized as a count.
 _MAX_CHANGES = 200
+# Only a single run can include its plan and apply: the organization run listing
+# answers HTTP 400 "Invalid include parameter" for them, so it includes nothing.
 _RUN_INCLUDE = "plan,apply,configuration_version.ingress_attributes"
 _OPERATIONS = "plan_and_apply,save_plan,refresh_only,destroy,empty_apply,action_only"
 # Run states with no further transitions. planned_and_saved can still be applied.
@@ -572,11 +574,11 @@ class _Walker:
             self.rows.append({"id": f"workspace:{wid}", "_deleted": True})
 
     # -- runs --------------------------------------------------------------
-    def _list_runs(self, names: list[str], floor: str) -> Iterator[tuple[dict, dict[str, dict]]]:
-        """Runs created at or after ``floor``, with their plan, apply and commit."""
+    def _list_runs(self, names: list[str], floor: str) -> Iterator[dict]:
+        """Runs created at or after ``floor``."""
         config = self.config
         operations = _OPERATIONS + (",plan_only" if config.include_speculative else "")
-        params: dict[str, Any] = {"include": _RUN_INCLUDE, "filter[operation]": operations}
+        params: dict[str, Any] = {"filter[operation]": operations}
         size = _NAMES_PER_REQUEST
         groups = [names[i : i + size] for i in range(0, len(names), size)]
         for group in groups or [None]:
@@ -585,7 +587,6 @@ class _Walker:
             previous = None
             ordered = True
             for document in self._pages(f"/organizations/{config.organization}/runs", params):
-                included = _included(document)
                 stop = False
                 for run in document["data"]:
                     created = str((run.get("attributes") or {}).get("created-at") or "")
@@ -595,7 +596,7 @@ class _Walker:
                     if created < floor:
                         stop = True
                         continue
-                    yield run, _related(run, included)
+                    yield run
                 if stop and ordered:
                     break
 
@@ -618,6 +619,15 @@ class _Walker:
         self.known[wid]["runs"].append(run["id"])
         self.pending.pop(run["id"], None)
         self.progressed = True
+
+    def _read_run(self, run_id: str) -> dict | None:
+        """One run with its plan, apply and commit, or ``None`` when it is gone."""
+        try:
+            return self._call(self.client.get, f"/runs/{run_id}", {"include": _RUN_INCLUDE})
+        except TerraformCloudAPIError as exc:
+            if exc.status != 404:
+                raise
+            return None
 
     # -- the run -----------------------------------------------------------
     def walk(self) -> None:
@@ -658,17 +668,20 @@ class _Walker:
 
         newest = cursor
         listed: set[str] = set()
-        for run, related in self._list_runs(selected_names, floor):
+        for run in self._list_runs(selected_names, floor):
             listed.add(run["id"])
             wid = _workspace_id(run)
             created = str((run.get("attributes") or {}).get("created-at") or "")
             newest = max(newest or created, created)
             if wid not in workspaces or run["id"] in self.known[wid]["runs"]:
                 continue
-            if (run.get("attributes") or {}).get("status") in _FINAL_STATES:
-                self._emit(run, related, names)
-            else:
+            if (run.get("attributes") or {}).get("status") not in _FINAL_STATES:
                 self.pending[run["id"]] = wid
+                continue
+            # The listing cannot include the plan and apply, so a finished run is read once.
+            document = self._read_run(run["id"])
+            if document is not None:
+                self._emit(document["data"], _related(document["data"], _included(document)), names)
 
         # Runs that were still in progress last time and are now below the cursor.
         for run_id, wid in list(self.pending.items()):
@@ -677,11 +690,8 @@ class _Walker:
             if wid not in workspaces:
                 self.pending.pop(run_id)
                 continue
-            try:
-                document = self._call(self.client.get, f"/runs/{run_id}", {"include": _RUN_INCLUDE})
-            except TerraformCloudAPIError as exc:
-                if exc.status != 404:
-                    raise
+            document = self._read_run(run_id)
+            if document is None:
                 self.pending.pop(run_id)
                 continue
             run = document["data"]

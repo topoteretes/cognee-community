@@ -1,4 +1,8 @@
-"""In-memory stand-in for the HCP Terraform API (JSON:API), shared by the test modules."""
+"""In-memory stand-in for the HCP Terraform API (JSON:API), shared by the test modules.
+
+Like the live API, the organization run listing rejects ``plan`` and ``apply`` in
+``include`` (HTTP 400 "Invalid include parameter"); a single run accepts them.
+"""
 
 import pytest
 
@@ -8,6 +12,12 @@ from cognee_community_connector_terraform_cloud.terraform_cloud import (
 )
 
 ORG = "acme"
+# What the live organization run listing accepts in ``include``.
+_LISTING_INCLUDES = {
+    "configuration_version": {"configuration-versions"},
+    "configuration_version.ingress_attributes": {"configuration-versions", "ingress-attributes"},
+    "workspace": {"workspaces"},
+}
 _OPERATION_FLAGS = {
     "plan_only": {"plan-only": True},
     "destroy": {"is-destroy": True},
@@ -163,6 +173,10 @@ class FakeTerraformCloud:
                 items = [w for w in items if tags <= set(w["attributes"]["tag-names"])]
             return self._page(items, params)
         if path == f"/organizations/{ORG}/runs":
+            requested = [i for i in str(params.get("include") or "").split(",") if i]
+            if any(i not in _LISTING_INCLUDES for i in requested):
+                raise TerraformCloudAPIError("HTTP 400", status=400)
+            kinds = set().union(*(_LISTING_INCLUDES[i] for i in requested))
             operations = set(params["filter[operation]"].split(","))
             names = params.get("filter[workspace_names]")
             runs = [
@@ -184,7 +198,13 @@ class FakeTerraformCloud:
             )
             page = self._page([d["data"] for d in runs], params)
             ids = {r["id"] for r in page.get("data") or []}
-            page["included"] = [i for d in runs if d["data"]["id"] in ids for i in d["included"]]
+            page["included"] = [
+                i
+                for d in runs
+                if d["data"]["id"] in ids
+                for i in d["included"]
+                if i["type"] in kinds
+            ]
             return page
         if path.startswith("/runs/"):
             run_id = path.split("/")[2]

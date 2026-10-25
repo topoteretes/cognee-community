@@ -328,6 +328,34 @@ def test_pending_run_that_disappears_is_dropped(org):
     assert state["pending"] == {}
 
 
+def test_run_listing_includes_nothing(org):
+    # Live, the organization run listing answers HTTP 400 for plan and apply, and the
+    # commit comes with the single read of each new run.
+    org.add_run("ws-1", "run-1", "2026-10-15T10:00:00.000Z")
+    _run(org, {})
+    assert all("include" not in p for p in org.run_list_calls())
+
+
+def test_finished_run_is_read_once_for_its_plan_and_apply(org):
+    org.add_run("ws-1", "run-1", "2026-10-15T10:00:00.000Z", plan_log=TEXT_LOG)
+    state = {}
+    rows = _run(org, state)
+    assert "aws_s3_bucket.logs will be created" in rows[-1]["content"]
+    assert [path for path, _ in org.calls if path == "/runs/run-1"] == ["/runs/run-1"]
+
+    org.calls.clear()
+    assert _run(org, state) == []
+    assert [path for path, _ in org.calls if path.startswith("/runs/")] == []
+
+
+def test_run_deleted_between_listing_and_read_is_skipped(org):
+    org.add_run("ws-1", "run-1", "2026-10-15T10:00:00.000Z")
+    org.errors["/runs/run-1"] = 404
+    stats = _stats()
+    assert "run:run-1" not in _ids(_run(org, {}, stats))
+    assert stats["failed"] == 0
+
+
 def test_apply_log_is_read_only_for_failed_applies(org):
     org.add_run("ws-1", "run-1", "2026-10-15T10:00:00.000Z", plan_log=TEXT_LOG)
     org.add_run(
@@ -441,6 +469,17 @@ def test_deleted_selected_workspace_is_forgotten_not_raised(org):
     _run(org, state, workspace_names=("networking-prod", "app-staging"))
     del org.workspaces["ws-1"]
     rows = _run(org, state, workspace_names=("networking-prod", "app-staging"))
+    assert _ids(rows) == ["run:run-1", "workspace:ws-1"]
+
+
+def test_only_selected_workspace_deleted_is_forgotten_after_confirmation(org):
+    # The listing comes back empty, so the first run waits and the next one forgets.
+    org.add_run("ws-1", "run-1", "2026-10-15T10:00:00.000Z")
+    state = {}
+    _run(org, state, workspace_names=("networking-prod",))
+    del org.workspaces["ws-1"]
+    assert _run(org, state, workspace_names=("networking-prod",)) == []
+    rows = _run(org, state, workspace_names=("networking-prod",))
     assert _ids(rows) == ["run:run-1", "workspace:ws-1"]
 
 
