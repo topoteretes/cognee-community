@@ -335,8 +335,11 @@ def test_check_active_runs_before_every_request():
 def test_repeated_next_link_and_empty_middle_page_raise():
     class Api:
         name = "Inbox API"
+        calls = 0
 
         def get(self, url, params=None):
+            self.calls += 1
+            assert self.calls <= 4, "pagination exceeded the test request budget"
             return {"_embedded": {"x": [{"id": 1}]}, "_links": {"next": {"href": "same"}}}
 
     with pytest.raises(_UnstableListingError):
@@ -346,6 +349,7 @@ def test_repeated_next_link_and_empty_middle_page_raise():
         name = "Docs API"
 
         def get(self, url, params=None):
+            assert params["page"] <= 4, "pagination exceeded the test request budget"
             return {"articles": {"page": params["page"], "pages": 3, "items": []}}
 
     with pytest.raises(_UnstableListingError):
@@ -680,8 +684,8 @@ def test_removing_a_large_inbox_forgets_all_of_it(tmp_path, monkeypatch):
     _run(tmp_path, fake, mailbox_ids=[1, 2])
     fake.conversations = fake.conversations[-1:]  # the 6 in inbox 2 vanish: mass vanish
     pipeline, source = _run(tmp_path, fake, mailbox_ids=[1, 2])
-    assert len(_rows(pipeline)) == 7  # guard: nothing forgotten from a "broken" listing
-    assert source.cognee_sync_stats["conversations_reconcile_skipped"] == 1
+    assert len(_rows(pipeline)) == 4  # first bounded batch of three is confirmed
+    assert source.cognee_sync_stats["conversations_forgotten"] == 3
     fake.conversations = [_conv(i, mailboxId=2) for i in range(1, 7)] + [_conv(9, mailboxId=1)]
     pipeline, _ = _run(tmp_path, fake, mailbox_ids=[1])  # scope change: no cap
     assert set(_rows(pipeline)) == {"conversation:9"}

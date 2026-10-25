@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0.0"]
+dev = ["pytest>=8.0.0", "pytest-timeout>=2.3.1", "ruff>=0.9.0"]
 
 [project.urls]
 Homepage = "https://github.com/topoteretes/cognee"
@@ -36,3 +36,6 @@ select = ["E", "W", "F", "I", "N", "B", "UP", "C4", "PGH", "SIM", "RUF"]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
+
+[tool.pytest.ini_options]
+timeout = 60

@@ -42,11 +42,10 @@ Design
   hash of every conversation in it and re-extract them all.
 * **Incremental** - ``status=all&modifiedSince=<cursor>`` sorted by
   ``modifiedAt``. The cursor comes from Help Scout's own clock (the ``Date``
-  header of the run's first response) minus a 5-minute overlap, never from the
-  local clock, and only moves after a fully successful run. If a conversation
-  is modified while the listing is paged, the sort order shifts and a
-  conversation can slip between pages; that shows up as a repeated id, and the
-  listing is read again (and, if it is still moving, the cursor is not moved).
+  header of the run's first response) minus a 5-minute overlap. With no Date
+  header it uses the local run-start time. Repeated ids, changing totals or an
+  incomplete listing trigger a retry with the same cutoff. After three unstable
+  passes the cursor stays put. Page-number APIs cannot provide snapshot isolation.
 * **Configuration changes** - ``mailbox_ids``, ``include_notes`` and
   ``include_spam`` are stored next to the cursor. When they change, the next run
   does a full listing, so an inbox added later is backfilled and an inbox removed
@@ -67,8 +66,9 @@ Design
   shifting listing never turns into deletes. Articles get the same treatment.
 * **Safe failure** - ``5xx`` and network errors are retried with backoff; a
   rate-limit wait longer than ``max_rate_limit_wait`` stops the run cleanly (what
-  was read is kept, no cursor moves, nothing is forgotten) and is reported in
-  ``cognee_sync_stats``. Any other error aborts the run.
+  was read and confirmed tombstones are kept, and their identities are saved).
+  The stopped resource advances no cursor; independent resources may finish.
+  A per-id 403 keeps the document and is counted; other errors abort the run.
 """
 
 from __future__ import annotations
@@ -98,14 +98,16 @@ DOCS_API = "https://docsapi.helpscout.net/v1"
 
 CURSOR_OVERLAP = timedelta(minutes=5)
 DEFAULT_MAX_RATE_LIMIT_WAIT = 120.0
-# Re-check at most this many "vanished" ids per run; more than that from one
-# listing is treated as a broken listing, not as a mass delete.
+# Re-check a bounded batch; remember checked IDs until the cycle completes.
 MAX_VERIFY = 200
 
 _UTC = timezone.utc
 _MAX_RETRIES = 5
 _SERVER_ERRORS = frozenset({500, 502, 503, 504})
-_DELETED_COLUMN = {"_deleted": {"data_type": "bool", "hard_delete": True}}
+_DELETED_COLUMN = {
+    "_deleted": {"data_type": "bool", "hard_delete": True},
+    "_sync_order": {"data_type": "bigint", "dedup_sort": "desc"},
+}
 _RESOURCE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,40}$")
 _THREAD_LABELS = {
     "customer": "customer",
@@ -125,6 +127,10 @@ class RateLimitedError(Exception):
 
 class _NotFoundError(Exception):
     pass
+
+
+class _ForbiddenError(PermissionError):
+    """An HTTP 403, distinguishable from invalid credentials (401)."""
 
 
 class _UnstableListingError(Exception):
@@ -219,7 +225,9 @@ def help_scout_source(
             "pip install cognee-community-connector-help-scout"
         ) from exc
 
-    if getattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 0) < 1:
+    if getattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 0) < 1 or not hasattr(
+        dlt_utils, "PIPELINE_SCOPE_ATTR"
+    ):
         raise RuntimeError(
             "The Help Scout connector needs a cognee build with table-scoped DLT "
             "document cleanup (cognee >= 1.6.1). Upgrade cognee before syncing, so a "
@@ -330,9 +338,12 @@ def _count(stats: dict[str, int], key: str, amount: int = 1) -> None:
 
 
 def _stop_cleanly(rows: Iterator[dict], stats: dict[str, int]) -> Iterator[dict]:
-    """End the run without error on a long rate limit; state stays untouched."""
+    """End cleanly on a long limit; retain yielded rows and their bookkeeping."""
     try:
-        yield from rows
+        # A retry may emit a newer version or tombstone for an already-yielded
+        # id. Make merge select the LAST observation, not an arbitrary row.
+        for sequence, row in enumerate(rows):
+            yield {**row, "_sync_order": sequence}
     except RateLimitedError as exc:
         _count(stats, "failed_rate_limit")
         logger.warning("Help Scout: %s Stopping this run; the next run continues.", exc)
@@ -445,13 +456,22 @@ class _Api:
                 self._auth.renew()
                 renewed = True
                 continue
-            if status in (401, 403):
+            if status == 403:
+                raise _ForbiddenError(f"Help Scout {self.name} refused access (HTTP 403).")
+            if status == 401:
                 raise PermissionError(
                     f"Help Scout {self.name} refused the request (HTTP {status}). "
                     "Check the credentials and the app's permissions."
                 )
             if status == 404:
-                raise _NotFoundError()
+                # Use a fixed resource label, never expose ids, URLs or query strings.
+                kind = "resource"
+                path = url.split("?", 1)[0].rstrip("/")
+                for label in ("threads", "conversations", "articles", "collections"):
+                    if f"/{label}" in path:
+                        kind = label
+                        break
+                raise _NotFoundError(f"Help Scout {self.name}: {kind} not found (HTTP 404).")
             if status == 429:
                 wait = _rate_limit_wait(response.headers, attempt)
                 if wait > self._max_wait or attempt == _MAX_RETRIES - 1:
@@ -480,7 +500,10 @@ class _Api:
         if not value:
             return
         try:
-            self.server_time = email.utils.parsedate_to_datetime(value).astimezone(_UTC)
+            parsed = email.utils.parsedate_to_datetime(value)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=_UTC)
+            self.server_time = parsed.astimezone(_UTC)
         except (TypeError, ValueError):
             return
 
@@ -623,19 +646,25 @@ def _iter_docs(
 def _sync_conversations(
     api: _Api, state: dict, options: _Options, stats: dict[str, int]
 ) -> Iterator[dict]:
-    api.server_time = None  # the cursor comes from this run's first response
+    run_started = datetime.now(_UTC)
+    api.server_time = None
     url = f"{MAILBOX_API}/conversations"
     config = options.conversation_config()
     config_changed = "config" in state and state["config"] != config
     cursor = None if config_changed else (state.get("modified_since") or options.modified_since)
     full_listing = cursor is None
     known = {int(i) for i in state.get("known_ids") or []}
-    runs = int(state.get("runs_since_reconcile") or 0) + 1
-    # A scope change always reconciles: conversations now out of scope must go.
-    do_reconcile = config_changed or (
-        options.reconcile and (full_listing or runs >= options.reconcile_every)
+    checked = (
+        set(state.get("reconcile_checked") or [])
+        if state.get("reconcile_config") == config
+        else set()
     )
-
+    runs = int(state.get("runs_since_reconcile") or 0) + 1
+    do_reconcile = (
+        config_changed
+        or state.get("reconcile_pending", False)
+        or (options.reconcile and (full_listing or runs >= options.reconcile_every))
+    )
     base: dict[str, Any] = {"status": "all"}
     if options.mailbox_ids:
         base["mailbox"] = ",".join(str(m) for m in options.mailbox_ids)
@@ -643,67 +672,83 @@ def _sync_conversations(
     if cursor:
         changed_params["modifiedSince"] = cursor
 
-    handled: set[int] = set()
-    emitted: set[int] = set()
     gone: set[int] = set()
     stable = False
-    listing = _Listing()
-    # A conversation modified while we page moves to the end of the modifiedAt
-    # order and can push another one between pages. That shows up as a repeated
-    # id; the listing is then read again (already handled ids are skipped).
-    for _pass in range(3):
-        listing = _Listing()
-        for conversation in _iter_hal(api, url, changed_params, "conversations", listing):
-            conversation_id = conversation.get("id")
-            if conversation_id is None or conversation_id in handled:
-                continue
-            handled.add(conversation_id)
-            if _excluded(conversation, options):
-                if conversation_id in known:
-                    gone.add(conversation_id)
-                    yield _tombstone(conversation_id)
-                continue
+    scope_complete = not config_changed
+    try:
+        # Retry from page 1 with the SAME cutoff. Reprocess repeated ids across
+        # passes: their content may itself have changed while pages shifted.
+        for _pass in range(3):
+            listing = _Listing()
             try:
-                threads, extra = _threads_for(api, conversation)
-            except _NotFoundError:  # deleted between the list call and this one
-                if conversation_id in known:
+                for conversation in _iter_hal(api, url, changed_params, "conversations", listing):
+                    conversation_id = conversation.get("id")
+                    if conversation_id is None:
+                        continue
+                    if _excluded(conversation, options):
+                        known.discard(conversation_id)
+                        gone.add(conversation_id)
+                        yield _tombstone(conversation_id)
+                        continue
+                    try:
+                        threads, extra = _threads_for(api, conversation)
+                    except _NotFoundError:
+                        known.discard(conversation_id)
+                        gone.add(conversation_id)
+                        yield _tombstone(conversation_id)
+                        continue
+                    _count(stats, "conversations_thread_requests", extra)
+                    known.add(conversation_id)
+                    _count(stats, "conversations_synced")
+                    yield _conversation_row(conversation, threads, options)
+            except _UnstableListingError:
+                continue
+            if listing.consistent():
+                stable = True
+                break
+        if not stable:
+            logger.warning("Help Scout: the listing kept moving; the cursor stays where it was.")
+
+        if do_reconcile:
+            # Persist the intent even if a limit interrupts listing/verification.
+            state["reconcile_pending"] = True
+            if full_listing and stable and listing.consistent():
+                present: set[int] | None = {int(i) for i in listing.seen if i is not None}
+            else:
+                present = _list_present_ids(api, url, base)
+            if present is None:
+                _count(stats, "conversations_reconcile_skipped")
+            else:
+                missing = known - present - gone
+                checked.intersection_update(missing)
+                candidates = sorted(missing - checked)
+                for conversation_id in _confirm_gone(
+                    api, candidates, options, stats, MAX_VERIFY, checked
+                ):
+                    known.discard(conversation_id)
                     gone.add(conversation_id)
                     yield _tombstone(conversation_id)
-                continue
-            _count(stats, "conversations_thread_requests", extra)
-            emitted.add(conversation_id)
-            _count(stats, "conversations_synced")
-            yield _conversation_row(conversation, threads, options)
-        if listing.repeats == 0:
-            stable = True
-            break
-    if not stable:
-        logger.warning("Help Scout: the listing kept moving; the cursor stays where it was.")
+                pending = bool(set(candidates) - checked - gone)
+                state["reconcile_pending"] = pending
+                if not pending:
+                    checked.clear()
+                    runs = 0
+                    scope_complete = True
 
-    if do_reconcile:
-        if full_listing and stable and listing.consistent():
-            present: set[int] | None = {int(i) for i in listing.seen if i is not None}
-        else:
-            present = _list_present_ids(api, url, base)
-        if present is None:
-            _count(stats, "conversations_reconcile_skipped")
-        else:
-            candidates = sorted(known - present - gone - emitted)
-            # A scope change legitimately removes many at once, so no cap then.
-            limit = None if config_changed else MAX_VERIFY
-            for conversation_id in _confirm_gone(api, candidates, options, stats, limit):
-                gone.add(conversation_id)
-                yield _tombstone(conversation_id)
-            runs = 0
-
-    _count(stats, "conversations_forgotten", len(gone))
-    state["known_ids"] = sorted((known | emitted) - gone)
-    state["runs_since_reconcile"] = runs
-    if stable:
-        now = api.server_time or datetime.now(_UTC)
-        state["modified_since"] = _iso(now - CURSOR_OVERLAP)
-        state["config"] = config
-    logger.info("Help Scout: %d conversation(s) synced, %d forgotten.", len(emitted), len(gone))
+        state["runs_since_reconcile"] = runs
+        if stable:
+            # A missing Date header must use the START, not the end, of a long run.
+            now = api.server_time or run_started
+            state["modified_since"] = _iso(now - CURSOR_OVERLAP)
+            if scope_complete:
+                state["config"] = config
+    finally:
+        # dlt commits yielded rows on a clean rate stop. Save their identities
+        # too, including confirmed tombstones; other exceptions roll back dlt.
+        state["known_ids"] = sorted(known)
+        state["reconcile_checked"] = sorted(checked)
+        state["reconcile_config"] = config
+        _count(stats, "conversations_forgotten", len(gone))
 
 
 def _list_present_ids(api: _Api, url: str, base: dict) -> set[int] | None:
@@ -714,11 +759,11 @@ def _list_present_ids(api: _Api, url: str, base: dict) -> set[int] | None:
         for _ in _iter_hal(api, url, params, "conversations", listing):
             pass
     except _UnstableListingError as exc:
-        logger.warning("Help Scout: %s Nothing is forgotten this run.", exc)
+        logger.warning("Help Scout: %s No deletes inferred from this listing.", exc)
         return None
     if not listing.consistent():
         logger.warning(
-            "Help Scout: the id listing changed while it was read; nothing is forgotten this run."
+            "Help Scout: the id listing changed; no deletes inferred from this listing."
         )
         return None
     return {int(i) for i in listing.seen if i is not None}
@@ -730,22 +775,24 @@ def _confirm_gone(
     options: _Options,
     stats: dict[str, int],
     limit: int | None = MAX_VERIFY,
+    checked: set[int] | None = None,
 ) -> Iterator[int]:
-    """Re-check each id that looks vanished; yield only the ones really gone."""
-    if limit is not None and len(candidates) > limit:
-        _count(stats, "conversations_reconcile_skipped")
-        logger.warning(
-            "Help Scout: %d conversations look vanished at once; treating the listing "
-            "as broken and forgetting nothing this run.",
-            len(candidates),
-        )
-        return
-    for conversation_id in candidates:
+    """Verify a bounded batch. A forbidden GET alone is not proof of deletion."""
+    checked = checked if checked is not None else set()
+    for conversation_id in candidates[:limit]:
         try:
             conversation = api.get(f"{MAILBOX_API}/conversations/{conversation_id}")
         except _NotFoundError:
+            checked.add(conversation_id)
             yield conversation_id
             continue
+        except _ForbiddenError:
+            # Retain inaccessible documents. A 403 could mean missing permission,
+            # not deletion; listing-level 403 and every 401 still abort the run.
+            _count(stats, "conversations_access_denied")
+            checked.add(conversation_id)
+            continue
+        checked.add(conversation_id)
         if _excluded(conversation, options) or (
             options.mailbox_ids and conversation.get("mailboxId") not in options.mailbox_ids
         ):

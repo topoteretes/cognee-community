@@ -1,7 +1,7 @@
 """End-to-end through ``cognee.add`` (no LLM needed): a conversation deleted in
 Help Scout leaves the cognee dataset on the next sync.
 
-``cognify`` needs an LLM; the graph step runs only when ``LLM_API_KEY`` is set.
+``cognify`` needs an LLM; the graph step requires ``--run-llm-tests`` and a key.
 """
 
 import asyncio
@@ -55,8 +55,11 @@ def test_deleted_conversation_leaves_the_dataset(isolated_cognee):
     assert second == ["#101 Refund", "#103 Refund"]
 
 
-@pytest.mark.skipif(not os.environ.get("LLM_API_KEY"), reason="cognify needs an LLM")
-def test_deleted_conversation_leaves_the_graph(isolated_cognee):  # pragma: no cover - needs LLM
+def test_deleted_conversation_leaves_the_graph(isolated_cognee, request):  # pragma: no cover
+    if not request.config.getoption("--run-llm-tests"):
+        pytest.skip("live cognify requires explicit --run-llm-tests")
+    if not os.environ.get("LLM_API_KEY"):
+        pytest.skip("live cognify requires LLM_API_KEY")
     fake = FakeHelpScout([_conv(1, subject="Zebra-ticket")])
 
     async def graph_text():

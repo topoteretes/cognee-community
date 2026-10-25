@@ -111,17 +111,20 @@ all. Volatile fields (preview text, "waiting since", read state) are left out fo
 **Incremental sync.** `GET /v2/conversations?status=all&embed=threads&sortField=modifiedAt&sortOrder=asc`,
 plus `modifiedSince=<cursor>` after the first run. `status=all` is needed because the default is
 active conversations only. The cursor is **Help Scout's clock**, taken from the `Date` header of the
-run's first response, minus a 5-minute overlap, so a local clock that runs ahead cannot hide changes.
-It is kept in dlt resource state and only moves after a fully successful run.
+run's first response, minus a 5-minute overlap. If Date is absent, the fallback is the local
+run-start time (not the end of a long run). It is kept in dlt resource state.
 
 If a conversation changes while the listing is being paged, it jumps to the end of the
 `modifiedAt` order and can push another conversation across a page boundary. That shows up as a
-repeated id; the listing is then read again (already handled ids are skipped). If it keeps moving,
-the cursor stays where it was, so nothing is skipped.
+repeated id or changing `totalElements`. Incomplete counts are also rejected. The listing is read
+again from page 1 with the same cutoff, including previously seen records in case their content
+changed. After three unstable attempts, the cursor stays put for a later retry. These checks reduce
+page-shift misses; this API does not provide a snapshot under arbitrary concurrent changes.
 
 **Configuration changes.** `mailbox_ids`, `include_notes` and `include_spam` are stored next to the
 cursor. When they change, the next run does a full listing and a reconcile: an inbox added later is
-backfilled, and conversations of an inbox removed later are forgotten.
+backfilled, and conversations of an inbox removed later are forgotten. The new config is committed
+only after its reconcile completes; unstable listings or pending verification batches keep it pending.
 
 **Threads and the rate limit.** Thread bodies come embedded in the list: one request returns up to
 25 conversations with their threads. The per-conversation threads endpoint is called only when the
@@ -139,10 +142,15 @@ when something is deleted mid-listing, so a vanished id is only forgotten when:
 2. a re-check of that id (`GET /conversations/{id}`) says it is gone (`404`, deleted, spam, or now
    outside `mailbox_ids`).
 
-More than 200 vanished ids at once is treated as a broken listing, not a mass delete (except
-right after a configuration change, where removing an inbox legitimately removes many). Docs articles
+At most 200 candidates are verified per run, including after configuration changes. Pending batches
+continue on the next run rather than waiting for `reconcile_every`. Checked-live IDs are remembered
+within the cycle, so lower IDs cannot starve later deletions. When the cycle ends, the regular cadence
+resumes. A per-conversation `403` is **not proof of deletion**: the document stays, an access-denied
+counter is incremented, and the next regular cycle can check it again. Listing-level `403` and all
+`401` failures still abort the run. Docs articles
 follow the same rules (`count` across pages, then `GET /articles/{id}`). dlt removes tombstoned rows
-on `merge`, and cognee's orphan cleanup then deletes those documents from the dataset (see
+on `merge`. An internal `_sync_order` column makes the last observation in a run win if a
+retry emits an updated row or tombstone for the same id, and cognee's orphan cleanup then deletes those documents from the dataset (see
 `tests/test_cognee_add.py`).
 
 **Docs articles.** Collections -> article list (the Docs API returns up to 50 per page). An article's
@@ -151,8 +159,10 @@ answer fails the run instead of storing a blank document.
 
 **Rate limits and failures.** The Inbox API answers `429` with `X-RateLimit-Retry-After`; the Docs API
 with `X-RateLimit-Reset` instead. Waits up to `max_rate_limit_wait` are slept; a longer one **stops the
-run cleanly**: what was read is kept, no cursor moves, nothing is forgotten, and `failed_rate_limit` is
-counted. `5xx` and network errors are retried with backoff. Any other error aborts the run. Error
+resource cleanly**: yielded documents and confirmed tombstones are retained. Conversation IDs and
+verification progress are saved even on a partial run; that resource's cursor does not advance.
+An independent resource may have completed already. `failed_rate_limit` is counted. `5xx` and network
+errors are retried with backoff. Except for per-id reconcile `403` handling above, other errors abort. Error
 messages and logs carry the API name and status only, never URLs or ids.
 
 ## Known gaps
@@ -165,9 +175,10 @@ messages and logs carry the API name and status only, never URLs or ids.
   If that state is lost, the next run is a full backfill, and conversations that were deleted while
   the state was missing are only forgotten once cognee's own cleanup notices them.
 * **Clock.** The cursor uses Help Scout's `Date` header; if no response carries one, it falls back to
-  the local clock (still minus the 5-minute overlap).
+  local run-start time (still minus the 5-minute overlap). Local clock skew remains a risk then.
 * **Listing API.** The v2 list endpoint pages by page number. Help Scout's newer cursor-paged listing
-  would remove the page-shift problem entirely; the checks above make page numbers safe meanwhile.
+  may reduce page-shift issues. Current retries detect changed counts and repeated ids, but do not
+  guarantee snapshot isolation if concurrent changes keep the count unchanged.
 
 ## Privacy
 
@@ -188,4 +199,11 @@ while paging, a delete in the middle of a reconcile listing (60 conversations, n
 one), a live conversation missing from the listing, `404` between list and threads, adding and removing
 an inbox, `reconcile_every`, two sources in one dataset, a failed run that keeps the cursor, and the
 Docs article rules. `tests/test_cognee_add.py` runs the source through `cognee.add` and checks that a
-deleted conversation leaves the dataset; its `cognify` graph check runs when `LLM_API_KEY` is set.
+deleted conversation leaves the dataset. The live `cognify` graph test requires BOTH an explicit
+`--run-llm-tests` command-line flag and `LLM_API_KEY`. A key discovered by dotenv alone never opts in.
+Normal tests have a 60-second timeout; pagination fakes also have strict request budgets.
+
+```bash
+# Optional, makes live LLM calls:
+uv run --extra dev pytest tests/test_cognee_add.py --run-llm-tests
+```
