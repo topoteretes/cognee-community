@@ -619,7 +619,8 @@ class _Walker:
     def _emit(self, rows: list[dict]) -> Iterator[dict]:
         for row in rows:
             self.emitted += 1
-            self.stats["emitted"] += 1
+            # An archived board's tombstone comes through here too.
+            self.stats["deleted" if row.get("_deleted") else "emitted"] += 1
             yield row
 
     def _drop_board(self, board_id: str, boards: dict[str, dict], visit: dict) -> Iterator[dict]:

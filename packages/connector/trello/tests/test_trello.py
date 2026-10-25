@@ -597,8 +597,10 @@ def test_closed_board_is_forgotten_when_archived_is_excluded(trello):
     state = {}
     _run(trello, state)
     trello.boards[BOARD]["closed"] = True
-    rows = _run(trello, state)
+    stats = _stats()
+    rows = _run(trello, state, stats=stats)
     assert _ids(rows) == [f"board:{BOARD}", "card:c1"]
+    assert stats["deleted"] == 2 and stats["emitted"] == 0
 
 
 def test_bad_token_raises_and_forgets_nothing(trello):
