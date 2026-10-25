@@ -1,4 +1,8 @@
-"""In-memory stand-in for the Coda API, shared by the test modules."""
+"""In-memory stand-in for the Coda API, shared by the test modules.
+
+Like the live API, a table listing carries only references: ``updatedAt`` and
+``displayColumn`` come from the table's own endpoint.
+"""
 
 import itertools
 import re
@@ -106,7 +110,7 @@ class FakeCoda:
                 and params.get("folderId", d["folderId"]) == d["folderId"]
             ]
             return self._list(docs, params)
-        pattern = r"/docs/([\w-]+)(?:/(pages|tables)(?:/([\w-]+)/(columns|rows))?)?"
+        pattern = r"/docs/([\w-]+)(?:/(pages|tables)(?:/([\w-]+)(?:/(columns|rows))?)?)?"
         match = re.fullmatch(pattern, path)
         if not match or match.group(1) not in self.docs:
             raise CodaAPIError("Coda request failed: HTTP 404", status=404)
@@ -117,10 +121,22 @@ class FakeCoda:
             return self._list(self.pages[doc_id], params)
         if table_id is None:
             types = params.get("tableTypes", "table,view,database").split(",")
-            return self._list([t for t in self.tables[doc_id] if t["tableType"] in types], params)
+            tables = [t for t in self.tables[doc_id] if t["tableType"] in types]
+            return self._list([self._reference(t) for t in tables], params)
+        if part is None:
+            table = next((t for t in self.tables[doc_id] if t["id"] == table_id), None)
+            if table is None:
+                raise CodaAPIError("Coda request failed: HTTP 404", status=404)
+            return dict(table)
         if part == "columns":
             return self._list(self.columns[table_id], params)
         return self._list(self.rows[table_id], params)
+
+    @staticmethod
+    def _reference(table):
+        """The fields the live API puts in a table listing."""
+        keys = ("id", "type", "tableType", "href", "browserLink", "name", "parent")
+        return {key: table[key] for key in keys if key in table}
 
     def export_markdown(self, doc_id, page_id):
         if self.bad_token:

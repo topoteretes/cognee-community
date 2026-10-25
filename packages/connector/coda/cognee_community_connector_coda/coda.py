@@ -24,7 +24,8 @@ Design
   they show the rows of a table that is already synced.
 * **Incremental.** The API has no ``changedSince`` filter, so every run lists the
   pages and tables of each doc (cheap) and compares their ``updatedAt`` with the
-  last run. Only changed pages are exported again and only changed tables have
+  last run; a table's ``updatedAt`` comes from its own endpoint, since the listing
+  has none. Only changed pages are exported again and only changed tables have
   their rows read again.
 * **Forget-on-delete.** A page or table missing from its doc's listing, a doc
   that answers 404 or 410, and a doc that leaves the listing or the selection
@@ -400,7 +401,9 @@ class _Walker:
         pages = [p for p in listed_pages if _wanted_page(p, self.config)]
         tables = []
         if self.config.include_tables:
-            tables = list(self._items(f"/docs/{doc_id}/tables", {"tableTypes": _TABLE_TYPES}))
+            listed = self._items(f"/docs/{doc_id}/tables", {"tableTypes": _TABLE_TYPES})
+            details = (self._table(doc_id, table, entry) for table in listed)
+            tables = [table for table in details if table is not None]
 
         yield from self._sync_kind(doc, "pages", pages, entry, renamed, keep_pages)
         yield from self._sync_kind(doc, "tables", tables, entry, renamed, False)
@@ -444,6 +447,23 @@ class _Walker:
             del known[item_id]
             self.stats["deleted"] += 1
             yield {"id": f"{prefix}:{doc['id']}:{item_id}", "_deleted": True}
+
+    def _table(self, doc_id: str, table: dict, entry: dict) -> dict | None:
+        """The table with its ``updatedAt`` and ``displayColumn``, which the listing lacks.
+
+        ``None`` when the table was deleted after the listing, so it is forgotten.
+        """
+        try:
+            return self._call(self.client.get, f"/docs/{doc_id}/tables/{table['id']}")
+        except CodaAPIError as exc:
+            if exc.status in _DELETED:
+                return None
+            if exc.status != _FORBIDDEN:
+                raise
+        logger.warning("Coda: table %s answered 403, left unchanged.", table["id"])
+        known = (entry.get("tables") or {}).get(table["id"])
+        # Access removed: a known table keeps its last version, an unknown one is skipped.
+        return {**table, "updatedAt": known["updated"]} if known else None
 
     def _render_item(self, doc: dict, kind: str, item: dict) -> dict:
         if kind == "pages":

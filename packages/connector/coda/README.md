@@ -90,7 +90,9 @@ pages carry no content of their own and are skipped too.
 ## How sync and forget-on-delete work
 
 - **Incremental.** Coda has no "changed since" filter, so every run lists the pages and
-  tables of each doc and compares their `updatedAt` with the last run. Only changed pages
+  tables of each doc and compares their `updatedAt` with the last run. The table listing
+  carries no `updatedAt`, so each table's own endpoint is read too (one request per table
+  per run). Only changed pages
   are exported again (Coda's export runs in the background, so the connector starts it,
   waits for it and downloads the result), and only changed tables have their rows read
   again. Unchanged documents keep their id and are not processed again. Renaming a doc

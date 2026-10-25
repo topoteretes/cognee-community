@@ -292,6 +292,46 @@ def test_edited_table_row_reprocesses_only_the_table(doc):
     assert "- Status: Done" in rows[0]["content"] and doc.exports == []
 
 
+def test_table_changes_come_from_the_table_not_the_listing(doc):
+    # A live table listing carries no updatedAt, so a run reads each table's own
+    # endpoint, and only the tables that changed have their rows read again.
+    state = {}
+    _run(doc, state)
+    doc.calls.clear()
+    assert _run(doc, state) == []
+    assert (f"/docs/{DOC}/tables/grid-1", {}) in doc.calls and _row_reads(doc) == []
+
+
+def test_display_column_is_not_repeated_in_the_table_text(doc):
+    rows = _run(doc, {})
+    table = next(r for r in rows if r["id"] == f"table:{DOC}:grid-1")
+    assert "## Row: Fix export" in table["content"]
+    assert "- Task:" not in table["content"]
+
+
+@pytest.mark.parametrize("status", [404, 410])
+def test_table_deleted_after_the_listing_is_forgotten(doc, status):
+    state = {}
+    _run(doc, state)
+    doc.errors[f"/docs/{DOC}/tables/grid-1"] = status
+    rows = _run(doc, state)
+    assert [r["id"] for r in rows if r["_deleted"]] == [f"table:{DOC}:grid-1"]
+
+
+def test_table_that_answers_403_is_kept(doc):
+    state = {}
+    _run(doc, state)
+    doc.errors[f"/docs/{DOC}/tables/grid-1"] = 403
+    assert _run(doc, state) == []
+    assert "grid-1" in state["docs"][DOC]["tables"]
+
+
+def test_new_table_that_answers_403_is_skipped(doc):
+    doc.errors[f"/docs/{DOC}/tables/grid-1"] = 403
+    rows = _run(doc, {})
+    assert f"table:{DOC}:grid-1" not in [r["id"] for r in rows]
+
+
 def test_touched_but_unchanged_content_is_not_emitted(doc):
     state = {}
     _run(doc, state)
