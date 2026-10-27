@@ -5,12 +5,14 @@ headers, paging and error mapping are the real ones.
 """
 
 import json
+import logging
 import os
 import time
 
 import dlt
 import pytest
 import stripe
+from cognee.tasks.ingestion import dlt_utils
 from dlt.pipeline.exceptions import PipelineStepFailed
 from fake_stripe import ACCOUNT_ID, PLATFORM_KEY, START, FakeStripe
 
@@ -31,6 +33,11 @@ from cognee_community_connector_stripe.stripe import (
 
 ALL = list(OBJECT_TYPES)
 DAY = 24 * 3600
+# With every type selected the events are read in four families (the subscription and
+# dispute events fall under customer.* and charge.*).
+EVENTS = ["/v1/events"] * 4
+# The resource name a source derives for the fake's connected account.
+PREFIX = "stripe_acct_connected"
 
 
 def _client(fake: FakeStripe):
@@ -258,7 +265,7 @@ def test_relationships_become_node_sets():
     invoice = render_invoice(
         {
             "id": "in_1",
-            "customer": {"id": "cus_1", "object": "customer"},
+            "customer": "cus_1",
             "parent": {"subscription_details": {"subscription": "sub_1"}},
             "lines": {
                 "data": [
@@ -272,11 +279,10 @@ def test_relationships_become_node_sets():
         },
         RenderOptions(),
     )
-    assert {"customer:cus_1", "invoice:in_1", "subscription:sub_1", "product:prod_1"} <= set(
-        invoice["node_sets"]
-    )
+    # Nothing refers to an invoice or a dispute by id, so neither is a node set of its own.
+    assert set(invoice["node_sets"]) == {"customer:cus_1", "subscription:sub_1", "product:prod_1"}
     dispute = render_dispute({"id": "dp_1", "charge": "ch_1"}, RenderOptions())
-    assert set(dispute["node_sets"]) == {"dispute:dp_1", "charge:ch_1"}
+    assert set(dispute["node_sets"]) == {"charge:ch_1"}
 
 
 def test_invoice_payments_link_invoices_and_charges():
@@ -424,7 +430,7 @@ def test_unchanged_account_reads_only_events():
     rows = _run(fake, state)
 
     assert rows == []
-    assert fake.paths() == ["/v1/events"]
+    assert fake.paths() == EVENTS
 
 
 def test_edits_are_read_back_from_events():
@@ -446,7 +452,7 @@ def test_edits_are_read_back_from_events():
     assert "Status: void" in contents[objects["invoice"]["id"]]
     assert sorted(fake.paths()) == sorted(
         [
-            "/v1/events",
+            *EVENTS,
             f"/v1/customers/{objects['customer']['id']}",
             f"/v1/invoices/{objects['invoice']['id']}",
         ]
@@ -525,7 +531,7 @@ def test_events_about_cards_are_never_fetched():
     rows = _run(fake, state)
 
     assert rows == []
-    assert fake.paths() == ["/v1/events"]
+    assert fake.paths() == EVENTS
     assert objects  # the account itself is untouched
 
 
@@ -694,7 +700,7 @@ def test_a_failed_run_leaves_the_state_untouched():
     _run(fake, state)
     before = json.loads(json.dumps(state))
     fake.tick(7200)
-    fake.failures.append(("/v1/events", 401))
+    fake.fail("/v1/events", 401)
 
     with pytest.raises(stripe.AuthenticationError):
         _run(fake, state)
@@ -716,18 +722,38 @@ def test_a_revoked_connection_stops_the_sync():
 # ---------------------------------------------------------------------------
 
 
-def test_source_validates_its_arguments(monkeypatch):
-    monkeypatch.delenv("STRIPE_API_KEY", raising=False)
-    with pytest.raises(ValueError, match="API key required"):
-        stripe_source()
+def test_source_validates_its_arguments():
+    with pytest.raises(ValueError, match="API key is required"):
+        stripe_source("")
     with pytest.raises(ValueError, match="Unknown Stripe object"):
         stripe_source(PLATFORM_KEY, objects=["cards"])
+    with pytest.raises(TypeError, match=r"list of object types, e\.g\. \['customers'\]"):
+        stripe_source(PLATFORM_KEY, objects="customers")
 
 
 def test_source_declares_document_mode():
     source = stripe_source(PLATFORM_KEY, account_id=ACCOUNT_ID)
     assert source.cognee_document_source == "stripe"
-    assert source.cognee_pipeline_scope == "stripe"
+    # One pipeline, and so one cursor, per resource.
+    assert source.cognee_pipeline_scope == PREFIX
+    assert list(source.resources) == [PREFIX]
+
+
+def test_the_resource_name_keeps_accounts_apart():
+    assert stripe_source(PLATFORM_KEY).cognee_pipeline_scope == "stripe"
+    named = stripe_source(PLATFORM_KEY, account_id="acct_1", resource_name="stripe_shop")
+    assert list(named.resources) == ["stripe_shop"]
+    assert stripe_source(PLATFORM_KEY, account_id="acct_1Ab").cognee_pipeline_scope == (
+        "stripe_acct_1ab"
+    )
+    with pytest.raises(ValueError, match="resource_name"):
+        stripe_source(PLATFORM_KEY, resource_name="Not Valid")
+
+
+def test_an_older_cognee_is_refused_with_a_clear_error(monkeypatch):
+    monkeypatch.setattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 1)
+    with pytest.raises(RuntimeError, match="DOCUMENT_SYNC_VERSION >= 2"):
+        stripe_source(PLATFORM_KEY)
 
 
 @pytest.fixture
@@ -765,8 +791,9 @@ def test_merge_pipeline_applies_tombstones_and_keeps_the_cursor(pipeline):
         make_pipeline().run(source, write_disposition="merge")
         return source.cognee_sync_stats
 
-    assert run() == {"written": 6, "deleted": 0}
-    assert _table_ids(db_path, "stripe_customers") == {objects["customer"]["id"]}
+    first = run()
+    assert (first["written"], first["deleted"], first["failed"]) == (6, 0, 0)
+    assert _table_ids(db_path, f"{PREFIX}_customers") == {objects["customer"]["id"]}
 
     fake.tick(7200)
     fake.delete("products", objects["product"]["id"])
@@ -774,11 +801,11 @@ def test_merge_pipeline_applies_tombstones_and_keeps_the_cursor(pipeline):
     stats = run()
 
     # Only the change was fetched and written; everything else stayed in place.
-    assert stats == {"written": 0, "deleted": 1}
+    assert (stats["written"], stats["deleted"]) == (0, 1)
     assert "/v1/customers" not in fake.paths()
-    assert _table_ids(db_path, "stripe_products") == set()
-    assert _table_ids(db_path, "stripe_customers") == {objects["customer"]["id"]}
-    assert _table_ids(db_path, "stripe_invoices") == {objects["invoice"]["id"]}
+    assert _table_ids(db_path, f"{PREFIX}_products") == set()
+    assert _table_ids(db_path, f"{PREFIX}_customers") == {objects["customer"]["id"]}
+    assert _table_ids(db_path, f"{PREFIX}_invoices") == {objects["invoice"]["id"]}
 
 
 def test_pipeline_refuses_a_replace_run(pipeline):
@@ -801,12 +828,258 @@ def test_pipeline_failure_does_not_commit_the_cursor(pipeline):
         return stripe_source(PLATFORM_KEY, account_id=ACCOUNT_ID, http_client=fake.http_client())
 
     make_pipeline().run(source(), write_disposition="merge")
-    cursor = make_pipeline().state["sources"]["stripe"]["resources"]["stripe_objects"]["cursor"]
-    fake.failures.append(("/v1/events", 401))
+    cursor = make_pipeline().state["sources"]["stripe"]["resources"][PREFIX]["cursor"]
+    fake.fail("/v1/events", 401)
 
     with pytest.raises(PipelineStepFailed):
         make_pipeline().run(source(), write_disposition="merge")
 
-    state = make_pipeline().state["sources"]["stripe"]["resources"]["stripe_objects"]
+    state = make_pipeline().state["sources"]["stripe"]["resources"][PREFIX]
     assert state["cursor"] == cursor
     assert os.path.exists(_db_path)
+
+
+# ---------------------------------------------------------------------------
+# Events are filtered on the server
+# ---------------------------------------------------------------------------
+
+
+def _event_filters(fake: FakeStripe) -> list[str]:
+    return sorted(query["type"] for _m, path, query, _h in fake.requests if path == "/v1/events")
+
+
+def test_events_are_filtered_on_the_server():
+    fake = FakeStripe()
+    objects = _billing(fake)
+    state: dict = {}
+    _run(fake, state)
+    fake.tick(7200)
+    # Plenty of events about things this connector never reads.
+    for index in range(150):
+        fake.event("payment_method.attached", {"id": f"pm_{index}", "object": "payment_method"})
+    fake.update("customers", objects["customer"]["id"], name="Alphacorp Inc")
+    fake.clear_requests()
+
+    rows = _run(fake, state)
+
+    assert _ids(rows) == {objects["customer"]["id"]}
+    assert _event_filters(fake) == ["charge.*", "customer.*", "invoice.*", "product.*"]
+    # The unrelated events never reached the client, so each family was one page.
+    assert fake.paths().count("/v1/events") == 4
+
+
+@pytest.mark.parametrize(
+    ("objects", "expected"),
+    [
+        (["customers"], ["customer.*"]),
+        (["subscriptions"], ["customer.subscription.*"]),
+        (["disputes"], ["charge.dispute.*"]),
+        (["customers", "subscriptions"], ["customer.*"]),
+        (["charges", "disputes"], ["charge.*"]),
+        (["products", "invoices"], ["invoice.*", "product.*"]),
+    ],
+)
+def test_only_the_event_families_of_the_selected_types_are_read(objects, expected):
+    fake = FakeStripe()
+    _billing(fake)
+    state: dict = {}
+    _run(fake, state, objects=objects)
+    fake.tick(7200)
+    fake.clear_requests()
+
+    _run(fake, state, objects=objects)
+
+    assert _event_filters(fake) == expected
+
+
+# ---------------------------------------------------------------------------
+# A run that cannot finish stops cleanly and resumes
+# ---------------------------------------------------------------------------
+
+
+def _run_with_stats(fake: FakeStripe, state: dict, **kwargs):
+    stats: dict = {}
+    return _run(fake, state, stats=stats, **kwargs), stats
+
+
+def test_a_spent_budget_stops_cleanly_and_the_next_run_resumes():
+    fake = FakeStripe()
+    customers = {fake.add("customers", name=f"Customer {index}")["id"] for index in range(250)}
+    state: dict = {}
+
+    first, stats = _run_with_stats(fake, state, objects=["customers"], max_requests=2)
+
+    assert len(_ids(first)) == 200
+    assert (stats["failed"], stats["failed_budget"], stats["requests"]) == (1, 1, 2)
+    # The listing is unfinished, so it is not recorded as a finished sync.
+    assert "cursor" not in state
+    assert state["resume"]["after"] is not None
+
+    second, stats = _run_with_stats(fake, state, objects=["customers"])
+
+    assert len(_ids(second)) == 50
+    assert stats["failed"] == 0
+    assert _ids(first) | _ids(second) == customers
+    assert "resume" not in state
+    assert isinstance(state["cursor"], int)
+    assert len(state["known"]["customers"]) == 250
+
+
+def test_a_partial_listing_never_forgets_what_it_has_not_reached():
+    fake = FakeStripe()
+    customers = [fake.add("customers", name=f"Customer {index}") for index in range(150)]
+    state: dict = {}
+    _run(fake, state, objects=["customers"])
+    fake.tick(7200)
+    # The oldest customer is on the last page, which the first run will not reach.
+    fake.delete("customers", customers[0]["id"])
+
+    rows, stats = _run_with_stats(
+        fake, state, objects=["customers"], full_refresh=True, max_requests=1
+    )
+
+    assert stats["failed_budget"] == 1
+    assert _tombstones(rows) == set()
+    assert len(state["known"]["customers"]) == 150
+
+    rows, stats = _run_with_stats(fake, state, objects=["customers"])
+
+    assert _tombstones(rows) == {customers[0]["id"]}
+    assert len(state["known"]["customers"]) == 149
+
+
+def test_a_rate_limit_that_outlasts_the_retries_stops_the_run_cleanly():
+    fake = FakeStripe()
+    customers = {fake.add("customers", name=f"Customer {index}")["id"] for index in range(120)}
+    fake.fail("/v1/customers", 429, "Too many requests.")
+    state: dict = {}
+
+    rows, stats = _run_with_stats(fake, state, objects=["customers"])
+
+    assert rows == []
+    assert (stats["failed"], stats["failed_rate_limit"]) == (1, 1)
+    assert state["resume"]["queue"] == ["customers"]
+
+    rows, stats = _run_with_stats(fake, state, objects=["customers"])
+
+    assert _ids(rows) == customers
+    assert stats["failed"] == 0
+
+
+def test_a_long_event_walk_falls_back_to_a_listing():
+    """Reading the events would cost more than half the budget, so the type is listed."""
+    fake = FakeStripe()
+    customer = fake.add("customers", name="Alphacorp")
+    state: dict = {}
+    _run(fake, state, objects=["customers"])
+    fake.tick(7200)
+    for _ in range(600):
+        fake.event("customer.updated", fake.objects["customers"][customer["id"]])
+    fake.clear_requests()
+
+    rows, stats = _run_with_stats(fake, state, objects=["customers"], max_requests=10)
+
+    assert _ids(rows) == {customer["id"]}
+    assert stats["failed"] == 0
+    assert fake.paths()[-1] == "/v1/customers"
+    assert fake.paths().count("/v1/events") <= 6
+
+
+def test_the_connection_is_checked_before_every_request():
+    fake = FakeStripe()
+    for index in range(250):
+        fake.add("customers", name=f"Customer {index}")
+    calls = []
+
+    def check_active():
+        calls.append(1)
+        if len(calls) > 2:
+            raise RuntimeError("connection revoked")
+
+    with pytest.raises(RuntimeError, match="connection revoked"):
+        _run(fake, {}, objects=["customers"], check_active=check_active)
+
+    # The third request never left, though rows of the first two pages were already read.
+    assert fake.paths() == ["/v1/customers"] * 2
+
+
+# ---------------------------------------------------------------------------
+# Failures never leak the API key
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("status", "error", "reason"),
+    [
+        (401, stripe.AuthenticationError, "failed_auth"),
+        (403, stripe.PermissionError, "failed_auth"),
+        (404, stripe.InvalidRequestError, None),
+        (429, None, "failed_rate_limit"),
+        (500, stripe.APIError, None),
+        (503, stripe.APIError, None),
+    ],
+)
+def test_the_api_key_never_appears_in_errors_or_logs(status, error, reason, caplog, capsys):
+    caplog.set_level(logging.DEBUG)
+    fake = FakeStripe()
+    _billing(fake)
+    fake.fail("/v1/customers", status, "Injected failure.")
+    stats: dict = {}
+    texts = []
+
+    if error is None:
+        _run(fake, {}, stats=stats)
+    else:
+        with pytest.raises(error) as raised:
+            _run(fake, {}, stats=stats)
+        texts += [str(raised.value), repr(raised.value), str(raised.value.__dict__)]
+
+    output = capsys.readouterr()
+    texts += [caplog.text, output.out, output.err, json.dumps(stats)]
+    assert all(PLATFORM_KEY not in text for text in texts)
+    assert (reason in stats) if reason else not any(key.startswith("failed_") for key in stats)
+
+
+# ---------------------------------------------------------------------------
+# Two accounts in one dataset
+# ---------------------------------------------------------------------------
+
+
+def test_two_accounts_in_one_dataset_keep_their_own_tables_and_cursors(tmp_path):
+    dataset = "stripe_shared"
+    start = int(time.time()) - 3600
+    shop = FakeStripe(start=start, account_id="acct_shop")
+    cafe = FakeStripe(start=start, account_id="acct_cafe")
+    shop.add("customers", object_id="cus_shop", name="Shop")
+    cafe.add("customers", object_id="cus_cafe", name="Cafe")
+
+    def run(fake: FakeStripe):
+        source = stripe_source(
+            PLATFORM_KEY,
+            account_id=fake.account_id,
+            objects=["customers"],
+            http_client=fake.http_client(),
+        )
+        # cognee names the pipeline from the dataset and the source's scope.
+        pipeline = dlt.pipeline(
+            pipeline_name=dlt_utils.pipeline_name_for_source(source, dataset),
+            destination=dlt.destinations.sqlalchemy(f"sqlite:///{tmp_path / 'stripe.db'}"),
+            dataset_name=dataset,
+            pipelines_dir=str(tmp_path / "pipelines"),
+        )
+        pipeline.run(source, write_disposition="merge")
+        return pipeline, source.cognee_sync_stats
+
+    run(shop)
+    run(cafe)
+    shop.tick(7200)
+    shop.delete("customers", "cus_shop")
+    shop_pipeline, stats = run(shop)
+
+    db_path = tmp_path / f"stripe__{dataset}.db"
+    # Syncing one account tombstoned only that account's customer.
+    assert (stats["written"], stats["deleted"]) == (0, 1)
+    assert _table_ids(db_path, "stripe_acct_shop_customers") == set()
+    assert _table_ids(db_path, "stripe_acct_cafe_customers") == {"cus_cafe"}
+    shop_state = shop_pipeline.state["sources"]["stripe"]["resources"]["stripe_acct_shop"]
+    assert shop_state["known"] == {"customers": []}

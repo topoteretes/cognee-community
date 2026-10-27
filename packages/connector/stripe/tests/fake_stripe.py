@@ -17,11 +17,14 @@ It mirrors the Stripe behaviour the connector relies on:
   is how invoices and charges are tied together since API version 2025-03-31)
   are only returned when the request expands them, and charges carry no
   ``invoice`` field;
+* events filter on ``type``, which takes a trailing wildcard (``charge.*``);
+  ``types`` takes none and is refused when it carries one;
 * a deleted customer stays retrievable as a ``deleted: true`` stub, a deleted
   product or draft invoice answers 404, and a canceled subscription stays
   listed with ``status=all``.
 """
 
+import fnmatch
 import json
 from urllib.parse import parse_qsl, urlsplit
 
@@ -57,15 +60,16 @@ _EVENT_PREFIXES = {
 class FakeStripe(BaseAdapter):
     """Serves the Stripe list, retrieve and events endpoints the connector reads."""
 
-    def __init__(self, start: int = START):
+    def __init__(self, start: int = START, account_id: str = ACCOUNT_ID):
         super().__init__()
+        self.account_id = account_id
         self.objects: dict[str, dict[str, dict]] = {name: {} for name in _PREFIXES}
         self.deleted_customers: set[str] = set()
         self.events: list[dict] = []
         # (method, path, query, headers) of every request served.
         self.requests: list[tuple[str, str, dict, dict]] = []
-        # (path substring, status): served once instead of the real response.
-        self.failures: list[tuple[str, int]] = []
+        # Failures served instead of the real response; see fail().
+        self.failures: list[dict] = []
         self.clock = start
         self._next_id = 1
 
@@ -134,6 +138,23 @@ class FakeStripe(BaseAdapter):
             }
         )
 
+    def fail(
+        self,
+        needle: str,
+        status: int,
+        message: str = "Injected failure.",
+        times: int = 1,
+        retry: bool = False,
+    ) -> None:
+        """Answer the next ``times`` requests whose path contains ``needle`` with ``status``.
+
+        The client is told not to retry unless ``retry`` is set, so a test sees the error at
+        once instead of after the library's backoff.
+        """
+        self.failures.append(
+            {"needle": needle, "status": status, "message": message, "times": times, "retry": retry}
+        )
+
     def expire_events_before(self, timestamp: int) -> None:
         """Drop events older than ``timestamp``, as Stripe's 30-day retention does."""
         self.events = [event for event in self.events if event["created"] >= timestamp]
@@ -154,22 +175,33 @@ class FakeStripe(BaseAdapter):
         headers = {key.lower(): value for key, value in request.headers.items()}
         self.requests.append((request.method, url.path, query, headers))
 
-        for index, (needle, status) in enumerate(self.failures):
-            if needle in url.path:
-                del self.failures[index]
-                return _response(request, status, _error("api_error", "Injected failure."))
+        for failure in self.failures:
+            if failure["needle"] in url.path and failure["times"] > 0:
+                failure["times"] -= 1
+                return _response(
+                    request,
+                    failure["status"],
+                    _error("api_error", failure["message"]),
+                    retry=failure["retry"],
+                )
 
         if headers.get("authorization") != f"Bearer {PLATFORM_KEY}":
             return _response(request, 401, _error("invalid_request_error", "Invalid API Key."))
-        if headers.get("stripe-account") != ACCOUNT_ID:
+        if headers.get("stripe-account") != self.account_id:
             return _response(request, 403, _error("invalid_request_error", "No such account."))
+        if any(key.startswith("types") and "*" in value for key, value in query.items()):
+            message = "The '*' character is not supported in the 'types' parameter."
+            return _response(request, 400, _error("invalid_request_error", message))
 
         parts = url.path.strip("/").split("/")
         if request.method != "GET" or len(parts) not in (2, 3) or parts[0] != "v1":
             return _response(request, 404, _error("invalid_request_error", "Unrecognized URL."))
         resource = parts[1]
         if len(parts) == 2 and resource == "events":
-            return _response(request, 200, self._list(url.path, self.events, query))
+            events = self.events
+            if "type" in query:
+                events = [e for e in events if fnmatch.fnmatchcase(e["type"], query["type"])]
+            return _response(request, 200, self._list(url.path, events, query))
         if resource not in self.objects:
             return _response(request, 404, _error("invalid_request_error", "Unrecognized URL."))
         if len(parts) == 3:
@@ -222,12 +254,14 @@ def _error(error_type: str, message: str, code: str | None = None) -> dict:
     return {"error": error}
 
 
-def _response(request, status: int, body: dict) -> requests.Response:
+def _response(request, status: int, body: dict, retry: bool = True) -> requests.Response:
     response = requests.Response()
     response.status_code = status
     response._content = json.dumps(body).encode()
     response.headers["Content-Type"] = "application/json"
     response.headers["Request-Id"] = "req_fake"
+    if not retry:
+        response.headers["Stripe-Should-Retry"] = "false"
     response.request = request
     response.url = request.url
     return response

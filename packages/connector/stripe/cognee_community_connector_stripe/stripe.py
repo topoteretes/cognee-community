@@ -1,91 +1,39 @@
-"""DLT source for Stripe billing data (events cursor + forget-on-delete).
+"""DLT source that syncs Stripe billing data into cognee as documents.
 
-Reads the customers, subscriptions, invoices, charges, products and disputes
-of one Stripe account and yields each object as a document for cognee's
-ingestion pipeline::
-
-    import cognee
-    from cognee_community_connector_stripe import stripe_source
+Reads customers, subscriptions, invoices, charges, products and disputes of one
+Stripe account. After the first full listing it follows Stripe's events, and an
+object deleted in Stripe is forgotten. The README has the design notes::
 
     await cognee.remember(
-        stripe_source(platform_secret_key, account_id="acct_..."),
+        stripe_source(api_key, account_id="acct_..."),
         dataset_name="stripe",
         primary_key="id",
         write_disposition="merge",  # required: the source emits deletions
     )
-
-Design
-------
-* **Built on the dlt verified source**: Stripe I/O uses the official
-  ``stripe`` client and the verified source's paging loop (``limit=100`` +
-  ``starting_after``, ``status=all`` for subscriptions). It differs where
-  cognee needs it to: each source carries its own credentials in a client
-  instead of setting ``stripe.api_key`` globally; objects are rendered through
-  allowlists instead of being yielded whole; and lists are not windowed by
-  ``created`` alone, which misses edits.
-* **Stripe Connect**: requests use the platform's secret key with the
-  ``Stripe-Account`` header of the connected account, as Stripe recommends
-  over the deprecated per-account OAuth access token.
-* **Documents, linked by node sets**: one row per object in
-  ``stripe_<object>`` tables (the id is Stripe's own, ``cus_...``,
-  ``sub_...``). The source declares ``cognee_document_source = "stripe"``. A
-  relational dlt source would get no row-to-row edges: cognee reads them from
-  foreign keys in the staging database, and dlt's SQLite staging tables carry
-  none, even when the resource declares ``references``. Instead every row
-  names its related objects in ``cognee_node_set``
-  (``customer:cus_1``, ``subscription:sub_1``, ...), so a customer, its
-  subscriptions, their invoices, the charges and the disputes are joined
-  through shared ``NodeSet`` nodes in the graph.
-* **Never card data**: rows are built from per-object allowlists. Payment
-  methods, card and billing details, addresses, receipt and hosted-invoice
-  links and dispute evidence are never read into a row, so a field Stripe
-  adds later cannot leak in. Contact details (email, phone) and free-form
-  ``metadata`` are opt-in.
-* **Incremental sync**: Stripe list endpoints filter on ``created`` only, so
-  edits to old objects are found through the Events API instead. A run lists
-  the events since the last run's start, re-reads each changed object and
-  upserts it (``write_disposition="merge"``). The first run, a changed
-  selection, or a cursor older than Stripe's 30-day event retention does a
-  full listing instead.
-* **Forget-on-delete**: an object that is deleted upstream (a deleted
-  customer, product or draft invoice) or leaves the selection is emitted as a
-  ``_deleted`` tombstone, so dlt drops the row and cognee's orphan cleanup
-  removes it from the graph and vector stores. A full listing tombstones every
-  known id that was not listed.
-* **Failure safety**: errors (auth, permissions, exhausted retries, network)
-  are not swallowed. They abort the run before dlt commits the rows and the
-  cursor, so nothing is forgotten and the next run starts over.
 """
 
-import os
+import re
 import time
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime
+from datetime import date, datetime, timezone
 from typing import Any
 
 import dlt
 import stripe
 from cognee.shared.logging_utils import get_logger
-from cognee.tasks.ingestion.dlt_utils import (
-    DOCUMENT_SOURCE_ATTR,
-    NODE_SET_COLUMN,
-    NODE_SET_COLUMN_HINT,
-    PIPELINE_SCOPE_ATTR,
-    guarded_rows,
-)
+from cognee.tasks.ingestion import dlt_utils
 
 logger = get_logger("stripe_connector")
 
 STRIPE_SOURCE_NAME = "stripe"
-STRIPE_RESOURCE_NAME = "stripe_objects"
-
-API_KEY_ENV = "STRIPE_API_KEY"
-ACCOUNT_ID_ENV = "STRIPE_ACCOUNT_ID"
 
 # Pinned, so every connected account returns the same object shapes whatever
 # its own default API version is.
 STRIPE_API_VERSION = "2025-03-31.basil"
+
+# Stripe requests one run may make before it stops cleanly and resumes next run.
+DEFAULT_MAX_REQUESTS = 5_000
 
 _PAGE_SIZE = 100
 _MAX_NETWORK_RETRIES = 3
@@ -102,7 +50,10 @@ _MAX_RETRIEVES_PER_TYPE = 200
 
 # Bump when rendering or the state layout changes, so the next run re-renders
 # every object instead of keeping rows rendered by an older connector.
-_STATE_VERSION = 1
+_STATE_VERSION = 2
+
+# The first cognee release whose document sources take per-row node sets.
+_MIN_DOCUMENT_SYNC_VERSION = 2
 
 # Currencies whose amounts Stripe does not express in hundredths.
 _ZERO_DECIMAL_CURRENCIES = {
@@ -139,6 +90,8 @@ class _ObjectType:
     name: str
     # The ``object`` field Stripe sets on these objects (and on event payloads).
     stripe_object: str
+    # The events that name this type, as a ``type`` filter with a wildcard.
+    event_type: str
     dashboard_path: str
     # History objects honour ``created_since``; the others are always whole.
     windowed: bool
@@ -148,13 +101,9 @@ class _ObjectType:
     # is prefixed with ``data.``, so each endpoint spells it out).
     retrieve_params: dict[str, Any] = field(default_factory=dict)
 
-    @property
-    def table_name(self) -> str:
-        return f"stripe_{self.name}"
-
 
 def stripe_client(
-    api_key: str | None = None,
+    api_key: str,
     *,
     account_id: str | None = None,
     http_client: Any = None,
@@ -162,20 +111,17 @@ def stripe_client(
     """Return a ``StripeClient`` scoped to one account.
 
     Args:
-        api_key: The Connect platform's secret key, or, to try the connector
-            on your own account, a restricted key with read access. Falls back
-            to ``STRIPE_API_KEY``.
+        api_key: The Connect platform's secret key, or a restricted key with
+            read access to read your own account.
         account_id: The connected account (``acct_...``) sent as
-            ``Stripe-Account``. Falls back to ``STRIPE_ACCOUNT_ID``; omit it
-            to read the key's own account.
+            ``Stripe-Account``. Omit it to read the key's own account.
         http_client: A ``stripe`` HTTP client (mainly a test-injection point).
     """
-    api_key = api_key or os.environ.get(API_KEY_ENV)
     if not api_key:
-        raise ValueError(f"Stripe API key required: pass api_key= or set {API_KEY_ENV}.")
+        raise ValueError("A Stripe API key is required.")
     return stripe.StripeClient(
         api_key,
-        stripe_account=account_id or os.environ.get(ACCOUNT_ID_ENV) or None,
+        stripe_account=account_id or None,
         stripe_version=STRIPE_API_VERSION,
         max_network_retries=_MAX_NETWORK_RETRIES,
         http_client=http_client,
@@ -183,7 +129,7 @@ def stripe_client(
 
 
 def stripe_source(
-    api_key: str | None = None,
+    api_key: str,
     *,
     account_id: str | None = None,
     objects: Sequence[str] | None = None,
@@ -191,41 +137,54 @@ def stripe_source(
     include_contact_details: bool = False,
     include_metadata: bool = False,
     full_refresh: bool = False,
+    resource_name: str | None = None,
+    max_requests: int | None = DEFAULT_MAX_REQUESTS,
     check_active: Callable[[], None] | None = None,
     http_client: Any = None,
 ):
     """Create a dlt source that yields Stripe objects as documents.
 
     Args:
-        api_key: The Connect platform's secret key (or a restricted read key of
-            your own account). Falls back to ``STRIPE_API_KEY``.
-        account_id: The connected account to read (``acct_...``). Falls back
-            to ``STRIPE_ACCOUNT_ID``.
-        objects: What to ingest, any of ``customers``, ``subscriptions``,
-            ``invoices``, ``charges``, ``products`` and ``disputes`` (default:
-            all). An empty list is valid and forgets everything synced before.
+        api_key: The Connect platform's secret key, or a restricted read key of
+            your own account.
+        account_id: The connected account to read (``acct_...``).
+        objects: What to ingest, a list of any of ``customers``,
+            ``subscriptions``, ``invoices``, ``charges``, ``products`` and
+            ``disputes`` (default: all). An empty list is valid and forgets
+            everything synced before.
         created_since: Only keep invoices, charges and disputes created at or
             after this time (a datetime, date, ISO string or unix timestamp).
-            Older ones are forgotten. Customers, subscriptions and products are
-            always synced whole.
+            Older ones are forgotten. The other types are always synced whole.
         include_contact_details: Also ingest customer email and phone.
         include_metadata: Also ingest each object's free-form ``metadata``.
         full_refresh: List everything this run instead of reading events.
-        check_active: Called between rows; raises to stop a sync whose
-            connection was revoked mid-run (used by the cognee integration).
+        resource_name: Names the dlt resource, the pipeline scope and the
+            staging tables, so it must differ for every account synced into
+            one dataset. Defaults to a name derived from ``account_id``.
+        max_requests: Stripe requests one run may make. A run that spends them
+            stops cleanly, keeps what it read and resumes next run. ``None``
+            lifts the limit.
+        check_active: Called before every request and row; raises to stop a
+            sync whose connection was revoked (used by the cognee integration).
         http_client: A ``stripe`` HTTP client (mainly a test-injection point).
 
     Returns:
-        A dlt source for ``cognee.remember(...)``. Pass
-        ``write_disposition="merge"``: incremental runs emit only changes and
-        tombstones, and any other disposition is refused.
+        A dlt source for ``cognee.remember(...)``, with the counts of the last
+        run in ``source.cognee_sync_stats``. Pass ``write_disposition="merge"``;
+        any other disposition is refused.
     """
+    _require_document_sync()
+    if isinstance(objects, str):
+        raise TypeError(
+            f"objects must be a list of object types, e.g. [{objects!r}], not a string."
+        )
     selected = list(dict.fromkeys(OBJECT_TYPES if objects is None else objects))
     unknown = [name for name in selected if name not in OBJECT_TYPES]
     if unknown:
         raise ValueError(
             f"Unknown Stripe object type(s) {unknown}; choose from {sorted(OBJECT_TYPES)}."
         )
+    name = _resource_name(resource_name, account_id)
     client = stripe_client(api_key, account_id=account_id, http_client=http_client)
     options = RenderOptions(
         include_contact_details=include_contact_details, include_metadata=include_metadata
@@ -234,18 +193,21 @@ def stripe_source(
     stats: dict[str, int] = {}
 
     @dlt.resource(
-        name=STRIPE_RESOURCE_NAME,
+        name=name,
         primary_key="id",
         write_disposition="merge",
         # Rows with _deleted=True are removed from the staging table on merge,
         # which is what makes cognee's orphan cleanup forget them.
-        columns={"_deleted": {"data_type": "bool", "hard_delete": True}, **NODE_SET_COLUMN_HINT},
+        columns={
+            "_deleted": {"data_type": "bool", "hard_delete": True},
+            **dlt_utils.NODE_SET_COLUMN_HINT,
+        },
     )
     def stripe_objects():
         # The caller's write_disposition overrides the one declared above. A
         # replace run of an event delta would empty every table but the
         # changed rows, so refuse it before reading anything.
-        disposition = source.resources[STRIPE_RESOURCE_NAME].write_disposition
+        disposition = source.resources[name].write_disposition
         if disposition != "merge":
             raise ValueError(
                 f'stripe_source needs write_disposition="merge", got {disposition!r}. '
@@ -255,12 +217,15 @@ def stripe_source(
             client,
             selected,
             dlt.current.resource_state(),
+            resource_name=name,
             created_since=since,
             options=options,
             full_refresh=full_refresh,
             stats=stats,
+            check_active=check_active,
+            max_requests=max_requests,
         )
-        for table_name, row in guarded_rows(rows, check_active):
+        for table_name, row in dlt_utils.guarded_rows(rows, check_active):
             yield dlt.mark.with_table_name(row, table_name)
 
     @dlt.source(name=STRIPE_SOURCE_NAME)
@@ -270,14 +235,127 @@ def stripe_source(
     source = _stripe()
     # Opt into the document path (object → text document → cognify).
     # resolve_dlt_sources reads this marker; it never imports this connector.
-    setattr(source, DOCUMENT_SOURCE_ATTR, STRIPE_SOURCE_NAME)
-    # Give the source its own dlt pipeline per dataset, so its cursor is not
-    # shared with unrelated dlt sources.
-    setattr(source, PIPELINE_SCOPE_ATTR, STRIPE_SOURCE_NAME)
-    # Counts of the last run (objects written, objects forgotten), for hosts
-    # that record how a sync went.
+    setattr(source, dlt_utils.DOCUMENT_SOURCE_ATTR, STRIPE_SOURCE_NAME)
+    # One dlt pipeline, and so one cursor, per resource name.
+    setattr(source, dlt_utils.PIPELINE_SCOPE_ATTR, name)
     source.cognee_sync_stats = stats
     return source
+
+
+def _require_document_sync() -> None:
+    """Fail clearly on a cognee that ignores per-row node sets."""
+    version = getattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 0)
+    if version < _MIN_DOCUMENT_SYNC_VERSION:
+        raise RuntimeError(
+            "The Stripe connector needs a cognee whose document sources take per-row node "
+            f"sets (DOCUMENT_SYNC_VERSION >= {_MIN_DOCUMENT_SYNC_VERSION}, cognee 1.6.4 or "
+            f"later), but this one reports {version}."
+        )
+
+
+def _resource_name(resource_name: str | None, account_id: str | None) -> str:
+    """The dlt resource name: explicit, else derived from the account so accounts stay apart."""
+    if resource_name is not None:
+        if not re.fullmatch(r"[a-z][a-z0-9_]*", resource_name):
+            raise ValueError(
+                f"resource_name {resource_name!r} must be lowercase letters, digits and "
+                "underscores, starting with a letter."
+            )
+        return resource_name
+    if not account_id:
+        return STRIPE_SOURCE_NAME
+    suffix = re.sub(r"[^a-z0-9]+", "_", account_id.lower()).strip("_")
+    return f"{STRIPE_SOURCE_NAME}_{suffix}"
+
+
+# ---------------------------------------------------------------------------
+# Requests: every Stripe call of a run goes through one place
+# ---------------------------------------------------------------------------
+
+
+class _SyncStopError(Exception):
+    """A run that ends cleanly: ``reason`` is the stats key that says why."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+class _Requests:
+    """Checks the connection before each Stripe request and counts it against the budget.
+
+    A spent budget or a rate limit that outlasts the client's retries stops the
+    run cleanly. An authentication or permission error is recorded and raised.
+    """
+
+    def __init__(
+        self,
+        client: stripe.StripeClient,
+        check_active: Callable[[], None] | None,
+        max_requests: int | None,
+        stats: dict[str, int],
+    ):
+        self.client = client
+        self._check_active = check_active
+        self._max_requests = max_requests
+        self._stats = stats
+
+    @property
+    def count(self) -> int:
+        return self._stats["requests"]
+
+    @property
+    def max_requests(self) -> int | None:
+        return self._max_requests
+
+    def call(self, request: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        if self._check_active is not None:
+            self._check_active()
+        if self._max_requests is not None and self.count >= self._max_requests:
+            raise _SyncStopError("failed_budget")
+        self._stats["requests"] += 1
+        try:
+            return request(*args, **kwargs)
+        except stripe.RateLimitError:
+            raise _SyncStopError("failed_rate_limit") from None
+        except (stripe.AuthenticationError, stripe.PermissionError):
+            self._stats["failed_auth"] = 1
+            self._stats["failed"] = 1
+            raise
+
+    def list(
+        self, service: Any, params: dict[str, Any], after: str | None = None
+    ) -> Iterator[dict]:
+        """Yield every object of a Stripe list endpoint as a plain dict.
+
+        The dlt verified source's paging loop: pages of 100, each one starting
+        after the last id of the page before, or after ``after`` to resume.
+        """
+        starting_after = after
+        while True:
+            page_params = {**params, "limit": _PAGE_SIZE}
+            if starting_after:
+                page_params["starting_after"] = starting_after
+            page = self.call(service.list, params=page_params)
+            data = [obj.to_dict() for obj in page.data]
+            yield from data
+            if not page.has_more or not data:
+                return
+            starting_after = data[-1]["id"]
+
+    def retrieve(self, service: Any, object_id: str, params: dict[str, Any]) -> dict | None:
+        """The object as a dict, or None when it was deleted."""
+        try:
+            obj = self.call(service.retrieve, object_id, params=params).to_dict()
+        except stripe.InvalidRequestError as error:
+            if error.http_status == 404:
+                return None
+            raise
+        # Deleted customers stay retrievable as a stub that says so.
+        return None if obj.get("deleted") else obj
+
+    def service(self, object_type: _ObjectType) -> Any:
+        return getattr(self.client.v1, object_type.name)
 
 
 # ---------------------------------------------------------------------------
@@ -285,27 +363,39 @@ def stripe_source(
 # ---------------------------------------------------------------------------
 
 
+def _table_name(resource_name: str, object_type: _ObjectType) -> str:
+    return f"{resource_name}_{object_type.name}"
+
+
 def sync_objects(
     client: stripe.StripeClient,
     objects: Sequence[str],
     state: dict,
     *,
+    resource_name: str = STRIPE_SOURCE_NAME,
     created_since: int | None = None,
     options: RenderOptions | None = None,
     full_refresh: bool = False,
     now: float | None = None,
     stats: dict[str, int] | None = None,
+    check_active: Callable[[], None] | None = None,
+    max_requests: int | None = DEFAULT_MAX_REQUESTS,
 ) -> Iterator[tuple[str, dict[str, Any]]]:
     """Yield ``(table_name, row)`` for everything that changed since the last run.
 
-    ``state`` holds the events ``cursor`` (when the last good run started),
-    the ``scope`` it covered and the ``known`` ids per object type. dlt only
-    persists it when the whole run loads, so a failed run leaves it as it
-    was and the next run repeats the work. ``stats``, when given, is filled
-    with the number of objects ``written`` and ``deleted``.
+    ``state`` holds the events ``cursor`` (when the last finished sync started),
+    the ``scope`` it covered, the ``known`` ids per object type and, while a
+    full listing is unfinished, the ``resume`` point. dlt only persists it when
+    the run loads, so a failed run leaves it as it was and the next run repeats
+    the work. ``stats`` is filled with ``written`` and ``deleted`` objects, the
+    ``requests`` made and, when the run did not finish, ``failed`` and its
+    reason (``failed_budget``, ``failed_rate_limit`` or ``failed_auth``).
     """
     options = options or RenderOptions()
-    started = int(time.time() if now is None else now)
+    stats = {} if stats is None else stats
+    stats.clear()
+    stats.update(written=0, deleted=0, requests=0, failed=0)
+    requests = _Requests(client, check_active, max_requests, stats)
     scope = {
         "version": _STATE_VERSION,
         "objects": sorted(objects),
@@ -314,40 +404,70 @@ def sync_objects(
         "metadata": options.include_metadata,
     }
     previous_known: dict[str, list[str]] = state.get("known") or {}
+    resume = state.get("resume") if (state.get("resume") or {}).get("scope") == scope else None
     cursor = state.get("cursor")
+    # A run that resumes a full listing keeps that listing's start as its cursor.
+    started = resume["started"] if resume else int(time.time() if now is None else now)
     incremental = (
-        not full_refresh
+        resume is None
+        and not full_refresh
         and state.get("scope") == scope
         and isinstance(cursor, int)
         and started - cursor < _EVENT_RETENTION_SECONDS
     )
 
-    known: dict[str, set[str]] = {}
-    stats = {} if stats is None else stats
-    stats.clear()
-    stats.update(written=0, deleted=0)
-    # With nothing selected there is nothing to refresh, so the events are not read.
-    changed = (
-        _changed_ids(client, cursor - _CURSOR_OVERLAP_SECONDS) if incremental and objects else {}
-    )
+    changed: dict[str, set[str]] = {}
+    if incremental and objects:
+        # With nothing selected there is nothing to refresh, so no events are read.
+        try:
+            changed = _changed_ids(requests, objects, cursor - _CURSOR_OVERLAP_SECONDS)
+        except _EventsTooLongError:
+            incremental = False
+        except _SyncStopError as stop:
+            _record_stop(stats, stop)
+            return
 
-    for name in objects:
+    queue = list(resume["queue"]) if resume else list(objects)
+    # The point a resumed listing starts from; only its first type has one.
+    progress = {"after": resume["after"], "listed": set(resume["listed"])} if resume else {}
+    known = {name: set(previous_known.get(name) or []) for name in objects}
+
+    for position, name in enumerate(queue):
         object_type = OBJECT_TYPES[name]
-        old_ids = set(previous_known.get(name) or [])
         ids = changed.get(object_type.stripe_object, set())
-        if incremental and len(ids) <= _MAX_RETRIEVES_PER_TYPE:
-            rows = _sync_changed(client, object_type, ids, old_ids, created_since, options)
+        listing = not incremental or len(ids) > _MAX_RETRIEVES_PER_TYPE
+        if listing:
+            rows = _sync_all(requests, object_type, known[name], created_since, options, progress)
         else:
-            rows = _sync_all(client, object_type, old_ids, created_since, options)
-        known[name] = set(old_ids)
-        for row in rows:
-            if row["_deleted"]:
-                known[name].discard(row["id"])
-                stats["deleted"] += 1
-            else:
-                known[name].add(row["id"])
-                stats["written"] += 1
-            yield object_type.table_name, row
+            rows = _sync_changed(requests, object_type, ids, known[name], created_since, options)
+        try:
+            for row in rows:
+                if row["_deleted"]:
+                    known[name].discard(row["id"])
+                    stats["deleted"] += 1
+                else:
+                    known[name].add(row["id"])
+                    stats["written"] += 1
+                yield _table_name(resource_name, object_type), row
+        except _SyncStopError as stop:
+            # A listing resumes where it stopped. Anything else starts over as a
+            # full listing, which is bounded by the budget and can always resume.
+            after = progress.get("after") if listing else None
+            listed = progress.get("listed", set()) if listing else set()
+            state["resume"] = {
+                "scope": scope,
+                "started": started,
+                "queue": queue[position:],
+                "after": after,
+                "listed": sorted(listed),
+            }
+            state["known"] = {n: sorted(ids) for n, ids in known.items()}
+            _record_stop(stats, stop)
+            return
+        if listing:
+            # A finished listing is the whole truth about the type.
+            known[name] = progress["listed"]
+        progress = {}
 
     # Types that left the selection are forgotten.
     for name, ids in previous_known.items():
@@ -355,41 +475,61 @@ def sync_objects(
             continue
         for object_id in ids:
             stats["deleted"] += 1
-            yield OBJECT_TYPES[name].table_name, _tombstone(object_id)
+            yield _table_name(resource_name, OBJECT_TYPES[name]), _tombstone(object_id)
 
+    state.pop("resume", None)
     state["cursor"] = started
     state["scope"] = scope
     state["known"] = {name: sorted(ids) for name, ids in known.items()}
     logger.info(
-        "Stripe: %s sync of %s: %d object(s) written, %d forgotten.",
+        "Stripe: %s sync of %s: %d object(s) written, %d forgotten, %d request(s).",
         "incremental" if incremental else "full",
         ", ".join(objects) or "nothing",
         stats["written"],
         stats["deleted"],
+        stats["requests"],
+    )
+
+
+def _record_stop(stats: dict[str, int], stop: _SyncStopError) -> None:
+    stats["failed"] = 1
+    stats[stop.reason] = 1
+    logger.warning(
+        "Stripe: sync stopped after %d request(s) (%s); what was read is kept and the "
+        "next run resumes.",
+        stats["requests"],
+        stop.reason,
     )
 
 
 def _sync_all(
-    client: stripe.StripeClient,
+    requests: _Requests,
     object_type: _ObjectType,
     old_ids: set[str],
     created_since: int | None,
     options: RenderOptions,
+    progress: dict[str, Any],
 ) -> Iterator[dict[str, Any]]:
-    """List every object of a type; tombstone known ids that were not listed."""
+    """List every object of a type; tombstone known ids that were not listed.
+
+    ``progress`` carries the last id read and the ids listed so far, so a run
+    that stops can resume from there. It ends holding every id listed.
+    """
     params = dict(object_type.list_params)
     if object_type.windowed and created_since is not None:
         params["created"] = {"gte": created_since}
-    listed: set[str] = set()
-    for obj in list_all(_service(client, object_type), params):
-        listed.add(obj["id"])
+    progress.setdefault("after", None)
+    progress.setdefault("listed", set())
+    for obj in requests.list(requests.service(object_type), params, after=progress["after"]):
         yield _row(object_type, obj, options)
-    for object_id in sorted(old_ids - listed):
+        progress["listed"].add(obj["id"])
+        progress["after"] = obj["id"]
+    for object_id in sorted(old_ids - progress["listed"]):
         yield _tombstone(object_id)
 
 
 def _sync_changed(
-    client: stripe.StripeClient,
+    requests: _Requests,
     object_type: _ObjectType,
     ids: set[str],
     old_ids: set[str],
@@ -397,9 +537,9 @@ def _sync_changed(
     options: RenderOptions,
 ) -> Iterator[dict[str, Any]]:
     """Re-read the objects events named; tombstone the ones that are gone."""
-    service = _service(client, object_type)
+    service = requests.service(object_type)
     for object_id in sorted(ids):
-        obj = _retrieve(service, object_id, object_type.retrieve_params)
+        obj = requests.retrieve(service, object_id, object_type.retrieve_params)
         out_of_window = (
             obj is not None
             and object_type.windowed
@@ -413,60 +553,49 @@ def _sync_changed(
         yield _row(object_type, obj, options)
 
 
-def _changed_ids(client: stripe.StripeClient, since: int) -> dict[str, set[str]]:
+class _EventsTooLongError(Exception):
+    """The events to read cost more than a full listing would."""
+
+
+def _changed_ids(requests: _Requests, objects: Sequence[str], since: int) -> dict[str, set[str]]:
     """Ids of the objects named by events since ``since``, keyed by object type.
 
-    Every event is read rather than filtered by type: the ``types`` filter
-    takes no wildcards and at most 20 names, fewer than the invoice events
-    alone. Events about objects this connector never reads (cards, payment
-    methods) are dropped here, unread.
+    Stripe filters on ``type`` here, which takes a trailing wildcard
+    (``customer.*``); ``types`` does not, and takes at most 20 names. Only the
+    event families of the selected types are read. The walk gives up when it
+    alone would take half the budget, so a full listing can resume instead.
     """
+    event_types = _event_types(objects)
+    limit = None if requests.max_requests is None else max(1, requests.max_requests // 2)
+    start = requests.count
     changed: dict[str, set[str]] = {}
-    for event in list_all(client.v1.events, {"created": {"gte": since}}):
-        obj = (event.get("data") or {}).get("object") or {}
-        # An upcoming invoice has no id yet; there is nothing to re-read.
-        if obj.get("id") and obj.get("object") in _STRIPE_OBJECTS:
-            changed.setdefault(obj["object"], set()).add(obj["id"])
-        # A charge's document says whether it is disputed, but a dispute's events
-        # name only the dispute, so its charge is refreshed with it.
-        if obj.get("object") == "dispute" and _id(obj.get("charge")):
-            changed.setdefault("charge", set()).add(_id(obj["charge"]))
+    for event_type in event_types:
+        params = {"created": {"gte": since}, "type": event_type}
+        for event in requests.list(requests.client.v1.events, params):
+            if limit is not None and requests.count - start > limit:
+                raise _EventsTooLongError
+            obj = (event.get("data") or {}).get("object") or {}
+            # An upcoming invoice has no id yet; there is nothing to re-read.
+            if obj.get("id") and obj.get("object") in _STRIPE_OBJECTS:
+                changed.setdefault(obj["object"], set()).add(obj["id"])
+            # A charge's document says whether it is disputed, but a dispute's events
+            # name only the dispute, so its charge is refreshed with it.
+            if obj.get("object") == "dispute" and _id(obj.get("charge")):
+                changed.setdefault("charge", set()).add(_id(obj["charge"]))
     return changed
 
 
-def list_all(service: Any, params: dict[str, Any]) -> Iterator[dict]:
-    """Yield every object of a Stripe list endpoint as a plain dict.
-
-    The dlt verified source's paging loop: pages of 100, each one starting
-    after the last id of the page before.
-    """
-    starting_after = None
-    while True:
-        page_params = {**params, "limit": _PAGE_SIZE}
-        if starting_after:
-            page_params["starting_after"] = starting_after
-        page = service.list(params=page_params)
-        data = [obj.to_dict() for obj in page.data]
-        yield from data
-        if not page.has_more or not data:
-            return
-        starting_after = data[-1]["id"]
-
-
-def _retrieve(service: Any, object_id: str, params: dict[str, Any]) -> dict | None:
-    """The object as a dict, or None when it was deleted."""
-    try:
-        obj = service.retrieve(object_id, params=params).to_dict()
-    except stripe.InvalidRequestError as error:
-        if error.http_status == 404:
-            return None
-        raise
-    # Deleted customers stay retrievable as a stub that says so.
-    return None if obj.get("deleted") else obj
-
-
-def _service(client: stripe.StripeClient, object_type: _ObjectType) -> Any:
-    return getattr(client.v1, object_type.name)
+def _event_types(objects: Sequence[str]) -> list[str]:
+    """The event ``type`` filters for the selected types, without a family another one covers."""
+    types = {OBJECT_TYPES[name].event_type for name in objects}
+    return sorted(
+        event_type
+        for event_type in types
+        if not any(
+            other != event_type and event_type.startswith(other.removesuffix("*"))
+            for other in types
+        )
+    )
 
 
 def _row(object_type: _ObjectType, obj: dict, options: RenderOptions) -> dict[str, Any]:
@@ -477,7 +606,7 @@ def _row(object_type: _ObjectType, obj: dict, options: RenderOptions) -> dict[st
         "title": row["title"],
         "content": row["content"],
         "url": f"https://dashboard.stripe.com{test_mode}/{object_type.dashboard_path}/{obj['id']}",
-        NODE_SET_COLUMN: sorted({node for node in row["node_sets"] if node}),
+        dlt_utils.NODE_SET_COLUMN: sorted({node for node in row["node_sets"] if node}),
         "_deleted": False,
     }
 
@@ -584,11 +713,7 @@ def render_invoice(invoice: dict, options: RenderOptions) -> dict[str, Any]:
     ]
     if options.include_contact_details:
         lines.append(_field("Customer email", invoice.get("customer_email")))
-    node_sets = [
-        _node("customer", customer_id),
-        _node("invoice", invoice["id"]),
-        _node("subscription", subscription_id),
-    ]
+    node_sets = [_node("customer", customer_id), _node("subscription", subscription_id)]
     # A charge does not name its invoice. The invoice's payments name the
     # PaymentIntent (or charge) that paid it, and the charge names its
     # PaymentIntent, so both documents share that node set. Stripe returns an
@@ -693,7 +818,7 @@ def render_dispute(dispute: dict, options: RenderOptions) -> dict[str, Any]:
     return {
         "title": f"Dispute {dispute['id']} ({dispute.get('reason') or 'unknown reason'})",
         "content": _join(lines),
-        "node_sets": [_node("dispute", dispute["id"]), _node("charge", charge_id)],
+        "node_sets": [_node("charge", charge_id)],
     }
 
 
@@ -702,6 +827,7 @@ OBJECT_TYPES: dict[str, _ObjectType] = {
     for object_type in (
         _ObjectType(
             name="customers",
+            event_type="customer.*",
             stripe_object="customer",
             dashboard_path="customers",
             windowed=False,
@@ -710,6 +836,7 @@ OBJECT_TYPES: dict[str, _ObjectType] = {
         ),
         _ObjectType(
             name="subscriptions",
+            event_type="customer.subscription.*",
             stripe_object="subscription",
             dashboard_path="subscriptions",
             windowed=False,
@@ -719,6 +846,7 @@ OBJECT_TYPES: dict[str, _ObjectType] = {
         ),
         _ObjectType(
             name="invoices",
+            event_type="invoice.*",
             stripe_object="invoice",
             dashboard_path="invoices",
             windowed=True,
@@ -730,6 +858,7 @@ OBJECT_TYPES: dict[str, _ObjectType] = {
         ),
         _ObjectType(
             name="charges",
+            event_type="charge.*",
             stripe_object="charge",
             dashboard_path="payments",
             windowed=True,
@@ -738,6 +867,7 @@ OBJECT_TYPES: dict[str, _ObjectType] = {
         ),
         _ObjectType(
             name="products",
+            event_type="product.*",
             stripe_object="product",
             dashboard_path="products",
             windowed=False,
@@ -746,6 +876,7 @@ OBJECT_TYPES: dict[str, _ObjectType] = {
         ),
         _ObjectType(
             name="disputes",
+            event_type="charge.dispute.*",
             stripe_object="dispute",
             dashboard_path="disputes",
             windowed=True,
@@ -767,11 +898,8 @@ def _node(kind: str, object_id: str | None) -> str:
     return f"{kind}:{object_id}" if object_id else ""
 
 
-def _id(value: Any) -> str | None:
-    """An object id, whether the field holds the id or the expanded object."""
-    if isinstance(value, dict):
-        value = value.get("id")
-    return value if isinstance(value, str) and value else None
+def _id(value: str | None) -> str | None:
+    return value or None
 
 
 def _line_product(entry: dict) -> str | None:
@@ -798,9 +926,9 @@ def _metadata(obj: dict, options: RenderOptions) -> list[str]:
     return ["Metadata:", *(f"- {key}: {metadata[key]}" for key in sorted(metadata))]
 
 
-def _money(amount: Any, currency: str | None) -> str:
+def _money(amount: int | None, currency: str | None) -> str:
     """Render a Stripe amount (in the currency's smallest unit) as ``49.00 USD``."""
-    if not isinstance(amount, int) or isinstance(amount, bool):
+    if amount is None:
         return ""
     code = (currency or "").lower()
     if code in _ZERO_DECIMAL_CURRENCIES:
@@ -822,30 +950,26 @@ def _price(price: dict) -> str:
     return f"{amount} every {count} {interval}s" if count > 1 else f"{amount} per {interval}"
 
 
-def _day(timestamp: Any) -> str:
+def _day(timestamp: int | None) -> str:
     """A unix timestamp as a UTC date. Dates, not times: rows stay stable."""
-    if not isinstance(timestamp, int) or isinstance(timestamp, bool):
+    if not timestamp:
         return ""
-    return datetime.fromtimestamp(timestamp, UTC).strftime("%Y-%m-%d")
+    return datetime.fromtimestamp(timestamp, timezone.utc).strftime("%Y-%m-%d")
 
 
-def _period(start: Any, end: Any) -> str:
+def _period(start: int | None, end: int | None) -> str:
     start_day, end_day = _day(start), _day(end)
     return f"{start_day} to {end_day}" if start_day and end_day else ""
 
 
 def _unix_time(value: datetime | date | str | int | None) -> int | None:
     """Normalize ``created_since`` to a unix timestamp."""
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        raise ValueError("created_since must be a datetime, date, ISO string or unix timestamp")
-    if isinstance(value, int):
+    if value is None or isinstance(value, int):
         return value
     if isinstance(value, str):
         value = datetime.fromisoformat(value)
     if not isinstance(value, datetime):
-        value = datetime(value.year, value.month, value.day, tzinfo=UTC)
+        value = datetime(value.year, value.month, value.day)
     if value.tzinfo is None:
-        value = value.replace(tzinfo=UTC)
+        value = value.replace(tzinfo=timezone.utc)
     return int(value.timestamp())

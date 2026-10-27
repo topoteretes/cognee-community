@@ -49,6 +49,7 @@ DATASET = "stripe_e2e_test"
 # Distinctive tokens so each customer maps to exactly one graph entity.
 ALPHA = "Alphacorp"
 BRAVO = "Bravocorp"
+CHARLIE = "Charliecorp"
 
 
 # Texts the mocked LLM was asked to extract a graph from, one per call.
@@ -68,7 +69,7 @@ async def _mock_structured_output(
         return SummarizedContent(summary="Mock summary", description="Mock summary")
     if response_model == KnowledgeGraph:
         LLM_EXTRACTIONS.append(text_input or "")
-        names = [token for token in (ALPHA, BRAVO) if text_input and token in text_input]
+        names = [t for t in (ALPHA, BRAVO, CHARLIE) if text_input and t in text_input]
         nodes = [KGNode(id=n, name=n, type="Company", description=f"{n} entity") for n in names]
         return KnowledgeGraph(nodes=nodes, edges=[])
     return response_model()
@@ -206,7 +207,7 @@ def _fake_stripe() -> tuple[FakeStripe, dict]:
 
 async def _sync(stripe: FakeStripe) -> None:
     await cognee.add(
-        stripe_source(PLATFORM_KEY, account_id=ACCOUNT_ID, http_client=stripe.http_client()),
+        stripe_source(PLATFORM_KEY, account_id=stripe.account_id, http_client=stripe.http_client()),
         dataset_name=DATASET,
         primary_key="id",
         write_disposition="merge",
@@ -249,7 +250,10 @@ async def test_billing_is_remembered_linked_and_forgotten(clean_environment):
 
     after = await _dataset_documents()
     assert set(after) == {obj["id"] for key, obj in objects.items() if key != "bravo"}
-    assert stripe.paths() == ["/v1/events", f"/v1/customers/{objects['bravo']['id']}"]
+    assert stripe.paths() == [
+        *["/v1/events"] * 4,
+        f"/v1/customers/{objects['bravo']['id']}",
+    ]
     assert all(after[object_id] == documents[object_id] for object_id in after)
     assert await _graph_has(ALPHA), "surviving customer's entity must remain"
     assert not await _graph_has(BRAVO), "deleted customer's entity must be forgotten"
@@ -272,6 +276,32 @@ async def test_unchanged_resync_makes_no_llm_call(clean_environment):
     await _sync(stripe)
     assert len(LLM_EXTRACTIONS) == 1
     assert "Renewal call booked" in LLM_EXTRACTIONS[0]
+
+
+@pytest.mark.asyncio
+async def test_two_accounts_share_a_dataset_without_forgetting_each_other(clean_environment):
+    start = int(time.time()) - 3600
+    shop = FakeStripe(start=start, account_id="acct_shop")
+    cafe = FakeStripe(start=start, account_id="acct_cafe")
+    shop.add("customers", object_id="cus_shop_a", name=ALPHA)
+    shop.add("customers", object_id="cus_shop_b", name=BRAVO)
+    cafe.add("customers", object_id="cus_cafe_a", name=CHARLIE)
+
+    await _sync(shop)
+    await _sync(cafe)
+    assert set(await _dataset_documents()) == {"cus_shop_a", "cus_shop_b", "cus_cafe_a"}
+
+    # Deleting in one account forgets only that account's customer, and syncing the other
+    # account afterwards does not take it for a deletion either.
+    shop.tick(7200)
+    shop.delete("customers", "cus_shop_b")
+    await _sync(shop)
+    await _sync(cafe)
+
+    assert set(await _dataset_documents()) == {"cus_shop_a", "cus_cafe_a"}
+    assert await _graph_has(ALPHA)
+    assert await _graph_has(CHARLIE)
+    assert not await _graph_has(BRAVO)
 
 
 @pytest.mark.asyncio
@@ -356,7 +386,7 @@ async def test_packaged_example_runs_end_to_end(clean_environment, monkeypatch, 
     monkeypatch.setattr(
         example,
         "stripe_source",
-        lambda **kwargs: stripe_source(**kwargs, http_client=stripe.http_client()),
+        lambda *args, **kwargs: stripe_source(*args, **kwargs, http_client=stripe.http_client()),
     )
 
     await example.main()

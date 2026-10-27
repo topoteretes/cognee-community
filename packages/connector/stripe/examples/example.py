@@ -62,10 +62,13 @@ async def main() -> None:
         return
 
     print("Syncing Stripe billing data into cognee ...")
-    # The key and account come from the environment. write_disposition must be
-    # "merge": later runs emit only what changed, plus deletions.
+    # write_disposition must be "merge": later runs emit only what changed, plus deletions.
     await cognee.remember(
-        stripe_source(objects=_objects()),
+        stripe_source(
+            os.environ["STRIPE_API_KEY"],
+            account_id=os.environ.get("STRIPE_ACCOUNT_ID"),
+            objects=_objects(),
+        ),
         dataset_name=DATASET_NAME,
         primary_key="id",
         write_disposition="merge",
