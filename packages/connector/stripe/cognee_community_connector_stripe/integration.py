@@ -21,11 +21,13 @@ so importing the connector never touches the integrations registry.
   types. A new connection starts with nothing selected.
 * **Sync**: ``sync_now`` runs :func:`stripe_source` for the stored selection
   into one dataset per connected account, through core's ``run_sync`` so the
-  generic routes see it in flight.
+  generic routes see it in flight. A run that stops early (a spent request budget,
+  a rate limit) records ``failed`` and its reason in the sync counts.
 * **Disconnect**: ``revoke_remote`` deauthorizes the account at Stripe, so
   the platform loses access to it, not just the local record.
 """
 
+import asyncio
 import base64
 import re
 from typing import Any
@@ -137,7 +139,11 @@ class StripeIntegration(OAuthIntegration):
         if payload.get("scope") != _SCOPE:
             # The consent screen asked for read_only; anything broader is not
             # what the user agreed to here, so the connection is not kept.
-            raise RuntimeError(f"Stripe granted scope {payload.get('scope')!r}, not {_SCOPE!r}")
+            raise RuntimeError(
+                f"Stripe granted scope {payload.get('scope')!r} instead of {_SCOPE!r}. Stripe "
+                f"grants {_SCOPE} only to platforms registered as extensions, so the platform "
+                "must be an extension to connect read-only."
+            )
         return payload
 
     async def exchange_callback(self, code: str, params: dict[str, str]) -> dict[str, Any]:
@@ -257,17 +263,22 @@ async def sync_stripe(credential: IntegrationCredential, http_client: Any = None
             http_client=http_client,
         )
         owner = await get_user(credential.user_id)
-        result = await remember(
-            source,
-            dataset_name=StripeIntegration().dataset_name(credential),
-            user=owner,
-            self_improvement=False,
-            primary_key="id",
-            write_disposition="merge",
-        )
-        stats = source.cognee_sync_stats
-        counts.update(scanned=stats.get("written", 0), deleted=stats.get("deleted", 0))
-        if getattr(result, "status", None) == "errored":
+        try:
+            result = await remember(
+                source,
+                dataset_name=StripeIntegration().dataset_name(credential),
+                user=owner,
+                self_improvement=False,
+                primary_key="id",
+                write_disposition="merge",
+            )
+        finally:
+            # Also when the run raised, so the connection says how far it got and why it
+            # stopped (failed_auth, failed_rate_limit or failed_budget).
+            stats = source.cognee_sync_stats
+            counts.update({key: value for key, value in stats.items() if key.startswith("failed")})
+            counts.update(scanned=stats.get("written", 0), deleted=stats.get("deleted", 0))
+        if counts.get("failed") or getattr(result, "status", None) == "errored":
             counts["failed"] = 1
             return SYNC_STATUS_DEGRADED, counts
         return SYNC_STATUS_OK, counts
@@ -311,6 +322,6 @@ async def _get_account(account_id: str) -> dict[str, Any]:
             if response.status == 200:
                 return await response.json()
             logger.warning("Stripe /v1/accounts lookup failed: HTTP %s", response.status)
-    except (TimeoutError, aiohttp.ClientError):
+    except (asyncio.TimeoutError, aiohttp.ClientError):
         logger.warning("Stripe /v1/accounts lookup failed", exc_info=True)
     return {}

@@ -128,8 +128,12 @@ async def test_exchange_callback_uses_the_platform_key_and_names_the_account(str
 
 @pytest.mark.asyncio
 async def test_a_broader_scope_than_read_only_is_refused(stripe_server):
-    with pytest.raises(RuntimeError, match="'read_write', not 'read_only'"):
+    with pytest.raises(RuntimeError, match="registered as extensions") as error:
         await StripeIntegration().exchange_code("broad")
+
+    # The message names what was granted and what the platform needs to be.
+    assert "'read_write' instead of 'read_only'" in str(error.value)
+    assert "must be an extension" in str(error.value)
 
 
 @pytest.mark.asyncio
