@@ -3,13 +3,13 @@ name = "cognee-community-connector-stripe"
 version = "0.1.0"
 description = "Stripe data-source connector for cognee — sync customers, subscriptions, invoices, charges, products and disputes into memory (Stripe Connect, events cursor + forget-on-delete)"
 readme = "README.md"
-requires-python = ">=3.11,<3.14"
+requires-python = ">=3.10,<3.15"
 dependencies = [
     # Needs cognee's document-mode with per-row node sets (cognee_node_set,
     # DOCUMENT_SYNC_VERSION 2) and, for the optional Stripe Connect integration
     # in register.py, the OAuthIntegration resource-picker contract and the
     # provider-neutral run_sync, all present in cognee 1.6.4.
-    "cognee==1.6.4",
+    "cognee>=1.6.4,<2",
     "dlt[sqlalchemy]>=1.9.0,<2",
     # The client library the dlt verified Stripe source is built on.
     "stripe>=16,<17",
@@ -28,7 +28,7 @@ packages = ["cognee_community_connector_stripe"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "N", "B", "UP", "C4", "PGH", "SIM", "RUF"]
