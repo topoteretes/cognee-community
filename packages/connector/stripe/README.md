@@ -36,16 +36,19 @@ unless you pass `include_metadata=True`.
 
 Links are node-set memberships, recorded in the `cognee_node_set` column: a subscription row
 carries `customer:cus_…`, `subscription:sub_…` and `product:prod_…`, and cognee stores them as
-`stripe:customer:cus_…` and so on. Each document's chunks get a `belongs_to_set` edge to those
-shared `NodeSet` nodes, so `customer → subscription → invoice → charge → dispute` is a path in the
-graph. It is deterministic and does not depend on the LLM. Since API version 2025-03-31 a charge
+`stripe:customer:cus_…` and so on. Only records that something else refers to get a node set of
+their own (customers, subscriptions, products and charges), so an invoice or a dispute adds none.
+Each document's chunks get a `belongs_to_set` edge to those shared `NodeSet` nodes, so
+`customer → subscription → invoice → charge → dispute` is a path in the graph. It is
+deterministic and does not depend on the LLM. Since API version 2025-03-31 a charge
 no longer names its invoice, so the connector expands the invoice's `payments` and links the two
 through the PaymentIntent that paid it (`payment_intent:pi_…`). Node sets also filter search
 (`node_name=["stripe:customer:cus_…"]`).
 
 ## Requirements
 
-Requires cognee 1.6.4: document mode with per-row node sets for the source, and the
+Python 3.10 to 3.14 and cognee 1.6.4 or later: document mode with per-row node sets for the
+source (checked when a source is built, so an older cognee fails with a clear error), and the
 `OAuthIntegration` resource picker and `run_sync` for the optional Stripe Connect integration.
 
 ## Install
@@ -62,7 +65,6 @@ cd packages/connector/stripe && uv sync
 import cognee
 from cognee_community_connector_stripe import stripe_source
 
-# The key and account fall back to STRIPE_API_KEY and STRIPE_ACCOUNT_ID.
 await cognee.remember(
     stripe_source(platform_secret_key, account_id="acct_..."),
     dataset_name="stripe",
@@ -88,8 +90,13 @@ any other disposition before reading anything.
 | `include_contact_details=True` | Also ingest customer email and phone. |
 | `include_metadata=True` | Also ingest each object's `metadata`. |
 | `full_refresh=True` | List everything this run instead of reading events. |
+| `max_requests=5000` | Stripe requests one run may make (`None` lifts the limit). A run that spends them, or hits a rate limit that outlasts the client's retries, stops cleanly and resumes next run. |
+| `resource_name=...` | Names the dlt resource, the pipeline scope and the staging tables. Defaults to a name derived from `account_id`, so accounts never share a cursor. |
+| `check_active=...` | Called before every request and row; raising stops the sync (used when a connection can be revoked mid-run). |
 
-Use one Stripe account per dataset. See `examples/example.py` for the full flow.
+The credentials are arguments, not environment lookups; `examples/example.py` shows reading them
+from `STRIPE_API_KEY` and `STRIPE_ACCOUNT_ID`. Several Stripe accounts can sync into one dataset:
+each gets its own resource, cursor and tables. See `examples/example.py` for the full flow.
 
 ## Try it on a free test account
 
@@ -135,7 +142,10 @@ per-account access token, so nothing secret is stored per connection.
 4. The integration asks for `read_only`. Stripe's docs list that scope for
    [extensions](https://docs.stripe.com/connect/oauth-changes-for-standard-platforms), so check
    how your platform is registered. If Stripe returns any other scope, the integration refuses
-   the connection rather than keeping broader access than the user agreed to.
+   the connection rather than keeping broader access than the user agreed to: the callback ends
+   in `error_exchange_failed` and the server log names the scope Stripe returned and says the
+   platform must be an extension. Register the platform as an extension (Stripe's docs say to
+   contact Stripe about that) to connect read-only.
 
 To try the connector without Connect, see [Try it on a free test account](#try-it-on-a-free-test-account).
 
@@ -184,8 +194,10 @@ types.
 - **Later runs: events.** Stripe's list endpoints filter on `created` only, so edits to old
   objects, like paying an invoice or renaming a customer, are invisible to a created-date
   cursor. Each run instead reads the events since the previous run started (with five minutes of
-  overlap for clock skew), re-reads each object they name, and upserts it. A run with no changes
-  costs one request. Events about cards and payment methods are dropped without being read.
+  overlap for clock skew), re-reads each object they name, and upserts it. Stripe filters the
+  events on the server by family (`customer.*`, `invoice.*`, `charge.*`, `product.*`, only those of
+  the selected types), so an unchanged account costs one request per family and events about cards
+  and payment methods are never sent.
 - **Full listing again** when the selection or options change, when `full_refresh=True`, or when
   the cursor is older than Stripe's 30-day event retention. A type with more than 200 changes in
   one run is also listed rather than re-read one object at a time.
@@ -196,10 +208,17 @@ types.
   Canceled subscriptions stay, with their new status.
 - **Incremental in memory too.** Rendering is deterministic, using dates only, so a re-read
   object that did not really change keeps its content-hash `data_id` and is not re-cognified.
-- **Failure safety.** Errors are never swallowed: an auth or permission error, retries exhausted
-  on a `5xx`, or a network failure. The run aborts before dlt commits the rows and the cursor, so
-  nothing is forgotten and the next run starts over. Only `404` and Stripe's `deleted: true` stub
-  are treated as "gone".
+- **A run that cannot finish.** Every request counts against `max_requests`. When the budget is
+  spent, or a rate limit outlasts the client's retries, the run stops cleanly: the rows it read
+  are kept, a full listing remembers where it stopped, and the next run resumes there, so an
+  account too big for one run still converges. Nothing is forgotten from a partial listing; ids
+  are tombstoned only once their type has been listed to the end. If reading the events alone
+  would take half the budget, the run lists instead. The sync counts carry `failed` and the
+  reason (`failed_budget`, `failed_rate_limit`, `failed_auth`).
+- **Failure safety.** An auth or permission error, retries exhausted on a `5xx`, or a network
+  failure aborts the run before dlt commits the rows and the cursor, so nothing is forgotten and
+  the next run starts over. Only `404` and Stripe's `deleted: true` stub are treated as "gone".
+  The API key is not echoed in the errors or logs of a 401, 403, 404, 429 or 5xx.
 
 ## Design notes
 
@@ -216,7 +235,7 @@ cognify can extract entities from.
 | Verified source | This connector | Why |
 | --- | --- | --- |
 | Sets `stripe.api_key` globally | One `StripeClient` per source | Each source carries its own credentials |
-| Secret key from `dlt.secrets` | Platform key + `Stripe-Account` (Connect) | The issue asks for Connect, and Stripe deprecates per-account tokens |
+| Secret key from `dlt.secrets` | Key passed by the caller, with `Stripe-Account` for Connect | The caller decides where credentials come from, and Stripe deprecates per-account tokens |
 | Yields whole objects (`to_dict()`) | Allowlisted rendering | Charges carry `payment_method_details`, and invoices carry addresses and hosted links |
 | `replace` windowed by `created`, or `append` for immutable types | `merge` driven by events, with tombstones | `created` misses edits, and deletions need a feed |
 | API version `2022-11-15` | `2025-03-31.basil` | Current object shapes, pinned so every account returns the same ones |
@@ -230,7 +249,8 @@ cognify can extract entities from.
   payment attempts.
 - The sync state keeps the id of every synced object (a few dozen bytes each) to detect
   deletions, so it grows with the account.
-- One Stripe account per dataset.
+- Every record that something refers to has a node set of its own, so a very large account has
+  many `NodeSet` nodes and `node_name` filters narrow to one record.
 
 ## Testing
 
@@ -253,11 +273,20 @@ and an invoice's `payments` come back only when the request expands them. The te
   clock skew is covered, card events are never fetched, and bulk changes fall back to a listing
 - deletes of customers, products and draft invoices, canceled subscriptions, a stale cursor
   after event retention, deselection and the empty selection
+- events filtered on the server: unrelated events never reach the client, and only the families
+  of the selected types are asked for
+- a spent budget and a rate limit stopping a run cleanly, the next run resuming where it stopped,
+  a partial listing forgetting nothing, a long event walk falling back to a listing, and the
+  connection being checked before every request
 - failure safety, and a real `dlt` merge pipeline where tombstones drop rows, the cursor survives
   between runs, a failed run commits nothing, and a `replace` run is refused
+- the API key never showing up in the exception text or the logs of a 401, 403, 404, 429 or 5xx
+- two accounts in one dataset keeping their own tables and cursors, and an older cognee being
+  refused with a clear error
 - the Connect integration: read-only authorize URL, Basic-auth code exchange, refusal of a broader
   scope, no tokens stored, the three-state picker and deauthorize on disconnect
 - an end-to-end `cognee.add` + `cognify` run (LLM mocked) where node sets link customer →
   subscription → invoice → charge → dispute in the graph, card digits never reach it, unchanged
-  documents keep their ids, and a deleted customer leaves the graph
+  documents keep their ids, a deleted customer leaves the graph, and two accounts syncing into one
+  dataset do not forget each other's documents
 - the integration syncing a stored selection end to end, and a smoke run of `examples/example.py`
