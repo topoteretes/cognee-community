@@ -44,16 +44,17 @@ answer = await cognee.search(
 | `rule_type` | both | `"alert"` or `"record"` to read one kind of rule. Also applied after reading, for a server that ignores it. |
 | `rule_groups` | all groups | A list of rule groups to read. Also applied after reading. Without `rule_type`, a listed group the server does not have stops the run. |
 | `include_metadata` | `False` | Also read type, unit and help text for every metric the server knows. |
-| `allow_empty` | `False` | Let one sync through that finds no rules although an earlier sync found some, or that lacks groups of `rule_groups`. Their documents are forgotten. Missing groups are remembered, so later runs skip them with a warning without the flag, until they are back. |
+| `allow_empty` | `False` | Let one sync through that finds no rules although an earlier sync found some, or that lacks groups of `rule_groups`. Their documents are forgotten. Missing groups are remembered, so later runs skip them without the flag, until they are back. Each run warns how many it skipped, with the time of the run that accepted them, and lists them in `cognee_sync_stats["skipped_groups"]`. |
 | `allow_empty_metrics` | `False` | Let one sync through whose metric metadata has under half the metrics of the last sync. Separate from `allow_empty`, so forgetting rules never forgets metrics by accident. |
 | `resource_name` | from the address, e.g. `prometheus_localhost_9090_<hash>` | Prefix of the staging tables. Each server gets its own by default; the hash of the exact address keeps `prom-eu` and `prom.eu` apart. |
 | `check_active` | none | Called before every response is used. Raise from it to stop a sync whose access was revoked. |
-| `service` | dlt's session, kept short | `requests.Session` to send requests through. By default nothing is retried: a 429, a 5xx or a dropped connection stops the run with memory unchanged, because any wait would hold cognee's staging lock and the next run re-reads everything. Each request times out after 30 s. `session` is accepted as another name for it. |
+| `service` | dlt's session, kept short | `requests.Session` to send requests through. By default a 429 stops the run with memory unchanged, because waiting would hold cognee's staging lock and the next run re-reads everything. A 5xx or a dropped connection gets one retry after at most 5 s. Each request times out after 30 s. `session` is accepted as another name for it. |
 
 All arguments are keyword-only. After a run, `source.cognee_sync_stats` holds the row count of
 each table (`rules`, and `metrics` with metadata on) and `failed_rate_limit`, the number of 429
-answers that stopped the run. The counts are cleared when a run starts and logged when it ends. A
-table that empties after holding rows logs a warning.
+answers that stopped the run, plus `skipped_groups`, the `rule_groups` entries a run skipped because
+an earlier `allow_empty=True` run accepted them as gone. The counts are cleared when a run starts
+and logged when it ends. A table that empties after holding rows logs a warning.
 
 See `examples/example.py` for the full flow.
 
@@ -155,6 +156,9 @@ Nothing has been released yet, but if you ran this connector from an earlier com
 ```bash
 uv run --with pytest pytest tests/
 ```
+
+CI (`.github/workflows/prometheus_connector_tests.yml`) runs the suite on the versions in
+`uv.lock` with Python 3.10 and 3.14, and on the floor in `pyproject.toml` (cognee 1.6.1, dlt 1.9.0).
 
 The tests run offline. A fake `requests` transport stands in for the server, so the real
 `rest_api` source and auth run against responses recorded from a local Prometheus 3.15.0

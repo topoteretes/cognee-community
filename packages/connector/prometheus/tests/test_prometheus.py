@@ -16,6 +16,7 @@ import base64
 import copy
 import json
 import re
+import threading
 import time
 from collections import Counter
 from pathlib import Path
@@ -101,6 +102,8 @@ class FakePrometheus(BaseAdapter):
         self.timeouts.append(kwargs.get("timeout"))
 
         failure = self.fail(url.path) if self.fail else None
+        if isinstance(failure, Exception):
+            raise failure  # e.g. a dropped connection
         if failure:
             response = self._response(request, *failure)
             response.headers["Retry-After"] = self.retry_after
@@ -409,6 +412,59 @@ def test_an_older_cognee_is_refused(monkeypatch):
         prometheus_source(base_url=BASE_URL)
 
 
+def _guard_groups_harness(monkeypatch, state):
+    from cognee_community_connector_prometheus import prometheus
+
+    warnings = []
+    monkeypatch.setattr(prometheus.dlt.current, "source_state", lambda: state)
+    monkeypatch.setattr(prometheus.logger, "warning", lambda *args: warnings.append(args))
+    return prometheus, warnings
+
+
+def test_a_skipped_group_keeps_the_time_of_the_run_that_accepted_it(monkeypatch):
+    state = {}
+    prometheus, warnings = _guard_groups_harness(monkeypatch, state)
+    on_server = [{"name": "node-health", "rules": []}]
+    wanted = ["node-health", "gone-a", "gone-b"]
+
+    # gone-a is accepted on 1 October, gone-b on 27 October.
+    monkeypatch.setattr(prometheus, "_now", lambda: "2026-10-01 09:00 UTC")
+    stats = {}
+    prometheus._guard_missing_groups(on_server, None, wanted[:2], True, stats)
+    assert stats["skipped_groups"] == ["gone-a"]
+    monkeypatch.setattr(prometheus, "_now", lambda: "2026-10-27 15:00 UTC")
+    prometheus._guard_missing_groups(on_server, None, wanted, True, {})
+
+    # A later run without the flag warns once per accepting run, with its time.
+    warnings.clear()
+    stats = {}
+    prometheus._guard_missing_groups(on_server, None, wanted, False, stats)
+    assert stats["skipped_groups"] == ["gone-a", "gone-b"]
+    assert sorted(args[1:] for args in warnings) == [
+        (1, "2026-10-01 09:00 UTC"),
+        (1, "2026-10-27 15:00 UTC"),
+    ]
+    # Group names are the caller's own labels: none reaches a log message.
+    assert not any(name in str(args) for args in warnings for name in wanted)
+
+    # Back on the server, a group drops out; missing again, it stops the run again.
+    back = [*on_server, {"name": "gone-a", "rules": []}]
+    prometheus._guard_missing_groups(back, None, wanted[:2], False, {})
+    assert state["forgotten_groups"] == {}
+    with pytest.raises(ValueError, match="1 of the 2 rule groups"):
+        prometheus._guard_missing_groups(on_server, None, wanted[:2], False, {})
+
+
+def test_skipped_groups_saved_by_an_earlier_commit_are_read(monkeypatch):
+    # Earlier commits kept a plain list, without the time.
+    state = {"forgotten_groups": ["gone-a"]}
+    prometheus, warnings = _guard_groups_harness(monkeypatch, state)
+    on_server = [{"name": "node-health", "rules": []}]
+    prometheus._guard_missing_groups(on_server, None, ["node-health", "gone-a"], False, {})
+    assert warnings[-1][1:] == (1, "an earlier run")
+    assert state["forgotten_groups"] == {"gone-a": "an earlier run"}
+
+
 def test_source_takes_keyword_arguments_only():
     with pytest.raises(TypeError):
         prometheus_source(BASE_URL)
@@ -477,6 +533,28 @@ def test_source_selects_only_loadable_resources():
 # ---------------------------------------------------------------------------
 # dlt pipeline: snapshot sync, forget-on-delete, fail closed
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _no_telemetry(monkeypatch):
+    # dlt 1.9 sends anonymous telemetry from a background thread that sleeps
+    # between tries. Tests that record time.sleep must only see the connector's.
+    monkeypatch.setenv("RUNTIME__DLTHUB_TELEMETRY", "false")
+
+
+def _record_sleeps(monkeypatch):
+    """Record time.sleep calls made on the main thread, which is where retries wait."""
+    real_sleep = time.sleep
+    slept = []
+
+    def sleep(seconds):
+        if threading.current_thread() is threading.main_thread():
+            slept.append(seconds)
+        else:
+            real_sleep(seconds)
+
+    monkeypatch.setattr(time, "sleep", sleep)
+    return slept
 
 
 @pytest.fixture
@@ -645,6 +723,7 @@ def test_sync_stats_count_the_rows_of_the_last_run(dlt_mod, tmp_path):
         "rules": len(_read(pipeline)),
         "metrics": len(_read(pipeline, METRICS)),
         "failed_rate_limit": 0,
+        "skipped_groups": [],
     }
     assert source.cognee_sync_stats["rules"] > 0
 
@@ -732,11 +811,28 @@ def test_a_429_stops_the_run_at_once(dlt_mod, tmp_path):
     assert _read(_pipeline(dlt_mod, tmp_path)) == before
 
 
-def test_a_5xx_stops_the_run_without_a_retry(dlt_mod, tmp_path, monkeypatch):
-    # Any wait would be spent inside cognee's staging lock, and the next run
-    # re-reads everything, so the default session never retries.
-    slept = []
-    monkeypatch.setattr(time, "sleep", slept.append)
+def test_a_transient_5xx_gets_one_short_retry(dlt_mod, tmp_path, monkeypatch):
+    # One blip should not fail the run, but any wait is spent inside cognee's
+    # staging lock, so it is one retry, a few seconds.
+    slept = _record_sleeps(monkeypatch)
+    fake = FakePrometheus()
+    fake.retry_after = "1000"
+    failed = []
+
+    def once_on_metadata(path):
+        if path.endswith("/api/v1/metadata") and not failed:
+            failed.append(path)
+            return (503, b"")
+        return None
+
+    fake.fail = once_on_metadata
+    pipeline = _run_sync(dlt_mod, tmp_path, fake, service=_session_on(fake), include_metadata=True)
+    assert _read(pipeline) and _read(pipeline, METRICS)
+    assert failed and slept == [5], "one retry, its 1000 s Retry-After capped at 5 s"
+
+
+def test_a_5xx_that_persists_stops_the_run_after_one_retry(dlt_mod, tmp_path, monkeypatch):
+    slept = _record_sleeps(monkeypatch)
     fake = FakePrometheus()
     before = _read(_run_sync(dlt_mod, tmp_path, fake))
 
@@ -745,9 +841,56 @@ def test_a_5xx_stops_the_run_without_a_retry(dlt_mod, tmp_path, monkeypatch):
     fake.fail = lambda path: (503, b"")
     with pytest.raises(PipelineStepFailed, match="503"):
         _run_sync(dlt_mod, tmp_path, fake, service=_session_on(fake))
-    assert len(fake.rule_calls()) == 1, "not retried"
-    assert slept == [], "no wait"
+    assert len(fake.rule_calls()) == 2, "one retry"
+    assert slept == [5]
     assert _read(_pipeline(dlt_mod, tmp_path)) == before
+
+
+def test_the_default_session_never_retries_a_429(monkeypatch):
+    # Not only through the response hooks: the session itself leaves 429 out of
+    # the codes it retries, so a request without the hooks is not retried either.
+    slept = _record_sleeps(monkeypatch)
+    fake = FakePrometheus()
+    fake.retry_after = "1000"
+    fake.fail = lambda path: (429, b"{}")
+    session = _session_on(fake)
+    assert session.get(f"{BASE_URL}/api/v1/rules").status_code == 429
+    assert len(fake.calls) == 1 and slept == []
+
+    fake.fail = lambda path: (503, b"")
+    fake.calls.clear()
+    assert session.get(f"{BASE_URL}/api/v1/rules").status_code == 503
+    assert len(fake.calls) == 2 and slept == [5]
+
+
+def test_a_429_on_the_metadata_call_stops_the_run(dlt_mod, tmp_path, monkeypatch):
+    # The metadata call has its own response hooks, so it gets its own test.
+    slept = _record_sleeps(monkeypatch)
+    fake = FakePrometheus()
+    fake.retry_after = "1000"
+    fake.fail = lambda path: (429, b"{}") if path.endswith("/api/v1/metadata") else None
+    source = prometheus_source(base_url=BASE_URL, service=_session_on(fake), include_metadata=True)
+    with pytest.raises(PipelineStepFailed, match=r"rate limited \(429\)"):
+        _pipeline(dlt_mod, tmp_path).run(source)
+    metadata_calls = [call for call in fake.calls if call[0].endswith("/api/v1/metadata")]
+    assert len(metadata_calls) == 1 and slept == []
+    assert source.cognee_sync_stats["failed_rate_limit"] == 1
+
+
+def test_a_dropped_connection_gets_one_short_retry(dlt_mod, tmp_path, monkeypatch):
+    slept = _record_sleeps(monkeypatch)
+    fake = FakePrometheus()
+    dropped = []
+
+    def drop_once(path):
+        if not dropped:
+            dropped.append(path)
+            return requests.ConnectionError("connection reset by peer")
+        return None
+
+    fake.fail = drop_once
+    assert _read(_run_sync(dlt_mod, tmp_path, fake, service=_session_on(fake)))
+    assert dropped and len(slept) == 1 and slept[0] <= 5
 
 
 def test_each_request_times_out_after_30_seconds(dlt_mod, tmp_path):
@@ -800,7 +943,7 @@ def test_metadata_that_lost_most_metrics_aborts(dlt_mod, tmp_path):
     assert len(_read(_run_sync(dlt_mod, tmp_path, fake, include_metadata=True), METRICS)) == 7
 
 
-def test_a_rule_group_asked_for_by_name_that_is_gone_aborts(dlt_mod, tmp_path):
+def test_a_rule_group_asked_for_by_name_that_is_gone_aborts(dlt_mod, tmp_path, monkeypatch):
     fake = FakePrometheus()
     groups = [group["name"] for group in fake.rules["data"]["groups"]][:2]
     before = _read(_run_sync(dlt_mod, tmp_path, fake, rule_groups=groups))
@@ -815,7 +958,17 @@ def test_a_rule_group_asked_for_by_name_that_is_gone_aborts(dlt_mod, tmp_path):
     # allow_empty forgets it for one run; later runs skip it without the flag.
     kept = _read(_run_sync(dlt_mod, tmp_path, fake, rule_groups=groups, allow_empty=True))
     assert kept and set(kept) < set(before)
-    assert _read(_run_sync(dlt_mod, tmp_path, fake, rule_groups=groups)) == kept
+    from cognee_community_connector_prometheus import prometheus
+
+    warnings = []
+    monkeypatch.setattr(prometheus.logger, "warning", lambda *args: warnings.append(args))
+    source = prometheus_source(base_url=BASE_URL, service=fake.session(), rule_groups=groups)
+    pipeline = _pipeline(dlt_mod, tmp_path)
+    pipeline.run(source)
+    assert _read(pipeline) == kept
+    assert source.cognee_sync_stats["skipped_groups"] == [groups[0]]
+    (skipped,) = [args for args in warnings if "skipping" in args[0]]
+    assert skipped[1] == 1 and skipped[2].endswith(" UTC")
     # Once the group is back, its rules are synced again.
     for group in fake.rules["data"]["groups"]:
         if group["name"] == "renamed":

@@ -23,6 +23,7 @@ import os
 import re
 from collections import Counter
 from collections.abc import Callable
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -67,6 +68,10 @@ _KNOWN_ANNOTATIONS = (
 # Seconds before one request gives up. dlt's default is 60, and the wait happens
 # inside cognee's staging lock, which every other dlt ingestion waits on.
 _REQUEST_TIMEOUT = 30
+# Longest wait before the one retry a 5xx or a dropped connection gets. dlt's
+# own cap is 300 s, four times per request; a few seconds rides out a blip
+# without holding the staging lock for long. A 429 is never retried.
+_RETRY_WAIT = 5
 # Control characters other than tab and newline. A NUL would make Postgres
 # refuse the whole load, so every sync would fail while that rule exists.
 _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
@@ -110,7 +115,8 @@ def prometheus_source(
             default, because a server whose rule files did not load, or a filter
             that matches nothing, looks like that, and it would forget
             everything. Missing groups are remembered, so later runs skip them
-            with a warning, until they are back.
+            with a warning and list them in ``cognee_sync_stats``, until they
+            are back.
         allow_empty_metrics: Let one sync through whose metric metadata has
             under half the metrics of the last sync. Off by default: right
             after a restart Prometheus reports metadata only for the targets
@@ -126,10 +132,10 @@ def prometheus_source(
             aborts and memory stays as it was.
         service: ``requests.Session`` to send requests through, mainly for tests.
             By default dlt's session is used, set so a sync never waits long
-            inside cognee's staging lock: nothing is retried, so a 429, a 5xx
-            or a dropped connection stops the run with memory unchanged, and
-            each request times out after 30 s. ``session`` is accepted as
-            another name for it.
+            inside cognee's staging lock: a 429 stops the run, a 5xx or a
+            dropped connection gets one retry after at most 5 s, and each
+            request times out after 30 s. ``session`` is accepted as another
+            name for it.
 
     Returns:
         A dlt source for ``cognee.add(...)`` / ``cognee.remember(...)``. Its
@@ -297,16 +303,19 @@ def _default_resource_name(parts) -> str:
 
 
 def _default_session():
-    """dlt's session with retries switched off, since it runs inside cognee's staging lock.
+    """dlt's session, kept short because it runs inside cognee's staging lock.
 
-    Every wait would hold that lock, which every other dlt ingestion in the
-    process waits on, and the next run re-reads everything anyway. So a 429
-    stops the run (``_rate_limited``), a 5xx or a dropped connection stops it
-    too, and each request gives up after ``_REQUEST_TIMEOUT``.
+    A 5xx or a dropped connection gets one retry after at most ``_RETRY_WAIT``
+    seconds, so one blip doesn't fail the run. A 429 is never retried: it is
+    left out of the retried codes, and ``_rate_limited`` stops the run from
+    inside the request before dlt's retry would see the answer anyway. Each try
+    gives up after ``_REQUEST_TIMEOUT``.
     """
     return Client(
         raise_for_status=False,
-        request_max_attempts=1,  # one try per request: no retry, so no wait
+        status_codes=tuple(range(500, 600)),  # dlt's default list also has 429
+        request_max_attempts=2,
+        request_max_retry_delay=_RETRY_WAIT,
         request_timeout=_REQUEST_TIMEOUT,
     ).session
 
@@ -343,6 +352,7 @@ def _rule_documents(
     # never shows the last good run's numbers as its own.
     stats.clear()
     stats["failed_rate_limit"] = 0
+    stats["skipped_groups"] = []
     pages = list(raw)
     data = pages[0] if len(pages) == 1 else None
     groups = data.get("groups") if isinstance(data, dict) else None
@@ -350,31 +360,38 @@ def _rule_documents(
     # ids. The type and group filters are applied here as well, for a server
     # that ignores `type` or `rule_group[]` (older Prometheus does).
     rows = list(_rule_rows(groups, Counter(), rule_type, rule_groups))
-    _guard_missing_groups(groups, rule_type, rule_groups, allow_empty)
+    _guard_missing_groups(groups, rule_type, rule_groups, allow_empty, stats)
     _guard_empty("rules", len(rows), allow_empty)
     yield rows
     _finish(stats, "rules", table, len(rows))
 
 
 def _guard_missing_groups(
-    groups: Any, rule_type: str | None, rule_groups: list[str] | None, allow_empty: bool
+    groups: Any,
+    rule_type: str | None,
+    rule_groups: list[str] | None,
+    allow_empty: bool,
+    stats: dict,
 ) -> None:
     """Refuse a sync that lacks a rule group the caller asked for by name.
 
     A group that was renamed, or whose file did not load, is otherwise forgotten
     without a word while the other groups load. With ``rule_type`` set the
     server may leave out a group that has no rule of that type, so the check is
-    skipped then. ``allow_empty=True`` lets one run forget the missing groups;
-    they are then remembered in dlt state, so later runs skip them with a
-    warning instead of stopping, until they are back. The messages give counts
-    only: group names are the caller's own labels and are kept out of logs.
+    skipped then. ``allow_empty=True`` lets one run forget the missing groups.
+    Each is then kept in dlt state with the time of that run, so later runs
+    skip it instead of stopping, until it is back. Skipped groups are listed in
+    ``cognee_sync_stats["skipped_groups"]`` and counted in a warning on every
+    run. Log messages give counts only: group names are the caller's own labels.
     """
     if not rule_groups or rule_type or not isinstance(groups, list):
         return
     state = dlt.current.source_state()
     present = {group.get("name") for group in groups if isinstance(group, dict)}
     missing = sorted(set(rule_groups) - present)
-    accepted = set(state.get("forgotten_groups") or [])
+    accepted = state.get("forgotten_groups") or {}
+    if isinstance(accepted, list):  # written by an earlier commit, time unknown
+        accepted = dict.fromkeys(accepted, "an earlier run")
     new = [group for group in missing if group not in accepted]
     if new and not allow_empty:
         raise ValueError(
@@ -383,13 +400,22 @@ def _guard_missing_groups(
             "rules. Pass allow_empty=True for one run to forget them; later runs then "
             "skip them with a warning."
         )
-    if missing:
+    now = _now()
+    kept = {group: accepted.get(group, now) for group in missing}
+    for when in sorted(set(kept.values())):
         logger.warning(
-            "Prometheus: %s rule groups in rule_groups are not on the server; "
-            "their rules are forgotten",
-            len(missing),
+            "Prometheus: skipping %s rule groups of rule_groups: not on the server, "
+            "accepted as gone by the allow_empty=True run of %s",
+            sum(1 for group in missing if kept[group] == when),
+            when,
         )
-    state["forgotten_groups"] = missing
+    stats["skipped_groups"] = missing
+    state["forgotten_groups"] = kept
+
+
+def _now() -> str:
+    """The time a run accepted a missing group, as shown in its warnings."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
 def _guard_metric_drop(count: int, allow_empty_metrics: bool) -> None:
