@@ -59,7 +59,15 @@ from typing import Any
 
 from cognee.shared.logging_utils import get_logger
 
+try:
+    from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
+except ImportError:
+    DOCUMENT_SOURCE_ATTR = "cognee_document_source"
+
 logger = get_logger("slack_export_connector")
+
+SLACK_TABLE_NAME = "slack_messages"
+SLACK_SOURCE_NAME = "slack"
 
 # Slack membership/config notices arrive as ``type == "message"`` events
 # distinguished only by their ``subtype`` (e.g. "<@U> has joined the channel").
@@ -203,10 +211,13 @@ def iter_slack_export_messages(export_path: str | os.PathLike) -> Iterator[dict]
                 user_id = message.get("user") or message.get("bot_id")
                 user_name = user_lookup.get(user_id) if user_id else None
                 text = _message_text(message, user_name, channel_name)
+                title = f"#{channel_name} message by {user_name or 'unknown'}"
 
                 yielded += 1
                 yield {
                     "id": f"{channel_id}:{ts}",
+                    "title": title,
+                    "content": text,
                     "channel_id": channel_id,
                     "channel_name": channel_name,
                     "ts": ts,
@@ -232,7 +243,8 @@ def slack_export_source(export_path: str | os.PathLike):
             contains ``channels.json`` and the per-channel folders).
 
     Returns:
-        A ``dlt`` resource (``slack_messages``) with ``write_disposition="replace"``.
+        A ``dlt`` resource (``slack_messages``) with ``write_disposition="replace"``
+        and document-mode tag (``cognee_document_source = "slack"``).
         Hand it to ``cognee.remember(...)``; see the module docstring for the
         recommended ``max_rows_per_table=0`` / dedicated-dataset settings.
     """
@@ -245,8 +257,11 @@ def slack_export_source(export_path: str | os.PathLike):
 
     path = str(export_path)
 
-    @dlt.resource(name="slack_messages", primary_key="id", write_disposition="replace")
+    @dlt.resource(name=SLACK_TABLE_NAME, primary_key="id", write_disposition="replace")
     def slack_messages():
         yield from iter_slack_export_messages(path)
 
+    # Opt into the document ingestion path (message -> text document -> cognify).
+    # resolve_dlt_sources reads this marker; it never imports this connector.
+    setattr(slack_messages, DOCUMENT_SOURCE_ATTR, SLACK_SOURCE_NAME)
     return slack_messages
