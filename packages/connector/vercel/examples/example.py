@@ -1,6 +1,6 @@
 """Vercel connector demo: ask memory which deploy broke and why.
 
-Pull Vercel projects, deployments and failed-build output into cognee.
+Pull Vercel projects and deployments into cognee.
 ``vercel_source`` returns a ``dlt`` source you hand straight to
 ``cognee.remember``. Rows are ingested as normal documents, so they go through
 the full cognify entity-extraction pipeline.
@@ -14,10 +14,10 @@ Privacy / opt-in
 ----------------
 This reads project settings and deployment metadata. The env values, deploy-hook
 URLs and protection secrets that come back on the project object are never
-copied. Build output of failed deployments is off by default and switched on
-below: it is ingested as Vercel returns it, and Vercel only redacts sensitive
-values of 32 characters or more, so leave it off if your builds can print
-secrets. Use a dedicated dataset so you can wipe it on its own.
+copied. Build output of failed deployments is off, the default: it is ingested
+as Vercel returns it, and Vercel only redacts sensitive values of 32 characters
+or more. Read the README's Limits before passing include_build_logs=True. Use a
+dedicated dataset so you can wipe it on its own.
 
 One-time setup
 --------------
@@ -54,10 +54,9 @@ async def main() -> None:
         return
 
     # Scope with project_ids=[...] and lookback_days=...; the defaults read every
-    # project the token can see and the last 30 days of deployments.
-    # include_build_logs=True: also read what failed builds printed. Off by
-    # default, because a build can print a secret into its log.
-    source = vercel_source(lookback_days=7, include_build_logs=True)
+    # project the token can see and the last 30 days of deployments. Build logs
+    # stay off: a build can print a secret into its log.
+    source = vercel_source(lookback_days=7)
 
     print("Syncing Vercel projects and deployments into cognee ...")
     # self_improvement=False: a re-sync should not trigger the whole-graph
@@ -65,7 +64,7 @@ async def main() -> None:
     await cognee.remember(source, dataset_name=DATASET_NAME, self_improvement=False)
 
     answer = await cognee.search(
-        query_text="Which deployments failed, and what did the build output say?",
+        query_text="Which deployments failed, and with what error?",
         query_type=cognee.SearchType.GRAPH_COMPLETION,
         datasets=[DATASET_NAME],
     )

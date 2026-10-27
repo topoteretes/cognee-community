@@ -15,6 +15,7 @@ import gzip
 import itertools
 import json
 import sqlite3
+import threading
 import time
 from urllib.parse import parse_qs, urlsplit
 
@@ -190,6 +191,8 @@ class FakeVercel(BaseAdapter):
             response._content = b"<html>maintenance</html>"
             return response
         status = self.fail(url.path, params) if self.fail else None
+        if isinstance(status, Exception):
+            raise status  # e.g. a dropped connection
         if status:
             response = self._response(request, status, {"error": {"code": "boom"}})
             response.headers["Retry-After"] = self.retry_after
@@ -584,6 +587,28 @@ def test_project_ids_must_be_a_list():
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _no_telemetry(monkeypatch):
+    # dlt 1.9 sends anonymous telemetry from a background thread that sleeps
+    # between tries. Tests that record time.sleep must only see the connector's.
+    monkeypatch.setenv("RUNTIME__DLTHUB_TELEMETRY", "false")
+
+
+def _record_sleeps(monkeypatch):
+    """Record time.sleep calls made on the main thread, which is where retries wait."""
+    real_sleep = time.sleep
+    slept = []
+
+    def sleep(seconds):
+        if threading.current_thread() is threading.main_thread():
+            slept.append(seconds)
+        else:
+            real_sleep(seconds)
+
+    monkeypatch.setattr(time, "sleep", sleep)
+    return slept
+
+
 @pytest.fixture
 def dlt_mod():
     return pytest.importorskip("dlt")
@@ -948,7 +973,7 @@ def test_a_selected_project_that_is_gone_aborts_and_names_it(dlt_mod, tmp_path):
     assert {table: _read(_pipeline(dlt_mod, tmp_path), table) for table in _TABLES} == before
 
 
-def test_allow_empty_forgets_a_selected_project_that_is_gone(dlt_mod, tmp_path):
+def test_allow_empty_forgets_a_selected_project_that_is_gone(dlt_mod, tmp_path, monkeypatch):
     # For a one-entry selection, dropping the entry would sync the whole account.
     fake = _fleet()
     _run_sync(dlt_mod, tmp_path, fake, project_ids=["web"])
@@ -962,9 +987,21 @@ def test_allow_empty_forgets_a_selected_project_that_is_gone(dlt_mod, tmp_path):
     assert set(_read(pipeline, VERCEL_PROJECTS_TABLE)) == {"prj_api"}
     assert set(_read(pipeline, VERCEL_DEPLOYMENTS_TABLE)) == {"dpl_ok2"}
 
-    # Later runs without the flag skip the forgotten entry instead of stopping.
-    pipeline = _run_sync(dlt_mod, tmp_path, fake, project_ids=["web", "prj_api"])
+    # Later runs without the flag skip the forgotten entry instead of stopping,
+    # and say so: in the counts, and in a warning naming the run that accepted it.
+    from cognee_community_connector_vercel import vercel
+
+    warnings = []
+    monkeypatch.setattr(vercel.logger, "warning", lambda *args: warnings.append(args))
+    source = vercel_source(
+        token="test-token", service=fake.session(), project_ids=["web", "prj_api"]
+    )
+    pipeline = _pipeline(dlt_mod, tmp_path)
+    pipeline.run(source)
     assert set(_read(pipeline, VERCEL_DEPLOYMENTS_TABLE)) == {"dpl_ok2"}
+    assert source.cognee_sync_stats["skipped_projects"] == ["web"]
+    (skipped,) = [args for args in warnings if "skipping project_ids" in args[0]]
+    assert skipped[1] == "web" and skipped[2].endswith(" UTC")
     # A new missing entry still stops the run.
     with pytest.raises(PipelineStepFailed, match="docs"):
         _run_sync(dlt_mod, tmp_path, fake, project_ids=["web", "prj_api", "docs"])
@@ -983,6 +1020,82 @@ def test_a_selection_that_is_all_gone_lists_no_deployments(dlt_mod, tmp_path):
     assert _read(pipeline, VERCEL_DEPLOYMENTS_TABLE) == {}
     assert _deployment_calls(fake) == [], "nothing selected is left, so nothing is listed"
     assert fake.event_paths() == []
+
+
+def test_the_missing_project_error_counts_every_project_the_token_sees(dlt_mod, tmp_path):
+    fake = _fleet_with_docs()  # web, api and docs
+    with pytest.raises(PipelineStepFailed, match=r"among the 3 projects this token can see"):
+        _run_sync(dlt_mod, tmp_path, fake, project_ids=["web", "prj_typo"])
+
+
+def test_loading_only_some_tables_is_refused_with_a_clear_message(dlt_mod, tmp_path):
+    # The deployment tables use the projects list read in the same run.
+    fake = _fleet()
+    source = vercel_source(token="test-token", service=fake.session())
+    with pytest.raises(PipelineStepFailed, match=r"with_resources\(\).*not supported"):
+        _pipeline(dlt_mod, tmp_path).run(source.with_resources(VERCEL_DEPLOYMENTS_TABLE))
+    with pytest.raises(NotImplementedError, match=r"parallelize\(\) is not supported"):
+        source.parallelize()
+
+
+def _guard_missing_harness(monkeypatch, state):
+    from cognee_community_connector_vercel import vercel
+
+    warnings = []
+    monkeypatch.setattr(vercel.dlt.current, "source_state", lambda: state)
+    monkeypatch.setattr(vercel.logger, "warning", lambda *args: warnings.append(args))
+    return vercel, warnings
+
+
+def test_a_skipped_project_keeps_the_time_of_the_run_that_accepted_it(monkeypatch):
+    state = {}
+    vercel, warnings = _guard_missing_harness(monkeypatch, state)
+    api, web = _project("prj_api", "api"), _project("prj_web", "web")
+    wanted = {"web", "prj_api"}
+
+    # The accepting run already lists it and warns, with its own time.
+    monkeypatch.setattr(vercel, "_now", lambda: "2026-10-01 09:00 UTC")
+    stats = {}
+    vercel._guard_missing(wanted, [api], 1, True, stats)
+    assert stats["skipped_projects"] == ["web"]
+    assert warnings[-1][1:] == ("web", "2026-10-01 09:00 UTC")
+
+    # A later run without the flag keeps that time, not its own.
+    monkeypatch.setattr(vercel, "_now", lambda: "2026-10-27 15:00 UTC")
+    stats = {}
+    vercel._guard_missing(wanted, [api], 1, False, stats)
+    assert stats["skipped_projects"] == ["web"]
+    assert warnings[-1][1:] == ("web", "2026-10-01 09:00 UTC")
+    assert state["forgotten_projects"] == {"web": "2026-10-01 09:00 UTC"}
+
+    # Found again, it drops out; missing again, it stops the run again.
+    vercel._guard_missing(wanted, [api, web], 2, False, {})
+    assert state["forgotten_projects"] == {}
+    with pytest.raises(ValueError, match="not found"):
+        vercel._guard_missing(wanted, [api], 1, False, {})
+
+
+def test_skipped_projects_saved_by_an_earlier_commit_are_read(monkeypatch):
+    # Earlier commits kept a plain list, without the time.
+    state = {"forgotten_projects": ["web"]}
+    vercel, warnings = _guard_missing_harness(monkeypatch, state)
+    vercel._guard_missing({"web", "prj_api"}, [_project("prj_api", "api")], 1, False, {})
+    assert warnings[-1][1:] == ("web", "an earlier run")
+    assert state["forgotten_projects"] == {"web": "an earlier run"}
+
+
+def test_the_projects_hand_over_refuses_a_missing_or_reused_list():
+    from cognee_community_connector_vercel.vercel import _RunProjects
+
+    run = _RunProjects()
+    with pytest.raises(RuntimeError, match="needs this run's projects list"):
+        run.take("deployments")
+    run.publish([{"id": "prj_web"}])
+    assert run.take("deployments") == [{"id": "prj_web"}]
+    with pytest.raises(RuntimeError, match="needs this run's projects list"):
+        run.take("deployments")  # a second run would get last run's list
+    run.publish([])
+    assert run.take("deployments") == []
 
 
 def test_project_ids_that_match_nothing_abort(dlt_mod, tmp_path):
@@ -1194,7 +1307,7 @@ def test_an_account_that_suddenly_lists_no_projects_aborts(dlt_mod, tmp_path):
     assert {table: _read(pipeline, table) for table in _TABLES} == before
 
 
-def test_a_token_for_another_account_aborts(dlt_mod, tmp_path):
+def test_a_token_for_another_account_aborts(dlt_mod, tmp_path, monkeypatch):
     # Another account still has projects, so the empty check alone would let it
     # through, and replace would forget every document of the first account.
     fake = _fleet()
@@ -1210,9 +1323,14 @@ def test_a_token_for_another_account_aborts(dlt_mod, tmp_path):
         _run_sync(dlt_mod, tmp_path, other)
     assert {table: _read(_pipeline(dlt_mod, tmp_path), table) for table in _TABLES} == before
 
-    # Meant on purpose: allow_empty lets the switch through once.
+    # Meant on purpose: allow_empty lets the switch through once, with a warning.
+    from cognee_community_connector_vercel import vercel
+
+    warnings = []
+    monkeypatch.setattr(vercel.logger, "warning", lambda *args: warnings.append(args))
     pipeline = _run_sync(dlt_mod, tmp_path, other, allow_empty=True)
     assert set(_read(pipeline, VERCEL_PROJECTS_TABLE)) == {"prj_x"}
+    assert any("another account" in args[0] for args in warnings)
     _run_sync(dlt_mod, tmp_path, other)
 
 
@@ -1305,6 +1423,7 @@ def test_sync_stats_count_the_rows_of_the_last_run(dlt_mod, tmp_path):
         "deployments": 3,
         "build_logs": 1,
         "failed_rate_limit": 0,
+        "skipped_projects": [],
     }
 
 
@@ -1436,11 +1555,28 @@ def test_a_429_stops_the_run_at_once(dlt_mod, tmp_path):
     assert {table: _read(_pipeline(dlt_mod, tmp_path), table) for table in _TABLES} == before
 
 
-def test_a_5xx_stops_the_run_without_a_retry(dlt_mod, tmp_path, monkeypatch):
-    # Any wait would be spent inside cognee's staging lock, and the next run
-    # re-reads everything, so the default session never retries.
-    slept = []
-    monkeypatch.setattr(time, "sleep", slept.append)
+def test_a_transient_5xx_gets_one_short_retry(dlt_mod, tmp_path, monkeypatch):
+    # A run of a few hundred requests should not fail on one blip, but any wait
+    # is spent inside cognee's staging lock, so it is one retry, a few seconds.
+    slept = _record_sleeps(monkeypatch)
+    fake = _fleet()
+    fake.retry_after = "1000"
+    failed = []
+
+    def once_on_page_two(path, params):
+        if path == "/v7/deployments" and "until" in params and not failed:
+            failed.append(path)
+            return 503
+        return None
+
+    fake.fail = once_on_page_two
+    pipeline = _run_sync(dlt_mod, tmp_path, fake, service=_session_on(fake))
+    assert set(_read(pipeline, VERCEL_DEPLOYMENTS_TABLE)) == {"dpl_ok1", "dpl_ok2", "dpl_err"}
+    assert failed and slept == [5], "one retry, its 1000 s Retry-After capped at 5 s"
+
+
+def test_a_5xx_that_persists_stops_the_run_after_one_retry(dlt_mod, tmp_path, monkeypatch):
+    slept = _record_sleeps(monkeypatch)
     fake = _fleet()
     before = {table: _read(_run_sync(dlt_mod, tmp_path, fake), table) for table in _TABLES}
 
@@ -1449,9 +1585,65 @@ def test_a_5xx_stops_the_run_without_a_retry(dlt_mod, tmp_path, monkeypatch):
     fake.fail = lambda path, params: 503 if path == "/v7/deployments" else None
     with pytest.raises(PipelineStepFailed, match="503"):
         _run_sync(dlt_mod, tmp_path, fake, service=_session_on(fake))
-    assert len(_deployment_calls(fake)) == 1, "not retried"
-    assert slept == [], "no wait"
+    assert len(_deployment_calls(fake)) == 2, "one retry"
+    assert slept == [5]
     assert {table: _read(_pipeline(dlt_mod, tmp_path), table) for table in _TABLES} == before
+
+
+def test_a_429_is_never_retried(dlt_mod, tmp_path, monkeypatch):
+    slept = _record_sleeps(monkeypatch)
+    fake = _fleet()
+    fake.fail = lambda path, params: 429 if path == "/v7/deployments" else None
+    with pytest.raises(PipelineStepFailed, match=r"rate limited \(429\)"):
+        _run_sync(dlt_mod, tmp_path, fake, service=_session_on(fake))
+    assert len(_deployment_calls(fake)) == 1 and slept == []
+
+
+def test_the_default_session_never_retries_a_429(monkeypatch):
+    # Not only through the response hooks: the session itself leaves 429 out of
+    # the codes it retries, so a request without the hooks is not retried either.
+    slept = _record_sleeps(monkeypatch)
+    fake = _fleet()
+    fake.retry_after = "1000"
+    fake.fail = lambda path, params: 429
+    session = _session_on(fake)
+    assert session.get("https://api.vercel.com/v10/projects").status_code == 429
+    assert len(fake.calls) == 1 and slept == []
+
+    fake.fail = lambda path, params: 503
+    fake.calls.clear()
+    assert session.get("https://api.vercel.com/v10/projects").status_code == 503
+    assert len(fake.calls) == 2 and slept == [5]
+
+
+def test_a_429_on_the_events_call_stops_the_run(dlt_mod, tmp_path, monkeypatch):
+    # The events call has its own response hooks, so it gets its own test.
+    slept = _record_sleeps(monkeypatch)
+    fake = _fleet()
+    fake.retry_after = "1000"
+    fake.fail = lambda path, params: 429 if path.endswith("/events") else None
+    source = vercel_source(token="test-token", service=_session_on(fake), include_build_logs=True)
+    with pytest.raises(PipelineStepFailed, match=r"rate limited \(429\)"):
+        _pipeline(dlt_mod, tmp_path).run(source)
+    assert len(fake.event_paths()) == 1 and slept == []
+    assert source.cognee_sync_stats["failed_rate_limit"] == 1
+
+
+def test_a_dropped_connection_gets_one_short_retry(dlt_mod, tmp_path, monkeypatch):
+    slept = _record_sleeps(monkeypatch)
+    fake = _fleet()
+    dropped = []
+
+    def drop_page_two_once(path, params):
+        if path == "/v7/deployments" and "until" in params and not dropped:
+            dropped.append(path)
+            return requests.ConnectionError("connection reset by peer")
+        return None
+
+    fake.fail = drop_page_two_once
+    pipeline = _run_sync(dlt_mod, tmp_path, fake, service=_session_on(fake))
+    assert set(_read(pipeline, VERCEL_DEPLOYMENTS_TABLE)) == {"dpl_ok1", "dpl_ok2", "dpl_err"}
+    assert dropped and len(slept) == 1 and slept[0] <= 5
 
 
 def test_each_request_times_out_after_30_seconds(dlt_mod, tmp_path):
@@ -1504,21 +1696,40 @@ def test_an_expired_build_log_keeps_its_document(dlt_mod, tmp_path):
 
 
 def test_an_expired_log_without_an_inspector_url_keeps_its_document(dlt_mod, tmp_path):
-    # Vercel types inspectorUrl as nullable. If no failed build of a load has
-    # one, dlt creates no `url` column, and the kept row must be read back
-    # without it, exactly as it was loaded.
+    # Vercel types inspectorUrl as nullable. The `url` column is declared, so a
+    # load where no failed build has one still has `url` (None), and the kept row
+    # comes back exactly as it was loaded, url included.
     fake = _fleet()
     for deployment in fake.deployments:
         if deployment["uid"] == "dpl_err":
             del deployment["inspectorUrl"]
     first = _run_sync(dlt_mod, tmp_path, fake)
     before = _read(first, VERCEL_BUILD_LOGS_TABLE)
-    assert set(before) == {"dpl_err"} and "url" not in before["dpl_err"]
+    assert set(before) == {"dpl_err"} and before["dpl_err"]["url"] is None
 
     fake.fail = lambda path, params: 410 if path.endswith("/events") else None
     for _ in range(2):  # and again on the next run, from the row it kept
         pipeline = _run_sync(dlt_mod, tmp_path, fake)
         assert _read(pipeline, VERCEL_BUILD_LOGS_TABLE) == before
+
+
+def test_rows_without_a_url_keep_their_columns_when_a_later_load_has_one(dlt_mod, tmp_path):
+    # dlt creates no column that is None in every row. If `url` appeared only
+    # when a later load had an inspectorUrl, every older row would read back with
+    # a new NULL column, and cognee, which hashes every column, would re-ingest
+    # rows that did not change. The column is declared, so it is there from the
+    # first load.
+    fake = _fleet()
+    for deployment in fake.deployments:
+        del deployment["inspectorUrl"]
+    first = {table: _read(_run_sync(dlt_mod, tmp_path, fake), table) for table in _TABLES}
+    assert all(row["url"] is None for row in first[VERCEL_DEPLOYMENTS_TABLE].values())
+
+    fake.deployments.append(_deployment("dpl_new", "web", minutes_ago=1))  # has a URL
+    second = _run_sync(dlt_mod, tmp_path, fake)
+    for table in _TABLES:
+        rows = _read(second, table)
+        assert {key: rows[key] for key in first[table]} == first[table], table
 
 
 def test_an_expired_log_with_no_earlier_load_is_skipped(dlt_mod, tmp_path):

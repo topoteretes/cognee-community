@@ -54,6 +54,10 @@ _MAX_PROJECT_IDS = 20
 # Seconds before one request gives up. dlt's default is 60, and the wait happens
 # inside cognee's staging lock, which every other dlt ingestion waits on.
 _REQUEST_TIMEOUT = 30
+# Longest wait before the one retry a 5xx or a dropped connection gets. dlt's
+# own cap is 300 s, four times per request; a few seconds rides out a blip
+# without holding the staging lock for long. A 429 is never retried.
+_RETRY_WAIT = 5
 # The raw lists the loaded tables are built from. They are never loaded themselves.
 _RAW_PROJECTS = "vercel_raw_projects"
 # The newest page of projects, read again after the full list (see _merge_head).
@@ -115,7 +119,8 @@ def vercel_source(
             of another account, although an earlier sync found some, or that
             lacks entries of ``project_ids``. Those documents are forgotten.
             Missing ``project_ids`` entries are remembered, so later runs skip
-            them with a warning, until they are found again.
+            them with a warning and list them in ``cognee_sync_stats``, until
+            they are found again.
         resource_name: Prefix of the staging tables and key of the dlt state.
             Defaults to ``vercel``, or ``vercel_<team id>`` with a team, so two
             teams in one dataset keep separate tables.
@@ -123,11 +128,10 @@ def vercel_source(
             to stop a sync whose access was revoked; the run aborts and memory
             stays as it was.
         service: ``requests.Session`` to send requests through, mainly for tests.
-            By default dlt's session is used with retries off, because every
-            wait would be spent inside cognee's staging lock: a 429, a 5xx or a
-            dropped connection stops the run with memory unchanged, and each
-            request times out after 30 s. ``session`` is accepted as another
-            name for it.
+            By default dlt's session is used, kept short because it runs inside
+            cognee's staging lock: a 429 stops the run, a 5xx or a dropped
+            connection gets one retry after at most 5 s, and each request times
+            out after 30 s. ``session`` is accepted as another name for it.
 
     Returns:
         A dlt source for ``cognee.add(...)`` / ``cognee.remember(...)``. Its
@@ -188,7 +192,7 @@ def vercel_source(
             run,
             tables["projects"],
         ),
-        _table(_deployment_rows, tables["deployments"])(
+        _table(_deployment_rows, tables["deployments"], _URL_COLUMN)(
             raw[_RAW_DEPLOYMENTS],
             run,
             wanted,
@@ -219,7 +223,7 @@ def vercel_source(
         events = rest_api_resources({"client": client, "resources": [events_endpoint, parents]})
         build_events = next(r for r in events if r.name == _BUILD_EVENTS)
         loaded.append(
-            _table(_build_log_documents, tables["build_logs"])(
+            _table(_build_log_documents, tables["build_logs"], _URL_COLUMN)(
                 build_events, max_log_chars, log_lines, listed, stats, tables["build_logs"]
             )
         )
@@ -236,7 +240,16 @@ def vercel_source(
     # Keep this source's dlt state per dataset and per resource name.
     setattr(source, dlt_utils.PIPELINE_SCOPE_ATTR, name)
     source.cognee_sync_stats = stats
+    # Parallel resources would race the projects list (see _RunProjects).
+    source.parallelize = _no_parallelize
     return source
+
+
+def _no_parallelize(*args: Any, **kwargs: Any):
+    raise NotImplementedError(
+        "Vercel: parallelize() is not supported. The deployment tables use the projects "
+        "list read by the projects table in the same run, so that table has to run first."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -244,9 +257,11 @@ def vercel_source(
 # ---------------------------------------------------------------------------
 
 
-def _table(rows: Callable, name: str):
+def _table(rows: Callable, name: str, columns: dict | None = None):
     """A full-snapshot table: every run replaces it, and cognee forgets what left it."""
-    return dlt.resource(rows, name=name, primary_key="id", write_disposition="replace")
+    return dlt.resource(
+        rows, name=name, primary_key="id", write_disposition="replace", columns=columns
+    )
 
 
 def _project_rows(
@@ -262,12 +277,13 @@ def _project_rows(
     # failed run never shows the last good run's numbers as its own.
     stats.clear()
     stats["failed_rate_limit"] = 0
+    stats["skipped_projects"] = []
     every = _merge_head(_unique(_items(raw), "id"), list(_items(raw_head)))
     run.publish(every)
     found = every
     if wanted:
         found = [project for project in every if _is_wanted_project(project, wanted)]
-        _guard_missing(wanted, found, len(every), allow_empty)
+        _guard_missing(wanted, found, len(every), allow_empty, stats)
     _guard_empty("projects", len(found), allow_empty)
     _guard_account(found, allow_empty)
     yield [_project_row(project) for project in found]
@@ -332,8 +348,9 @@ class _RunProjects:
     def take(self, consumer: str) -> list[dict]:
         if self._projects is None or consumer in self._taken:
             raise RuntimeError(
-                f"Vercel: the {consumer} list ran before this run's projects list. "
-                "Aborting rather than filtering it with an old list."
+                f"Vercel: the {consumer} table needs this run's projects list, and the "
+                "projects table did not run before it. Loading only some tables with "
+                "with_resources(), or running them with parallelize(), is not supported."
             )
         self._taken.add(consumer)
         return self._projects
@@ -395,11 +412,8 @@ def _staged_rows(table: str, ids: list[str]) -> dict[str, dict]:
         logger.info("Vercel: no earlier build logs to keep in %s", table)
         return {}
     wanted = set(ids)
-    # Only the columns the table has: dlt creates no column whose value was None
-    # in every row, so a load whose failed builds had no inspectorUrl has no
-    # `url`. The row goes back exactly as it was loaded.
     return {
-        row["id"]: {key: row[key] for key in _LOG_COLUMNS if key in row}
+        row["id"]: {key: row.get(key) for key in _LOG_COLUMNS}
         for row in found
         if row.get("id") in wanted
     }
@@ -407,6 +421,12 @@ def _staged_rows(table: str, ids: list[str]) -> dict[str, dict]:
 
 # The columns a build log row is built with, so dlt's own columns stay out.
 _LOG_COLUMNS = ("id", "title", "content", "url")
+# `url` is declared on the deployments and build logs tables. dlt creates no
+# column that is None in every row, so without this a load where no deployment
+# had an inspectorUrl has no `url`; when a later load has one, the column
+# appears, every older row reads back with url NULL, and cognee, which hashes
+# every column, re-ingests rows that did not change.
+_URL_COLUMN = {"url": {"data_type": "text", "nullable": True}}
 
 
 def _select_staged(pipeline, table: str) -> list[dict]:
@@ -593,16 +613,20 @@ class _OverlappingCursor(JSONResponseCursorPaginator):
 
 
 def _default_session():
-    """dlt's session with retries switched off, since it runs inside cognee's staging lock.
+    """dlt's session, kept short because it runs inside cognee's staging lock.
 
-    Every wait would hold that lock, which every other dlt ingestion in the
-    process waits on, and the next run re-reads the whole window anyway. So a
-    429 stops the run (``_rate_limited``), a 5xx or a dropped connection stops
-    it too, and each request gives up after ``_REQUEST_TIMEOUT``.
+    A 5xx or a dropped connection gets one retry after at most ``_RETRY_WAIT``
+    seconds, since a run of a few hundred requests would otherwise fail on any
+    single blip and start over. A 429 is never retried: it is left out of the
+    retried codes, and ``_rate_limited`` stops the run from inside the request
+    before dlt's retry would see the answer anyway. Each try gives up after
+    ``_REQUEST_TIMEOUT``.
     """
     return Client(
         raise_for_status=False,
-        request_max_attempts=1,  # one try per request: no retry, so no wait
+        status_codes=tuple(range(500, 600)),  # dlt's default list also has 429
+        request_max_attempts=2,
+        request_max_retry_delay=_RETRY_WAIT,
         request_timeout=_REQUEST_TIMEOUT,
     ).session
 
@@ -692,19 +716,25 @@ def _guard_empty(kind: str, count: int, allow_empty: bool) -> None:
     state[f"had_{kind}"] = count > 0
 
 
-def _guard_missing(wanted: set[str], found: list[dict], total: int, allow_empty: bool) -> None:
+def _guard_missing(
+    wanted: set[str], found: list[dict], total: int, allow_empty: bool, stats: dict
+) -> None:
     """Refuse a sync that lacks a project the caller listed by name or id.
 
     A deleted or renamed project, or a typo, would otherwise forget its documents
-    without a word. ``allow_empty=True`` lets one run forget them; the entries
-    are then remembered in dlt state, so later runs skip them with a warning
-    instead of stopping, until they are found again.
+    without a word. ``allow_empty=True`` lets one run forget them. Each entry is
+    then kept in dlt state with the time of that run, so later runs skip it
+    instead of stopping, until it is found again. Skipped entries are listed in
+    ``cognee_sync_stats["skipped_projects"]`` and in a warning on every run, so a
+    typo accepted once stays visible.
     """
     state = dlt.current.source_state()
     missing = sorted(
         item for item in wanted if not any(_is_wanted_project(p, {item}) for p in found)
     )
-    accepted = set(state.get("forgotten_projects") or [])
+    accepted = state.get("forgotten_projects") or {}
+    if isinstance(accepted, list):  # written by an earlier commit, time unknown
+        accepted = dict.fromkeys(accepted, "an earlier run")
     new = [item for item in missing if item not in accepted]
     if new and not allow_empty:
         raise ValueError(
@@ -712,9 +742,22 @@ def _guard_missing(wanted: set[str], found: list[dict], total: int, allow_empty:
             f"{new}. Aborting rather than forgetting their documents. Pass allow_empty=True "
             "for one run to forget them; later runs then skip them with a warning."
         )
-    if missing:
-        logger.warning("Vercel: project_ids not found, their documents are forgotten: %s", missing)
-    state["forgotten_projects"] = missing
+    now = _now()
+    kept = {item: accepted.get(item, now) for item in missing}
+    for item in missing:
+        logger.warning(
+            "Vercel: skipping project_ids entry %r: not found, accepted as gone by the "
+            "allow_empty=True run of %s",
+            item,
+            kept[item],
+        )
+    stats["skipped_projects"] = missing
+    state["forgotten_projects"] = kept
+
+
+def _now() -> str:
+    """The time a run accepted a missing entry, as shown in its warnings."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
 def _guard_account(projects: list[dict], allow_empty: bool) -> None:

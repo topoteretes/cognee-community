@@ -42,16 +42,19 @@ answer = await cognee.search(
 | `project_ids` | all projects | A list of project ids or names (any case) to restrict the sync to. Names are turned into ids through the run's projects list, which is read once per run, and deployments are matched on the project id, so a renamed project keeps its older deployments. Up to 20 projects are filtered by Vercel itself. A listed project the token cannot see stops the run, first sync included, and the error names it. |
 | `lookback_days` | `30` | How far back deployments are read, in days (more than 0). `None` reads all of them. |
 | `include_build_logs` | `False` | Also fetch the build output of failed deployments. See Limits before switching it on. |
-| `allow_empty` | `False` | Let one sync through that lists no projects or only another account's projects although an earlier sync found some, or that lacks entries of `project_ids`. Their documents are forgotten. Missing `project_ids` entries are remembered, so later runs skip them with a warning without the flag, until they are found again. |
+| `allow_empty` | `False` | Let one sync through that lists no projects or only another account's projects although an earlier sync found some, or that lacks entries of `project_ids`. Their documents are forgotten. Missing `project_ids` entries are remembered, so later runs skip them without the flag, until they are found again. Each run warns about them, with the time of the run that accepted them, and lists them in `cognee_sync_stats["skipped_projects"]`. |
 | `resource_name` | `vercel`, or `vercel_<team id>` | Prefix of the staging tables. Each team gets its own by default. |
 | `check_active` | none | Called before every page is used. Raise from it to stop a sync whose access was revoked. |
-| `service` | dlt's session, kept short | `requests.Session` to send requests through. By default nothing is retried: a 429, a 5xx or a dropped connection stops the run with memory unchanged, because any wait would hold cognee's staging lock and the next run re-reads everything. Each request times out after 30 s. `session` is accepted as another name for it. |
+| `service` | dlt's session, kept short | `requests.Session` to send requests through. By default a 429 stops the run with memory unchanged, because waiting would hold cognee's staging lock and the next run re-reads everything. A 5xx or a dropped connection gets one retry after at most 5 s. Each request times out after 30 s. `session` is accepted as another name for it. |
 | `max_log_chars` | `20000` | Keep only the end of a build log. Only the newest `max_log_chars // 10` lines (at least 100) are requested. `None` requests and keeps all of it. |
 
 All arguments are keyword-only. After a run, `source.cognee_sync_stats` holds the row count of
 each table (`projects`, `deployments`, `build_logs`) and `failed_rate_limit`, the number of 429
-answers that stopped the run. The counts are cleared when a run starts and logged when it ends. A
-table that empties after holding rows logs a warning.
+answers that stopped the run, plus `skipped_projects`, the `project_ids` entries a run skipped
+because an earlier `allow_empty=True` run accepted them as gone. The counts are cleared when a run
+starts and logged when it ends. A table that empties after holding rows logs a warning.
+`with_resources()` and `parallelize()` are not supported: the deployment tables use the projects
+list that the projects table reads in the same run.
 
 See `examples/example.py` for the full flow.
 
@@ -159,6 +162,9 @@ Nothing has been released yet, but if you ran this connector from an earlier com
 ```bash
 uv run --with pytest pytest tests/
 ```
+
+CI (`.github/workflows/vercel_connector_tests.yml`) runs the suite on the versions in `uv.lock`
+with Python 3.10 and 3.14, and on the floor in `pyproject.toml` (cognee 1.6.1, dlt 1.9.0).
 
 The tests run offline. A fake `requests` transport stands in for api.vercel.com, so the real
 `rest_api` source, paginator and auth run against in-memory fixtures. They cover the field
