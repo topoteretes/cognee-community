@@ -172,3 +172,102 @@ def test_an_error_body_without_json_still_names_the_status():
     with pytest.raises(LatticeAPIError) as caught:
         client.get("/v1/goals/x")
     assert caught.value.status == 404
+
+
+def test_a_key_pasted_with_a_trailing_newline_is_trimmed():
+    fake = FakeLattice()
+    fake.add_user("Ada")
+    client = LatticeClient(f"{API_KEY}\n", transport=fake.transport())
+    assert len(client.list_all("/v1/users")) == 1
+
+
+def test_a_key_with_spaces_is_refused_without_echoing_it():
+    with pytest.raises(ValueError, match="spaces or control characters") as caught:
+        LatticeClient("SECRET part two")
+    assert "SECRET" not in str(caught.value)
+
+
+def test_a_page_without_a_data_list_is_a_failed_read_not_an_empty_listing():
+    client = LatticeClient(
+        API_KEY,
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, json={"hasMore": False})),
+    )
+    with pytest.raises(LatticeAPIError, match="without a `data` list"):
+        client.list_all("/v1/goals")
+
+
+@pytest.mark.parametrize("body", [["not", "an", "object"], "text", None])
+def test_a_2xx_that_is_not_a_json_object_is_a_failed_read(body):
+    client = LatticeClient(
+        API_KEY, transport=httpx.MockTransport(lambda r: httpx.Response(200, json=body))
+    )
+    with pytest.raises(LatticeAPIError, match="JSON object"):
+        client.get("/v1/goals")
+
+
+def test_a_body_that_is_not_json_at_all_is_a_failed_read():
+    client = LatticeClient(
+        API_KEY, transport=httpx.MockTransport(lambda r: httpx.Response(200, text="<html>"))
+    )
+    with pytest.raises(LatticeAPIError, match="JSON object"):
+        client.get("/v1/goals")
+
+
+def test_a_retry_after_longer_than_the_cap_stops_the_run_instead_of_sleeping():
+    fake = FakeLattice()
+    fake.fail("/v1/users", 429, times=3, headers={"Retry-After": "3600"})
+    sleeps: list[float] = []
+    with pytest.raises(LatticeAPIError, match="longer than 120s") as caught:
+        make_client(fake, sleeps).get("/v1/users")
+    assert caught.value.status == 429
+    assert sleeps == []
+
+
+def test_a_cursor_that_keeps_changing_stops_at_the_page_cap(monkeypatch):
+    from cognee_community_connector_lattice import client as client_module
+
+    monkeypatch.setattr(client_module, "_MAX_PAGES", 5)
+    counter = iter(range(10**6))
+
+    def endless(request):
+        return httpx.Response(
+            200,
+            json={
+                "object": "list",
+                "hasMore": True,
+                "endingCursor": f"c{next(counter)}",
+                "data": [],
+            },
+        )
+
+    with pytest.raises(LatticeAPIError, match="incomplete"):
+        LatticeClient(API_KEY, transport=httpx.MockTransport(endless)).list_all("/v1/goals")
+    assert next(counter) <= 7
+
+
+def test_check_active_is_asked_before_every_request_and_can_stop_the_sync():
+    fake = FakeLattice()
+    for i in range(250):
+        fake.add_user(f"User {i}")
+    asked = []
+
+    def check():
+        asked.append(len(fake.calls))
+        if len(fake.calls) >= 2:
+            raise PermissionError("revoked")
+
+    client = make_client(fake, check_active=check)
+    with pytest.raises(PermissionError):
+        client.list_all("/v1/users")
+    assert len(fake.calls) == 2, "no request may be sent once access is revoked"
+    assert asked == [0, 1, 2]
+
+
+def test_a_closed_client_reopens_on_the_next_request():
+    fake = FakeLattice()
+    fake.add_user("Ada")
+    client = make_client(fake)
+    assert len(client.list_all("/v1/users")) == 1
+    client.close()
+    client.close()
+    assert len(client.list_all("/v1/users")) == 1

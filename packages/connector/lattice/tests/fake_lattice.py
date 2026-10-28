@@ -271,6 +271,9 @@ class FakeLattice:
             if "state" in params:
                 goals = [g for g in goals if g["state"] == params["state"]]
             return self._page(goals, params)
+        if len(route) == 2 and route[0] == "goal":
+            goal = self.goals.get(route[1])
+            return httpx.Response(200, json=goal) if goal else _error(404, "goal not found")
         if len(route) == 3 and route[0] == "goals" and route[2] == "updates":
             if route[1] not in self.updates:
                 return _error(404, "goal not found")

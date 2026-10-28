@@ -305,3 +305,18 @@ async def test_it_works_through_cognee_remember_with_the_default_disposition(moc
     await cognee.remember(lattice_source(client=client), dataset_name=DATASET)
 
     assert await _graph_has(ALPHA)
+
+
+@pytest.mark.asyncio
+async def test_a_key_that_suddenly_sees_nothing_forgets_nothing(mocked_llm, fake):
+    await _sync(fake)
+    assert await _graph_has(ALPHA)
+
+    # Wrong region or revoked permissions: every listing would come back empty,
+    # which must not be read as "everything was deleted".
+    fake.users.clear()
+    fake.goals.clear()
+    with pytest.raises(Exception, match="no users for this API key"):
+        await _sync(fake)
+
+    assert await _graph_has(ALPHA) and await _graph_has(BRAVO)

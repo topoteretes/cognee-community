@@ -1,5 +1,6 @@
 """The source: what it selects, what it refuses by default, and how it fails."""
 
+import httpx
 import pytest
 from cognee.tasks.ingestion.dlt_utils import (
     DOCUMENT_SOURCE_ATTR,
@@ -401,3 +402,103 @@ def test_the_source_needs_a_key_when_no_client_is_given(monkeypatch):
     monkeypatch.delenv("LATTICE_API_KEY", raising=False)
     with pytest.raises(ValueError, match="LATTICE_API_KEY"):
         lattice_source()
+
+
+# -- hardening ---------------------------------------------------------------------
+def test_an_unreadable_updates_endpoint_keeps_the_goal_instead_of_forgetting_it(fake):
+    goal = fake.add_goal("Alphacorp renewal", [fake.ada])
+    fake.fail(f"/v1/goals/{goal}/updates", 404, times=20)
+
+    (row,) = rows(source_for(fake), "goals")
+    assert row["title"] == "Alphacorp renewal"
+    assert "Progress updates" not in row["content"]
+
+
+def test_a_forbidden_updates_endpoint_also_keeps_the_goal(fake):
+    goal = fake.add_goal("Ship", [fake.ada])
+    fake.fail(f"/v1/goals/{goal}/updates", 403, times=20)
+    assert len(rows(source_for(fake), "goals")) == 1
+
+
+def test_a_goal_the_server_confirms_gone_is_left_out(fake):
+    fake.add_goal("Keep", [fake.ada])
+    drop = fake.add_goal("Drop", [fake.ada])
+    fake.fail(f"/v1/goals/{drop}/updates", 404, times=20)
+    del fake.goals[drop]  # the single-goal lookup now answers 404 too
+
+    assert [r["title"] for r in rows(source_for(fake), "goals")] == ["Keep"]
+
+
+def test_a_server_error_on_updates_still_aborts_the_run(fake):
+    goal = fake.add_goal("Ship", [fake.ada])
+    fake.fail(f"/v1/goals/{goal}/updates", 500, times=20)
+    with pytest.raises(LatticeAPIError, match="500"):
+        rows(source_for(fake), "goals")
+
+
+def test_a_workspace_that_refuses_status_null_falls_back_to_active_users(fake):
+    gone = fake.add_user("Alan Turing", status="DEACTIVATED")
+    fake.add_goal("Legacy", [gone, fake.ada])
+    original = fake._route
+
+    def refuse_null(path, params):
+        if path == "/v1/users" and params.get("status") == "NULL":
+            return httpx.Response(400, json={"error": "invalid status"})
+        return original(path, params)
+
+    fake._route = refuse_null
+    (row,) = rows(source_for(fake), "goals")
+    assert "Owners: Ada Lovelace, an unknown user" in row["content"]
+
+
+def test_an_empty_user_list_stops_the_sync_instead_of_reading_every_list_as_empty():
+    fake = FakeLattice()  # no users: a key that can see nothing
+    with pytest.raises(LatticeAPIError, match="no users for this API key"):
+        rows(source_for(fake), "goals")
+
+
+def test_an_unreadable_question_falls_back_to_its_id_and_does_not_stop_the_sync(reviewed):
+    del reviewed.questions[reviewed.q_well]
+    (row,) = rows(source_for(reviewed, review_cycle_ids=[reviewed.cycle]), "reviews")
+    assert f"Question: {reviewed.q_well}" in row["content"]
+    assert "Shipped the migration" in row["content"]
+
+
+def test_a_source_can_be_read_twice_and_closes_its_connection_each_time(fake):
+    fake.add_goal("Ship", [fake.ada])
+    client = LatticeClient(API_KEY, transport=fake.transport(), sleep=lambda _s: None)
+    source = lattice_source(client=client)
+
+    assert len(rows(source, "goals")) == 1
+    assert client._http is None, "the connection is closed after each kind"
+    assert len(rows(source, "goals")) == 1
+
+
+def test_check_active_stops_a_source_before_it_reads_more(fake):
+    fake.add_goal("Ship", [fake.ada])
+    stop = {"now": False}
+
+    def check():
+        if stop["now"]:
+            raise PermissionError("access revoked")
+
+    source = source_for(fake, check_active=check)
+    stop["now"] = True
+    with pytest.raises(PermissionError):
+        rows(source, "goals")
+    assert fake.calls == []
+
+
+def test_sync_stats_are_counts_only(reviewed):
+    reviewed.add_goal("Alphacorp secret title", [reviewed.ada])
+    reviewed.add_goal("Hidden", [reviewed.ada], private=True)
+    source = source_for(reviewed, review_cycle_ids=[reviewed.cycle])
+    for kind in ("goals", "review_cycles", "reviews"):
+        rows(source, kind)
+
+    assert source.cognee_sync_stats == {
+        "goals": 1,
+        "goals_skipped": 1,
+        "review_cycles": 1,
+        "reviewees": 1,
+    }
