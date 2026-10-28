@@ -51,7 +51,7 @@ Run the same `remember` call again whenever you want to sync. Use the default
 | Argument | Meaning |
 |---|---|
 | `api_key` | A Lattice API key. Falls back to `LATTICE_API_KEY`. |
-| `region` | `"us"` (default) or `"emea"`. Falls back to `LATTICE_REGION`. A workspace answers only on its own region's host, so a wrong region looks like a 401. |
+| `region` | `"us"` (default) or `"emea"`. Falls back to `LATTICE_REGION`. Lattice serves each workspace from its own region's host, so use the one your workspace is on. |
 | `include_goals` | Sync goals and key results. Default `True`. |
 | `goal_states` | Which goals, by state: `Draft`, `Active`, `Ended`, `Archived`. Default `("Active", "Ended")`. |
 | `include_goal_updates` | Add each goal's progress updates (status and comment) to its document. Default `True`. One request per goal. |
@@ -67,8 +67,10 @@ Run the same `remember` call again whenever you want to sync. Use the default
 
 ### 1. Get an API key
 
-Lattice API keys are created and managed in the Lattice admin dashboard
-([authentication](https://developers.lattice.com/reference/authentication)). Lattice states that
+A Lattice admin creates a key under **Admin > Platform > API keys > Generate API key**
+([help article](https://help.lattice.com/hc/en-us/articles/360059449534-Lattice-s-Public-API)).
+The full key is shown only once, so copy it straight away. If the creating user is later
+deactivated, the key stops working. Lattice states that
 **a key carries the privileges of the user who created it.** The connector only ever sends `GET`
 requests, but it can read whatever that user can, so create the key from an account that can see
 only what you want in memory (a dedicated, low-privilege user is the safest choice). The key is
