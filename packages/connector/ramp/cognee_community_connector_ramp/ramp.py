@@ -42,13 +42,23 @@ DEFAULT_LOOKBACK_DAYS = 60
 DEFAULT_MAX_REQUESTS = 1000
 # attempts per request on 5xx or network errors, backing off 1s then 2s
 _RETRIES = 3
-# 429s waited out (Retry-After) before the run is cut short
+# 429s waited out (Retry-After) before the run is cut short: two short waits ride out a
+# burst, and together with _MAX_RETRY_AFTER they bound one run's sleeping at two minutes
 _RATE_LIMIT_WAITS = 2
-# a longer Retry-After cuts the run short instead of blocking the worker thread
+# seconds; a longer Retry-After cuts the run short instead of blocking the worker thread,
+# because cognee holds a process-wide dlt staging lock while the resource yields. Ramp's
+# rate-limit page documents no ceiling on the header, so the cap is cognee's, not Ramp's.
 _MAX_RETRY_AFTER = 60.0
-_TIMEOUT = 30.0  # seconds
+# seconds waited after a 429 whose Retry-After is missing or unparseable
+_DEFAULT_RETRY_AFTER = 5.0
+# seconds for one request, so a hung connection cannot stall the whole dlt load
+_TIMEOUT = 30.0
 # renew a token this many seconds before it expires
 _TOKEN_MARGIN = 60
+# seconds a token is assumed to last when the token answer omits ``expires_in`` (the spec
+# documents it). Kept short: a wrong guess costs one renewal, and ``get`` renews once more
+# when a token is refused mid-run.
+_DEFAULT_TOKEN_TTL = 3600.0
 # runs in a row one transaction may fail before it is given up on; it is then re-read
 # once a week, so a record whose access returns (or that was deleted) is caught later
 _MAX_ATTEMPTS = 5
@@ -56,6 +66,12 @@ _RETRY_GIVEN_UP_DAYS = 7
 # a receipt with no OCR data yet is fetched again for this long after its upload; older
 # ones are taken as unreadable (the sandbox's receipts never get OCR)
 _OCR_WAIT_DAYS = 3
+# Ramp reports amounts in minor units and sends minor_unit_conversion_rate as the divisor;
+# this is the fallback when that field is missing or unreadable (cents, as for USD)
+_MINOR_UNITS = 100
+# receipt line items named in the document; the rest are counted, so a long till receipt
+# cannot crowd out the memo the document is written around
+_RECEIPT_ITEMS = 10
 # transaction states that mean the money never moved
 _DEAD_STATES = {"DECLINED", "ERROR"}
 # fields that change without changing the document; ignored when deciding to re-render
@@ -154,7 +170,16 @@ class RampClient:
         if not body.get("access_token"):
             raise RampAuthError("Ramp issued no access token; check the app's client credentials")
         self._token = body["access_token"]
-        self._token_expires = time.time() + float(body.get("expires_in") or 0)
+        try:
+            lifetime = float(body["expires_in"])
+        except (KeyError, TypeError, ValueError):
+            # without a lifetime the token would look expired on every request, so each
+            # GET would mint a new one: unbounded requests outside the run's budget
+            logger.warning(
+                "Ramp's token answer had no usable expires_in; assuming %ss.", _DEFAULT_TOKEN_TTL
+            )
+            lifetime = _DEFAULT_TOKEN_TTL
+        self._token_expires = time.time() + lifetime
         return self._token
 
     def _send(
@@ -206,7 +231,7 @@ class RampClient:
         if status == 403:
             # fatal on a listing (nothing is readable), retried per record elsewhere
             raise RampAccessError(f"Ramp refused {endpoint} (HTTP 403); check the app's scopes")
-        if status == 404 and _record_missing(response):
+        if status == 404 and _record_missing(response, path):
             raise RampNotFoundError(f"Ramp has no such record at {endpoint}")
         if status == 422 and "start token" in _error_message(response).lower():
             raise RampStaleTokenError(f"Ramp refused a saved page token for {endpoint}")
@@ -249,24 +274,57 @@ def _token_refused(response: httpx.Response) -> bool:
     return response.status_code == 404 and "access token" in _error_message(response).lower()
 
 
-def _record_missing(response: httpx.Response) -> bool:
-    """A 404 naming the requested record ("The requested X (<id>) does not exist.").
+# Ramp documents no "record deleted" error code: the sandbox answers a missing transaction
+# and an unknown access token with the same 404 ``DEVELOPER_7002``, so the only thing that
+# tells them apart is the message, matched whole and required to name the id we asked for.
+_MISSING_KIND = re.compile(r"^[A-Za-z][A-Za-z ]*$")
 
-    Any other 404 is an error that deletes nothing.
+
+def _requested_id(path: str) -> str | None:
+    """The record id in ``/developer/v1/<collection>/<id>``, or None for a collection."""
+    parts = path.strip("/").split("/")
+    return parts[3] if len(parts) == 4 and parts[:2] == ["developer", "v1"] else None
+
+
+def _record_missing(response: httpx.Response, path: str) -> bool:
+    """A 404 whose message is Ramp's exact "does not exist" sentence for *this* id.
+
+    Any other 404 is an error that deletes nothing: a 404 on a collection, a 404 about
+    another record, and a differently worded 404 all keep the stored document.
     """
+    record_id = _requested_id(path)
+    if not record_id:
+        return False
     message = _error_message(response)
-    return message.startswith("The requested ") and message.endswith("does not exist.")
+    head, _, tail = message.partition(" (")
+    kind = head.removeprefix("The requested ")
+    return (
+        head.startswith("The requested ")
+        and bool(_MISSING_KIND.match(kind))
+        and tail == f"{record_id}) does not exist."
+    )
 
 
-def _next_start(next_url: str | None) -> str | None:
-    """The ``start`` token of ``page.next``; the URL itself is never followed."""
+def _next_start(next_url: Any, path: str) -> str | None:
+    """The ``start`` token of ``page.next``; the URL itself is never followed.
+
+    A ``next`` we cannot read is an error, never the end of the listing: treating it as
+    the end would both skip the rest of the window and read the pages already walked as
+    a complete listing, which queues every unlisted stored row for a deletion check.
+    """
     if not next_url:
         return None
+    if not isinstance(next_url, str):
+        raise RampAPIError(f"Ramp sent an unreadable next page for {_endpoint(path)}")
     values = parse_qs(urlparse(next_url).query).get("start")
-    return values[0] if values else None
+    if not values or not values[0]:
+        raise RampAPIError(f"Ramp sent a next page without a start token for {_endpoint(path)}")
+    return values[0]
 
 
 def _app_identity(client_id: str) -> str:
+    # 16 hex chars (64 bits) is far past collision range for the handful of apps one
+    # resource_name ever sees, and keeps the raw client_id out of dlt state
     return hashlib.sha256(client_id.encode()).hexdigest()[:16]
 
 
@@ -278,7 +336,8 @@ def _retry_after(response: httpx.Response) -> float:
     try:
         return max(0.0, float(response.headers.get("retry-after", "")))
     except ValueError:
-        return 5.0
+        # also an HTTP-date Retry-After, which Ramp's docs do not promise to send
+        return _DEFAULT_RETRY_AFTER
 
 
 # ---------------------------------------------------------------------------
@@ -294,31 +353,34 @@ def render_transaction(
     is not knowledge.
     """
     memo = _text(transaction.get("memo"))
-    holder = transaction.get("card_holder") or {}
+    holder = _fields(transaction.get("card_holder"))
     person = " ".join(filter(None, [holder.get("first_name"), holder.get("last_name")]))
     department = _text(holder.get("department_name"))
     merchant = _text(transaction.get("merchant_name")) or "an unknown merchant"
     date = _text(transaction.get("user_transaction_time"))[:10] or "an unknown date"
 
     context: list[str] = []
-    for item in transaction.get("line_items") or []:
+    line_items = []
+    for item in _records(transaction.get("line_items")):
         if note := _text(item.get("memo")):
             amount = _line_item_amount(item.get("amount"))
-            context.append(f"Line item: {note}" + (f" ({amount})" if amount else ""))
+            line_items.append(f"Line item: {note}" + (f" ({amount})" if amount else ""))
+    # sorted, so line items coming back in a different order don't re-cognify the document
+    context.extend(sorted(line_items))
     if trip := _text(transaction.get("trip_name")):
         context.append(f"Trip: {trip}")
     # sorted, so a different order from the API doesn't re-cognify the document
     attendees = sorted(
-        _text(a.get("name")) for a in transaction.get("attendees") or [] if a.get("name")
+        _text(a.get("name")) for a in _records(transaction.get("attendees")) if a.get("name")
     )
     if attendees:
         context.append(f"Attendees: {', '.join(attendees)}")
-    for receipt in receipts:
-        context.extend(_receipt_lines(receipt))
-    for violation in transaction.get("policy_violations") or []:
+    # sorted for the same reason: /receipts pages in no documented order
+    context.extend(sorted(line for r in _records(receipts) for line in _receipt_lines(r)))
+    for violation in _records(transaction.get("policy_violations")):
         if note := _text(violation.get("memo")):
             context.append(f"Policy note: {note}")
-    for dispute in transaction.get("disputes") or []:
+    for dispute in _records(transaction.get("disputes")):
         if note := _text(dispute.get("memo")):
             context.append(f"Dispute ({_text(dispute.get('type'))}): {note}")
     if require_context and not memo and not context:
@@ -341,9 +403,9 @@ def render_transaction(
         lines.append("Refund of an earlier transaction.")
     lines.extend(context)
     coding = sorted(
-        f"{_text((s.get('category_info') or {}).get('name')) or 'Field'}: "
+        f"{_text(_fields(s.get('category_info')).get('name')) or 'Field'}: "
         f"{_text(s.get('display_name') or s.get('name'))}"
-        for s in transaction.get("accounting_field_selections") or []
+        for s in _records(transaction.get("accounting_field_selections"))
         if s.get("display_name") or s.get("name")
     )
     if coding:
@@ -360,13 +422,17 @@ def render_transaction(
 
 
 def _receipt_lines(receipt: dict) -> list[str]:
-    ocr = receipt.get("ocr") or {}
-    names = [n for item in ocr.get("line_items") or [] if (n := _text(item.get("item_name")))]
+    ocr = _fields(receipt.get("ocr"))
+    # sorted and capped: a long till receipt would otherwise crowd out the memo, and the
+    # OCR order is not stable across re-reads
+    names = sorted(
+        n for item in _records(ocr.get("line_items")) if (n := _text(item.get("item_name")))
+    )
     lines = []
     if names:
-        shown = ", ".join(names[:10]) + (", ..." if len(names) > 10 else "")
+        shown = ", ".join(names[:_RECEIPT_ITEMS]) + (", ..." if len(names) > _RECEIPT_ITEMS else "")
         lines.append(f"Receipt: {len(names)} line item{'s' if len(names) != 1 else ''} ({shown})")
-    for tax in ocr.get("taxes") or []:
+    for tax in _records(ocr.get("taxes")):
         if tax.get("tax_amount") is not None:
             name = _text(tax.get("tax_name")) or "tax"
             lines.append(
@@ -376,28 +442,51 @@ def _receipt_lines(receipt: dict) -> list[str]:
 
 
 def _transaction_amount(transaction: dict) -> str:
-    amount = transaction.get("entity_amount") or {}
-    if amount.get("value") is None:
+    amount = _fields(transaction.get("entity_amount"))
+    value = _number(amount.get("value"))
+    if value is None:
         return ""
-    rate = transaction.get("minor_unit_conversion_rate") or 100
-    return f"{amount['value'] / rate:,.2f} {_text(amount.get('currency'))}".strip()
+    rate = _number(transaction.get("minor_unit_conversion_rate")) or _MINOR_UNITS
+    return f"{value / rate:,.2f} {_text(amount.get('currency'))}".strip()
 
 
-def _line_item_amount(amount: dict | None) -> str:
-    if not amount or amount.get("amount") is None:
+def _line_item_amount(amount: Any) -> str:
+    """The line item's amount as text, or "" when it has none Ramp can be read from."""
+    fields = _fields(amount)
+    value = _number(fields.get("amount"))
+    if value is None:
         return ""
-    rate = amount.get("minor_unit_conversion_rate") or 100
-    return f"{amount['amount'] / rate:,.2f} {_text(amount.get('currency_code'))}".strip()
+    rate = _number(fields.get("minor_unit_conversion_rate")) or _MINOR_UNITS
+    return f"{value / rate:,.2f} {_text(fields.get('currency_code'))}".strip()
 
 
-def _location(location: dict | None) -> str:
-    parts = [_text((location or {}).get(key)) for key in ("city", "state", "country")]
+def _location(location: Any) -> str:
+    parts = [_text(_fields(location).get(key)) for key in ("city", "state", "country")]
     parts = [part for part in parts if part]
     return f" ({', '.join(parts)})" if parts else ""
 
 
 def _text(value: Any) -> str:
     return str(value).strip() if value is not None else ""
+
+
+def _fields(value: Any) -> dict:
+    """``value`` when it is a JSON object, else an empty one.
+
+    Ramp answers null where the spec says object, and one malformed nested field must
+    not raise out of the rendering and block its transaction on every run.
+    """
+    return value if isinstance(value, dict) else {}
+
+
+def _records(value: Any) -> list[dict]:
+    """The JSON objects of ``value`` when it is a list; nothing otherwise."""
+    return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+
+
+def _number(value: Any) -> float | None:
+    """``value`` as a number, or None when Ramp sent something else (e.g. a string)."""
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
 
 
 def _hash(value: Any) -> str:
@@ -541,7 +630,7 @@ class _Walker:
                     f"Ramp sent a listing without data or page for {_endpoint(path)}"
                 )
             yield data
-            start = _next_start(page.get("next"))
+            start = _next_start(page.get("next"), path)
             if progress is not None:
                 progress["start"] = start
             if not start:
@@ -562,6 +651,10 @@ class _Walker:
         return self.include_declined or transaction.get("state") not in _DEAD_STATES
 
     def _listing_filters(self) -> dict[str, Any]:
+        # order_by_date_asc asks the listing for an explicit order, so paging never
+        # depends on a default Ramp could change. Oldest first is the stable one: a
+        # transaction arriving mid-walk lands on a page behind the cursor, so it can
+        # never push another record onto a page that was already read.
         params: dict[str, Any] = {"order_by_date_asc": "true"}
         if self.include_declined:
             params["state"] = "ALL"
@@ -581,6 +674,8 @@ class _Walker:
         The input key hashes the selection and every non-volatile field (including the
         receipt id list), so an unchanged transaction is skipped before its receipts are read.
         """
+        if not isinstance(transaction, dict) or not _text(transaction.get("id")):
+            raise RampAPIError("Ramp sent a transaction without an id")
         row_id = _row_id(transaction["id"])
         self.stats["scanned"] += 1
         stable = {k: v for k, v in transaction.items() if k not in _VOLATILE_FIELDS}
@@ -616,7 +711,7 @@ class _Walker:
         return any(
             receipt.get("ocr") is None
             and (_normal_time(receipt.get("created_at")) or "") >= horizon
-            for receipt in receipts
+            for receipt in _records(receipts)
         )
 
     def _tombstone(self, row_id: str) -> dict:
@@ -656,6 +751,12 @@ class _Walker:
                 walk["seen"].clear()
                 seen.clear()
             for transaction in page:
+                if not isinstance(transaction, dict) or not _text(transaction.get("id")):
+                    # the listing is still complete: a stored row this record was meant to
+                    # cover is only forgotten after its own re-read by id says it is gone
+                    self.stats["failed"] += 1
+                    logger.warning("Ramp listed a record that is not a transaction; skipped.")
+                    continue
                 row_id = _row_id(transaction["id"])
                 if row_id not in seen:  # a restarted listing returns records again
                     seen.add(row_id)
@@ -883,6 +984,9 @@ def ramp_source(
     Args:
         resource_name: Stable name of this connection, one per Ramp business. It scopes
             the sync state and the cleanup of forgotten transactions, so keep it fixed.
+            dlt normalizes it into a table name, so two names in one dataset that differ
+            only in case or punctuation (``Ramp_A`` and ``ramp-a``) would share a table
+            while keeping separate state; pick names that differ in more than that.
         client_id, client_secret: A Ramp developer app with client credentials enabled
             and the ``transactions:read`` and ``receipts:read`` scopes.
         sandbox: Use Ramp's sandbox (``demo-api.ramp.com``) instead of production.
@@ -898,19 +1002,35 @@ def ramp_source(
         department_ids, user_ids, entity_id: Only sync these departments, card holders
             or business entity.
         max_requests: Request budget of one run. A big backfill finishes over several runs.
+            Running out of it is not an error: see the note on ``cognee_sync_stats`` below.
         adopt_state_from: ``client_id`` of a previous Ramp app of the same business whose
             sync state this run may take over; everything is listed again.
 
     Returns:
         A ``dlt`` resource configured with ``primary_key="id"``,
         ``write_disposition="merge"`` and a ``_deleted`` hard-delete column.
+
+        Its ``cognee_sync_stats`` dict holds this run's counts (``scanned``, ``skipped``,
+        ``deleted``, ``failed``, ``abandoned``). A run that runs out of ``max_requests``,
+        or that Ramp keeps rate limiting, is **not** an error: it yields what it reached,
+        saves its progress and returns, reporting ``failed_budget`` or
+        ``failed_rate_limit`` (and a non-zero ``failed``) in those stats. A caller that
+        needs to know whether a sync completed has to read them; everything else (a
+        refused token, a malformed listing, an unreachable API) raises, and dlt then
+        commits neither rows nor state.
     """
     import dlt
 
+    # 2 is the version that added per-row node sets (NODE_SET_COLUMN_HINT), which the rows
+    # below rely on; the attribute is missing altogether before cognee 1.6.3
     if getattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 0) < 2:
         raise RuntimeError("Ramp sync requires cognee>=1.6.4 (per-row node sets).")
     if not isinstance(resource_name, str) or not resource_name.strip():
         raise ValueError("ramp_source needs a resource_name, one per Ramp business")
+    if resource_name != resource_name.strip():
+        # dlt would keep the padding in the resource name while normalizing it away in the
+        # table name, so " ramp_acme" and "ramp_acme" share a table but not their state
+        raise ValueError("resource_name must not start or end with whitespace")
     if lookback_days < 0:
         raise ValueError("lookback_days must be zero or more")
     if max_requests < 3:

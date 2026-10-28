@@ -103,9 +103,24 @@ document is kept. A Ramp outage (5xx, network) is retried without limit. A run s
 `max_requests` or a 429 resumes next time; if the saved page token's record has since
 disappeared, Ramp answers `422 "Invalid start token"` and the listing restarts.
 
-Ramp answers an expired token with HTTP 404 `DEVELOPER_7002`, the same as a missing record. The
-client renews the token on that answer, and only a 404 naming the requested record counts as
-deleted.
+Ramp answers an expired token with HTTP 404 `DEVELOPER_7002`, the same as a missing record, and
+documents no "record deleted" code. The client renews the token on that answer, and a transaction
+is only taken as gone when a `GET /transactions/<id>` answers 404 with Ramp's exact
+`The requested <kind> (<id>) does not exist.` sentence naming *that* id. A 404 on a listing, a
+404 about another record, or any other wording is an error that forgets nothing.
+
+### Rate limits and incomplete runs
+
+Ramp rate limits per app. A 429 is waited out up to twice, for at most 60 seconds each, and then
+the run stops: cognee holds a process-wide dlt staging lock while a source yields, so a long
+`Retry-After` is not slept through.
+
+A run that runs out of `max_requests`, or that Ramp keeps rate limiting, is **not** an error. It
+yields what it reached, saves its progress and returns, so the next run continues where it stopped.
+The only signal is `source.cognee_sync_stats`, which then holds `failed_budget` or
+`failed_rate_limit` and a non-zero `failed`. Read those stats if you need to know whether a sync
+finished. Everything else (a refused token, a malformed listing, an unreachable API) raises, and
+dlt commits neither rows nor state.
 
 ### Limitations
 
@@ -115,8 +130,18 @@ deleted.
 - Each changed transaction with receipts costs one extra request. Receipts are listed for the
   whole business, so with a selection, receipts on other people's transactions cost a read each.
 - State belongs to one Ramp app (`client_id`); after switching apps for the same business, pass
-  `adopt_state_from`. State keeps a few short values per stored transaction, rewritten on every
-  load.
+  `adopt_state_from`. State keeps a few short values per stored transaction (no bodies), rewritten
+  on every load.
+- A transaction whose own read keeps failing (a 403, a 422, an unrecognised 404) is retried on five
+  runs, then only once a week. Its document is kept, and `cognee_sync_stats["failed"]` stays at one
+  or more while it is being retried: that is not a broken sync.
+- `resource_name` becomes a dlt table name, so two sources in one dataset whose names differ only
+  in case or punctuation (`Ramp_A` and `ramp-a`) would write to the same table while keeping
+  separate state. Give them names that differ in more than that.
+- Anyone who can read the cognee dataset can read the transactions in it, including card holders'
+  and attendees' names. Give the dataset the same audience as Ramp's transaction list.
+- One malformed record in a listing is skipped and counted in `failed` rather than failing the run;
+  the rest of the page still syncs.
 
 ## Verified against the Ramp sandbox
 

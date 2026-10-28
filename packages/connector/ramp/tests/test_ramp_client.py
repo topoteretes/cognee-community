@@ -1,5 +1,7 @@
 """Client tests: auth, the expired-token 404, rate limits, retries and error messages."""
 
+import json
+
 import httpx
 import pytest
 from fake_ramp import FakeRamp, ago, client_for, serve, sync
@@ -30,6 +32,24 @@ def test_token_response_without_a_token_is_an_auth_error(fake):
     fake.queued = [httpx.Response(200, content=b'{"token_type": "Bearer"}')]
     with pytest.raises(RampAuthError, match="no access token"):
         client_for(fake).get("/developer/v1/transactions")
+
+
+def test_token_without_expires_in_is_still_cached(fake):
+    """A missing lifetime must not mint a token per request: those escape the budget."""
+    original = fake._token
+
+    def token(request):
+        body = json.loads(original(request).content)
+        body.pop("expires_in")
+        return httpx.Response(200, content=json.dumps(body))
+
+    fake._token = token
+    fake.add("t1", ago(3), memo="A")
+    client = client_for(fake)
+    client.get("/developer/v1/transactions")
+    client.get("/developer/v1/transactions")
+
+    assert fake.tokens_issued == 1
 
 
 def test_bad_credentials_raise(fake):
@@ -91,6 +111,30 @@ def test_unrecognised_404_is_an_error_not_a_deletion(fake):
     serve(fake, "/transactions/t1", 404, b"<html>Not Found</html>")
     _, deletes, stats = sync(fake, state)
     assert not deletes
+    assert stats["failed"] == 1
+    assert "transaction:t1" in state["rows"]
+
+
+def test_404_naming_another_record_is_not_a_deletion(fake):
+    """The "does not exist" message has to name the id we asked for, nothing else."""
+    fake.add("t1", ago(200), memo="Old venue")
+    state: dict = {}
+    sync(fake, state)
+
+    del fake.transactions["t1"]
+    body = json.dumps(
+        {
+            "error_v2": {
+                "message": "The requested TransactionCanonical (txn_other) does not exist.",
+                "error_code": "DEVELOPER_7002",
+            }
+        }
+    ).encode()
+    undo = serve(fake, "/transactions/t1", 404, body)
+    _, deletes, stats = sync(fake, state)
+    undo()
+
+    assert not deletes, "a 404 about another record must keep the document"
     assert stats["failed"] == 1
     assert "transaction:t1" in state["rows"]
 

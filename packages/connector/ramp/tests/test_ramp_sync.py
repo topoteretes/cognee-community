@@ -4,6 +4,7 @@ Each test drives the fake through a real-world change and checks the rows the
 connector yields and the state it keeps for the next run.
 """
 
+import json
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -87,6 +88,53 @@ def test_attendee_order_does_not_change_the_document(fake):
     a = fake.add("t1", ago(3), memo="Dinner", attendees=[{"name": "Raj"}, {"name": "Jane"}])
     b = dict(a, attendees=[{"name": "Jane"}, {"name": "Raj"}])
     assert render_transaction(a, []) == render_transaction(b, [])
+
+
+def test_render_is_stable_when_ramp_shuffles_its_lists(fake):
+    """A re-read that returns the same data in another order must render byte for byte."""
+    txn = fake.add(
+        "t1",
+        ago(2),
+        memo="Team dinner with Alphacorp",
+        line_items=[
+            {"memo": "Wine", "amount": {"amount": 1200, "currency_code": "USD"}},
+            {"memo": "Halibut", "amount": {"amount": 4200, "currency_code": "USD"}},
+        ],
+        attendees=[{"name": "Raj Patel"}, {"name": "Jane Doe"}],
+        accounting_field_selections=[
+            {"display_name": "Meals", "category_info": {"name": "GL account"}},
+            {"display_name": "Engineering", "category_info": {"name": "Department"}},
+        ],
+    )
+    first_receipt = fake.add_receipt("rc1", "t1", ago(2), items=("Wine", "Halibut"))
+    second_receipt = fake.add_receipt("rc2", "t1", ago(1), items=("Tip",))
+    first = render_transaction(txn, [first_receipt, second_receipt])
+
+    shuffled = dict(
+        txn,
+        line_items=list(reversed(txn["line_items"])),
+        attendees=list(reversed(txn["attendees"])),
+        accounting_field_selections=list(reversed(txn["accounting_field_selections"])),
+    )
+    first_receipt["ocr"]["line_items"].reverse()
+    second = render_transaction(shuffled, [second_receipt, first_receipt])
+
+    assert first == second
+
+
+def test_reordered_line_items_are_not_reingested(fake):
+    fake.add(
+        "t1",
+        ago(2),
+        memo="Team dinner with Alphacorp",
+        line_items=[{"memo": "Wine"}, {"memo": "Halibut"}],
+    )
+    state: dict = {}
+    sync(fake, state)
+
+    fake.transactions["t1"]["line_items"].reverse()
+    upserts, deletes, _ = sync(fake, state)
+    assert not upserts and not deletes, "the same line items in another order are not a change"
 
 
 def test_refund_line_carries_no_raw_ids(fake):
@@ -538,6 +586,63 @@ def test_malformed_listing_raises_and_forgets_nothing(fake):
     assert "transaction:t1" in state["rows"] and not state["recheck"]
 
 
+def test_listing_record_that_is_not_a_transaction_is_skipped_not_fatal(fake):
+    """One malformed record in a page must not kill the run on every single sync."""
+    fake.add("t1", ago(2), memo="Dinner with Alphacorp")
+    body = json.dumps(
+        {"data": [None, {"memo": "no id at all"}, fake.transactions["t1"]], "page": {"next": None}}
+    ).encode()
+    undo = serve(fake, "/developer/v1/transactions", 200, body)
+    upserts, deletes, stats = sync(fake, {})
+    undo()
+
+    assert set(upserts) == {"transaction:t1"}, "the readable records must still be ingested"
+    assert not deletes
+    assert stats["failed"] == 2
+
+
+def test_next_page_without_a_start_token_raises_instead_of_ending_the_walk(fake):
+    """A ``next`` we cannot follow is an error; read as the end it would skip the rest."""
+    fake.add("t1", ago(2), memo="Dinner with Alphacorp")
+    fake.add("t2", ago(1), memo="Taxi for Bravocorp")
+    state: dict = {}
+    sync(fake, state)
+
+    body = json.dumps(
+        {"data": [], "page": {"next": "https://api.ramp.com/developer/v1/whatever?page_size=100"}}
+    ).encode()
+    undo = serve(fake, "/developer/v1/transactions", 200, body)
+    with pytest.raises(ramp.RampAPIError, match="without a start token"):
+        sync(fake, state)
+    undo()
+    assert set(state["rows"]) == {"transaction:t1", "transaction:t2"}
+
+
+def test_malformed_nested_fields_do_not_block_a_transaction(fake):
+    """Ramp sending a string or null where the spec says object must not raise."""
+    fake.add(
+        "t1",
+        ago(2),
+        memo="Dinner with Alphacorp",
+        card_holder=None,
+        merchant_location="San Francisco",
+        entity_amount={"value": "48210", "currency": "USD"},
+        minor_unit_conversion_rate="not a number",
+        line_items=[None, "junk", {"memo": "Wine", "amount": "1200"}],
+        attendees="nobody",
+        accounting_field_selections=[{"display_name": "Meals", "category_info": "GL account"}],
+        disputes=None,
+        policy_violations="none",
+        receipts=None,
+    )
+    upserts, _, stats = sync(fake, {})
+
+    assert stats["failed"] == 0
+    content = upserts["transaction:t1"]["content"]
+    assert "Line item: Wine" in content
+    assert "Field: Meals" in content
+
+
 def test_one_failing_record_does_not_block_the_run(fake):
     fake.add("t1", ago(200), memo="Old venue")
     fake.add("t2", ago(1), memo="Recent")
@@ -676,6 +781,9 @@ def test_running_out_of_budget_during_a_reread_keeps_it_queued(fake):
 def test_source_validates_its_arguments(fake):
     with pytest.raises(ValueError, match="resource_name"):
         ramp_source(resource_name=" ", service=client_for(fake))
+    with pytest.raises(ValueError, match="whitespace"):
+        # dlt would normalize the padding out of the table name but keep it in the state
+        ramp_source(resource_name=" ramp_acme", service=client_for(fake))
     with pytest.raises(ValueError, match="client_id"):
         ramp_source(resource_name="ramp_acme")
     with pytest.raises(ValueError, match="ISO 8601"):
