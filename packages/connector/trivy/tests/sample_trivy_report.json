@@ -1,0 +1,84 @@
+{
+  "SchemaVersion": 2,
+  "ArtifactName": "registry.example.com/backend-api:v2.4.0",
+  "ArtifactType": "container_image",
+  "Metadata": {
+    "OS": {
+      "Family": "debian",
+      "Name": "11.7"
+    },
+    "ImageConfig": {
+      "architecture": "amd64",
+      "os": "linux"
+    }
+  },
+  "Results": [
+    {
+      "Target": "backend-api:v2.4.0 (debian 11.7)",
+      "Class": "os-pkgs",
+      "Type": "debian",
+      "Vulnerabilities": [
+        {
+          "VulnerabilityID": "CVE-2023-38545",
+          "PkgName": "libcurl4",
+          "InstalledVersion": "7.74.0-1.3+deb11u7",
+          "FixedVersion": "7.74.0-1.3+deb11u10",
+          "Status": "fixed",
+          "Severity": "CRITICAL",
+          "Title": "curl: SOCKS5 heap buffer overflow",
+          "Description": "This flaw allows an attacker to cause a heap buffer overflow in the SOCKS5 proxy handshake.",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2023-38545",
+          "CVSS": {
+            "nvd": {
+              "V3Score": 9.8
+            }
+          }
+        },
+        {
+          "VulnerabilityID": "CVE-2023-44487",
+          "PkgName": "nghttp2",
+          "InstalledVersion": "1.43.0-1",
+          "FixedVersion": "1.43.0-1+deb11u1",
+          "Status": "fixed",
+          "Severity": "HIGH",
+          "Title": "HTTP/2 Rapid Reset DDoS vulnerability",
+          "Description": "The HTTP/2 protocol allows a denial of service (server resource consumption) via rapid stream resets.",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2023-44487"
+        }
+      ]
+    },
+    {
+      "Target": "k8s/deployment.yaml",
+      "Class": "config",
+      "Type": "kubernetes",
+      "Misconfigurations": [
+        {
+          "Type": "Kubernetes Security Check",
+          "ID": "KSV001",
+          "Title": "Can elevate its own privileges",
+          "Description": "A program can run with higher privileges than its parent process.",
+          "Severity": "HIGH",
+          "Resolution": "Set 'securityContext.allowPrivilegeEscalation' to 'false'.",
+          "Status": "FAIL",
+          "PrimaryURL": "https://avd.aquasec.com/misconfig/ksv001"
+        }
+      ]
+    },
+    {
+      "Target": ".env.production",
+      "Class": "secret",
+      "Type": "secret",
+      "Secrets": [
+        {
+          "RuleID": "aws-access-key-id",
+          "Category": "AWS",
+          "Severity": "CRITICAL",
+          "Title": "AWS Access Key ID",
+          "StartLine": 12,
+          "EndLine": 12,
+          "Match": "AKIAIOSFODNN7EXAMPLE"
+        }
+      ]
+    }
+  ]
+}
