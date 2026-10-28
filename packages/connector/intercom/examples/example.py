@@ -43,7 +43,7 @@ async def main() -> None:
 
     print("Syncing Intercom into cognee ...")
     await cognee.remember(
-        intercom_source(base_url=base_url),
+        intercom_source(token=os.environ["INTERCOM_ACCESS_TOKEN"], base_url=base_url),
         dataset_name=DATASET_NAME,
         write_disposition="merge",
         self_improvement=False,

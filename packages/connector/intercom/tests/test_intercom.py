@@ -91,7 +91,8 @@ class FakeIntercomSession:
     def close(self):
         self.closed = True
 
-    def __init__(self, conversations=(), articles=(), contacts=None, page_size=2):
+    def __init__(self, conversations=(), articles=(), contacts=None, page_size=2, workspace="ws1"):
+        self.workspace = workspace  # the app id_code GET /me reports
         self.conversations = {c["id"]: c for c in conversations}
         self.articles = list(articles)
         self.contacts = contacts or {}  # {contact_id: {"name": ..., "notes": [...]}}
@@ -104,6 +105,8 @@ class FakeIntercomSession:
         self.calls.append((method, path, params, json))
         if self.scripted:
             return self.scripted.pop(0)
+        if method == "GET" and path == "/me":
+            return FakeResponse(200, {"type": "admin", "app": {"id_code": self.workspace}})
         if method == "GET" and path == "/conversations":
             items = [{"id": cid} for cid in sorted(self.conversations)]
             return self._cursor_page(items, "conversations", (params or {}).get("starting_after"))
@@ -226,15 +229,38 @@ def test_source_declares_document_marker():
     assert document_source_tag(source) == "intercom"
 
 
-def test_source_scopes_its_dlt_state():
+def test_source_scopes_its_dlt_state_by_resource_name():
     from cognee.tasks.ingestion.dlt_utils import PIPELINE_SCOPE_ATTR, pipeline_name_for_source
 
-    us = intercom_source(session=FakeIntercomSession())
-    eu = intercom_source(session=FakeIntercomSession(), base_url="https://api.eu.intercom.io/")
-    assert getattr(us, PIPELINE_SCOPE_ATTR) == "intercom:https://api.intercom.io"
-    assert getattr(eu, PIPELINE_SCOPE_ATTR) == "intercom:https://api.eu.intercom.io"
-    assert pipeline_name_for_source(us, "a") != pipeline_name_for_source(us, "b")
-    assert pipeline_name_for_source(us, "a") != "ingest_dlt_source"  # not the shared one
+    default = intercom_source(session=FakeIntercomSession())
+    named = intercom_source(session=FakeIntercomSession(), resource_name="intercom_eu")
+    assert getattr(default, PIPELINE_SCOPE_ATTR) == "intercom"
+    assert list(default.resources) == [
+        "intercom_conversations",
+        "intercom_articles",
+        "intercom_contact_notes",
+    ]
+    assert getattr(named, PIPELINE_SCOPE_ATTR) == "intercom_eu"
+    assert next(iter(named.resources)) == "intercom_eu_conversations"
+    assert pipeline_name_for_source(default, "a") != pipeline_name_for_source(default, "b")
+    assert pipeline_name_for_source(default, "a") != "ingest_dlt_source"  # not the shared one
+
+
+def test_source_validates_configuration():
+    with pytest.raises(ValueError, match="token is required"):
+        intercom_source()
+    with pytest.raises(ValueError, match="base_url must be"):
+        intercom_source(token="tok", base_url="api.intercom.io")
+    with pytest.raises(ValueError, match="snake_case"):
+        intercom_source(token="tok", resource_name="Intercom-EU")
+    with pytest.raises(ValueError, match="at most 48"):
+        intercom_source(token="tok", resource_name="i" * 49)
+
+
+def test_source_refuses_a_cognee_without_document_sync(monkeypatch):
+    monkeypatch.delattr(ic.dlt_utils, "DOCUMENT_SYNC_VERSION")
+    with pytest.raises(RuntimeError, match="document sync cleanup"):
+        intercom_source(token="tok")
 
 
 def test_source_requires_something_to_sync():
@@ -342,9 +368,30 @@ def test_rate_limit_is_retried_after_the_advertised_delay(_no_sleep):
 def test_auth_error_is_not_retried(_no_sleep):
     session = FakeIntercomSession()
     session.scripted = [FakeResponse(401)]
-    with pytest.raises(requests.HTTPError):
-        IntercomAPI(session, BASE).request("GET", "/conversations")
+    api = IntercomAPI(session, BASE)
+    with pytest.raises(requests.HTTPError, match="access token"):
+        api.request("GET", "/conversations")
     assert _no_sleep == []
+    assert api.stats["failed_auth"] == 1
+
+
+def test_server_errors_stop_after_three_attempts(_no_sleep):
+    session = FakeIntercomSession()
+    session.scripted = [FakeResponse(500)] * 3
+    with pytest.raises(IntercomSyncError, match="HTTP 500"):
+        IntercomAPI(session, BASE).request("GET", "/conversations")
+    assert _no_sleep == [1.0, 2.0]
+
+
+def test_rate_limit_stops_once_the_wait_budget_is_spent(_no_sleep):
+    session = FakeIntercomSession()
+    session.scripted = [FakeResponse(429, headers={"Retry-After": "45"})] * 3
+    api = IntercomAPI(session, BASE)
+
+    with pytest.raises(IntercomSyncError, match="rate-limiting"):
+        api.request("GET", "/conversations")
+    assert _no_sleep == [45.0]  # a second 45 s wait would pass the 60 s budget
+    assert api.stats["failed_rate_limit"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -361,7 +408,8 @@ def test_first_conversation_sync_fetches_everything_and_saves_cursor():
     rows = list(sync_conversations(IntercomAPI(session, BASE), state))
 
     assert [r["id"] for r in rows] == ["c1", "c2"]
-    assert state == {"known_ids": ["c1", "c2"], "cursor": 200}
+    assert (state["known_ids"], state["cursor"]) == (["c1", "c2"], 200)
+    assert set(state["digests"]) == {"c1", "c2"}
     search = next(c for c in session.calls if c[1] == "/conversations/search")
     assert search[3]["query"] == {"field": "updated_at", "operator": ">", "value": 0}
 
@@ -384,6 +432,22 @@ def test_later_sync_searches_from_the_cursor_with_overlap():
     assert retrieved == ["/conversations/c2"]  # c1 unchanged → not re-fetched
     assert "Refund sent." in rows[0]["content"]
     assert state["cursor"] == 9_000
+
+
+def test_unchanged_documents_are_not_re_emitted():
+    session = _workspace()
+    api = IntercomAPI(session, BASE)
+    conversations, articles, stats = {}, {}, {}
+    list(sync_conversations(api, conversations))
+    list(sync_articles(api, False, articles))
+
+    # Both fall inside the five-minute overlap, so both are read again; nothing changed.
+    assert list(sync_conversations(api, conversations, stats)) == []
+    assert (stats["skipped"], stats["changed"]) == (2, 0)
+    assert list(sync_articles(api, False, articles)) == []
+
+    session.articles[1]["body"] = "<p>Download them from Billing, or ask us.</p>"
+    assert [row["id"] for row in sync_articles(api, False, articles)] == ["a2"]
 
 
 def test_deleted_conversation_is_tombstoned():
@@ -626,3 +690,84 @@ def test_complete_waits_for_every_content_type():
     run.start("contact_notes")
     run.finish("contact_notes")
     assert stats["complete"] == 1
+
+
+def _pipeline(dlt, tmp_path, name):
+    return dlt.pipeline(
+        pipeline_name=name,
+        destination=dlt.destinations.sqlalchemy(
+            f"sqlite:///{(tmp_path / f'{name}.db').as_posix()}"
+        ),
+        dataset_name="intercom_ds",
+        pipelines_dir=str(tmp_path / "state"),
+    )
+
+
+def test_a_second_workspace_needs_its_own_resource_name(dlt_mod, tmp_path):
+    from cognee.tasks.ingestion.dlt_utils import pipeline_name_for_source
+    from dlt.pipeline.exceptions import PipelineStepFailed
+
+    first = _workspace()
+    second = _workspace()  # the same conversation and article ids
+    second.workspace = "ws2"
+
+    def sync(session, **kwargs):
+        source = intercom_source(session=session, **kwargs)
+        # Name the pipeline as cognee does: one per (dataset, scope).
+        pipeline = _pipeline(dlt_mod, tmp_path, pipeline_name_for_source(source, "intercom"))
+        pipeline.run(source, write_disposition="merge", primary_key="id")
+        return pipeline
+
+    sync(first)
+    with pytest.raises(PipelineStepFailed, match="belongs to workspace ws2"):
+        sync(second)  # same resource_name: it would overwrite the first workspace
+    sync(second, resource_name="intercom_two")
+    del first.conversations["c1"]
+    pipeline = sync(first)
+    other = sync(second, resource_name="intercom_two")
+
+    assert set(_read(pipeline, "intercom_conversations")) == {"c2"}
+    assert set(_read(other, "intercom_two_conversations")) == {"c1", "c2"}
+
+
+@pytest.mark.parametrize("status", [401, 403, 404, 429, 500])
+def test_the_token_never_reaches_errors_or_logs(
+    dlt_mod, tmp_path, monkeypatch, caplog, capsys, status
+):
+    from dlt.pipeline.exceptions import PipelineStepFailed
+
+    token = "ic_LeakCanary0123456789"
+    session = _workspace()
+    echo = {"type": "error.list", "errors": [{"message": f"Bad token {token}"}]}
+    session.scripted = [FakeResponse(status, echo, headers={"Retry-After": "1"})] * 3
+    monkeypatch.setattr(ic, "_make_session", lambda secret: session)
+    source = intercom_source(token=f" {token}\n")
+
+    with pytest.raises(PipelineStepFailed) as failure:
+        _pipeline(dlt_mod, tmp_path, f"intercom_leak_{status}").run(
+            source, write_disposition="merge", primary_key="id"
+        )
+
+    chain, error = [], failure.value
+    while error is not None:
+        chain.append(f"{error!r} {error}")
+        error = error.__cause__ or error.__context__
+    output = capsys.readouterr()
+    assert token not in " ".join(chain)
+    assert token not in caplog.text + output.out + output.err
+    assert source.cognee_sync_stats["complete"] == 0
+    assert source.cognee_sync_stats["failed_auth"] == (1 if status in (401, 403) else 0)
+    assert source.cognee_sync_stats["failed_rate_limit"] == (1 if status == 429 else 0)
+
+
+def test_control_characters_and_lone_surrogates_are_dropped(dlt_mod, tmp_path):
+    session = _workspace()
+    session.conversations["c1"]["source"]["subject"] = "Ref\x00und\x1b"
+    session.conversations["c1"]["conversation_parts"]["conversation_parts"] = [
+        _part("Refund \ud800sent.")
+    ]
+    pipeline = _run_sync(dlt_mod, tmp_path, session)
+
+    content = _read(pipeline, "intercom_conversations")["c1"]
+    assert "Ben: Refund sent." in content
+    assert conversation_to_row(session.conversations["c1"])["title"] == "Refund"

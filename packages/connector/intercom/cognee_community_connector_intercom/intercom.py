@@ -1,81 +1,43 @@
-"""Intercom connector for cognee — a ``dlt`` source that turns support history into memory.
+"""Intercom connector for cognee: a ``dlt`` source that turns support content into memory.
 
-Sync Intercom conversations (with their replies and internal notes), Help Center
-articles and, opt-in, contact notes into cognee, incrementally and with
-forget-on-delete::
-
-    import cognee
-    from cognee_community_connector_intercom import intercom_source
+One document per conversation (with its replies and internal notes), per Help
+Center article and, opt-in, per contact note, synced incrementally with
+forget-on-delete. Hand the source to :func:`cognee.remember` with
+``write_disposition="merge"``::
 
     await cognee.remember(
-        intercom_source(),              # INTERCOM_ACCESS_TOKEN from the env, or token=...
+        intercom_source(token=os.environ["INTERCOM_ACCESS_TOKEN"]),
         dataset_name="intercom",
-        write_disposition="merge",     # REQUIRED (see .. important:: below)
+        write_disposition="merge",
     )
 
-.. important::
-   ``write_disposition="merge"`` is **mandatory**. cognee applies the caller's
-   write disposition to every table of the source; conversations sync
-   incrementally (unchanged ones are not re-emitted) and deletions are emitted
-   as ``_deleted`` tombstone rows, both of which only work under ``merge``.
-
-Design
-------
-* **Auth** — an access token from an Intercom app (Developer Hub → your app →
-  Authentication), sent as a Bearer token. ``Intercom-Version`` is pinned so API
-  changes cannot silently alter parsing. ``base_url`` selects the data region
-  (US by default; ``https://api.eu.intercom.io`` or ``https://api.au.intercom.io``).
-  The connector only issues reads (``GET``, plus ``POST`` to the search endpoint).
-* **Conversations** — one document per conversation: its title or subject, the
-  opening message and every reply and internal note in order, each labelled with
-  the author's role and name. Email addresses are left out. Internal notes stay
-  in the conversation they explain. Parts without text (assignments, state
-  changes) are skipped.
-* **Help Center articles** — one document per published article (drafts are
-  opt-in); the HTML body is rendered to text.
-* **Contact notes** — opt-in (``include_contact_notes=True``); one document per
-  note. This walks every contact, one request each, so it suits small workspaces.
-* **Incremental sync** — conversations come from the search endpoint filtered on
-  ``updated_at``, starting five minutes before the newest ``updated_at`` seen
-  last run (the search index can lag slightly behind writes). The cursor is kept
-  in dlt's per-resource state. Articles and contact notes are re-read in full
-  each run; unchanged ones keep a stable content hash and are not re-cognified.
-* **Forget-on-delete** — Intercom has no delete feed, so each run sweeps the ids
-  that currently exist (a list of all conversation ids, or the full article and
-  note listings) and emits ids that vanished since the previous run with the
-  ``_deleted`` hard-delete marker, like the Confluence connector. dlt drops them
-  on ``merge`` and cognee's orphan cleanup forgets them. Any failed request
-  aborts the run, so a broken listing never looks like a deletion.
-
-Limitations
------------
-* Intercom returns at most the 500 most recent parts of a conversation; longer
-  conversations are truncated (logged, and noted in the document).
-* The conversation id sweep pages through every conversation each run (150 per
-  request).
+The README describes what is stored, how changes and deletions are found, and what a
+run does when Intercom fails part of the way through.
 """
 
 from __future__ import annotations
 
+import hashlib
 import html
-import os
+import json
 import re
 import time
 from collections.abc import Callable, Iterator
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import dlt
 import requests
 from cognee.shared.logging_utils import get_logger
-from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR, PIPELINE_SCOPE_ATTR
+from cognee.tasks.ingestion import dlt_utils
+from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
+from dlt.common.normalizers.naming.snake_case import NamingConvention
 
 logger = get_logger("intercom_connector")
 
 INTERCOM_SOURCE_NAME = "intercom"
-CONVERSATIONS_TABLE_NAME = "intercom_conversations"
-ARTICLES_TABLE_NAME = "intercom_articles"
-CONTACT_NOTES_TABLE_NAME = "intercom_contact_notes"
+# Tables are "<resource_name>_conversations", "_articles" and "_contact_notes".
+_TABLE_SUFFIXES = ("conversations", "articles", "contact_notes")
 
 DEFAULT_BASE_URL = "https://api.intercom.io"
 # Pin the API version so upstream changes can't silently alter parsing.
@@ -86,15 +48,30 @@ _PAGE_SIZE = 150
 _ARTICLES_PAGE_SIZE = 50
 # Re-query this far before the cursor: the search index can trail recent writes.
 _SEARCH_OVERLAP_SECONDS = 300
-# Retry budget for rate-limited / transient responses, and the longest single wait.
-_MAX_RETRIES = 5
+# Attempts per request, and the longest single wait.
+_MAX_ATTEMPTS = 3
 _MAX_RETRY_DELAY_SECONDS = 60.0
+# Retries sleep inside cognee's staging lock, which every other dlt ingestion in
+# the process waits on, so a run waits at most this long in total.
+_WAIT_BUDGET_SECONDS = 60.0
 _MAX_PAGES = 100_000
-_STAT_KEYS = ("scanned", "changed", "deleted", "failed", "requests")
+_STAT_KEYS = (
+    "scanned",
+    "skipped",
+    "changed",
+    "deleted",
+    "failed",
+    "failed_auth",
+    "failed_rate_limit",
+    "requests",
+)
 _REQUEST_TIMEOUT_SECONDS = 30
 
 
 _TOMBSTONE_COLUMNS = {"_deleted": {"data_type": "bool", "hard_delete": True}}
+# C0/C1 control characters (tab and newline kept) and lone surrogates: a NUL makes
+# Postgres reject the load and a lone surrogate fails the dlt extract.
+_UNSAFE_CHARS = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\ud800-\udfff]")
 
 _AUTHOR_ROLES = {
     "user": "Customer",
@@ -121,43 +98,59 @@ def intercom_source(
     include_articles: bool = True,
     include_draft_articles: bool = False,
     include_contact_notes: bool = False,
-    check_active: Callable[[], None] | None = None,
     service: Any = None,
+    *,
+    resource_name: str = INTERCOM_SOURCE_NAME,
+    check_active: Callable[[], None] | None = None,
     session: Any = None,
 ):
     """Create a dlt source that yields Intercom content as documents.
 
     Args:
-        token: Intercom access token. Falls back to ``INTERCOM_ACCESS_TOKEN``.
+        token: Intercom access token. Required unless ``service`` is given.
         base_url: API host for the workspace's data region.
         include_conversations: Sync conversations with their replies and notes.
         include_articles: Sync Help Center articles.
         include_draft_articles: Also sync unpublished articles.
         include_contact_notes: Also sync notes attached to contacts.
-        check_active: Optional host checkpoint, called before every request and before
-            every row is published; raising from it stops the run.
         service: Pre-built ``requests``-compatible session (tests, proxies). It is
             used as is and not closed; when omitted, each run opens and closes its own
             from the token.
+        resource_name: Prefix of the three dlt tables (``<name>_conversations``,
+            ``<name>_articles``, ``<name>_contact_notes``), which also scopes the sync
+            state. A dataset's state remembers its workspace, and a token for another
+            workspace stops the run, so give each workspace its own name in a shared
+            dataset.
+        check_active: Optional host checkpoint, called before every request and before
+            every row is published; raising from it stops the run.
         session: Alias of ``service``. Give at most one.
 
     Returns:
         A dlt source for ``cognee.remember(..., write_disposition="merge")``. After a
         run, ``source.cognee_sync_stats`` holds counts only, summed over the three
         content types: ``scanned``, ``changed``, ``deleted``, ``failed`` (items
-        without an id), ``requests``, and ``complete`` (1 once all three finished).
+        without an id), ``failed_auth`` and ``failed_rate_limit`` (1 when the run
+        stopped for that reason), ``requests``, and ``complete`` (1 once all three
+        finished).
     """
+    if getattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 0) < 1:
+        raise RuntimeError(
+            "The Intercom connector needs cognee's document sync cleanup (cognee>=1.6.3)."
+        )
+    base = str(base_url or "").strip().rstrip("/")
+    if not base.startswith(("https://", "http://")):
+        raise ValueError("base_url must be an Intercom API URL, e.g. https://api.intercom.io.")
+    _check_resource_name(resource_name)
+    if not (include_conversations or include_articles or include_contact_notes):
+        raise ValueError("Nothing to sync: enable conversations, articles or contact notes.")
     if service is not None and session is not None:
         raise ValueError("Pass service= or session=, not both.")
     client = service if service is not None else session
-    secret = _check_token(token if token is not None else os.environ.get("INTERCOM_ACCESS_TOKEN"))
+    secret = _check_token(token)
     if client is None and not secret:
-        raise ValueError(
-            "Intercom access token required: pass token= or set INTERCOM_ACCESS_TOKEN."
-        )
-    base = base_url.rstrip("/")
+        raise ValueError("token is required (an Intercom access token).")
     stats: dict[str, int] = {}
-    run = _RunStats(stats, ("conversations", "articles", "contact_notes"))
+    run = _RunStats(stats, _TABLE_SUFFIXES)
 
     def _run(name: str, sync: Callable[..., Iterator[dict]], enabled: bool) -> Iterator[dict]:
         part = run.start(name)
@@ -169,14 +162,16 @@ def intercom_source(
         http = client if client is not None else _make_session(secret)
         try:
             api = IntercomAPI(http, base, check_active=check_active, stats=part)
+            _check_workspace(api, state, resource_name)
             yield from sync(api, state, part, check_active)
         finally:
             if client is None:
                 http.close()
+            run.publish()  # a failed run still reports its requests and failure reason
         run.finish(name)
 
     @dlt.resource(
-        name=CONVERSATIONS_TABLE_NAME,
+        name=f"{resource_name}_conversations",
         primary_key="id",
         write_disposition="merge",
         columns=_TOMBSTONE_COLUMNS,
@@ -185,7 +180,7 @@ def intercom_source(
         yield from _run("conversations", sync_conversations, include_conversations)
 
     @dlt.resource(
-        name=ARTICLES_TABLE_NAME,
+        name=f"{resource_name}_articles",
         primary_key="id",
         write_disposition="merge",
         columns=_TOMBSTONE_COLUMNS,
@@ -197,16 +192,13 @@ def intercom_source(
         yield from _run("articles", sync, include_articles)
 
     @dlt.resource(
-        name=CONTACT_NOTES_TABLE_NAME,
+        name=f"{resource_name}_contact_notes",
         primary_key="id",
         write_disposition="merge",
         columns=_TOMBSTONE_COLUMNS,
     )
     def intercom_contact_notes():
         yield from _run("contact_notes", sync_contact_notes, include_contact_notes)
-
-    if not (include_conversations or include_articles or include_contact_notes):
-        raise ValueError("Nothing to sync: enable conversations, articles or contact notes.")
 
     @dlt.source(name=INTERCOM_SOURCE_NAME)
     def _intercom():
@@ -216,14 +208,46 @@ def intercom_source(
         return [intercom_conversations, intercom_articles, intercom_contact_notes]
 
     source = _intercom()
-    # Opt into the document ingestion path (row → text document → cognify).
+    # Opt into the document ingestion path (row -> text document -> cognify).
     # resolve_dlt_sources reads this marker; it never imports this connector.
     setattr(source, DOCUMENT_SOURCE_ATTR, INTERCOM_SOURCE_NAME)
-    # One dlt state (cursor, known ids) per workspace region and cognee dataset,
-    # so syncing other sources or datasets on the same machine can't reset it.
-    setattr(source, PIPELINE_SCOPE_ATTR, f"{INTERCOM_SOURCE_NAME}:{base}")
+    # The table prefix also scopes the dlt state (cursor, known ids, workspace), so
+    # the state and the tables it describes always resolve to the same pipeline.
+    setattr(source, dlt_utils.PIPELINE_SCOPE_ATTR, resource_name)
     source.cognee_sync_stats = stats
     return source
+
+
+def _check_resource_name(name: Any) -> None:
+    """A non-empty name that dlt keeps as it is, short enough for its table names.
+
+    It prefixes the tables and scopes the state: two names dlt normalizes alike
+    ("Intercom-EU", "intercom_eu") would share tables.
+    """
+    if not isinstance(name, str) or not name or len(name) > 48:
+        raise ValueError("resource_name must be a non-empty string of at most 48 characters.")
+    if NamingConvention().normalize_table_identifier(name) != name:
+        raise ValueError("resource_name must be lowercase snake_case (letters, digits, _).")
+
+
+def _check_workspace(api: IntercomAPI, state: dict, resource_name: str) -> None:
+    """Stop before a token for another workspace can overwrite this state's documents.
+
+    Conversation and article ids are only unique within a workspace, so a second
+    workspace synced under the same ``resource_name`` would overwrite, and then
+    tombstone, the first one's documents.
+    """
+    me = api.request("GET", "/me")
+    workspace = str((me.get("app") or {}).get("id_code") or "")
+    known = state.get("workspace")
+    if workspace and known and known != workspace and state.get("known_ids"):
+        raise IntercomSyncError(
+            f"This dataset already holds Intercom workspace {known} under resource_name "
+            f"{resource_name!r}, but the token belongs to workspace {workspace}. Pass a "
+            "different resource_name= to sync another workspace into the same dataset."
+        )
+    if workspace:
+        state["workspace"] = workspace
 
 
 class IntercomSyncError(RuntimeError):
@@ -241,14 +265,14 @@ class _RunStats:
         part = self.parts[name]
         part.clear()
         part.update(dict.fromkeys(_STAT_KEYS, 0), complete=0)
-        self._publish()
+        self.publish()
         return part
 
     def finish(self, name: str) -> None:
         self.parts[name]["complete"] = 1
-        self._publish()
+        self.publish()
 
-    def _publish(self) -> None:
+    def publish(self) -> None:
         totals = {key: sum(part.get(key, 0) for part in self.parts.values()) for key in _STAT_KEYS}
         self.stats.clear()
         self.stats.update(totals)
@@ -292,6 +316,7 @@ class IntercomAPI:
         self.base_url = base_url.rstrip("/")
         self.check_active = check_active
         self.stats = stats if stats is not None else {}
+        self.waited = 0.0  # seconds slept on retries this run
 
     def request(
         self, method: str, path: str, params: dict | None = None, body: dict | None = None
@@ -299,32 +324,47 @@ class IntercomAPI:
         """Call the API, retrying 429/5xx and network errors; other errors raise.
 
         A 429 waits for ``Retry-After`` or Intercom's ``X-RateLimit-Reset``; other
-        retries back off exponentially. A permanent error (auth, not found) or an
-        exhausted retry budget raises, which aborts the sync before any deletion.
+        retries back off exponentially. A permanent error (auth, not found), three
+        failed attempts or a spent wait budget raises, which aborts the sync before
+        any deletion.
         """
         url = f"{self.base_url}{path}"
-        attempt = 0
-        while True:
+        for attempt in range(_MAX_ATTEMPTS):
             if self.check_active is not None:
                 self.check_active()
             self.stats["requests"] = self.stats.get("requests", 0) + 1
+            failure: Exception | None = None
             try:
                 response = self.session.request(
                     method, url, params=params, json=body, timeout=_REQUEST_TIMEOUT_SECONDS
                 )
             except (requests.ConnectionError, requests.Timeout) as exc:
-                if attempt == _MAX_RETRIES - 1:
-                    raise
-                reason, delay = str(exc), min(2.0**attempt, _MAX_RETRY_DELAY_SECONDS)
+                failure, reason = exc, type(exc).__name__
+                delay = min(2.0**attempt, _MAX_RETRY_DELAY_SECONDS)
             else:
-                retryable = response.status_code == 429 or response.status_code >= 500
-                if not retryable or attempt == _MAX_RETRIES - 1:
+                status = response.status_code
+                if status != 429 and status < 500:
+                    if status in (401, 403):
+                        self.stats["failed_auth"] = 1
                     return _parse(response, path)
-                reason = f"HTTP {response.status_code}"
-                delay = _retry_delay(response.headers, attempt)
-            logger.warning("Intercom: %s on %s — retrying in %.1fs.", reason, path, delay)
+                reason, delay = f"HTTP {status}", _retry_delay(response.headers, attempt)
+            if attempt == _MAX_ATTEMPTS - 1 or self.waited + delay > _WAIT_BUDGET_SECONDS:
+                break
+            logger.warning("Intercom: %s on %s; retrying in %.1fs.", reason, path, delay)
+            self.waited += delay
             time.sleep(delay)
-            attempt += 1
+        if failure is not None:
+            raise failure
+        if response.status_code == 429:
+            self.stats["failed_rate_limit"] = 1
+            raise IntercomSyncError(
+                f"Intercom is rate-limiting {path} (HTTP 429). The run stopped before "
+                "anything was forgotten; the next run picks up from the last cursor."
+            )
+        raise IntercomSyncError(
+            f"Intercom failed {path} with HTTP {response.status_code}. The run stopped "
+            "before anything was forgotten; the next run picks up from the last cursor."
+        )
 
     def paginate(
         self, method: str, path: str, key: str, body: dict | None = None
@@ -375,9 +415,11 @@ class IntercomAPI:
 
 def _parse(response: Any, path: str) -> dict:
     """Raise on a failed response with a hint for the common causes; else decode JSON."""
-    if response.status_code == 401:
+    if response.status_code in (401, 403):
         raise requests.HTTPError(
-            f"Intercom rejected the access token on {path} (HTTP 401).", response=response
+            f"Intercom refused {path} (HTTP {response.status_code}). Check that the access "
+            "token is valid and the app has read permission for this content.",
+            response=response,
         )
     response.raise_for_status()
     try:
@@ -447,6 +489,8 @@ def sync_conversations(
 
     newest = cursor
     fetched_ids: set[str] = set()
+    digests = dict(state.get("digests", {}))
+    emitted = 0
     for summary in api.paginate("POST", "/conversations/search", "conversations", query):
         if not summary.get("id"):
             stats["failed"] = stats.get("failed", 0) + 1
@@ -465,19 +509,29 @@ def sync_conversations(
         updated_at = summary.get("updated_at")
         if updated_at is not None and (newest is None or updated_at > newest):
             newest = updated_at
-        yield _checked(conversation_to_row(conversation), check_active)
+        row = conversation_to_row(conversation)
+        if _unchanged(row, digests):
+            continue  # re-read by the overlap window, or touched without a visible change
+        emitted += 1
+        yield _checked(row, check_active)
 
     deleted = known_ids - current_ids
     for conversation_id in sorted(deleted):
+        digests.pop(conversation_id, None)
         yield _checked({"id": conversation_id, "_deleted": True}, check_active)
-    _count(stats, scanned=len(current_ids), changed=len(fetched_ids), deleted=len(deleted))
+    _count(
+        stats,
+        scanned=len(current_ids),
+        skipped=len(fetched_ids) - emitted,
+        changed=emitted,
+        deleted=len(deleted),
+    )
 
     state["known_ids"] = sorted(current_ids | fetched_ids)
+    state["digests"] = {doc_id: d for doc_id, d in digests.items() if doc_id in state["known_ids"]}
     if newest is not None:
         state["cursor"] = newest
-    logger.info(
-        "Intercom: %d changed conversation(s), %d deletion(s).", len(fetched_ids), len(deleted)
-    )
+    logger.info("Intercom: %d changed conversation(s), %d deletion(s).", emitted, len(deleted))
 
 
 def conversation_to_row(conversation: dict) -> dict:
@@ -523,8 +577,8 @@ def conversation_to_row(conversation: dict) -> dict:
 
     return {
         "id": conversation_id,
-        "title": title,
-        "content": "\n\n".join(lines),
+        "title": _clean(title),
+        "content": _clean("\n\n".join(lines)),
         "_deleted": False,
     }
 
@@ -570,14 +624,23 @@ def sync_articles(
     if state.get("include_drafts", include_drafts) == include_drafts:
         _refuse_empty_listing("articles", current_ids, known_ids)
 
-    for row in rows:
+    digests = dict(state.get("digests", {}))
+    changed = [row for row in rows if not _unchanged(row, digests)]
+    for row in changed:
         yield _checked(row, check_active)
     deleted = known_ids - current_ids
     for article_id in sorted(deleted):
         yield _checked({"id": article_id, "_deleted": True}, check_active)
     state["known_ids"] = sorted(current_ids)
+    state["digests"] = {doc_id: d for doc_id, d in digests.items() if doc_id in current_ids}
     state["include_drafts"] = include_drafts
-    _count(stats, scanned=len(current_ids), changed=len(current_ids), deleted=len(deleted))
+    _count(
+        stats,
+        scanned=len(current_ids),
+        skipped=len(rows) - len(changed),
+        changed=len(changed),
+        deleted=len(deleted),
+    )
     logger.info("Intercom: %d article(s), %d deletion(s).", len(current_ids), len(deleted))
 
 
@@ -591,8 +654,8 @@ def article_to_row(article: dict) -> dict:
         lines.append(body)
     return {
         "id": str(article["id"]),
-        "title": article.get("title") or f"Article {article['id']}",
-        "content": "\n\n".join(lines),
+        "title": _clean(article.get("title") or f"Article {article['id']}"),
+        "content": _clean("\n\n".join(lines)),
         "url": article.get("url"),
         "_deleted": False,
     }
@@ -623,13 +686,22 @@ def sync_contact_notes(
     current_ids = {row["id"] for row in rows}
     _refuse_empty_listing("contact notes", current_ids, known_ids)
 
-    for row in rows:
+    digests = dict(state.get("digests", {}))
+    changed = [row for row in rows if not _unchanged(row, digests)]
+    for row in changed:
         yield _checked(row, check_active)
     deleted = known_ids - current_ids
     for note_id in sorted(deleted):
         yield _checked({"id": note_id, "_deleted": True}, check_active)
-    _count(stats, scanned=len(current_ids), changed=len(current_ids), deleted=len(deleted))
+    _count(
+        stats,
+        scanned=len(current_ids),
+        skipped=len(rows) - len(changed),
+        changed=len(changed),
+        deleted=len(deleted),
+    )
     state["known_ids"] = sorted(current_ids)
+    state["digests"] = {doc_id: d for doc_id, d in digests.items() if doc_id in current_ids}
     logger.info("Intercom: %d contact note(s), %d deletion(s).", len(current_ids), len(deleted))
 
 
@@ -642,8 +714,8 @@ def contact_note_to_row(note: dict, contact: dict) -> dict:
     ]
     return {
         "id": str(note["id"]),
-        "title": f"Note on {who}",
-        "content": "\n\n".join(line for line in lines if line),
+        "title": _clean(f"Note on {who}"),
+        "content": _clean("\n\n".join(line for line in lines if line)),
         "_deleted": False,
     }
 
@@ -676,11 +748,23 @@ def _count(stats: dict, **counts: int) -> None:
         stats[key] = stats.get(key, 0) + value
 
 
+def _unchanged(row: dict, digests: dict) -> bool:
+    """Whether ``row`` renders exactly as last synced; records its hash either way."""
+    digest = hashlib.sha256(json.dumps(row, sort_keys=True).encode()).hexdigest()
+    same = digests.get(row["id"]) == digest
+    digests[row["id"]] = digest
+    return same
+
+
 def _checked(row: dict, check_active: Callable[[], None] | None) -> dict:
     """Ask the host checkpoint before a row is published."""
     if check_active is not None:
         check_active()
     return row
+
+
+def _clean(text: str) -> str:
+    return _UNSAFE_CHARS.sub("", text)
 
 
 def html_to_text(value: str | None) -> str:
@@ -696,4 +780,4 @@ def html_to_text(value: str | None) -> str:
 def _format_date(timestamp: int | None) -> str:
     if not timestamp:
         return "at an unknown time"
-    return datetime.fromtimestamp(timestamp, tz=UTC).date().isoformat()
+    return datetime.fromtimestamp(timestamp, tz=timezone.utc).date().isoformat()
