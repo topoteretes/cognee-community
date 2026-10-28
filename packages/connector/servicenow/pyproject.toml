@@ -3,12 +3,11 @@ name = "cognee-community-connector-servicenow"
 version = "0.1.0"
 description = "ServiceNow data-source connector for cognee — knowledge articles, incidents, problems and changes as memory, incremental with forget-on-delete"
 readme = "README.md"
-requires-python = ">=3.11,<=3.13"
+requires-python = ">=3.10,<3.15"
 dependencies = [
-    # Document mode (DOCUMENT_SOURCE_ATTR) shipped in cognee 1.4.0; 1.6.x adds
-    # PIPELINE_SCOPE_ATTR, which keeps this source's dlt state (known ids and
-    # versions) separate from other sources and datasets.
-    "cognee==1.6.2",
+    # 1.6.3 has PIPELINE_SCOPE_ATTR (this source's dlt state stays apart from other
+    # sources and datasets) and DOCUMENT_SYNC_VERSION, checked when the source is built.
+    "cognee>=1.6.3,<2",
     "dlt[sqlalchemy]>=1.9.0,<2",
     "requests>=2.31.0,<3",
 ]
@@ -29,7 +28,7 @@ packages = ["cognee_community_connector_servicenow"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "N", "B", "UP", "C4", "PGH", "SIM", "RUF"]

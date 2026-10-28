@@ -34,7 +34,12 @@ async def main() -> None:
     include_journal = os.environ.get("SERVICENOW_INCLUDE_JOURNAL") == "1"
     print("Syncing ServiceNow into cognee ...")
     await cognee.remember(
-        servicenow_source(include_journal=include_journal),
+        servicenow_source(
+            instance_url=os.environ["SERVICENOW_INSTANCE_URL"],
+            username=os.environ.get("SERVICENOW_USERNAME", ""),
+            password=os.environ["SERVICENOW_PASSWORD"],
+            include_journal=include_journal,
+        ),
         dataset_name=DATASET_NAME,
         write_disposition="merge",
         self_improvement=False,

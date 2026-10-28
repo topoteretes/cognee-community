@@ -1,82 +1,42 @@
-"""ServiceNow connector for cognee — a ``dlt`` source that turns IT history into memory.
+"""ServiceNow connector for cognee: a ``dlt`` source that turns IT history into memory.
 
-Sync ServiceNow knowledge articles, incidents, problems and change requests (and,
-opt-in, their work notes and comments) into cognee, incrementally and with
-forget-on-delete::
-
-    import cognee
-    from cognee_community_connector_servicenow import servicenow_source
+One document per knowledge article, incident, problem and change request (and,
+opt-in, their work notes and comments), synced incrementally with forget-on-delete.
+Hand the source to :func:`cognee.remember` with ``write_disposition="merge"``::
 
     await cognee.remember(
         servicenow_source(
             instance_url="https://dev12345.service-now.com",
-            username="cognee.reader",
-            password="...",
+            username="cognee.integration",
+            password=os.environ["SERVICENOW_PASSWORD"],
         ),
         dataset_name="servicenow",
-        write_disposition="merge",   # REQUIRED (see .. important:: below)
+        write_disposition="merge",
     )
 
-.. important::
-   ``write_disposition="merge"`` is **mandatory**. cognee applies the caller's
-   write disposition to every table of the source; this source only emits
-   records that changed and deletes by emitting ``_deleted`` tombstone rows, and
-   both only work under ``merge``.
-
-Design
-------
-* **Auth** — instance URL plus basic auth for a read-only integration user
-  (``username``/``password``, or ``SERVICENOW_INSTANCE_URL``,
-  ``SERVICENOW_USERNAME``, ``SERVICENOW_PASSWORD``). The connector only reads,
-  through the Table API.
-* **What is synced** — published ``kb_knowledge`` articles plus ``incident``,
-  ``problem`` and ``change_request`` records, one document per record. Each table
-  can be narrowed with an encoded query (e.g. ``{"incident": "active=true"}``).
-  Reference fields are rendered by their display values (names, not sys_ids).
-  Work notes and comments are opt-in (``include_journal=True``) because they
-  often contain customer details.
-* **Incremental sync without date queries** — each run lists every in-scope
-  record's ``sys_id``, raw ``sys_updated_on`` (UTC) and ``sys_mod_count`` and
-  compares them with the previous run, kept in dlt's per-resource state. Only new or
-  changed records are then fetched in full, in batches. This avoids encoded
-  date filters, whose ``gs.dateGenerate`` values are interpreted in the
-  integration user's time zone. Adding a work note or comment updates the parent
-  record's ``sys_updated_on``, so journal changes are picked up too.
-* **Forget-on-delete** — a record missing from the listing (deleted, or moved out
-  of scope, such as a retired knowledge article or a record no longer matching
-  the table's query) is emitted with the ``_deleted`` hard-delete marker. dlt
-  drops it on ``merge`` and cognee's orphan cleanup removes it from the graph and
-  vector stores. A table removed from ``tables`` has all its records forgotten.
-  Any failed request aborts the run, so a broken listing never looks like a
-  deletion.
-
-Limitations
------------
-* The listing reads three small fields of every in-scope record each run, and the
-  state keeps one version string per record, so narrow very large tables with a query
-  (e.g. ``active=true`` or a ``sys_created_on`` window).
-* Journal entries are read from ``sys_journal_field``, which the integration user
-  must be able to read when ``include_journal=True``.
+The README describes what is stored, how changes and deletions are found, and what a
+run does when ServiceNow fails part of the way through.
 """
 
 from __future__ import annotations
 
 import html
-import os
 import re
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any
+from urllib.parse import urlsplit
 
 import dlt
 import requests
 from cognee.shared.logging_utils import get_logger
-from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR, PIPELINE_SCOPE_ATTR
+from cognee.tasks.ingestion import dlt_utils
+from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
+from dlt.common.normalizers.naming.snake_case import NamingConvention
 
 logger = get_logger("servicenow_connector")
 
 SERVICENOW_SOURCE_NAME = "servicenow"
-RECORDS_TABLE_NAME = "servicenow_records"
 
 # Tables synced by default, with the query that defines "in scope" for each.
 DEFAULT_TABLES: dict[str, str] = {
@@ -135,11 +95,29 @@ _TABLE_LABELS = {
 _LIST_PAGE_SIZE = 1000
 _MAX_PAGES = 100_000
 _FETCH_BATCH_SIZE = 100
-_MAX_RETRIES = 5
+_MAX_ATTEMPTS = 3
 _MAX_RETRY_DELAY_SECONDS = 60.0
+# Retries sleep inside cognee's staging lock, which every other dlt ingestion in
+# the process waits on, so a run waits at most this long in total.
+_WAIT_BUDGET_SECONDS = 60.0
 _REQUEST_TIMEOUT_SECONDS = 60
 
+_STAT_KEYS = (
+    "scanned",
+    "skipped",
+    "changed",
+    "deleted",
+    "failed",
+    "failed_auth",
+    "failed_rate_limit",
+    "requests",
+    "complete",
+)
+
 _TOMBSTONE_COLUMNS = {"_deleted": {"data_type": "bool", "hard_delete": True}}
+# C0/C1 control characters (tab and newline kept) and lone surrogates: a NUL makes
+# Postgres reject the load and a lone surrogate fails the dlt extract.
+_UNSAFE_CHARS = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\ud800-\udfff]")
 
 _BLOCK_END_RE = re.compile(r"(?i)<br\s*/?>|</(p|div|li|h[1-6]|tr|blockquote|pre)>")
 _TAG_RE = re.compile(r"<[^>]+>")
@@ -151,65 +129,76 @@ _SPACES_RE = re.compile(r"[ \t\r\f\v\xa0]+")
 # Public factory
 # ---------------------------------------------------------------------------
 def servicenow_source(
-    instance_url: str | None = None,
+    instance_url: str,
     username: str | None = None,
     password: str | None = None,
     tables: Mapping[str, str] | None = None,
     include_journal: bool = False,
-    check_active: Callable[[], None] | None = None,
     service: Any = None,
+    *,
+    resource_name: str | None = None,
+    check_active: Callable[[], None] | None = None,
     session: Any = None,
 ):
     """Create a dlt source that yields ServiceNow records as documents.
 
     Args:
-        instance_url: e.g. ``https://dev12345.service-now.com``. Falls back to
-            ``SERVICENOW_INSTANCE_URL``.
-        username: Read-only integration user. Falls back to ``SERVICENOW_USERNAME``.
-        password: Its password. Falls back to ``SERVICENOW_PASSWORD``.
+        instance_url: e.g. ``https://dev12345.service-now.com``.
+        username: Read-only integration user. Required unless ``service`` is given.
+        password: Its password.
         tables: ``{table: encoded_query}`` to sync; ``""`` means every record.
             Defaults to :data:`DEFAULT_TABLES`. Supported tables: ``kb_knowledge``,
             ``incident``, ``problem``, ``change_request``.
         include_journal: Append work notes and comments to each record.
-        check_active: Optional host checkpoint, called before every request and before
-            every row is published; raising from it stops the run.
         service: Pre-built ``requests``-compatible session (tests, proxies). It is
             used as is and not closed; when omitted, each run opens and closes its own
             from the credentials above.
+        resource_name: dlt resource (table) name, which also scopes the sync state.
+            Defaults to ``servicenow_<host>`` from ``instance_url``, so two instances
+            synced into one dataset keep apart.
+        check_active: Optional host checkpoint, called before every request and before
+            every row is published; raising from it stops the run.
         session: Alias of ``service``. Give at most one.
 
     Returns:
         A dlt source for ``cognee.remember(..., write_disposition="merge")``. After a
         run, ``source.cognee_sync_stats`` holds counts only: ``scanned`` (records
         listed), ``skipped`` (unchanged), ``changed``, ``deleted``, ``failed``
-        (listing rows without a sys_id), ``requests``, and ``complete`` (1 once the
-        run finished).
+        (listing rows without a sys_id), ``failed_auth`` and ``failed_rate_limit``
+        (1 when the run stopped for that reason), ``requests``, and ``complete`` (1
+        once the run finished).
     """
-
-    base_url = (instance_url or os.environ.get("SERVICENOW_INSTANCE_URL") or "").rstrip("/")
-    if not base_url:
-        raise ValueError(
-            "ServiceNow instance URL required: pass instance_url= or set SERVICENOW_INSTANCE_URL."
+    if getattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 0) < 1:
+        raise RuntimeError(
+            "The ServiceNow connector needs cognee's document sync cleanup (cognee>=1.6.3)."
         )
+    base_url = str(instance_url or "").strip().rstrip("/")
+    if not base_url.startswith(("https://", "http://")):
+        raise ValueError(
+            "instance_url must be the instance URL, e.g. https://dev12345.service-now.com."
+        )
+    if tables is not None and not isinstance(tables, Mapping):
+        raise ValueError('tables must be a dict of {table: encoded_query}, e.g. {"incident": ""}.')
     scope = dict(DEFAULT_TABLES if tables is None else tables)
     unsupported = sorted(set(scope) - set(_TABLE_FIELDS))
     if unsupported:
         raise ValueError(f"Unsupported tables {unsupported}; choose from {sorted(_TABLE_FIELDS)}.")
+    if not all(isinstance(query, str) for query in scope.values()):
+        raise ValueError('Each table maps to an encoded query string ("" for every record).')
+    name = resource_name if resource_name is not None else _default_resource_name(base_url)
+    _check_resource_name(name)
     if service is not None and session is not None:
         raise ValueError("Pass service= or session=, not both.")
     client = service if service is not None else session
     # A value pasted from a password manager or a file often ends in a newline.
-    user = (username or os.environ.get("SERVICENOW_USERNAME") or "").strip()
-    secret = (password or os.environ.get("SERVICENOW_PASSWORD") or "").rstrip("\r\n")
+    user = (username or "").strip()
+    secret = (password or "").rstrip("\r\n")
     if client is None and not (user and secret):
-        raise ValueError(
-            "ServiceNow credentials required: pass username= and password= or set "
-            "SERVICENOW_USERNAME and SERVICENOW_PASSWORD."
-        )
+        raise ValueError("username and password are required (a read-only integration user).")
     stats: dict[str, int] = {}
 
     @dlt.resource(
-        name=RECORDS_TABLE_NAME,
+        name=name,
         primary_key="id",
         write_disposition="merge",
         columns=_TOMBSTONE_COLUMNS,
@@ -231,14 +220,34 @@ def servicenow_source(
         return servicenow_records
 
     source = _servicenow()
-    # Opt into the document ingestion path (row → text document → cognify).
+    # Opt into the document ingestion path (row -> text document -> cognify).
     # resolve_dlt_sources reads this marker; it never imports this connector.
     setattr(source, DOCUMENT_SOURCE_ATTR, SERVICENOW_SOURCE_NAME)
-    # One dlt state (known records and their versions) per instance and cognee
-    # dataset, so syncing other sources or datasets on the machine can't reset it.
-    setattr(source, PIPELINE_SCOPE_ATTR, f"{SERVICENOW_SOURCE_NAME}:{base_url}")
+    # The table name also scopes the dlt state (known records and their versions),
+    # so the state and the table it describes always resolve to the same pipeline.
+    setattr(source, dlt_utils.PIPELINE_SCOPE_ATTR, name)
     source.cognee_sync_stats = stats
     return source
+
+
+def _default_resource_name(base_url: str) -> str:
+    """``servicenow_<host>`` (with port and path), e.g. ``servicenow_dev12345_service_now_com``."""
+    parts = urlsplit(base_url)
+    raw = f"{parts.hostname or ''}_{parts.port or ''}{parts.path}".lower()
+    slug = re.sub(r"[^a-z0-9]+", "_", raw).strip("_")
+    return f"{SERVICENOW_SOURCE_NAME}_{slug}"[:64].rstrip("_")
+
+
+def _check_resource_name(name: Any) -> None:
+    """A non-empty name of at most 64 characters that dlt keeps as it is.
+
+    It names the table and scopes the state: two names dlt normalizes alike
+    ("ServiceNow-Prod", "servicenow_prod") would share a table.
+    """
+    if not isinstance(name, str) or not name or len(name) > 64:
+        raise ValueError("resource_name must be a non-empty string of at most 64 characters.")
+    if NamingConvention().normalize_table_identifier(name) != name:
+        raise ValueError("resource_name must be lowercase snake_case (letters, digits, _).")
 
 
 class ServiceNowSyncError(RuntimeError):
@@ -269,32 +278,47 @@ class ServiceNowAPI:
         self.base_url = base_url.rstrip("/")
         self.check_active = check_active
         self.stats = stats if stats is not None else {}
+        self.waited = 0.0  # seconds slept on retries this run
 
     def request(self, path: str, params: dict) -> dict:
-        """GET a Table API path, retrying 429/5xx and network errors; others raise."""
+        """GET a Table API path, retrying 429/5xx and network errors within the wait budget."""
         url = f"{self.base_url}{path}"
-        attempt = 0
-        while True:
+        for attempt in range(_MAX_ATTEMPTS):
             if self.check_active is not None:
                 self.check_active()
             self.stats["requests"] = self.stats.get("requests", 0) + 1
+            failure: Exception | None = None
             try:
                 response = self.session.request(
                     "GET", url, params=params, timeout=_REQUEST_TIMEOUT_SECONDS
                 )
             except (requests.ConnectionError, requests.Timeout) as exc:
-                if attempt == _MAX_RETRIES - 1:
-                    raise
-                reason, delay = str(exc), min(2.0**attempt, _MAX_RETRY_DELAY_SECONDS)
+                failure, reason = exc, type(exc).__name__
+                delay = min(2.0**attempt, _MAX_RETRY_DELAY_SECONDS)
             else:
-                retryable = response.status_code == 429 or response.status_code >= 500
-                if not retryable or attempt == _MAX_RETRIES - 1:
+                status = response.status_code
+                if status != 429 and status < 500:
+                    if status in (401, 403):
+                        self.stats["failed_auth"] = 1
                     return _parse(response, path)
-                reason = f"HTTP {response.status_code}"
-                delay = _retry_delay(response.headers, attempt)
-            logger.warning("ServiceNow: %s on %s — retrying in %.1fs.", reason, path, delay)
+                reason, delay = f"HTTP {status}", _retry_delay(response.headers, attempt)
+            if attempt == _MAX_ATTEMPTS - 1 or self.waited + delay > _WAIT_BUDGET_SECONDS:
+                break
+            logger.warning("ServiceNow: %s on %s; retrying in %.1fs.", reason, path, delay)
+            self.waited += delay
             time.sleep(delay)
-            attempt += 1
+        if failure is not None:
+            raise failure
+        if response.status_code == 429:
+            self.stats["failed_rate_limit"] = 1
+            raise ServiceNowSyncError(
+                f"ServiceNow is rate-limiting {path} (HTTP 429). The run stopped before "
+                "changing anything; the next run starts over."
+            )
+        raise ServiceNowSyncError(
+            f"ServiceNow failed {path} with HTTP {response.status_code}. The run stopped "
+            "before changing anything; the next run starts over."
+        )
 
     def table(self, table: str, params: dict, page_size: int = _LIST_PAGE_SIZE) -> Iterator[dict]:
         """Yield every record of ``/api/now/table/{table}`` across offset pages."""
@@ -326,6 +350,13 @@ def _parse(response: Any, path: str) -> dict:
             "ServiceNow rejected the credentials (HTTP 401). Check the username and "
             "password; on newer instances the integration user also needs the "
             "snc_basic_auth_api_access role and Internal Integration User ticked.",
+            response=response,
+        )
+    if response.status_code == 403:
+        raise requests.HTTPError(
+            f"ServiceNow refused {path} (HTTP 403). The integration user needs read access "
+            "to this table (for example the itil role for incidents, or knowledge for "
+            "articles).",
             response=response,
         )
     response.raise_for_status()
@@ -366,7 +397,7 @@ def sync_records(
         stats = api.stats
     api.stats = stats  # requests are counted in the same dictionary
     stats.clear()
-    stats.update(scanned=0, skipped=0, changed=0, deleted=0, failed=0, requests=0, complete=0)
+    stats.update(dict.fromkeys(_STAT_KEYS, 0))
 
     tables_state = state.setdefault("tables", {})
     queries = state.setdefault("queries", {})
@@ -506,6 +537,10 @@ def _journal_entries(
     return entries
 
 
+def _clean(text: str) -> str:
+    return _UNSAFE_CHARS.sub("", text)
+
+
 def record_to_row(base_url: str, table: str, record: Mapping[str, Any], journal: list[str]) -> dict:
     """Render one record (display values) as a document row."""
     sys_id = record["sys_id"]
@@ -519,8 +554,8 @@ def record_to_row(base_url: str, table: str, record: Mapping[str, Any], journal:
     lines.extend(journal)
     return {
         "id": _record_id(table, sys_id),
-        "title": f"{number}: {summary}" if summary else number,
-        "content": "\n".join(lines),
+        "title": _clean(f"{number}: {summary}" if summary else number),
+        "content": _clean("\n".join(lines)),
         "url": f"{base_url}/nav_to.do?uri={table}.do?sys_id={sys_id}",
         "_deleted": False,
     }

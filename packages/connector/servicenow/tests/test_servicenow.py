@@ -25,6 +25,7 @@ from cognee_community_connector_servicenow.servicenow import (
 )
 
 BASE = "https://dev1.service-now.com"
+TABLE = "servicenow_dev1_service_now_com"  # the default resource name for BASE
 ONLY_INCIDENTS = {"incident": ""}
 
 # ---------------------------------------------------------------------------
@@ -89,7 +90,8 @@ def _matches(record, condition):
 class FakeServiceNowSession:
     """Stand-in for a ``requests`` session talking to the Table API."""
 
-    def __init__(self, tables, journal=(), page_size=None):
+    def __init__(self, tables, journal=(), page_size=None, base=BASE):
+        self.base = base
         self.tables = tables  # {table: [record, ...]}
         self.journal = list(journal)  # sys_journal_field rows
         self.page_size = page_size
@@ -100,7 +102,8 @@ class FakeServiceNowSession:
         self.closed = True
 
     def request(self, method, url, params=None, timeout=None):
-        table = url.removeprefix(f"{BASE}/api/now/table/")
+        assert url.startswith(f"{self.base}/api/now/table/"), url
+        table = url.removeprefix(f"{self.base}/api/now/table/")
         self.calls.append((table, dict(params)))
         if self.scripted:
             return self.scripted.pop(0)
@@ -183,18 +186,38 @@ def test_source_declares_document_marker_and_scope():
     source = servicenow_source(instance_url=f"{BASE}/", session=FakeServiceNowSession({}))
     assert SERVICENOW_SOURCE_NAME == "servicenow"
     assert document_source_tag(source) == "servicenow"
-    assert getattr(source, PIPELINE_SCOPE_ATTR) == f"servicenow:{BASE}"
+    # The table and the state scope share one name, derived from the instance.
+    assert getattr(source, PIPELINE_SCOPE_ATTR) == TABLE
+    assert list(source.resources) == [TABLE]
     assert pipeline_name_for_source(source, "a") != pipeline_name_for_source(source, "b")
+    named = servicenow_source(
+        instance_url=BASE, session=FakeServiceNowSession({}), resource_name="sn_prod"
+    )
+    assert getattr(named, PIPELINE_SCOPE_ATTR) == "sn_prod"
 
 
-def test_source_validates_configuration(monkeypatch):
-    monkeypatch.delenv("SERVICENOW_INSTANCE_URL", raising=False)
-    with pytest.raises(ValueError, match="instance URL required"):
-        servicenow_source(session=FakeServiceNowSession({}))
+def test_source_validates_configuration():
+    session = FakeServiceNowSession({})
+    with pytest.raises(ValueError, match="instance_url must be"):
+        servicenow_source(instance_url=None, session=session)
+    with pytest.raises(ValueError, match="instance_url must be"):
+        servicenow_source(instance_url="dev1.service-now.com", session=session)
+    with pytest.raises(ValueError, match="username and password are required"):
+        servicenow_source(instance_url=BASE, username="reader")
     with pytest.raises(ValueError, match="Unsupported tables"):
-        servicenow_source(
-            instance_url=BASE, tables={"sys_user": ""}, session=FakeServiceNowSession({})
-        )
+        servicenow_source(instance_url=BASE, tables={"sys_user": ""}, session=session)
+    with pytest.raises(ValueError, match="must be a dict"):
+        servicenow_source(instance_url=BASE, tables="incident", session=session)
+    with pytest.raises(ValueError, match="encoded query string"):
+        servicenow_source(instance_url=BASE, tables={"incident": None}, session=session)
+    with pytest.raises(ValueError, match="snake_case"):
+        servicenow_source(instance_url=BASE, resource_name="SN-Prod", session=session)
+
+
+def test_source_refuses_a_cognee_without_document_sync(monkeypatch):
+    monkeypatch.delattr(sn.dlt_utils, "DOCUMENT_SYNC_VERSION")
+    with pytest.raises(RuntimeError, match="document sync cleanup"):
+        servicenow_source(instance_url=BASE, username="reader", password="pw")
 
 
 # ---------------------------------------------------------------------------
@@ -219,9 +242,34 @@ def test_rate_limit_is_retried_and_auth_errors_are_not(_no_sleep):
     assert _no_sleep == [3.0, 2.0]
 
     session.scripted = [FakeResponse(401)]
+    api = _api(session)
     with pytest.raises(requests.HTTPError, match="snc_basic_auth_api_access"):
-        list(_api(session).table("incident", {}))
+        list(api.table("incident", {}))
     assert _no_sleep == [3.0, 2.0]  # no extra retry for 401
+    assert api.stats["failed_auth"] == 1
+
+    session.scripted = [FakeResponse(403)]
+    with pytest.raises(requests.HTTPError, match="read access"):
+        list(_api(session).table("incident", {}))
+
+
+def test_server_errors_stop_after_three_attempts(_no_sleep):
+    session = FakeServiceNowSession({"incident": []})
+    session.scripted = [FakeResponse(500)] * 3
+    with pytest.raises(sn.ServiceNowSyncError, match="HTTP 500"):
+        list(_api(session).table("incident", {}))
+    assert _no_sleep == [1.0, 2.0]
+
+
+def test_rate_limit_stops_once_the_wait_budget_is_spent(_no_sleep):
+    session = FakeServiceNowSession({"incident": []})
+    session.scripted = [FakeResponse(429, headers={"Retry-After": "45"})] * 3
+    api = _api(session)
+
+    with pytest.raises(sn.ServiceNowSyncError, match="rate-limiting"):
+        list(api.table("incident", {}))
+    assert _no_sleep == [45.0]  # a second 45 s wait would pass the 60 s budget
+    assert api.stats["failed_rate_limit"] == 1
 
 
 def test_web_page_instead_of_json_names_hibernation():
@@ -419,6 +467,8 @@ def test_stats_count_what_a_run_did():
         "changed": 2,
         "deleted": 0,
         "failed": 0,
+        "failed_auth": 0,
+        "failed_rate_limit": 0,
         "requests": 2,  # the listing and one fetch batch
         "complete": 1,
     }
@@ -485,10 +535,10 @@ def _run_sync(dlt, tmp_path, session, **kwargs):
     return pipeline
 
 
-def _read(pipeline):
+def _read(pipeline, table=TABLE):
     with (
         pipeline.sql_client() as client,
-        client.execute_query("SELECT id, content FROM servicenow_records") as cursor,
+        client.execute_query(f"SELECT id, content FROM {table}") as cursor,
     ):
         return {row[0]: row[1] for row in cursor.fetchall()}
 
@@ -558,3 +608,89 @@ def test_deleted_record_and_retired_article_are_removed(dlt_mod, tmp_path):
     # Tombstoned rows are hard-deleted by the merge, so cognee's read-back no
     # longer sees them and orphan cleanup forgets them.
     assert set(_read(pipeline)) == {"incident:s2"}
+
+
+def _pipeline(dlt, tmp_path, name):
+    return dlt.pipeline(
+        pipeline_name=name,
+        destination=dlt.destinations.sqlalchemy(
+            f"sqlite:///{(tmp_path / f'{name}.db').as_posix()}"
+        ),
+        dataset_name="servicenow_ds",
+        pipelines_dir=str(tmp_path / "state"),
+    )
+
+
+def test_two_instances_in_one_dataset_keep_their_own_table_and_state(dlt_mod, tmp_path):
+    from cognee.tasks.ingestion.dlt_utils import pipeline_name_for_source
+
+    # A sub-production instance cloned from production shares its sys_ids.
+    test_base = "https://dev1test.service-now.com"
+    prod = _instance()
+    test = _instance()
+    test.base = test_base
+
+    def sync(session, base):
+        source = servicenow_source(instance_url=base, session=session)
+        # Name the pipeline as cognee does: one per (dataset, scope).
+        pipeline = _pipeline(dlt_mod, tmp_path, pipeline_name_for_source(source, "servicenow"))
+        pipeline.run(source, write_disposition="merge", primary_key="id")
+        return pipeline
+
+    sync(prod, BASE)
+    sync(test, test_base)
+    prod.tables["incident"].pop(0)  # closed and deleted on production only
+    pipeline = sync(prod, BASE)
+    other = sync(test, test_base)
+
+    assert "incident:s1" not in _read(pipeline)
+    assert "incident:s1" in _read(other, table="servicenow_dev1test_service_now_com")
+    assert len(_read(other, table="servicenow_dev1test_service_now_com")) == 3
+
+
+@pytest.mark.parametrize("status", [401, 403, 404, 429, 500])
+def test_the_password_never_reaches_errors_or_logs(
+    dlt_mod, tmp_path, monkeypatch, caplog, capsys, status
+):
+    import base64
+
+    from dlt.pipeline.exceptions import PipelineStepFailed
+
+    password = "sn-LeakCanary0123456789"
+    basic = base64.b64encode(f"reader:{password}".encode()).decode()
+    session = _instance()
+    echo = {"error": {"message": f"Bad password {password}", "detail": f"Basic {basic}"}}
+    session.scripted = [FakeResponse(status, echo, headers={"Retry-After": "1"})] * 3
+    monkeypatch.setattr(sn, "_make_session", lambda user, secret: session)
+    source = servicenow_source(instance_url=BASE, username="reader", password=f"{password}\n")
+
+    with pytest.raises(PipelineStepFailed) as failure:
+        _pipeline(dlt_mod, tmp_path, f"servicenow_leak_{status}").run(
+            source, write_disposition="merge", primary_key="id"
+        )
+
+    chain, error = [], failure.value
+    while error is not None:
+        chain.append(f"{error!r} {error}")
+        error = error.__cause__ or error.__context__
+    output = capsys.readouterr()
+    for secret in (password, basic):
+        assert secret not in " ".join(chain)
+        assert secret not in caplog.text + output.out + output.err
+    assert source.cognee_sync_stats["complete"] == 0
+    assert source.cognee_sync_stats["failed_auth"] == (1 if status in (401, 403) else 0)
+    assert source.cognee_sync_stats["failed_rate_limit"] == (1 if status == 429 else 0)
+
+
+def test_control_characters_and_lone_surrogates_are_dropped(dlt_mod, tmp_path):
+    session = _instance()
+    session.tables["incident"][0].update(
+        short_description="VPN\x00 down\x1b", close_notes="Renewed the \ud800certificate."
+    )
+    pipeline = _run_sync(dlt_mod, tmp_path, session)
+
+    content = _read(pipeline)["incident:s1"]
+    assert "Renewed the certificate." in content
+    assert "\x00" not in content and "\x1b" not in content
+    record = session.tables["incident"][0]
+    assert sn.record_to_row(BASE, "incident", record, [])["title"] == "INC001: VPN down"
