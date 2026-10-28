@@ -25,11 +25,12 @@ async def main() -> None:
         write_disposition="replace",
     )
 
-    # 4. Ingest into cognee memory
+    # 4. Ingest into cognee memory (max_rows_per_table=0 disables cognee's 50-row default limit)
     print(f"Ingesting Clay table '{table_id}' into cognee memory...")
     await cognee.remember(
         resource,
         dataset_name="clay_accounts",
+        max_rows_per_table=0,
     )
     print("Ingestion complete! Data is now available in cognee.")
 

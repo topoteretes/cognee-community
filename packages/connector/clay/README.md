@@ -66,12 +66,15 @@ async def main():
     await cognee.remember(
         source,
         dataset_name="clay_accounts",
+        max_rows_per_table=0,  # 0 disables cognee's 50-row default cap for full-table sync
     )
 
 
 if __name__ == "__main__":
     asyncio.run(main())
 ```
+
+> **Note**: Setting `max_rows_per_table=0` in `cognee.remember()` is recommended for full-table syncs. Without it, Cognee applies a default limit of 50 records per table, which would truncate larger tables.
 
 ---
 
@@ -83,24 +86,26 @@ if __name__ == "__main__":
 def clay_source(
     table_id: str | None = None,
     *,
-    api_key: str | None = None,
+    api_key: str | Callable[[], str] | None = None,
     fields: list[str] | None = None,
     primary_key: str | None = None,
     write_disposition: str = "replace",
     limit: int = 100,
     base_url: str = "https://api.clay.com/public/v0",
+    check_active: Callable[[], None] | None = None,
 ) -> dlt.sources.DltResource: ...
 ```
 
 | Parameter | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `table_id` | `str \| None` | `None` | Target table ID. Falls back to `CLAY_TABLE_ID`. |
-| `api_key` | `str \| None` | `None` | API key. Falls back to `CLAY_API_KEY`. Never logged. |
+| `api_key` | `str \| Callable[[], str] \| None` | `None` | API key or token provider callable. Falls back to `CLAY_API_KEY`. Never logged. |
 | `fields` | `list[str] \| None` | `None` | Columns to include. Formatted into the `query.select` payload. If omitted, all columns are queried and a warning is logged. |
-| `primary_key` | `str \| None` | `None` | Column to use as business identifier. Falls back to system record ID if present, or deterministic hash. |
+| `primary_key` | `str \| None` | `None` | Column to use as business identifier. Takes precedence over system IDs; falls back to system record ID if absent/null, or deterministic hash. |
 | `write_disposition` | `str` | `"replace"` | `dlt` sync disposition. `"replace"` performs full table snapshot sync. |
 | `limit` | `int` | `100` | Rows requested per page (1–100). |
 | `base_url` | `str` | `"https://api.clay.com/public/v0"` | Base URL for Clay public API. |
+| `check_active` | `Callable[[], None] \| None` | `None` | Optional host authorization checkpoint called per row to allow clean cancellation without corrupted state. |
 
 ---
 

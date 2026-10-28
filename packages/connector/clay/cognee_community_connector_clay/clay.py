@@ -15,6 +15,7 @@ the resource produced here is passed directly to :func:`cognee.remember`::
         ),
         dataset_name="clay_accounts",
         write_disposition="replace",
+        max_rows_per_table=0,
     )
 
 Design
@@ -44,9 +45,16 @@ Design
 import hashlib
 import json
 import os
+import re
+from collections.abc import Callable
 from typing import Any
 
-from requests import Response
+Token = str | Callable[[], str]
+
+try:
+    from requests import Response
+except ImportError:
+    Response = Any  # type: ignore[misc,assignment]
 
 try:
     from cognee.shared.logging_utils import get_logger
@@ -62,7 +70,20 @@ DEFAULT_BASE_URL = "https://api.clay.com/public/v0"
 
 def _normalize_field_name(field_name: str) -> str:
     """Convert an arbitrary column name into a clean snake_case identifier."""
-    return field_name.strip().lower().replace(" ", "_").replace("-", "_")
+    cleaned = re.sub(r"[^\w]+", "_", field_name.strip()).strip("_").lower()
+    return cleaned or "col"
+
+
+def _extract_cell_value(cell_data: Any) -> Any:
+    """Extract unwrapped value from a structured Clay cell dictionary if present."""
+    if isinstance(cell_data, dict):
+        if "value" in cell_data:
+            return cell_data["value"]
+        if "status" in cell_data and set(cell_data.keys()).issubset(
+            {"status", "error", "format", "type"}
+        ):
+            return None
+    return cell_data
 
 
 def _normalize_clay_row(
@@ -75,6 +96,9 @@ def _normalize_clay_row(
     Handles both wrapped item formats (e.g. ``{"record_id": ..., "fields": {...}}``)
     and direct column mappings (e.g. ``{"Company Name": {"value": ..., "status": ...}}``).
     """
+    if not isinstance(raw_item, dict):
+        raise TypeError(f"Expected dict row from Clay API, got {type(raw_item).__name__}")
+
     raw_fields: dict[str, Any] = (
         raw_item.get("fields") if isinstance(raw_item.get("fields"), dict) else raw_item
     )
@@ -82,30 +106,38 @@ def _normalize_clay_row(
     normalized: dict[str, Any] = {}
     system_id: str | None = None
 
-    # Check for top-level or field-level record identifier
+    # Check for top-level record identifier (unwrapping cell object if structured)
     for id_key in ("record_id", "id", "_id"):
         if id_key in raw_item and raw_item[id_key] is not None:
-            system_id = str(raw_item[id_key])
-            break
+            extracted_id = _extract_cell_value(raw_item[id_key])
+            if extracted_id is not None and str(extracted_id).strip():
+                system_id = str(extracted_id).strip()
+                break
 
     # Unpack cell values
     for col_name, cell_data in raw_fields.items():
+        val = _extract_cell_value(cell_data)
         if col_name in ("record_id", "id", "_id") and not system_id:
-            system_id = str(cell_data)
+            if val is not None and str(val).strip():
+                system_id = str(val).strip()
 
         norm_key = _normalize_field_name(str(col_name))
+        normalized[norm_key] = val
 
-        if isinstance(cell_data, dict) and ("value" in cell_data or "status" in cell_data):
-            normalized[norm_key] = cell_data.get("value")
+    # Resolve primary key: user-designated business key takes precedence over system ID
+    if primary_key_field:
+        norm_pk = _normalize_field_name(primary_key_field)
+        val = normalized.get(norm_pk)
+        if val is not None and str(val).strip():
+            key_part = str(val).strip()
+        elif system_id:
+            key_part = system_id
         else:
-            normalized[norm_key] = cell_data
-
-    # Resolve primary key
-    if system_id:
+            # Fall back to deterministic SHA-256 of normalized row when business key is null/empty
+            hash_input = json.dumps(normalized, sort_keys=True, default=str)
+            key_part = hashlib.sha256(hash_input.encode("utf-8")).hexdigest()[:16]
+    elif system_id:
         key_part = system_id
-    elif primary_key_field and _normalize_field_name(primary_key_field) in normalized:
-        resolved_val = normalized[_normalize_field_name(primary_key_field)]
-        key_part = str(resolved_val) if resolved_val is not None else "null"
     else:
         # Deterministic SHA-256 fallback of normalized payload
         hash_input = json.dumps(normalized, sort_keys=True, default=str)
@@ -118,6 +150,16 @@ def _normalize_clay_row(
 
 def _handle_clay_response_errors(response: Response, *args: Any, **kwargs: Any) -> Response:
     """Inspect Clay HTTP response status and raise descriptive error messages."""
+    if response.status_code == 400:
+        try:
+            err_json = response.json()
+            detail = err_json.get("message") or err_json.get("error") or response.text
+        except Exception:
+            detail = response.text
+        raise RuntimeError(
+            f"Clay API bad request (HTTP 400): {detail}. "
+            "Please check requested fields and query parameters."
+        )
     if response.status_code == 401:
         raise RuntimeError(
             "Clay API authentication failed (HTTP 401). "
@@ -130,35 +172,54 @@ def _handle_clay_response_errors(response: Response, *args: Any, **kwargs: Any) 
             "Please verify that your workspace is on an Enterprise plan "
             "and that API access is enabled for this table under Table Settings -> Integrations."
         )
+    if response.status_code == 404:
+        raise RuntimeError(
+            "Clay table not found (HTTP 404). "
+            "Please verify that the table_id exists and is accessible."
+        )
+    if response.status_code == 429:
+        raise RuntimeError(
+            "Clay API rate limit exceeded (HTTP 429). "
+            "Please reduce request frequency or increase retry backoff."
+        )
+    if response.status_code >= 500:
+        raise RuntimeError(
+            f"Clay API server error (HTTP {response.status_code}). "
+            "Please try again later or check Clay service status."
+        )
     return response
 
 
 def clay_source(
     table_id: str | None = None,
     *,
-    api_key: str | None = None,
+    api_key: Token | None = None,
     fields: list[str] | None = None,
     primary_key: str | None = None,
     write_disposition: str = "replace",
     limit: int = 100,
     base_url: str = DEFAULT_BASE_URL,
+    check_active: Callable[[], None] | None = None,
 ):
     """Return a ``dlt`` resource yielding normalized structured records from a Clay table.
 
     Args:
         table_id: Clay table ID to query (e.g. 't_0te9i4tZEHwc9hihBXu').
             Falls back to ``CLAY_TABLE_ID`` environment variable.
-        api_key: Clay API key. Falls back to ``CLAY_API_KEY`` environment variable.
+        api_key: Clay API key or callable returning one. Falls back to
+            ``CLAY_API_KEY`` environment variable.
         fields: Optional list of column names to query. When specified, only these
             columns are selected via the query payload. If omitted, all table
             columns are fetched, and a warning is logged regarding third-party data licensing.
         primary_key: Optional business column name to use as the record identifier
-            (e.g. 'domain', 'email'). If omitted, system IDs or deterministic content
-            hashes are used.
+            (e.g. 'domain', 'email'). Takes precedence over system IDs. If omitted or empty,
+            system IDs or deterministic content hashes are used.
         write_disposition: ``dlt`` write disposition. Defaults to ``"replace"``
             (recommended full table snapshot sync).
         limit: Number of records to request per page (1-100, default 100).
         base_url: Base URL for Clay public API (default: 'https://api.clay.com/public/v0').
+        check_active: Optional host authorization checkpoint called per row to allow
+            clean cancellation without corrupted state.
 
     Returns:
         A ``dlt`` resource yielding normalized records with stable namespaced IDs.
@@ -171,18 +232,24 @@ def clay_source(
             'Install it with: pip install "cognee-community-connector-clay"'
         ) from exc
 
-    resolved_table_id = table_id or os.getenv("CLAY_TABLE_ID")
+    raw_table_id = table_id or os.getenv("CLAY_TABLE_ID")
+    resolved_table_id = raw_table_id.strip() if isinstance(raw_table_id, str) else None
     if not resolved_table_id:
         raise ValueError(
             "table_id is required "
             "(pass it explicitly or set the CLAY_TABLE_ID environment variable)."
         )
 
-    resolved_api_key = api_key or os.getenv("CLAY_API_KEY")
+    raw_api_key = api_key or os.getenv("CLAY_API_KEY")
+    if callable(raw_api_key):
+        raw_api_key = raw_api_key()
+    resolved_api_key = raw_api_key.strip() if isinstance(raw_api_key, str) else None
     if not resolved_api_key:
         raise ValueError(
             "api_key is required (pass it explicitly or set the CLAY_API_KEY environment variable)."
         )
+    if any(c in resolved_api_key for c in "\r\n\t"):
+        raise ValueError("api_key must not contain whitespace or control characters.")
 
     if not (1 <= limit <= 100):
         raise ValueError("limit must be between 1 and 100 as specified by Clay's Table Query API.")
@@ -193,7 +260,10 @@ def clay_source(
     }
 
     if fields:
-        query_payload["select"] = [{"field": f, "as": _normalize_field_name(f)} for f in fields]
+        sanitized_fields = [f.strip() for f in fields if isinstance(f, str) and f.strip()]
+        query_payload["select"] = [
+            {"field": f, "as": _normalize_field_name(f)} for f in sanitized_fields
+        ]
     else:
         logger.warning(
             "No 'fields' filter specified for Clay table '%s'. Syncing all columns "
@@ -242,13 +312,16 @@ def clay_source(
     resource = source.resources[resource_name]
 
     # Apply row normalization transformation mapping
-    resource.add_map(
-        lambda row: _normalize_clay_row(
+    def _transform_row(row: dict[str, Any]) -> dict[str, Any]:
+        if check_active is not None:
+            check_active()
+        return _normalize_clay_row(
             row,
             table_id=resolved_table_id,
             primary_key_field=primary_key,
         )
-    )
+
+    resource.add_map(_transform_row)
 
     # Note: DOCUMENT_SOURCE_ATTR is deliberately NOT set on this resource,
     # ensuring cognee routes these records through structured relational/graph ingestion
