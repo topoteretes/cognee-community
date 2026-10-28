@@ -1,30 +1,19 @@
-"""Trigger.dev connector demo — "Ask my background jobs & task executions".
+"""Trigger.dev connector demo: ask your background jobs why they failed.
 
-Pull your Trigger.dev tasks, runs, error stacktraces, and cron schedules into cognee memory,
-incrementally, with forget-on-delete.
+``triggerdev_source`` returns a ``dlt`` resource you hand straight to
+``cognee.remember``. The first run reads the environment's schedules and the last
+week of error groups, failed runs and deployments; later runs send only what
+changed, and a deleted schedule is forgotten.
 
-This example is built on cognee's DLT ingestion subsystem: ``triggerdev_source``
-returns a ``dlt`` resource that you hand straight to ``cognee.remember``. The
-first run backfills the project history; subsequent runs re-process only
-records whose content changed, and deleted tasks or schedules are forgotten
-from memory on the next sync.
-
-────────────────────────────────────────────────────────────────────────────
 One-time setup
-────────────────────────────────────────────────────────────────────────────
-1. Install the connector package:
+--------------
+1. In the Trigger.dev dashboard open your project, pick the environment (prod,
+   staging, dev), go to API keys and copy its secret key (``tr_prod_...``).
+2. Export it, and an LLM key for cognee (e.g. ``LLM_API_KEY``)::
 
-       pip install cognee-community-connector-triggerdev
+       export TRIGGER_SECRET_KEY="tr_prod_..."
 
-2. Obtain a Trigger.dev Project API Key from Trigger.dev Dashboard → Project Settings → API Keys.
-
-3. Export it:
-
-       export TRIGGERDEV_API_KEY="tr_prod_..."
-
-4. Set your LLM API key (e.g. ``OPENAI_API_KEY`` or ``ANTHROPIC_API_KEY``) in your environment.
-
-Run it:
+Run it::
 
     python examples/example.py
 """
@@ -33,42 +22,43 @@ import asyncio
 import os
 
 import cognee
+
 from cognee_community_connector_triggerdev import triggerdev_source
 
-DATASET_NAME = "triggerdev_ops"
-RESOURCE_NAME = "triggerdev_main"
-
-TRIGGERDEV_REMEMBER_KWARGS = {
-    "primary_key": "id",
-    "write_disposition": "merge",
-    "max_rows_per_table": 0,
-}
+DATASET_NAME = "triggerdev"
+# one resource_name per Trigger.dev environment; it scopes the sync state
+RESOURCE_NAME = "triggerdev_prod"
 
 
 async def sync(api_key: str) -> None:
     source = triggerdev_source(api_key=api_key, resource_name=RESOURCE_NAME)
-    result = await cognee.remember(source, dataset_name=DATASET_NAME, **TRIGGERDEV_REMEMBER_KWARGS)
-    print("Sync result:", result)
-    print("Sync stats:", source.cognee_sync_stats)
+    await cognee.remember(
+        source,
+        dataset_name=DATASET_NAME,
+        primary_key="id",
+        write_disposition="merge",  # required, the add pipeline defaults to "replace"
+        max_rows_per_table=0,  # read the whole table back so deleted rows can be forgotten
+        self_improvement=False,  # no whole-graph enrichment pass on every sync
+    )
+    print("sync stats:", source.cognee_sync_stats)
 
 
-async def main():
-    api_key = os.environ.get("TRIGGERDEV_API_KEY")
+async def main() -> None:
+    api_key = os.environ.get("TRIGGER_SECRET_KEY")
     if not api_key:
-        print("Set TRIGGERDEV_API_KEY.\nSee the setup steps in this file's docstring, then re-run.")
+        print("Set TRIGGER_SECRET_KEY to an environment's secret key (see the docstring).")
         return
 
-    print("\n=== Trigger.dev Sync #1 (Backfill) ===")
     await sync(api_key)
 
     answer = await cognee.search(
-        query_text="Which background tasks failed in the last runs, and what were the error messages?",
+        query_text="Which tasks failed this week, and what error did each one hit?",
         query_type=cognee.SearchType.GRAPH_COMPLETION,
         datasets=[DATASET_NAME],
     )
-    print("\nOps Assistant Answer:\n", answer)
+    print("Ops answer:", answer)
 
-    print("\n=== Trigger.dev Sync #2 (Incremental) ===")
+    # nothing changed upstream, so the second run sends nothing to cognee
     await sync(api_key)
 
 

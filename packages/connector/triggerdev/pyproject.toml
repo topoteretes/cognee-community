@@ -1,7 +1,7 @@
 [project]
 name = "cognee-community-connector-triggerdev"
 version = "0.1.0"
-description = "Trigger.dev data-source connector for cognee — sync background tasks, workflow runs, schedules, and error logs into memory (incremental + forget-on-delete)"
+description = "Trigger.dev data-source connector for cognee: sync an environment's schedules, error groups, failed runs and deployments into memory (incremental + forget-on-delete)"
 readme = "README.md"
 requires-python = ">=3.10,<3.15"
 dependencies = [
