@@ -117,6 +117,41 @@ def test_a_burst_429_waits_retry_after_then_succeeds(monkeypatch):
     assert sleeps == [2.0]
 
 
+@pytest.mark.parametrize("value", ["nan", "-5", "inf"])
+def test_an_odd_retry_after_falls_back_to_backoff(monkeypatch, value):
+    client, _, sleeps = _client(
+        monkeypatch, _Response(429, headers={"retry-after": value}), _Response(200, OK)
+    )
+
+    assert client.request("/v1/notes") == OK
+    assert sleeps == [1]
+
+
+def test_a_redirect_is_not_followed_and_raises(monkeypatch):
+    client, calls, _ = _client(
+        monkeypatch, _Response(302, headers={"location": "https://evil.example/"})
+    )
+
+    with pytest.raises(PipedriveAPIError, match="HTTP 302"):
+        client.request("/v1/notes")
+    assert calls[0][1]["allow_redirects"] is False
+
+
+def test_waits_across_a_run_are_capped_and_reset_by_the_next_run(monkeypatch):
+    burst = _Response(429, headers={"retry-after": "9"})
+    client, _, sleeps = _client(monkeypatch, *([burst, _Response(200, OK)] * 6), burst)
+
+    for _ in range(6):
+        client.request("/v1/notes")
+    with pytest.raises(PipedriveRateLimitedError, match="too long"):
+        client.request("/v1/notes")
+    assert sum(sleeps) <= 60
+
+    client.start_run()
+    monkeypatch.setattr(pipedrive_module.requests, "get", lambda url, **kw: _Response(200, OK))
+    assert client.request("/v1/notes") == OK
+
+
 def test_a_spent_daily_budget_stops_instead_of_sleeping_for_hours(monkeypatch):
     client, calls, sleeps = _client(monkeypatch, _Response(429, headers={"retry-after": "3600"}))
 

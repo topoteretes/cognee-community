@@ -12,8 +12,8 @@ and is meant to be handed to ``cognee.remember``::
 """
 
 import hashlib
-import html
 import json
+import math
 import re
 import time
 from collections.abc import Callable, Iterator
@@ -44,6 +44,8 @@ _RETRIES = 3
 # pipedrive's burst window is 2 seconds; a longer Retry-After means the daily budget
 # is spent, and sleeping on it would hold cognee's staging lock for hours
 _MAX_RETRY_WAIT = 10.0
+# total seconds one run may spend waiting on retries before it stops and resumes later
+_MAX_RUN_WAIT = 60.0
 # resource_name becomes a dlt table and pipeline name, which the filesystem limits
 _MAX_NAME_LENGTH = 64
 # the singular of each kind, used in row ids, app urls and the GET re-check
@@ -104,9 +106,11 @@ def _endpoint(path: str) -> str:
 
 def _retry_after(headers: Any) -> float | None:
     try:
-        return float(headers.get("retry-after"))
+        wait = float(headers.get("retry-after"))
     except (TypeError, ValueError):
         return None
+    # time.sleep refuses nan and negative values
+    return wait if math.isfinite(wait) and wait >= 0 else None
 
 
 class PipedriveClient:
@@ -122,6 +126,17 @@ class PipedriveClient:
             raise ValueError("The Pipedrive API token is empty or has an invalid format")
         self._api_token = token
         self._sleep = sleep
+        self._waited = 0.0
+
+    def start_run(self) -> None:
+        """Reset the retry wait budget; called at the start of every sync run."""
+        self._waited = 0.0
+
+    def _wait(self, seconds: float) -> None:
+        if self._waited + seconds > _MAX_RUN_WAIT:
+            raise PipedriveRateLimitedError("Pipedrive kept this run waiting too long on retries")
+        self._waited += seconds
+        self._sleep(seconds)
 
     def __repr__(self) -> str:
         return "PipedriveClient(api_token=<redacted>)"
@@ -139,25 +154,30 @@ class PipedriveClient:
             if check_active is not None:
                 check_active()
             try:
+                # no redirects: requests would forward the custom token header to any host
                 response = requests.get(
-                    BASE_URL + path, params=params, headers=headers, timeout=_TIMEOUT
+                    BASE_URL + path,
+                    params=params,
+                    headers=headers,
+                    timeout=_TIMEOUT,
+                    allow_redirects=False,
                 )
             except requests.RequestException as exc:
                 if last:
                     raise PipedriveAPIError(
                         f"Pipedrive request failed: {type(exc).__name__}"
                     ) from None
-                self._sleep(2**attempt)
+                self._wait(2**attempt)
                 continue
             status = response.status_code
             if status == 429 and not last:
                 wait = _retry_after(response.headers)
                 if wait is not None and wait > _MAX_RETRY_WAIT:
                     raise PipedriveRateLimitedError("Pipedrive rate limit exceeded (HTTP 429)")
-                self._sleep(wait if wait is not None else 2**attempt)
+                self._wait(wait if wait is not None else 2**attempt)
                 continue
             if status >= 500 and not last:
-                self._sleep(2**attempt)
+                self._wait(2**attempt)
                 continue
             # the last attempt always ends here, so the loop never falls through
             return self._parse(response, path)
@@ -235,7 +255,8 @@ def html_to_text(value: Any) -> str:
     parser = _TextExtractor()
     parser.feed(value)
     parser.close()
-    text = html.unescape("".join(parser.parts)).replace("\xa0", " ")
+    # convert_charrefs already decoded entities; decoding again would turn "&lt;" into "<"
+    text = "".join(parser.parts).replace("\xa0", " ")
     lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.splitlines()]
     return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
 
@@ -252,8 +273,17 @@ def _lines(fields: list[tuple[str, str]]) -> list[str]:
     return [f"{label}: {value}" for label, value in fields if value]
 
 
+def _lookup(names: dict[Any, str], record_id: Any) -> str:
+    """The name of an id, or "" for an id of an unexpected shape."""
+    if isinstance(record_id, bool) or not isinstance(record_id, (int, str)):
+        return ""
+    return names.get(record_id, "")
+
+
 def _name(lookups: Lookups, kind: str, record_id: Any) -> str:
-    return lookups.names.get(f"{kind}:{record_id}", "") if record_id else ""
+    if not record_id or isinstance(record_id, bool) or not isinstance(record_id, (int, str)):
+        return ""
+    return lookups.names.get(f"{kind}:{record_id}", "")
 
 
 def _money(value: Any, currency: Any) -> str:
@@ -269,7 +299,7 @@ def _field_value(value: Any, field_type: str, options: dict[str, str], lookups: 
         ids = value if isinstance(value, list) else str(value).split(",")
         return ", ".join(sorted(options.get(str(i).strip(), _text(i)) for i in ids))
     if field_type == "user":
-        return lookups.users.get(value, "")
+        return _lookup(lookups.users, value)
     if field_type == "org":
         return _name(lookups, "organization", value)
     if field_type == "people":
@@ -279,6 +309,9 @@ def _field_value(value: Any, field_type: str, options: dict[str, str], lookups: 
             return _money(value.get("value"), value.get("currency"))
         return ", ".join(f"{k}: {_text(v)}" for k, v in sorted(value.items()) if _text(v))
     return _text(value)
+
+
+_CONTACT_FIELD_TYPES = frozenset({"phone", "email"})
 
 
 def _custom_fields(record: dict, kind: str, lookups: Lookups) -> list[tuple[str, str]]:
@@ -291,6 +324,9 @@ def _custom_fields(record: dict, kind: str, lookups: Lookups) -> list[tuple[str,
         if key not in defs:
             continue
         name, field_type, options = defs[key]
+        # contact channels stay out of memory, like the built-in emails and phones
+        if field_type in _CONTACT_FIELD_TYPES:
+            continue
         text = _field_value(value, field_type, options, lookups)
         if name and text:
             pairs.append((name, text))
@@ -326,7 +362,7 @@ def render_organization(org: dict, lookups: Lookups) -> dict:
     title = _text(org.get("name")) or "Unnamed organization"
     address = org.get("address")
     fields = [
-        ("Owner", lookups.users.get(org.get("owner_id"), "")),
+        ("Owner", _lookup(lookups.users, org.get("owner_id"))),
         ("Address", _text(address.get("value")) if isinstance(address, dict) else _text(address)),
         ("Labels", _labels(org, "organization", lookups)),
         *_custom_fields(org, "organization", lookups),
@@ -341,7 +377,7 @@ def render_person(person: dict, lookups: Lookups) -> dict:
     fields = [
         ("Job title", _text(person.get("job_title"))),
         ("Organization", _name(lookups, "organization", person.get("org_id"))),
-        ("Owner", lookups.users.get(person.get("owner_id"), "")),
+        ("Owner", _lookup(lookups.users, person.get("owner_id"))),
         ("Labels", _labels(person, "person", lookups)),
         *_custom_fields(person, "person", lookups),
     ]
@@ -355,12 +391,12 @@ def render_deal(deal: dict, lookups: Lookups) -> dict:
         status = f"{status} (archived)".strip()
     fields = [
         ("Status", status),
-        ("Pipeline", lookups.pipelines.get(deal.get("pipeline_id"), "")),
-        ("Stage", lookups.stages.get(deal.get("stage_id"), "")),
+        ("Pipeline", _lookup(lookups.pipelines, deal.get("pipeline_id"))),
+        ("Stage", _lookup(lookups.stages, deal.get("stage_id"))),
         ("Value", _money(deal.get("value"), deal.get("currency"))),
         ("Organization", _name(lookups, "organization", deal.get("org_id"))),
         ("Person", _name(lookups, "person", deal.get("person_id"))),
-        ("Owner", lookups.users.get(deal.get("owner_id"), "")),
+        ("Owner", _lookup(lookups.users, deal.get("owner_id"))),
         ("Expected close date", _text(deal.get("expected_close_date"))),
         ("Won on", _text(deal.get("won_time"))[:10]),
         ("Lost on", _text(deal.get("lost_time"))[:10]),
@@ -402,7 +438,7 @@ def render_activity(activity: dict, lookups: Lookups) -> dict:
         ("Due", due),
         ("Done", _text(bool(activity.get("done")))),
         *_parents(activity, lookups),
-        ("Owner", lookups.users.get(activity.get("owner_id"), "")),
+        ("Owner", _lookup(lookups.users, activity.get("owner_id"))),
         (
             "Location",
             _text(location.get("value")) if isinstance(location, dict) else _text(location),
@@ -422,7 +458,7 @@ def render_note(note: dict, lookups: Lookups) -> dict:
     parents = _parents(note, lookups)
     about = next((f"{kind.lower()} {name}" for kind, name in parents if name), "")
     title = f"Note on {about}" if about else "Note"
-    author = lookups.users.get(note.get("user_id"), "")
+    author = _lookup(lookups.users, note.get("user_id"))
     if not author and isinstance(note.get("user"), dict):
         author = _text(note["user"].get("name"))
     fields = [*parents, ("Author", author), ("Added", _text(note.get("add_time"))[:10])]
@@ -473,8 +509,8 @@ def _walk_names(include: tuple[str, ...], include_archived: bool) -> list[str]:
 
 def _records(payload: dict, path: str) -> list:
     data = payload.get("data")
-    # v1 answers an empty listing with null instead of []
-    if data is None:
+    # v1 answers an empty listing with null instead of []; v2 always sends a list
+    if data is None and path.startswith("/v1/"):
         return []
     if not isinstance(data, list):
         raise PipedriveAPIError(f"Pipedrive sent no list for {_endpoint(path)}")
@@ -533,6 +569,9 @@ class _Walker:
         self.check_active = check_active
         self.requests = 0
         self.emitted = 0
+        start_run = getattr(client, "start_run", None)
+        if callable(start_run):
+            start_run()
         self.walks = _walk_names(include, include_archived)
         self.fingerprints: dict[str, str] = state.setdefault("fingerprints", {})
         self.seen: list[str] = state.setdefault("seen", [])
@@ -648,6 +687,7 @@ class _Walker:
         progress = self.state.setdefault("walks", {}).setdefault(walk, {})
         if progress.get("done"):
             return
+        resumed = bool(progress.get("cursor") or progress.get("start"))
         while True:
             if mode == "cursor":
                 params: dict[str, Any] = {"limit": PAGE_SIZE}
@@ -655,7 +695,16 @@ class _Walker:
                     params["cursor"] = progress["cursor"]
             else:
                 params = {"limit": PAGE_SIZE, "start": progress.get("start", 0), "sort": "id ASC"}
-            payload = self._call(path, params)
+            try:
+                payload = self._call(path, params)
+            except PipedriveAPIError:
+                if not resumed:
+                    raise
+                # a cursor kept from an earlier run may have expired: list this kind again
+                progress.clear()
+                resumed = False
+                continue
+            resumed = False
             records = _records(payload, path)
             yield from records
             if mode == "cursor":
@@ -695,7 +744,13 @@ class _Walker:
             # a deleted record left in a listing is not seen, so the re-check forgets it
             if record.get("is_deleted") or record.get("active_flag") is False:
                 continue
-            row = render(record, self.lookups)
+            if walk == "deals" and record.get("is_archived") and not self.include_archived:
+                continue
+            try:
+                row = render(record, self.lookups)
+            except Exception as exc:  # one odd record must not block the whole company
+                self._failed("render", PipedriveAPIError(type(exc).__name__))
+                continue
             if walk in ("organizations", "persons", "deals", "archived_deals"):
                 raw = record.get("title") if walk.endswith("deals") else record.get("name")
                 self.lookups.names[row["id"]] = _text(raw)

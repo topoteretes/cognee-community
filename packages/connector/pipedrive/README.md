@@ -76,7 +76,8 @@ fields and their options):
 
 Notes are their own documents, so editing one note re-processes only that note. Each note
 and activity names the records it belongs to, and the graph links them through those names.
-Email addresses and phone numbers of persons are left out on purpose.
+Email addresses and phone numbers of persons are left out on purpose, including custom
+fields of the phone type.
 
 ## How sync + forget-on-delete work
 
@@ -97,8 +98,9 @@ relational stores. A record that is still there is kept. Keep `resource_name` an
 fixed across runs.
 
 A run never sleeps for long on Pipedrive's rate limits. A short burst limit (`429` with a
-`Retry-After` of a few seconds) is waited out; a spent daily budget, or `max_requests`
-(1000 by default), stops the run cleanly. It keeps its progress, reports it in
+`Retry-After` of a few seconds) is waited out, but one run waits at most a minute in total on
+retries; past that, a spent daily budget, or `max_requests` (1000 by default), stops the run
+cleanly. It keeps its progress, reports it in
 `source.cognee_sync_stats`, and the next run resumes on the page it stopped at. Deletions are
 only decided once a full cycle over every listing has finished.
 A record whose check fails is kept as it is, counted in `failed` and retried on the next run,

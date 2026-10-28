@@ -144,7 +144,7 @@ class _HTTPResponse:
 def _serve(fake: FakePipedrive, tokens: list[str]):
     """Route requests.get into the fake, the way the real HTTP API would answer."""
 
-    def get(url, *, params=None, headers=None, timeout=None):
+    def get(url, *, params=None, headers=None, timeout=None, allow_redirects=True):
         tokens.append(headers["x-api-token"])
         try:
             payload = fake.request(url.removeprefix(BASE_URL), params=params)

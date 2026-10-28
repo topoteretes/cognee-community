@@ -19,7 +19,12 @@ DEAL_FIELDS = [
         "options": [{"id": 7, "label": "12 months"}, {"id": 8, "label": "24 months"}],
     },
 ]
-PERSON_FIELDS = [{"key": PERSON_FIELD_KEY, "name": "Favourite tool", "field_type": "varchar"}]
+PHONE_FIELD_KEY = "d" * 40
+PERSON_FIELDS = [
+    {"key": PERSON_FIELD_KEY, "name": "Favourite tool", "field_type": "varchar"},
+    # a custom contact channel, which must stay out of memory like the built-in phones
+    {"key": PHONE_FIELD_KEY, "name": "Assistant phone", "field_type": "phone"},
+]
 ORGANIZATION_FIELDS: list[dict] = []
 USERS = [{"id": 100, "name": "Sam Seller"}]
 PIPELINES = [{"id": 1, "name": "Sales"}]
@@ -45,6 +50,8 @@ class FakePipedrive:
         self.notes: dict[int, dict] = {}
         # still in pipedrive but missing from listings, like a record skipped by a page shift
         self.hidden: set[str] = set()
+        # the regular deal listing leaves archived deals out; True lists them anyway
+        self.archived_in_listing = False
         self.fail_after: int | None = None
         # (path, n): the nth call of path and every call after it fail
         self.fail_from: tuple[str, int] | None = None
@@ -176,7 +183,7 @@ class FakePipedrive:
                 for r in store.values()
                 if f"{kind}:{r['id']}" not in self.hidden
                 and not r.get("is_deleted")
-                and not (kind == "deals" and r.get("is_archived"))
+                and not (kind == "deals" and r.get("is_archived") and not self.archived_in_listing)
             ]
             return self._cursor_page(records, params)
         if path == "/api/v2/deals/archived":

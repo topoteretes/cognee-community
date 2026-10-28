@@ -3,7 +3,7 @@
 import random
 
 import pytest
-from fake_pipedrive import DEAL_FIELD_KEY, PERSON_FIELD_KEY, FakePipedrive
+from fake_pipedrive import DEAL_FIELD_KEY, PERSON_FIELD_KEY, PHONE_FIELD_KEY, FakePipedrive
 
 from cognee_community_connector_pipedrive.pipedrive import (
     PipedriveAccessError,
@@ -104,11 +104,14 @@ def test_ids_are_rendered_as_names():
 
 
 def test_contact_channels_are_never_rendered():
-    rows, _ = _sync(_company(), {})
+    fake = _company()
+    fake.persons[2]["custom_fields"] = {PHONE_FIELD_KEY: "+1 555 0199"}
+    rows, _ = _sync(fake, {})
     text = " ".join(f"{row['title']} {row['content']}" for row in rows)
 
     assert "@example.com" not in text
     assert "555 0100" not in text
+    assert "555 0199" not in text and "Assistant phone" not in text
 
 
 def test_a_quiet_second_run_emits_nothing():
@@ -188,6 +191,33 @@ def test_an_archived_deal_is_kept_unless_archived_deals_are_left_out():
 
     rows, _ = _sync(fake, state, include_archived=False)
     assert _tombstones(rows) == {"deal:3"}
+
+
+def test_an_archived_deal_in_the_regular_listing_is_still_forgotten_when_left_out():
+    fake, state = _company(), {}
+    fake.archived_in_listing = True
+    _sync(fake, state)
+
+    fake.deals[3]["is_archived"] = True
+    rows, _ = _sync(fake, state, include_archived=False)
+
+    assert _tombstones(rows) == {"deal:3"}
+
+
+def test_a_record_that_fails_to_render_does_not_block_the_company():
+    fake, state = _company(), {}
+    # an owner id of an unexpected shape, which a plain dict lookup cannot hash
+    fake.deals[3]["owner_id"] = {"id": 100}
+    fake.organizations[1]["label_ids"] = 5  # not a list, so rendering it raises
+    rows, stats = _sync(fake, state)
+
+    assert "deal:3" in _ids(rows)  # the odd owner is left out, the deal still renders
+    assert "organization:1" not in _ids(rows)
+    assert stats["failed"] == 1
+    # the cycle still closed: a deleted record is forgotten in the same run
+    del fake.notes[5]
+    rows, _ = _sync(fake, state)
+    assert _tombstones(rows) == {"note:5"}
 
 
 def test_a_deleted_deal_is_forgotten():
@@ -290,6 +320,47 @@ def test_a_listing_without_paging_info_raises_instead_of_looking_complete(answer
         _sync(fake, state)
 
 
+def test_a_v2_listing_with_null_data_raises_instead_of_looking_empty():
+    fake, state = _company(), {}
+    _sync(fake, state)
+
+    fake.answers["/api/v2/persons"] = {
+        "success": True,
+        "data": None,
+        "additional_data": {"next_cursor": None},
+    }
+    with pytest.raises(PipedriveAPIError, match="no list"):
+        _sync(fake, state)
+
+
+def test_a_cursor_refused_after_a_cut_run_restarts_the_listing():
+    fake, state = FakePipedrive(page_size=2), {}
+    for i in range(1, 6):
+        fake.add_deal(i, f"Deal {i}")
+    fake.fail_from = ("/api/v2/deals", 2)
+    fake.fail_with = PipedriveRateLimitedError("Pipedrive rate limit exceeded (HTTP 429)")
+    _sync(fake, state, include=("deals",))
+
+    fake.fail_after = fake.fail_from = None
+    real_request = fake.request
+
+    def expired_cursor(path, *, params=None, check_active=None):
+        if path == "/api/v2/deals" and (params or {}).get("cursor") == "2" and not seen:
+            seen.append(1)
+            fake.calls.append((path, dict(params)))
+            raise PipedriveAPIError("Pipedrive request failed: HTTP 400")
+        return real_request(path, params=params, check_active=check_active)
+
+    seen: list[int] = []
+    fake.request = expired_cursor
+    rows, stats = _sync(fake, state, include=("deals",))
+
+    assert _ids(rows) == {"deal:3", "deal:4", "deal:5"}
+    assert stats["failed"] == 0
+    cursors = [p.get("cursor") for path, p in fake.calls if path == "/api/v2/deals"][-4:]
+    assert cursors == ["2", None, "2", "4"]
+
+
 def test_a_rate_limited_run_resumes_where_it_stopped():
     fake, state = FakePipedrive(page_size=2), {}
     for i in range(1, 6):
@@ -385,4 +456,7 @@ def test_html_notes_become_readable_text():
     )
 
     assert text == "Hi team,\n\n- SSO\n- Audit log\n\nBudget: €10k\nOwner: Ada"
+    # an escaped tag the user typed stays as written
+    assert html_to_text("<p>Use &lt;b&gt; for bold</p>") == "Use <b> for bold"
+    assert html_to_text("<p>&amp;lt; is an entity</p>") == "&lt; is an entity"
     assert html_to_text(None) == "" and html_to_text("  ") == ""
