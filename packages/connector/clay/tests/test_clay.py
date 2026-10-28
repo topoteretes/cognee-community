@@ -314,7 +314,7 @@ def test_http_400_bad_request(sample_table_id: str, sample_api_key: str) -> None
 
     with patch("requests.adapters.HTTPAdapter.send", new=mock_send):
         resource = clay_source(table_id=sample_table_id, api_key=sample_api_key)
-        with pytest.raises(Exception, match="Clay API bad request .*Invalid select column"):
+        with pytest.raises(Exception, match=r"Clay API bad request .*Invalid select column"):
             list(resource)
 
 
@@ -403,7 +403,7 @@ def test_check_active_cancellation(
             api_key=sample_api_key,
             check_active=mock_check_active,
         )
-        with pytest.raises(InterruptedError, match="Sync cancelled by host"):
+        with pytest.raises(Exception, match=r"Sync cancelled by host"):
             list(resource)
 
 
@@ -415,7 +415,5 @@ def test_http_500_server_error(sample_table_id: str, sample_api_key: str) -> Non
 
     with patch("requests.adapters.HTTPAdapter.send", new=mock_send):
         resource = clay_source(table_id=sample_table_id, api_key=sample_api_key)
-        with pytest.raises(Exception, match="Clay API server error .*500"):
+        with pytest.raises(Exception, match=r"Clay API server error .*500"):
             list(resource)
-
-

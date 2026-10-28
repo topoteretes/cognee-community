@@ -117,9 +117,13 @@ def _normalize_clay_row(
     # Unpack cell values
     for col_name, cell_data in raw_fields.items():
         val = _extract_cell_value(cell_data)
-        if col_name in ("record_id", "id", "_id") and not system_id:
-            if val is not None and str(val).strip():
-                system_id = str(val).strip()
+        if (
+            col_name in ("record_id", "id", "_id")
+            and not system_id
+            and val is not None
+            and str(val).strip()
+        ):
+            system_id = str(val).strip()
 
         norm_key = _normalize_field_name(str(col_name))
         normalized[norm_key] = val
