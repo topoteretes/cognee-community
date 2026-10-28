@@ -62,6 +62,7 @@ Run the same `remember` call again whenever you want to sync. Use the default
 | `review_cycle_ids` | Cycles whose submitted review **responses** to sync, one document per reviewee. **Default none.** |
 | `resource_name` | Prefix for this workspace's staging tables. Default `lattice`; give each workspace its own when several sync into one dataset. |
 | `client` | A `LatticeClient`, for a custom base URL, transport or retry behaviour. |
+| `check_active` | Called before every request and between rows; raises to stop a sync whose access was revoked mid-run (for hosts). |
 
 ## Setup
 
@@ -134,9 +135,17 @@ Use a dedicated dataset so you can forget it all in one call.
   listing and its updates request is left out, so it is forgotten too. The source refuses any other
   write disposition: with `merge` nothing would ever be forgotten.
 - **Errors never delete.** A failed or partial read (a rate limit that does not clear, a server
-  error, a timeout, a cursor that never ends) raises before anything is loaded, so a hiccup is
-  never read as "everything was deleted" and the next run starts from the same memory. Rate
-  limits (429, `Retry-After`) and 5xx and network errors are retried with backoff first.
+  error, a timeout, a cursor that never ends, a page without its `data`) raises before anything
+  is loaded, so a hiccup is never read as "everything was deleted" and the next run starts from
+  the same memory. Rate limits (429, `Retry-After`) and 5xx and network errors are retried with
+  backoff first; a `Retry-After` above two minutes stops the run instead of waiting.
+  A key that sees no users at all (wrong region, missing permissions) stops the run too, because
+  every other list would then look empty.
+- **Unreadable is not deleted.** If a goal's updates cannot be read, the connector asks Lattice for
+  the goal itself and forgets it only when Lattice answers 404; otherwise it keeps the goal and
+  leaves the updates out. A question whose wording cannot be read falls back to its id.
+- **Counts.** After a run, `source.cognee_sync_stats` holds counts only (goals, goals skipped,
+  feedback, review cycles, reviewees), never content.
 - **Rate limits.** Lattice allows 240 requests a minute. As a guide, 500 goals cost about 5 list
   requests plus 500 update requests (one per goal), and `include_goal_updates=False` removes
   the latter. 1,000 feedback items cost about 10 requests. A review cycle costs its reviewees
@@ -159,15 +168,11 @@ uv sync
 uv run pytest
 ```
 
-No Lattice account or API key is needed. The tests run against an in-memory fake of the Lattice
-Talent API, modelled on Lattice's published API reference (`tests/fake_lattice.py`): bearer auth,
-both regions, cursor pagination in both list shapes, 429 with `Retry-After`, the `state`,
-`status` and `onlyPublic` filters and integer timestamps. `tests/test_lattice_cognee.py` runs the
+No Lattice account or API key is needed. Lattice has no public sandbox, so the tests run against
+an in-memory fake of the Lattice Talent API, modelled on its published OpenAPI schemas
+(`tests/fake_lattice.py`). The fake covers bearer auth, both regions, cursor pagination in both
+list shapes, 429 with `Retry-After`, the `state`, `status` and `onlyPublic` filters and integer
+timestamps. `tests/test_lattice_cognee.py` runs the
 real cognee pipeline (dlt, ingestion, cognify, orphan cleanup) with a mocked LLM and embeddings
 and proves that a deleted, archived or de-scoped record leaves the graph, that an unchanged
 re-sync makes no LLM call, and that a failed sync forgets nothing.
-
-**Not yet verified against a live workspace:** Lattice has no public sandbox. Response shapes come
-from its published OpenAPI schemas, so details the schemas do not pin down (for example, how a
-real workspace answers `status=NULL` on `/v1/users`) are confirmed by a live run, not by these
-tests.
