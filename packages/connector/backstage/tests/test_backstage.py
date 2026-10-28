@@ -17,6 +17,7 @@ from cognee_community_connector_backstage.backstage import (
 )
 
 BASE = "https://backstage.example.com"
+TABLE = "backstage_backstage_example_com"  # the default resource name for BASE
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +101,8 @@ def _matches(entity, flt):
 class FakeBackstage:
     """Serves /api/catalog/entities/by-query with cursor paging, plus TechDocs files."""
 
-    def __init__(self, entities, docs=None, page_size=2):
+    def __init__(self, entities, docs=None, page_size=2, base=BASE):
+        self.base = base
         self.closed = False
         self.stuck_cursor = False
         self.entities = entities
@@ -113,7 +115,8 @@ class FakeBackstage:
         self._cursors = {}
 
     def request(self, method, url, params=None, timeout=None):
-        path = url[len(BASE) :]
+        assert url.startswith(self.base), url
+        path = url[len(self.base) :]
         self.calls.append((path, params))
         if self.fail_on_call == len(self.calls):
             return FakeResponse(400, {"error": "boom"})
@@ -253,18 +256,41 @@ def test_source_declares_document_marker_and_scope():
     source = backstage_source(base_url=BASE + "/", session=FakeBackstage([]))
 
     assert getattr(source, DOCUMENT_SOURCE_ATTR) == "backstage"
-    assert getattr(source, PIPELINE_SCOPE_ATTR) == f"backstage:{BASE}"
+    # The table and the state scope share one name, derived from the instance.
+    assert getattr(source, PIPELINE_SCOPE_ATTR) == TABLE
+    assert list(source.resources) == [TABLE]
+    local = backstage_source(base_url="http://localhost:7007/backstage", session=FakeBackstage([]))
+    assert getattr(local, PIPELINE_SCOPE_ATTR) == "backstage_localhost_7007_backstage"
+    named = backstage_source(base_url=BASE, session=FakeBackstage([]), resource_name="bs_prod")
+    assert getattr(named, PIPELINE_SCOPE_ATTR) == "bs_prod"
 
 
-def test_source_validates_configuration(monkeypatch):
+def test_source_validates_configuration():
     pytest.importorskip("dlt")
-    monkeypatch.delenv("BACKSTAGE_BASE_URL", raising=False)
-    with pytest.raises(ValueError, match="BACKSTAGE_BASE_URL"):
-        backstage_source(session=FakeBackstage([]))
+    with pytest.raises(ValueError, match="base_url must be"):
+        backstage_source(base_url=None, session=FakeBackstage([]))
+    with pytest.raises(ValueError, match="base_url must be"):
+        backstage_source(base_url="backstage.example.com", session=FakeBackstage([]))
     with pytest.raises(ValueError, match="kinds"):
         backstage_source(base_url=BASE, kinds=[], session=FakeBackstage([]))
+    with pytest.raises(ValueError, match="kinds must be a list"):
+        backstage_source(base_url=BASE, kinds="Component", session=FakeBackstage([]))
+    with pytest.raises(ValueError, match="techdocs must be a list"):
+        backstage_source(
+            base_url=BASE, techdocs="component:default/billing", session=FakeBackstage([])
+        )
+    with pytest.raises(ValueError, match="namespaces must be a list"):
+        backstage_source(base_url=BASE, namespaces="default", session=FakeBackstage([]))
     with pytest.raises(ValueError, match="kind:namespace/name"):
         backstage_source(base_url=BASE, techdocs=["billing"], session=FakeBackstage([]))
+    with pytest.raises(ValueError, match="snake_case"):
+        backstage_source(base_url=BASE, resource_name="Backstage-Prod", session=FakeBackstage([]))
+
+
+def test_source_refuses_a_cognee_without_document_sync(monkeypatch):
+    monkeypatch.delattr(bs.dlt_utils, "DOCUMENT_SYNC_VERSION")
+    with pytest.raises(RuntimeError, match="document sync cleanup"):
+        backstage_source(base_url=BASE)
 
 
 def test_service_and_session_are_one_client():
@@ -308,16 +334,44 @@ def test_listing_follows_the_cursor_and_skips_unselected_kinds():
     assert len(backend.calls) == 2
 
 
-def test_rate_limit_is_retried_and_auth_errors_name_the_token(_no_sleep):
+def test_retries_honour_retry_after_within_the_wait_budget(_no_sleep):
     backend = FakeBackstage([])
-    backend.scripted = [FakeResponse(429, headers={"Retry-After": "3"}), FakeResponse(503)]
+    backend.scripted = [FakeResponse(429, headers={"Retry-After": "600"})]
     assert list(_api(backend).entities(["kind=Component"])) == []
-    assert _no_sleep == [3.0, 2.0]
+    assert _no_sleep == [60.0]  # Retry-After is capped at a minute
 
-    backend.scripted = [FakeResponse(401)]
-    with pytest.raises(requests.HTTPError, match="externalAccess"):
+    _no_sleep.clear()
+    backend.scripted = [FakeResponse(502), FakeResponse(503)]
+    assert list(_api(backend).entities(["kind=Component"])) == []
+    assert _no_sleep == [1.0, 2.0]
+
+    _no_sleep.clear()
+    backend.scripted = [FakeResponse(500)] * 3
+    with pytest.raises(bs.BackstageSyncError, match="HTTP 500"):
         list(_api(backend).entities(["kind=Component"]))
-    assert _no_sleep == [3.0, 2.0]  # no retry for 401
+    assert _no_sleep == [1.0, 2.0]  # three attempts, then the run stops
+
+
+def test_rate_limit_stops_once_the_wait_budget_is_spent(_no_sleep):
+    backend = FakeBackstage([])
+    backend.scripted = [FakeResponse(429, headers={"Retry-After": "45"})] * 3
+    api = _api(backend)
+
+    with pytest.raises(bs.BackstageSyncError, match="rate-limiting"):
+        list(api.entities(["kind=Component"]))
+    assert _no_sleep == [45.0]  # a second 45 s wait would pass the 60 s budget
+    assert api.stats["failed_rate_limit"] == 1
+
+
+def test_auth_errors_name_the_token_and_are_not_retried(_no_sleep):
+    backend = FakeBackstage([])
+    backend.scripted = [FakeResponse(401)]
+    api = _api(backend)
+
+    with pytest.raises(requests.HTTPError, match="externalAccess"):
+        list(api.entities(["kind=Component"]))
+    assert _no_sleep == []
+    assert api.stats["failed_auth"] == 1
 
 
 def test_web_page_instead_of_json_points_at_the_base_url():
@@ -443,6 +497,8 @@ def test_stats_count_what_a_run_did():
         "changed": 4,
         "deleted": 0,
         "failed": 0,
+        "failed_auth": 0,
+        "failed_rate_limit": 0,
         "techdocs_pages": 2,
         "requests": 4,  # two listing pages, TechDocs metadata and index
         "complete": 1,
@@ -597,10 +653,10 @@ def _run_sync(dlt, tmp_path, backend, **kwargs):
     return pipeline
 
 
-def _read(pipeline):
+def _read(pipeline, table=TABLE):
     with (
         pipeline.sql_client() as client,
-        client.execute_query("SELECT id, content FROM backstage_documents") as cursor,
+        client.execute_query(f"SELECT id, content FROM {table}") as cursor,
     ):
         return {row[0]: row[1] for row in cursor.fetchall()}
 
@@ -643,3 +699,83 @@ def test_dlt_merge_applies_edits_and_deletions(dlt_mod, tmp_path):
         in rows["entity:component:default/billing-service"]
     )
     assert len(rows) == 5
+
+
+def _pipeline(dlt, tmp_path, name):
+    return dlt.pipeline(
+        pipeline_name=name,
+        destination=dlt.destinations.sqlalchemy(
+            f"sqlite:///{(tmp_path / f'{name}.db').as_posix()}"
+        ),
+        dataset_name="backstage_ds",
+        pipelines_dir=str(tmp_path / "state"),
+    )
+
+
+def test_two_instances_in_one_dataset_keep_their_own_table_and_state(dlt_mod, tmp_path):
+    from cognee.tasks.ingestion.dlt_utils import pipeline_name_for_source
+
+    other_base = "https://backstage.other.example"
+    first = FakeBackstage(_catalog())
+    second = FakeBackstage(_catalog(), base=other_base)  # the same entity refs
+
+    def sync(backend, base):
+        source = backstage_source(base_url=base, session=backend)
+        # Name the pipeline as cognee does: one per (dataset, scope), one database.
+        pipeline = _pipeline(dlt_mod, tmp_path, pipeline_name_for_source(source, "backstage"))
+        pipeline.run(source, write_disposition="merge", primary_key="id")
+        return pipeline
+
+    sync(first, BASE)
+    sync(second, other_base)
+    del first.entities[2]  # asha leaves the first instance only
+    pipeline = sync(first, BASE)
+    other = sync(second, other_base)
+
+    assert "entity:user:default/asha" not in _read(pipeline)
+    assert "entity:user:default/asha" in _read(other, table="backstage_backstage_other_example")
+    assert len(_read(other, table="backstage_backstage_other_example")) == 4
+
+
+@pytest.mark.parametrize("status", [401, 403, 404, 429, 500])
+def test_the_token_never_reaches_errors_or_logs(
+    dlt_mod, tmp_path, monkeypatch, caplog, capsys, status
+):
+    from dlt.pipeline.exceptions import PipelineStepFailed
+
+    token = "bs_LeakCanary0123456789"
+    monkeypatch.setattr(bs.time, "sleep", lambda seconds: None)
+    backend = FakeBackstage(_catalog())
+    echo = {"error": {"message": f"Invalid token {token}"}, "token": token}
+    backend.scripted = [FakeResponse(status, echo, headers={"Retry-After": "1"})] * 3
+    monkeypatch.setattr(bs, "_make_session", lambda secret: backend)
+    source = backstage_source(base_url=BASE, token=f" {token}\n")
+
+    with pytest.raises(PipelineStepFailed) as failure:
+        _pipeline(dlt_mod, tmp_path, f"backstage_leak_{status}").run(
+            source, write_disposition="merge", primary_key="id"
+        )
+
+    chain, error = [], failure.value
+    while error is not None:
+        chain.append(f"{error!r} {error}")
+        error = error.__cause__ or error.__context__
+    output = capsys.readouterr()
+    assert token not in " ".join(chain)
+    assert token not in caplog.text + output.out + output.err
+    assert source.cognee_sync_stats["complete"] == 0
+    assert source.cognee_sync_stats["failed_auth"] == (1 if status in (401, 403) else 0)
+    assert source.cognee_sync_stats["failed_rate_limit"] == (1 if status == 429 else 0)
+
+
+def test_control_characters_and_lone_surrogates_are_dropped(dlt_mod, tmp_path):
+    catalog = _catalog()
+    catalog[0]["metadata"]["title"] = "Bill\x00ing\x1b"
+    catalog[0]["metadata"]["description"] = "Charges \ud800customers."
+    pipeline = _run_sync(dlt_mod, tmp_path, FakeBackstage(catalog))
+
+    content = _read(pipeline)["entity:component:default/billing-service"]
+    assert "Charges customers." in content
+    assert "\x00" not in content and "\x1b" not in content
+    row = bs.entity_to_row(BASE, catalog[0], {})
+    assert row["title"] == "Component: Billing"

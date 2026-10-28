@@ -3,12 +3,11 @@ name = "cognee-community-connector-backstage"
 version = "0.1.0"
 description = "Backstage data-source connector for cognee — the software catalog (owners, systems, APIs, teams) and TechDocs as memory, incremental with forget-on-delete"
 readme = "README.md"
-requires-python = ">=3.11,<=3.13"
+requires-python = ">=3.10,<3.15"
 dependencies = [
-    # Document mode (DOCUMENT_SOURCE_ATTR) shipped in cognee 1.4.0; 1.6.x adds
-    # PIPELINE_SCOPE_ATTR, which keeps this source's dlt state (document hashes and
-    # TechDocs builds) separate from other sources and datasets.
-    "cognee>=1.6.2,<2",
+    # 1.6.3 has PIPELINE_SCOPE_ATTR (this source's dlt state stays apart from other
+    # sources and datasets) and DOCUMENT_SYNC_VERSION, checked when the source is built.
+    "cognee>=1.6.3,<2",
     "dlt[sqlalchemy]>=1.9.0,<2",
     "requests>=2.31.0,<3",
 ]

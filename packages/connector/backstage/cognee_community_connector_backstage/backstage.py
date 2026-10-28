@@ -1,88 +1,38 @@
-"""Backstage connector for cognee — a ``dlt`` source that turns a software catalog into memory.
+"""Backstage connector for cognee: a ``dlt`` source that turns a software catalog into memory.
 
-Sync a Backstage catalog (components, APIs, systems, domains, resources, groups
-and users, plus opt-in TechDocs pages) into cognee, incrementally and with
-forget-on-delete::
-
-    import cognee
-    from cognee_community_connector_backstage import backstage_source
+One document per catalog entity (with its relations written as sentences) and,
+opt-in, one per TechDocs page, synced incrementally with forget-on-delete. Hand
+the source to :func:`cognee.remember` with ``write_disposition="merge"``::
 
     await cognee.remember(
-        backstage_source(base_url="https://backstage.example.com", token="..."),
+        backstage_source(base_url="https://backstage.example.com", token=token),
         dataset_name="backstage",
-        write_disposition="merge",   # REQUIRED (see .. important:: below)
+        write_disposition="merge",
     )
 
-.. important::
-   ``write_disposition="merge"`` is **mandatory**. cognee applies the caller's
-   write disposition to every table of the source; this source only emits
-   documents that changed and deletes by emitting ``_deleted`` tombstone rows,
-   and both only work under ``merge``.
-
-Design
-------
-* **Auth** — the backend's base URL plus an optional static token
-  (``backend.auth.externalAccess``), sent as ``Authorization: Bearer``.
-  Instances that allow guest reads, such as https://demo.backstage.io, need no
-  token. The connector only reads.
-* **What is synced** — one document per catalog entity of the selected kinds
-  (default: Component, API, System, Domain, Resource, Group, User) and
-  namespaces. ``Location`` and ``Template`` entities are catalog plumbing and
-  are left out unless asked for. Each document holds the entity's description,
-  type, lifecycle, tags, links, an allowlist of annotations, and its relations
-  written as sentences ("queue-proxy is owned by the group team-b"), so cognify
-  extracts the ownership and dependency edges. Relation targets are named by
-  their title or display name when the target is in the synced catalog.
-* **Incremental sync** — every run lists the selected entities through
-  ``/api/catalog/entities/by-query`` (cursor paging, server-side filters) and
-  renders them. A hash of each rendered document is kept in dlt resource state,
-  so only documents that changed are emitted. That includes an entity whose
-  relation target was renamed, because its text changes too.
-* **Forget-on-delete** — an entity missing from the listing (deleted, or no
-  longer in the selected kinds or namespaces) is emitted with the ``_deleted``
-  hard-delete marker; dlt drops it on ``merge`` and cognee's orphan cleanup
-  removes it from the graph and vector stores. Any failed request, or a cursor
-  that repeats, aborts the run before tombstones are emitted, so a partial listing
-  never looks like a deletion. An empty listing for the same selection as the last
-  run (what a token that lost its read permission looks like) stops the run
-  instead of forgetting everything.
-* **Host hooks** — ``check_active`` is called before every request and every row,
-  and ``source.cognee_sync_stats`` reports counts only, like cognee's own
-  connectors.
-* **TechDocs (opt-in)** — pass ``techdocs=["component:default/my-service", ...]``
-  to add one document per TechDocs page of those entities, read from the
-  site's search index. The small ``techdocs_metadata.json`` is checked on
-  every run and the index is downloaded again only when its build timestamp
-  changes; pages that disappear, and entities dropped from ``techdocs``, are
-  tombstoned.
-
-Limitations
------------
-* Each run lists every selected entity (the catalog has no change feed), so
-  narrow very large catalogs with ``kinds`` and ``namespaces``.
-* API definitions (``spec.definition``) are not rendered; they are often large
-  OpenAPI documents. Annotations are rendered only when allowlisted.
+The README describes what is stored, how changes and deletions are found, and what a
+run does when Backstage fails part of the way through.
 """
 
 import hashlib
 import html
 import json
-import os
 import re
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import dlt
 import requests
 from cognee.shared.logging_utils import get_logger
-from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR, PIPELINE_SCOPE_ATTR
+from cognee.tasks.ingestion import dlt_utils
+from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
+from dlt.common.normalizers.naming.snake_case import NamingConvention
 
 logger = get_logger("backstage_connector")
 
 BACKSTAGE_SOURCE_NAME = "backstage"
-DOCUMENTS_TABLE_NAME = "backstage_documents"
 
 DEFAULT_KINDS: tuple[str, ...] = (
     "Component",
@@ -129,11 +79,30 @@ _LIST_FIELDS = (
 )
 _PAGE_SIZE = 500
 _MAX_PAGES = 10_000
-_MAX_RETRIES = 5
+_MAX_ATTEMPTS = 3
 _MAX_RETRY_DELAY_SECONDS = 60.0
+# Retries sleep inside cognee's staging lock, which every other dlt ingestion in
+# the process waits on, so a run waits at most this long in total.
+_WAIT_BUDGET_SECONDS = 60.0
 _REQUEST_TIMEOUT_SECONDS = 60
 
+_STAT_KEYS = (
+    "scanned",
+    "skipped",
+    "changed",
+    "deleted",
+    "failed",
+    "failed_auth",
+    "failed_rate_limit",
+    "techdocs_pages",
+    "requests",
+    "complete",
+)
+
 _TOMBSTONE_COLUMNS = {"_deleted": {"data_type": "bool", "hard_delete": True}}
+# C0/C1 control characters (tab and newline kept) and lone surrogates: a NUL makes
+# Postgres reject the load and a lone surrogate fails the dlt extract.
+_UNSAFE_CHARS = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\ud800-\udfff]")
 
 _BLOCK_END_RE = re.compile(r"(?i)<br\s*/?>|</(p|div|li|h[1-6]|tr|blockquote|pre)>")
 _TAG_RE = re.compile(r"<[^>]+>")
@@ -153,50 +122,72 @@ class BackstageSyncError(RuntimeError):
 # Public factory
 # ---------------------------------------------------------------------------
 def backstage_source(
-    base_url: str | None = None,
+    base_url: str,
     token: str | None = None,
     kinds: Sequence[str] = DEFAULT_KINDS,
     namespaces: Sequence[str] | None = None,
     techdocs: Sequence[str] = (),
     annotations: Sequence[str] = DEFAULT_ANNOTATIONS,
-    check_active: Callable[[], None] | None = None,
     service: Any = None,
+    *,
+    resource_name: str | None = None,
+    check_active: Callable[[], None] | None = None,
     session: Any = None,
 ):
     """Create a dlt source that yields Backstage catalog entities as documents.
 
     Args:
         base_url: The Backstage backend, e.g. ``https://backstage.example.com``.
-            Falls back to ``BACKSTAGE_BASE_URL``.
-        token: Static external-access token, sent as ``Authorization: Bearer``.
-            Falls back to ``BACKSTAGE_TOKEN``; omit it for guest-readable instances.
-        kinds: Entity kinds to sync. Defaults to :data:`DEFAULT_KINDS`.
-        namespaces: Namespaces to sync; ``None`` means every namespace.
+        token: Static external-access token, sent as ``Authorization: Bearer``. Omit
+            it for guest-readable instances.
+        kinds: Entity kinds to sync, a list. Defaults to :data:`DEFAULT_KINDS`.
+        namespaces: Namespaces to sync, a list; ``None`` means every namespace.
         techdocs: Entity refs (``kind:namespace/name``) whose TechDocs pages are
             synced too.
         annotations: Annotation keys rendered into documents.
-        check_active: Optional host checkpoint, called before every request and before
-            every row is published; raising from it stops the run.
         service: Pre-built ``requests``-compatible session (tests, proxies). It is
             used as is and not closed; when omitted, each run opens and closes its own.
+        resource_name: dlt resource (table) name, which also scopes the sync state.
+            Defaults to ``backstage_<host>`` from ``base_url``, so two instances synced
+            into one dataset keep apart.
+        check_active: Optional host checkpoint, called before every request and before
+            every row is published; raising from it stops the run.
         session: Alias of ``service``. Give at most one.
 
     Returns:
         A dlt source for ``cognee.remember(..., write_disposition="merge")``. After a
         run, ``source.cognee_sync_stats`` holds counts only: ``scanned``, ``skipped``
         (unchanged), ``changed``, ``deleted``, ``failed`` (malformed entities),
-        ``techdocs_pages``, ``requests``, and ``complete`` (1 once the run finished).
+        ``failed_auth`` and ``failed_rate_limit`` (1 when the run stopped for that
+        reason), ``techdocs_pages``, ``requests``, and ``complete`` (1 once the run
+        finished).
     """
-    base = (base_url or os.environ.get("BACKSTAGE_BASE_URL") or "").rstrip("/")
-    if not base:
-        raise ValueError("Backstage URL required: pass base_url= or set BACKSTAGE_BASE_URL.")
+    if getattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 0) < 1:
+        raise RuntimeError(
+            "The Backstage connector needs cognee's document sync cleanup (cognee>=1.6.3)."
+        )
+    base = str(base_url or "").strip().rstrip("/")
+    if not base.startswith(("https://", "http://")):
+        raise ValueError(
+            "base_url must be the Backstage backend URL, e.g. https://backstage.example.com."
+        )
+    for argument, value in (
+        ("kinds", kinds),
+        ("namespaces", namespaces or ()),
+        ("techdocs", techdocs),
+        ("annotations", annotations),
+    ):
+        if isinstance(value, str) or not all(isinstance(item, str) for item in value):
+            raise ValueError(f"{argument} must be a list of strings, not a single string.")
     if not kinds:
         raise ValueError("kinds must name at least one entity kind.")
     docs_refs = sorted({_parse_ref(ref)[3] for ref in techdocs})
+    name = resource_name if resource_name is not None else _default_resource_name(base)
+    _check_resource_name(name)
     if service is not None and session is not None:
         raise ValueError("Pass service= or session=, not both.")
     client = service if service is not None else session
-    secret = _check_token(token if token is not None else os.environ.get("BACKSTAGE_TOKEN"))
+    secret = _check_token(token)
     stats: dict[str, int] = {}
     config = SyncConfig(
         kinds=tuple(kinds),
@@ -206,7 +197,7 @@ def backstage_source(
     )
 
     @dlt.resource(
-        name=DOCUMENTS_TABLE_NAME,
+        name=name,
         primary_key="id",
         write_disposition="merge",
         columns=_TOMBSTONE_COLUMNS,
@@ -226,14 +217,35 @@ def backstage_source(
         return backstage_documents
 
     source = _backstage()
-    # Opt into the document ingestion path (row → text document → cognify).
+    # Opt into the document ingestion path (row -> text document -> cognify).
     # resolve_dlt_sources reads this marker; it never imports this connector.
     setattr(source, DOCUMENT_SOURCE_ATTR, BACKSTAGE_SOURCE_NAME)
-    # One dlt state (document hashes, TechDocs builds) per instance and cognee
-    # dataset, so syncing other sources or datasets on the machine can't reset it.
-    setattr(source, PIPELINE_SCOPE_ATTR, f"{BACKSTAGE_SOURCE_NAME}:{base}")
+    # The table name also scopes the dlt state (document hashes, TechDocs builds),
+    # so the state and the table it describes always resolve to the same pipeline.
+    setattr(source, dlt_utils.PIPELINE_SCOPE_ATTR, name)
     source.cognee_sync_stats = stats
     return source
+
+
+def _default_resource_name(base: str) -> str:
+    """``backstage_<host>`` (with port and path), e.g. ``backstage_demo_backstage_io``."""
+    parts = urlsplit(base)
+    slug = re.sub(
+        r"[^a-z0-9]+", "_", f"{parts.hostname or ''}_{parts.port or ''}{parts.path}".lower()
+    )
+    return f"{BACKSTAGE_SOURCE_NAME}_{slug.strip('_')}"[:64].rstrip("_")
+
+
+def _check_resource_name(name: Any) -> None:
+    """A non-empty name of at most 64 characters that dlt keeps as it is.
+
+    It names the table and scopes the state: two names dlt normalizes alike
+    ("Backstage-Prod", "backstage_prod") would share a table.
+    """
+    if not isinstance(name, str) or not name or len(name) > 64:
+        raise ValueError("resource_name must be a non-empty string of at most 64 characters.")
+    if NamingConvention().normalize_table_identifier(name) != name:
+        raise ValueError("resource_name must be lowercase snake_case (letters, digits, _).")
 
 
 class SyncConfig:
@@ -285,32 +297,47 @@ class BackstageAPI:
         self.base_url = base_url.rstrip("/")
         self.check_active = check_active
         self.stats = stats if stats is not None else {}
+        self.waited = 0.0  # seconds slept on retries this run
 
     def get(self, path: str, params: Any = None) -> Any:
-        """GET a backend path, retrying 429/5xx and network errors; others raise."""
+        """GET a backend path, retrying 429/5xx and network errors within the wait budget."""
         url = f"{self.base_url}{path}"
-        attempt = 0
-        while True:
+        for attempt in range(_MAX_ATTEMPTS):
             if self.check_active is not None:
                 self.check_active()
             self.stats["requests"] = self.stats.get("requests", 0) + 1
+            failure: Exception | None = None
             try:
                 response = self.session.request(
                     "GET", url, params=params, timeout=_REQUEST_TIMEOUT_SECONDS
                 )
             except (requests.ConnectionError, requests.Timeout) as exc:
-                if attempt == _MAX_RETRIES - 1:
-                    raise
-                reason, delay = str(exc), min(2.0**attempt, _MAX_RETRY_DELAY_SECONDS)
+                failure, reason = exc, type(exc).__name__
+                delay = min(2.0**attempt, _MAX_RETRY_DELAY_SECONDS)
             else:
-                retryable = response.status_code == 429 or response.status_code >= 500
-                if not retryable or attempt == _MAX_RETRIES - 1:
+                status = response.status_code
+                if status != 429 and status < 500:
+                    if status in (401, 403):
+                        self.stats["failed_auth"] = 1
                     return _parse(response, path)
-                reason = f"HTTP {response.status_code}"
-                delay = _retry_delay(response.headers, attempt)
-            logger.warning("Backstage: %s on %s — retrying in %.1fs.", reason, path, delay)
+                reason, delay = f"HTTP {status}", _retry_delay(response.headers, attempt)
+            if attempt == _MAX_ATTEMPTS - 1 or self.waited + delay > _WAIT_BUDGET_SECONDS:
+                break
+            logger.warning("Backstage: %s on %s; retrying in %.1fs.", reason, path, delay)
+            self.waited += delay
             time.sleep(delay)
-            attempt += 1
+        if failure is not None:
+            raise failure
+        if response.status_code == 429:
+            self.stats["failed_rate_limit"] = 1
+            raise BackstageSyncError(
+                f"Backstage is rate-limiting {path} (HTTP 429). The run stopped before "
+                "changing anything; the next run starts over."
+            )
+        raise BackstageSyncError(
+            f"Backstage failed {path} with HTTP {response.status_code}. The run stopped "
+            "before changing anything; the next run starts over."
+        )
 
     def entities(self, filters: Sequence[str]) -> Iterator[dict]:
         """Yield every entity matching any of ``filters``, following the cursor."""
@@ -391,8 +418,7 @@ def sync_catalog(
         stats = api.stats
     api.stats = stats  # requests are counted in the same dictionary
     stats.clear()
-    stats.update(scanned=0, skipped=0, changed=0, deleted=0, failed=0, techdocs_pages=0)
-    stats.update(requests=0, complete=0)
+    stats.update(dict.fromkeys(_STAT_KEYS, 0))
 
     # Read everything before yielding anything: a failed page aborts the run here,
     # before a partial listing could turn into tombstones.
@@ -553,8 +579,8 @@ def entity_to_row(
 
     return {
         "id": f"entity:{entity_ref(entity)}",
-        "title": f"{_kind_label(kind, title_case=True)}: {title}",
-        "content": "\n".join(lines),
+        "title": _clean(f"{_kind_label(kind, title_case=True)}: {title}"),
+        "content": _clean("\n".join(lines)),
         "url": f"{base_url}/catalog/{_path(namespace)}/{_path(kind.lower())}/{_path(name)}",
         "_deleted": False,
     }
@@ -585,8 +611,8 @@ def techdocs_pages(base_url: str, ref: str, site_name: str, index: Mapping[str, 
         rows.append(
             {
                 "id": f"techdocs:{ref}/{page}",
-                "title": f"{site_name}: {page_title}",
-                "content": f"TechDocs for {name} ({site_name}), page {page_title}.\n{body}",
+                "title": _clean(f"{site_name}: {page_title}"),
+                "content": _clean(f"TechDocs for {name} ({site_name}), page {page_title}.\n{body}"),
                 "url": f"{base_url}/docs/{_path(namespace)}/{_path(kind)}/{_path(name)}/{page}",
                 "_deleted": False,
             }
@@ -635,6 +661,10 @@ def _plain(value: Any) -> str:
     text = html.unescape(_TAG_RE.sub("", text)).replace("¶", "")
     lines = (_SPACES_RE.sub(" ", line).strip() for line in text.splitlines())
     return "\n".join(line for line in lines if line)
+
+
+def _clean(text: str) -> str:
+    return _UNSAFE_CHARS.sub("", text)
 
 
 def _digest(row: Mapping[str, Any]) -> str:

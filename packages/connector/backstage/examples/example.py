@@ -30,6 +30,7 @@ async def main() -> None:
     await cognee.remember(
         backstage_source(
             base_url=base_url,
+            token=os.environ.get("BACKSTAGE_TOKEN"),
             # TechDocs are opt-in, per entity ("kind:namespace/name").
             techdocs=["component:default/backstage-demo"]
             if "demo.backstage.io" in base_url
