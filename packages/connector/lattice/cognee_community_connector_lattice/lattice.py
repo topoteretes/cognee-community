@@ -46,8 +46,7 @@ Design
 """
 
 import re
-import weakref
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -59,6 +58,7 @@ from cognee.tasks.ingestion.dlt_utils import (
     NODE_SET_COLUMN,
     NODE_SET_COLUMN_HINT,
     PIPELINE_SCOPE_ATTR,
+    guarded_rows,
 )
 
 from .client import LatticeAPIError, LatticeClient
@@ -114,6 +114,7 @@ def lattice_source(
     review_cycle_ids: Sequence[str] | None = None,
     resource_name: str = DEFAULT_RESOURCE_NAME,
     client: Any = None,
+    check_active: Callable[[], None] | None = None,
 ):
     """Create a dlt source that yields Lattice goals, feedback and reviews as documents.
 
@@ -144,11 +145,14 @@ def lattice_source(
             each Lattice workspace its own name when several sync into one dataset.
         client: A ``LatticeClient`` (mainly a test-injection point); when omitted
             one is built from the key and region above.
+        check_active: Called before every request and between rows; raises to stop a
+            sync whose access was revoked mid-run (for hosts).
 
     Returns:
         A dlt source for ``cognee.remember(...)`` / ``cognee.add(...)``. It needs
         the default ``write_disposition="replace"``; any other is refused because
-        deletions are only visible as documents missing from the snapshot.
+        deletions are only visible as documents missing from the snapshot. After a
+        run, ``source.cognee_sync_stats`` holds counts only, never content.
     """
     if getattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 0) < 2:
         raise RuntimeError(
@@ -189,10 +193,10 @@ def lattice_source(
 
     if client is None:
         client = LatticeClient(api_key, region=region)
-        owned_client = client
-    else:
-        owned_client = None
+    if check_active is not None:
+        client.check_active = check_active
     tables = _Tables(resource_name)
+    stats: dict[str, int] = {}
 
     def resource(table: str, rows):
         @dlt.resource(
@@ -211,7 +215,11 @@ def lattice_source(
                     f'lattice_source needs write_disposition="replace", got {disposition!r}. '
                     "It lists everything on each run and deletions are the rows that are gone."
                 )
-            yield from rows(client, selection, tables)
+            try:
+                yield from guarded_rows(rows(client, selection, tables, stats), check_active)
+            finally:
+                # Reopened by the next kind's first request.
+                client.close()
 
         return staged
 
@@ -231,8 +239,8 @@ def lattice_source(
     # Give the source its own dlt pipeline per dataset, so a second workspace
     # synced into the same dataset keeps its own state.
     setattr(source, PIPELINE_SCOPE_ATTR, resource_name)
-    if owned_client is not None:
-        weakref.finalize(source, owned_client.close)
+    # Counts of the last run, for hosts that record how a sync went. Never content.
+    source.cognee_sync_stats = stats
     return source
 
 
@@ -266,7 +274,7 @@ class _Tables:
 # Row builders: each reads one kind completely, or raises. Nothing is yielded
 # from a listing that was cut short.
 # ---------------------------------------------------------------------------
-def _goal_rows(client, selection: _Selection, tables: _Tables) -> Iterator[dict]:
+def _goal_rows(client, selection: _Selection, tables: _Tables, stats: dict) -> Iterator[dict]:
     if not selection.include_goals:
         return
     names = _user_names(client)
@@ -296,11 +304,15 @@ def _goal_rows(client, selection: _Selection, tables: _Tables) -> Iterator[dict]
             try:
                 updates = client.list_all(f"/v1/goals/{goal_id}/updates")
             except LatticeAPIError as exc:
-                if exc.status != 404:
+                if exc.status not in (403, 404):
                     raise
-                # Deleted since it was listed: leave it out so it is forgotten.
-                logger.warning("Lattice: goal %s is gone, skipping: %s", goal_id, exc)
-                continue
+                if _goal_is_gone(client, goal_id):
+                    # Deleted since it was listed: leave it out so it is forgotten.
+                    logger.warning("Lattice: goal %s is gone, skipping.", goal_id)
+                    continue
+                # Still there, only its updates are unreadable. Keep the goal: an
+                # unreadable endpoint must never be read as a deletion.
+                logger.warning("Lattice: updates of goal %s are unreadable: %s", goal_id, exc)
         owners = [_name(names, ref) for ref in _refs(goal.get("owners"))]
         parent = (goal.get("parentGoal") or {}).get("id")
         count += 1
@@ -311,10 +323,11 @@ def _goal_rows(client, selection: _Selection, tables: _Tables) -> Iterator[dict]
             "content": goal_content(goal, owners, titles.get(parent), updates),
             NODE_SET_COLUMN: ["goals"],
         }
+    stats.update(goals=count, goals_skipped=skipped)
     logger.info("Lattice: synced %d goal(s), skipped %d.", count, skipped)
 
 
-def _feedback_rows(client, selection: _Selection, tables: _Tables) -> Iterator[dict]:
+def _feedback_rows(client, selection: _Selection, tables: _Tables, stats: dict) -> Iterator[dict]:
     if not selection.include_feedback:
         return
     names = _user_names(client)
@@ -341,10 +354,11 @@ def _feedback_rows(client, selection: _Selection, tables: _Tables) -> Iterator[d
             "content": feedback_content(feedback),
             NODE_SET_COLUMN: ["feedback"],
         }
+    stats.update(feedback=count)
     logger.info("Lattice: synced %d feedback item(s).", count)
 
 
-def _cycle_rows(client, selection: _Selection, tables: _Tables) -> Iterator[dict]:
+def _cycle_rows(client, selection: _Selection, tables: _Tables, stats: dict) -> Iterator[dict]:
     if not selection.include_review_cycles:
         return
     count = 0
@@ -357,10 +371,11 @@ def _cycle_rows(client, selection: _Selection, tables: _Tables) -> Iterator[dict
             "content": cycle_content(cycle),
             NODE_SET_COLUMN: ["review_cycles"],
         }
+    stats.update(review_cycles=count)
     logger.info("Lattice: synced %d review cycle(s).", count)
 
 
-def _review_rows(client, selection: _Selection, tables: _Tables) -> Iterator[dict]:
+def _review_rows(client, selection: _Selection, tables: _Tables, stats: dict) -> Iterator[dict]:
     if not selection.review_cycle_ids:
         return
     cycles = {cycle["id"]: cycle for cycle in _all_cycles(client)}
@@ -408,6 +423,7 @@ def _review_rows(client, selection: _Selection, tables: _Tables) -> Iterator[dic
                 "content": reviewee_content(reviews.values(), questions),
                 NODE_SET_COLUMN: ["reviews"],
             }
+    stats.update(reviewees=count)
     logger.info("Lattice: synced reviews of %d reviewee(s).", count)
 
 
@@ -416,11 +432,30 @@ def _review_rows(client, selection: _Selection, tables: _Tables) -> Iterator[dic
 # ---------------------------------------------------------------------------
 def _user_names(client) -> dict[str, str]:
     """User id -> name, for every user including deactivated ones."""
-    return {
+    try:
+        users = client.list_all("/v1/users", {"status": "NULL"})
+    except LatticeAPIError as exc:
+        if exc.status not in (400, 422):
+            raise
+        # Lattice documents status NULL as "every user"; if this workspace refuses it,
+        # fall back to the default (active users) so a deactivated owner is the only
+        # name lost.
+        logger.warning("Lattice: users with any status were refused (%s); active only.", exc)
+        users = client.list_all("/v1/users")
+    names = {
         user["id"]: user.get("preferredName") or user.get("name") or UNKNOWN_USER
-        for user in client.list_all("/v1/users", {"status": "NULL"})
+        for user in users
         if user.get("id")
     }
+    if not names:
+        # The key's own user always exists, so an empty list means the key sees
+        # nothing (wrong region or permissions); every listing would read as empty.
+        raise LatticeAPIError(
+            200,
+            "Lattice returned no users for this API key, so nothing it lists can be trusted. "
+            "Check the key's permissions and the region.",
+        )
+    return names
 
 
 def _all_cycles(client) -> list[dict]:
@@ -434,7 +469,24 @@ def _launched_cycles(client) -> dict[str, dict]:
 
 def _read_question(client, questions: dict[str, dict], revision_id: str | None) -> None:
     if revision_id and revision_id not in questions:
-        questions[revision_id] = client.get(f"/v1/questionRevision/{revision_id}")
+        try:
+            questions[revision_id] = client.get(f"/v1/questionRevision/{revision_id}")
+        except LatticeAPIError as exc:
+            if exc.status not in (403, 404):
+                raise
+            # Only the wording is lost (the document falls back to the question id);
+            # one unreadable question must not stop every run.
+            logger.warning("Lattice: question %s is unreadable: %s", revision_id, exc)
+            questions[revision_id] = {}
+
+
+def _goal_is_gone(client, goal_id: str) -> bool:
+    """True only when Lattice itself says the goal does not exist."""
+    try:
+        client.get(f"/v1/goal/{goal_id}")
+    except LatticeAPIError as exc:
+        return exc.status == 404
+    return False
 
 
 def _refs(listing: Any) -> list[dict]:
