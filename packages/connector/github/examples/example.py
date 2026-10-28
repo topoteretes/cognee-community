@@ -29,9 +29,20 @@ async def main() -> None:
         )
         return
 
-    # Scope with repos=[...] or orgs=[...]; omit both to ingest every repo the
-    # authenticated user can see.
-    source = github_source()
+    # Set GITHUB_DEPENDABOT_REPOS=owner/repo1,owner/repo2 to opt into alert
+    # ingestion. Alert reads require Dependabot alerts read permission, and the
+    # repositories must be listed explicitly so the alert snapshot is scoped.
+    dependabot_repos = [
+        repo.strip()
+        for repo in os.environ.get("GITHUB_DEPENDABOT_REPOS", "").split(",")
+        if repo.strip()
+    ]
+    if dependabot_repos:
+        source = github_source(repos=dependabot_repos, include_dependabot_alerts=True)
+    else:
+        # Without the opt-in variable, ingest the authenticated user's repos
+        # without requesting Dependabot alert access.
+        source = github_source()
 
     print("Syncing GitHub into cognee ...")
     await cognee.remember(source, dataset_name=DATASET_NAME)
@@ -44,8 +55,8 @@ async def main() -> None:
     print("\nSearch result:\n", answer)
 
     print(
-        "\nEdit an issue/PR/commit/release in GitHub, then re-run: edits re-sync and "
-        "removed items are reconciled out of memory."
+        "\nEdit an issue, PR, commit, release, or Dependabot alert in GitHub, then "
+        "re-run: changes update by stable ID and removed items are reconciled out of memory."
     )
 
 
