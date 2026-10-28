@@ -11,11 +11,18 @@ Two layers, all runnable without GCP credentials:
 """
 
 import re
-from datetime import UTC, date, datetime
+from datetime import date, datetime, timezone
 from types import SimpleNamespace
 
 import pytest
-from google.api_core.exceptions import Forbidden, NotFound
+from google.api_core.exceptions import (
+    Forbidden,
+    InternalServerError,
+    NotFound,
+    RetryError,
+    TooManyRequests,
+    Unauthorized,
+)
 from google.cloud.bigquery import SchemaField
 
 import cognee_community_connector_bigquery.bigquery as bq
@@ -32,6 +39,7 @@ from cognee_community_connector_bigquery.bigquery import (
 )
 
 PROJECT = "proj"
+METADATA, ROWS = "bigquery_proj_metadata", "bigquery_proj_rows"  # default table names
 
 # ---------------------------------------------------------------------------
 # Fixtures / fakes
@@ -80,7 +88,8 @@ class FakeQueryJob:
         self._rows = rows
         self.total_bytes_processed = total_bytes_processed
 
-    def result(self):
+    def result(self, **kwargs):
+        self.result_kwargs = kwargs
         return iter(self._rows)
 
 
@@ -99,21 +108,26 @@ class FakeBigQueryClient:
         self.rows = rows or {}  # {"dataset.table": [row dict, ...]}
         self.bytes_per_query = bytes_per_query
         self.queries = []  # (sql, {param: value}, dry_run)
+        self.call_kwargs = []  # (method, kwargs) as the connector passed them
+        self.jobs = []  # the query jobs handed out
         self.closed = False
 
     def close(self):
         self.closed = True
 
-    def list_datasets(self, project=None):
+    def list_datasets(self, project=None, **kwargs):
+        self.call_kwargs.append(("list_datasets", kwargs))
         return [SimpleNamespace(dataset_id=d) for d in self.datasets]
 
-    def get_dataset(self, ref):
+    def get_dataset(self, ref, **kwargs):
+        self.call_kwargs.append(("get_dataset", kwargs))
         dataset_id = ref.split(".")[-1]
         if dataset_id not in self.datasets:
             raise NotFound(f"Dataset {ref} not found")
         return self.datasets[dataset_id]
 
-    def list_tables(self, ref):
+    def list_tables(self, ref, **kwargs):
+        self.call_kwargs.append(("list_tables", kwargs))
         dataset_id = ref.split(".")[-1]
         return [
             SimpleNamespace(table_id=key.split(".")[1])
@@ -121,17 +135,20 @@ class FakeBigQueryClient:
             if key.startswith(f"{dataset_id}.")
         ]
 
-    def get_table(self, ref):
+    def get_table(self, ref, **kwargs):
+        self.call_kwargs.append(("get_table", kwargs))
         key = ".".join(ref.split(".")[-2:])
         if key not in self.tables:
             raise NotFound(f"Table {ref} not found")
         return self.tables[key]
 
-    def query(self, sql, job_config=None):
+    def query(self, sql, job_config=None, **kwargs):
+        self.call_kwargs.append(("query", kwargs))
         params = {p.name: p.value for p in job_config.query_parameters}
         self.queries.append((sql, params, bool(job_config.dry_run)))
         if job_config.dry_run:
-            return FakeQueryJob([], self.bytes_per_query)
+            self.jobs.append(FakeQueryJob([], self.bytes_per_query))
+            return self.jobs[-1]
         key = ".".join(re.search(r"FROM `([^`]+)`", sql).group(1).split(".")[-2:])
         rows = self.rows.get(key, [])
         where = re.search(r"WHERE `(\w+)` (>=|>) @since", sql)
@@ -139,7 +156,8 @@ class FakeBigQueryClient:
             column, op = where.groups()
             since = params["since"]
             rows = [r for r in rows if (r[column] >= since if op == ">=" else r[column] > since)]
-        return FakeQueryJob(rows, self.bytes_per_query)
+        self.jobs.append(FakeQueryJob(rows, self.bytes_per_query))
+        return self.jobs[-1]
 
 
 def _orders_client(rows=None, **kwargs):
@@ -155,7 +173,7 @@ def _order(order_id, status, day):
     return {
         "order_id": order_id,
         "status": status,
-        "updated_at": datetime(2024, 1, day, tzinfo=UTC),
+        "updated_at": datetime(2024, 1, day, tzinfo=timezone.utc),
     }
 
 
@@ -211,13 +229,17 @@ def test_view_document_includes_sql():
 def test_table_document_leaves_out_volatile_fields():
     # Row counts and modified times change on every load; keeping them out of the
     # text keeps the content hash (and so the cognee data_id) stable.
-    table = _table("sales", "orders", ORDERS_SCHEMA, num_rows=10, modified=datetime.now(UTC))
+    table = _table(
+        "sales", "orders", ORDERS_SCHEMA, num_rows=10, modified=datetime.now(timezone.utc)
+    )
     assert set(table_to_row(table)) == {"id", "title", "content", "url", "_deleted"}
     assert "10" not in table_to_row(table)["content"]
 
 
 def test_format_value_types():
-    assert format_value(datetime(2024, 1, 2, 3, 4, tzinfo=UTC)) == "2024-01-02T03:04:00+00:00"
+    assert (
+        format_value(datetime(2024, 1, 2, 3, 4, tzinfo=timezone.utc)) == "2024-01-02T03:04:00+00:00"
+    )
     assert format_value(date(2024, 1, 2)) == "2024-01-02"
     assert format_value({"b": 1, "a": [2]}) == '{"a": [2], "b": 1}'
     assert format_value(b"\x00\x01") == "<2 bytes>"
@@ -239,15 +261,94 @@ def test_source_scopes_its_dlt_state_by_project():
 
     narrow = bigquery_source(client=_orders_client(), tables=["sales.orders"])
     wide = bigquery_source(client=_orders_client(), datasets=["sales"], row_syncs=[ORDERS_SYNC])
-    # Same project → same state, whatever is selected, so narrowing the scope
-    # tombstones what dropped out instead of orphaning it in another state.
-    assert (
-        getattr(narrow, PIPELINE_SCOPE_ATTR)
-        == getattr(wide, PIPELINE_SCOPE_ATTR)
-        == "bigquery:proj"
-    )
+    # Same project -> same state, whatever is selected, so narrowing the scope
+    # tombstones what dropped out instead of orphaning it in another state. The
+    # tables and the state scope share one name.
+    assert getattr(narrow, PIPELINE_SCOPE_ATTR) == getattr(wide, PIPELINE_SCOPE_ATTR)
+    assert getattr(narrow, PIPELINE_SCOPE_ATTR) == "bigquery_proj"
+    assert list(narrow.resources) == [METADATA, ROWS]
     assert pipeline_name_for_source(narrow, "a") != pipeline_name_for_source(narrow, "b")
     assert pipeline_name_for_source(narrow, "a") != "ingest_dlt_source"  # not the shared one
+    assert bq._default_resource_name("my-project-123") == "bigquery_my_project_123"
+    named = bigquery_source(client=_orders_client(), resource_name="bq_prod")
+    assert list(named.resources) == ["bq_prod_metadata", "bq_prod_rows"]
+
+
+def test_source_validates_configuration():
+    client = _orders_client()
+    with pytest.raises(ValueError, match="datasets must be a list"):
+        bigquery_source(client=client, datasets="sales")
+    with pytest.raises(ValueError, match="tables must be a list"):
+        bigquery_source(client=client, tables="sales.orders")
+    with pytest.raises(ValueError, match="row_syncs must be a list"):
+        bigquery_source(client=client, row_syncs=ORDERS_SYNC)
+    with pytest.raises(ValueError, match="snake_case"):
+        bigquery_source(client=client, resource_name="BigQuery-Prod")
+
+
+def test_source_refuses_a_cognee_without_document_sync(monkeypatch):
+    monkeypatch.delattr(bq.dlt_utils, "DOCUMENT_SYNC_VERSION")
+    with pytest.raises(RuntimeError, match="document sync cleanup"):
+        bigquery_source(client=_orders_client())
+
+
+def test_every_call_and_query_job_gets_a_bounded_retry():
+    fake = _orders_client(rows=[_order(1, "new", 1)])
+    client = bq._CheckedClient(fake, None, {})
+    list(sync_metadata(client, PROJECT, None, {}))
+    list(sync_rows(client, PROJECT, [ORDERS_SYNC], 10**9, {}, {}))
+
+    assert {method for method, _ in fake.call_kwargs} == {
+        "list_datasets",
+        "get_dataset",
+        "list_tables",
+        "get_table",
+        "query",
+    }
+    for method, kwargs in fake.call_kwargs:
+        assert kwargs["timeout"] == 60.0
+        assert kwargs["retry"].timeout == 60.0  # the library default is 600 s
+        if method == "query":
+            assert kwargs["job_retry"].timeout == 60.0  # the library default is 2400 s
+    assert fake.jobs[-1].result_kwargs["retry"].timeout == 60.0
+
+
+@pytest.mark.parametrize(
+    ("error", "reason"),
+    [
+        (Unauthorized("bad credentials"), "failed_auth"),
+        (Forbidden("Access Denied"), "failed_auth"),
+        (Forbidden("Quota", errors=[{"reason": "rateLimitExceeded"}]), "failed_rate_limit"),
+        (TooManyRequests("slow down"), "failed_rate_limit"),
+        (RetryError("gave up", cause=TooManyRequests("slow down")), "failed_rate_limit"),
+    ],
+)
+def test_auth_and_rate_limit_failures_are_counted(error, reason):
+    fake = _orders_client()
+
+    def fail(ref, **kwargs):
+        raise error
+
+    fake.get_table = fail
+    stats = {}
+    with pytest.raises(type(error)):
+        list(sync_metadata(bq._CheckedClient(fake, None, stats), PROJECT, None, {}))
+    other = {"failed_auth", "failed_rate_limit"} - {reason}
+    assert stats[reason] == 1 and not any(stats.get(key) for key in other)
+
+
+def test_a_broken_key_file_is_reported_without_its_contents(tmp_path):
+    import traceback
+
+    canary = "MIIEvLeakCanary0123456789"
+    key = tmp_path / "key.json"
+    key.write_text(f"private_key={canary}")  # not JSON
+    with pytest.raises(ValueError, match="Could not load the service-account key") as failure:
+        bq._make_client("proj", str(key))
+    assert canary not in "".join(traceback.format_exception(failure.value))
+    # The parse error keeps the file's text on the exception (JSONDecodeError.doc),
+    # so it must not travel with the error a host may log or inspect.
+    assert failure.value.__cause__ is None and failure.value.__suppress_context__
 
 
 # ---------------------------------------------------------------------------
@@ -300,7 +401,7 @@ def test_missing_configured_table_is_skipped_but_other_errors_abort():
     assert ids == ["proj.sales", "proj.sales.orders"]
 
     # ... but a permission error must abort the run instead of looking like a deletion.
-    def forbidden(ref):
+    def forbidden(ref, **kwargs):
         raise Forbidden("no access")
 
     client.get_table = forbidden
@@ -355,7 +456,7 @@ def test_cursor_limits_later_runs_to_changed_rows():
     assert [r["id"] for r in rows] == ["proj.sales.orders:2"]
     assert "status: shipped" in rows[0]["content"]
     incremental = [q for q in client.queries if not q[2] and "@since" in q[0]]
-    assert incremental[0][1] == {"since": datetime(2024, 1, 2, tzinfo=UTC)}
+    assert incremental[0][1] == {"since": datetime(2024, 1, 2, tzinfo=timezone.utc)}
     assert table_state["cursor"] == "2024-01-03T00:00:00+00:00"
 
 
@@ -484,10 +585,10 @@ def test_first_sync_loads_metadata_and_rows(dlt_mod, tmp_path):
 
     pipeline = _run_sync(dlt_mod, tmp_path, client, row_syncs=[ORDERS_SYNC])
 
-    metadata = _read(pipeline, "bigquery_metadata")
+    metadata = _read(pipeline, METADATA)
     assert set(metadata) == {"proj.sales", "proj.sales.orders"}
     assert "Unique order id." in metadata["proj.sales.orders"]
-    assert set(_read(pipeline, "bigquery_rows")) == {"proj.sales.orders:1"}
+    assert set(_read(pipeline, ROWS)) == {"proj.sales.orders:1"}
 
 
 def test_description_edit_is_reflected_on_resync(dlt_mod, tmp_path):
@@ -497,7 +598,7 @@ def test_description_edit_is_reflected_on_resync(dlt_mod, tmp_path):
     client.tables["sales.orders"].description = "Orders, including cancelled ones."
     pipeline = _run_sync(dlt_mod, tmp_path, client)
 
-    content = _read(pipeline, "bigquery_metadata")["proj.sales.orders"]
+    content = _read(pipeline, METADATA)["proj.sales.orders"]
     assert "Orders, including cancelled ones." in content
     assert "One row per order." not in content
 
@@ -513,8 +614,8 @@ def test_dropped_table_and_deleted_row_are_removed_on_resync(dlt_mod, tmp_path):
 
     # Tombstoned rows are hard-deleted by the merge, so cognee's read-back no
     # longer sees them and orphan cleanup forgets them.
-    assert "proj.sales.returns" not in _read(pipeline, "bigquery_metadata")
-    assert set(_read(pipeline, "bigquery_rows")) == {"proj.sales.orders:2"}
+    assert "proj.sales.returns" not in _read(pipeline, METADATA)
+    assert set(_read(pipeline, ROWS)) == {"proj.sales.orders:2"}
 
 
 # ---------------------------------------------------------------------------
@@ -538,6 +639,32 @@ def test_emptied_project_listing_forgets_nothing():
     # Naming the selection explicitly forgets what is gone.
     rows = list(sync_metadata(client, PROJECT, {"sales": None}, state))
     assert len(rows) == 2 and all(row["_deleted"] for row in rows)
+
+
+def test_unchanged_metadata_and_re_read_cursor_rows_are_not_re_emitted():
+    client = _orders_client(rows=[_order(1, "new", 1), _order(2, "new", 2)])
+    metadata, rows = {}, {}
+    list(sync_metadata(client, PROJECT, None, metadata))
+    list(sync_rows(client, PROJECT, [ORDERS_SYNC], 10**9, rows))
+    # Only rows at the cursor value are re-read, so only their hashes are kept.
+    assert set(rows["tables"]["proj.sales.orders"]["boundary"]) == {"2"}
+
+    stats = {}
+    assert list(sync_metadata(client, PROJECT, None, metadata, stats)) == []
+    # >= reads order 2 (at the cursor) again; its hash shows it is unchanged.
+    assert list(sync_rows(client, PROJECT, [ORDERS_SYNC], 10**9, rows, stats)) == []
+    assert (stats["skipped"], stats["changed"]) == (3, 0)  # dataset, table, order 2
+
+    # A row at the same cursor value that is new, or edited without the cursor moving.
+    client.rows["sales.orders"].append(_order(3, "new", 2))
+    client.rows["sales.orders"][1]["status"] = "shipped"
+    emitted = list(sync_rows(client, PROJECT, [ORDERS_SYNC], 10**9, rows))
+    assert [row["id"] for row in emitted] == ["proj.sales.orders:2", "proj.sales.orders:3"]
+
+    client.tables["sales.orders"].description = "Orders, refunds included."
+    assert [row["id"] for row in sync_metadata(client, PROJECT, None, metadata)] == [
+        "proj.sales.orders"
+    ]
 
 
 def test_stats_count_rows_and_null_keys():
@@ -596,3 +723,98 @@ def test_complete_waits_for_metadata_and_rows():
     run.start("rows")
     run.finish("rows")
     assert stats["complete"] == 1
+
+
+def _pipeline(dlt, tmp_path, name):
+    return dlt.pipeline(
+        pipeline_name=name,
+        destination=dlt.destinations.sqlalchemy(
+            f"sqlite:///{(tmp_path / f'{name}.db').as_posix()}"
+        ),
+        dataset_name="bigquery_ds",
+        pipelines_dir=str(tmp_path / "state"),
+    )
+
+
+def test_two_projects_in_one_dataset_keep_their_own_tables_and_state(dlt_mod, tmp_path):
+    from cognee.tasks.ingestion.dlt_utils import pipeline_name_for_source
+
+    first = _orders_client(rows=[_order(1, "new", 1)])
+    second = _orders_client(rows=[_order(1, "new", 1)])
+    second.project = "other"
+
+    def sync(client):
+        source = bigquery_source(client=client, row_syncs=[ORDERS_SYNC])
+        # Name the pipeline as cognee does: one per (dataset, scope).
+        pipeline = _pipeline(dlt_mod, tmp_path, pipeline_name_for_source(source, "bigquery"))
+        pipeline.run(source, write_disposition="merge", primary_key="id")
+        return pipeline
+
+    sync(first)
+    sync(second)
+    first.rows["sales.orders"] = []  # the order is deleted in the first project only
+    pipeline = sync(first)
+    other = sync(second)
+
+    assert _read(pipeline, ROWS) == {}
+    assert set(_read(other, "bigquery_other_rows")) == {"other.sales.orders:1"}
+
+
+@pytest.mark.parametrize("status", [401, 403, 404, 429, 500])
+def test_the_key_never_reaches_errors_or_logs(
+    dlt_mod, tmp_path, monkeypatch, caplog, capsys, status
+):
+    import json
+
+    from dlt.pipeline.exceptions import PipelineStepFailed
+    from google.cloud import bigquery
+
+    canary = "MIIEvLeakCanary0123456789"
+    key = tmp_path / "key.json"
+    key.write_text(json.dumps({"type": "service_account", "private_key": canary}))
+    errors = {
+        401: Unauthorized("Request had invalid authentication credentials."),
+        403: Forbidden("Access Denied: Project proj"),
+        404: NotFound("Not found: Project proj"),
+        429: TooManyRequests("Rate limit exceeded"),
+        500: InternalServerError("Backend error"),
+    }
+    fake = _orders_client()
+
+    def fail(*args, **kwargs):
+        raise errors[status]
+
+    fake.list_datasets = fail
+    seen = []
+    monkeypatch.setattr(
+        bigquery.Client,
+        "from_service_account_json",
+        classmethod(lambda cls, path, project=None: seen.append(path) or fake),
+    )
+    source = bigquery_source(project=PROJECT, credentials_path=str(key))
+
+    with pytest.raises(PipelineStepFailed) as failure:
+        _pipeline(dlt_mod, tmp_path, f"bigquery_leak_{status}").run(
+            source, write_disposition="merge", primary_key="id"
+        )
+
+    chain, error = [], failure.value
+    while error is not None:
+        chain.append(f"{error!r} {error}")
+        error = error.__cause__ or error.__context__
+    output = capsys.readouterr()
+    assert seen and canary not in " ".join(chain)
+    assert canary not in caplog.text + output.out + output.err
+    assert source.cognee_sync_stats["complete"] == 0
+    assert source.cognee_sync_stats["failed_auth"] == (1 if status in (401, 403) else 0)
+    assert source.cognee_sync_stats["failed_rate_limit"] == (1 if status == 429 else 0)
+
+
+def test_control_characters_and_lone_surrogates_are_dropped(dlt_mod, tmp_path):
+    client = _orders_client(rows=[_order(1, "ne\x00w\x1b", 1)])
+    client.tables["sales.orders"].description = "One row \ud800per order."
+    pipeline = _run_sync(dlt_mod, tmp_path, client, row_syncs=[ORDERS_SYNC])
+
+    assert "One row per order." in _read(pipeline, METADATA)["proj.sales.orders"]
+    row = _read(pipeline, ROWS)["proj.sales.orders:1"]
+    assert "new" in row and "\x00" not in row and "\x1b" not in row

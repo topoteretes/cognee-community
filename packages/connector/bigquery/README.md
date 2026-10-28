@@ -14,10 +14,13 @@ deterministic dlt-row path.
 
 ## Requirements
 
-Pins cognee 1.6.2. Document mode (`DOCUMENT_SOURCE_ATTR`) arrived in 1.4.0, and 1.6.x
-adds `PIPELINE_SCOPE_ATTR`, which this source sets so its sync state lives in its own
-dlt pipeline per cognee dataset (as cognee's built-in Gmail and Google Drive connectors
-do) instead of the shared `ingest_dlt_source` pipeline.
+- Python 3.10–3.14
+- `cognee>=1.6.3,<2`, `dlt[sqlalchemy]`, `google-cloud-bigquery`
+
+cognee 1.6.3 has `PIPELINE_SCOPE_ATTR`, which this source sets so its sync state lives
+in its own dlt pipeline per cognee dataset (as cognee's built-in Gmail and Google Drive
+connectors do) instead of the shared `ingest_dlt_source` pipeline, and
+`DOCUMENT_SYNC_VERSION`, which the source checks when it is built.
 
 ## Install
 
@@ -34,7 +37,8 @@ cd packages/connector/bigquery && uv sync
    credit card.
 2. Create a service account with the roles **BigQuery Data Viewer** and **BigQuery Job
    User**, and download a JSON key for it. The connector only reads.
-3. Export the key path, the project, and your `LLM_API_KEY` like any other cognee run:
+3. Pass the key path and the project to `bigquery_source` (`examples/example.py` reads
+   them from these environment variables), and export your `LLM_API_KEY`:
 
 ```bash
 export GOOGLE_APPLICATION_CREDENTIALS=/path/to/key.json
@@ -42,8 +46,9 @@ export BIGQUERY_PROJECT=my-project
 export LLM_API_KEY=sk-...
 ```
 
-Without a key file the connector falls back to Application Default Credentials
-(`gcloud auth application-default login`).
+Without `credentials_path` the connector uses Application Default Credentials
+(`gcloud auth application-default login`, or `GOOGLE_APPLICATION_CREDENTIALS`, which
+Google's client library reads itself).
 
 ## Usage
 
@@ -81,16 +86,21 @@ combined with `datasets`. See `examples/example.py` for a runnable version.
 
 | Argument | Meaning | Default |
 |---|---|---|
-| `project`, `credentials_path` | Project and service-account key | the key's project; `GOOGLE_APPLICATION_CREDENTIALS`, then Application Default Credentials |
+| `project`, `credentials_path` | Project and service-account key | the key's project; Application Default Credentials |
 | `datasets`, `tables` | Narrow the metadata sync | the whole project |
-| `row_syncs` | Tables whose rows become documents, one `RowSync` each | none |
+| `row_syncs` | Tables whose rows become documents, a list with one `RowSync` each | none |
 | `maximum_bytes_billed` | Per-query byte cap | 1 GB |
+| `resource_name` | Prefix of the two tables, which also scopes the sync state (keyword-only) | `bigquery_<project>` |
 | `check_active` | Host checkpoint, called before every BigQuery API call and before every row is published | none |
 | `service` (alias `client`) | Pre-built `google.cloud.bigquery.Client` (tests, proxies); not closed by the source | one per run, closed afterwards |
 
+The tables are `bigquery_<project>_metadata` and `bigquery_<project>_rows`, so each
+project keeps its own tables and sync state when several share one dataset.
+
 After a run, `source.cognee_sync_stats` holds counts only, summed over metadata and rows:
-`scanned`, `changed`, `deleted`, `failed` (rows with a NULL key), `requests` (API calls),
-and `complete` (1 once both finished).
+`scanned`, `skipped` (unchanged), `changed`, `deleted`, `failed` (rows with a NULL key),
+`failed_auth` and `failed_rate_limit` (1 when the run stopped for that reason),
+`requests` (API calls), and `complete` (1 once both finished).
 
 ## How sync and forget-on-delete work
 
@@ -110,11 +120,21 @@ disposition to every table the source produces, and this source deletes by emitt
   column only. Keys that disappeared are tombstoned. If the whole table is dropped, or you remove
   its `RowSync`, all of its rows are forgotten. Without a `cursor_column`, every run re-reads the
   whole table.
+- **Only changed documents are emitted.** A hash of each metadata document is kept in
+  dlt state, and so is the hash of each row at the last cursor value (the rows the
+  `>=` query reads again), so an unchanged project or table emits nothing.
 - **Cost guard**: every query is dry-run first. If the estimate is above
   `maximum_bytes_billed` (default 1 GB) the sync stops before anything is billed, and
   the same cap is set on the real query so BigQuery enforces it too.
-- Errors other than "not found" (permissions, network) abort the run, so a failed
-  listing never looks like a deletion.
+- **Failures.** Errors other than "not found" (permissions, network) abort the run, so
+  a failed listing never looks like a deletion. Google's client library retries
+  transient errors for up to 10 minutes per call (40 for a query job) by default, and
+  each wait sleeps inside cognee's staging lock that other ingestions wait on, so every
+  call, with its retries, is capped at 60 seconds. A 401 or 403 sets `failed_auth`, and
+  a 429 or a quota 403 sets `failed_rate_limit`. A key file that fails to load is
+  reported by its path and the kind of error only.
+- **Text.** Control characters and invalid Unicode are dropped from documents, so a
+  stray NUL in a row can't fail the load.
 - **Safety net.** If listing a whole project that had datasets returns none (a key for
   another project looks like this), the run stops instead of forgetting everything.
   To forget them, name the selection with `datasets=` or `tables=`.
@@ -134,5 +154,7 @@ uv run pytest tests/
 
 The tests use a fake BigQuery client (no credentials needed). They cover metadata and
 row rendering, scope selection, the cursor query, the key sweep, the byte cap, error
-handling, and full dlt `merge` runs into a temporary SQLite destination (first sync,
-edits re-sync, dropped tables and deleted rows are removed).
+handling and the bounded retries, that the key never shows up in errors or logs for
+401, 403, 404, 429 and 5xx, and full dlt `merge` runs into a temporary SQLite
+destination (first sync, edits re-sync, dropped tables and deleted rows are removed,
+two projects in one dataset).

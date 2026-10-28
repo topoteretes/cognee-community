@@ -52,7 +52,12 @@ async def main() -> None:
 
     print("Syncing BigQuery metadata into cognee ...")
     await cognee.remember(
-        bigquery_source(project=project, datasets=datasets, row_syncs=row_syncs),
+        bigquery_source(
+            project=project,
+            datasets=datasets,
+            row_syncs=row_syncs,
+            credentials_path=os.environ["GOOGLE_APPLICATION_CREDENTIALS"],
+        ),
         dataset_name=DATASET_NAME,
         write_disposition="merge",
         self_improvement=False,
