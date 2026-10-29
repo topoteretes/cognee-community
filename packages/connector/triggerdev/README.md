@@ -75,7 +75,9 @@ One document per record, tagged with the node set `triggerdev:task:<task id>` (d
 - **Error groups**: task, error type, status (unresolved, resolved, ignored), first and last
   seen day, fingerprint and the message (cut at 2,000 characters).
 - **Failed runs**: task, status, version, created, started and finished time, duration, tags,
-  schedule, number of attempts, and the last attempt's error with the top 15 lines of its stack
+  schedule, number of attempts, and the run's error with up to 5 stack frames of the task's own
+  code (Node, package and Trigger.dev runtime frames are dropped, and file paths are cut to their
+  last two parts, so the build machine's folders don't end up in memory)
   trace.
 - **Deployments**: version, status, short code, created and deployed time, runtime, and the git
   branch, commit, commit message, author and pull request when the deploy recorded them.

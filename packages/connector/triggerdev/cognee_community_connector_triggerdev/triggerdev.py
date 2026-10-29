@@ -28,6 +28,7 @@ or a response body.
 
 import hashlib
 import json
+import re
 import time
 from collections.abc import Callable, Iterator
 from datetime import datetime, timedelta, timezone
@@ -72,7 +73,13 @@ _REQUESTS_RESERVE = 50
 _MAX_PAGES = 1000
 # how much of an error message and stack trace a document keeps
 _MESSAGE_LIMIT = 2000
-_STACK_LINES = 15
+_STACK_FRAMES = 5
+# frames of Node itself, installed packages and Trigger.dev's bundled runtime; in a live
+# trace these are most of the frames, and their names would become junk graph entities
+_RUNTIME_FRAMES = ("node:internal", "node_modules", "/chunk-")
+# a frame's file location, of which only the last two path segments are kept: the full
+# path is the build machine's, e.g. file:///C:/Users/<name>/project/.trigger/tmp/...
+_FRAME_LOCATION = re.compile(r"(?:file://)?[^\s()]*/([^/\s()]+/[^/\s()]+:\d+:\d+)")
 # (connect, read) seconds; our own choice, Trigger.dev documents no expected latency
 _TIMEOUT = (10, 30)
 # attempts per request on 5xx or network errors, backing off 1s then 2s
@@ -331,25 +338,55 @@ def _last_error(attempts: list[dict[str, Any]]) -> dict[str, Any] | None:
     return errors[-1] if errors else None
 
 
+def _task_frames(trace: str) -> list[str]:
+    """The top frames of the task's own code, with short file locations.
+
+    The trace's first line repeats the error's name and message, which the document
+    already has, so only ``at ...`` frames are kept. A trace whose every frame is runtime
+    code keeps its top frame, so the document still says where the error was thrown.
+    """
+    frames = [line.strip() for line in trace.splitlines() if line.strip().startswith("at ")]
+    own = [frame for frame in frames if not any(part in frame for part in _RUNTIME_FRAMES)]
+    return [_FRAME_LOCATION.sub(r"\1", frame) for frame in (own or frames[:1])[:_STACK_FRAMES]]
+
+
 def _run_detail_lines(detail: dict[str, Any]) -> list[str]:
     schedule = detail.get("schedule")
     schedule = schedule if isinstance(schedule, dict) else {}
     attempts = [a for a in detail.get("attempts") or [] if isinstance(a, dict)]
+    count = detail.get("attemptCount")
+    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+        count = len(attempts)
     lines = _lines(
         [
             ("Schedule", _text(schedule.get("id"))),
-            ("Attempts", str(len(attempts)) if attempts else ""),
+            ("Attempts", str(count) if count else ""),
         ]
     )
-    error = _last_error(attempts)
+    # the live API reports the run's error at the top level and leaves attempts empty;
+    # older answers carry it on each attempt only
+    error = detail.get("error")
+    if not isinstance(error, dict):
+        error = _last_error(attempts)
     if error:
         name = _text(error.get("name")) or "Error"
         message = _clip(_text(error.get("message")), _MESSAGE_LIMIT)
         lines += ["", f"Error: {name}: {message}" if message else f"Error: {name}"]
-        stack = _text(error.get("stackTrace")).splitlines()[:_STACK_LINES]
+        stack = _task_frames(_text(error.get("stackTrace")))
         if stack:
             lines += ["Stack trace (top):", *stack]
     return lines
+
+
+def _duration(milliseconds: Any) -> str:
+    if isinstance(milliseconds, bool) or not isinstance(milliseconds, int | float):
+        return ""
+    if milliseconds <= 0:
+        return ""
+    # runs that fail fast take a few ms, which "0.0s" would hide
+    if milliseconds < 1000:
+        return f"{round(milliseconds)}ms"
+    return f"{milliseconds / 1000:.1f}s"
 
 
 def render_run(run: dict[str, Any], detail: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -368,12 +405,7 @@ def render_run(run: dict[str, Any], detail: dict[str, Any] | None = None) -> dic
         ("Started", _minute(run.get("startedAt"))),
         ("Finished", _minute(finished)),
         # a live run's duration grows on every read, so only a finished one is rendered
-        (
-            "Duration",
-            f"{duration / 1000:.1f}s"
-            if finished and isinstance(duration, int | float) and not isinstance(duration, bool)
-            else "",
-        ),
+        ("Duration", _duration(duration) if finished else ""),
         (
             "Tags",
             ", ".join(sorted({_text(t) for t in tags} - {""})) if isinstance(tags, list) else "",

@@ -150,7 +150,11 @@ class FakeTriggerDev:
         error_message: str | None = "Stripe webhook signature mismatch",
         schedule_id: str | None = None,
         env_id: str | None = None,
+        error_in_attempts: bool = False,
     ) -> dict:
+        """A run as the live API answers it (checked 2026-10-29): the retrieved run
+        carries its error at the top level with ``attemptCount``, and ``attempts`` is
+        empty. ``error_in_attempts`` answers the older documented shape instead."""
         created = created_at or ago(hours=2)
         finished = status not in ("QUEUED", "EXECUTING", "REATTEMPTING", "FROZEN")
         self.runs[run_id] = {
@@ -168,24 +172,20 @@ class FakeTriggerDev:
             "tags": ["customer_42", "billing"],
             "env": {"id": env_id or self.env_id, "name": "prod"},
         }
+        error = {
+            "name": "Error",
+            "message": error_message,
+            "stackTrace": f"Error: {error_message}\n    at handler (src/trigger/{task}.ts:42:11)",
+        }
         attempts = [
-            {
-                "id": f"attempt_{run_id}_1",
-                "status": "FAILED",
-                "createdAt": created,
-                "error": {
-                    "name": "Error",
-                    "message": error_message,
-                    "stackTrace": (
-                        f"Error: {error_message}\n    at handler (src/trigger/{task}.ts:42:11)"
-                    ),
-                },
-            }
+            {"id": f"attempt_{run_id}_1", "status": "FAILED", "createdAt": created, "error": error}
         ]
         self.details[run_id] = {
             "payload": {"card": "4242 4242 4242 4242", "email": "ada@example.com"},
             "output": {"secret": "do-not-store"},
-            "attempts": attempts if error_message else [],
+            "attempts": attempts if error_message and error_in_attempts else [],
+            "attemptCount": 2 if error_message and not error_in_attempts else 0,
+            "error": error if error_message and not error_in_attempts else None,
             "schedule": {"id": schedule_id} if schedule_id else None,
         }
         return self.runs[run_id]

@@ -11,6 +11,21 @@ from cognee_community_connector_triggerdev.triggerdev import (
     TriggerDevClient,
     TriggerDevSourceError,
     _iter_rows,
+    render_run,
+)
+
+# the shape of a stack trace the live API returned for a task run by `trigger.dev dev`
+_BUILD = "file:///C:/Users/dev/My%20Jobs/.trigger/tmp/build-ifmrHv"
+_LIVE_TRACE = "\n".join(
+    [
+        "Error: Stripe webhook signature mismatch for cus_42",
+        f"    at run ({_BUILD}/My%20Jobs/src/trigger/tasks.mjs:22:11)",
+        f"    at _tracer.startActiveSpan.attributes ({_BUILD}/chunk-KCKFKYH2.mjs:70174:22)",
+        f"    at {_BUILD}/AppData/Local/npm-cache/_npx/f5/node_modules/trigger.dev/dist/esm"
+        "/entryPoints/dev-run-worker.mjs:154:22",
+        "    at AsyncLocalStorage.run (node:internal/async_local_storage/frame:66:14)",
+        f"    at ContextAPI.with ({_BUILD}/chunk-IKSFYADO.mjs:741:46)",
+    ]
 )
 
 
@@ -70,7 +85,8 @@ def test_documents_are_readable_and_keep_payloads_outputs_and_git_urls_out(monke
     run = rows["run:run_1"]
     assert run["title"] == "send-invoice run run_1: failed"
     assert "Error: Error: Stripe webhook signature mismatch" in run["content"]
-    assert "at handler (src/trigger/send-invoice.ts:42:11)" in run["content"]
+    assert "at handler (trigger/send-invoice.ts:42:11)" in run["content"]
+    assert "Attempts: 2" in run["content"]
     assert "Tags: billing, customer_42" in run["content"]
     assert run[NODE_SET_COLUMN] == ["task:send-invoice"]
 
@@ -85,6 +101,45 @@ def test_documents_are_readable_and_keep_payloads_outputs_and_git_urls_out(monke
     everything = repr(rows)
     for secret in ("4242", "ada@example.com", "do-not-store", "ghs_leak", "x-access-token"):
         assert secret not in everything
+
+
+def test_an_answer_with_the_error_only_on_its_attempts_still_renders_it(monkeypatch):
+    fake = FakeTriggerDev()
+    fake.add_run("run_old", "send-invoice", error_in_attempts=True)
+    fake.install(monkeypatch)
+    run = _sync({}, include=("runs",))[0][0]
+
+    assert "Attempts: 1" in run["content"]
+    assert "Error: Error: Stripe webhook signature mismatch" in run["content"]
+
+
+def test_a_live_stack_trace_keeps_only_the_tasks_own_frames_without_full_paths():
+    run = {"id": "run_1", "taskIdentifier": "send-invoice", "status": "FAILED"}
+    detail = {"error": {"name": "Error", "message": "mismatch", "stackTrace": _LIVE_TRACE}}
+    content = render_run(run, detail)["content"]
+
+    assert content.endswith("Stack trace (top):\nat run (trigger/tasks.mjs:22:11)")
+    for noise in ("chunk-", "node:internal", "node_modules", "C:/Users", "My%20Jobs"):
+        assert noise not in content
+
+
+def test_a_trace_of_only_runtime_frames_keeps_its_top_frame():
+    run = {"id": "run_1", "taskIdentifier": "send-invoice", "status": "FAILED"}
+    trace = "Error: boom\n    at ContextAPI.with (file:///srv/app/.trigger/chunk-AB.mjs:741:46)"
+    detail = {"error": {"name": "Error", "message": "boom", "stackTrace": trace}}
+
+    assert render_run(run, detail)["content"].endswith(
+        "at ContextAPI.with (.trigger/chunk-AB.mjs:741:46)"
+    )
+
+
+def test_a_run_that_fails_fast_keeps_its_duration(monkeypatch):
+    fake = FakeTriggerDev()
+    fake.add_run("run_fast", "send-invoice")["durationMs"] = 20
+    fake.install(monkeypatch)
+    run = _sync({}, include=("runs",))[0][0]
+
+    assert "Duration: 20ms" in run["content"]
 
 
 def test_volatile_fields_do_not_resend_a_record(monkeypatch):
