@@ -18,10 +18,16 @@ from cognee_community_connector_evernote import (
 
 
 class FakeEvernoteClient:
-    def __init__(self, chunks=None, note_contents=None):
+    def __init__(self, chunks=None, note_contents=None, sync_state=None):
         self.chunks = list(chunks or [])
         self.note_contents = dict(note_contents or {})
         self.get_note_content_calls = []
+        self.sync_state = sync_state
+
+    def get_sync_state(self):
+        if self.sync_state is not None:
+            return self.sync_state
+        return SimpleNamespace(currentTime=1600000000000, updateCount=1000)
 
     def get_filtered_sync_chunk(self, after_usn, max_entries, filter_obj):
         if self.chunks:

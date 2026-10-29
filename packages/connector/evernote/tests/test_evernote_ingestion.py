@@ -12,7 +12,7 @@ import pytest_asyncio
 from cognee.modules.data.methods import get_authorized_existing_datasets
 from cognee.modules.data.methods.get_dataset_data import get_dataset_data
 from cognee.modules.users.methods import get_default_user
-from evernote.edam.notestore.ttypes import SyncChunk
+from evernote.edam.notestore.ttypes import SyncChunk, SyncState
 
 from cognee_community_connector_evernote import evernote_source
 
@@ -20,11 +20,26 @@ DATASET_NAME = "evernote_integration_test"
 
 
 class FakeEvernoteClient:
-    def __init__(self, chunks=None, note_contents=None):
+    def __init__(self, chunks=None, note_contents=None, update_count=None):
         self.chunks = list(chunks or [])
         self.note_contents = dict(note_contents or {})
+        self.update_count = update_count
+        self.get_filtered_sync_chunk_calls = []
+
+    def get_sync_state(self):
+        count = self.update_count
+        if count is None and self.chunks:
+            count = getattr(self.chunks[0], "updateCount", 1000) or 1000
+        elif count is None:
+            count = 1000
+        return SyncState(
+            currentTime=1609459200000,
+            fullSyncBefore=0,
+            updateCount=count,
+        )
 
     def get_filtered_sync_chunk(self, after_usn, max_entries, filter_obj):
+        self.get_filtered_sync_chunk_calls.append((after_usn, max_entries, filter_obj))
         if self.chunks:
             return self.chunks.pop(0)
         return SyncChunk(chunkHighUSN=None)
@@ -249,3 +264,102 @@ async def test_evernote_ingestion_lifecycle(persistent_environment):
     assert "noteB" not in final_guids
     assert "noteC" not in final_guids
     assert len(final_data) == 1
+
+
+@pytest.mark.asyncio
+async def test_evernote_incremental_ingestion_with_cursor(persistent_environment):
+    """Incremental sync across cognee.add runs: run 1 ingests 3 notes, run 2 edits/trashes notes."""
+    dataset = "evernote_cursor_dataset"
+    nb = SimpleNamespace(guid="nb-1", name="Engineering")
+    note1 = SimpleNamespace(
+        guid="n1",
+        title="Note 1",
+        notebookGuid="nb-1",
+        tagGuids=[],
+        active=True,
+        created=1609459200000,
+        updated=1609459200000,
+    )
+    note2 = SimpleNamespace(
+        guid="n2",
+        title="Note 2",
+        notebookGuid="nb-1",
+        tagGuids=[],
+        active=True,
+        created=1609459200000,
+        updated=1609459200000,
+    )
+    note3 = SimpleNamespace(
+        guid="n3",
+        title="Note 3",
+        notebookGuid="nb-1",
+        tagGuids=[],
+        active=True,
+        created=1609459200000,
+        updated=1609459200000,
+    )
+
+    contents = {
+        "n1": "<en-note><div>Body 1</div></en-note>",
+        "n2": "<en-note><div>Body 2</div></en-note>",
+        "n3": "<en-note><div>Body 3</div></en-note>",
+    }
+
+    # Run 1: initial ingestion of 3 notes
+    chunk1 = SyncChunk(
+        chunkHighUSN=10,
+        updateCount=10,
+        notebooks=[nb],
+        notes=[note1, note2, note3],
+    )
+    client = FakeEvernoteClient(chunks=[chunk1], note_contents=contents, update_count=10)
+    source1 = evernote_source(token="fake-token", client=client)
+    await cognee.add(source1, dataset_name=dataset, write_disposition="merge")
+
+    # Assert 3 data records created on Run 1
+    data1 = await _get_evernote_dataset_data(dataset)
+    assert len(data1) == 3
+    assert {_get_metadata(d)["external_id"] for d in data1} == {"n1", "n2", "n3"}
+    assert client.get_filtered_sync_chunk_calls[0][0] == 0
+
+    # Run 2: incremental run editing note1 and trashing note2
+    contents["n1"] = "<en-note><div>Body 1 Updated</div></en-note>"
+    note1_edited = SimpleNamespace(
+        guid="n1",
+        title="Note 1 Updated",
+        notebookGuid="nb-1",
+        tagGuids=[],
+        active=True,
+        created=1609459200000,
+        updated=1609500000000,
+    )
+    note2_trashed = SimpleNamespace(
+        guid="n2",
+        title="Note 2",
+        notebookGuid="nb-1",
+        tagGuids=[],
+        active=False,
+    )
+
+    chunk2 = SyncChunk(
+        chunkHighUSN=20,
+        updateCount=20,
+        notes=[note1_edited, note2_trashed],
+    )
+    client.chunks = [chunk2]
+    client.update_count = 20
+
+    source2 = evernote_source(token="fake-token", client=client)
+    await cognee.add(source2, dataset_name=dataset, write_disposition="merge")
+
+    # Assert that the fake api saw afterUSN > 0 on run 2
+    assert len(client.get_filtered_sync_chunk_calls) == 2
+    after_usn_run2 = client.get_filtered_sync_chunk_calls[1][0]
+    assert after_usn_run2 == 10
+    assert after_usn_run2 > 0
+
+    # Assert Data records: n1 updated, n2 removed, n3 retained
+    data2 = await _get_evernote_dataset_data(dataset)
+    guids_run2 = {_get_metadata(d)["external_id"] for d in data2}
+    assert guids_run2 == {"n1", "n3"}
+    assert "n2" not in guids_run2
