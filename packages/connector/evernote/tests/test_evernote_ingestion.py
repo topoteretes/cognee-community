@@ -26,6 +26,9 @@ class FakeEvernoteClient:
         self.update_count = update_count
         self.get_filtered_sync_chunk_calls = []
 
+    def get_user_id(self):
+        return 12345
+
     def get_sync_state(self):
         count = self.update_count
         if count is None and self.chunks:

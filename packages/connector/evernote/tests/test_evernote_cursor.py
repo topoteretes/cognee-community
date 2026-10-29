@@ -12,7 +12,6 @@ from evernote.edam.notestore.ttypes import SyncChunk, SyncState
 
 from cognee_community_connector_evernote import (
     EvernoteAuthError,
-    EvernoteError,
     EvernoteRateLimitError,
     evernote_source,
 )
@@ -42,6 +41,9 @@ class FakeCursorEvernoteClient:
             fullSyncBefore=0,
             updateCount=self.update_count,
         )
+
+    def get_user_id(self):
+        return 12345
 
     def get_filtered_sync_chunk(self, after_usn, max_entries, filter_obj):
         self.get_filtered_sync_chunk_calls.append((after_usn, max_entries, filter_obj))
@@ -362,18 +364,31 @@ def test_rate_limit_and_auth_error_leave_cursor_unchanged():
     assert state["last_usn"] == 40
 
 
-def test_server_update_count_less_than_last_usn_raises_evernote_error():
-    """When server updateCount < last_usn, raise EvernoteError indicating resync required."""
-    client = FakeCursorEvernoteClient(update_count=30)
-    state = {"last_usn": 50}
+def test_server_update_count_less_than_last_usn_triggers_full_resync():
+    """When server updateCount < last_usn, trigger a full resync starting from USN 0."""
+    chunk = SyncChunk(
+        chunkHighUSN=30,
+        updateCount=30,
+        notes=[SimpleNamespace(guid="n-resync", title="Resynced", active=True)],
+    )
+    client = FakeCursorEvernoteClient(chunks=[chunk], update_count=30)
+    state = {"last_usn": 50, "note_ids": ["n-old"]}
 
-    with pytest.raises(
-        EvernoteError, match="cursor is ahead of the server; a full resync is required"
-    ):
-        list(_sync_records(client, state))
+    rows = list(_sync_records(client, state))
 
-    # State untouched
-    assert state["last_usn"] == 50
+    # Calls get_filtered_sync_chunk with after_usn == 0 (from USN 0)
+    assert client.get_filtered_sync_chunk_calls[0][0] == 0
+    # Stale note from state["note_ids"] is tombstoned
+    tombstones = [r for r in rows if r.get("_deleted")]
+    assert len(tombstones) == 1
+    assert tombstones[0]["id"] == "n-old"
+    # Live note yielded as active row
+    active = [r for r in rows if not r.get("_deleted")]
+    assert len(active) == 1
+    assert active[0]["id"] == "n-resync"
+    # New last_usn is stored
+    assert state["last_usn"] == 30
+    assert state["note_ids"] == ["n-resync"]
 
 
 def test_dlt_pipeline_real_persistence_across_runs(tmp_path):

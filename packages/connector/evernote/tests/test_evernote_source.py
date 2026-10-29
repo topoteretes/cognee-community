@@ -29,6 +29,9 @@ class FakeEvernoteClient:
             return self.sync_state
         return SimpleNamespace(currentTime=1600000000000, updateCount=1000)
 
+    def get_user_id(self):
+        return 12345
+
     def get_filtered_sync_chunk(self, after_usn, max_entries, filter_obj):
         if self.chunks:
             return self.chunks.pop(0)
@@ -386,3 +389,24 @@ def test_empty_body_and_title_yields_tombstone():
     assert len(active) == 1
     assert active[0]["id"] == "n-titleonly"
     assert active[0]["content"] == "Just A Title"
+
+
+def test_trashed_note_not_in_state_still_yields_tombstone():
+    """A trashed note that was NOT previously ingested still yields a tombstone on first run."""
+    note_trashed = SimpleNamespace(
+        guid="n-new-trash", title="New Trashed Note", notebookGuid="nb-1", active=False
+    )
+    chunk = SyncChunk(
+        chunkHighUSN=10,
+        updateCount=10,
+        notes=[note_trashed],
+    )
+    client = FakeEvernoteClient(chunks=[chunk])
+
+    # First run: empty state, note was never in state["note_ids"]
+    source = evernote_source(token="tok", client=client)
+    rows = list(source)
+
+    assert len(rows) == 1
+    assert rows[0]["id"] == "n-new-trash"
+    assert rows[0]["_deleted"] is True

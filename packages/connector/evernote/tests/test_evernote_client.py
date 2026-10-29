@@ -27,13 +27,24 @@ from cognee_community_connector_evernote.evernote import EvernotePermissionError
 
 
 class FakeUserStore:
-    def __init__(self, note_store_url="https://fake.evernote.com/edam/note/shard"):
+    def __init__(self, note_store_url="https://fake.evernote.com/edam/note/shard", user_id=12345):
         self.note_store_url = note_store_url
+        self.user_id = user_id
         self.calls = []
+        self.get_user_side_effects = []
 
     def getUserUrls(self, token):
         self.calls.append(("getUserUrls", token))
         return type("UserUrls", (), {"noteStoreUrl": self.note_store_url})()
+
+    def getUser(self, token):
+        self.calls.append(("getUser", token))
+        if self.get_user_side_effects:
+            item = self.get_user_side_effects.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
+        return type("User", (), {"id": self.user_id})()
 
 
 class FakeNoteStore:
@@ -376,3 +387,32 @@ def test_evernote_source_builds_evernote_api_when_client_is_none():
     assert source.client.sandbox is True
     # Construction made no network calls:
     assert source.client._note_store_url is None
+
+
+def test_get_user_id_lazy_resolution_and_caching():
+    """get_user_id resolves lazily, injects token, and caches the result."""
+    user_store = FakeUserStore(user_id=9876)
+    api = EvernoteApi(token="my-token", user_store=user_store)
+
+    assert api._user_id is None
+    assert len(user_store.calls) == 0
+
+    # First call calls getUser(token)
+    uid = api.get_user_id()
+    assert uid == 9876
+    assert user_store.calls == [("getUser", "my-token")]
+
+    # Second call uses cache
+    uid2 = api.get_user_id()
+    assert uid2 == 9876
+    assert len(user_store.calls) == 1
+
+
+def test_get_user_id_error_mapping():
+    """getUser errors are mapped to appropriate EvernoteError subclasses."""
+    user_store = FakeUserStore()
+    user_store.get_user_side_effects = [EDAMUserException(errorCode=EDAMErrorCode.INVALID_AUTH)]
+    api = EvernoteApi(token="bad-token", user_store=user_store)
+
+    with pytest.raises(EvernoteAuthError):
+        api.get_user_id()

@@ -74,6 +74,7 @@ class EvernoteApi:
         self._user_store = user_store
         self._note_store = note_store
         self._note_store_url: str | None = None
+        self._user_id: int | None = None
 
     def __repr__(self) -> str:
         return f"EvernoteApi(sandbox={self.sandbox!r})"
@@ -107,6 +108,20 @@ class EvernoteApi:
         urls = self._call_with_retry(user_store.getUserUrls, self._token)
         self._note_store_url = str(urls.noteStoreUrl)
         return self._note_store_url
+
+    def get_user_id(self) -> int:
+        """Resolve and cache user ID lazily via UserStore.getUser(token)."""
+        if self._user_id is not None:
+            return self._user_id
+
+        user_store = self._user_store
+        if user_store is None:
+            user_store = self._create_user_store()
+            self._user_store = user_store
+
+        user = self._call_with_retry(user_store.getUser, self._token)
+        self._user_id = int(user.id)
+        return self._user_id
 
     def get_note_store(self) -> Any:
         """Return NoteStore client, creating it lazily on first access."""
@@ -394,6 +409,8 @@ def _sync_records(
     state: dict[str, Any],
     notebook_names: list[str] | None = None,
     tag_names: list[str] | None = None,
+    sandbox: bool = False,
+    full_resync: bool = False,
 ) -> Generator[Any, None, None]:
     """Execute the two-pass sync algorithm using the provided state dict.
 
@@ -401,34 +418,61 @@ def _sync_records(
     """
     log = get_logger("evernote_connector")
 
+    # Step 0: Account binding
+    user_id = api_client.get_user_id()
+    bind = f"{'sandbox' if sandbox else 'production'}:{user_id}"
+
+    if "account" in state and state["account"] != bind:
+        raise EvernoteError(
+            "this resource name is bound to a different Evernote account or environment; "
+            "use a different resource_name"
+        )
+
     # Step 1: Call api.get_sync_state() first and read after_usn
     sync_state = api_client.get_sync_state() if hasattr(api_client, "get_sync_state") else None
     current_sync_time = getattr(sync_state, "currentTime", None)
     server_update_count = getattr(sync_state, "updateCount", None)
+    full_sync_before = getattr(sync_state, "fullSyncBefore", None)
 
     has_last_usn = "last_usn" in state
-    after_usn = state.get("last_usn", 0)
+    last_usn = state.get("last_usn", 0)
+    last_sync_time = state.get("last_sync_time")
 
-    # Step 2: Server updateCount < last_usn means cursor is ahead of server
-    if has_last_usn and server_update_count is not None and server_update_count < state["last_usn"]:
-        raise EvernoteError("cursor is ahead of the server; a full resync is required")
+    # Step 2: Determine if this run is a FULL resync
+    is_full_resync = (
+        full_resync
+        or (
+            has_last_usn
+            and full_sync_before is not None
+            and last_sync_time is not None
+            and full_sync_before > last_sync_time
+        )
+        or (has_last_usn and server_update_count is not None and server_update_count < last_usn)
+    )
 
-    # Step 3: Server updateCount == last_usn means nothing changed on server
+    # Step 3: Server updateCount == last_usn means nothing changed on server (incremental only)
     if (
-        has_last_usn
+        not is_full_resync
+        and has_last_usn
         and server_update_count is not None
-        and server_update_count == state["last_usn"]
+        and server_update_count == last_usn
     ):
         if current_sync_time is not None:
             state["last_sync_time"] = int(current_sync_time)
-        elif "last_sync_time" not in state:
-            state["last_sync_time"] = 0
+        state["account"] = bind
         yield dlt.mark.materialize_table_schema()
         return
 
     # Step 4: Iterate sync chunks from after_usn, starting notebook/tag maps from state
-    notebook_map: dict[str, str] = dict(state.get("notebooks") or {})
-    tag_map: dict[str, str] = dict(state.get("tags") or {})
+    if is_full_resync or not has_last_usn:
+        after_usn = 0
+        notebook_map: dict[str, str] = {}
+        tag_map: dict[str, str] = {}
+    else:
+        after_usn = last_usn
+        notebook_map = dict(state.get("notebooks") or {})
+        tag_map = dict(state.get("tags") or {})
+
     note_meta: dict[str, Any] = {}
     expunged_guids: set[str] = set()
     highest_chunk_usn: int | None = None
@@ -450,6 +494,14 @@ def _sync_records(
         for guid in getattr(chunk, "expungedNotes", None) or []:
             expunged_guids.add(guid)
             note_meta.pop(guid, None)
+
+        # UNKNOWN: How Evernote reports notes inside an expunged notebook (whether their GUIDs
+        # are also included in chunk.expungedNotes, whether they are orphaned, or whether
+        # the notebook deletion cascades on the server). No behavior is invented here.
+        for nb_guid in getattr(chunk, "expungedNotebooks", None) or []:
+            notebook_map.pop(nb_guid, None)
+        for tag_guid in getattr(chunk, "expungedTags", None) or []:
+            tag_map.pop(tag_guid, None)
 
     # Validate requested notebook_names and tag_names against MERGED maps
     if notebook_names is not None:
@@ -476,58 +528,68 @@ def _sync_records(
         {g for g, n in tag_map.items() if n in set(tag_names)} if tag_names is not None else None
     )
 
+    def _is_live_and_in_scope(note: Any) -> bool:
+        if getattr(note, "active", True) is False or getattr(note, "deleted", None) is not None:
+            return False
+        if (
+            allowed_nb_guids is not None
+            and getattr(note, "notebookGuid", None) not in allowed_nb_guids
+        ):
+            return False
+        if allowed_tag_guids is not None:
+            note_tag_guids = set(getattr(note, "tagGuids", None) or [])
+            if not bool(note_tag_guids & allowed_tag_guids):
+                return False
+        return True
+
     # Pass 2: Emit tombstones and active in-scope notes
-    # 1. Expunged notes yield tombstones
+    # state["note_ids"] is used ONLY for:
+    #   (a) the full-resync stale-id reconciliation sweep below, and
+    #   (b) final bookkeeping (add yielded ids, discard tombstoned ids).
+    # Every tombstone case (trashed, expunged, out-of-scope, NoteNotFound,
+    # empty content+title) is emitted unconditionally — regardless of whether
+    # the id was previously ingested.
+    prior_note_ids: set[str] = set(state.get("note_ids") or [])
+
+    if is_full_resync:
+        # Deletion reconciliation: tombstone ids that were ingested before but
+        # are no longer present on server or live in-scope in this full snapshot.
+        live_in_scope_ids = {
+            guid for guid, note in note_meta.items() if _is_live_and_in_scope(note)
+        }
+        stale = prior_note_ids - live_in_scope_ids - set(note_meta.keys()) - expunged_guids
+        for stale_id in sorted(stale):
+            yield {"id": stale_id, "title": "", "content": "", "_deleted": True}
+            tombstoned_count += 1
+            updated_note_ids.discard(stale_id)
+
+    # 1. Expunged notes always yield tombstones
     for guid in sorted(expunged_guids):
         yield {"id": guid, "title": "", "content": "", "_deleted": True}
         tombstoned_count += 1
         updated_note_ids.discard(guid)
 
-    # 2. Iterate note metadata
+    # 2. Changed / snapshot note metadata
     for note in note_meta.values():
         guid = getattr(note, "guid", "")
-        # Check if trashed
-        is_trashed = (
-            getattr(note, "active", True) is False or getattr(note, "deleted", None) is not None
-        )
-        if is_trashed:
+        if not _is_live_and_in_scope(note):
             yield {"id": guid, "title": "", "content": "", "_deleted": True}
             tombstoned_count += 1
             updated_note_ids.discard(guid)
             continue
 
-        # Scope check
-        in_notebook_scope = (
-            allowed_nb_guids is None or getattr(note, "notebookGuid", None) in allowed_nb_guids
-        )
-        note_tag_guids = set(getattr(note, "tagGuids", None) or [])
-        in_tag_scope = allowed_tag_guids is None or bool(note_tag_guids & allowed_tag_guids)
-
-        if not (in_notebook_scope and in_tag_scope):
-            # Active note OUT of scope yields a tombstone
-            yield {"id": guid, "title": "", "content": "", "_deleted": True}
-            tombstoned_count += 1
-            updated_note_ids.discard(guid)
-            continue
-
-        # In-scope active note: fetch body
         try:
             enml = api_client.get_note_content(guid)
         except NoteNotFoundError:
-            # Note was removed between Pass 1 metadata collection and Pass 2 body fetch
             yield {"id": guid, "title": "", "content": "", "_deleted": True}
             tombstoned_count += 1
             updated_note_ids.discard(guid)
             continue
-        # Any other error propagates and aborts the whole run:
-        # partial staging must never be published to cognee memory.
 
         content_text = enml_to_text(enml)
         if not content_text:
             content_text = getattr(note, "title", "") or ""
         if not content_text:
-            # If content and title are both empty, yield a tombstone so a
-            # previously ingested version is removed from cognee.
             yield {"id": guid, "title": "", "content": "", "_deleted": True}
             tombstoned_count += 1
             updated_note_ids.discard(guid)
@@ -552,7 +614,7 @@ def _sync_records(
     if yielded_count == 0 and tombstoned_count == 0:
         yield dlt.mark.materialize_table_schema()
 
-    # Step 5: State is mutated ONLY after all rows and tombstones have been yielded
+    # Step 6: State is mutated ONLY after all rows and tombstones have been yielded
     # without error. Dlt persists resource state only when the run completes
     # successfully, ensuring that any mid-run failure (e.g. transport, auth,
     # rate-limit, or body fetch error) leaves the cursor and state untouched
@@ -564,12 +626,11 @@ def _sync_records(
 
     if current_sync_time is not None:
         state["last_sync_time"] = int(current_sync_time)
-    elif "last_sync_time" not in state:
-        state["last_sync_time"] = 0
 
     state["notebooks"] = notebook_map
     state["tags"] = tag_map
     state["note_ids"] = sorted(updated_note_ids)
+    state["account"] = bind
 
 
 def evernote_source(
@@ -579,6 +640,7 @@ def evernote_source(
     tag_names: list[str] | None = None,
     resource_name: str = "evernote_notes",
     client: Any = None,
+    full_resync: bool = False,
 ):
     """Create an Evernote dlt resource for cognee memory ingestion.
 
@@ -618,6 +680,8 @@ def evernote_source(
             state=state,
             notebook_names=notebook_names,
             tag_names=tag_names,
+            sandbox=sandbox,
+            full_resync=full_resync,
         )
 
     resource = records()
