@@ -1,5 +1,6 @@
 """Client tests: the Link paginator, auth, rate-limit pacing, retries and bad bodies."""
 
+import re
 import time
 
 import httpx
@@ -279,3 +280,28 @@ def test_a_repeating_page_cursor_is_an_error_not_an_endless_listing(fake):
     fake.stuck_cursor = True
     with pytest.raises(SentryAPIError, match="same page cursor twice"):
         sync(fake, {}, event_sample=0)
+
+
+def test_one_endpoints_spent_window_does_not_stall_another(fake):
+    """Sentry meters per endpoint: issue detail 5 a window, the listing 10.
+
+    Sharing one resume time across the client means spending the small detail budget
+    blocks the listing as well, and the run then stops with a message naming the wrong
+    endpoint.
+    """
+    fake.add_issue("i1")
+    fake.rate_limit = {
+        "X-Sentry-Rate-Limit-Remaining": "0",
+        "X-Sentry-Rate-Limit-Reset": str(int(time.time()) + 3600),
+    }
+    fake.rate_limit_path = "/issues/i1/"
+    sleeps: list[float] = []
+    client = client_for(fake, sleeps)
+
+    client.get(f"{sentry.API_ROOT}/issues/i1/")
+
+    # the issue-detail window is now spent for an hour; the listing must still answer
+    client.get(client.issues_path)
+    assert sleeps == [], "the listing has its own budget and waits for nothing"
+    with pytest.raises(SentryRateLimitedError, match=re.escape("/issues/{id}/")):
+        client.get(f"{sentry.API_ROOT}/issues/i1/")

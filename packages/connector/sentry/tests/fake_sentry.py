@@ -24,6 +24,7 @@ What it models:
 """
 
 import json
+import time
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -52,8 +53,23 @@ class FakeSentry:
         self.page_size = 100
         # responses served before the normal ones, e.g. 429s or 500s
         self.queued: list[httpx.Response] = []
-        # rate-limit headers added to every answer, when set
-        self.rate_limit: dict[str, str] = {}
+        # The live API sends these on *every* response (NOTES, 2026-10-28), so the
+        # default is a window with budget left: the header-parsing path then runs in
+        # every test instead of only in the ones that set up an exhausted window.
+        self.rate_limit: dict[str, str] = {
+            "X-Sentry-Rate-Limit-Remaining": "9",
+            "X-Sentry-Rate-Limit-Limit": "10",
+            "X-Sentry-Rate-Limit-Reset": str(int(time.time()) + 1),
+            "X-Sentry-Rate-Limit-ConcurrentRemaining": "24",
+            "X-Sentry-Rate-Limit-ConcurrentLimit": "25",
+        }
+        # when set, those headers go only on answers whose path ends with this, so a
+        # test can spend one endpoint's budget and leave the others alone
+        self.rate_limit_path: str | None = None
+        # {(issue id, slot): event} for the slots that answer with their own event;
+        # Sentry serves the same event for every slot on an issue with few events
+        self.slot_events: dict[tuple[str, str], dict] = {}
+        self._path = ""
 
     # -- fixtures ------------------------------------------------------------
 
@@ -134,8 +150,15 @@ class FakeSentry:
         self.add_event(issue_id)
         return issue
 
-    def add_event(self, issue_id: str, *, frames=None, kind="ValueError", value=None) -> dict:
-        """The event every ``events/{slot}/`` endpoint of this issue answers with."""
+    def add_event(
+        self, issue_id: str, *, frames=None, kind="ValueError", value=None, slot=None, event_id=None
+    ) -> dict:
+        """The event this issue's ``events/{slot}/`` endpoints answer with.
+
+        Without ``slot`` every slot answers with this one event, which is what Sentry
+        does for an issue with few events. With ``slot`` only that one does, so a test
+        can give the slots distinct events.
+        """
         frames = (
             frames
             if frames is not None
@@ -172,7 +195,7 @@ class FakeSentry:
         event = {
             "id": f"ev{issue_id}",
             "groupID": issue_id,
-            "eventID": "f" * 32,
+            "eventID": event_id or "f" * 32,
             "dateCreated": ago(1),
             "entries": [
                 {
@@ -192,7 +215,12 @@ class FakeSentry:
             ],
             "contexts": {"runtime": {"name": "CPython", "version": "3.12.3"}},
         }
-        self.events[issue_id] = event
+        if event_id:
+            event["id"] = event_id
+        if slot is None:
+            self.events[issue_id] = event
+        else:
+            self.slot_events[(issue_id, slot)] = event
         return event
 
     def delete_issue(self, issue_id: str) -> None:
@@ -219,6 +247,7 @@ class FakeSentry:
         path = request.url.path
         params = dict(request.url.params)
         self.calls.append((request.method, path, params))
+        self._path = path
         if self.queued:
             return self.queued.pop(0)
         if request.headers.get("authorization") != f"Bearer {self.valid_token}":
@@ -279,7 +308,7 @@ class FakeSentry:
     def _event(self, issue_id: str, slot: str) -> httpx.Response:
         if slot not in ("recommended", "latest", "oldest"):
             return self._json(404, {"detail": "The requested resource does not exist"})
-        event = self.events.get(issue_id)
+        event = self.slot_events.get((issue_id, slot)) or self.events.get(issue_id)
         if event is None or issue_id not in self.issues:
             return self._json(404, {"detail": "The requested resource does not exist"})
         return self._json(200, event)
@@ -313,7 +342,11 @@ class FakeSentry:
             content=json.dumps(body),
             headers={
                 "Content-Type": "application/json",
-                **self.rate_limit,
+                **(
+                    self.rate_limit
+                    if self.rate_limit_path is None or self._path.endswith(self.rate_limit_path)
+                    else {}
+                ),
                 **(headers or {}),
             },
         )

@@ -25,6 +25,7 @@ import httpx
 from cognee.shared.logging_utils import get_logger
 from cognee.tasks.ingestion import dlt_utils
 from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR, NODE_SET_COLUMN
+from dlt.common.normalizers.naming.snake_case import NamingConvention
 
 logger = get_logger("sentry_connector")
 
@@ -64,12 +65,10 @@ _RETRY_GIVEN_UP_DAYS = 7
 # window) is re-checked this often instead of on every run
 _AGED_RECHECK_DAYS = 7
 # longest resource_name accepted: dlt turns it into a table name, and the shortest
-# identifier limit among cognee's destinations (Postgres) is 63 characters
+# identifier limit among cognee's destinations (Postgres) is 63 characters. dlt appends
+# "__<child>" for nested tables, so this bounds the root table's name, not every
+# identifier derived from it
 _MAX_RESOURCE_NAME = 63
-# default event retention of Sentry's free plan (30 days); only used to explain the
-# "aged out" marking in logs and to size the recheck, never to delete anything
-DEFAULT_RETENTION_DAYS = 30
-# per-user / graph fields that change without changing what the document says
 # Fields that move on their own without changing what the document says, so they must
 # not bypass the fast skip. The ones below were taken from a live organization's issue
 # payload (2026-10-28) on top of the documented ones; anything rendered into a document
@@ -108,7 +107,13 @@ _MISSING_DETAIL = "the requested resource does not exist"
 _FRACTION = re.compile(r"\.(\d+)")
 # the id in /api/0/issues/<id>/..., for messages and logs
 _ID_SEGMENT = re.compile(r"(/api/0/issues)/[^/]+")
+# the slot in .../events/<recommended|latest|oldest>/; the three share one rate-limit
+# budget, so they share one window key
+_EVENT_SLOT_SEGMENT = re.compile(r"(/events)/[^/]+")
 _LINK_PART = re.compile(r'(\w+)="([^"]*)"')
+# Sentry's statsPeriod is a count and a unit, e.g. "24h", "14d"; anything else comes
+# back as an opaque HTTP 400 naming the endpoint rather than the argument
+_STATS_PERIOD = re.compile(r"^\d+[smhdw]$")
 
 
 class SentrySourceError(RuntimeError):
@@ -165,12 +170,21 @@ class SentryClient:
         # never reused under the same resource_name
         self.identity = _identity(self.base_url, org_slug)
         self._http = http or httpx.Client(timeout=_TIMEOUT)
+        # only a client this object made is this object's to close
+        self._owns_http = http is None
         self._sleep = sleep
-        # epoch second this caller's rate-limit window resets, when it is used up
-        self._resume_at = 0.0
+        # {window key: epoch second that window resets}, for the windows that are used
+        # up. Sentry's budgets are per endpoint, so one number for the whole client
+        # would let a spent issue-detail budget stall the listing as well
+        self._resume_at: dict[str, float] = {}
 
     def __repr__(self) -> str:
         return f"SentryClient(base_url={self.base_url!r}, org_slug={self.org_slug!r})"
+
+    def close(self) -> None:
+        """Release the connection pool. A caller-supplied client is left alone."""
+        if self._owns_http:
+            self._http.close()
 
     @property
     def issues_path(self) -> str:
@@ -182,10 +196,10 @@ class SentryClient:
 
     def get(self, path: str, params: dict[str, Any] | None = None) -> Any:
         """GET ``path`` and return its parsed JSON body."""
-        body, _ = self.get_page(path, params)
+        body, _ = self._get_page(path, params)
         return body
 
-    def get_page(self, path: str, params: dict[str, Any] | None = None) -> tuple[Any, str | None]:
+    def _get_page(self, path: str, params: dict[str, Any] | None = None) -> tuple[Any, str | None]:
         """GET ``path`` and return ``(body, next cursor)``.
 
         The cursor is ``None`` on the last page: see :func:`next_cursor`.
@@ -203,7 +217,7 @@ class SentryClient:
         be read as "the organization has no issues" (which would check every stored
         issue for deletion).
         """
-        body, cursor = self.get_page(path, params)
+        body, cursor = self._get_page(path, params)
         if not isinstance(body, list):
             raise SentryAPIError(f"Sentry sent a listing that is not a JSON array for {path}")
         if any(not isinstance(record, dict) for record in body):
@@ -241,10 +255,10 @@ class SentryClient:
                 if failures < _RETRIES:
                     self._sleep(2 ** (failures - 1))
                     continue
-            self._note_window(response)
+            self._note_window(response, path)
             return response
 
-    def _note_window(self, response: httpx.Response) -> None:
+    def _note_window(self, response: httpx.Response, path: str) -> None:
         """Remember when a used-up rate-limit window resets.
 
         Sentry's rate limits are per caller and per endpoint, and an internal
@@ -255,11 +269,15 @@ class SentryClient:
         """
         remaining = _header_number(response, "x-sentry-rate-limit-remaining")
         if remaining is not None and remaining <= 0:
-            self._resume_at = max(self._resume_at, time.time() + _reset_delay(response))
+            key = _window_key(path)
+            self._resume_at[key] = max(
+                self._resume_at.get(key, 0.0), time.time() + _reset_delay(response)
+            )
 
     def _wait_for_window(self, path: str) -> None:
-        """Wait out a used-up window, or cut the run short if that takes too long."""
-        delay = self._resume_at - time.time()
+        """Wait out this endpoint's used-up window, or cut the run short if it is long."""
+        key = _window_key(path)
+        delay = self._resume_at.get(key, 0.0) - time.time()
         if delay <= 0:
             return
         if delay > _MAX_WAIT:
@@ -267,9 +285,13 @@ class SentryClient:
                 f"Sentry's rate limit for {_endpoint(path)} resets in {delay:.0f}s, "
                 f"more than the {_MAX_WAIT:.0f}s this run may wait"
             )
-        logger.info("Sentry rate limit used up; waiting %.0fs for the window to reset.", delay)
+        logger.info(
+            "Sentry rate limit for %s used up; waiting %.0fs for the window to reset.",
+            _endpoint(path),
+            delay,
+        )
         self._sleep(delay)
-        self._resume_at = 0.0
+        self._resume_at.pop(key, None)
 
     @staticmethod
     def _parse(response: httpx.Response, path: str) -> Any:
@@ -281,7 +303,7 @@ class SentryClient:
             raise SentryAuthError(f"Sentry refused {endpoint} (HTTP 401); check the auth token")
         if status == 403:
             raise SentryAccessError(
-                f"Sentry refused {endpoint} (HTTP 403); the token needs {', '.join(SCOPES)}"
+                f"Sentry refused {endpoint} (HTTP 403); the token needs {_scope_for(path)}"
             )
         if status == 404:
             if _resource_missing(response):
@@ -319,6 +341,24 @@ def _endpoint(path: str) -> str:
     return _ID_SEGMENT.sub(r"\1/{id}", path)
 
 
+def _scope_for(path: str) -> str:
+    """The scope Sentry's reference lists for ``path``, to name in a 403.
+
+    Naming all three would leave the user to guess which one is missing.
+    """
+    return "project:read" if path.endswith("/projects/") else "event:read"
+
+
+def _window_key(path: str) -> str:
+    """The endpoint whose rate-limit budget ``path`` draws on.
+
+    Sentry meters per endpoint, and measured on a live organization the three per-issue
+    event slots share one budget (15 a window) while the issue detail has its own (5)
+    and the organization listing its own (10).
+    """
+    return _EVENT_SLOT_SEGMENT.sub(r"\1/{slot}", _endpoint(path))
+
+
 def _detail(response: httpx.Response) -> str:
     """Sentry's error body is ``{"detail": "..."}`` (sometimes ``{"detail": {...}}``)."""
     try:
@@ -338,8 +378,14 @@ def _resource_missing(response: httpx.Response) -> bool:
 
     A dead token answers 401, not 404, so this cannot be confused with revoked access;
     any 404 body that does not say this raises instead of deleting anything.
+
+    Matched against the whole detail rather than as a substring. Sentry sends no error
+    code, so this text is the only signal a tombstone can rest on, and a 404 that merely
+    *mentions* a missing resource - one naming a project, a filter or a sub-resource that
+    is gone while the issue is not - must not be read as "this issue was deleted".
     """
-    return _MISSING_DETAIL in _detail(response).strip().lower()
+    detail = _detail(response).strip().lower().rstrip(".")
+    return detail == _MISSING_DETAIL
 
 
 def next_cursor(link_header: str | None) -> str | None:
@@ -420,6 +466,10 @@ _MAX_TITLE = 500
 _MAX_CULPRIT = 300
 _MAX_MESSAGE = 2000
 _MAX_FRAME_LINE = 300
+# A stack deeper than this is not a document any more. Sentry itself keeps at most a few
+# hundred frames an event, and the point of the sample is a readable trace, so the cap is
+# an order of magnitude above the default rather than a guess at Sentry's own limit.
+MAX_FRAMES_LIMIT = 50
 
 
 def render_issue(issue: dict, samples: list[str] | None = None, *, aged: bool = False) -> dict:
@@ -567,7 +617,10 @@ def event_lines(event: dict, slot: str, *, max_frames: int = MAX_FRAMES) -> list
         )
         frames = [_frame_line(frame, bool(in_app)) for frame in chosen]
         if frames:
-            break  # the first exception with a stack trace is the one that was raised
+            # The first value that carries a stack trace. Sentry does not document the
+            # order of chained exceptions and nothing in the recorded responses pins it,
+            # so this is "a trace from this event", not "the one that was raised".
+            break
     if not header and not frames:
         return []
     lines = [f"Event sample ({slot}): {header}" if header else f"Event sample ({slot})"]
@@ -712,6 +765,9 @@ class _Walker:
         self.confirmed: dict[str, dict] = {}
         self.failed: list[str] = state.setdefault("recheck_failed", [])
         # {issue id: [failed reads in a row, time of the last one]}
+        # {"<issue id>|<step>": [count, last run]}: the two reads an issue can fail are
+        # counted apart, because giving up on its event sample must not also stop the
+        # by-id read that is the only thing able to notice it was deleted
         self.attempts: dict[str, list] = state.setdefault("attempts", {})
 
     # -- requests ----------------------------------------------------------
@@ -879,6 +935,7 @@ class _Walker:
         if reusable and stored is not None:
             return list(stored["sample"]), stored.get("sample_seen")
         lines: list[str] = []
+        seen_events: set[str] = set()
         for slot in _EVENT_SLOTS[: self.event_sample]:
             path = f"{API_ROOT}/issues/{issue['id']}/events/{slot}/"
             try:
@@ -888,13 +945,22 @@ class _Walker:
                 continue
             if not isinstance(event, dict):
                 raise SentryAPIError(f"Sentry sent a non-object event for {_endpoint(path)}")
+            # the slots overlap: on an issue with few events "recommended", "latest" and
+            # "oldest" are often the same event, and rendering it once per slot would put
+            # the same trace in the document two or three times
+            event_id = _text(event.get("id")) or _text(event.get("eventID"))
+            if event_id and event_id in seen_events:
+                continue
+            if event_id:
+                seen_events.add(event_id)
             lines.extend(event_lines(event, slot, max_frames=self.max_frames))
         return lines, last_seen
 
     def _tombstone(self, row_id: str) -> dict:
         self.rows.pop(row_id, None)
         self.aged.pop(row_id, None)
-        self.attempts.pop(_issue_id(row_id), None)
+        for key in (f"{_issue_id(row_id)}|{step}" for step in ("listing", "refresh")):
+            self.attempts.pop(key, None)
         self.stats["deleted"] += 1
         return {"id": row_id, "_deleted": True}
 
@@ -928,7 +994,7 @@ class _Walker:
                     walk["seen"].append(row_id)
                 # back in the listing: not aged out any more
                 self.aged.pop(row_id, None)
-                row = self._guarded(_text(issue["id"]), self._process, issue)
+                row = self._guarded(_text(issue["id"]), "listing", self._process, issue)
                 if row is not None:
                     yield row
         self._close_walk(seen)
@@ -1009,27 +1075,38 @@ class _Walker:
             row = (
                 None
                 if skip
-                else self._guarded(issue_id, self._refresh, issue_id, confirm_only=confirm_only)
+                else self._guarded(
+                    issue_id, "refresh", self._refresh, issue_id, confirm_only=confirm_only
+                )
             )
             self.recheck.pop(0)
             self.queued.discard(issue_id)
             if row is not None:
                 yield row
 
-    def _guarded(self, issue_id: str, step: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    def _guarded(
+        self,
+        issue_id: str,
+        step_name: str,
+        step: Callable[..., Any],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
         """Run one issue's step; an API error on it is retried next run, not fatal.
 
         A refused token (:class:`SentryAuthError`) and a rate limit still stop the run:
-        neither is about one issue.
+        neither is about one issue. ``step_name`` separates the give-up counters of the
+        listing read and the by-id read, so one failing read never silences the other.
         """
+        counter = f"{issue_id}|{step_name}"
         try:
             result = step(*args, **kwargs)
         except SentryAPIError as exc:
             # an outage (5xx, network) says nothing about the issue, so only errors
             # about this issue (403, an unrecognised 404) count toward giving up
             if not isinstance(exc, SentryUnavailableError):
-                attempts = self.attempts.get(issue_id, [0, None])[0] + 1
-                self.attempts[issue_id] = [attempts, self.run_start]
+                attempts = self.attempts.get(counter, [0, None])[0] + 1
+                self.attempts[counter] = [attempts, self.run_start]
                 if attempts >= _MAX_ATTEMPTS:
                     # an error that never clears: stop re-reading it by id (a listing
                     # that returns it still tries); a failed read never deletes
@@ -1044,12 +1121,12 @@ class _Walker:
                 self.failed.append(issue_id)
             logger.warning("Sentry failed on one issue, retried next run: %s", exc)
             return None
-        self.attempts.pop(issue_id, None)
+        self.attempts.pop(counter, None)
         return result
 
     def _given_up(self, issue_id: str) -> bool:
-        """Given up on, and re-read less than a week ago."""
-        count, last = self.attempts.get(issue_id, [0, None])
+        """Given up on the by-id read, and re-read less than a week ago."""
+        count, last = self.attempts.get(f"{issue_id}|refresh", [0, None])
         if count < _MAX_ATTEMPTS:
             return False
         retry_from = _parse_time(self.run_start) - timedelta(days=_RETRY_GIVEN_UP_DAYS)
@@ -1120,7 +1197,22 @@ def _iter_rows(
     except _CutShortError as cut:
         stats["failed"] = max(1, stats.get("failed", 0))
         stats[f"failed_{cut.reason}"] = 1
-        logger.warning("Sentry sync stopped early (%s); it resumes on the next run.", cut.reason)
+        stats["completed"] = False
+        # error, not warning: the load succeeds, so this line and the stats are the only
+        # places a cut-short run is visible at all
+        logger.error(
+            "Sentry sync stopped early (%s) and did not finish; it resumes on the next run.",
+            cut.reason,
+        )
+    except (SentryAuthError, SentryAccessError):
+        # recorded as well as raised: the raise is what keeps dlt from committing, but a
+        # host that holds the stats dict can then tell a refused token from any other
+        # failure without parsing the message
+        stats["failed"] = max(1, stats.get("failed", 0))
+        stats["failed_auth"] = 1
+        raise
+    else:
+        stats["completed"] = True
 
 
 # ---------------------------------------------------------------------------
@@ -1174,15 +1266,31 @@ def sentry_source(
     Returns:
         A ``dlt`` resource configured with ``primary_key="id"``,
         ``write_disposition="merge"`` and a ``_deleted`` hard-delete column.
+
+    A run stopped early by ``max_requests`` or by a rate-limit wait longer than
+    ``_MAX_WAIT`` **returns normally** rather than raising: the rows it read are kept
+    and the next run resumes. That is only visible in ``cognee_sync_stats``, which then
+    carries ``failed_budget`` or ``failed_rate_limit`` and a non-zero ``failed``, so a
+    caller that needs to know whether a sync completed has to read them. Errors that
+    are not about one issue - a refused token, a malformed listing, an outage - raise,
+    and dlt then commits neither rows nor state.
     """
     import dlt
 
-    if getattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 0) < 2:
-        raise RuntimeError("Sentry sync requires cognee>=1.6.4 (per-row node sets).")
+    found = getattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 0)
+    if found < 2:
+        raise RuntimeError(
+            f"Sentry sync needs cognee's document sync version 2 or later (cognee 1.6.4+), "
+            f"for per-row node sets; this cognee reports {found}."
+        )
     if not 0 <= event_sample <= MAX_EVENT_SAMPLE:
         raise ValueError(f"event_sample must be between 0 and {MAX_EVENT_SAMPLE}")
-    if max_frames < 1:
-        raise ValueError("max_frames must be at least 1")
+    if not 1 <= max_frames <= MAX_FRAMES_LIMIT:
+        # without a ceiling the caller can undo the bound on the document (and on the
+        # sample cached in dlt state) just by asking for more frames
+        raise ValueError(f"max_frames must be between 1 and {MAX_FRAMES_LIMIT}")
+    if stats_period is not None and not _STATS_PERIOD.match(_text(stats_period)):
+        raise ValueError('stats_period must be a count and a unit, e.g. "24h" or "14d", or None')
     if max_requests < 3:
         # a listing page, an event read and a deletion check must fit, or a run stalls
         raise ValueError("max_requests must be at least 3")
@@ -1203,12 +1311,28 @@ def sentry_source(
             # dlt derives table and state keys from it; keep it short enough to stay
             # readable in the destination's identifiers
             raise ValueError(f"resource_name must be at most {_MAX_RESOURCE_NAME} characters")
-    # built here so a missing token fails at construction, and the closure holds no secret
-    client = service
-    if client is None:
-        client = SentryClient(auth_token or "", org_slug=org_slug or "", host=host)
+        if NamingConvention().normalize_table_identifier(resource_name) != resource_name:
+            # state is kept under the name as given while rows go to the normalized
+            # table, so "Sentry_A" and "sentry-a" would share one table and keep two
+            # separate states - each run then tombstones what the other just wrote
+            raise ValueError("resource_name must be lowercase snake_case (letters, digits, _)")
+    if service is None:
+        # fail here rather than on the first row, while the same checks the client makes
+        # stay in one place
+        if not auth_token:
+            raise ValueError(
+                "sentry_source needs auth_token (an internal integration or user token), "
+                "or a prepared client in service="
+            )
+        if not _text(org_slug):
+            raise ValueError("sentry_source needs org_slug, the organization to sync")
+
+    def _client() -> Any:
+        """A client per run, so its connection pool does not outlive the run."""
+        return SentryClient(auth_token or "", org_slug=org_slug or "", host=host)
+
     name = resource_name or _default_resource_name(
-        getattr(client, "org_slug", org_slug), project_slugs
+        getattr(service, "org_slug", org_slug), project_slugs
     )
     stats: dict[str, int] = {}
 
@@ -1223,19 +1347,27 @@ def sentry_source(
     )
     def sentry_issues():
         stats.clear()
-        stats.update(scanned=0, skipped=0, deleted=0, failed=0, aged=0)
-        rows = _iter_rows(
-            client,
-            dlt.current.resource_state(),
-            stats,
-            project_slugs=project_slugs,
-            event_sample=event_sample,
-            max_frames=max_frames,
-            stats_period=stats_period,
-            max_requests=max_requests,
-            check_active=check_active,
-        )
-        yield from dlt_utils.guarded_rows(rows, check_active)
+        # completed starts False so a run that dies mid-stream never reads as finished
+        stats.update(scanned=0, skipped=0, deleted=0, failed=0, aged=0, completed=False)
+        client = service if service is not None else _client()
+        try:
+            rows = _iter_rows(
+                client,
+                dlt.current.resource_state(),
+                stats,
+                project_slugs=project_slugs,
+                event_sample=event_sample,
+                max_frames=max_frames,
+                stats_period=stats_period,
+                max_requests=max_requests,
+                check_active=check_active,
+            )
+            yield from dlt_utils.guarded_rows(rows, check_active)
+        finally:
+            # a run that raised still has to give its sockets back; an injected client
+            # belongs to the caller (the tests), so it is left open
+            if service is None:
+                client.close()
 
     resource = sentry_issues()
     setattr(resource, DOCUMENT_SOURCE_ATTR, "sentry")

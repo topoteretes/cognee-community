@@ -56,7 +56,12 @@ async def main() -> None:
         write_disposition="merge",
         self_improvement=False,  # no enrichment pass on every scheduled sync
     )
-    print("Sync stats:", source.cognee_sync_stats)
+    stats = source.cognee_sync_stats
+    print("Sync stats:", stats)
+    if not stats.get("completed"):
+        # a run stopped by the request budget or a long rate-limit wait still succeeds,
+        # so a caller that cares has to look here
+        print("This run did not finish; the next one resumes where it stopped.")
 
     answer = await cognee.search(
         query_text="Which parts of the codebase fail most often, and what is still unresolved?",

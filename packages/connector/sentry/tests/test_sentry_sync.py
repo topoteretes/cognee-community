@@ -5,6 +5,8 @@ a delete, a merge, an issue aging out of retention) and checks the rows the conn
 yields and the state it keeps for the next run.
 """
 
+import copy
+
 import httpx
 import pytest
 from cognee.tasks.ingestion.dlt_utils import PIPELINE_SCOPE_ATTR, document_source_tag
@@ -18,10 +20,11 @@ from fake_sentry import (
     sync,
 )
 
-from cognee_community_connector_sentry import sentry_source
+from cognee_community_connector_sentry import sentry, sentry_source
 from cognee_community_connector_sentry.sentry import (
     MAX_EVENT_SAMPLE,
     SentryAuthError,
+    SentryClient,
     _iter_rows,
     event_lines,
     render_issue,
@@ -99,9 +102,18 @@ def test_a_trace_with_no_in_app_frames_falls_back_to_the_innermost_ones(fake):
 
 
 def test_breadcrumbs_and_contexts_are_never_ingested(fake):
-    event = fake.events["i1"] if "i1" in fake.events else fake.add_event("i1")
-    rendered = "\n".join(event_lines(event, "recommended"))
-    assert "noise" not in rendered and "CPython" not in rendered
+    """Asserted on the whole synced document, not on the renderer that cannot see them.
+
+    That is where the promise matters: breadcrumbs and contexts are where both the
+    volume and most of the PII live, and the fake serves 50 breadcrumbs per event.
+    """
+    fake.add_issue("i1")
+
+    upserts, _, _ = sync(fake, {}, event_sample=1)
+
+    document = upserts["issue:i1"]["content"]
+    assert "noise" not in document, "breadcrumbs reached the document"
+    assert "CPython" not in document, "contexts reached the document"
 
 
 def test_an_event_without_an_exception_entry_renders_nothing(fake):
@@ -342,7 +354,8 @@ def test_a_revoked_token_forgets_nothing(fake):
     state: dict = {}
     client = client_for(fake)
     sync(fake, state, client=client)
-    rows_before = dict(state["rows"])
+    # deep, or an in-place edit of a per-row dict during the failed run would pass
+    rows_before = copy.deepcopy(state["rows"])
 
     fake.delete_issue("i1")  # i1 really is gone, so a check would tombstone it
     fake.valid_token = "rotated-in-sentry"  # the client still holds the old one
@@ -390,14 +403,22 @@ def test_an_issue_that_keeps_failing_is_given_up_on_not_deleted(fake):
     del fake.issues["i1"]
 
     undo = serve(fake, "/issues/i1/", 403, b'{"detail": "no"}')
+    abandoned = 0
     try:
         for _ in range(6):
-            _, deletes, _ = sync(fake, state)
+            _, deletes, stats = sync(fake, state)
             assert not deletes
+            abandoned += stats.get("abandoned", 0)
+        reads_at_give_up = len([call for call in fake.calls if call[1].endswith("/issues/i1/")])
+        # a seventh run must not read it again: it is given up on for a week
+        sync(fake, state)
+        reads_after = len([call for call in fake.calls if call[1].endswith("/issues/i1/")])
     finally:
         undo()
 
-    assert state["attempts"]["i1"][0] >= 5
+    assert state["attempts"]["i1|refresh"][0] >= 5
+    assert abandoned == 1, "giving up is announced once, not every run"
+    assert reads_after == reads_at_give_up, "a given-up issue is not re-read for a week"
     assert "issue:i1" in state["rows"], "a document is kept when its issue cannot be read"
 
 
@@ -435,7 +456,8 @@ def test_issues_that_leave_the_selection_are_forgotten(fake):
     assert set(state["rows"]) == {"issue:i1"}
 
 
-def test_a_changed_selection_re_renders_the_documents_it_keeps(fake):
+def test_a_changed_event_sample_re_renders_the_documents_it_keeps(fake):
+    """``event_sample`` changes what a document says, so the kept ones are rewritten."""
     fake.add_issue("i1")
     state: dict = {}
     sync(fake, state, event_sample=1)
@@ -487,8 +509,11 @@ def test_bad_arguments_are_refused_up_front(fake):
         sentry_source(auth_token="t", org_slug="o", max_requests=1)
     with pytest.raises(ValueError, match="project_slugs"):
         sentry_source(auth_token="t", org_slug="o", project_slugs=[])
-    with pytest.raises(ValueError, match="auth token"):
+    with pytest.raises(ValueError, match="auth_token"):
         sentry_source(auth_token="", org_slug="o")
+    # a name dlt would rename writes rows to one table while keeping two states
+    with pytest.raises(ValueError, match="snake_case"):
+        sentry_source(auth_token="t", org_slug="o", resource_name="Sentry-A")
 
 
 def test_a_renamed_project_does_not_forget_its_live_issues(fake):
@@ -716,3 +741,131 @@ def test_changing_the_selection_under_the_default_name_changes_the_scope(fake):
 
     assert both.name != narrowed.name, "two selections never share state"
     assert pinned.name == pinned_wider.name == "sentry_fix", "a fixed name spans the change"
+
+
+def test_the_same_event_is_not_put_in_the_document_three_times(fake):
+    """``recommended``, ``latest`` and ``oldest`` overlap on a quiet issue.
+
+    Sentry answers all three with the same event when an issue has few events, so
+    rendering per slot would repeat one trace two or three times - and cache it that
+    way in dlt state.
+    """
+    fake.add_issue("i1")
+
+    upserts, _, _ = sync(fake, {}, event_sample=3)
+
+    document = upserts["issue:i1"]["content"]
+    assert document.count("Event sample") == 1, document
+    # the culprit line also names the function, so count the rendered frame itself
+    assert document.count("in handle_request (app/views.py:42)") == 1, document
+
+
+def test_distinct_events_per_slot_are_all_rendered(fake):
+    """The de-duplication must key on the event, not drop every slot after the first."""
+    fake.add_issue("i1")
+    fake.add_event("i1", slot="latest", event_id="ev-latest", value="a later failure")
+    fake.add_event("i1", slot="oldest", event_id="ev-oldest", value="the first failure")
+
+    upserts, _, _ = sync(fake, {}, event_sample=3)
+
+    document = upserts["issue:i1"]["content"]
+    assert document.count("Event sample") == 3, document
+    assert "a later failure" in document and "the first failure" in document
+
+
+def test_max_frames_cannot_be_raised_until_the_document_is_unbounded(fake):
+    from cognee_community_connector_sentry.sentry import MAX_FRAMES_LIMIT
+
+    with pytest.raises(ValueError, match="max_frames"):
+        sentry_source(auth_token="t", org_slug="o", max_frames=MAX_FRAMES_LIMIT + 1)
+    with pytest.raises(ValueError, match="max_frames"):
+        sentry_source(auth_token="t", org_slug="o", max_frames=0)
+
+
+def test_a_malformed_stats_period_is_refused_by_name(fake):
+    """Otherwise it comes back as an opaque HTTP 400 naming the endpoint."""
+    with pytest.raises(ValueError, match="stats_period"):
+        sentry_source(auth_token="t", org_slug="o", stats_period="two weeks")
+    sentry_source(auth_token="t", org_slug="o", stats_period="14d")
+
+
+def test_giving_up_on_an_event_read_does_not_disable_the_deletion_check(fake):
+    """The two reads an issue can fail are counted apart.
+
+    One counter would mean an issue whose event sample keeps 403ing is eventually
+    skipped by the by-id pass too - and that pass is the only thing that can notice the
+    issue was deleted.
+    """
+    fake.add_issue("i1")
+    state: dict = {}
+    sync(fake, state, event_sample=1)
+    undo = serve(fake, "/events/recommended/", 403, b'{"detail": "no"}')
+    for run in range(6):
+        fake.issues["i1"]["lastSeen"] = ago(0.1 * (6 - run))
+        sync(fake, state, event_sample=1)
+    undo()
+    assert state["attempts"]["i1|listing"][0] >= 5, "the event read was given up on"
+
+    del fake.issues["i1"]
+    _, deletes, _ = sync(fake, state, event_sample=1)
+
+    assert deletes == {"issue:i1"}, "the deletion check must still run"
+
+
+def test_the_same_issue_in_a_different_field_order_is_not_rewritten(fake):
+    """Sentry gives no order guarantee for a JSON object's keys.
+
+    The input key and the fingerprint are both hashed from the payload, so hashing it
+    in the order it arrived would rewrite every document whenever the API reshuffled.
+    """
+    fake.add_issue("i1")
+    state: dict = {}
+    sync(fake, state, event_sample=1)
+    before = dict(state["rows"]["issue:i1"])
+
+    issue = fake.issues["i1"]
+    fake.issues["i1"] = dict(reversed(list(issue.items())))
+
+    upserts, deletes, stats = sync(fake, state, event_sample=1)
+
+    assert upserts == {} and deletes == set(), "reordering the payload changes nothing"
+    assert stats["skipped"] == 1
+    assert state["rows"]["issue:i1"] == before
+
+
+def test_a_client_only_closes_the_pool_it_made(fake):
+    """An injected client belongs to the caller; the tests reuse theirs across runs."""
+    injected = fake.client()
+    borrowed = SentryClient(fake.valid_token, org_slug=fake.org, http=injected)
+
+    borrowed.close()
+
+    assert not injected.is_closed, "a caller's client must survive being handed over"
+    owned = SentryClient(fake.valid_token, org_slug=fake.org)
+    owned.close()
+    assert owned._http.is_closed
+
+
+def test_the_resource_closes_the_client_it_made(fake, monkeypatch, tmp_path):
+    """A scheduled sync builds a source per load; an unclosed pool leaks every time."""
+    import dlt
+
+    closed: list[str] = []
+
+    def build(token, *, org_slug, host):
+        client = SentryClient(token, org_slug=org_slug, host=host, http=fake.client())
+        monkeypatch.setattr(client, "close", lambda: closed.append("closed"))
+        return client
+
+    fake.add_issue("i1")
+    monkeypatch.setattr(sentry, "SentryClient", build)
+    pipeline = dlt.pipeline(
+        pipeline_name="sentry_close_test",
+        destination=dlt.destinations.sqlalchemy(f"sqlite:///{(tmp_path / 'close.db').as_posix()}"),
+        dataset_name="sentry_close_ds",
+        pipelines_dir=str(tmp_path / "state"),
+    )
+
+    pipeline.run(sentry_source(auth_token=fake.valid_token, org_slug=fake.org))
+
+    assert closed == ["closed"], "the client the source made must be closed when the run ends"

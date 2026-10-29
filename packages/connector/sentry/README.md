@@ -63,11 +63,11 @@ See `examples/example.py` for the full flow, including a `GRAPH_COMPLETION` sear
 | `auth_token` | required | internal integration token, or a user auth token |
 | `org_slug` | required | the organization to sync |
 | `host` | `sentry.io` | data region host, or a self-hosted base URL |
-| `resource_name` | `sentry_<org slug>`, plus a selection suffix when `project_slugs` is set | scopes sync state and cleanup; one per organization |
+| `resource_name` | `sentry_<org slug>`, plus a selection suffix when `project_slugs` is set | scopes sync state and cleanup; one per organization. Must be lowercase snake_case: dlt normalizes a table name, so `Sentry_A` and `sentry-a` would write to one table while keeping two states |
 | `project_slugs` | all readable | only sync these projects |
-| `event_sample` | 1 | events sampled per issue for the stack trace (0–3) |
-| `max_frames` | 5 | in-app frames kept per sampled event |
-| `stats_period` | none sent | `statsPeriod` for the listing, e.g. `"14d"` |
+| `event_sample` | 1 | events sampled per issue for the stack trace (0–3); a slot repeating an event already sampled is skipped |
+| `max_frames` | 5 | in-app frames kept per sampled event (1–50, so the document stays bounded) |
+| `stats_period` | none sent | `statsPeriod` for the listing, a count and a unit, e.g. `"14d"` |
 | `max_requests` | 2000 | reads one run may make (a read retried through an outage counts once); a big backfill finishes over several runs |
 
 Changing `event_sample` or `max_frames` re-renders every document on the next run,
@@ -110,7 +110,13 @@ are used and marked as such. Breadcrumbs, request bodies, contexts and tags are 
 ingested: that is where both the volume and most of the PII live.
 
 Each document carries the node sets `sentry:project:<slug>` and `sentry:level:<level>`, so
-a search can be scoped to one project or to errors only.
+a search can be scoped to one project or to errors only. There is deliberately **no node
+set per issue**: the count of `NodeSet` nodes is bounded by the organization's projects
+times Sentry's six levels, not by the number of issues, so a 50,000-issue organization
+still has a handful of them and `recall(node_name="sentry:project:backend-api")` stays a
+real filter rather than a per-record lookup. The project node set uses the project *slug*,
+which a rename changes — after one, issues move to the new node set and the old one is
+left empty (the sync itself is unaffected, because the selection is matched on project id).
 
 ## How sync works
 
@@ -177,7 +183,9 @@ organization that drops a few thousand issues at once spends the checks over sev
 
 The client reads `X-Sentry-Rate-Limit-Remaining` and waits for `X-Sentry-Rate-Limit-Reset`
 (an epoch second, confirmed live) once the window's budget is used up, and backs off to the
-same header on a 429. A wait longer than 60 seconds cuts the run short instead of blocking
+same header on a 429. Those waits are tracked **per endpoint**, matching how Sentry meters:
+spending the issue-detail budget of 5 does not stall the listing, which has its own 10. The
+three event slots share one key, because they share one budget. A wait longer than 60 seconds cuts the run short instead of blocking
 cognee's dlt worker; the next run resumes at the listing page it was reading.
 
 **Pagination** reads Sentry's `Link` header. Sentry always sends a `rel="next"` link, on
@@ -198,10 +206,17 @@ small `httpx` one (about 200 lines), in the style of cognee's other `httpx` conn
 `source.cognee_sync_stats` holds the counts of the last run, as plain ints: `scanned` (issues
 read from the listing), `skipped` (unchanged, no document rewritten), `deleted` (tombstoned),
 `failed` (issues that failed on their own error) and `aged` (issues outside the listing window
-that Sentry still serves). `abandoned` appears once an issue has been given up on, and
-`failed_budget` or `failed_rate_limit` appears when the run stopped early for that reason —
-with `failed` forced to at least 1, so a run that did not finish is never silently a success.
-Read these if you need to know whether a sync completed.
+that Sentry still serves). `completed` is the one key that is not a count: `True` only when the run read the whole
+listing and drained its deletion checks. `abandoned` appears once an issue has been given up
+on; `failed_budget` or `failed_rate_limit` appears when the run stopped early for that reason,
+and `failed_auth` when a refused token ended it.
+
+**A run stopped by the request budget or by a rate-limit wait longer than 60 seconds returns
+normally**, keeping what it read — `cognee.remember(...)` succeeds, and only `completed` and
+the `failed_*` keys say otherwise. A caller that needs to know whether a sync finished has to
+read them; `examples/example.py` shows the check. Errors that are not about one issue (a
+refused token, a malformed listing, an outage) raise instead, and dlt then commits neither
+rows nor state.
 
 ### Limitations
 
@@ -213,7 +228,10 @@ Read these if you need to know whether a sync completed.
   reference); the `project_slugs` filter costs one extra request per run to resolve slugs to
   ids (`project:read`), and then sends them as repeated `project=<id>` params.
 - Sync state keeps a fingerprint, `lastSeen` and the rendered sample lines (at most
-  `max_frames` short lines) per issue, rewritten on every load.
+  `max_frames` short lines) per issue, rewritten on every load. A backfill that spans
+  several runs also keeps the ids listed so far, so that a resumed listing knows what it
+  has seen; on a very large organization that list is the biggest thing in the state until
+  the listing completes and it is dropped.
 - **The event sample is capped at 3, and defaults to 1.** The connector samples only
   Sentry's three fixed per-issue event slots — `events/recommended/`, `events/latest/` and
   `events/oldest/` — because those are stable between runs; a paged walk of an issue's
@@ -240,6 +258,32 @@ Read these if you need to know whether a sync completed.
   and unresolved — there is no delete event — so they could not drive forget-on-delete,
   and sync is pull-based.
 
+## Verified against a real organization vs. taken from the docs
+
+Everything in `tests/fake_sentry.py` is shaped by responses recorded from a live
+organization on 2026-10-28, and the sync itself was run against it on 2026-10-29.
+
+**Measured on the live API:** that the default listing hides resolved issues while
+`?query=` does not; that resolving an issue leaves `lastSeen` untouched; that `count`
+arrives as a *string*; that archiving gives `status: ignored` with an `archived_*`
+substatus; that `DELETE` answers 202 and a later `GET` answers 404 with
+`{"detail": "The requested resource does not exist"}` — the same body an id that never
+existed gets; that a merged-away id answers **200 with the survivor's `id`**, not a 404
+or a 302; that a bad token answers 401 `{"detail": "Invalid token"}` on both the listing
+and the detail, never an empty list; that `Link` carries `rel="next"` on every page and
+marks the end with `results="false"`; that `X-Sentry-Rate-Limit-Reset` is an epoch
+second; that the per-endpoint budgets are 10 (listing), 5 (issue detail) and 15 (event
+detail) with the window advancing about a second per call; and that the listing accepts
+the repeated numeric `project=` filter after slugs are resolved to ids.
+
+**Taken from Sentry's documentation and reasoning, not reproduced:** the scopes listed
+under Setup; the retention window of each plan; and, the one that matters, that an issue
+whose events have aged out drops from the listing while `GET /issues/{id}/` still answers
+200. Reproducing that last one means waiting out 30 days on a live organization. The
+connector is built so that if the inference is wrong the failure mode is a stale
+document, never a wrongly forgotten one — a missing issue is always re-read by id, and
+only a confirmed 404 or a merge redirect tombstones it.
+
 ## Testing
 
 ```bash
@@ -247,5 +291,6 @@ uv run pytest tests/
 ```
 
 No network or LLM key needed; the fake API in `tests/fake_sentry.py` serves Sentry's
-response shapes, and `tests/test_sentry_forget.py` runs the cognee pipeline end to end
-with a mocked LLM.
+response shapes, `tests/test_sentry_dlt.py` drives a real dlt pipeline,
+`tests/test_sentry_forget.py` runs the cognee pipeline end to end with a mocked LLM, and
+`tests/test_sentry_example.py` runs `examples/example.py` against the fake.
