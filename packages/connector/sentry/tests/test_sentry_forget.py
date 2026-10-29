@@ -11,6 +11,7 @@ import pytest
 from cognee.infrastructure.databases.graph import get_graph_engine
 from cognee.modules.data.methods import get_dataset_data, get_datasets_by_name
 from cognee.modules.users.methods import get_default_user
+from cognee.tasks.ingestion.exceptions.exceptions import DLTIngestionError
 from fake_sentry import FakeSentry, ago
 
 from cognee_community_connector_sentry import SentryClient, sentry_source
@@ -62,8 +63,11 @@ async def test_forgotten_issues_leave_the_graph(mocked_llm):
 
     # a failing API must not forget anything
     fake.queued = [httpx.Response(500, content=b"{}")] * 10
-    with pytest.raises(Exception):  # noqa: B017 - cognee wraps the source error
+    # cognee wraps dlt's PipelineStepFailed in its own error; naming it is the point,
+    # so this cannot pass on an unrelated failure
+    with pytest.raises(DLTIngestionError) as failure:
         await _sync(fake)
+    assert "sentry" in str(failure.value).lower()
     fake.queued = []
     assert await _graph_has("Alphacorp")
 

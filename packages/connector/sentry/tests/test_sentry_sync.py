@@ -527,7 +527,11 @@ def test_a_renamed_project_does_not_forget_its_live_issues(fake):
     upserts, _, _ = sync(fake, state, project_slugs=["backend-api"], event_sample=0)
     assert set(upserts) == {"issue:i1"}
 
-    # the project keeps its id but is renamed upstream; the listing still returns it
+    # a real rename moves the slug in BOTH places: the issue payload and the projects
+    # listing the slug is resolved through. Renaming only the issue leaves a state the
+    # API cannot produce, which is what this test used to assert against.
+    project_id = fake.projects.pop("backend-api")
+    fake.projects["backend-api-renamed"] = project_id
     fake.issues["i1"]["project"]["slug"] = "backend-api-renamed"
 
     upserts, deletes, _ = sync(fake, state, project_slugs=["backend-api"], event_sample=0)
@@ -869,3 +873,82 @@ def test_the_resource_closes_the_client_it_made(fake, monkeypatch, tmp_path):
     pipeline.run(sentry_source(auth_token=fake.valid_token, org_slug=fake.org))
 
     assert closed == ["closed"], "the client the source made must be closed when the run ends"
+
+
+def test_a_404_before_the_listing_does_not_tombstone_an_issue_the_listing_returns(fake):
+    """The pass before the listing may conclude nothing on its own - not even a delete.
+
+    ``DELETE`` is asynchronous, so there is a window where the detail endpoint 404s while
+    the listing still returns the issue. Tombstoning from the early pass put a delete and
+    an upsert for one primary key in a single load, with no ``dedup_sort`` hint, so dlt
+    was free to keep the delete - and because the row's stored fingerprint was then the
+    fresh one, no later run would ever emit it again. A live issue, silently gone.
+    """
+    fake.add_issue("i1", last_seen=ago(1))
+    state: dict = {}
+    sync(fake, state)
+    # a cut-short run left i1 queued for a by-id check
+    state["recheck"] = ["i1"]
+    undo = serve(fake, "/issues/i1/", 404, b'{"detail": "The requested resource does not exist"}')
+    try:
+        rows = list(_iter_rows(client_for(fake), state, {}))
+    finally:
+        undo()
+
+    ids = [(row["id"], row["_deleted"]) for row in rows]
+    assert ids == [], f"the listing still returns i1, so nothing may be emitted: {ids}"
+    assert "issue:i1" in state["rows"], "and the issue stays in memory"
+
+
+def test_a_404_before_the_listing_still_forgets_an_issue_the_listing_drops(fake):
+    """The other half: the early pass records what is gone, the late pass acts on it."""
+    fake.add_issue("i1", last_seen=ago(1))
+    fake.add_issue("i2", last_seen=ago(1))
+    state: dict = {}
+    sync(fake, state)
+    state["recheck"] = ["i1"]
+    fake.delete_issue("i1")  # gone from the listing and 404ing on the detail
+
+    upserts, deletes, _ = sync(fake, state)
+
+    assert deletes == {"issue:i1"}, "a genuinely deleted issue is still forgotten"
+    assert "issue:i1" not in state["rows"]
+    assert upserts == {}, "and i2 is unchanged"
+
+
+def test_a_404_that_only_mentions_a_missing_resource_is_not_a_delete(fake):
+    """The tombstone rests on the whole detail, not a substring of it.
+
+    Sentry sends no error code, so this text is the only signal. A 404 about a missing
+    project, filter or sub-resource can contain the same sentence while the issue itself
+    is alive, and reading that as "deleted" would forget live data.
+    """
+    fake.add_issue("i1", last_seen=ago(1))
+    state: dict = {}
+    sync(fake, state)
+    fake.age_out("i1")  # out of the listing, so the by-id check runs
+    # this really does contain the missing-resource sentence, which is the point: a
+    # substring match tombstones on it, an equality match does not
+    body = (
+        b'{"detail": "The requested resource does not exist for the project you '
+        b'filtered on; the issue was not checked"}'
+    )
+    undo = serve(fake, "/issues/i1/", 404, body)
+    try:
+        # an error about one issue is counted and retried next run, never fatal and
+        # never a delete
+        _, deletes, stats = sync(fake, state)
+    finally:
+        undo()
+
+    assert deletes == set(), "an unrecognised 404 never deletes"
+    assert stats["failed"] == 1, "it is counted, so the run is not silently a success"
+    assert "issue:i1" in state["rows"], "and the document is kept"
+
+
+def test_a_project_slug_that_never_resolved_is_still_an_error(fake):
+    """A rename is survivable; a typo is not, or the whole organization gets synced."""
+    fake.add_issue("i1", project="backend-api")
+
+    with pytest.raises(Exception, match="has no project"):
+        sync(fake, {}, project_slugs=["nosuchproject"], event_sample=0)

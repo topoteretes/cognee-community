@@ -305,3 +305,31 @@ def test_one_endpoints_spent_window_does_not_stall_another(fake):
     assert sleeps == [], "the listing has its own budget and waits for nothing"
     with pytest.raises(SentryRateLimitedError, match=re.escape("/issues/{id}/")):
         client.get(f"{sentry.API_ROOT}/issues/i1/")
+
+
+def test_many_short_rate_limit_waits_cannot_hold_the_run_for_hours(fake):
+    """Each wait is capped at 60s, but nothing stopped them accumulating.
+
+    Measured before the fix: a 41-request run slept 2,273s (38 minutes) across 39 waits,
+    scaling linearly with ``max_requests`` - about 32 hours at the default of 2,000, all
+    of it while cognee holds its process-wide dlt staging lock. That lock is the reason
+    the per-wait cap exists, so the run needs a total budget too.
+    """
+    for n in range(40):
+        fake.add_issue(f"i{n}", last_seen=ago(n + 1))
+    # every answer says the window is spent and resets in 58s, just under the per-wait cap
+    fake.rate_limit = {
+        "X-Sentry-Rate-Limit-Remaining": "0",
+        "X-Sentry-Rate-Limit-Reset": str(int(time.time()) + 58),
+    }
+    sleeps: list[float] = []
+    state: dict = {}
+
+    # event_sample=1 so each issue costs an event request, and each request a wait
+    _, deletes, stats = sync(fake, state, sleeps, event_sample=1)
+
+    assert not deletes, "a rate-limited run must forget nothing"
+    assert stats["failed_rate_limit"] == 1, "it stops cleanly and resumes next run"
+    assert sum(sleeps) <= sentry._MAX_TOTAL_WAIT, (
+        f"the run slept {sum(sleeps):.0f}s, over the {sentry._MAX_TOTAL_WAIT:.0f}s budget"
+    )

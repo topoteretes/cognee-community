@@ -116,7 +116,11 @@ times Sentry's six levels, not by the number of issues, so a 50,000-issue organi
 still has a handful of them and `recall(node_name="sentry:project:backend-api")` stays a
 real filter rather than a per-record lookup. The project node set uses the project *slug*,
 which a rename changes — after one, issues move to the new node set and the old one is
-left empty (the sync itself is unaffected, because the selection is matched on project id).
+left empty. The sync itself survives a rename: the selection is matched on project **id**,
+and when a selected slug stops resolving the last id it resolved to is reused, with a
+warning asking you to update `project_slugs`. A slug that never resolved is still an
+error, since syncing the whole organization instead would ingest projects you did not ask
+for.
 
 ## How sync works
 
@@ -186,7 +190,9 @@ The client reads `X-Sentry-Rate-Limit-Remaining` and waits for `X-Sentry-Rate-Li
 same header on a 429. Those waits are tracked **per endpoint**, matching how Sentry meters:
 spending the issue-detail budget of 5 does not stall the listing, which has its own 10. The
 three event slots share one key, because they share one budget. A wait longer than 60 seconds cuts the run short instead of blocking
-cognee's dlt worker; the next run resumes at the listing page it was reading.
+cognee's dlt worker, and so does a run whose waits add up past 300 seconds — one short
+wait per request would otherwise still hold that worker for hours. Either way the next
+run resumes at the listing page it was reading.
 
 **Pagination** reads Sentry's `Link` header. Sentry always sends a `rel="next"` link, on
 every page including the last, and marks the end of a listing with `results="false"` on it.
@@ -207,7 +213,8 @@ small `httpx` one (about 200 lines), in the style of cognee's other `httpx` conn
 read from the listing), `skipped` (unchanged, no document rewritten), `deleted` (tombstoned),
 `failed` (issues that failed on their own error) and `aged` (issues outside the listing window
 that Sentry still serves). `completed` is the one key that is not a count: `True` only when the run read the whole
-listing and drained its deletion checks. `abandoned` appears once an issue has been given up
+listing and drained its deletion checks. It is always present and starts `False`, so a run
+that died part way through never reads as finished. `abandoned` appears once an issue has been given up
 on; `failed_budget` or `failed_rate_limit` appears when the run stopped early for that reason,
 and `failed_auth` when a refused token ended it.
 
@@ -275,6 +282,11 @@ marks the end with `results="false"`; that `X-Sentry-Rate-Limit-Reset` is an epo
 second; that the per-endpoint budgets are 10 (listing), 5 (issue detail) and 15 (event
 detail) with the window advancing about a second per call; and that the listing accepts
 the repeated numeric `project=` filter after slugs are resolved to ids.
+
+One caveat on how that was measured: the 2026-10-28 recordings went through the
+*organization-scoped* `/organizations/{org}/issues/{id}/` path, while this connector calls
+the unscoped `/api/0/issues/{id}/`. Both were re-probed on 2026-10-29: the 404 body is
+byte-identical and the unscoped detail reports the same budget of 5 per window.
 
 **Taken from Sentry's documentation and reasoning, not reproduced:** the scopes listed
 under Setup; the retention window of each plan; and, the one that matters, that an issue

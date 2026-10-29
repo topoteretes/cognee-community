@@ -34,7 +34,6 @@ DEFAULT_HOST = "sentry.io"
 API_ROOT = "/api/0"
 # read-only scopes an internal integration needs: the org and project listings,
 # the issue listing, and the sampled event
-SCOPES = ("org:read", "project:read", "event:read")
 # the largest ``limit`` the issues endpoint accepts (API reference: "<= 100")
 PAGE_SIZE = 100
 # only three event endpoints are documented per issue (recommended/latest/oldest),
@@ -99,10 +98,12 @@ _NOISE_FIELDS = (
     "lifetime",
     "sessionCount",
 )
-# Sentry's 404 body for a resource that is not there. Recorded 2026-10-28 against both
-# a deleted issue and an id that never existed, on the org-scoped and the unscoped
-# path: {"detail": "The requested resource does not exist"}. Sentry sends no error code
-# with it, so the message is the only signal; any other 404 body keeps the document.
+# Sentry's 404 body for a resource that is not there: {"detail": "The requested
+# resource does not exist"}. Recorded 2026-10-28 against a deleted issue and an id that
+# never existed on the org-scoped path, and 2026-10-29 against a never-existing id on
+# the unscoped /api/0/issues/<id>/ path this client actually calls - byte-identical.
+# Sentry sends no error code with it, so the message is the only signal, and it is
+# matched whole: any other 404 body keeps the document.
 _MISSING_DETAIL = "the requested resource does not exist"
 _FRACTION = re.compile(r"\.(\d+)")
 # the id in /api/0/issues/<id>/..., for messages and logs
@@ -113,7 +114,7 @@ _EVENT_SLOT_SEGMENT = re.compile(r"(/events)/[^/]+")
 _LINK_PART = re.compile(r'(\w+)="([^"]*)"')
 # Sentry's statsPeriod is a count and a unit, e.g. "24h", "14d"; anything else comes
 # back as an opaque HTTP 400 naming the endpoint rather than the argument
-_STATS_PERIOD = re.compile(r"^\d+[smhdw]$")
+_STATS_PERIOD = re.compile(r"^[1-9]\d*[smhdw]$")
 
 
 class SentrySourceError(RuntimeError):
@@ -173,6 +174,11 @@ class SentryClient:
         # only a client this object made is this object's to close
         self._owns_http = http is None
         self._sleep = sleep
+        # seconds this client has already spent waiting in this run. Each wait is capped
+        # at _MAX_WAIT, but nothing stopped them accumulating: a run with a spent window
+        # on every request slept 38 minutes over 39 waits while cognee held its
+        # process-wide dlt staging lock, which is the thing the per-wait cap exists for
+        self._slept = 0.0
         # {window key: epoch second that window resets}, for the windows that are used
         # up. Sentry's budgets are per endpoint, so one number for the whole client
         # would let a spent issue-detail budget stall the listing as well
@@ -241,22 +247,38 @@ class SentryClient:
                     raise SentryUnavailableError(
                         f"Sentry could not be reached for {_endpoint(path)}"
                     ) from exc
-                self._sleep(2 ** (failures - 1))
+                self._pause(2 ** (failures - 1), path)
                 continue
             if response.status_code == 429:
                 waits += 1
                 delay = _rate_limit_wait(response)
                 if waits > _RATE_LIMIT_WAITS or delay > _MAX_WAIT:
                     raise SentryRateLimitedError(f"Sentry kept rate limiting {_endpoint(path)}")
-                self._sleep(delay)
+                self._pause(delay, path)
                 continue
             if response.status_code >= 500:
                 failures += 1
                 if failures < _RETRIES:
-                    self._sleep(2 ** (failures - 1))
+                    self._pause(2 ** (failures - 1), path)
                     continue
             self._note_window(response, path)
             return response
+
+    def _pause(self, delay: float, path: str) -> None:
+        """Sleep, keeping the run's total wait inside ``_MAX_TOTAL_WAIT``.
+
+        Each wait is already short; without a running total a run could still spend
+        hours asleep in many short waits, holding cognee's process-wide dlt staging
+        lock. Past the budget the run stops cleanly and resumes next time.
+        """
+        if self._slept + delay > _MAX_TOTAL_WAIT:
+            raise SentryRateLimitedError(
+                f"Sentry rate limiting has cost this run {self._slept:.0f}s already and "
+                f"{_endpoint(path)} wants {delay:.0f}s more, over the "
+                f"{_MAX_TOTAL_WAIT:.0f}s budget; the run stops and resumes next time"
+            )
+        self._slept += delay
+        self._sleep(delay)
 
     def _note_window(self, response: httpx.Response, path: str) -> None:
         """Remember when a used-up rate-limit window resets.
@@ -290,7 +312,7 @@ class SentryClient:
             _endpoint(path),
             delay,
         )
-        self._sleep(delay)
+        self._pause(delay, path)
         self._resume_at.pop(key, None)
 
     @staticmethod
@@ -466,6 +488,10 @@ _MAX_TITLE = 500
 _MAX_CULPRIT = 300
 _MAX_MESSAGE = 2000
 _MAX_FRAME_LINE = 300
+# total seconds one run may spend waiting out rate-limit windows. The per-wait cap keeps
+# any single wait short; this keeps a run of many short waits from holding cognee's dlt
+# staging lock for hours. Past it the run stops cleanly and resumes next time.
+_MAX_TOTAL_WAIT = 300.0
 # A stack deeper than this is not a document any more. Sentry itself keeps at most a few
 # hundred frames an event, and the point of the sample is a readable trace, so the cap is
 # an order of magnitude above the default rather than a guess at Sentry's own limit.
@@ -555,7 +581,11 @@ def _clipped(text: str, limit: int) -> str:
     """
     if len(text) <= limit:
         return text
-    return text[:limit].rstrip() + f"… [{len(text) - limit} more characters]"
+    # the marker counts toward the limit, or "bounded at 500" quietly meant 523
+    dropped = len(text) - limit
+    marker = f"… [{dropped} more characters]"
+    kept = max(0, limit - len(marker))
+    return text[:kept].rstrip() + marker
 
 
 def _metadata_value(issue: dict) -> str:
@@ -740,6 +770,8 @@ class _Walker:
         self.stats = stats
         for key in ("scanned", "skipped", "deleted", "failed", "aged"):
             stats.setdefault(key, 0)
+        # False until a run finishes, so a caller never reads a crashed run as complete
+        stats.setdefault("completed", False)
         self.project_slugs = sorted(set(project_slugs or []))
         self.event_sample = event_sample
         self.max_frames = max_frames
@@ -763,8 +795,12 @@ class _Walker:
         # {row id: issue body} for the by-id reads of this run, so the confirm-only
         # pass before the listing never costs the pass after it a second request
         self.confirmed: dict[str, dict] = {}
+        # row ids the confirm-only pass found gone (a 404, or a merge redirect). It may
+        # not tombstone them itself: the listing may still return the issue, and a
+        # tombstone plus an upsert for one primary key in one load lets dlt keep either
+        self.gone: set[str] = set()
         self.failed: list[str] = state.setdefault("recheck_failed", [])
-        # {issue id: [failed reads in a row, time of the last one]}
+        # {"<issue id>|<step>": [failed reads in a row, time of the last one]}
         # {"<issue id>|<step>": [count, last run]}: the two reads an issue can fail are
         # counted apart, because giving up on its event sample must not also stop the
         # by-id read that is the only thing able to notice it was deleted
@@ -824,24 +860,44 @@ class _Walker:
     def _project_ids(self) -> list[int]:
         """The numeric ids of the selected project slugs (the listing filters by id).
 
-        Resolved once per run, and only when slugs are given; an unknown slug is an
-        error, because silently syncing the whole organization instead would ingest
-        projects the caller did not ask for.
+        Resolved once per run, and only when slugs are given. A slug that resolved on an
+        earlier run and no longer does has almost certainly been **renamed**: the id is
+        what the listing filters on and the id survives a rename, so the last known id is
+        used and the run carries on. Raising instead would fail every later run, and a
+        project rename nobody told the caller about would stop the sync for good.
+
+        A slug that has *never* resolved is still an error: syncing the whole
+        organization instead would ingest projects the caller did not ask for.
         """
         if not self.project_slugs:
             return []
+        known: dict[str, int] = {
+            slug: int(pid) for slug, pid in self.state.get("project_ids", {}).items()
+        }
         found: dict[str, int] = {}
         for page in self._pages(self.client.projects_path, {}):
             for project in page:
                 slug = _text(project.get("slug"))
                 if slug in self.project_slugs and project.get("id") is not None:
                     found[slug] = int(project["id"])
-        missing = [slug for slug in self.project_slugs if slug not in found]
-        if missing:
+        unresolved = [slug for slug in self.project_slugs if slug not in found]
+        renamed = [slug for slug in unresolved if slug in known]
+        never = [slug for slug in unresolved if slug not in known]
+        if never:
             raise SentrySourceError(
                 f"Sentry organization {self.client.org_slug!r} has no project(s) "
-                f"{', '.join(missing)}; check project_slugs and the token's project:read scope"
+                f"{', '.join(never)}; check project_slugs and the token's project:read scope"
             )
+        for slug in renamed:
+            logger.warning(
+                "Sentry no longer lists a project with slug %r; it was most likely "
+                "renamed, so its last known id (%s) is still being synced. Update "
+                "project_slugs to the new slug.",
+                slug,
+                known[slug],
+            )
+            found[slug] = known[slug]
+        self.state["project_ids"] = {slug: found[slug] for slug in self.project_slugs}
         return [found[slug] for slug in self.project_slugs]
 
     def _in_scope(self, issue: dict) -> bool:
@@ -1037,9 +1093,17 @@ class _Walker:
         rows for one primary key in one load, with the stale one free to win.
         """
         row_id = _row_id(issue_id)
+        if not confirm_only and row_id in self.gone:
+            # the pass before the listing already read this id as gone, and a complete
+            # listing has since failed to return it, so the tombstone is now safe - and
+            # needs no second request
+            return self._tombstone(row_id) if row_id in self.rows else None
         try:
             issue = self.confirmed.get(row_id) or self._get(f"{API_ROOT}/issues/{issue_id}/")
         except SentryNotFoundError:
+            if confirm_only:
+                self.gone.add(row_id)
+                return None
             return self._tombstone(row_id) if row_id in self.rows else None
         if not isinstance(issue, dict) or not issue.get("id"):
             raise SentryAPIError(f"Sentry sent no issue for /api/0/issues/{{id}}/ ({issue_id})")
@@ -1049,6 +1113,9 @@ class _Walker:
                 issue_id,
                 issue["id"],
             )
+            if confirm_only:
+                self.gone.add(row_id)
+                return None
             return self._tombstone(row_id) if row_id in self.rows else None
         if row_id not in self.rows:
             return None

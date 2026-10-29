@@ -9,6 +9,7 @@ import json
 import dlt
 import httpx
 import pytest
+from dlt.pipeline.exceptions import PipelineStepFailed
 from fake_sentry import FakeSentry, ago
 
 from cognee_community_connector_sentry import SentryClient, sentry_source
@@ -55,8 +56,11 @@ def test_failed_run_commits_neither_rows_nor_state(tmp_path):
 
     fake.delete_issue("i1")
     fake.queued = [httpx.Response(500, content=b"{}")] * 10
-    with pytest.raises(Exception):  # noqa: B017 - dlt wraps the source error
+    with pytest.raises(PipelineStepFailed) as failure:
         pipeline.run(source(fake))
+    # name the wrapper and its cause, so this cannot pass on an unrelated failure
+    assert isinstance(failure.value.__cause__, Exception)
+    assert "sentry" in str(failure.value).lower()
 
     assert resource_state(pipeline, table) == before
     assert staged_ids(pipeline, table) == {"issue:i1", "issue:i2"}
