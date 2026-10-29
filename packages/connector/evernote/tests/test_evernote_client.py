@@ -4,6 +4,8 @@ All tests run offline using fake Thrift clients — no real network and no
 real credentials required.
 """
 
+from unittest.mock import MagicMock, patch
+
 import pytest
 from evernote.edam.error.ttypes import (
     EDAMErrorCode,
@@ -21,6 +23,7 @@ from cognee_community_connector_evernote import (
     NoteNotFoundError,
     evernote_source,
 )
+from cognee_community_connector_evernote.evernote import EvernotePermissionError
 
 
 class FakeUserStore:
@@ -174,6 +177,46 @@ def test_rate_limit_gives_up_after_max_retries():
     assert sleep_calls == [15.0, 15.0]
 
 
+def test_rate_limit_exceeding_max_wait_raises_without_sleeping():
+    """Rate-limiting error exceeding max_rate_limit_wait raises immediately without sleeping."""
+    sleep_calls = []
+    user_store = FakeUserStore()
+    note_store = FakeNoteStore()
+    rate_limit_error = EDAMSystemException(
+        errorCode=EDAMErrorCode.RATE_LIMIT_REACHED,
+        rateLimitDuration=500,
+    )
+    note_store.sync_state_side_effects = [rate_limit_error]
+
+    api = EvernoteApi(
+        token="my-token",
+        user_store=user_store,
+        note_store=note_store,
+        sleep_fn=sleep_calls.append,
+        max_rate_limit_wait=300,
+    )
+
+    with pytest.raises(EvernoteRateLimitError, match=r"500s.*exceeds maximum allowed wait.*300s"):
+        api.get_sync_state()
+
+    assert len(sleep_calls) == 0
+
+
+def test_transport_timeout_is_configured():
+    """THttpClient transport is configured with timeout_seconds * 1000 ms."""
+    api = EvernoteApi(token="my-token", timeout_seconds=45)
+    with patch("cognee_community_connector_evernote.evernote.THttpClient") as mock_thttp:
+        mock_instance = MagicMock()
+        mock_thttp.return_value = mock_instance
+
+        api._create_user_store()
+        mock_instance.setTimeout.assert_called_once_with(45000)
+
+        mock_instance.reset_mock()
+        api._create_note_store("https://evernote.com/shard/s1/notestore")
+        mock_instance.setTimeout.assert_called_once_with(45000)
+
+
 def test_transient_transport_error_retries_with_backoff():
     """Transient transport errors retry with exponential backoff before raising."""
     sleep_calls = []
@@ -223,11 +266,10 @@ def test_transient_transport_error_exhaustion():
     [
         EDAMErrorCode.INVALID_AUTH,
         EDAMErrorCode.AUTH_EXPIRED,
-        EDAMErrorCode.PERMISSION_DENIED,
     ],
 )
 def test_auth_errors_map_to_evernote_auth_error(error_code):
-    """Auth-related EDAMUserExceptions are mapped to EvernoteAuthError."""
+    """Auth-related EDAMUserExceptions (INVALID_AUTH, AUTH_EXPIRED) map to EvernoteAuthError."""
     user_store = FakeUserStore()
     note_store = FakeNoteStore()
     note_store.sync_state_side_effects = [
@@ -237,6 +279,22 @@ def test_auth_errors_map_to_evernote_auth_error(error_code):
     api = EvernoteApi(token="test-token", user_store=user_store, note_store=note_store)
 
     with pytest.raises(EvernoteAuthError, match="Evernote authentication failed"):
+        api.get_sync_state()
+
+
+def test_permission_denied_maps_to_evernote_permission_error():
+    """PERMISSION_DENIED EDAMUserException maps to EvernotePermissionError."""
+    user_store = FakeUserStore()
+    note_store = FakeNoteStore()
+    note_store.sync_state_side_effects = [
+        EDAMUserException(
+            errorCode=EDAMErrorCode.PERMISSION_DENIED, parameter="authenticationToken"
+        )
+    ]
+
+    api = EvernoteApi(token="test-token", user_store=user_store, note_store=note_store)
+
+    with pytest.raises(EvernotePermissionError, match="Evernote permission denied"):
         api.get_sync_state()
 
 
@@ -277,14 +335,25 @@ def test_token_never_appears_in_str_or_repr_of_raised_errors():
     assert sensitive_token not in str(exc_info.value)
     assert sensitive_token not in repr(exc_info.value)
 
-    # 2. NoteNotFoundError
+    # 2. EvernotePermissionError
+    note_store.sync_state_side_effects = [
+        EDAMUserException(
+            errorCode=EDAMErrorCode.PERMISSION_DENIED, parameter="authenticationToken"
+        )
+    ]
+    with pytest.raises(EvernotePermissionError) as exc_info:
+        api.get_sync_state()
+    assert sensitive_token not in str(exc_info.value)
+    assert sensitive_token not in repr(exc_info.value)
+
+    # 3. NoteNotFoundError
     note_store.note_content_side_effects = [EDAMNotFoundException(identifier="Note.guid", key="g1")]
     with pytest.raises(NoteNotFoundError) as exc_info:
         api.get_note_content("g1")
     assert sensitive_token not in str(exc_info.value)
     assert sensitive_token not in repr(exc_info.value)
 
-    # 3. EvernoteRateLimitError
+    # 4. EvernoteRateLimitError
     note_store.sync_state_side_effects = [
         EDAMSystemException(errorCode=EDAMErrorCode.RATE_LIMIT_REACHED, rateLimitDuration=5),
         EDAMSystemException(errorCode=EDAMErrorCode.RATE_LIMIT_REACHED, rateLimitDuration=5),
@@ -294,7 +363,7 @@ def test_token_never_appears_in_str_or_repr_of_raised_errors():
     assert sensitive_token not in str(exc_info.value)
     assert sensitive_token not in repr(exc_info.value)
 
-    # 4. EvernoteApi repr
+    # 5. EvernoteApi repr
     assert sensitive_token not in repr(api)
     assert sensitive_token not in str(api)
 
@@ -303,7 +372,7 @@ def test_evernote_source_builds_evernote_api_when_client_is_none():
     """evernote_source initializes EvernoteApi with token and sandbox flag."""
     source = evernote_source(token="tok-abc", sandbox=True)
     assert isinstance(source.client, EvernoteApi)
-    assert source.client.token == "tok-abc"
+    assert source.client._token == "tok-abc"
     assert source.client.sandbox is True
     # Construction made no network calls:
     assert source.client._note_store_url is None
