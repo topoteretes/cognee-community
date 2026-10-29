@@ -250,7 +250,10 @@ cognify can extract entities from.
 - The sync state keeps the id of every synced object (a few dozen bytes each) to detect
   deletions, so it grows with the account.
 - Every record that something refers to has a node set of its own, so a very large account has
-  many `NodeSet` nodes and `node_name` filters narrow to one record.
+  many `NodeSet` nodes and `node_name` filters narrow to one record. These per-record sets are
+  meant to be replaced by cognee's `cognee_structure` column once a stable cognee includes it (it
+  is in 1.6.6rc1). Node sets are part of a row's identity, so switching will re-ingest every
+  account synced before it.
 
 ## Testing
 
