@@ -12,9 +12,9 @@ card share a node set (`webflow:<site>/<collection>`), so they are linked in the
 
 ## Requirements
 
-- cognee **1.6.4** (pinned). The connector relies on document mode with table-scoped cleanup
+- cognee **1.6.4 or later** (1.x). The connector relies on document mode with table-scoped cleanup
   and per-row node sets (`DOCUMENT_SYNC_VERSION` 2).
-- Python 3.11 to 3.13.
+- Python 3.10 to 3.14.
 - A Webflow site and an API token (see [Setup](#setup)).
 
 ## Install
@@ -58,7 +58,7 @@ full flow.
 | `include_drafts` | Sync the staged version of items (drafts and unpublished edits) instead of only what is published. Default `False`. |
 | `include_collection_cards` | Also ingest one card per collection. Default `True`. |
 | `full_refresh` | Send every item this run, not only changed ones. |
-| `resource_name` | Name for this connection's dlt state and staging tables. Default `webflow`; give each Webflow account its own when several sync into one dataset. |
+| `resource_name` | Name for this connection's dlt state and staging tables. Default `webflow`; give each Webflow account its own when several sync into one dataset. A run whose sites share none with the ones already synced under a name is refused, so one account cannot forget another's content. |
 | `client` | A `WebflowClient`, for a custom base URL, transport or retry behaviour. |
 
 After a run, `source.cognee_sync_stats` holds counts only (items, unchanged, deleted, pages,
@@ -84,7 +84,8 @@ does not run the OAuth flow for you.
 | `pages:read` | `include_pages=True` |
 
 The connector only ever reads. The token is sent as a bearer header to `api.webflow.com` and is
-never logged or included in an error message.
+never logged or included in an error message. A token with spaces or control characters inside
+(a bad copy-paste) is refused up front without echoing it; surrounding whitespace is trimmed.
 
 ### 2. Choose what to sync
 
@@ -114,11 +115,15 @@ its content on purpose.
 - **Errors never delete.** A failed request, a listing that is incomplete or that kept changing
   while it was read, or a page that Webflow server-errors on stops the run before anything is
   committed, so nothing is forgotten and the next run starts from the same state. A suspected
-  deletion is confirmed by reading the collection a second time. A page whose content the token
+  deletion is confirmed by reading the collection a second time, and a collection that vanishes
+  from its site's listing is only forgotten once Webflow answers 404 for it. A page whose content the token
   cannot read (403/404) is skipped and kept, never forgotten.
 - **Rate limits.** Webflow allows 60 requests a minute on Starter and Basic plans and 120 on CMS
-  and above. A 429 is retried after its `Retry-After`, and 5xx and network errors are retried with
-  backoff. As a guide, a collection of 1,000 items costs about 12 requests per run.
+  and above. A 429 is retried after its `Retry-After` (about a minute), and 5xx and network errors
+  are retried with backoff. A `Retry-After` longer than two minutes stops the run instead of
+  holding it, and the next run starts from the same state. As a guide, a collection of 1,000 items
+  costs about 12 requests per run, so even a large collection finishes within a few minutes of
+  waiting; there is no separate request budget because the limit resets every minute.
 
 ## Privacy
 
