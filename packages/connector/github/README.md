@@ -5,6 +5,7 @@ Sync your GitHub repositories into Cognee memory with full-snapshot sync and for
 ## What this connector does
 
 - Ingests GitHub repos, issues, pull requests, commits, and releases as markdown documents
+- Optionally ingests Dependabot alerts, including current state and recorded resolution details
 - Stable IDs (`issue:owner/repo#42`, `commit:owner/repo#sha`) mean unchanged rows are not re-cognified
 - `write_disposition="replace"` gives full-snapshot sync; deletions propagate via orphan cleanup
 - Set `DOCUMENT_SOURCE_ATTR="github"` so cognee routes pages through its document/cognify pipeline
@@ -31,6 +32,10 @@ Sync your GitHub repositories into Cognee memory with full-snapshot sync and for
    export LLM_API_KEY="sk-..."  # your OpenAI/Anthropic/etc key
    ```
 
+   To read Dependabot alerts, the token also needs alert read access. Fine-grained tokens need
+   **Dependabot alerts: Read-only**. Classic tokens need the `security_events` scope; for public
+   repositories, `public_repo` is sufficient. Dependabot alert ingestion is read-only.
+
 4. **Run the example**  
 
    ```bash
@@ -45,8 +50,10 @@ from cognee_community_connector_github import github_source
 
 # Ingest specific repos (omit both to get your authenticated user's repos)
 source = github_source(
-    repos=["owner/repo1", "owner/repo2"],
-    orgs=["my-org"],  # all repos in the org
+    repos=["owner/repo1"],
+    include_dependabot_alerts=True,
+    # Dismissal comments are excluded unless explicitly requested:
+    # include_dismissal_comments=True,
 )
 
 await cognee.remember(source, dataset_name="github")
@@ -59,6 +66,15 @@ answer = await cognee.search(
 )
 print(answer)
 ```
+
+Dependabot alerts are opt-in and require an explicit `repos=[...]` list. The connector fetches
+open, fixed, dismissed, and auto-dismissed alerts, following GitHub's pagination links. Alert
+documents use the repository ID and alert number for identity, so state changes update the same
+document. Dismissal reasons and recorded dates are included; dismissal comments are omitted by
+default. Re-running with unchanged alert data produces the same document content.
+
+If an alert endpoint is unavailable, access is missing, or any page fails, the sync raises and
+the previous dlt snapshot is retained. It does not interpret a failed read as an empty alert list.
 
 ## Forget-on-delete & incremental behaviour
 
