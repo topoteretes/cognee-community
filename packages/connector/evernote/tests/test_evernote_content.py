@@ -246,4 +246,3 @@ def test_note_to_row_does_not_invent_url():
     row = note_to_row(note=note, content_text="Text")
     assert "url" not in row
     assert "note_url" not in row
-

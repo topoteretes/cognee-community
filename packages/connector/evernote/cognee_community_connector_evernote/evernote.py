@@ -11,6 +11,10 @@ from datetime import UTC, datetime
 from html.parser import HTMLParser
 from typing import Any
 
+import dlt
+from cognee.shared.logging_utils import get_logger
+from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR, PIPELINE_SCOPE_ATTR
+from dlt.common.normalizers.naming.snake_case import NamingConvention
 from evernote.edam.error.ttypes import (
     EDAMErrorCode,
     EDAMNotFoundException,
@@ -23,6 +27,8 @@ from evernote.edam.userstore import UserStore
 from thrift.protocol.TBinaryProtocol import TBinaryProtocol
 from thrift.transport.THttpClient import THttpClient
 from thrift.transport.TTransport import TTransportException
+
+logger = get_logger(__name__)
 
 
 class EvernoteError(Exception):
@@ -383,34 +389,6 @@ def iter_sync_chunks(
         current_after_usn = high_usn
 
 
-class EvernoteSource:
-    """Stub Evernote source representation for Milestone 1 and 2."""
-
-    def __init__(
-        self,
-        token: str | None = None,
-        sandbox: bool = False,
-        notebook_names: list[str] | None = None,
-        tag_names: list[str] | None = None,
-        resource_name: str = "evernote_notes",
-        client: Any = None,
-    ) -> None:
-        self.sandbox = sandbox
-        self.notebook_names = notebook_names
-        self.tag_names = tag_names
-        self.resource_name = resource_name
-        self.client = client
-        self._token = token
-
-    def __repr__(self) -> str:
-        return (
-            f"EvernoteSource(resource_name={self.resource_name!r}, "
-            f"sandbox={self.sandbox!r}, "
-            f"notebook_names={self.notebook_names!r}, "
-            f"tag_names={self.tag_names!r})"
-        )
-
-
 def evernote_source(
     token: str | None = None,
     sandbox: bool = False,
@@ -418,20 +396,11 @@ def evernote_source(
     tag_names: list[str] | None = None,
     resource_name: str = "evernote_notes",
     client: Any = None,
-) -> EvernoteSource:
-    """Create an Evernote data-source for cognee.
+):
+    """Create an Evernote dlt resource for cognee memory ingestion.
 
-    Args:
-        token: Evernote authentication token (or developer token). Falls back
-            to the ``EVERNOTE_TOKEN`` environment variable.
-        sandbox: Whether to target Evernote's sandbox environment.
-        notebook_names: Optional list of notebook names to restrict ingestion.
-        tag_names: Optional list of tag names to restrict ingestion.
-        resource_name: Table / resource name for dlt (default "evernote_notes").
-        client: Pre-built Evernote client (primarily an injection point for tests).
-
-    Returns:
-        EvernoteSource stub instance.
+    Extracts active notes filtered by optional notebook and tag scopes,
+    emitting merge records and tombstones for trashed or expunged notes.
     """
     resolved_token = token or os.environ.get("EVERNOTE_TOKEN")
     if client is None and not resolved_token:
@@ -439,14 +408,150 @@ def evernote_source(
             "Evernote authentication token required: pass token= or set EVERNOTE_TOKEN."
         )
 
-    if client is None:
-        client = EvernoteApi(token=resolved_token, sandbox=sandbox)
+    if not isinstance(resource_name, str) or not resource_name.strip():
+        raise ValueError("resource_name must be a nonempty string")
 
-    return EvernoteSource(
-        token=resolved_token,
-        sandbox=sandbox,
-        notebook_names=notebook_names,
-        tag_names=tag_names,
-        resource_name=resource_name,
-        client=client,
+    name = NamingConvention().normalize_table_identifier(resource_name)
+    api_client = (
+        client if client is not None else EvernoteApi(token=resolved_token, sandbox=sandbox)
     )
+
+    @dlt.resource(
+        name=name,
+        primary_key="id",
+        write_disposition="merge",
+        columns={
+            **{
+                field: {"data_type": "text", "nullable": False}
+                for field in ("id", "title", "content")
+            },
+            "_deleted": {"data_type": "bool", "hard_delete": True},
+        },
+    )
+    def records():
+        log = get_logger("evernote_connector")
+
+        yielded_count = 0
+        tombstoned_count = 0
+
+        # Pass 1: Collect notebook map, tag map, note metadata, and expunged note GUIDs
+        notebook_map: dict[str, str] = {}
+        tag_map: dict[str, str] = {}
+        note_meta: dict[str, Any] = {}
+        expunged_guids: set[str] = set()
+
+        for chunk in iter_sync_chunks(api_client, after_usn=0, max_entries=250):
+            for nb in getattr(chunk, "notebooks", None) or []:
+                notebook_map[nb.guid] = nb.name
+            for tag in getattr(chunk, "tags", None) or []:
+                tag_map[tag.guid] = tag.name
+            for note in getattr(chunk, "notes", None) or []:
+                note_meta[note.guid] = note
+            for guid in getattr(chunk, "expungedNotes", None) or []:
+                expunged_guids.add(guid)
+                note_meta.pop(guid, None)
+
+        # Validate requested notebook_names and tag_names against known account names
+        if notebook_names is not None:
+            requested_nbs = set(notebook_names)
+            found_nbs = set(notebook_map.values())
+            unknown_nbs = requested_nbs - found_nbs
+            if unknown_nbs:
+                raise EvernoteError(f"Unknown notebook name(s): {', '.join(sorted(unknown_nbs))}")
+
+        if tag_names is not None:
+            requested_tags = set(tag_names)
+            found_tags = set(tag_map.values())
+            unknown_tags = requested_tags - found_tags
+            if unknown_tags:
+                raise EvernoteError(f"Unknown tag name(s): {', '.join(sorted(unknown_tags))}")
+
+        # Compute allowed notebook and tag GUID sets
+        allowed_nb_guids = (
+            {g for g, n in notebook_map.items() if n in set(notebook_names)}
+            if notebook_names is not None
+            else None
+        )
+        allowed_tag_guids = (
+            {g for g, n in tag_map.items() if n in set(tag_names)}
+            if tag_names is not None
+            else None
+        )
+
+        # Pass 2: Emit tombstones and active in-scope notes
+        # 1. Expunged notes yield tombstones
+        for guid in sorted(expunged_guids):
+            yield {"id": guid, "title": "", "content": "", "_deleted": True}
+            tombstoned_count += 1
+
+        # 2. Iterate note metadata
+        for note in note_meta.values():
+            guid = getattr(note, "guid", "")
+            # Check if trashed
+            is_trashed = (
+                getattr(note, "active", True) is False or getattr(note, "deleted", None) is not None
+            )
+            if is_trashed:
+                yield {"id": guid, "title": "", "content": "", "_deleted": True}
+                tombstoned_count += 1
+                continue
+
+            # Scope check
+            in_notebook_scope = (
+                allowed_nb_guids is None or getattr(note, "notebookGuid", None) in allowed_nb_guids
+            )
+            note_tag_guids = set(getattr(note, "tagGuids", None) or [])
+            in_tag_scope = allowed_tag_guids is None or bool(note_tag_guids & allowed_tag_guids)
+
+            if not (in_notebook_scope and in_tag_scope):
+                # Active note OUT of scope yields a tombstone
+                yield {"id": guid, "title": "", "content": "", "_deleted": True}
+                tombstoned_count += 1
+                continue
+
+            # In-scope active note: fetch body
+            try:
+                enml = api_client.get_note_content(guid)
+            except NoteNotFoundError:
+                # Note was removed between Pass 1 metadata collection and Pass 2 body fetch
+                yield {"id": guid, "title": "", "content": "", "_deleted": True}
+                tombstoned_count += 1
+                continue
+            except Exception:
+                # Any other error propagates and aborts the whole run:
+                # partial staging must never be published to cognee memory.
+                raise
+
+            content_text = enml_to_text(enml)
+            if not content_text:
+                content_text = getattr(note, "title", "") or ""
+            if not content_text:
+                # If content and title are both empty, yield a tombstone so a
+                # previously ingested version is removed from cognee.
+                yield {"id": guid, "title": "", "content": "", "_deleted": True}
+                tombstoned_count += 1
+                continue
+
+            row = note_to_row(
+                note,
+                content_text,
+                notebook_names=notebook_map,
+                tag_names=tag_map,
+            )
+            yield row
+            yielded_count += 1
+
+        log.info(
+            "Evernote sync complete: %d row(s) yielded, %d tombstone(s) emitted.",
+            yielded_count,
+            tombstoned_count,
+        )
+
+        if yielded_count == 0 and tombstoned_count == 0:
+            yield dlt.mark.materialize_table_schema()
+
+    resource = records()
+    setattr(resource, DOCUMENT_SOURCE_ATTR, "evernote")
+    setattr(resource, PIPELINE_SCOPE_ATTR, name)
+    resource.client = api_client
+    return resource
