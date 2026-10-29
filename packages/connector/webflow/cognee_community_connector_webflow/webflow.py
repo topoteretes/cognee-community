@@ -56,7 +56,7 @@ from cognee.tasks.ingestion.dlt_utils import (
     guarded_rows,
 )
 
-from .client import WebflowAPIError, WebflowClient
+from .client import WebflowAPIError, WebflowClient, resolve_token
 from .render import card_content, item_content, page_content, schema_fingerprint
 
 logger = get_logger("webflow_connector")
@@ -121,8 +121,8 @@ def webflow_source(
             into one dataset.
         client: A ``WebflowClient`` (mainly a test-injection point); when
             omitted one is built from the token above.
-        check_active: Called between rows; raises to stop a sync whose access
-            was revoked mid-run (for hosts).
+        check_active: Called before every request and between rows; raises to
+            stop a sync whose access was revoked mid-run (for hosts).
 
     Returns:
         A dlt source for ``cognee.remember(...)``. Pass
@@ -157,7 +157,8 @@ def webflow_source(
         full_refresh=full_refresh,
         resource_name=resource_name,
     )
-    client = client or WebflowClient(token)
+    if client is None:
+        resolve_token(token)  # fail now, not in the middle of a sync
     stats: dict[str, int] = {}
 
     @dlt.resource(
@@ -178,12 +179,19 @@ def webflow_source(
                 f'webflow_source needs write_disposition="merge", got {disposition!r}. '
                 "Its incremental runs emit only changes and deletions."
             )
+        # A client is built per run, so the same source can be run again. A client
+        # the caller passed in stays theirs to close.
+        run_client = client or WebflowClient(token)
+        if check_active is not None:
+            # A listing makes many requests before its first row, so ask before each one.
+            run_client.check_active = check_active
         try:
-            rows = sync_rows(client, selection, dlt.current.resource_state(), stats=stats)
+            rows = sync_rows(run_client, selection, dlt.current.resource_state(), stats=stats)
             for table_name, row in guarded_rows(rows, check_active):
                 yield dlt.mark.with_table_name(row, table_name)
         finally:
-            client.close()
+            if client is None:
+                run_client.close()
 
     @dlt.source(name=WEBFLOW_SOURCE_NAME)
     def _webflow():
@@ -233,7 +241,21 @@ def sync_rows(
     tombstones: list[tuple[str, str]] = []
 
     sites = _resolve_sites(client, selection)
-    collections = _resolve_collections(client, selection, sites)
+    site_ids = {site["id"] for site in sites}
+    previous_sites = set(state.get("sites", []))
+    if previous_sites and not previous_sites & site_ids:
+        # A second account under one resource_name would forget the first one's content.
+        raise ValueError(
+            f"resource_name {name!r} already holds content from other Webflow sites. Give "
+            "each Webflow account or site its own resource_name."
+        )
+    collections, existing = _resolve_collections(client, selection, sites)
+    for collection_id, entry in previous_items.items():
+        # Listed under its site last time, missing now: confirm it is really gone
+        # before its items are forgotten. A collection merely taken out of the
+        # selection is still in `existing` and is forgotten on purpose.
+        if collection_id not in existing and entry.get("site") in site_ids:
+            _confirm_collection_gone(client, collection_id)
     current_items: dict[str, dict] = {}
     current_cards: set[str] = set()
 
@@ -244,7 +266,11 @@ def sync_rows(
         stamps = yield from _sync_collection(
             client, selection, collection, schema, known, trusted, table, tombstones, stats
         )
-        current_items[collection["id"]] = {"table": table, "stamps": stamps}
+        current_items[collection["id"]] = {
+            "table": table,
+            "stamps": stamps,
+            "site": collection["siteId"],
+        }
         stats["collections"] += 1
         if selection.include_collection_cards:
             current_cards.add(collection["id"])
@@ -285,6 +311,7 @@ def sync_rows(
         yield table, {"id": row_id, "_deleted": True}
 
     state["version"] = _STATE_VERSION
+    state["sites"] = sorted(site_ids)
     state["collections"] = current_items
     state["cards"] = sorted(current_cards)
     state["pages"] = current_pages
@@ -449,6 +476,8 @@ def _resolve_sites(client, selection: _Selection) -> list[dict]:
             )
     sites = []
     for site in raw:
+        if not site.get("id"):
+            continue
         label = site.get("shortName") or site["id"]
         sites.append(
             {
@@ -461,23 +490,29 @@ def _resolve_sites(client, selection: _Selection) -> list[dict]:
     return sites
 
 
-def _resolve_collections(client, selection: _Selection, sites: list[dict]) -> list[dict]:
+def _resolve_collections(
+    client, selection: _Selection, sites: list[dict]
+) -> tuple[list[dict], dict[str, dict]]:
+    """The collections to sync, and every collection that exists on the selected sites."""
     found: dict[str, dict] = {}
     for site in sites:
         listing = client.get(f"/sites/{site['id']}/collections").get("collections") or []
         for collection in listing:
+            if not collection.get("id"):
+                continue
             slug = collection.get("slug") or collection["id"]
             found.setdefault(
                 collection["id"],
                 {
                     **collection,
-                    "displayName": collection.get("displayName") or collection["slug"],
+                    "displayName": collection.get("displayName") or slug,
+                    "siteId": site["id"],
                     "siteName": site["name"],
                     "nodeSet": f"webflow:{site['label']}/{slug}",
                 },
             )
     if selection.collections is None:
-        return list(found.values())
+        return list(found.values()), found
 
     chosen: dict[str, dict] = {}
     for wanted in selection.collections:
@@ -495,7 +530,22 @@ def _resolve_collections(client, selection: _Selection, sites: list[dict]) -> li
             )
         for collection in matches:
             chosen.setdefault(collection["id"], collection)
-    return list(chosen.values())
+    return list(chosen.values()), found
+
+
+def _confirm_collection_gone(client, collection_id: str) -> None:
+    """Return when Webflow says the collection is gone; raise when it still exists."""
+    try:
+        client.get(f"/collections/{collection_id}")
+    except WebflowAPIError as exc:
+        if exc.status == 404:
+            return
+        raise
+    raise WebflowAPIError(
+        200,
+        f"Collection {collection_id} was missing from its site's listing but still exists; "
+        "nothing was synced. Try again.",
+    )
 
 
 # ---------------------------------------------------------------------------

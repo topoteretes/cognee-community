@@ -469,6 +469,55 @@ def test_a_deletion_confirmed_by_the_second_read_is_forgotten(fake):
     assert len(fake.requests_to("/items/live")) == 2, "one read, then one to confirm"
 
 
+def test_a_collection_missing_from_one_listing_but_still_there_is_not_forgotten(fake):
+    docs = fake.add_collection(fake.site, "docs", fields=FIELDS)
+    fake.add_item(docs, "Guide")
+    state: dict = {}
+    sync(fake, state)
+    before = {**state}
+    fake.hidden_from_listing.add(docs)
+
+    with pytest.raises(WebflowAPIError, match="still exists"):
+        sync(fake, state)
+
+    assert state == before
+
+
+def test_a_site_taken_out_of_site_ids_is_forgotten_without_a_fuss(fake):
+    other = fake.add_site("Second", "second")
+    notes = fake.add_collection(other, "notes", fields=FIELDS)
+    note = fake.add_item(notes, "Note")
+    state: dict = {}
+    sync(fake, state)
+
+    run = sync(fake, state, site_ids=(fake.site,))
+
+    assert run.forgotten == {note, notes}
+    assert state["sites"] == [fake.site]
+
+
+def test_a_second_account_under_the_same_resource_name_is_refused(fake):
+    state: dict = {}
+    sync(fake, state)
+    before = {**state}
+    stranger = FakeWebflow()
+    stranger_site = stranger.add_site("Other account", "other", site_id="f" * 24)
+    stranger_posts = stranger.add_collection(stranger_site, "posts", fields=FIELDS)
+    stranger.add_item(stranger_posts, "Theirs")
+
+    with pytest.raises(ValueError, match="its own resource_name"):
+        sync(stranger, state)
+
+    assert state == before
+
+
+def test_a_rotated_token_for_the_same_site_keeps_the_state(fake):
+    state: dict = {}
+    sync(fake, state)
+
+    assert sync(fake, state).items == set()
+
+
 # ---------------------------------------------------------------------------
 # Errors never delete
 # ---------------------------------------------------------------------------

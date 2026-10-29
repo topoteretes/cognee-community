@@ -9,7 +9,7 @@ like a site editor: add, edit, unpublish, archive and delete items and pages.
 
 import json
 from collections.abc import Callable
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import httpx
 
@@ -26,11 +26,13 @@ class FakeWebflow:
         self.calls: list[tuple[str, dict]] = []
         # A site that was never published has no live items (Webflow answers 409).
         self.published = True
+        # Collections left out of a site's listing while they still exist.
+        self.hidden_from_listing: set[str] = set()
         # Called before each request, to change data while a listing is read.
         self.on_request: Callable[[str, dict], None] | None = None
         # path prefix -> responses to give before answering normally.
         self._failures: dict[str, list[httpx.Response]] = {}
-        self._clock = datetime(2026, 1, 1, tzinfo=UTC)
+        self._clock = datetime(2026, 1, 1, tzinfo=timezone.utc)
         self._counter = 0
 
     # -- editor actions ------------------------------------------------------
@@ -173,7 +175,9 @@ class FakeWebflow:
             rows = [
                 _public(c)
                 for c in self.collections.values()
-                if c["siteId"] == parts[1] and self._site(parts[1])
+                if c["siteId"] == parts[1]
+                and self._site(parts[1])
+                and c["id"] not in self.hidden_from_listing
             ]
             return httpx.Response(200, json={"collections": rows})
         if len(parts) == 3 and parts[0] == "sites" and parts[2] == "pages":

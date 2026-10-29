@@ -13,6 +13,7 @@ from cognee.tasks.ingestion import dlt_utils
 from fake_webflow import TOKEN, FakeWebflow
 
 from cognee_community_connector_webflow import WebflowClient, webflow_source
+from cognee_community_connector_webflow import webflow as webflow_module
 
 
 @pytest.fixture
@@ -156,3 +157,44 @@ def test_building_the_source_without_a_token_fails_early(monkeypatch):
     monkeypatch.delenv("WEBFLOW_API_TOKEN", raising=False)
     with pytest.raises(ValueError, match="WEBFLOW_API_TOKEN"):
         webflow_source()
+
+
+def test_a_source_can_be_run_again_and_builds_a_fresh_client_each_run(tmp_path, fake, monkeypatch):
+    built = []
+
+    def make_client(token):
+        built.append(token)
+        return _client(fake)
+
+    monkeypatch.setattr(webflow_module, "WebflowClient", make_client)
+    source = webflow_source(TOKEN)
+    pipeline = _pipeline(tmp_path)
+
+    pipeline.run(source, write_disposition="merge", primary_key="id")
+    fake.edit_item(fake.posts, fake.alpha, body="Edited")
+    pipeline.run(source, write_disposition="merge", primary_key="id")
+
+    assert built == [TOKEN, TOKEN]
+    assert source.cognee_sync_stats["items"] == 1
+
+
+def test_a_client_passed_in_is_left_open_for_its_owner(tmp_path, fake):
+    client = _client(fake)
+
+    _pipeline(tmp_path).run(
+        webflow_source(client=client), write_disposition="merge", primary_key="id"
+    )
+
+    assert not client._http.is_closed
+
+
+def test_check_active_stops_a_sync_before_it_reads_or_commits_anything(tmp_path, fake):
+    def revoked():
+        raise PermissionError("access revoked")
+
+    source = webflow_source(client=_client(fake), check_active=revoked)
+
+    with pytest.raises(Exception, match="access revoked"):
+        _pipeline(tmp_path).run(source, write_disposition="merge", primary_key="id")
+
+    assert fake.calls == [], "no request may be made once access is revoked"
