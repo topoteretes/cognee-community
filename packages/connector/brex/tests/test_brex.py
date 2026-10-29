@@ -2,14 +2,19 @@
 
 Covers:
 - Token validation and error handling
+- Resource selection and `include` validation
+- Amount normalization (cents, decimals, zero, and negative refunds/credits)
+- Currency formatting for positive and negative values
 - Client error mappings (401, 403, 429)
 - Multi-page pagination traversal
 - Structured relational expenses ingestion and ID namespacing
 - Document-mode routing and Markdown formatting for memos
 - Structured relational budgets ingestion with parent-child links
-- Incremental high-watermark cursor advancement (posted_at_start)
-- Forget-on-delete tombstone emission (_deleted=True)
+- Incremental high-watermark cursor advancement and known_ids accumulation
+- Deletion reconciliation on full refresh (`full_refresh=True`)
+- Empty-sweep guardrails (skipping tombstones on unexpected empty responses)
 - Anti-corruption abort guard on failure
+- Dual-path routing separation (verifying document vs relational source tagging)
 """
 
 from __future__ import annotations
@@ -20,9 +25,13 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 try:
-    from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
+    from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR, document_source_tag
 except ImportError:
     DOCUMENT_SOURCE_ATTR = "cognee_document_source"
+
+    def document_source_tag(item):
+        return getattr(item, DOCUMENT_SOURCE_ATTR, None)
+
 
 from cognee_community_connector_brex.brex import (
     BREX_BUDGETS_TABLE,
@@ -31,7 +40,9 @@ from cognee_community_connector_brex.brex import (
     _budget_to_row,
     _expense_to_memo_card,
     _expense_to_row,
+    _format_currency,
     _normalize_amount,
+    brex_memos_source,
     brex_source,
 )
 from cognee_community_connector_brex.client import (
@@ -52,22 +63,48 @@ def test_missing_token_raises_value_error():
         brex_source(token=None)
 
 
-def test_normalize_amount():
-    """Verify numeric amount and currency parsing from various Brex payload formats."""
-    # Cents integer representation
+def test_invalid_or_empty_include_raises_value_error():
+    """Verify that empty or unrecognized include list raises ValueError."""
+    with pytest.raises(ValueError, match="include must not be empty"):
+        brex_source(token="tok", include=[])
+
+    with pytest.raises(ValueError, match="Invalid resource"):
+        brex_source(token="tok", include=["invoices", "expenses"])
+
+
+def test_normalize_amount_and_formatting():
+    """Verify numeric amount parsing and formatting for +/- cents, floats, zero."""
+    # Positive cents integer representation
     val, curr = _normalize_amount({"amount": 1050, "currency": "USD"})
     assert val == 10.50
     assert curr == "USD"
+    assert _format_currency(val, curr) == "$10.50 USD"
 
-    # Float amount
-    val, curr = _normalize_amount(45.25)
-    assert val == 45.25
-    assert curr == "USD"
+    # Negative cents integer (refund / credit)
+    val_neg, curr_neg = _normalize_amount({"amount": -1500, "currency": "USD"})
+    assert val_neg == -15.00
+    assert curr_neg == "USD"
+    assert _format_currency(val_neg, curr_neg) == "-$15.00 USD"
+
+    # Zero amount
+    val_zero, curr_zero = _normalize_amount({"amount": 0, "currency": "USD"})
+    assert val_zero == 0.0
+    assert _format_currency(val_zero, curr_zero) == "$0.00 USD"
+
+    # Float amount (positive and negative)
+    val_f, curr_f = _normalize_amount(45.25)
+    assert val_f == 45.25
+    assert curr_f == "USD"
+
+    val_f_neg, _ = _normalize_amount(-32.10)
+    assert val_f_neg == -32.10
+    assert _format_currency(val_f_neg, "EUR") == "-$32.10 EUR"
 
     # Missing or null amount
-    val, curr = _normalize_amount(None)
-    assert val is None
-    assert curr is None
+    val_none, curr_none = _normalize_amount(None)
+    assert val_none is None
+    assert curr_none is None
+    assert _format_currency(None, None) == "N/A USD"
 
 
 def test_client_error_handling():
@@ -139,7 +176,7 @@ def test_expense_row_transformation(mock_expenses_data: list[dict[str, Any]]):
 
 
 def test_memo_card_document_mode(mock_expenses_data: list[dict[str, Any]]):
-    """Verify memo transformation into Markdown document card."""
+    """Verify memo transformation into Markdown document card including refund cases."""
     raw = mock_expenses_data[0]
     card = _expense_to_memo_card(raw, id_prefix="brex")
 
@@ -152,6 +189,12 @@ def test_memo_card_document_mode(mock_expenses_data: list[dict[str, Any]]):
     assert "Monthly infrastructure log indexing" in card["content"]
     assert "brex:budget:bgt_cloud_q2" in card["content"]
     assert card["_deleted"] is False
+
+    # Negative / refund memo
+    refund_raw = dict(raw, id="exp_refund", amount={"amount": -4500, "currency": "USD"})
+    refund_card = _expense_to_memo_card(refund_raw, id_prefix="brex")
+    assert "-$45.00 USD" in refund_card["title"]
+    assert "-$45.00 USD" in refund_card["content"]
 
 
 def test_budget_row_transformation(mock_budgets_data: list[dict[str, Any]]):
@@ -168,29 +211,36 @@ def test_budget_row_transformation(mock_budgets_data: list[dict[str, Any]]):
 
 
 def test_brex_source_resource_selection_and_document_mode(mock_brex_client):
-    """Verify brex_source selects specified resources and sets DOCUMENT_SOURCE_ATTR."""
-    source = brex_source(
+    """Verify default resources, document-mode isolation, and dedicated memos source."""
+    # 1. Default brex_source: relational resources, NO source-level document tag
+    default_src = brex_source(token="mock_tok", client=mock_brex_client)
+    assert set(default_src.selected_resources.keys()) == {BREX_EXPENSES_TABLE, BREX_BUDGETS_TABLE}
+    assert getattr(default_src, DOCUMENT_SOURCE_ATTR, None) is None
+
+    # 2. Mixed source: expenses, memos, budgets. Source level is NOT marked as document mode!
+    mixed_src = brex_source(
         token="mock_tok",
         include=["expenses", "memos", "budgets"],
         client=mock_brex_client,
     )
+    assert BREX_EXPENSES_TABLE in mixed_src.selected_resources
+    assert BREX_MEMOS_TABLE in mixed_src.selected_resources
+    assert BREX_BUDGETS_TABLE in mixed_src.selected_resources
+    # Crucial: source-level DOCUMENT_SOURCE_ATTR must be None so relational tables aren't misrouted!
+    assert getattr(mixed_src, DOCUMENT_SOURCE_ATTR, None) is None
+    # brex_memos resource itself has the tag
+    assert getattr(mixed_src.selected_resources[BREX_MEMOS_TABLE], DOCUMENT_SOURCE_ATTR) == "brex"
 
-    resources = source.selected_resources
-    assert BREX_EXPENSES_TABLE in resources
-    assert BREX_MEMOS_TABLE in resources
-    assert BREX_BUDGETS_TABLE in resources
-
-    # Document mode verification
-    memos_res = resources[BREX_MEMOS_TABLE]
-    assert getattr(memos_res, DOCUMENT_SOURCE_ATTR) == "brex"
-
-    # Relational resources should NOT have DOCUMENT_SOURCE_ATTR set
-    assert getattr(resources[BREX_EXPENSES_TABLE], DOCUMENT_SOURCE_ATTR, None) is None
-    assert getattr(resources[BREX_BUDGETS_TABLE], DOCUMENT_SOURCE_ATTR, None) is None
+    # 3. Dedicated brex_memos_source: pure document mode
+    memos_src = brex_memos_source(token="mock_tok", client=mock_brex_client)
+    assert set(memos_src.selected_resources.keys()) == {BREX_MEMOS_TABLE}
+    assert getattr(memos_src, DOCUMENT_SOURCE_ATTR) == "brex"
+    assert document_source_tag(memos_src) == "brex"
 
 
-def test_incremental_sync_and_cursor_advancement(mock_brex_client):
-    """Verify incremental sync advances posted_at cursor in resource state."""
+def test_incremental_sync_and_known_ids_accumulation(mock_brex_client, mock_expenses_data):
+    """Verify incremental delta accumulates new record IDs into known_ids."""
+    # Initial run: mock client returns exp_001 and exp_002
     source = brex_source(
         token="mock_tok",
         include=["expenses"],
@@ -203,40 +253,135 @@ def test_incremental_sync_and_cursor_advancement(mock_brex_client):
         rows = list(expenses_resource())
 
     assert len(rows) == 2
-    # The newest timestamp in mock data is 2026-04-15T18:00:00Z
     assert state.get("last_posted_at") == "2026-04-15T18:00:00Z"
+    assert state.get("known_ids") == ["exp_001", "exp_002"]
+
+    # Second run: new expense exp_003 posted after last watermark
+    new_expense = {
+        "id": "exp_003",
+        "amount": {"amount": 500, "currency": "USD"},
+        "merchant": {"name": "Github"},
+        "posted_at": "2026-04-20T10:00:00Z",
+    }
+    mock_brex_client.expenses = [new_expense]
+
+    source2 = brex_source(
+        token="mock_tok",
+        include=["expenses"],
+        client=mock_brex_client,
+    )
+    expenses_resource2 = source2.selected_resources[BREX_EXPENSES_TABLE]
+
+    with patch("dlt.current.resource_state", return_value=state):
+        rows2 = list(expenses_resource2())
+
+    assert len(rows2) == 1
+    assert rows2[0]["expense_id"] == "exp_003"
+    # State known_ids must retain exp_001 and exp_002 and append exp_003!
+    assert state["known_ids"] == ["exp_001", "exp_002", "exp_003"]
+    assert state["last_posted_at"] == "2026-04-20T10:00:00Z"
 
 
-def test_forget_on_delete_tombstones(mock_brex_client, mock_expenses_data):
-    """Verify missing items in full snapshot emit _deleted: True tombstones."""
-    # Simulate client only returning exp_001 (exp_002 was deleted upstream)
-    mock_brex_client.expenses = [mock_expenses_data[0]]
+def test_second_run_deletion_on_full_refresh(mock_brex_client, mock_expenses_data):
+    """Verify full_refresh reconciles against all known_ids and emits tombstones."""
+    # State knew about exp_001, exp_002, and exp_003
+    state = {
+        "last_posted_at": "2026-04-20T10:00:00Z",
+        "known_ids": ["exp_001", "exp_002", "exp_003"],
+    }
+
+    # Upstream deleted exp_002; client only returns exp_001 and exp_003
+    exp_003 = {
+        "id": "exp_003",
+        "amount": {"amount": 500, "currency": "USD"},
+        "merchant": {"name": "Github"},
+        "posted_at": "2026-04-20T10:00:00Z",
+    }
+    mock_brex_client.expenses = [mock_expenses_data[0], exp_003]
 
     source = brex_source(
         token="mock_tok",
         include=["expenses"],
         client=mock_brex_client,
+        full_refresh=True,
     )
     expenses_resource = source.selected_resources[BREX_EXPENSES_TABLE]
-
-    # Prior state knew about both exp_001 and exp_002
-    state = {
-        "last_posted_at": None,  # Full snapshot
-        "known_ids": ["exp_001", "exp_002"],
-    }
 
     with patch("dlt.current.resource_state", return_value=state):
         rows = list(expenses_resource())
 
-    active_rows = [r for r in rows if not r.get("_deleted")]
-    tombstone_rows = [r for r in rows if r.get("_deleted")]
+    active = [r for r in rows if not r.get("_deleted")]
+    tombstones = [r for r in rows if r.get("_deleted")]
 
-    assert len(active_rows) == 1
-    assert active_rows[0]["id"] == "brex:expense:exp_001"
+    assert len(active) == 2
+    assert len(tombstones) == 1
+    assert tombstones[0]["id"] == "brex:expense:exp_002"
+    assert tombstones[0]["_deleted"] is True
+    assert state["known_ids"] == ["exp_001", "exp_003"]
 
-    assert len(tombstone_rows) == 1
-    assert tombstone_rows[0]["id"] == "brex:expense:exp_002"
-    assert tombstone_rows[0]["_deleted"] is True
+
+def test_empty_sweep_guard_preserves_state(mock_brex_client):
+    """Verify unexpected empty sweep does NOT wipe existing known records."""
+    mock_brex_client.expenses = []
+
+    state = {
+        "last_posted_at": None,
+        "known_ids": ["exp_001", "exp_002"],
+    }
+
+    source = brex_source(
+        token="mock_tok",
+        include=["expenses"],
+        client=mock_brex_client,
+        full_refresh=True,
+        allow_empty_sweep=False,
+    )
+    expenses_resource = source.selected_resources[BREX_EXPENSES_TABLE]
+
+    with patch("dlt.current.resource_state", return_value=state):
+        rows = list(expenses_resource())
+
+    # Empty sweep guard should skip deletion: 0 tombstones emitted
+    assert len(rows) == 0
+    # State preserved!
+    assert state["known_ids"] == ["exp_001", "exp_002"]
+
+    # When allow_empty_sweep=True is explicitly set, destructive tombstones are permitted
+    source_allowed = brex_source(
+        token="mock_tok",
+        include=["expenses"],
+        client=mock_brex_client,
+        full_refresh=True,
+        allow_empty_sweep=True,
+    )
+    expenses_resource_allowed = source_allowed.selected_resources[BREX_EXPENSES_TABLE]
+
+    with patch("dlt.current.resource_state", return_value=state):
+        rows_allowed = list(expenses_resource_allowed())
+
+    assert len(rows_allowed) == 2
+    assert all(r["_deleted"] for r in rows_allowed)
+    assert state["known_ids"] == []
+
+
+def test_budget_empty_sweep_guard(mock_brex_client):
+    """Verify budget empty sweep guard preserves state on transient empty responses."""
+    mock_brex_client.budgets = []
+    state = {"known_ids": ["bgt_cloud_q2", "bgt_parent_eng"]}
+
+    source = brex_source(
+        token="mock_tok",
+        include=["budgets"],
+        client=mock_brex_client,
+        allow_empty_sweep=False,
+    )
+    budgets_resource = source.selected_resources[BREX_BUDGETS_TABLE]
+
+    with patch("dlt.current.resource_state", return_value=state):
+        rows = list(budgets_resource())
+
+    assert len(rows) == 0
+    assert state["known_ids"] == ["bgt_cloud_q2", "bgt_parent_eng"]
 
 
 def test_anti_corruption_guardrail_on_error():
@@ -303,7 +448,7 @@ def test_real_dlt_pipeline_sync_and_forget_on_delete(tmp_path):
 
     client = MockBrexClient(expenses=list(sample_expenses), budgets=[])
 
-    # First sync
+    # First sync: expenses & memos
     pipeline.run(brex_source(token="tok", client=client, include=["expenses", "memos"]))
 
     with (

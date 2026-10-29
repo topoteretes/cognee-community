@@ -3,14 +3,16 @@
 Supports:
 1. brex_memos: Document mode (DOCUMENT_SOURCE_ATTR = "brex"). Formats corporate expenses,
    receipt annotations, and user justification memos into rich semantic document cards
-   for LLM entity extraction and knowledge graph construction.
+   for LLM entity extraction and knowledge graph construction. Use `brex_memos_source()`.
 2. brex_expenses: Structured relational mode. Emits normalized transaction rows with stable
    namespaced IDs, foreign keys, and incremental sync via `posted_at_start`.
 3. brex_budgets: Structured relational mode. Ingests budget definitions and hierarchies.
 
-Anti-corruption guardrail:
-If any API request, pagination step, or network call fails during reconciliation, deletion
-tombstone emission is aborted immediately to protect graph state from transient failures.
+Anti-corruption & Empty-Sweep Guardrails:
+- If any API request, pagination step, or network call fails during reconciliation, deletion
+  tombstone emission is aborted immediately to protect graph state from transient failures.
+- If a full sweep returns 0 records when previous records were known, deletion tombstones
+  are skipped to prevent accidental corpus erasure, unless `allow_empty_sweep=True`.
 """
 
 from __future__ import annotations
@@ -29,9 +31,10 @@ except ImportError:
     logger = logging.getLogger("brex_connector")
 
 try:
-    from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
+    from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR, PIPELINE_SCOPE_ATTR
 except ImportError:
     DOCUMENT_SOURCE_ATTR = "cognee_document_source"
+    PIPELINE_SCOPE_ATTR = "cognee_pipeline_scope"
 
 from .client import DEFAULT_BASE_URL, BrexClient
 
@@ -40,6 +43,8 @@ BREX_EXPENSES_TABLE = "brex_expenses"
 BREX_MEMOS_TABLE = "brex_memos"
 BREX_BUDGETS_TABLE = "brex_budgets"
 BREX_SOURCE_NAME = "brex"
+BREX_MEMOS_SOURCE_NAME = "brex_memos"
+VALID_RESOURCES = {"expenses", "memos", "budgets"}
 
 _EXTRA_HINT = (
     'The Brex connector requires "dlt" and "requests": '
@@ -52,6 +57,8 @@ def _format_currency(amount: float | None, currency: str | None) -> str:
     curr = currency or "USD"
     if amount is None:
         return f"N/A {curr}"
+    if amount < 0:
+        return f"-${abs(amount):,.2f} {curr}"
     return f"${amount:,.2f} {curr}"
 
 
@@ -65,9 +72,9 @@ def _normalize_amount(raw_amount: Any) -> tuple[float | None, str | None]:
         curr = raw_amount.get("currency", "USD")
         if amt is not None:
             try:
-                # Convert cents to dollars if integer representation
+                # Convert cents to dollars (including negative amounts/refunds)
                 val = float(amt)
-                if isinstance(amt, int) and amt > 0:
+                if isinstance(amt, int):
                     val = amt / 100.0
                 return val, curr
             except (ValueError, TypeError):
@@ -217,15 +224,23 @@ def brex_source(
     base_url: str = DEFAULT_BASE_URL,
     id_prefix: str = DEFAULT_ID_PREFIX,
     client: Any = None,
+    full_refresh: bool = False,
+    allow_empty_sweep: bool = False,
+    resource_name: str | None = None,
 ):
     """Return a dlt source yielding Brex expenses, memos, and budgets.
 
     Args:
         token: Brex API User or Admin token. Falls back to BREX_API_TOKEN environment variable.
-        include: List of resources to sync (defaults to ["expenses", "memos", "budgets"]).
+        include: List of resources to sync (defaults to ["expenses", "budgets"]).
+                 Valid values: "expenses", "memos", "budgets".
         base_url: Brex API base URL (default: 'https://platform.brexapis.com/v1').
         id_prefix: Namespace prefix for global IDs (default: 'brex').
         client: Pre-built BrexClient instance (for offline testing injection).
+        full_refresh: If True, bypasses watermark cursor and runs a full sweep with deletion
+                     reconciliation.
+        allow_empty_sweep: If True, permits empty API responses to tombstone existing records.
+        resource_name: Optional pipeline scope identifier for multi-account / isolated state.
 
     Returns:
         A dlt source configured with primary_key="id", write_disposition="merge",
@@ -235,6 +250,21 @@ def brex_source(
         import dlt
     except ImportError as exc:
         raise ImportError(_EXTRA_HINT) from exc
+
+    if include is not None:
+        if not include:
+            raise ValueError(
+                "include must not be empty. Valid options: 'expenses', 'memos', 'budgets'."
+            )
+        invalid = set(include) - VALID_RESOURCES
+        if invalid:
+            raise ValueError(
+                f"Invalid resource(s) in include: {sorted(invalid)}. "
+                f"Valid options: {sorted(VALID_RESOURCES)}."
+            )
+        resources_to_sync = set(include)
+    else:
+        resources_to_sync = {"expenses", "budgets"}
 
     resolved_token = token or os.environ.get("BREX_API_TOKEN")
     if client is None:
@@ -246,8 +276,6 @@ def brex_source(
         active_client = BrexClient(token=resolved_token, base_url=base_url)
     else:
         active_client = client
-
-    resources_to_sync = set(include or ["expenses", "memos", "budgets"])
 
     @dlt.resource(
         name=BREX_EXPENSES_TABLE,
@@ -275,7 +303,7 @@ def brex_source(
     def brex_expenses() -> Iterator[dict[str, Any]]:
         """Yield structured rows for card expenses with incremental sync and reconciliation."""
         state = dlt.current.resource_state()
-        last_posted = state.get("last_posted_at")
+        last_posted = None if full_refresh else state.get("last_posted_at")
         known_ids = set(state.get("known_ids", []))
 
         current_sync_keys = set()
@@ -293,15 +321,26 @@ def brex_source(
 
                 yield row
 
-            # Reconciliation of deleted records (only on full scan without cursor)
+            # Full sweep reconciliation of deleted records
             if not last_posted:
+                if known_ids and not current_sync_keys and not allow_empty_sweep:
+                    logger.warning(
+                        "Brex: expense sweep returned 0 records but %d were known; "
+                        "skipping deletion to prevent mass tombstoning.",
+                        len(known_ids),
+                    )
+                    return
+
                 deleted_ids = known_ids - current_sync_keys
-                for d_id in deleted_ids:
+                for d_id in sorted(deleted_ids):
                     yield {
                         "id": f"{id_prefix}:expense:{d_id}",
                         "_deleted": True,
                     }
                 state["known_ids"] = sorted(current_sync_keys)
+            else:
+                # Incremental delta run: add newly seen records to known_ids
+                state["known_ids"] = sorted(known_ids | current_sync_keys)
 
             if newest_posted:
                 state["last_posted_at"] = newest_posted
@@ -325,7 +364,7 @@ def brex_source(
     def brex_memos() -> Iterator[dict[str, Any]]:
         """Yield Markdown document cards for expenses with memos (Document Mode)."""
         state = dlt.current.resource_state()
-        last_posted = state.get("last_posted_at")
+        last_posted = None if full_refresh else state.get("last_posted_at")
         known_memo_ids = set(state.get("known_ids", []))
 
         current_sync_keys = set()
@@ -343,15 +382,26 @@ def brex_source(
 
                 yield card
 
-            # Reconciliation of deleted records on full scan
+            # Full sweep reconciliation of deleted memos
             if not last_posted:
+                if known_memo_ids and not current_sync_keys and not allow_empty_sweep:
+                    logger.warning(
+                        "Brex: memo sweep returned 0 records but %d were known; "
+                        "skipping deletion to prevent mass tombstoning.",
+                        len(known_memo_ids),
+                    )
+                    return
+
                 deleted_ids = known_memo_ids - current_sync_keys
-                for d_id in deleted_ids:
+                for d_id in sorted(deleted_ids):
                     yield {
                         "id": f"{id_prefix}:memo:{d_id}",
                         "_deleted": True,
                     }
                 state["known_ids"] = sorted(current_sync_keys)
+            else:
+                # Incremental delta run: add newly seen memo records to known_ids
+                state["known_ids"] = sorted(known_memo_ids | current_sync_keys)
 
             if newest_posted:
                 state["last_posted_at"] = newest_posted
@@ -393,9 +443,18 @@ def brex_source(
                 current_sync_keys.add(b_id)
                 yield row
 
+            # Empty sweep protection
+            if known_budget_ids and not current_sync_keys and not allow_empty_sweep:
+                logger.warning(
+                    "Brex: budget sweep returned 0 records but %d were known; "
+                    "skipping deletion to prevent mass tombstoning.",
+                    len(known_budget_ids),
+                )
+                return
+
             # Emit tombstones for deleted budgets
             deleted_ids = known_budget_ids - current_sync_keys
-            for d_id in deleted_ids:
+            for d_id in sorted(deleted_ids):
                 yield {
                     "id": f"{id_prefix}:budget:{d_id}",
                     "_deleted": True,
@@ -420,11 +479,43 @@ def brex_source(
 
     source = _brex()
 
+    # Isolate dlt pipeline state if resource_name is provided
+    if resource_name:
+        setattr(source, PIPELINE_SCOPE_ATTR, resource_name)
+
     # Route brex_memos specifically through document mode
     if "memos" in resources_to_sync:
         setattr(brex_memos, DOCUMENT_SOURCE_ATTR, "brex")
         if BREX_MEMOS_TABLE in source.resources:
             setattr(source.resources[BREX_MEMOS_TABLE], DOCUMENT_SOURCE_ATTR, "brex")
-        setattr(source, DOCUMENT_SOURCE_ATTR, "brex")
+        # Tag source as document mode ONLY when selection is strictly memos
+        if resources_to_sync == {"memos"}:
+            setattr(source, DOCUMENT_SOURCE_ATTR, "brex")
 
     return source
+
+
+def brex_memos_source(
+    token: str | None = None,
+    *,
+    base_url: str = DEFAULT_BASE_URL,
+    id_prefix: str = DEFAULT_ID_PREFIX,
+    client: Any = None,
+    full_refresh: bool = False,
+    allow_empty_sweep: bool = False,
+    resource_name: str | None = None,
+):
+    """Return a dedicated document-mode dlt source yielding Brex memos.
+
+    Tagged with DOCUMENT_SOURCE_ATTR = 'brex' for routing to Cognee LLM knowledge graph extraction.
+    """
+    return brex_source(
+        token=token,
+        include=["memos"],
+        base_url=base_url,
+        id_prefix=id_prefix,
+        client=client,
+        full_refresh=full_refresh,
+        allow_empty_sweep=allow_empty_sweep,
+        resource_name=resource_name,
+    )

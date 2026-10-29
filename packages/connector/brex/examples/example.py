@@ -3,7 +3,7 @@
 This script demonstrates:
 1. Connecting with Brex Bearer API Token.
 2. Ingesting expense memos into the document path (searchable via LLM knowledge graph).
-3. Ingesting structured expenses and budgets incrementally with forget-on-delete.
+3. Ingesting structured expenses and budgets into the relational path with merge reconciliation.
 4. Searching corporate expenses using cognee.search().
 """
 
@@ -12,7 +12,7 @@ import os
 
 import cognee
 
-from cognee_community_connector_brex import brex_source
+from cognee_community_connector_brex import brex_memos_source, brex_source
 
 
 async def main() -> None:
@@ -21,16 +21,16 @@ async def main() -> None:
     # 1. Retrieve API token from environment variable
     token = os.getenv("BREX_API_TOKEN", "b_usr_sample_token_123")
 
-    # 2. Configure the Brex source with desired resources
-    source = brex_source(
-        token=token,
-        include=["expenses", "memos", "budgets"],
-    )
+    # 2. Configure Brex sources:
+    # - spend_source: structured relational expenses & departmental budgets
+    # - memos_source: document cards for memos and receipts (LLM knowledge graph)
+    spend_source = brex_source(token=token, include=["expenses", "budgets"])
+    memos_source = brex_memos_source(token=token)
 
-    # 3. Ingest into Cognee memory
-    print("Ingesting Brex corporate expenses and budgets into memory...")
+    # 3. Ingest both into Cognee memory
+    print("Ingesting Brex corporate expenses, budgets, and memos into memory...")
     await cognee.remember(
-        source,
+        [spend_source, memos_source],
         dataset_name="brex_spend",
         primary_key="id",
         write_disposition="merge",

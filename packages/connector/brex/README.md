@@ -10,11 +10,13 @@ Syncs corporate spend data incrementally via Brex's native `posted_at_start` hig
 
 - **Bearer Token Authentication**: Uses Brex User or Admin API tokens with `expenses.read` and `budgets.read` scopes.
 - **Dual-Path Ingestion Model**:
-  - **Document Mode (`brex_memos`)**: Renders transaction notes, user justifications, merchants, employee details, and categories into Markdown document cards (`DOCUMENT_SOURCE_ATTR = "brex"`). These flow directly into Cognee's text chunking and LLM knowledge graph extraction.
-  - **Structured Relational Mode (`brex_expenses`, `brex_budgets`)**: Ingests tabular financial records with normalized foreign keys (`budget_id`, `parent_budget_id`) and typed fields (`amount`, `currency`, `category`, `status`).
-- **Incremental High-Watermark Sync**: Leverages Brex's `posted_at_start` filter and cursor pagination to fetch only changed or newly posted expenses on subsequent runs.
-- **Forget-on-Delete Reconciliation**: Identifies deleted, voided, or refunded items and emits hard-delete tombstones (`{"_deleted": True}`) that drive Cognee's `orphan_cleanup` across graph, vector, and relational stores.
-- **Anti-Corruption Guardrail**: If an API request fails, times out, or encounters rate limits, deletion reconciliation is **aborted immediately** without emitting tombstones to protect graph state from partial sync drops.
+  - **Document Mode (`brex_memos_source`)**: Renders transaction notes, user justifications, merchants, employee details, and categories into Markdown document cards (`DOCUMENT_SOURCE_ATTR = "brex"`). These flow directly into Cognee's text chunking and LLM knowledge graph extraction.
+  - **Structured Relational Mode (`brex_source`)**: Ingests tabular financial records (`brex_expenses`, `brex_budgets`) with normalized foreign keys (`budget_id`, `parent_budget_id`) and typed fields (`amount`, `currency`, `category`, `status`).
+- **Incremental High-Watermark Sync**: Leverages Brex's `posted_at_start` filter and cursor pagination to fetch only changed or newly posted expenses on subsequent runs, accumulating new IDs in resource state.
+- **Forget-on-Delete Reconciliation**: On full sweeps (`full_refresh=True`), the connector reconciles active records against `known_ids`. Missing or voided IDs emit hard-delete tombstones (`{"_deleted": True}`) that drive Cognee's `orphan_cleanup` across graph, vector, and relational stores.
+- **Anti-Corruption & Empty-Sweep Guardrails**:
+  - If an API request fails, times out, or encounters rate limits, deletion reconciliation is **aborted immediately** without emitting tombstones.
+  - If a sweep returns 0 records when previous records were known, deletion is skipped to protect against transient empty responses, unless `allow_empty_sweep=True`.
 - **Global ID Namespacing**: Stable global IDs (`brex:expense:{id}`, `brex:memo:{id}`, `brex:budget:{id}`).
 
 ---
@@ -50,19 +52,21 @@ cd packages/connector/brex && uv sync --all-extras
 import asyncio
 import os
 import cognee
-from cognee_community_connector_brex import brex_source
+from cognee_community_connector_brex import brex_memos_source, brex_source
 
 
 async def main():
-    # Configure the Brex source
-    source = brex_source(
-        token=os.environ["BREX_API_TOKEN"],
-        include=["expenses", "memos", "budgets"],
-    )
+    token = os.environ["BREX_API_TOKEN"]
+
+    # 1. Structured relational financial data (expenses & budgets)
+    spend_source = brex_source(token=token, include=["expenses", "budgets"])
+
+    # 2. Semantic document cards for LLM knowledge graph extraction
+    memos_source = brex_memos_source(token=token)
 
     # Ingest into Cognee memory
     await cognee.remember(
-        source,
+        [spend_source, memos_source],
         dataset_name="brex_spend",
         primary_key="id",
         write_disposition="merge",
@@ -96,10 +100,11 @@ if __name__ == "__main__":
 
 ## Synchronization & Forget-on-Delete Architecture
 
-1. **Initial Backfill**: The connector scans corporate card expenses and records the latest `posted_at` timestamp in DLT resource state (`last_posted_at`).
-2. **Incremental Delta**: On subsequent runs, queries only fetch records where `posted_at_start >= :last_posted_at`.
-3. **ID Reconciliation**: On full snapshot runs, the connector matches upstream active records against `known_ids`. Missing or voided IDs emit tombstone rows (`{"id": "...", "_deleted": True}`).
-4. **Orphan Cleanup**: On `write_disposition="merge"`, DLT removes marked rows, and Cognee's `orphan_cleanup` purges corresponding entities and embeddings from the graph, vector, and relational stores.
+1. **Initial Backfill**: The connector scans corporate card expenses, records initial IDs in `known_ids`, and updates the latest `posted_at` timestamp in DLT resource state (`last_posted_at`).
+2. **Incremental Delta**: On subsequent runs, queries only fetch records where `posted_at_start >= :last_posted_at` and accumulate new IDs into `known_ids`.
+3. **Full Sweep ID Reconciliation**: When `full_refresh=True` (or without a watermark cursor), the connector reconciles upstream active records against `known_ids`. Missing or voided IDs emit tombstone rows (`{"id": "...", "_deleted": True}`).
+4. **Empty-Sweep Protection**: If an unexpected empty listing occurs while records are already known, deletion is skipped to protect against transient wipes.
+5. **Orphan Cleanup**: On `write_disposition="merge"`, DLT removes marked rows, and Cognee's `orphan_cleanup` purges corresponding entities and embeddings from the graph, vector, and relational stores.
 
 ---
 
