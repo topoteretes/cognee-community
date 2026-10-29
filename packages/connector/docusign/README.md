@@ -71,11 +71,14 @@ Choose what to ingest:
 | Argument | Effect |
 | --- | --- |
 | `statuses=["completed"]` | Envelope statuses to ingest. `voided` and `deleted` are rejected: those envelopes are always forgotten. |
-| `folder_ids=[...]` | Only envelopes in these folders (folder id, name or type such as `sentitems`). Each configured folder also becomes a node set. |
+| `folder_ids=[...]` | Only envelopes in these folders: a folder id, a folder name (resolved through `GET /folders`), or a system folder such as `sentitems`. An unknown folder raises. Each configured folder also becomes a node set. |
 | `from_date="2025-01-01"` | Ignore envelopes whose status changed before this date. |
 | `node_set_field="agreement_type"` | Use this envelope custom field's value as the envelope's node set, so `recall` can be scoped to just NDAs. |
 | `include_certificates=False` | Append the certificate of completion to each PDF. Off by default (signer IPs, audit data). |
 | `include_form_data=True` | Add what signers typed into form fields to the text. One extra request per ingested envelope. |
+| `max_requests=None` | Stop cleanly after about this many API requests in one run and resume next run. See [Staying under rate limits](#staying-under-rate-limits). |
+| `resource_name="docusign_envelopes"` | Name of the staging table and the incremental state. Every DocuSign source syncing into one dataset needs its own name. |
+| `check_active=None` | Optional callable for hosts, run before every request and around each row, to stop a sync whose connection was revoked. |
 | `account_id`, `base_uri` | Read a specific account / host. Normally discovered from `/oauth/userinfo`. |
 | `environment="demo"` | `"demo"` (developer sandbox) or `"production"`. |
 
@@ -110,8 +113,8 @@ Pass the arguments, or set the environment variables:
 The connector only sends `GET` requests. DocuSign has no read-only scope though: the `signature`
 scope that the API requires also allows sending and voiding. To keep the blast radius small,
 create a **dedicated API user** with a limited permission profile (no sending, no admin rights),
-share only the envelopes you want ingested with that user, and use that user's GUID. Visibility is
-per user, so the connector keeps separate state per account and user.
+share only the envelopes you want ingested with that user, and use that user's GUID. What the
+connector sees depends on that user's access.
 
 ## Setup: developer account and integration key
 
@@ -168,10 +171,16 @@ disabled, `form_data`) and renders one document.
   the whole run loaded.
 - **Unchanged envelopes** that the overlap window re-lists are skipped without a download. cognee
   would also keep them as they are, because the rendered text is identical.
-- **Failure safety**: a failed page, a `401`, exhausted `5xx` retries or a long rate limit abort
-  the run before anything is deleted or the cursor moves. The next run retries from the same
-  point. `429` responses are waited out when DocuSign asks for a short wait (`Retry-After` /
-  `X-RateLimit-Reset`) and otherwise stop the run.
+- **Failure safety**: a failed page, a `401`, a response that is not a JSON object, exhausted `5xx`
+  retries or a client error abort the run before anything is deleted or the cursor moves. The next
+  run retries from the same point. A `429` is waited out when DocuSign asks for a short wait
+  (`Retry-After` / `X-RateLimit-Reset`, at most 60 s) and otherwise stops the run cleanly, see
+  below.
+- **Listing order**: oldest status change first, so a run that stops early can resume at its
+  cursor. A listing that keeps answering with the same `nextUri` raises instead of looping.
+- **Folders**: DocuSign's list endpoint rejects a custom folder *name* (HTTP 400) and returns
+  nothing when a folder filter is combined with several `status` values. So names are turned into
+  folder ids first, and with `folder_ids` the status is checked in the connector, not in the query.
 
 ### Forget-on-delete
 
@@ -180,11 +189,16 @@ date, so a `from_date` listing alone never sees them:
 
 - A **completed** envelope cannot be voided. Removing it means moving it to the **Deleted** folder
   (`recyclebin`) or purging it. Neither changes `statusChangedDateTime`.
-- A **purge** only changes `purgeState` (for example `documents_purged`).
+- A **purge** only changes `purgeState` (for example `documents_queued`).
+- DocuSign **empties the Deleted folder after a while**. The envelope then sits in no folder and
+  its documents are no longer readable by the API user (HTTP 400
+  `USER_NOT_ENVELOPE_SENDER_OR_RECIPIENT`). A new sync that lists such an envelope skips it
+  instead of failing, and an ingested one is forgotten.
 
 So every run does two checks:
 
-1. Envelopes the listing returns that are `voided`, `deleted`, in the Deleted folder, purged, or no
+1. Envelopes the listing returns that are `voided`, `deleted`, in the Deleted folder or in no
+   folder, purged (any `purgeState` but `unpurged`, a queued purge included), unreadable, or no
    longer in scope (status or folder) become tombstones.
 2. Every envelope id the connector ingested earlier but the listing did not return is looked up
    again by id (`envelope_ids=...` with folders and purge information, 50 ids per request). Ones
@@ -193,10 +207,22 @@ So every run does two checks:
 A tombstone sets the `_deleted` hard-delete column, so dlt removes the row on `merge` and cognee's
 `orphan_cleanup` removes the document's graph and vector nodes.
 
-Two safety valves keep a bad response from emptying a dataset: if a full listing returns no
-envelopes at all while some were known (a folder typo, an outage), nothing is forgotten that run;
-and if the by-id lookup returns nothing while the listing also returned nothing, nothing is
-forgotten either.
+Safety valves keep a bad response from emptying a dataset: if a full listing returns no envelopes
+at all while some were known, nothing is forgotten that run; if the by-id lookup returns nothing
+while the listing also returned nothing, nothing is forgotten either; and a run that was cut short
+never forgets anything, because its listing is incomplete. A queued purge counts as removed, so if
+one is later cancelled, the envelope comes back on the next full re-list (change a setting, or run
+with `write_disposition="replace"`).
+
+### Staying under rate limits
+
+DocuSign enforces hourly API limits, so the first sync of a large account may not fit in one hour.
+Pass `max_requests=N` and a run stops cleanly after about `N` requests: it keeps what it read,
+leaves the cursor at the first envelope it did not reach, and the next run resumes there. Each run
+reads at least one envelope, so even a tiny budget converges. A `429` that asks for a long wait
+does the same. Such a run reports `failed`, plus `failed_budget` or `failed_rate_limit`, in the
+[sync stats](#sync-stats). A scope change over an already ingested dataset needs its whole listing,
+so it cannot resume: a long `429` there stops the run with an error and nothing changes.
 
 ### Request cost
 
@@ -212,7 +238,7 @@ a possible follow-up and is not part of this connector.
 
 The source exposes counts only, never subjects or contract text, on `source.cognee_sync_stats`:
 `full_sync`, `listed`, `ingested`, `unchanged`, `forgotten`, `rechecked`, `pdf_no_text`
-(scans), `pdf_unreadable`.
+(scans), `pdf_unreadable`, `failed`, `failed_rate_limit`, `failed_budget`.
 
 ### Limits
 
@@ -220,7 +246,9 @@ The source exposes counts only, never subjects or contract text, on `source.cogn
   header only.
 - A change that DocuSign does not record as a status change (for example editing a custom field on
   a finished envelope) is picked up only if the envelope is re-listed for another reason.
-- One source per account and user per dataset: the staging table name is fixed.
+- One `resource_name` per source in a dataset. A run refuses to continue when the stored state
+  belongs to a different account, rather than forgetting the other account's envelopes. Renaming a
+  source starts it over; documents synced under the old name are not cleaned up.
 
 ## Tests
 
@@ -232,6 +260,7 @@ uv run pytest
 The tests need no DocuSign account. `tests/fake_docusign.py` is mounted on a real `requests`
 session, so the JWT exchange, account discovery, `nextUri` paging, retries and token renewal all
 run unchanged, and it mimics DocuSign's behaviour that matters here (the Deleted folder and purges
-do not move `statusChangedDateTime`). `tests/test_docusign_cognee.py` runs the real
+do not move `statusChangedDateTime`, an emptied Deleted folder leaves no folders and unreadable
+documents, and a folder filter combined with several statuses returns nothing). `tests/test_docusign_cognee.py` runs the real
 `cognee.add` + `cognify` with a mocked LLM and checks that removed envelopes leave the graph and
 that an unchanged re-sync makes no LLM call.
