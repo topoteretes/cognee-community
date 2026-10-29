@@ -12,9 +12,9 @@ what the columns mean. A table's rows and its card share a node set
 
 ## Requirements
 
-- cognee **1.6.4** (pinned). The connector relies on document mode with table-scoped cleanup
+- cognee **1.6.4** or later. The connector relies on document mode with table-scoped cleanup
   and per-row node sets (`DOCUMENT_SYNC_VERSION` 2).
-- Python 3.11 to 3.13.
+- Python 3.10 to 3.14.
 - A provisioned Redshift cluster or a Redshift Serverless workgroup.
 
 ## Install
@@ -77,7 +77,7 @@ the full flow.
 |---|---|
 | `RedshiftTable(name, primary_key, cursor_column=None, columns=None, where=None)` | A table or view. `name` is `schema.table` (lower case unless it was created quoted). `primary_key` is one column or a list. |
 | `RedshiftQuery(name, sql, primary_key, cursor_column=None)` | A `SELECT` whose result is synced like a table. `name` identifies its documents. |
-| `connection` | `DataApiConnection(...)` (default, from `REDSHIFT_*` env vars) or `DirectConnection(...)`. |
+| `connection` | Required: `DataApiConnection(...)` or `DirectConnection(...)`. There is no default, so you decide where settings come from. |
 | `include_table_cards` | Also ingest one card per table. Default `True`. |
 | `full_refresh` | Read every row this run, not just rows past the cursor. |
 | `resource_name` | Name for this connection's dlt state and staging tables. Default `redshift`; give each cluster its own when several sync into one dataset. |
@@ -89,10 +89,11 @@ duplicates, selections), never row content.
 
 ### 1. Choose how to authenticate
 
-`DataApiConnection` takes its settings as arguments or from the environment. AWS credentials
-come from the normal boto3 chain (env vars, `~/.aws`, an instance, task or Lambda role).
+`DataApiConnection` takes its settings as arguments. `DataApiConnection.from_env()` reads them
+from the environment variables in the table below instead. AWS credentials come from the
+normal boto3 chain (env vars, `~/.aws`, an instance, task or Lambda role).
 
-| Target | Arguments | Environment |
+| Target | Arguments | Environment (`from_env()`) |
 |---|---|---|
 | Serverless, IAM identity | `database`, `workgroup_name` | `REDSHIFT_DATABASE`, `REDSHIFT_WORKGROUP_NAME` |
 | Provisioned, temporary credentials for a database user | `database`, `cluster_identifier`, `db_user` | `REDSHIFT_DATABASE`, `REDSHIFT_CLUSTER_IDENTIFIER`, `REDSHIFT_DB_USER` |
@@ -235,9 +236,10 @@ connection = DirectConnection(
 - **Soft deletes.** Put them in `where` (`"deleted_at IS NULL"`). A row that stops matching is
   forgotten like a deleted one.
 - **Dropped tables.** A table that was synced before and no longer appears in
-  `svv_all_tables` (dropped, or the user lost access) is forgotten with its card. A table
-  that was never synced and cannot be found is an error, so a typo never ingests nothing
-  quietly.
+  `svv_all_tables` is checked with `SELECT 1 FROM <table> LIMIT 0`. Only when Redshift answers
+  that it does not exist is the table forgotten, with its card. Any other answer (permission
+  denied, a timeout) aborts the run and keeps everything. A table that was never synced and
+  cannot be found is an error, so a typo never ingests nothing quietly.
 - **Changed selection.** Removing a selection forgets its rows. Changing its columns, key,
   cursor or `where` re-reads it once.
 - **Errors never delete.** A statement that fails, is aborted or times out (`timeout=`,
@@ -282,6 +284,12 @@ connection = DirectConnection(
 - dlt keeps the cursors outside cognee's data. If you prune cognee's data but keep the dlt
   pipeline directory, run once with `full_refresh=True`.
 - Table cards come from `svv_all_tables` and `svv_all_columns`. Queries have no card.
+- A table is read with one statement per run, and the Data API caps a statement's result at
+  500 MB and a single row at 64 KB. A table over either limit fails the run, with nothing
+  forgotten. Narrow it with `columns=` (leave out huge text columns) and `where=`, or sync an
+  aggregate with `RedshiftQuery`.
+- `where` and `sql` run exactly as you write them, so give the connector a read-only
+  database user.
 
 ## Trying it on a real Redshift
 
