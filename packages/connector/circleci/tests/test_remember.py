@@ -8,6 +8,7 @@ becomes ``cipipeline3``), which shows what is in the graph after each sync.
 
 import asyncio
 import importlib
+import json
 import re
 
 import cognee
@@ -92,9 +93,9 @@ async def _prune():
     await cognee.prune.prune_system(metadata=True)
 
 
-async def _remember(session, dataset, slugs=(SLUG,)):
+async def _remember(session, dataset, slugs=(SLUG,), resource_name="circleci_pipelines"):
     await cognee.remember(
-        circleci_source(project_slugs=list(slugs), session=session),
+        circleci_source(project_slugs=list(slugs), service=session, resource_name=resource_name),
         dataset_name=dataset,
         primary_key="id",
         write_disposition="merge",
@@ -108,9 +109,9 @@ async def _memory(dataset):
     datasets = [d for d in await cognee.datasets.list_datasets() if d.name == dataset]
     documents = await cognee.datasets.list_data(datasets[0].id) if datasets else []
     titles = {
-        d.external_metadata["external_id"]: d.external_metadata["title"]
-        for d in documents
-        if (d.external_metadata or {}).get("source") == "circleci"
+        meta["external_id"]: meta["title"]
+        for meta in map(_document_metadata, documents)
+        if meta.get("source") == "circleci"
     }
     nodes, _ = await (await get_graph_engine()).get_graph_data()
     entities = {
@@ -120,6 +121,18 @@ async def _memory(dataset):
         if (match := _ENTITY.search(str(value)))
     }
     return titles, entities
+
+
+def _document_metadata(document) -> dict:
+    """The document's source metadata: in ``system_metadata`` on current cognee,
+    in ``external_metadata`` on releases before the move."""
+    for field in ("system_metadata", "external_metadata"):
+        meta = getattr(document, field, None)
+        if isinstance(meta, str):
+            meta = json.loads(meta)
+        if isinstance(meta, dict) and meta.get("source"):
+            return meta
+    return {}
 
 
 def _with_other_project(session):
@@ -157,7 +170,7 @@ def test_remember_ingests_new_pipelines_and_updates_finished_ones(cognee_env, se
     assert finished[0][SLOW_RERUN].endswith(": failed")
 
 
-def test_remember_forgets_a_deleted_project(cognee_env, session_for):
+def test_remember_forgets_a_dropped_project(cognee_env, session_for):
     dataset = "circleci_forget"
 
     async def scenario():
@@ -165,10 +178,8 @@ def test_remember_forgets_a_deleted_project(cognee_env, session_for):
 
         await _remember(_with_other_project(session_for("index.json")), dataset, (SLUG, OTHER))
         before = await _memory(dataset)
-
-        gone = _with_other_project(session_for("index.json"))
-        gone.queue(f"/project/{SLUG}/pipeline", (404, {"message": "Project not found"}))
-        await _remember(gone, dataset, (SLUG, OTHER))
+        # The fixture project is dropped from project_slugs.
+        await _remember(_with_other_project(session_for("index.json")), dataset, (OTHER,))
         after = await _memory(dataset)
 
         await _prune()
@@ -181,3 +192,50 @@ def test_remember_forgets_a_deleted_project(cognee_env, session_for):
     # The fixture project's pipelines are gone from the dataset and the graph.
     assert list(after_titles) == ["other-77"]
     assert after_entities == {"cipipeline77"}
+
+
+def test_remember_forgets_the_last_project_of_a_dataset(cognee_env, session_for):
+    dataset = "circleci_emptied"
+
+    async def scenario():
+        await _prune()
+
+        await _remember(session_for("index.json"), dataset)
+        before = await _memory(dataset)
+        empty = session_for("index.json")
+        empty.queue(f"/project/{OTHER}/pipeline", (200, {"items": []}))
+        await _remember(empty, dataset, (OTHER,))
+        after = await _memory(dataset)
+
+        await _prune()
+        return before, after
+
+    (before_titles, _), (after_titles, after_entities) = asyncio.run(scenario())
+
+    assert len(before_titles) == 5
+    assert after_titles == {}
+    assert after_entities == set()
+
+
+def test_remember_keeps_two_sources_apart_in_one_dataset(cognee_env, session_for):
+    dataset = "circleci_two_sources"
+
+    async def scenario():
+        await _prune()
+
+        await _remember(session_for("index.json"), dataset, resource_name="circleci_a")
+        other = _with_other_project(session_for("index.json"))
+        await _remember(other, dataset, (OTHER,), resource_name="circleci_b")
+        # A second run of each: neither sees the other's project as dropped.
+        await _remember(session_for("index.json"), dataset, resource_name="circleci_a")
+        other = _with_other_project(session_for("index.json"))
+        await _remember(other, dataset, (OTHER,), resource_name="circleci_b")
+        after = await _memory(dataset)
+
+        await _prune()
+        return after
+
+    titles, entities = asyncio.run(scenario())
+
+    assert len(titles) == 6
+    assert entities == {f"cipipeline{n}" for n in (1, 2, 3, 4, 5, 77)}

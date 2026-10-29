@@ -19,13 +19,15 @@ DATASET_NAME = "circleci"
 
 
 async def main() -> None:
+    token = os.environ.get("CIRCLECI_TOKEN")
     slug = os.environ.get("CIRCLECI_PROJECT_SLUG")
-    if not (os.environ.get("CIRCLECI_TOKEN") and slug):
+    if not (token and slug):
         print("Set CIRCLECI_TOKEN and CIRCLECI_PROJECT_SLUG to run this example.")
         return
 
     await cognee.remember(
-        circleci_source(project_slugs=[slug]),
+        # Each CircleCI source syncing into a dataset needs its own resource_name.
+        circleci_source(project_slugs=[slug], token=token, resource_name="circleci_example"),
         dataset_name=DATASET_NAME,
         primary_key="id",
         # "merge" keeps earlier pipelines. The default ("replace") would forget

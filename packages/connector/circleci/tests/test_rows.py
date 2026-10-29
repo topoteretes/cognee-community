@@ -1,11 +1,14 @@
 """Pipeline → document row, built from recorded API responses."""
 
+import copy
+
 from cognee_community_connector_circleci.circleci import (
     DEFAULT_BASE_URL,
     _fetch_workflows,
     _message_tail,
     _overall_status,
     _pipeline_to_row,
+    _redact,
 )
 
 SLUG = "gh/rokadepiyush49-rgb/cognee-circleci-fixture"
@@ -123,3 +126,80 @@ def test_overall_status_prefers_unfinished_then_worst():
     assert _overall_status({}, [{"status": "failed"}, {"status": "running"}]) == "running"
     assert _overall_status({}, [{"status": "success"}, {"status": "failed"}]) == "failed"
     assert _overall_status({}, [{"status": "success"}]) == "success"
+
+
+def test_overall_status_uses_the_latest_run_of_each_workflow():
+    first = {"id": "a", "name": "build", "status": "failed", "created_at": "2026-10-07T21:00:00Z"}
+    rerun = {"id": "b", "name": "build", "status": "success", "created_at": "2026-10-07T21:10:00Z"}
+
+    assert _overall_status({}, [rerun, first]) == "success"
+    assert _overall_status({}, [first, {**rerun, "status": "failed"}]) == "failed"
+
+
+def test_row_text_does_not_depend_on_api_order(fake_session, load_fixture):
+    pipeline = load_fixture("main/pipeline.json")
+    workflows = _fetch_workflows(fake_session, DEFAULT_BASE_URL, SLUG, pipeline["id"])
+    shuffled = copy.deepcopy(workflows)
+    for workflow in shuffled:
+        workflow["jobs"].reverse()
+        for job in workflow["jobs"]:
+            job.get("failing_tests", []).reverse()
+    shuffled.reverse()
+
+    assert _pipeline_to_row(pipeline, shuffled) == _pipeline_to_row(pipeline, workflows)
+
+
+def test_failure_output_is_redacted():
+    pipeline = {
+        "id": "p1",
+        "number": 8,
+        "project_slug": SLUG,
+        "state": "errored",
+        "created_at": "2026-10-08T10:00:00Z",
+        "errors": [{"type": "config", "message": "bad value for API_KEY=abcd1234efgh"}],
+        "vcs": {"branch": "main"},
+    }
+    job = {
+        "id": "j1",
+        "name": "test",
+        "status": "failed",
+        "failing_tests": [
+            {
+                "name": "test_login",
+                "message": (
+                    "E   AssertionError: password='hunter22' rejected\n"
+                    "using ghp_abcdefghijklmnopqrstuvwxyz0123456789 and "
+                    "https://deploy:s3cr3tpass@example.com/repo\n"
+                    "header Authorization: Bearer abc.def.ghi-jkl\n"
+                    "env token my-own-circle-token"
+                ),
+            }
+        ],
+    }
+    workflows = [{"id": "w1", "name": "build", "status": "failed", "jobs": [job]}]
+
+    content = _pipeline_to_row(pipeline, workflows, secrets=["my-own-circle-token"])["content"]
+
+    for secret in ("abcd1234efgh", "hunter22", "ghp_abcdef", "s3cr3tpass", "abc.def", "my-own"):
+        assert secret not in content
+    assert "password='[REDACTED]' rejected" in content
+    assert "https://deploy:[REDACTED]@example.com/repo" in content
+    assert "Bearer [REDACTED]" in content
+
+
+def test_redaction_leaves_ordinary_failures_alone():
+    message = "E   KeyError: 'timeout'\ntests/test_broken.py:26: KeyError"
+
+    assert _redact(message) == message
+
+
+def test_workflow_order_does_not_change_the_row(session_for, load_fixture):
+    # slow-finished has two workflows (slow-check, build-and-test).
+    session = session_for("slow-finished/index.json")
+    pipeline = load_fixture("slow-finished/pipeline.json")
+    workflows = _fetch_workflows(session, DEFAULT_BASE_URL, SLUG, pipeline["id"])
+    assert len(workflows) == 2
+
+    assert _pipeline_to_row(pipeline, workflows[::-1]) == _pipeline_to_row(pipeline, workflows)
+    content = _pipeline_to_row(pipeline, workflows)["content"]
+    assert content.index("Workflow build-and-test") < content.index("Workflow slow-check")

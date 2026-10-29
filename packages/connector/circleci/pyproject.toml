@@ -3,11 +3,11 @@ name = "cognee-community-connector-circleci"
 version = "0.1.0"
 description = "CircleCI data-source connector for cognee — sync pipeline, workflow and job outcomes (with failing tests, not logs) into memory"
 readme = "README.md"
-requires-python = ">=3.11,<3.14"
+requires-python = ">=3.10,<3.14"
 dependencies = [
-    # Requires cognee "document-mode" (DOCUMENT_SOURCE_ATTR + resolve_dlt_sources
-    # routing rows through cognify), first shipped in cognee 1.4.0.
-    "cognee==1.4.0",
+    # Requires table-scoped document cleanup and per-source pipeline state
+    # (DOCUMENT_SYNC_VERSION >= 1, PIPELINE_SCOPE_ATTR), first shipped in cognee 1.6.1.
+    "cognee>=1.6.1,<2",
     "dlt[sqlalchemy]>=1.9.0,<2",
     "requests>=2.31.0,<3",
 ]
@@ -25,7 +25,7 @@ packages = ["cognee_community_connector_circleci"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "N", "B", "UP", "C4", "PGH", "SIM", "RUF"]
