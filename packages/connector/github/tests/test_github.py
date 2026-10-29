@@ -6,10 +6,14 @@ Two layers:
     proves re-sync edits + forget-on-delete (replace snapshot).
 """
 
-import pytest
 import dlt
+
 from cognee_community_connector_github.github import (
-    _repo_to_row, _issue_to_row, _pr_to_row, _commit_to_row, _release_to_row,
+    _commit_to_row,
+    _issue_to_row,
+    _pr_to_row,
+    _release_to_row,
+    _repo_to_row,
 )
 
 # ---------------------------------------------------------------------------
@@ -52,12 +56,19 @@ def test_release_row_shape_stable_id():
 
 class FakeResp:
     def __init__(self, data):
-        self.status_code = 200; self.headers = {"content-type":"application/json","link":""}
+        self.status_code = 200
+        self.headers = {"content-type": "application/json", "link": ""}
         self._data = data
-    def json(self): return self._data
-    def text(self): return str(self._data)
+
+    def json(self):
+        return self._data
+
+    def text(self):
+        return str(self._data)
+
     def raise_for_status(self):
-        if self.status_code >= 400: raise Exception(str(self.status_code))
+        if self.status_code >= 400:
+            raise Exception(str(self.status_code))
 
 class FakeClient:
     def __init__(self, data):
@@ -91,8 +102,7 @@ def test_pipeline_sync_edit_and_delete(tmp_path, monkeypatch):
     # delete: empty issues (simulating vanished)
     data["/repos/o/test/issues"] = []
     pl.run(github_source(token="fake", repos=["o/test"], client=fake))
-    with pl.sql_client() as c:
-        with c.execute_query("SELECT id FROM github_documents") as cur:
-            ids = [r[0] for r in cur.fetchall()]
+    with pl.sql_client() as c, c.execute_query("SELECT id FROM github_documents") as cur:
+        ids = [r[0] for r in cur.fetchall()]
     assert "issue:o/test#1" not in ids  # deleted/vanished drops out
     assert "repo:o/test" in ids
