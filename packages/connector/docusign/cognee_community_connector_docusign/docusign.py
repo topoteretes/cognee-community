@@ -48,23 +48,26 @@ Design
   run therefore does two checks:
 
   1. envelopes the listing returns that are voided, deleted, in the recycle
-     bin, purged, or no longer in scope become tombstones;
+     bin or in no folder, purged, unreadable, or no longer in scope become
+     tombstones;
   2. every envelope id the previous runs ingested but this listing did not
      return is looked up again by id (``envelope_ids=...`` with folders and
      purge information) and tombstoned when it is gone.
 
   The ``_deleted`` hard-delete column makes dlt remove the row on ``merge``,
   and cognee's ``orphan_cleanup`` then forgets it from the graph and vectors.
-* **Failure safety**: errors (401, exhausted 429/5xx retries, network) are not
-  swallowed. They abort the run before dlt commits the new cursor, so nothing
-  is deleted and the next run retries from the same point.
+* **Failure safety**: errors (401, exhausted 5xx retries, network, a body that
+  is not a JSON object) are not swallowed. They abort the run before dlt
+  commits the new cursor, so nothing is deleted and the next run retries from
+  the same point. A request budget or a long 429 instead stops the run cleanly:
+  progress is kept, nothing is forgotten, and the next run resumes at the cursor.
 """
 
 import io
 import json
 import os
 import re
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -84,7 +87,11 @@ from cognee_community_connector_docusign.auth import (
     resolve_account,
     resolve_credentials,
 )
-from cognee_community_connector_docusign.client import DocuSignAPIError, DocuSignClient
+from cognee_community_connector_docusign.client import (
+    DocuSignAPIError,
+    DocuSignClient,
+    DocuSignRateLimitError,
+)
 
 logger = get_logger("docusign_connector")
 
@@ -106,6 +113,10 @@ _REMOVED_STATUSES = frozenset({"voided", "deleted"})
 # Statuses that are never an agreement to read.
 _REJECTED_STATUSES = _REMOVED_STATUSES | {"created", "template"}
 _UNPURGED = frozenset({"", "unpurged"})
+# DocuSign empties the Deleted folder after a while. The envelope then sits in no
+# folder, and its documents answer HTTP 400 with this code: the API user can no
+# longer read it (seen live).
+_UNREADABLE_CODES = frozenset({"USER_NOT_ENVELOPE_SENDER_OR_RECIPIENT"})
 # Recipient categories shown as "received a copy".
 _COPY_CATEGORIES = ("carbonCopies", "certifiedDeliveries", "agents", "editors", "intermediaries")
 _SIGNER_CATEGORIES = ("signers", "inPersonSigners")
@@ -119,7 +130,28 @@ _STAT_KEYS = (
     "rechecked",
     "pdf_no_text",
     "pdf_unreadable",
+    "failed",
+    "failed_rate_limit",
+    "failed_budget",
 )
+
+# Folder names the list endpoint accepts besides folder GUIDs. They are virtual
+# or system folders, so ``GET /folders`` does not always return them.
+_SYSTEM_FOLDERS = frozenset(
+    {
+        "awaiting_my_signature",
+        "completed",
+        "draft",
+        "drafts",
+        "expiring_soon",
+        "inbox",
+        "out_for_signature",
+        "recyclebin",
+        "sentitems",
+        "waiting_for_others",
+    }
+)
+_RESOURCE_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 _FRACTION_RE = re.compile(r"(\.\d{6})\d+")
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
@@ -173,6 +205,9 @@ def docusign_source(
     node_set_field: str | None = None,
     include_certificates: bool = False,
     include_form_data: bool = True,
+    max_requests: int | None = None,
+    resource_name: str = DOCUSIGN_TABLE_NAME,
+    check_active: Callable[[], None] | None = None,
     session: Any = None,
 ):
     """Create a dlt source that yields DocuSign envelopes as documents.
@@ -190,9 +225,10 @@ def docusign_source(
             (``DOCUSIGN_ENVIRONMENT``).
         statuses: Envelope statuses to ingest. ``voided`` and ``deleted`` are
             not accepted: those envelopes are always forgotten.
-        folder_ids: Only ingest envelopes in these folders (ids, names or
-            types such as ``sentitems``). Each configured folder also becomes a
-            node set. An envelope that leaves the folders is forgotten.
+        folder_ids: Only ingest envelopes in these folders (ids, names, or
+            system folders such as ``sentitems``; names are resolved through
+            ``GET /folders``). Each configured folder also becomes a node set.
+            An envelope that leaves the folders is forgotten.
         from_date: Ignore envelopes whose status changed before this date.
         node_set_field: Name of an envelope custom field (for example
             ``agreement_type``) whose value becomes the envelope's node set, so
@@ -200,6 +236,20 @@ def docusign_source(
         include_certificates: Append the certificate of completion to each PDF.
             Off by default: it holds signer IP addresses and audit data.
         include_form_data: Add what signers typed into form fields to the text.
+        max_requests: Stop cleanly after about this many API requests in one
+            run, keep what was read, and resume from there next run. Use it to
+            stay under DocuSign's hourly API limit when the first sync of a
+            large account would not fit. ``None`` (default) means no budget.
+            Forget-on-delete only runs on a run that was not cut short.
+        resource_name: Stable name of the dlt resource, the staging table and
+            the incremental state. Every DocuSign source syncing into one
+            dataset needs its own name: two sources sharing one share state, and
+            each run would forget the other's envelopes. A run refuses to
+            continue when the stored state belongs to a different account.
+            Renaming a source starts it over; documents synced under the old
+            name are not cleaned up.
+        check_active: Optional host authorization checkpoint, called before each
+            request and around each row.
         session: ``requests`` session for every call (mainly a test-injection
             point).
 
@@ -220,12 +270,18 @@ def docusign_source(
     scope = _build_scope(
         statuses, folder_ids, from_date, include_certificates, include_form_data, node_set_field
     )
+    if not _RESOURCE_NAME_RE.fullmatch(resource_name or ""):
+        raise ValueError(
+            "resource_name must be letters, digits and underscores, not starting with a digit."
+        )
+    if max_requests is not None and max_requests < 1:
+        raise ValueError("max_requests must be a positive number of requests, or None.")
     account_id = account_id or os.environ.get(ACCOUNT_ID_ENV)
     base_uri = base_uri or os.environ.get(BASE_URI_ENV)
     stats: dict[str, int] = {}
 
     @dlt.resource(
-        name=DOCUSIGN_TABLE_NAME,
+        name=resource_name,
         primary_key="id",
         write_disposition="merge",
         # _deleted is a boolean hard-delete marker: rows where it is True are
@@ -242,8 +298,18 @@ def docusign_source(
             resolved_account, resolved_uri = resolve_account(
                 http, auth, credentials.oauth_host, account_id
             )
-        client = DocuSignClient(auth, resolved_uri, resolved_account, http)
-        yield from sync_envelopes(client, scope, dlt.current.resource_state(), stats)
+        client = DocuSignClient(
+            auth, resolved_uri, resolved_account, http, check_active=check_active
+        )
+        rows = sync_envelopes(
+            client,
+            scope,
+            dlt.current.resource_state(),
+            stats,
+            max_requests=max_requests,
+            owner=resolved_account,
+        )
+        yield from dlt_utils.guarded_rows(rows, check_active)
 
     @dlt.source(name=DOCUSIGN_SOURCE_NAME)
     def _docusign():
@@ -254,10 +320,9 @@ def docusign_source(
     # resolve_dlt_sources reads this marker; it never imports this connector.
     setattr(source, DOCUMENT_SOURCE_ATTR, DOCUSIGN_SOURCE_NAME)
     # Cursors and the ledger of ingested envelopes live in a pipeline of their
-    # own, so syncing two accounts (or users: visibility is per user) into two
-    # datasets in turn never restores one's state into the other.
-    owner = account_id or credentials.user_id or credentials.integration_key or "token"
-    setattr(source, dlt_utils.PIPELINE_SCOPE_ATTR, f"{DOCUSIGN_SOURCE_NAME}:{owner}")
+    # own. Its scope is the resource name, so the same value names the staging
+    # table and the state, and two sources never share a cursor.
+    setattr(source, dlt_utils.PIPELINE_SCOPE_ATTR, resource_name)
     # Host-readable diagnostics: counts only, never subjects or contract text.
     source.cognee_sync_stats = stats
     return source
@@ -294,19 +359,39 @@ def _build_scope(
 
 
 def sync_envelopes(
-    client: DocuSignClient, scope: Scope, state: dict, stats: dict[str, int] | None = None
+    client: DocuSignClient,
+    scope: Scope,
+    state: dict,
+    stats: dict[str, int] | None = None,
+    *,
+    max_requests: int | None = None,
+    owner: str | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Yield changed envelopes since the last run, plus hard-delete markers.
 
-    ``state`` holds the ``scope`` fingerprint, the ``cursor`` and ``known``,
-    a ledger ``{envelope_id: statusChangedDateTime}`` of what has been
-    ingested. They are only written after every request succeeded, and dlt only
-    commits the state when the whole run loads, so a failed run leaves them
-    where they were.
+    ``state`` holds the ``scope`` fingerprint, the ``cursor``, the ``owner``
+    account and ``known``, a ledger ``{envelope_id: statusChangedDateTime}`` of
+    what has been ingested. They are only written after the run finished, and
+    dlt only commits the state when the whole run loads, so a failed run leaves
+    them where they were.
+
+    The listing is read oldest change first. When ``max_requests`` is reached,
+    or DocuSign asks for a long wait, the run stops cleanly: what was read is
+    kept, the cursor stays at the first envelope not yet read, and the next run
+    resumes there. A run that is cut short never forgets anything, because its
+    listing is incomplete. A run that cannot resume (a scope change over an
+    existing ledger) raises instead.
     """
     stats = stats if stats is not None else {}
     stats.clear()
     stats.update(dict.fromkeys(_STAT_KEYS, 0))
+
+    if owner and state.get("owner") not in (None, owner):
+        raise RuntimeError(
+            "This DocuSign source's stored state belongs to a different account. Give each "
+            "source syncing into one dataset its own resource_name; sharing one would make "
+            "each run forget the other account's envelopes."
+        )
 
     known: dict[str, str] = dict(state.get("known") or {})
     cursor = _parse_time(state.get("cursor"))
@@ -314,36 +399,84 @@ def sync_envelopes(
     stats["full_sync"] = int(full)
     if full and known:
         logger.info("DocuSign: scope changed or no cursor; re-listing all envelopes.")
+    # A first sync, or an incremental one, can stop and resume. A full re-list
+    # over an existing ledger cannot: its cleanup needs the whole listing.
+    resumable = not (full and known)
 
+    folder_values, folder_tokens = _resolve_folders(client, scope)
     kept: dict[str, str] = {} if full else dict(known)
     listed: set[str] = set()
     newest = None if full else cursor
     from_date = scope.from_date if full else _format_time(cursor - _CURSOR_OVERLAP)
+    started_at = client.requests_made
+    stopped: str | None = None
+    resume_at: datetime | None = None
+    current: datetime | None = None
 
-    for envelope in client.paginate_envelopes(_list_params(scope, from_date)):
-        envelope_id = envelope["envelopeId"]
-        listed.add(envelope_id)
-        stats["listed"] += 1
-        changed_raw = envelope.get("statusChangedDateTime") or ""
-        changed = _parse_time(changed_raw)
-        if changed and (newest is None or changed > newest):
-            newest = changed
+    try:
+        for envelope in client.paginate_envelopes(_list_params(scope, from_date, folder_values)):
+            envelope_id = envelope.get("envelopeId")
+            if not envelope_id:
+                logger.warning("DocuSign: skipping a listed envelope that has no id.")
+                continue
+            changed_raw = envelope.get("statusChangedDateTime") or ""
+            current = changed = _parse_time(changed_raw)
 
-        reason = _removal_reason(envelope, scope)
-        if reason is None and not full and known.get(envelope_id) == changed_raw and changed_raw:
-            stats["unchanged"] += 1
-            continue
-        row = None if reason else _envelope_to_row(client, envelope, scope, stats)
-        if row is not None:
-            kept[envelope_id] = changed_raw
-            stats["ingested"] += 1
-            yield row
-        elif envelope_id in known:
-            kept.pop(envelope_id, None)
-            stats["forgotten"] += 1
-            yield _deleted_row(envelope_id)
+            reason = _removal_reason(envelope, scope, folder_tokens)
+            unchanged = (
+                reason is None
+                and not full
+                and known.get(envelope_id) == changed_raw
+                and changed_raw
+            )
+            if (
+                max_requests
+                and resumable
+                # at least one envelope per run, so a tiny budget still makes progress
+                and stats["ingested"] > 0
+                and reason is None
+                and not unchanged
+                and client.requests_made - started_at + _requests_per_envelope(scope) > max_requests
+            ):
+                stopped, resume_at = "budget", changed
+                break
 
-    if full:
+            listed.add(envelope_id)
+            stats["listed"] += 1
+            if unchanged:
+                stats["unchanged"] += 1
+            else:
+                row = (
+                    None
+                    if reason
+                    else _envelope_to_row(client, envelope, scope, folder_tokens, stats)
+                )
+                if row is not None:
+                    kept[envelope_id] = changed_raw
+                    stats["ingested"] += 1
+                    yield row
+                elif envelope_id in known:
+                    kept.pop(envelope_id, None)
+                    stats["forgotten"] += 1
+                    yield _deleted_row(envelope_id)
+            if changed and (newest is None or changed > newest):
+                newest = changed
+            current = None
+    except DocuSignRateLimitError:
+        if not resumable:
+            raise
+        stopped, resume_at = "rate_limit", current
+
+    if stopped:
+        stats["failed"] = 1
+        stats[f"failed_{stopped}"] = 1
+        logger.warning(
+            "DocuSign: stopped early (%s); progress is kept and the next run resumes. "
+            "Nothing is forgotten on a run that was cut short.",
+            stopped.replace("_", " "),
+        )
+        newest = resume_at or newest
+    elif full:
         unlisted = set(known) - listed
         if unlisted and not listed:
             # An empty listing while envelopes were known almost always means a
@@ -362,12 +495,20 @@ def sync_envelopes(
                 yield _deleted_row(envelope_id)
     else:
         yield from _recheck_known(
-            client, scope, sorted(set(kept) - listed), kept, stats, listing_worked=bool(listed)
+            client,
+            scope,
+            folder_tokens,
+            sorted(set(kept) - listed),
+            kept,
+            stats,
+            listing_worked=bool(listed),
         )
 
     state["scope"] = scope.fingerprint
     state["cursor"] = _format_time(newest) if newest else None
     state["known"] = dict(sorted(kept.items()))
+    if owner:
+        state["owner"] = owner
     logger.info(
         "DocuSign: %d listed, %d ingested, %d unchanged, %d forgotten.",
         stats["listed"],
@@ -377,27 +518,84 @@ def sync_envelopes(
     )
 
 
-def _list_params(scope: Scope, from_date: str) -> dict[str, Any]:
-    # voided/deleted are listed too, so a tracked envelope that ended up there
-    # is seen and forgotten; _removal_reason keeps them out of the dataset.
-    statuses = sorted(set(scope.statuses) | _REMOVED_STATUSES)
+def _requests_per_envelope(scope: Scope) -> int:
+    """Requests one new or changed envelope costs: its PDF, plus its form data."""
+    return 2 if scope.include_form_data else 1
+
+
+def _resolve_folders(client: DocuSignClient, scope: Scope) -> tuple[list[str], frozenset[str]]:
+    """Turn configured folders into list-endpoint values and match tokens.
+
+    The list endpoint only takes folder GUIDs or a fixed set of system names, and
+    answers a custom folder's *name* with HTTP 400. ``GET /folders`` maps names
+    (and types) to GUIDs. An unknown folder raises: skipping it would quietly
+    forget what an earlier run ingested from it.
+    """
+    if not scope.folder_ids:
+        return [], frozenset()
+    available = _flatten_folders(client.get_json("folders").get("folders") or [])
+    values: list[str] = []
+    tokens: set[str] = set()
+    for wanted in scope.folder_ids:
+        key = wanted.lower()
+        matches = [
+            folder
+            for folder in available
+            if key in {str(folder.get(k, "")).lower() for k in ("folderId", "name", "type")}
+        ]
+        tokens.add(key)
+        if matches:
+            for folder in matches:
+                values.append(folder["folderId"])
+                tokens.add(folder["folderId"].lower())
+        elif key in _SYSTEM_FOLDERS:
+            values.append(key)
+        else:
+            names = ", ".join(sorted(str(f.get("name")) for f in available if f.get("name")))
+            raise ValueError(
+                f"DocuSign folder {wanted!r} was not found. Use a folder id, a folder name "
+                f"({names}), or one of: {', '.join(sorted(_SYSTEM_FOLDERS))}."
+            )
+    return list(dict.fromkeys(values)), frozenset(tokens)
+
+
+def _flatten_folders(folders: list[dict]) -> list[dict]:
+    flat: list[dict] = []
+    for folder in folders:
+        if not isinstance(folder, dict):
+            continue
+        flat.append(folder)
+        flat.extend(_flatten_folders(folder.get("folders") or []))
+    return flat
+
+
+def _list_params(scope: Scope, from_date: str, folder_values: list[str]) -> dict[str, Any]:
     params: dict[str, Any] = {
         "from_date": from_date,
         # Filter on when the status changed, not on when the envelope was created.
         "from_to_status": "changed",
-        "status": ",".join(statuses),
+        # Oldest change first, so a run that stops early can resume at its cursor.
+        "order_by": "status_changed",
+        "order": "asc",
         "include": "recipients,custom_fields,folders",
         "include_purge_information": "true",
         "count": _PAGE_SIZE,
     }
-    if scope.folder_ids:
-        params["folder_ids"] = ",".join(scope.folder_ids)
+    if folder_values:
+        # DocuSign returns nothing at all when a folder filter is combined with a
+        # list of statuses (seen live), so the status is checked here instead.
+        params["folder_ids"] = ",".join(folder_values)
+    else:
+        # voided/deleted are listed too, so a tracked envelope that ended up there
+        # is seen and forgotten; _removal_reason keeps them out of the dataset.
+        params["status"] = ",".join(sorted(set(scope.statuses) | _REMOVED_STATUSES))
     return params
 
 
 def _recheck_known(
     client: DocuSignClient,
     scope: Scope,
+    folder_tokens: frozenset[str],
     candidates: list[str],
     kept: dict[str, str],
     stats: dict[str, int],
@@ -421,7 +619,8 @@ def _recheck_known(
             "count": _PAGE_SIZE,
         }
         for envelope in client.paginate_envelopes(params):
-            found[envelope["envelopeId"]] = envelope
+            if envelope.get("envelopeId"):
+                found[envelope["envelopeId"]] = envelope
     stats["rechecked"] += len(candidates)
 
     if not found and not listing_worked:
@@ -438,14 +637,14 @@ def _recheck_known(
 
     for envelope_id in candidates:
         envelope = found.get(envelope_id)
-        if envelope is not None and _removal_reason(envelope, scope) is None:
+        if envelope is not None and _removal_reason(envelope, scope, folder_tokens) is None:
             continue
         kept.pop(envelope_id, None)
         stats["forgotten"] += 1
         yield _deleted_row(envelope_id)
 
 
-def _removal_reason(envelope: dict, scope: Scope) -> str | None:
+def _removal_reason(envelope: dict, scope: Scope, folder_tokens: frozenset[str]) -> str | None:
     """Why an envelope must not be in the dataset, or ``None`` when it belongs."""
     status = (envelope.get("status") or "").lower()
     if status in _REMOVED_STATUSES:
@@ -455,9 +654,11 @@ def _removal_reason(envelope: dict, scope: Scope) -> str | None:
     if (envelope.get("purgeState") or "").lower() not in _UNPURGED:
         return "purged"
     folders = [f for f in envelope.get("folders") or [] if isinstance(f, dict)]
+    if "folders" in envelope and not folders:
+        return "in no folder (removed from the Deleted folder)"
     if any(_is_recycle_bin(folder) for folder in folders):
         return "in the Deleted folder"
-    if scope.folder_ids and folders and not _matching_folders(folders, scope):
+    if folder_tokens and folders and not _matching_folders(folders, folder_tokens):
         return "outside the configured folders"
     return None
 
@@ -466,12 +667,12 @@ def _is_recycle_bin(folder: dict) -> bool:
     return "recyclebin" in {str(folder.get(key, "")).lower() for key in ("type", "folderId")}
 
 
-def _matching_folders(folders: list[dict], scope: Scope) -> list[dict]:
-    wanted = {value.lower() for value in scope.folder_ids}
+def _matching_folders(folders: list[dict], folder_tokens: frozenset[str]) -> list[dict]:
     return [
         folder
         for folder in folders
-        if wanted & {str(folder.get(key, "")).lower() for key in ("folderId", "name", "type")}
+        if folder_tokens
+        & {str(folder.get(key, "")).lower() for key in ("folderId", "name", "type")}
     ]
 
 
@@ -481,7 +682,11 @@ def _matching_folders(folders: list[dict], scope: Scope) -> list[dict]:
 
 
 def _envelope_to_row(
-    client: DocuSignClient, envelope: dict, scope: Scope, stats: dict[str, int]
+    client: DocuSignClient,
+    envelope: dict,
+    scope: Scope,
+    folder_tokens: frozenset[str],
+    stats: dict[str, int],
 ) -> dict[str, Any] | None:
     """Fetch an envelope's PDF (and form data) and render its document row.
 
@@ -496,8 +701,8 @@ def _envelope_to_row(
         )
         form_data = _fetch_form_data(client, envelope_id) if scope.include_form_data else {}
     except DocuSignAPIError as exc:
-        if exc.status == 404:
-            logger.info("DocuSign: an envelope disappeared while it was being read; skipping.")
+        if exc.status == 404 or exc.code in _UNREADABLE_CODES:
+            logger.info("DocuSign: an envelope is gone or unreadable for this user; skipping.")
             return None
         raise
 
@@ -511,7 +716,7 @@ def _envelope_to_row(
         # envelopes are emitted separately with _deleted=True.
         "_deleted": False,
     }
-    node_sets = _node_sets(envelope, scope)
+    node_sets = _node_sets(envelope, scope, folder_tokens)
     if node_sets:
         row[NODE_SET_COLUMN] = node_sets
     return row
@@ -551,14 +756,14 @@ def _clean_text(text: str) -> str:
     return _BLANK_LINES_RE.sub("\n\n", "\n".join(lines)).strip()
 
 
-def _node_sets(envelope: dict, scope: Scope) -> list[str]:
+def _node_sets(envelope: dict, scope: Scope, folder_tokens: frozenset[str]) -> list[str]:
     """Configured folders the envelope sits in, plus the ``node_set_field`` value."""
     names = [
         str(folder.get("name") or folder.get("folderId"))
         for folder in _matching_folders(
-            [f for f in envelope.get("folders") or [] if isinstance(f, dict)], scope
+            [f for f in envelope.get("folders") or [] if isinstance(f, dict)], folder_tokens
         )
-        if scope.folder_ids
+        if folder_tokens
     ]
     if scope.node_set_field:
         wanted = scope.node_set_field.lower()

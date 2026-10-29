@@ -28,17 +28,23 @@ logger = get_logger("docusign_connector")
 
 _REQUEST_TIMEOUT = 60
 _MAX_ATTEMPTS = 5
-# A rate-limit wait longer than this aborts the run: the next sync retries.
-_MAX_RATE_LIMIT_WAIT = 120.0
+# A rate-limit wait longer than this stops the run: the next sync retries. Kept
+# short on purpose, because cognee holds a process-wide staging lock while a
+# source extracts.
+_MAX_RATE_LIMIT_WAIT = 60.0
 _MAX_BACKOFF = 30.0
+# A listing that pages further than this is looping (DocuSign answering with the
+# same nextUri), not growing.
+_MAX_PAGES = 5000
 
 
 class DocuSignAPIError(RuntimeError):
     """The eSignature API answered with an error (or kept failing)."""
 
-    def __init__(self, message: str, status: int | None = None):
+    def __init__(self, message: str, status: int | None = None, code: str = ""):
         super().__init__(message)
         self.status = status
+        self.code = code
 
 
 class DocuSignRateLimitError(DocuSignAPIError):
@@ -57,8 +63,11 @@ class DocuSignClient:
         *,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.time,
+        check_active: Callable[[], None] | None = None,
     ):
         self._auth = auth
+        self._check_active = check_active
+        self.requests_made = 0
         self._session = session or requests.Session()
         self._sleep = sleep
         self._clock = clock
@@ -67,15 +76,22 @@ class DocuSignClient:
         self._api_root = f"{self._host_root}/restapi/v2.1/accounts/{account_id}"
 
     def get_json(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        """``GET`` an account-relative path and return the JSON object (``{}`` if empty)."""
+        """``GET`` an account-relative path and return the JSON object.
+
+        An empty body is ``{}`` (DocuSign answers some empty listings that way).
+        A body that is not a JSON object raises: treating it as an empty listing
+        would let a bad response look like "everything was removed".
+        """
         response = self._get(self._url(path), params, accept="application/json")
         if not response.content:
             return {}
         try:
             payload = response.json()
-        except ValueError as exc:
-            raise DocuSignAPIError(f"DocuSign returned invalid JSON for {path}.") from exc
-        return payload if isinstance(payload, dict) else {}
+        except ValueError:
+            raise DocuSignAPIError("DocuSign returned a response that is not JSON.") from None
+        if not isinstance(payload, dict):
+            raise DocuSignAPIError("DocuSign returned JSON that is not an object.")
+        return payload
 
     def get_bytes(self, path: str, params: dict[str, Any] | None = None) -> bytes:
         """``GET`` an account-relative path and return the raw body (a PDF)."""
@@ -85,12 +101,16 @@ class DocuSignClient:
         """Yield every envelope of a ``/envelopes`` listing, following ``nextUri``."""
         path: str = "envelopes"
         query: dict[str, Any] | None = params
+        seen: set[str] = set()
         while True:
             page = self.get_json(path, query)
             yield from page.get("envelopes") or []
             next_uri = page.get("nextUri")
             if not next_uri:
                 return
+            if next_uri in seen or len(seen) >= _MAX_PAGES:
+                raise DocuSignAPIError("DocuSign listing did not end: nextUri repeated.")
+            seen.add(next_uri)
             # nextUri already carries every query parameter of the first request.
             path, query = next_uri, None
 
@@ -110,6 +130,10 @@ class DocuSignClient:
         renewed = False
         for attempt in range(1, _MAX_ATTEMPTS + 1):
             last = attempt == _MAX_ATTEMPTS
+            if self._check_active is not None:
+                # Host authorization checkpoint: raises when the connection was revoked.
+                self._check_active()
+            self.requests_made += 1
             try:
                 response = self._session.get(
                     url,
@@ -150,7 +174,7 @@ class DocuSignClient:
                 self._sleep(_backoff(attempt))
                 continue
             if status >= 400:
-                raise DocuSignAPIError(_error_message(response), status)
+                raise DocuSignAPIError(_error_message(response), status, _error_code(response))
             return response
         raise AssertionError("unreachable")  # pragma: no cover
 
@@ -175,6 +199,15 @@ def _number(value: str | None) -> float | None:
         return float(value) if value is not None else None
     except ValueError:
         return None
+
+
+def _error_code(response: requests.Response) -> str:
+    """DocuSign's ``errorCode`` (e.g. ``USER_NOT_ENVELOPE_SENDER_OR_RECIPIENT``), or ``""``."""
+    try:
+        payload = response.json()
+    except ValueError:
+        return ""
+    return str(payload.get("errorCode") or "") if isinstance(payload, dict) else ""
 
 
 def _error_message(response: requests.Response) -> str:
