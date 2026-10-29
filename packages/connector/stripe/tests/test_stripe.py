@@ -647,6 +647,28 @@ def test_deselected_types_are_forgotten():
     assert set(state["known"]) == {"customers"}
 
 
+def test_a_deselected_type_is_still_forgotten_after_a_run_that_stops():
+    """The ids of a type that left the selection must survive a run that stops early."""
+    fake = FakeStripe()
+    objects = _billing(fake)
+    state: dict = {}
+    _run(fake, state, objects=["customers", "products", "disputes"])
+    fake.tick(7200)
+
+    # Dropping disputes starts a full listing, which the budget cuts off at products.
+    rows, stats = _run_with_stats(fake, state, objects=["customers", "products"], max_requests=1)
+
+    assert stats["failed_budget"] == 1
+    assert _tombstones(rows) == set()
+    assert state["known"]["disputes"] == [objects["dispute"]["id"]]
+
+    rows, stats = _run_with_stats(fake, state, objects=["customers", "products"])
+
+    assert stats["failed"] == 0
+    assert _tombstones(rows) == {objects["dispute"]["id"]}
+    assert set(state["known"]) == {"customers", "products"}
+
+
 def test_empty_selection_forgets_everything():
     fake = FakeStripe()
     objects = _billing(fake)

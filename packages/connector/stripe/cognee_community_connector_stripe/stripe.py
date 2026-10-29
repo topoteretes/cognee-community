@@ -461,7 +461,12 @@ def sync_objects(
                 "after": after,
                 "listed": sorted(listed),
             }
-            state["known"] = {n: sorted(ids) for n, ids in known.items()}
+            # Types that left the selection are tombstoned only by a run that finishes,
+            # so their ids must outlive one that stops.
+            state["known"] = {
+                **{n: ids for n, ids in previous_known.items() if n not in known},
+                **{n: sorted(ids) for n, ids in known.items()},
+            }
             _record_stop(stats, stop)
             return
         if listing:
