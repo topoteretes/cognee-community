@@ -13,6 +13,7 @@ Three layers, all runnable in CI without a DocuSign account:
 
 import copy
 import logging
+import time
 from types import SimpleNamespace
 from uuid import NAMESPACE_OID, uuid5
 
@@ -30,7 +31,11 @@ from fake_docusign import (
 )
 
 from cognee_community_connector_docusign.auth import DocuSignAuth, resolve_credentials
-from cognee_community_connector_docusign.client import DocuSignAPIError, DocuSignClient
+from cognee_community_connector_docusign.client import (
+    DocuSignAPIError,
+    DocuSignClient,
+    DocuSignRateLimitError,
+)
 from cognee_community_connector_docusign.docusign import (
     DOCUSIGN_SOURCE_NAME,
     _build_scope,
@@ -40,6 +45,7 @@ from cognee_community_connector_docusign.docusign import (
     sync_envelopes,
 )
 
+LISTING = {"from_date": "2000-01-01", "from_to_status": "changed"}
 CONTRACTS = {"folderId": "folder-contracts", "name": "Contracts", "type": "normal"}
 ARCHIVE = {"folderId": "folder-archive", "name": "Archive", "type": "normal"}
 
@@ -232,7 +238,8 @@ def test_source_declares_document_marker_and_account_scope(monkeypatch):
     source = docusign_source(access_token="tok", account_id=ACCOUNT_ID, base_uri="https://x")
 
     assert document_source_tag(source) == "docusign"
-    assert getattr(source, PIPELINE_SCOPE_ATTR) == f"docusign:{ACCOUNT_ID}"
+    # The scope is the resource name, so the staging table and the state share one name.
+    assert getattr(source, PIPELINE_SCOPE_ATTR) == "docusign_envelopes"
     assert pipeline_name_for_source(source, "a") != pipeline_name_for_source(source, "b")
     assert pipeline_name_for_source(source, "a") != "ingest_dlt_source"
 
@@ -386,6 +393,50 @@ def test_envelope_in_the_deleted_folder_is_forgotten_when_the_listing_returns_it
     assert set(state["known"]) == {keep}
 
 
+def test_emptied_deleted_folder_is_forgotten_by_the_recheck(fake, client):
+    # Seen live: days after an envelope is binned, DocuSign empties the folder. The
+    # envelope then lists no folders at all.
+    gone = fake.add_envelope("Gone", "text")
+    keep = fake.add_envelope("Keep", "text")
+    state: dict = {}
+    _sync(client, state)
+    fake.empty_recycle_bin(gone)
+
+    assert _tombstones(_sync(client, state)) == {_row_id(gone)}
+    assert set(state["known"]) == {keep}
+
+
+def test_unreadable_envelope_in_a_first_sync_is_skipped_not_fatal(fake, client):
+    # The live failure: a fresh sync listed an envelope whose documents answered HTTP 400.
+    readable = fake.add_envelope("Readable", "text")
+    unreadable = fake.add_envelope("Unreadable", "text")
+    fake.envelopes[unreadable]["_unreadable"] = True  # listed with folders, but not readable
+
+    rows = _sync(client, {})
+
+    assert _live(rows) == {_row_id(readable)}
+    assert _tombstones(rows) == set()
+
+
+def test_known_envelope_that_becomes_unreadable_is_forgotten(fake, client):
+    keep = fake.add_envelope("Keep", "text")
+    lost = fake.add_envelope("Lost", "text")
+    state: dict = {}
+    _sync(client, state)
+    fake.edit_text(lost, "changed, then access was lost")
+    fake.envelopes[lost]["_unreadable"] = True
+
+    assert _tombstones(_sync(client, state)) == {_row_id(lost)}
+    assert set(state["known"]) == {keep}
+
+
+def test_other_client_errors_still_abort_the_run(fake, client):
+    fake.add_envelope("A", "text")
+    fake.fail_once("/documents/combined", 400)  # not the "unreadable" error code
+    with pytest.raises(DocuSignAPIError, match="HTTP 400"):
+        _sync(client, {})
+
+
 def test_purged_documents_are_forgotten_by_the_recheck(fake, client):
     purged = fake.add_envelope("Purged", "text")
     keep = fake.add_envelope("Keep", "text")
@@ -529,11 +580,283 @@ def test_empty_full_listing_does_not_forget_known_envelopes(fake, client):
     state: dict = {}
     _sync(client, state, _scope())
 
-    # A folder typo makes the next full listing empty.
-    rows = _sync(client, state, _scope(folder_ids=["no-such-folder"]))
+    # A from_date in the future makes the next full listing empty.
+    rows = _sync(client, state, _scope(from_date="2099-01-01"))
 
     assert rows == {}
     assert set(state["known"]) == {only}
+
+
+# ---------------------------------------------------------------------------
+# Folders: names resolve to ids, and no status filter next to a folder filter
+# ---------------------------------------------------------------------------
+
+
+def test_custom_folder_name_is_resolved_to_its_id(fake, client):
+    inside = fake.add_envelope("Inside", "text", folders=[CONTRACTS])
+    fake.add_envelope("Outside", "text", folders=[ARCHIVE])
+
+    rows = _sync(client, {}, _scope(folder_ids=["Contracts"]))
+
+    assert _live(rows) == {_row_id(inside)}
+    query = fake.listing_queries()[0]
+    assert query["folder_ids"] == "folder-contracts"  # the id, never the name (HTTP 400 live)
+    assert rows[_row_id(inside)]["cognee_node_set"] == ["Contracts"]
+
+
+def test_folder_filter_is_never_combined_with_a_status_filter(fake, client):
+    # Against the real API, a folder filter plus several statuses returns nothing at all.
+    done = fake.add_envelope("Done", "text", folders=[CONTRACTS])
+    fake.add_envelope("Pending", "text", status="sent", folders=[CONTRACTS])
+
+    rows = _sync(client, {}, _scope(folder_ids=["folder-contracts"]))
+
+    assert "status" not in fake.listing_queries()[0]
+    assert _live(rows) == {_row_id(done)}  # the status is still enforced, client side
+
+
+def test_system_folder_names_pass_through(fake, client):
+    envelope_id = fake.add_envelope("Sent", "text")
+    rows = _sync(client, {}, _scope(folder_ids=["sentitems"]))
+    assert _live(rows) == {_row_id(envelope_id)}
+
+
+def test_unknown_folder_raises_and_lists_the_choices(fake, client):
+    fake.add_envelope("A", "text", folders=[CONTRACTS])
+    state: dict = {}
+    with pytest.raises(ValueError, match="Contracts"):
+        _sync(client, state, _scope(folder_ids=["Contrcts"]))
+    assert state == {}
+
+
+# ---------------------------------------------------------------------------
+# Resuming: request budget and rate limits
+# ---------------------------------------------------------------------------
+
+
+def _drain(client, state, scope, **kwargs):
+    """Run syncs until one finishes without being cut short; return (rows, runs)."""
+    rows: dict[str, dict] = {}
+    for run in range(1, 20):
+        stats: dict = {}
+        for row in sync_envelopes(client, scope, state, stats, **kwargs):
+            rows[row["id"]] = row
+        if not stats["failed"]:
+            return rows, run
+    raise AssertionError("the sync never finished")
+
+
+def test_request_budget_stops_cleanly_and_resumes_until_done(fake, client):
+    ids = {_row_id(fake.add_envelope(f"Agreement {n}", f"text {n}")) for n in range(6)}
+    state: dict = {}
+    stats: dict = {}
+
+    first = {r["id"] for r in sync_envelopes(client, _scope(), state, stats, max_requests=5)}
+
+    # 1 listing page + 2 requests per envelope fits two envelopes in a budget of 5.
+    assert len(first) == 2
+    assert stats["failed"] == 1 and stats["failed_budget"] == 1
+    assert len(state["known"]) == 2 and state["cursor"]
+
+    fake.requests.clear()
+    _rows, runs = _drain(client, state, _scope(), max_requests=5)
+
+    assert runs <= 4
+    assert set(state["known"]) == {i.removeprefix("envelope:") for i in ids}
+    # No envelope was fetched twice across the resumed runs.
+    fetched = fake.requested("/documents/combined")
+    assert len(fetched) == len(set(fetched)) == 4
+
+
+def test_tiny_budget_still_makes_progress(fake, client):
+    fake.add_envelope("A", "text")
+    fake.add_envelope("B", "text")
+    state: dict = {}
+    stats: dict = {}
+
+    rows = list(sync_envelopes(client, _scope(), state, stats, max_requests=1))
+
+    assert len(rows) == 1  # one envelope per run at least, so the sync converges
+    assert stats["failed_budget"] == 1
+
+
+def test_a_run_cut_short_forgets_nothing(fake, client):
+    binned = fake.add_envelope("Binned", "text")
+    fake.add_envelope("Keep", "text")
+    state: dict = {}
+    _sync(client, state)
+    fake.move_to_recycle_bin(binned)
+    for n in range(4):
+        fake.add_envelope(f"New {n}", "text")
+
+    stats: dict = {}
+    rows = list(sync_envelopes(client, _scope(), state, stats, max_requests=3))
+
+    assert stats["failed_budget"] == 1
+    assert not [r for r in rows if r["_deleted"]]  # the lookup is skipped on a partial run
+    assert binned in state["known"]
+
+    rows, _ = _drain(client, state, _scope(), max_requests=3)
+    assert _tombstones(rows) == {_row_id(binned)}
+    assert binned not in state["known"]
+
+
+def test_a_long_rate_limit_stops_cleanly_and_keeps_progress(fake, client):
+    for n in range(4):
+        fake.add_envelope(f"Agreement {n}", "text")
+    state: dict = {}
+    reset = str(int(time.time()) + 3600)
+    fake.fail_once("/documents/combined", 200)  # a successful fetch is not a failure
+    fake.failures.clear()
+    first_pdf = {"n": 0}
+    original_send = fake.send
+
+    def send(request, **kwargs):
+        if request.url.endswith("/documents/combined?certificate=false"):
+            first_pdf["n"] += 1
+            if first_pdf["n"] == 3:
+                return fake._json(
+                    request,
+                    429,
+                    {"errorCode": "HOURLY_APIINVOCATION_LIMIT"},
+                    {"X-RateLimit-Reset": reset},
+                )
+        return original_send(request, **kwargs)
+
+    fake.send = send
+    stats: dict = {}
+    rows = list(sync_envelopes(client, _scope(), state, stats))
+
+    assert len(rows) == 2 and stats["failed_rate_limit"] == 1
+    assert len(state["known"]) == 2
+    fake.send = original_send
+    rows, _ = _drain(client, state, _scope())
+    assert len(state["known"]) == 4
+
+
+def test_rate_limit_on_the_first_listing_page_is_a_clean_stop(fake, client):
+    fake.add_envelope("A", "text")
+    state: dict = {}
+    fake.fail_once("/envelopes", 429, {"X-RateLimit-Reset": str(int(time.time()) + 3600)})
+    stats: dict = {}
+
+    assert list(sync_envelopes(client, _scope(), state, stats)) == []
+
+    assert stats["failed_rate_limit"] == 1
+    assert state["known"] == {} and state["cursor"] is None
+    assert _live(_sync(client, state))  # the next run just works
+
+
+def test_a_rate_limit_during_a_scope_change_aborts_instead(fake, client):
+    fake.add_envelope("A", "text", folders=[CONTRACTS])
+    state: dict = {}
+    _sync(client, state)
+    fake.fail_once("/envelopes", 429, {"X-RateLimit-Reset": str(int(time.time()) + 3600)})
+    before = copy.deepcopy(state)
+
+    with pytest.raises(DocuSignRateLimitError):
+        _sync(client, state, _scope(folder_ids=["Contracts"]))  # needs the whole listing
+
+    assert state == before
+
+
+# ---------------------------------------------------------------------------
+# Malformed answers and guards
+# ---------------------------------------------------------------------------
+
+
+def test_a_listing_that_never_ends_is_an_error(fake, client):
+    for n in range(3):
+        fake.add_envelope(f"Agreement {n}", "text")
+    fake.page_size_cap = 100
+    fake.repeat_next_uri = True
+    with pytest.raises(DocuSignAPIError, match="nextUri"):
+        list(
+            client.paginate_envelopes(
+                {"from_date": "2000-01-01", "from_to_status": "changed", "count": 1}
+            )
+        )
+
+
+@pytest.mark.parametrize("body", ["[]", "not json at all", '"a string"'])
+def test_a_body_that_is_not_a_json_object_is_never_an_empty_listing(fake, client, body):
+    keep = fake.add_envelope("Keep", "text")
+    state: dict = {}
+    _sync(client, state)
+    fake.raw_responses.append(("/envelopes", body))
+
+    with pytest.raises(DocuSignAPIError):
+        _sync(client, state)
+
+    assert keep in state["known"]
+
+
+def test_a_listed_envelope_without_an_id_is_skipped(fake, client):
+    good = fake.add_envelope("Good", "text")
+    fake.extra_listing = [{"status": "completed", "emailSubject": "No id"}]
+
+    assert _live(_sync(client, {})) == {_row_id(good)}
+
+
+def test_state_of_another_account_is_refused(fake, client):
+    fake.add_envelope("A", "text")
+    state: dict = {}
+    list(sync_envelopes(client, _scope(), state, owner="acct-1"))
+    assert state["owner"] == "acct-1"
+
+    with pytest.raises(RuntimeError, match="different account"):
+        list(sync_envelopes(client, _scope(), state, owner="acct-2"))
+    assert list(sync_envelopes(client, _scope(), state, owner="acct-1")) == []
+
+
+def test_resource_name_is_validated_and_scopes_the_state():
+    from cognee.tasks.ingestion.dlt_utils import PIPELINE_SCOPE_ATTR, pipeline_name_for_source
+
+    one = docusign_source(
+        access_token="t", account_id="a", base_uri="https://x", resource_name="docusign_acme"
+    )
+    two = docusign_source(
+        access_token="t", account_id="a", base_uri="https://x", resource_name="docusign_beta"
+    )
+
+    assert getattr(one, PIPELINE_SCOPE_ATTR) == "docusign_acme"
+    assert pipeline_name_for_source(one, "ds") != pipeline_name_for_source(two, "ds")
+    assert "docusign_acme" in one.resources
+    with pytest.raises(ValueError, match="resource_name"):
+        docusign_source(access_token="t", resource_name="not valid!")
+    with pytest.raises(ValueError, match="max_requests"):
+        docusign_source(access_token="t", max_requests=0)
+
+
+def test_check_active_runs_before_every_request(fake, rsa_keys):
+    calls = {"n": 0}
+
+    def check_active():
+        calls["n"] += 1
+        if calls["n"] > 3:
+            raise PermissionError("connection revoked")
+
+    session = fake.session()
+    auth = DocuSignAuth(resolve_credentials(INTEGRATION_KEY, USER_ID, rsa_keys[0]), session)
+    guarded = DocuSignClient(
+        auth, f"https://{API_HOST}", ACCOUNT_ID, session, check_active=check_active
+    )
+    for n in range(5):
+        fake.add_envelope(f"Agreement {n}", "text")
+    state: dict = {}
+
+    with pytest.raises(PermissionError):
+        _sync(guarded, state)
+
+    assert state == {}  # a revoked connection stops the run before any state is written
+
+
+def test_sync_stats_are_plain_integers(fake, client):
+    fake.add_envelope("A", "text")
+    stats: dict = {}
+    _sync(client, {}, stats=stats)
+    assert all(type(value) is int for value in stats.values())
+    assert {"failed", "failed_rate_limit", "failed_budget"} <= set(stats)
 
 
 # ---------------------------------------------------------------------------

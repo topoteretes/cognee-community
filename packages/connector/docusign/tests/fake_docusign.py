@@ -13,7 +13,11 @@ It mirrors the DocuSign behaviour the connector relies on:
 * moving an envelope to the Deleted folder, or purging it, does **not** change
   ``statusChangedDateTime`` (this is why the connector rechecks known ids);
 * a purge with metadata removes the envelope from every listing;
-* ``documents/combined`` returns a real PDF whose text layer ``pypdf`` reads.
+* ``documents/combined`` returns a real PDF whose text layer ``pypdf`` reads;
+* ``folder_ids`` takes folder GUIDs or system names only (HTTP 400 for a custom
+  folder *name*), and a folder filter combined with several ``status`` values
+  returns nothing, both as seen against the real demo API;
+* ``GET /folders`` lists the system folders and the custom ones in use.
 """
 
 import json
@@ -31,6 +35,18 @@ USER_ID = "user-guid-1"
 INTEGRATION_KEY = "integration-key-1"
 API_ROOT = f"/restapi/v2.1/accounts/{ACCOUNT_ID}"
 
+SYSTEM_FOLDER_NAMES = {
+    "awaiting_my_signature",
+    "completed",
+    "draft",
+    "drafts",
+    "expiring_soon",
+    "inbox",
+    "out_for_signature",
+    "recyclebin",
+    "sentitems",
+    "waiting_for_others",
+}
 RECYCLE_BIN = {"folderId": "recyclebin", "name": "Deleted Items", "type": "recyclebin"}
 SENT_ITEMS = {"folderId": "sentitems", "name": "Sent Items", "type": "sentitems"}
 
@@ -73,6 +89,9 @@ class FakeDocuSign(BaseAdapter):
         self.envelopes: dict[str, dict] = {}
         self.requests: list[tuple[str, str, dict]] = []
         self.token_requests = 0
+        self.repeat_next_uri = False  # answer every page with the same nextUri
+        self.extra_listing: list[dict] = []  # appended to every listing page (malformed rows)
+        self.raw_responses: list[tuple[str, str]] = []  # (path fragment, body) served once, as 200
         self.consent_required = False
         self.token_lifetime = 3600
         self.valid_tokens: set[str] = set()
@@ -169,6 +188,12 @@ class FakeDocuSign(BaseAdapter):
         """Does NOT touch statusChangedDateTime, like the real thing."""
         self.envelopes[envelope_id]["folders"] = [dict(RECYCLE_BIN)]
 
+    def empty_recycle_bin(self, envelope_id: str) -> None:
+        """DocuSign emptied the Deleted folder: no folders, and the API user can't read it."""
+        envelope = self.envelopes[envelope_id]
+        envelope["folders"] = []
+        envelope["_unreadable"] = True
+
     def move_to_folder(self, envelope_id: str, folder: dict) -> None:
         self.envelopes[envelope_id]["folders"] = [dict(folder)]
 
@@ -208,8 +233,20 @@ class FakeDocuSign(BaseAdapter):
         if not self._authorized(request.headers.get("Authorization", "")):
             return self._json(request, 401, {"errorCode": "AUTHORIZATION_INVALID_TOKEN"})
 
+        for index, (fragment, body) in enumerate(self.raw_responses):
+            if fragment in path:
+                del self.raw_responses[index]
+                response = requests.Response()
+                response.status_code = 200
+                response._content = body.encode()
+                response.url = request.url
+                response.request = request
+                return response
+
         if path == f"{API_ROOT}/envelopes":
             return self._list(request, query)
+        if path == f"{API_ROOT}/folders":
+            return self._json(request, 200, {"folders": self._folders()})
         parts = path.removeprefix(API_ROOT).strip("/").split("/")
         if len(parts) == 3 and parts[0] == "envelopes" and parts[2] == "form_data":
             return self._form_data(request, parts[1])
@@ -279,13 +316,25 @@ class FakeDocuSign(BaseAdapter):
             if "status" in query:
                 selected = [e for e in selected if e["status"] in query["status"].split(",")]
             if "folder_ids" in query:
-                folder_ids = set(query["folder_ids"].split(","))
-                selected = [
-                    e
-                    for e in selected
-                    if folder_ids & {f[key] for f in e["folders"] for key in ("folderId", "name")}
-                ]
-        selected.sort(key=lambda e: (e["statusChangedDateTime"], e["envelopeId"]))
+                folder_ids = query["folder_ids"].split(",")
+                valid = {f["folderId"] for f in self._folders()} | SYSTEM_FOLDER_NAMES
+                if any(value not in valid for value in folder_ids):
+                    return self._json(
+                        request, 400, {"errorCode": "INVALID_REQUEST_PARAMETER", "message": "x"}
+                    )
+                if "," in query.get("status", ""):
+                    selected = []  # the real API returns nothing for this combination
+                else:
+                    selected = [
+                        e
+                        for e in selected
+                        if set(folder_ids)
+                        & {f[key] for f in e["folders"] for key in ("folderId", "type")}
+                    ]
+        selected.sort(
+            key=lambda e: (e["statusChangedDateTime"], e["envelopeId"]),
+            reverse=query.get("order") == "desc",
+        )
         page = selected[start : start + top]
         includes = set(query.get("include", "").split(","))
         body: dict = {
@@ -294,14 +343,34 @@ class FakeDocuSign(BaseAdapter):
             "startPosition": str(start),
             "endPosition": str(start + max(len(page) - 1, 0)),
         }
-        if page:
+        if page or self.extra_listing:
             body["envelopes"] = [self._view(e, includes, query) for e in page]
+            body["envelopes"].extend(dict(extra) for extra in self.extra_listing)
         if start + top < len(selected):
             rest = {k: v for k, v in query.items() if k != "start_position"}
             rest["start_position"] = str(start + top)
             qs = "&".join(f"{k}={v}" for k, v in rest.items())
             body["nextUri"] = f"{API_ROOT}/envelopes?{qs}"
+        if self.repeat_next_uri:
+            body["nextUri"] = (
+                f"{API_ROOT}/envelopes?from_date=2000-01-01&from_to_status=changed&start_position=0"
+            )
         return self._json(request, 200, body)
+
+    def _folders(self):
+        system = [
+            {"name": "Draft", "type": "draft", "folderId": "folder-draft"},
+            {"name": "Deleted Items", "type": "recyclebin", "folderId": "recyclebin"},
+            {"name": "Sent Items", "type": "sentitems", "folderId": "sentitems"},
+        ]
+        seen = {f["folderId"] for f in system}
+        custom = []
+        for envelope in self.envelopes.values():
+            for folder in envelope["folders"]:
+                if folder["folderId"] not in seen:
+                    seen.add(folder["folderId"])
+                    custom.append(dict(folder))
+        return system + custom
 
     def _view(self, envelope, includes, query):
         view = {k: v for k, v in envelope.items() if not k.startswith("_")}
@@ -336,6 +405,12 @@ class FakeDocuSign(BaseAdapter):
         envelope = self.envelopes.get(envelope_id)
         if envelope is None or envelope["_metadata_purged"]:
             return self._json(request, 404, {"errorCode": "ENVELOPE_DOES_NOT_EXIST"})
+        if envelope.get("_unreadable"):
+            return self._json(
+                request,
+                400,
+                {"errorCode": "USER_NOT_ENVELOPE_SENDER_OR_RECIPIENT", "message": "x"},
+            )
         assert query.get("certificate") in ("true", "false")
         response = requests.Response()
         response.status_code = 200
