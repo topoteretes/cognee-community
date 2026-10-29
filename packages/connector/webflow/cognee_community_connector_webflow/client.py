@@ -21,6 +21,26 @@ _RETRY_STATUS = {429, 500, 502, 503, 504}
 # A listing that changes while it is read can skip or repeat rows; read it
 # again a few times before giving up.
 _LISTING_ATTEMPTS = 3
+# Webflow's Retry-After is about a minute. A much longer wait would hold the
+# whole ingestion run, so stop cleanly instead and let the next run retry.
+_MAX_WAIT = 120.0
+# 1,000 pages is 100,000 rows. A listing that is still going after that is not
+# ending, for example because the server ignores the offset.
+_MAX_PAGES = 1000
+
+
+def resolve_token(token: str | None = None) -> str:
+    """The token to use: the argument, else ``WEBFLOW_API_TOKEN``, checked but never echoed."""
+    token = (token or os.environ.get(TOKEN_ENV_VAR) or "").strip()
+    if not token:
+        raise ValueError(f"Webflow token required: pass token= or set {TOKEN_ENV_VAR}.")
+    # A stray space or newline from a copy-paste would make the HTTP library
+    # reject the header and quote it, token included, in its error.
+    if not token.isprintable() or any(character.isspace() for character in token):
+        raise ValueError(
+            "The Webflow token contains spaces or control characters. Check how it was copied."
+        )
+    return token
 
 
 class WebflowAPIError(Exception):
@@ -53,9 +73,9 @@ class WebflowClient:
         sleep: Callable[[float], None] = time.sleep,
         timeout: float = 30.0,
     ):
-        token = token or os.environ.get(TOKEN_ENV_VAR)
-        if not token:
-            raise ValueError(f"Webflow token required: pass token= or set {TOKEN_ENV_VAR}.")
+        token = resolve_token(token)
+        # Called before every request; a host sets it to stop a sync whose access was revoked.
+        self.check_active: Callable[[], None] | None = None
         self._sleep = sleep
         self._http = httpx.Client(
             base_url=base_url.rstrip("/"),
@@ -71,19 +91,33 @@ class WebflowClient:
         """GET one resource, retrying rate limits and transient errors."""
         for attempt in range(_MAX_RETRIES):
             last = attempt == _MAX_RETRIES - 1
+            if self.check_active is not None:
+                self.check_active()
             try:
                 response = self._http.get(path, params=params)
             except httpx.TransportError as exc:
                 if last:
                     raise
-                self._wait(f"{type(exc).__name__}", attempt, None)
+                self._wait(type(exc).__name__, attempt, _backoff(attempt))
                 continue
             if response.status_code in _RETRY_STATUS and not last:
-                self._wait(f"HTTP {response.status_code}", attempt, response.headers)
+                delay = _retry_after(response.headers, attempt)
+                if delay > _MAX_WAIT:
+                    raise _api_error(
+                        response, f"asked to wait {delay:.0f}s, which is too long; try again later"
+                    )
+                self._wait(f"HTTP {response.status_code}", attempt, delay)
                 continue
             if response.status_code >= 400:
                 raise _api_error(response)
-            return response.json()
+            try:
+                body = response.json()
+            except ValueError:
+                body = None
+            if not isinstance(body, dict):
+                # An empty or HTML 200 must not read as "no rows", which would forget everything.
+                raise WebflowAPIError(response.status_code, f"{path} did not return a JSON object.")
+            return body
         raise AssertionError("unreachable")  # pragma: no cover
 
     def paginate(self, path: str, key: str, params: dict[str, Any] | None = None) -> Iterator[dict]:
@@ -132,7 +166,7 @@ class WebflowClient:
     ) -> Iterator[tuple[list[dict], int | None]]:
         """Yield ``(rows, reported_total)`` for each page until the listing ends."""
         offset = 0
-        while True:
+        for _ in range(_MAX_PAGES):
             page = self.get(path, {**(params or {}), "limit": PAGE_SIZE, "offset": offset})
             rows = page.get(key) or []
             total = (page.get("pagination") or {}).get("total")
@@ -147,13 +181,17 @@ class WebflowClient:
                 raise WebflowAPIError(
                     200, f"{path} returned {offset} of {total} rows; the listing is incomplete."
                 )
+        raise WebflowAPIError(200, f"{path} did not end after {_MAX_PAGES} pages.")
 
-    def _wait(self, reason: str, attempt: int, headers: httpx.Headers | None) -> None:
-        delay = _retry_after(headers, attempt)
+    def _wait(self, reason: str, attempt: int, delay: float) -> None:
         logger.warning(
             "Webflow: %s, retrying in %.1fs (%d/%d).", reason, delay, attempt + 1, _MAX_RETRIES
         )
         self._sleep(delay)
+
+
+def _backoff(attempt: int) -> float:
+    return float(2**attempt)
 
 
 def _retry_after(headers: httpx.Headers | None, attempt: int) -> float:
@@ -161,14 +199,15 @@ def _retry_after(headers: httpx.Headers | None, attempt: int) -> float:
     try:
         return max(0.0, float((headers or {}).get("retry-after")))
     except (TypeError, ValueError):
-        return float(2**attempt)
+        return _backoff(attempt)
 
 
-def _api_error(response: httpx.Response) -> WebflowAPIError:
+def _api_error(response: httpx.Response, note: str | None = None) -> WebflowAPIError:
     try:
         body = response.json()
     except ValueError:
         body = {}
     message = body.get("message") if isinstance(body, dict) else None
     code = body.get("code") if isinstance(body, dict) else None
-    return WebflowAPIError(response.status_code, message or response.reason_phrase, code)
+    message = message or response.reason_phrase
+    return WebflowAPIError(response.status_code, f"{message} ({note})" if note else message, code)

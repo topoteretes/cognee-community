@@ -158,3 +158,68 @@ def test_list_all_gives_up_on_a_listing_that_never_settles(client, fake):
 
     with pytest.raises(WebflowAPIError, match="kept changing"):
         client.list_all(f"/collections/{fake.collection_id}/items", "items")
+
+
+def test_a_token_pasted_with_a_trailing_newline_still_works(fake):
+    client = WebflowClient(f"{TOKEN}\n", transport=fake.transport())
+
+    assert client.get("/sites")["sites"]
+
+
+def test_a_token_with_spaces_inside_is_refused_without_echoing_it():
+    with pytest.raises(ValueError, match="spaces or control characters") as error:
+        WebflowClient("abc def-SECRET")
+
+    assert "SECRET" not in str(error.value)
+
+
+def test_a_token_with_control_characters_is_refused():
+    with pytest.raises(ValueError, match="control characters"):
+        WebflowClient("abc\x00def")
+
+
+def test_a_retry_after_that_is_too_long_stops_the_run_instead_of_sleeping(client, fake, sleeps):
+    fake.fail("/sites", 429, times=10, code="too_many_requests", headers={"Retry-After": "3600"})
+
+    with pytest.raises(WebflowAPIError, match="too long") as error:
+        client.get("/sites")
+
+    assert error.value.status == 429
+    assert sleeps == []
+
+
+@pytest.mark.parametrize("content", [b"", b"<html>maintenance</html>", b"[]", b'"ok"'])
+def test_a_200_that_is_not_a_json_object_is_an_error_not_an_empty_listing(content, sleeps):
+    transport = httpx.MockTransport(lambda _request: httpx.Response(200, content=content))
+    client = WebflowClient(TOKEN, transport=transport, sleep=sleeps.append)
+
+    with pytest.raises(WebflowAPIError, match="did not return a JSON object"):
+        client.get("/sites")
+
+
+def test_a_listing_that_never_ends_is_stopped(sleeps):
+    rows = [{"id": str(number)} for number in range(100)]
+    # No pagination block and a full page every time, as a server that ignores offset would.
+    transport = httpx.MockTransport(lambda _request: httpx.Response(200, json={"items": rows}))
+    client = WebflowClient(TOKEN, transport=transport, sleep=sleeps.append)
+
+    with pytest.raises(WebflowAPIError, match="did not end"):
+        list(client.paginate("/collections/x/items", "items"))
+
+
+def test_check_active_is_asked_before_every_request_and_can_stop_the_run(client, fake):
+    for number in range(250):
+        fake.add_item(fake.collection_id, f"Post {number}")
+    asked = []
+
+    def revoked_after_two_requests():
+        asked.append(True)
+        if len(asked) > 2:
+            raise PermissionError("access revoked")
+
+    client.check_active = revoked_after_two_requests
+
+    with pytest.raises(PermissionError):
+        list(client.paginate(f"/collections/{fake.collection_id}/items", "items"))
+
+    assert len(fake.requests_to("/items")) == 2, "the third request must never be sent"
