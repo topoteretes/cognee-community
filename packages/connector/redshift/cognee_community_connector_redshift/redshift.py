@@ -4,11 +4,16 @@ Syncs selected Redshift tables, views and SQL queries into cognee, plus a
 "table card" per table with its comment and its column comments::
 
     import cognee
-    from cognee_community_connector_redshift import RedshiftTable, redshift_source
+    from cognee_community_connector_redshift import (
+        DataApiConnection,
+        RedshiftTable,
+        redshift_source,
+    )
 
     await cognee.remember(
         redshift_source(
-            [RedshiftTable("public.tickets", primary_key="id", cursor_column="updated_at")]
+            [RedshiftTable("public.tickets", primary_key="id", cursor_column="updated_at")],
+            connection=DataApiConnection(database="dev", workgroup_name="analytics"),
         ),
         dataset_name="redshift",
         primary_key="id",
@@ -42,8 +47,9 @@ Design
   them from the graph and vector stores. Keys that appeared below the
   cursor (a late load) are fetched by key. A ``where`` filter defines what
   is selected, so a row that stops matching it (a soft delete) is forgotten
-  too. A table dropped upstream, or one removed from the selection, is
-  forgotten whole.
+  too. A table removed from the selection, or one Redshift confirms no
+  longer exists, is forgotten whole. A table that merely drops out of the
+  catalog (a revoked privilege) is not.
 * **Errors never delete** — a failed or timed-out statement aborts the run
   before dlt commits rows or state, so nothing is forgotten and the next
   run starts from the same cursor.
@@ -84,6 +90,28 @@ _KEY_BATCH = 100
 # Bump when rendering or the state layout changes, so the next run re-reads
 # every row instead of keeping documents rendered by an older connector.
 _STATE_VERSION = 1
+
+
+class _Guarded:
+    """A connection that runs ``check_active`` before every statement and row."""
+
+    def __init__(self, connection: Any, check_active: Callable[[], None]):
+        self._connection = connection
+        self._check_active = check_active
+
+    @property
+    def database(self) -> str:
+        self._check_active()
+        return self._connection.database
+
+    def query(self, sql: str, params: dict | None = None) -> Iterator[dict]:
+        self._check_active()
+        for row in self._connection.query(sql, params):
+            self._check_active()
+            yield row
+
+    def close(self) -> None:
+        self._connection.close()
 
 
 @dataclass(frozen=True)
@@ -167,7 +195,7 @@ class _Selection:
 def redshift_source(
     selections: Sequence[RedshiftTable | RedshiftQuery],
     *,
-    connection: DataApiConnection | DirectConnection | None = None,
+    connection: DataApiConnection | DirectConnection,
     include_table_cards: bool = True,
     full_refresh: bool = False,
     resource_name: str = DEFAULT_RESOURCE_NAME,
@@ -177,8 +205,10 @@ def redshift_source(
 
     Args:
         selections: The tables, views and queries to ingest.
-        connection: How to reach Redshift. Defaults to a ``DataApiConnection``
-            configured from the ``REDSHIFT_*`` environment variables.
+        connection: How to reach Redshift: a ``DataApiConnection`` or a
+            ``DirectConnection``. There is no default, so the caller decides
+            where settings come from (``DataApiConnection.from_env()`` reads
+            the ``REDSHIFT_*`` variables).
         include_table_cards: Also ingest one document per table with its
             comment and its columns, types and column comments.
         full_refresh: Read every row this run instead of only rows past the
@@ -186,8 +216,8 @@ def redshift_source(
         resource_name: Stable name for this connection's dlt state and staging
             tables. Give each cluster its own name when several sync into one
             dataset.
-        check_active: Called between rows; raises to stop a sync whose access
-            was revoked mid-run (for hosts).
+        check_active: Called before every statement and between rows; raises
+            to stop a sync whose access was revoked mid-run (for hosts).
 
     Returns:
         A dlt source for ``cognee.remember(...)``. Pass
@@ -205,7 +235,8 @@ def redshift_source(
         raise ValueError("resource_name must be lower case letters, digits and underscores.")
 
     normalized = _normalize_selections(selections, resource_name)
-    connection = connection or DataApiConnection()
+    if check_active is not None:
+        connection = _Guarded(connection, check_active)
     stats: dict[str, int] = {}
 
     @dlt.resource(
@@ -383,20 +414,24 @@ def sync_rows(
         selection_state = previous.get(selection.label, {})
         if selection.table:
             entry = catalog.get((selection.schema, selection.table))
-            if entry is None:
-                if not selection_state:
-                    raise ValueError(
-                        f"Redshift table {selection.label} was not found, or this user cannot "
-                        "see it. Check the name (lower case unless it was created quoted) "
-                        "and the user's privileges."
-                    )
-                # It was synced before, so it was dropped or its access revoked.
+            if entry is None and not selection_state:
+                raise ValueError(
+                    f"Redshift table {selection.label} was not found, or this user cannot "
+                    "see it. Check the name (lower case unless it was created quoted) "
+                    "and the user's privileges."
+                )
+            if entry is None and _relation_is_gone(connection, selection):
                 logger.warning(
                     "Redshift: table %s no longer exists; forgetting it.", selection.label
                 )
                 _forget(resource_name, selection.label, selection_state, tombstones, stats)
                 continue
-            if include_table_cards:
+            if entry is None:
+                # The catalog view missed a table Redshift can still read. Sync its
+                # rows and keep its card as it was.
+                if include_table_cards and selection.label in previous_cards:
+                    current_cards.add(selection.label)
+            elif include_table_cards:
                 current_cards.add(selection.label)
                 yield cards_table, _card_row(resource_name, selection, entry)
 
@@ -558,6 +593,23 @@ def _rows_by_key_sql(selection: _Selection, keys: list[str]) -> tuple[str, dict[
             parts.append(f"CAST({_quote(column)} AS {_TEXT}) = :{name}")
         matches.append("(" + " AND ".join(parts) + ")")
     return _select(selection, ["(" + " OR ".join(matches) + ")"], ordered=False), params
+
+
+def _relation_is_gone(connection, selection: _Selection) -> bool:
+    """True only when Redshift itself says the table does not exist.
+
+    The catalog views hide tables the user may not see, so a missing entry is
+    not proof of a drop. Any other answer (permission denied, a timeout)
+    raises, and nothing is forgotten.
+    """
+    try:
+        for _row in connection.query(f"SELECT 1 FROM {selection.relation} LIMIT 0"):
+            pass
+    except Exception as exc:
+        if "does not exist" in str(exc).lower():
+            return True
+        raise
+    return False
 
 
 def _read_keys(connection, selection: _Selection) -> set[str]:

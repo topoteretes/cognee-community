@@ -25,6 +25,7 @@ class FakeRedshift:
         self._public = str(tmp_path / "redshift_public.db")
         self.statements: list[tuple[str, dict | None]] = []
         self.fail_on: str | None = None
+        self.fail_message: str | None = None
         with self._admin() as db:
             db.execute(
                 "CREATE TABLE IF NOT EXISTS svv_all_tables (database_name TEXT, "
@@ -52,8 +53,14 @@ class FakeRedshift:
             def query(self, sql, params=None):
                 fake.statements.append((sql, dict(params) if params else None))
                 if fake.fail_on and fake.fail_on in sql:
-                    raise RuntimeError(f"statement failed: {fake.fail_on}")
-                return super().query(sql, params)
+                    raise RuntimeError(fake.fail_message or f"statement failed: {fake.fail_on}")
+                try:
+                    yield from super().query(sql, params)
+                except sqlite3.OperationalError as exc:
+                    if "no such table" in str(exc):
+                        # What Redshift answers for a table that is gone.
+                        raise RuntimeError(f'ERROR: relation "{exc}" does not exist') from exc
+                    raise
 
         return _Recording(self._connect, paramstyle="named")
 
@@ -77,6 +84,12 @@ class FakeRedshift:
     def drop_table(self, name):
         with self._admin() as db:
             db.execute(f'DROP TABLE public."{name}"')
+            db.execute("DELETE FROM svv_all_tables WHERE table_name = ?", (name,))
+            db.execute("DELETE FROM svv_all_columns WHERE table_name = ?", (name,))
+
+    def hide_from_catalog(self, name):
+        """The table stays readable but svv_all_* no longer lists it (a catalog gap)."""
+        with self._admin() as db:
             db.execute("DELETE FROM svv_all_tables WHERE table_name = ?", (name,))
             db.execute("DELETE FROM svv_all_columns WHERE table_name = ?", (name,))
 

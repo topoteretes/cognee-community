@@ -162,12 +162,45 @@ def test_serverless_with_secret_and_no_parameters(client):
     assert connection.database == "dev"
 
 
-def test_settings_come_from_the_environment(client, monkeypatch):
+def test_from_env_reads_the_environment_and_keyword_arguments_win(client, monkeypatch):
     monkeypatch.setenv("REDSHIFT_DATABASE", "warehouse")
     monkeypatch.setenv("REDSHIFT_WORKGROUP_NAME", "wg")
-    connection = DataApiConnection(client=client)
+    connection = DataApiConnection.from_env(client=client)
     assert connection.database == "warehouse"
     assert connection._target == {"Database": "warehouse", "WorkgroupName": "wg"}
+
+    override = DataApiConnection.from_env(client=client, database="other")
+    assert override.database == "other"
+
+
+def test_the_constructor_never_reads_redshift_variables(client, monkeypatch):
+    # The caller decides where settings come from; only from_env() reads them.
+    monkeypatch.setenv("REDSHIFT_DATABASE", "warehouse")
+    with pytest.raises(ValueError, match="database"):
+        DataApiConnection(workgroup_name="wg", client=client)
+
+
+def test_from_env_names_the_missing_variable(monkeypatch):
+    monkeypatch.delenv("REDSHIFT_DATABASE", raising=False)
+    with pytest.raises(ValueError, match="REDSHIFT_DATABASE"):
+        DataApiConnection.from_env()
+
+
+def test_a_repeated_result_token_stops_instead_of_looping(client):
+    connection = _connection(client)
+    page = {
+        "Records": [[{"longValue": 1}, {"stringValue": "a"}]],
+        "ColumnMetadata": COLUMNS,
+        "TotalNumRows": 99,
+        "NextToken": "same",
+    }
+    with Stubber(client) as stub:
+        stub.add_response("execute_statement", {"Id": "s"})
+        stub.add_response("describe_statement", {"Id": "s", "Status": "FINISHED"})
+        stub.add_response("get_statement_result", page, {"Id": "s"})
+        stub.add_response("get_statement_result", page, {"Id": "s", "NextToken": "same"})
+        with pytest.raises(RedshiftQueryError, match="same result page token"):
+            list(connection.query("SELECT 1"))
 
 
 @pytest.mark.parametrize(

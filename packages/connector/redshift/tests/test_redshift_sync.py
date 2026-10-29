@@ -384,6 +384,35 @@ def test_dropped_table_is_forgotten_with_its_card(fake, tickets):
     assert state["cards"] == []
 
 
+def test_table_missing_from_the_catalog_but_readable_is_kept(fake, tickets):
+    state: dict = {}
+    sync(fake, [tickets], state)
+
+    # The catalog view stops listing it (a privilege change, a view glitch), yet
+    # Redshift still answers SELECTs on it: that is not a drop.
+    fake.hide_from_catalog("tickets")
+    run = sync(fake, [tickets], state)
+
+    assert run.deleted == set()
+    assert "redshift:public.tickets:2" in run.rows
+    assert state["cards"] == ["public.tickets"]
+    assert state["selections"]["public.tickets"]["keys"] == ["1", "2"]
+
+
+@pytest.mark.parametrize("answer", ["ERROR: permission denied for relation tickets", "timeout"])
+def test_a_table_that_cannot_be_confirmed_gone_is_never_forgotten(fake, tickets, answer):
+    state: dict = {}
+    sync(fake, [tickets], state)
+    before = json.dumps(state, sort_keys=True)
+
+    fake.hide_from_catalog("tickets")
+    fake.fail_on, fake.fail_message = "LIMIT 0", answer
+    with pytest.raises(RuntimeError, match=answer.split(":")[-1].strip()[:10]):
+        sync(fake, [tickets], state)
+
+    assert json.dumps(state, sort_keys=True) == before
+
+
 def test_unknown_table_on_first_sync_is_an_error_not_a_silent_skip(fake):
     with pytest.raises(ValueError, match="was not found"):
         sync(fake, [RedshiftTable("public.tickts", primary_key="id")], {})

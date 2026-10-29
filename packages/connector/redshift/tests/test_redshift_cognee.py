@@ -136,9 +136,9 @@ def fake(tmp_path):
     return fake
 
 
-async def _sync(fake, selections):
+async def _sync(fake, selections, resource_name="redshift"):
     await cognee.add(
-        redshift_source(selections, connection=fake.connection()),
+        redshift_source(selections, connection=fake.connection(), resource_name=resource_name),
         dataset_name=DATASET,
         primary_key="id",
         write_disposition="merge",
@@ -218,3 +218,35 @@ async def test_unchanged_resync_does_not_call_the_llm_again(clean_environment, f
     fake.update("accounts", "id", 1, notes="Renewed early.", updated_at="2026-03-01")
     await _sync(fake, [ACCOUNTS, VENDORS])
     assert len(EXTRACTED) == 1 and "Renewed early." in EXTRACTED[0]
+
+
+@pytest.mark.asyncio
+async def test_two_clusters_in_one_dataset_do_not_forget_each_other(
+    clean_environment, fake, tmp_path
+):
+    (tmp_path / "other").mkdir()
+    other = FakeRedshift(tmp_path / "other")
+    other.create_table(
+        "accounts", {"id": "INTEGER", "name": "TEXT", "notes": "TEXT", "updated_at": "TIMESTAMP"}
+    )
+    other.insert(
+        "accounts",
+        {"id": 1, "name": CHARLIE, "notes": "Other cluster.", "updated_at": "2026-01-01"},
+    )
+
+    await _sync(fake, [ACCOUNTS], resource_name="main")
+    await _sync(other, [ACCOUNTS], resource_name="other")
+    for token in (ALPHA, BRAVO, CHARLIE):
+        assert await _graph_has(token), f"{token} should be in the graph after both syncs"
+
+    # Both clusters hold public.accounts. A delete in one must only forget its own rows.
+    fake.delete("accounts", "id", 2)
+    await _sync(fake, [ACCOUNTS], resource_name="main")
+    assert not await _graph_has(BRAVO)
+    assert await _graph_has(ALPHA)
+    assert await _graph_has(CHARLIE), "the other cluster's rows must not be touched"
+
+    other.delete("accounts", "id", 1)
+    await _sync(other, [ACCOUNTS], resource_name="other")
+    assert not await _graph_has(CHARLIE)
+    assert await _graph_has(ALPHA), "the first cluster's rows must not be touched"

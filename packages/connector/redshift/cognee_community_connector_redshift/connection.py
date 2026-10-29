@@ -57,9 +57,10 @@ class DataApiConnection:
     Serverless workgroups take ``workgroup_name`` and optionally
     ``secret_arn``.
 
-    Every argument falls back to a ``REDSHIFT_*`` environment variable. The
-    region is ``region_name``, else ``AWS_REGION``, else boto3's own choice
-    (``AWS_DEFAULT_REGION`` or your profile).
+    Settings are explicit arguments, so the caller decides where they come
+    from; ``DataApiConnection.from_env()`` reads the ``REDSHIFT_*`` variables
+    for you. The region is ``region_name``, else ``AWS_REGION``, else boto3's
+    own choice (``AWS_DEFAULT_REGION`` or your profile).
     """
 
     def __init__(
@@ -76,18 +77,12 @@ class DataApiConnection:
         client: Any = None,
         sleep: Callable[[float], None] = time.sleep,
     ):
-        database = database or os.getenv(DATABASE_ENV)
-        cluster_identifier = cluster_identifier or os.getenv(CLUSTER_ENV)
-        workgroup_name = workgroup_name or os.getenv(WORKGROUP_ENV)
-        db_user = db_user or os.getenv(DB_USER_ENV)
-        secret_arn = secret_arn or os.getenv(SECRET_ARN_ENV)
-
         if not database:
-            raise ValueError(f"Redshift database is missing. Pass database= or set {DATABASE_ENV}.")
+            raise ValueError("Redshift database is missing. Pass database=.")
         if bool(cluster_identifier) == bool(workgroup_name):
             raise ValueError(
                 "Pass exactly one of cluster_identifier= (provisioned cluster) or "
-                f"workgroup_name= (Serverless), or set {CLUSTER_ENV} or {WORKGROUP_ENV}."
+                "workgroup_name= (Serverless)."
             )
         if db_user and secret_arn:
             raise ValueError("Pass db_user= or secret_arn=, not both.")
@@ -115,6 +110,27 @@ class DataApiConnection:
         self._client = client
         self._sleep = sleep
 
+    @classmethod
+    def from_env(cls, **overrides: Any) -> "DataApiConnection":
+        """Build a connection from the ``REDSHIFT_*`` environment variables.
+
+        Reads ``REDSHIFT_DATABASE``, ``REDSHIFT_CLUSTER_IDENTIFIER``,
+        ``REDSHIFT_WORKGROUP_NAME``, ``REDSHIFT_DB_USER`` and
+        ``REDSHIFT_SECRET_ARN``. Keyword arguments override them.
+        """
+        names = {
+            "database": DATABASE_ENV,
+            "cluster_identifier": CLUSTER_ENV,
+            "workgroup_name": WORKGROUP_ENV,
+            "db_user": DB_USER_ENV,
+            "secret_arn": SECRET_ARN_ENV,
+        }
+        settings: dict[str, Any] = {k: os.getenv(v) for k, v in names.items() if os.getenv(v)}
+        settings.update(overrides)
+        if not settings.get("database"):
+            raise ValueError(f"Redshift database is missing. Set {DATABASE_ENV}.")
+        return cls(**settings)
+
     def query(self, sql: str, params: Mapping[str, str] | None = None) -> Iterator[dict]:
         """Run one statement and yield its rows, following every result page."""
         client = self._get_client()
@@ -125,6 +141,7 @@ class DataApiConnection:
         self._wait(client, statement_id)
 
         next_token = None
+        seen_tokens: set[str] = set()
         names: list[str] | None = None
         while True:
             page_request = {"Id": statement_id}
@@ -138,6 +155,12 @@ class DataApiConnection:
             next_token = page.get("NextToken")
             if not next_token:
                 return
+            if next_token in seen_tokens:
+                raise RedshiftQueryError(
+                    "Redshift returned the same result page token twice; stopping instead of "
+                    "reading the same page forever."
+                )
+            seen_tokens.add(next_token)
 
     def close(self) -> None:
         """Nothing to release: each statement is its own HTTPS call."""

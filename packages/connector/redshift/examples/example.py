@@ -65,7 +65,7 @@ def _connection():
             password=os.environ["REDSHIFT_PASSWORD"],
         )
     # The Data API, configured from REDSHIFT_* and the AWS credential chain.
-    return DataApiConnection()
+    return DataApiConnection.from_env()
 
 
 async def main() -> None:

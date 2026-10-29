@@ -10,7 +10,11 @@ import pytest
 from cognee.tasks.ingestion import dlt_utils
 from fake_redshift import FakeRedshift
 
-from cognee_community_connector_redshift import RedshiftTable, redshift_source
+from cognee_community_connector_redshift import (
+    DataApiConnection,
+    RedshiftTable,
+    redshift_source,
+)
 
 
 @pytest.fixture
@@ -117,9 +121,46 @@ def test_resource_name_must_be_a_plain_name(fake):
         redshift_source([TICKETS], connection=fake.connection(), resource_name="Finance Team")
 
 
-def test_default_connection_is_the_data_api_from_the_environment(monkeypatch):
+def test_the_connection_is_required(monkeypatch):
+    # No hidden default: the caller decides where settings come from.
     monkeypatch.setenv("REDSHIFT_DATABASE", "dev")
     monkeypatch.setenv("REDSHIFT_WORKGROUP_NAME", "analytics")
-    # Built without touching AWS: the client is created on the first statement.
-    source = redshift_source([TICKETS])
+    with pytest.raises(TypeError, match="connection"):
+        redshift_source([TICKETS])
+
+
+def test_a_data_api_connection_from_the_environment_builds_without_touching_aws(monkeypatch):
+    monkeypatch.setenv("REDSHIFT_DATABASE", "dev")
+    monkeypatch.setenv("REDSHIFT_WORKGROUP_NAME", "analytics")
+    # The boto3 client is only created on the first statement.
+    source = redshift_source([TICKETS], connection=DataApiConnection.from_env())
     assert dlt_utils.document_source_tag(source) == "redshift"
+
+
+def test_check_active_runs_before_every_statement_and_row(tmp_path, fake):
+    calls = []
+
+    def check_active():
+        calls.append(1)
+
+    guarded = redshift_source([TICKETS], connection=fake.connection(), check_active=check_active)
+    _pipeline(tmp_path).run(
+        guarded, write_disposition="merge", primary_key="id", columns=dlt_utils.NODE_SET_COLUMN_HINT
+    )
+    # More than the rows alone: every statement is checked as well.
+    assert len(calls) > guarded.cognee_sync_stats["rows"] * 2
+
+
+def test_a_revoked_connection_stops_before_the_first_statement(tmp_path, fake):
+    def check_active():
+        raise PermissionError("access was revoked")
+
+    source = redshift_source([TICKETS], connection=fake.connection(), check_active=check_active)
+    with pytest.raises(Exception, match="access was revoked"):
+        _pipeline(tmp_path).run(
+            source,
+            write_disposition="merge",
+            primary_key="id",
+            columns=dlt_utils.NODE_SET_COLUMN_HINT,
+        )
+    assert fake.statements == []
