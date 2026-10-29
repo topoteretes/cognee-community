@@ -7,6 +7,7 @@ import json
 import dlt
 import httpx
 import pytest
+from dlt.pipeline.exceptions import PipelineStepFailed
 from fake_ramp import FakeRamp, ago
 
 from cognee_community_connector_ramp import RampClient, ramp_source
@@ -51,8 +52,11 @@ def test_failed_run_commits_neither_rows_nor_state(tmp_path):
 
     del fake.transactions["t1"]
     fake.queued = [httpx.Response(500, content=b"{}")] * 10
-    with pytest.raises(Exception):  # noqa: B017 - dlt wraps the source error
+    with pytest.raises(PipelineStepFailed) as failure:
         pipeline.run(source(fake))
+    # naming the wrapper and its cause, so the test cannot pass on an unrelated error
+    assert isinstance(failure.value.__cause__, Exception)
+    assert "ramp" in str(failure.value).lower()
 
     assert resource_state(pipeline, "ramp_a") == before
     assert staged_ids(pipeline, "ramp_a") == {"transaction:t1", "transaction:t2"}

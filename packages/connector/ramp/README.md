@@ -51,12 +51,12 @@ See `examples/example.py` for the full flow, including a `GRAPH_COMPLETION` sear
 
 | Argument | Default | |
 | --- | --- | --- |
-| `resource_name` | required | scopes sync state and cleanup; one per Ramp business |
+| `resource_name` | required | scopes sync state and cleanup; one per Ramp business. Must be lowercase snake_case: dlt keeps the name as given for the state and normalizes it for the table, so anything else is refused rather than silently sharing a table |
 | `since` | all history | ISO 8601 time; earlier transactions are not ingested |
 | `lookback_days` | 60 | how far behind the cursor each run re-reads (see below) |
 | `require_context` | `True` | skip transactions that are only an amount |
 | `include_declined` | `False` | also ingest declined (and errored) transactions |
-| `department_ids`, `user_ids`, `entity_id` | all | only sync these departments, card holders or entity |
+| `department_ids`, `user_ids`, `entity_id` | all | only sync these departments, card holders or entity. The first two take a **list**; a bare string is refused, because it would become a selection matching nothing and every stored transaction would then be forgotten |
 | `max_requests` | 1000 | request budget of one run; a big backfill finishes over several runs |
 | `adopt_state_from` | `None` | `client_id` of a previous Ramp app of the same business, whose state this run may take over |
 
@@ -120,7 +120,8 @@ yields what it reached, saves its progress and returns, so the next run continue
 The only signal is `source.cognee_sync_stats`, which then holds `failed_budget` or
 `failed_rate_limit` and a non-zero `failed`. Read those stats if you need to know whether a sync
 finished. Everything else (a refused token, a malformed listing, an unreachable API) raises, and
-dlt commits neither rows nor state.
+dlt commits neither rows nor state — so there is no `failed_auth` count to read: an auth failure
+never produces a committed run at all.
 
 ### Limitations
 
@@ -135,9 +136,13 @@ dlt commits neither rows nor state.
 - A transaction whose own read keeps failing (a 403, a 422, an unrecognised 404) is retried on five
   runs, then only once a week. Its document is kept, and `cognee_sync_stats["failed"]` stays at one
   or more while it is being retried: that is not a broken sync.
-- `resource_name` becomes a dlt table name, so two sources in one dataset whose names differ only
-  in case or punctuation (`Ramp_A` and `ramp-a`) would write to the same table while keeping
-  separate state. Give them names that differ in more than that.
+- `resource_name` becomes a dlt table name. Two names differing only in case or punctuation
+  (`Ramp_A`, `ramp-a`, `ramp a`, `ramp.a`) all normalize to one table while keeping separate state,
+  so neither business's cleanup could reach the other's rows. Rather than leave that to the reader,
+  anything dlt's naming would change is **refused** when the source is built.
+- Sync state keeps one row id per listed transaction while a walk is in progress, so that a
+  resumed listing knows what it has already seen (1,375 on the sandbox backfill). It is bounded by
+  the lookback window and dropped once the listing completes.
 - Anyone who can read the cognee dataset can read the transactions in it, including card holders'
   and attendees' names. Give the dataset the same audience as Ramp's transaction list.
 - One malformed record in a listing is skipped and counted in `failed` rather than failing the run;

@@ -26,6 +26,7 @@ import httpx
 from cognee.shared.logging_utils import get_logger
 from cognee.tasks.ingestion import dlt_utils
 from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR, NODE_SET_COLUMN
+from dlt.common.normalizers.naming.snake_case import NamingConvention
 
 logger = get_logger("ramp_connector")
 
@@ -130,6 +131,7 @@ class RampClient:
         base_url: str = PRODUCTION_URL,
         http: httpx.Client | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        check_active: Callable[[], None] | None = None,
     ):
         if not client_id or not client_secret:
             raise ValueError("Ramp needs a client_id and a client_secret")
@@ -138,9 +140,28 @@ class RampClient:
         self.identity = _app_identity(client_id)
         self.base_url = base_url.rstrip("/")
         self._http = http or httpx.Client(timeout=_TIMEOUT)
+        # only a client this object made is this object's to close
+        self._owns_http = http is None
         self._sleep = sleep
         self._token: str | None = None
         self._token_expires = 0.0
+        self.check_active = check_active
+
+    def close(self) -> None:
+        """Release the connection pool. A caller-supplied client is left alone."""
+        if self._owns_http:
+            self._http.close()
+
+    def _pause(self, delay: float) -> None:
+        """Sleep, having first given the host a chance to stop the run.
+
+        A 429 can hold this for a minute and the retries for three seconds more, all of
+        it while cognee holds its process-wide dlt staging lock, so a revoked
+        authorization has to be able to interrupt a wait and not only a request.
+        """
+        if self.check_active is not None:
+            self.check_active()
+        self._sleep(delay)
 
     def __repr__(self) -> str:
         return f"RampClient(base_url={self.base_url!r})"
@@ -206,19 +227,19 @@ class RampClient:
                     raise RampUnavailableError(
                         f"Ramp could not be reached for {_endpoint(path)}"
                     ) from exc
-                self._sleep(2 ** (failures - 1))
+                self._pause(2 ** (failures - 1))
                 continue
             if response.status_code == 429:
                 waits += 1
                 delay = _retry_after(response)
                 if waits > _RATE_LIMIT_WAITS or delay > _MAX_RETRY_AFTER:
                     raise RampRateLimitedError(f"Ramp kept rate limiting {_endpoint(path)}")
-                self._sleep(delay)
+                self._pause(delay)
                 continue
             if response.status_code >= 500:
                 failures += 1
                 if failures < _RETRIES:
-                    self._sleep(2 ** (failures - 1))
+                    self._pause(2 ** (failures - 1))
                     continue
             return response
 
@@ -606,6 +627,8 @@ class _Walker:
         cut-short walk resumes at the page it was reading.
         """
         start = (progress or {}).get("start")
+        seen_tokens: set[str] = set()
+        restarts = 0
         while True:
             query = {**params, "page_size": PAGE_SIZE}
             if start:
@@ -615,10 +638,20 @@ class _Walker:
             except RampStaleTokenError:
                 if not (progress and progress.get("start")):
                     raise
+                if restarts:
+                    # a second refusal means restarting does not help: the listing hands
+                    # back a token it then rejects, so every restart re-reads the same
+                    # pages and the walk spends the whole budget without ever finishing.
+                    # One restart recovers the real case; two is a loop.
+                    raise RampAPIError(
+                        f"Ramp refused its own page token twice for {_endpoint(path)}; "
+                        "the listing is not making progress"
+                    ) from None
                 # the token is the id of the last record read, and Ramp answers 422 once
                 # that record is gone (an expired authorization, seen on the sandbox):
                 # restart the listing; records already read are skipped by their hashes
                 logger.warning("Ramp refused a saved page token; restarting the listing.")
+                restarts += 1
                 start = progress["start"] = None
                 progress["restarted"] = True
                 continue
@@ -630,7 +663,13 @@ class _Walker:
                     f"Ramp sent a listing without data or page for {_endpoint(path)}"
                 )
             yield data
+            if start:
+                seen_tokens.add(start)
             start = _next_start(page.get("next"), path)
+            if start and start in seen_tokens:
+                # the same token again: the listing would re-read this page until the
+                # budget is gone, and a walk that never ends never confirms what is gone
+                raise RampAPIError(f"Ramp returned the same page token twice for {_endpoint(path)}")
             if progress is not None:
                 progress["start"] = start
             if not start:
@@ -1023,14 +1062,30 @@ def ramp_source(
 
     # 2 is the version that added per-row node sets (NODE_SET_COLUMN_HINT), which the rows
     # below rely on; the attribute is missing altogether before cognee 1.6.3
-    if getattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 0) < 2:
-        raise RuntimeError("Ramp sync requires cognee>=1.6.4 (per-row node sets).")
+    found = getattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 0)
+    if found < 2:
+        raise RuntimeError(
+            f"Ramp sync needs cognee's document sync version 2 or later (cognee 1.6.4+), "
+            f"for per-row node sets; this cognee reports {found}."
+        )
     if not isinstance(resource_name, str) or not resource_name.strip():
         raise ValueError("ramp_source needs a resource_name, one per Ramp business")
-    if resource_name != resource_name.strip():
-        # dlt would keep the padding in the resource name while normalizing it away in the
-        # table name, so " ramp_acme" and "ramp_acme" share a table but not their state
-        raise ValueError("resource_name must not start or end with whitespace")
+    if NamingConvention().normalize_table_identifier(resource_name) != resource_name:
+        # dlt keeps the name as given for the state and normalizes it for the table, so
+        # "Ramp_A", "ramp-a", "ramp a" and "ramp.a" all write to one table while each
+        # keeps its own state - neither business's cleanup can then reach the other's
+        # rows, and PIPELINE_SCOPE_ATTR is ambiguous for forget
+        raise ValueError("resource_name must be lowercase snake_case (letters, digits, _)")
+    for name, value in (("department_ids", department_ids), ("user_ids", user_ids)):
+        if value is None:
+            continue
+        if isinstance(value, str) or not isinstance(value, (list, tuple, set, frozenset)):
+            # set("dep_eng") is {"d", "_", "e", "p", "g", "n"}: a bare string becomes a
+            # selection that matches nothing, and every stored row is then read as having
+            # left the selection and tombstoned - a silent, total forget on a clean run
+            raise ValueError(f'{name} must be a list of ids, e.g. ["dep_eng"], not a string')
+        if not all(isinstance(item, str) and item.strip() for item in value):
+            raise ValueError(f"{name} must contain non-empty id strings")
     if lookback_days < 0:
         raise ValueError("lookback_days must be zero or more")
     if max_requests < 3:
@@ -1038,14 +1093,22 @@ def ramp_source(
         raise ValueError("max_requests must be at least 3")
     if since is not None and _parse_time(since) is None:
         raise ValueError("since must be an ISO 8601 time, e.g. 2026-01-01T00:00:00Z")
-    # built here so missing credentials fail at construction and the closure holds no raw secret
-    client = service
-    if client is None:
-        client = RampClient(
+    if service is None and not (client_id and client_secret):
+        # fail here rather than on the first row, keeping the credential check at
+        # construction without holding a client (or a raw secret) in the closure
+        raise ValueError(
+            "ramp_source needs client_id and client_secret, or a prepared client in service="
+        )
+
+    def _client() -> Any:
+        """A client per run, so its connection pool does not outlive the run."""
+        return RampClient(
             client_id or "",
             client_secret or "",
             base_url=SANDBOX_URL if sandbox else PRODUCTION_URL,
+            check_active=check_active,
         )
+
     stats: dict[str, int] = {}
 
     @dlt.resource(
@@ -1060,22 +1123,29 @@ def ramp_source(
     def ramp_transactions():
         stats.clear()
         stats.update(scanned=0, skipped=0, deleted=0, failed=0)
-        rows = _iter_rows(
-            client,
-            dlt.current.resource_state(),
-            stats,
-            since=since,
-            lookback_days=lookback_days,
-            include_declined=include_declined,
-            require_context=require_context,
-            department_ids=department_ids,
-            user_ids=user_ids,
-            entity_id=entity_id,
-            max_requests=max_requests,
-            check_active=check_active,
-            adopt_state_from=adopt_state_from,
-        )
-        yield from dlt_utils.guarded_rows(rows, check_active)
+        client = service if service is not None else _client()
+        try:
+            rows = _iter_rows(
+                client,
+                dlt.current.resource_state(),
+                stats,
+                since=since,
+                lookback_days=lookback_days,
+                include_declined=include_declined,
+                require_context=require_context,
+                department_ids=department_ids,
+                user_ids=user_ids,
+                entity_id=entity_id,
+                max_requests=max_requests,
+                check_active=check_active,
+                adopt_state_from=adopt_state_from,
+            )
+            yield from dlt_utils.guarded_rows(rows, check_active)
+        finally:
+            # a run that raised still has to give its sockets back; an injected client
+            # belongs to the caller (the tests), so it is left open
+            if service is None:
+                client.close()
 
     resource = ramp_transactions()
     setattr(resource, DOCUMENT_SOURCE_ATTR, "ramp")

@@ -781,9 +781,23 @@ def test_running_out_of_budget_during_a_reread_keeps_it_queued(fake):
 def test_source_validates_its_arguments(fake):
     with pytest.raises(ValueError, match="resource_name"):
         ramp_source(resource_name=" ", service=client_for(fake))
-    with pytest.raises(ValueError, match="whitespace"):
-        # dlt would normalize the padding out of the table name but keep it in the state
-        ramp_source(resource_name=" ramp_acme", service=client_for(fake))
+    for bad in (" ramp_acme", "Ramp_A", "ramp-a", "ramp a", "ramp.a"):
+        # dlt keeps the name as given for the state and normalizes it for the table, so
+        # every one of these would share a table with "ramp_a" while keeping its own
+        # state, and neither business's cleanup could reach the other's rows
+        with pytest.raises(ValueError, match="snake_case"):
+            ramp_source(resource_name=bad, service=client_for(fake))
+    for bad_selection in ("dep_eng", 5, ["", "dep_eng"]):
+        # set("dep_eng") matches nothing, so every stored row would look as though it had
+        # left the selection and be tombstoned on a run reporting no failures at all
+        with pytest.raises(ValueError, match="department_ids"):
+            ramp_source(
+                resource_name="ramp_acme",
+                service=client_for(fake),
+                department_ids=bad_selection,
+            )
+    with pytest.raises(ValueError, match="user_ids"):
+        ramp_source(resource_name="ramp_acme", service=client_for(fake), user_ids="usr_sam")
     with pytest.raises(ValueError, match="client_id"):
         ramp_source(resource_name="ramp_acme")
     with pytest.raises(ValueError, match="ISO 8601"):
@@ -803,3 +817,148 @@ def test_sandbox_flag_targets_the_demo_api():
 def test_max_requests_must_leave_room_for_progress(fake):
     with pytest.raises(ValueError, match="at least 3"):
         ramp_source(resource_name="r", service=client_for(fake), max_requests=2)
+
+
+def test_a_bare_string_selection_is_refused_rather_than_forgetting_everything(fake):
+    """The failure this guards against was silent and total.
+
+    ``set("dep_eng")`` is ``{"d", "_", "e", "p", "g", "n"}``, so a bare string became a
+    selection matching no department at all. Every stored transaction then looked as
+    though it had left the selection and was tombstoned - on a run that reported
+    ``failed: 0``, i.e. a clean success. The whole dataset went, quietly.
+    """
+    fake.add("t1", ago(2), memo="lunch with the team")
+    fake.add("t2", ago(1), memo="hotel for the offsite")
+    state: dict = {}
+    upserts, _, _ = sync(fake, state)
+    assert set(upserts) == {"transaction:t1", "transaction:t2"}
+
+    with pytest.raises(ValueError, match="department_ids"):
+        ramp_source(resource_name="ramp_acme", service=client_for(fake), department_ids="dep_eng")
+
+    # and the real selection still works, so the check is not just blanket refusal
+    _, deletes, _ = sync(fake, state, department_ids=["dep_eng"])
+    assert deletes == set(), "the matching department keeps its transactions"
+    assert set(state["rows"]) == {"transaction:t1", "transaction:t2"}
+
+
+def test_a_listing_that_keeps_refusing_its_own_token_stops_instead_of_looping(fake):
+    """Ramp hands back a ``start`` token and then answers 422 for it.
+
+    One restart is the real recovery (the record the token names was deleted). But the
+    restart was unbounded, so a listing that refuses every token restarted for ever:
+    measured, 50 requests - the whole budget - on every run, re-reading page one each
+    time and never completing, so nothing was ever confirmed gone either.
+    """
+    fake.add("t1", ago(1))
+    original = fake._handle
+
+    def handle(request):
+        response = original(request)
+        if request.url.path.endswith("/transactions") and response.status_code == 200:
+            # a next token the fake will then reject, because it names no record
+            body = json.loads(response.content)
+            body["page"] = {"next": "https://x/transactions?start=STUCK"}
+            return httpx.Response(200, json=body)
+        return response
+
+    fake._handle = handle
+    try:
+        with pytest.raises(Exception, match="refused its own page token twice"):
+            sync(fake, {}, max_requests=50)
+    finally:
+        fake._handle = original
+
+
+def test_a_repeated_page_token_is_an_error_not_an_endless_listing(fake):
+    """The other shape: the token is accepted, and names the same page for ever."""
+    fake.add("t1", ago(1))
+    original = fake._handle
+
+    def handle(request):
+        response = original(request)
+        if request.url.path.endswith("/transactions") and response.status_code == 200:
+            body = json.loads(response.content)
+            # a token the fake accepts (t1 exists), handed back unchanged every time
+            body["page"] = {"next": "https://x/transactions?start=t1"}
+            return httpx.Response(200, json=body)
+        return response
+
+    fake._handle = handle
+    try:
+        with pytest.raises(Exception, match="same page token twice"):
+            sync(fake, {}, max_requests=50)
+    finally:
+        fake._handle = original
+
+
+def test_a_client_only_closes_the_pool_it_made(fake):
+    """An injected client belongs to the caller; the tests reuse theirs across runs."""
+    injected = fake.client()
+    borrowed = RampClient("client", "secret", http=injected)
+
+    borrowed.close()
+
+    assert not injected.is_closed, "a caller's client must survive being handed over"
+    owned = RampClient("client", "secret")
+    owned.close()
+    assert owned._http.is_closed
+
+
+def test_the_resource_closes_the_client_it_made(fake, monkeypatch, tmp_path):
+    """A scheduled sync builds a source per load; an unclosed pool leaks every time."""
+    import dlt
+
+    closed: list[str] = []
+
+    def build(client_id, client_secret, *, base_url, check_active=None):
+        # the fake only honours its own credentials; the ids the factory was given are
+        # irrelevant here, the point is who closes the client
+        client = RampClient(*fake.credentials, http=fake.client())
+        monkeypatch.setattr(client, "close", lambda: closed.append("closed"))
+        return client
+
+    fake.add("t1", ago(1), memo="lunch with the team")
+    monkeypatch.setattr(ramp, "RampClient", build)
+    pipeline = dlt.pipeline(
+        pipeline_name="ramp_close_test",
+        destination=dlt.destinations.sqlalchemy(f"sqlite:///{(tmp_path / 'c.db').as_posix()}"),
+        dataset_name="ramp_close_ds",
+        pipelines_dir=str(tmp_path / "state"),
+    )
+
+    pipeline.run(ramp_source(resource_name="ramp_acme", client_id="a", client_secret="b"))
+
+    assert closed == ["closed"], "the client the source made must be closed when the run ends"
+
+
+def test_the_cognee_version_guard_names_what_it_found(fake, monkeypatch):
+    """An untested version guard is one goran asks to delete in favour of the pin."""
+    from cognee.tasks.ingestion import dlt_utils
+
+    monkeypatch.setattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 1, raising=False)
+
+    with pytest.raises(RuntimeError, match="reports 1"):
+        ramp_source(resource_name="ramp_acme", service=client_for(fake))
+
+
+@pytest.mark.parametrize("status", [401, 403, 404, 429, 500, 503])
+def test_the_credentials_never_reach_a_message_or_a_log(fake, caplog, capsys, status):
+    """Nothing pinned this before; Asana leaked a token through an httpx header error."""
+    secret = "SUPERSECRET-ramp-value"
+    client = RampClient("client-id-value", secret, http=fake.client(), sleep=lambda _s: None)
+    fake.queued = [httpx.Response(status, content=b'{"error": {"message": "nope"}}')] * 8
+
+    with caplog.at_level("DEBUG"):
+        try:
+            client.get("/developer/v1/transactions")
+        except Exception as exc:
+            haystack = " ".join([str(exc), repr(exc), repr(getattr(exc, "__dict__", {}))])
+        else:
+            haystack = ""
+    streams = capsys.readouterr()
+    haystack += " ".join([caplog.text, streams.out, streams.err])
+
+    assert secret not in haystack, f"the client secret leaked on {status}"
+    assert "client-id-value" not in haystack, f"the client id leaked on {status}"
+    assert client._basic not in haystack, f"the basic-auth blob leaked on {status}"
