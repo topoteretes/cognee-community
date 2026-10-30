@@ -1,0 +1,31 @@
+services:
+  db:
+    image: mariadb:11.4
+    environment:
+      MARIADB_DATABASE: wp
+      MARIADB_USER: wp
+      MARIADB_PASSWORD: wp
+      MARIADB_ROOT_PASSWORD: root
+    volumes: [db:/var/lib/mysql]
+  wordpress:
+    image: wordpress:php8.3-apache
+    depends_on: [db]
+    ports: ["8088:80"]
+    environment:
+      WORDPRESS_DB_HOST: db
+      WORDPRESS_DB_USER: wp
+      WORDPRESS_DB_PASSWORD: wp
+      WORDPRESS_DB_NAME: wp
+    volumes: [wp:/var/www/html]
+  cli:
+    image: wordpress:cli-php8.3
+    depends_on: [wordpress]
+    user: "33:33"
+    environment:
+      WORDPRESS_DB_HOST: db
+      WORDPRESS_DB_USER: wp
+      WORDPRESS_DB_PASSWORD: wp
+      WORDPRESS_DB_NAME: wp
+    volumes: [wp:/var/www/html]
+    entrypoint: ["sleep", "infinity"]
+volumes: {db: {}, wp: {}}
