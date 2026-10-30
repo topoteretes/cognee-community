@@ -1,0 +1,18 @@
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+name = "cognee-community-connector-meilisearch"
+version = "0.1.0"
+description = "Meilisearch search engine and document index connector for Cognee"
+authors = ["Bhomvrat Rai <bhomvratrai@gmail.com>"]
+readme = "README.md"
+packages = [{ include = "cognee_community_connector_meilisearch" }]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+aiohttp = ">=3.9.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=7.0.0"
