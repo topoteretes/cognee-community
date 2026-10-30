@@ -1,0 +1,23 @@
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+name = "cognee-community-connector-devto"
+version = "0.1.0"
+description = "DEV.to (Forem) data source connector for Cognee AI memory layer"
+authors = ["Swati <swatiicfai@users.noreply.github.com>"]
+license = "Apache-2.0"
+readme = "README.md"
+packages = [{include = "cognee_community_connector_devto"}]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+cognee = ">=0.1.0"
+dlt = ">=0.4.0"
+requests = ">=2.28.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=7.0.0"
+pytest-asyncio = ">=0.20.0"
+responses = ">=0.23.0"
