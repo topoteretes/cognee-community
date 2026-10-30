@@ -17,21 +17,22 @@ Rules the code keeps:
   never wipes memory.
 """
 
-import os
 import re
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from itertools import groupby
-from typing import Any
+from typing import Any, NoReturn
 from urllib.parse import urlsplit
 
 import dlt
 from cognee.shared.logging_utils import get_logger
 from cognee.tasks.ingestion import dlt_utils
 from dlt.destinations.exceptions import DatabaseUndefinedRelation
+from dlt.extract.exceptions import ResourceExtractionError
 from dlt.sources.helpers.requests import Client
 from dlt.sources.helpers.rest_client.paginators import JSONResponseCursorPaginator
 from dlt.sources.rest_api import rest_api_resources
+from requests import exceptions as http_errors
 
 logger = get_logger("vercel_connector")
 
@@ -54,9 +55,9 @@ _MAX_PROJECT_IDS = 20
 # Seconds before one request gives up. dlt's default is 60, and the wait happens
 # inside cognee's staging lock, which every other dlt ingestion waits on.
 _REQUEST_TIMEOUT = 30
-# Longest wait before the one retry a 5xx or a dropped connection gets. dlt's
-# own cap is 300 s, four times per request; a few seconds rides out a blip
-# without holding the staging lock for long. A 429 is never retried.
+# Longest wait before the one retry a run gets, for a 5xx or a dropped
+# connection. dlt's own cap is 300 s, four times per request; one short wait
+# per run rides out a blip without holding the staging lock for long.
 _RETRY_WAIT = 5
 # The raw lists the loaded tables are built from. They are never loaded themselves.
 _RAW_PROJECTS = "vercel_raw_projects"
@@ -101,9 +102,9 @@ def vercel_source(
     """Create a dlt source that yields Vercel projects, deployments and failed-build output.
 
     Args:
-        token: Vercel access token, sent as a bearer token. Falls back to
-            ``VERCEL_TOKEN``.
-        team_id: Team id (``team_...``) to read. Falls back to ``VERCEL_TEAM_ID``.
+        token: Vercel access token, sent as a bearer token. Required; the
+            example reads it from ``VERCEL_TOKEN``.
+        team_id: Team id (``team_...``) to read.
         project_ids: Read only these projects, by id or name (names in any case).
             Names are turned into ids through the projects list. A project named
             here that the account does not have stops the run.
@@ -129,9 +130,10 @@ def vercel_source(
             stays as it was.
         service: ``requests.Session`` to send requests through, mainly for tests.
             By default dlt's session is used, kept short because it runs inside
-            cognee's staging lock: a 429 stops the run, a 5xx or a dropped
-            connection gets one retry after at most 5 s, and each request times
-            out after 30 s. ``session`` is accepted as another name for it.
+            cognee's staging lock: a 429 stops the run, the first 5xx or dropped
+            connection of a run gets one retry after at most 5 s and any later
+            one stops it, a timeout is not retried, and each request times out
+            after 30 s. ``session`` is accepted as another name for it.
 
     Returns:
         A dlt source for ``cognee.add(...)`` / ``cognee.remember(...)``. Its
@@ -140,12 +142,16 @@ def vercel_source(
     # cognee marks its document-sync behaviour with this number. Version 1, in
     # 1.6.1, is the one that scopes orphan cleanup by staging table, which three
     # tables under one tag need. Later versions only add to it.
-    if getattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 0) < 1:
+    # A dev build of cognee can carry the version but not the scope attribute
+    # yet, so both are checked.
+    if getattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 0) < 1 or not hasattr(
+        dlt_utils, "PIPELINE_SCOPE_ATTR"
+    ):
         raise RuntimeError("The Vercel connector needs cognee>=1.6.1 (table-scoped cleanup).")
-    resolved_token = token or os.environ.get("VERCEL_TOKEN")
-    if not resolved_token:
-        raise ValueError("Vercel access token required: pass token= or set VERCEL_TOKEN.")
-    resolved_team = team_id or os.environ.get("VERCEL_TEAM_ID")
+    if not token:
+        raise ValueError("Vercel access token required: pass token=.")
+    resolved_token = token
+    resolved_team = team_id
     name = _resource_name(resource_name, resolved_team)
     wanted = _wanted(project_ids)
     if max_log_chars is not None and max_log_chars < 1:
@@ -172,10 +178,11 @@ def vercel_source(
         check_active=check_active,
         stats=stats,
     )
+    http = service or session or _default_session()
     client = {
         "base_url": _API_BASE,
         "auth": {"type": "bearer", "token": resolved_token},
-        "session": service or session or _default_session(),
+        "session": http,
     }
     raw = {r.name: r for r in rest_api_resources({"client": client, "resources": endpoints})}
 
@@ -190,6 +197,7 @@ def vercel_source(
             allow_empty,
             stats,
             run,
+            getattr(http, "retry_budget", None),
             tables["projects"],
         ),
         _table(_deployment_rows, tables["deployments"], _URL_COLUMN)(
@@ -215,6 +223,7 @@ def vercel_source(
             lookback_days,
             run_filters[_RAW_FAILED],
             listed,
+            stats,
         )
         events_endpoint = _events_endpoint(
             team=resolved_team, check_active=check_active, log_lines=log_lines, stats=stats
@@ -245,7 +254,7 @@ def vercel_source(
     return source
 
 
-def _no_parallelize(*args: Any, **kwargs: Any):
+def _no_parallelize(*args: Any, **kwargs: Any) -> NoReturn:
     raise NotImplementedError(
         "Vercel: parallelize() is not supported. The deployment tables use the projects "
         "list read by the projects table in the same run, so that table has to run first."
@@ -271,14 +280,19 @@ def _project_rows(
     allow_empty: bool,
     stats: dict,
     run: "_RunProjects",
+    budget: "_RetryBudget | None",
     table: str,
 ):
     # The first table of a run, before any request: clear the counts, so a
-    # failed run never shows the last good run's numbers as its own.
+    # failed run never shows the last good run's numbers as its own, and give
+    # the run its one retry.
+    if budget is not None:
+        budget.reset()
     stats.clear()
     stats["failed_rate_limit"] = 0
+    stats["failed_auth"] = 0
     stats["skipped_projects"] = []
-    every = _merge_head(_unique(_items(raw), "id"), list(_items(raw_head)))
+    every = _merge_head(_unique(_items(raw, stats), "id"), list(_items(raw_head, stats)))
     run.publish(every)
     found = every
     if wanted:
@@ -303,7 +317,7 @@ def _deployment_rows(
     if ids is not None and not ids:
         rows = []  # every selected project is gone: nothing to list
     else:
-        found = _unique(_items(raw), "uid")
+        found = _unique(_items(raw, stats), "uid")
         rows = [_deployment_row(item) for item in found if _in_scope(item, ids)]
     yield rows
     _finish(stats, "deployments", table, len(rows))
@@ -316,11 +330,12 @@ def _failed_parents(
     lookback_days: int | None,
     filters: dict,
     listed: list[str],
+    stats: dict,
 ):
     ids = _run_filters(filters, run.take("failed deployments"), wanted, lookback_days)
     parents = []
     if ids is None or ids:
-        found = _unique(_items(raw), "uid")
+        found = _unique(_items(raw, stats), "uid")
         parents = [_failed_parent(item) for item in found if _in_scope(item, ids)]
     listed[:] = [parent["uid"] for parent in parents]
     # One list: rest_api's child step iterates what it is given.
@@ -385,7 +400,7 @@ def _build_log_documents(
     again unchanged, which keeps its document. It goes once the deployment does.
     """
     loaded = set()
-    for row in _build_log_rows(_items(build_events), max_log_chars, log_lines):
+    for row in _build_log_rows(_items(build_events, stats), max_log_chars, log_lines):
         loaded.add(row["id"])
         yield row
     gone = [uid for uid in listed if uid not in loaded]
@@ -612,23 +627,58 @@ class _OverlappingCursor(JSONResponseCursorPaginator):
         self._next_reference = cursor
 
 
+class _RetryBudget:
+    """One retry for a whole run, used as dlt's retry condition.
+
+    Every wait happens inside cognee's staging lock, which every other dlt
+    ingestion in the process waits on, and dlt would otherwise retry each
+    request on its own. With this, the first 5xx or dropped connection of a run
+    is retried once after at most ``_RETRY_WAIT`` seconds, and any later one
+    stops the run. A timeout is not retried, so a request that hangs costs
+    ``_REQUEST_TIMEOUT`` once, and a 429 never is.
+    """
+
+    _RETRIED = (http_errors.ConnectionError, http_errors.ChunkedEncodingError)
+
+    def __init__(self):
+        self.left = 1
+
+    def reset(self) -> None:
+        self.left = 1
+
+    def __call__(self, response, exception) -> bool:
+        if isinstance(exception, http_errors.Timeout):
+            return False  # ConnectTimeout is also a ConnectionError; it is not retried
+        failed = isinstance(exception, self._RETRIED) or (
+            response is not None and 500 <= response.status_code < 600
+        )
+        if not failed or self.left <= 0:
+            return False
+        self.left -= 1
+        return True
+
+
 def _default_session():
     """dlt's session, kept short because it runs inside cognee's staging lock.
 
-    A 5xx or a dropped connection gets one retry after at most ``_RETRY_WAIT``
-    seconds, since a run of a few hundred requests would otherwise fail on any
-    single blip and start over. A 429 is never retried: it is left out of the
-    retried codes, and ``_rate_limited`` stops the run from inside the request
-    before dlt's retry would see the answer anyway. Each try gives up after
-    ``_REQUEST_TIMEOUT``.
+    dlt's own retry rules are switched off (no status codes, no exceptions), and
+    ``_RetryBudget`` decides instead: one retry per run for a 5xx or a dropped
+    connection, after at most ``_RETRY_WAIT`` seconds. A timeout and a 429 are
+    never retried; ``_rate_limited`` also stops the run on a 429 from inside the
+    request. Each request gives up after ``_REQUEST_TIMEOUT``.
     """
-    return Client(
+    budget = _RetryBudget()
+    session = Client(
         raise_for_status=False,
-        status_codes=tuple(range(500, 600)),  # dlt's default list also has 429
+        status_codes=(),
+        exceptions=(),
+        retry_condition=budget,
         request_max_attempts=2,
         request_max_retry_delay=_RETRY_WAIT,
         request_timeout=_REQUEST_TIMEOUT,
     ).session
+    session.retry_budget = budget
+    return session
 
 
 def _rate_limited(stats: dict):
@@ -682,9 +732,73 @@ def _is_wanted_project(project: dict, wanted: set[str]) -> bool:
     return project.get("id") in wanted or str(project.get("name") or "").lower() in names
 
 
-def _items(resource) -> Any:
-    """Every item of a raw rest_api resource. dlt hands them over one at a time."""
-    yield from resource
+def _items(resource, stats: dict) -> Any:
+    """Every item of a raw rest_api resource. dlt hands them over one at a time.
+
+    A failed request reaches this point as dlt's error, whose text carries the
+    full URL, query included (team id, project ids). It is replaced by a
+    ``VercelHTTPError`` that names only the status and the endpoint.
+    """
+    try:
+        yield from resource
+    except (ResourceExtractionError, http_errors.RequestException) as exc:
+        mapped = _http_error(exc, stats)
+        if mapped is None:
+            raise
+        raise mapped from None
+
+
+class VercelHTTPError(RuntimeError):
+    """A request to Vercel failed. The message has the status and endpoint only.
+
+    The response, when there was one, is on ``response`` for callers that need
+    more; its URL carries the query, so it is kept out of the message.
+    """
+
+    def __init__(self, status: int | None, endpoint: str, response=None, reason: str = ""):
+        self.status = status
+        self.endpoint = endpoint
+        self.response = response
+        what = f"HTTP {status}" if status else f"{reason or 'request'} failed"
+        super().__init__(f"Vercel: {what} on {endpoint}. Aborting; memory is unchanged.")
+
+
+class VercelAuthError(VercelHTTPError):
+    """401 or 403: the token is wrong or expired, or cannot see this team."""
+
+    def __init__(self, status: int, endpoint: str, response=None):
+        super().__init__(status, endpoint, response)
+        self.args = (
+            f"Vercel: HTTP {status} on {endpoint}: check the token and its access to this "
+            "team. Aborting; memory is unchanged.",
+        )
+
+
+def _http_error(exc: BaseException, stats: dict) -> VercelHTTPError | None:
+    """The VercelHTTPError for a failed request under dlt's extraction errors.
+
+    Only dlt's wrappers are looked through. Any other exception, such as the
+    connector's own checks, keeps its message, and so does a body that is not
+    JSON (requests counts that as a request error too).
+    """
+    seen: BaseException | None = exc
+    while isinstance(seen, ResourceExtractionError):
+        seen = seen.__cause__ or seen.__context__
+    if isinstance(seen, VercelHTTPError):
+        return seen
+    if isinstance(seen, http_errors.HTTPError) and seen.response is not None:
+        response = seen.response
+        endpoint = _endpoint(response.url)
+        if response.status_code in (401, 403):
+            stats["failed_auth"] = stats.get("failed_auth", 0) + 1
+            return VercelAuthError(response.status_code, endpoint, response)
+        return VercelHTTPError(response.status_code, endpoint, response)
+    if isinstance(seen, http_errors.RequestException) and not isinstance(
+        seen, http_errors.InvalidJSONError
+    ):
+        url = seen.request.url if seen.request is not None else ""
+        return VercelHTTPError(None, _endpoint(url or ""), reason=type(seen).__name__)
+    return None
 
 
 def _unique(items, key: str) -> list[dict]:
@@ -734,7 +848,7 @@ def _guard_missing(
     )
     accepted = state.get("forgotten_projects") or {}
     if isinstance(accepted, list):  # written by an earlier commit, time unknown
-        accepted = dict.fromkeys(accepted, "an earlier run")
+        accepted = dict.fromkeys(accepted, "time unknown")
     new = [item for item in missing if item not in accepted]
     if new and not allow_empty:
         raise ValueError(
@@ -746,8 +860,8 @@ def _guard_missing(
     kept = {item: accepted.get(item, now) for item in missing}
     for item in missing:
         logger.warning(
-            "Vercel: skipping project_ids entry %r: not found, accepted as gone by the "
-            "allow_empty=True run of %s",
+            "Vercel: skipping project_ids entry %r: not found; an allow_empty=True run "
+            "accepted it as gone (%s)",
             item,
             kept[item],
         )
@@ -843,13 +957,18 @@ def _require_event_list(response, *args, **kwargs):
         )
 
 
+def _endpoint(url: str) -> str:
+    """The path of a URL, with deployment ids masked and the query left out."""
+    return _DEPLOYMENT_ID.sub("/{id}", urlsplit(url).path)
+
+
 def _where(response) -> str:
     """The endpoint a response came from, for the connector's own messages.
 
     The query (team id, project names) is left out, and so is a deployment id in
     the path, so a message names the endpoint and not the record.
     """
-    return _DEPLOYMENT_ID.sub("/{id}", urlsplit(response.url).path)
+    return _endpoint(response.url)
 
 
 def _json(response) -> Any:
@@ -905,7 +1024,7 @@ def _project_row(project: dict) -> dict:
     )
     return {
         "id": project.get("id"),
-        "title": f"Vercel project {name}",
+        "title": _clean(f"Vercel project {name}"),
         "content": "\n".join(lines),
     }
 
@@ -947,9 +1066,9 @@ def _deployment_row(deployment: dict) -> dict:
     )
     return {
         "id": uid,
-        "title": f"Vercel deployment {uid} of {name} ({target})",
+        "title": _clean(f"Vercel deployment {uid} of {name} ({target})"),
         "content": "\n".join(lines),
-        "url": deployment.get("inspectorUrl"),
+        "url": _clean(deployment["inspectorUrl"]) if deployment.get("inspectorUrl") else None,
     }
 
 
@@ -988,9 +1107,9 @@ def _build_log_rows(events: Any, max_log_chars: int | None, line_limit: int | No
         name = lines[0].get(_PARENT_NAME)
         yield {
             "id": uid,
-            "title": f"Build output of failed Vercel deployment {uid} of {name}",
+            "title": _clean(f"Build output of failed Vercel deployment {uid} of {name}"),
             "content": text,
-            "url": lines[0].get(_PARENT_URL) or None,
+            "url": _clean(lines[0][_PARENT_URL]) if lines[0].get(_PARENT_URL) else None,
         }
 
 
@@ -1055,5 +1174,14 @@ def _timestamp(milliseconds: Any) -> str | None:
 
 
 def _lines(*pairs: tuple[str, Any]) -> list[str]:
-    """Render ``label: value`` lines, skipping empty values."""
-    return [f"{label}: {value}" for label, value in pairs if value not in (None, "")]
+    """Render ``label: value`` lines as clean text, skipping empty values."""
+    return [_clean(f"{label}: {value}") for label, value in pairs if value not in (None, "")]
+
+
+def _clean(text: str) -> str:
+    """Drop control characters and replace text that is not valid UTF-8.
+
+    A commit message or an error can carry anything, and a NUL would make
+    Postgres refuse the whole load on every sync while that row is in the window.
+    """
+    return _CONTROL.sub("", text).encode("utf-8", "replace").decode("utf-8")

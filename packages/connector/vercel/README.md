@@ -19,11 +19,13 @@ cd packages/connector/vercel && uv sync --all-extras
 ## Usage
 
 ```python
+import os
+
 import cognee
 from cognee_community_connector_vercel import vercel_source
 
 await cognee.remember(
-    vercel_source(),  # VERCEL_TOKEN from env, or pass token=...
+    vercel_source(token=os.environ["VERCEL_TOKEN"]),
     dataset_name="vercel",  # give the connector its own dataset
     self_improvement=False,  # skip the enrichment pass on repeated syncs
 )
@@ -37,21 +39,21 @@ answer = await cognee.search(
 
 | Argument | Default | What it does |
 |---|---|---|
-| `token` | `VERCEL_TOKEN` | Access token, sent as a bearer token. |
-| `team_id` | `VERCEL_TEAM_ID` | Team to read. Needed when a full-account token should read a team. |
+| `token` | required | Access token, sent as a bearer token. The factory reads no environment variables; the example reads `VERCEL_TOKEN` and `VERCEL_TEAM_ID`. |
+| `team_id` | none | Team to read. Needed when a full-account token should read a team. |
 | `project_ids` | all projects | A list of project ids or names (any case) to restrict the sync to. Names are turned into ids through the run's projects list, which is read once per run, and deployments are matched on the project id, so a renamed project keeps its older deployments. Up to 20 projects are filtered by Vercel itself. A listed project the token cannot see stops the run, first sync included, and the error names it. |
 | `lookback_days` | `30` | How far back deployments are read, in days (more than 0). `None` reads all of them. |
 | `include_build_logs` | `False` | Also fetch the build output of failed deployments. See Limits before switching it on. |
-| `allow_empty` | `False` | Let one sync through that lists no projects or only another account's projects although an earlier sync found some, or that lacks entries of `project_ids`. Their documents are forgotten. Missing `project_ids` entries are remembered, so later runs skip them without the flag, until they are found again. Each run warns about them, with the time of the run that accepted them, and lists them in `cognee_sync_stats["skipped_projects"]`. |
+| `allow_empty` | `False` | Let one sync through that lists no projects or only another account's projects although an earlier sync found some, or that lacks entries of `project_ids`. Their documents are forgotten. Missing `project_ids` entries are remembered, so later runs skip them without the flag, until they are found again. Each run warns about them, with the time of the run that accepted them, and lists them in `cognee_sync_stats["skipped_projects"]`, the accepting run included. |
 | `resource_name` | `vercel`, or `vercel_<team id>` | Prefix of the staging tables. Each team gets its own by default. |
 | `check_active` | none | Called before every page is used. Raise from it to stop a sync whose access was revoked. |
-| `service` | dlt's session, kept short | `requests.Session` to send requests through. By default a 429 stops the run with memory unchanged, because waiting would hold cognee's staging lock and the next run re-reads everything. A 5xx or a dropped connection gets one retry after at most 5 s. Each request times out after 30 s. `session` is accepted as another name for it. |
+| `service` | dlt's session, kept short | `requests.Session` to send requests through. By default a 429 stops the run with memory unchanged, because waiting would hold cognee's staging lock and the next run re-reads everything. The first 5xx or dropped connection of a run gets one retry after at most 5 s, and any later one stops the run, so retries add at most 5 s per run. A timeout is not retried: each request times out after 30 s. `session` is accepted as another name for it. |
 | `max_log_chars` | `20000` | Keep only the end of a build log. Only the newest `max_log_chars // 10` lines (at least 100) are requested. `None` requests and keeps all of it. |
 
 All arguments are keyword-only. After a run, `source.cognee_sync_stats` holds the row count of
 each table (`projects`, `deployments`, `build_logs`) and `failed_rate_limit`, the number of 429
-answers that stopped the run, plus `skipped_projects`, the `project_ids` entries a run skipped
-because an earlier `allow_empty=True` run accepted them as gone. The counts are cleared when a run
+answers that stopped the run, `failed_auth`, the number of 401 or 403 answers, plus `skipped_projects`, the `project_ids` entries skipped in this
+run, including the ones this run accepted with `allow_empty=True`. The counts are cleared when a run
 starts and logged when it ends. A table that empties after holding rows logs a warning.
 `with_resources()` and `parallelize()` are not supported: the deployment tables use the projects
 list that the projects table reads in the same run.
@@ -90,6 +92,9 @@ Each run is a **full snapshot of a fixed window**: every deployment created in t
   list without its `pagination` block, or build events that are not a list, count as unexpected.
   A partial snapshot would otherwise be forgotten as if it were a deletion. The one exception is
   the events call: 404 or 410 there means the build has no output to read (see Limits).
+- A failed request raises `VercelHTTPError` (`VercelAuthError` for a 401 or 403, which is also
+  counted in `failed_auth`). Its message names the status and the endpoint only; the query, which
+  carries the team id and project ids, stays out of it. The response is on `.response`.
 - Pages overlap by one millisecond. Vercel's `until` cursor is exclusive and points at the last
   item of the page, so a second deployment from that same millisecond would fall between two
   pages. The repeated item is dropped by id. If a cursor stops moving, the run aborts.
@@ -149,12 +154,15 @@ Nothing has been released yet, but if you ran this connector from an earlier com
   documents stay next to the new ones until that same `forget()`.
 - `resource_name` is checked more strictly: `__` and a trailing `_` are rejected with a
   `ValueError`. Pick a name of lowercase words joined by single underscores.
+- If no deployment in an earlier sync had an `inspectorUrl`, its tables have no `url` column.
+  The first sync after upgrading adds it, which changes those rows' hashes, so they are
+  re-ingested once. Vercel normally sends `inspectorUrl`, so most tables already have it.
 
 ## Setup
 
 1. Create an access token at <https://vercel.com/account/tokens>. Scope it to one team and give
    it an expiry.
-2. Set it as `VERCEL_TOKEN` (or pass `token=...`), plus your `LLM_API_KEY` like any other cognee
+2. Pass it as `token=...` (the example reads it from `VERCEL_TOKEN`), plus set your `LLM_API_KEY` like any other cognee
    run.
 
 ## Testing

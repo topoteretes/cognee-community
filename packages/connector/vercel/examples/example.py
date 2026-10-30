@@ -56,7 +56,11 @@ async def main() -> None:
     # Scope with project_ids=[...] and lookback_days=...; the defaults read every
     # project the token can see and the last 30 days of deployments. Build logs
     # stay off: a build can print a secret into its log.
-    source = vercel_source(lookback_days=7)
+    source = vercel_source(
+        token=os.environ["VERCEL_TOKEN"],
+        team_id=os.environ.get("VERCEL_TEAM_ID"),
+        lookback_days=7,
+    )
 
     print("Syncing Vercel projects and deployments into cognee ...")
     # self_improvement=False: a re-sync should not trigger the whole-graph

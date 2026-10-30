@@ -192,6 +192,8 @@ class FakeVercel(BaseAdapter):
             return response
         status = self.fail(url.path, params) if self.fail else None
         if isinstance(status, Exception):
+            if isinstance(status, requests.RequestException) and status.request is None:
+                status.request = request  # as requests' own adapter sets it
             raise status  # e.g. a dropped connection
         if status:
             response = self._response(request, status, {"error": {"code": "boom"}})
@@ -360,6 +362,18 @@ def test_deployment_row_reads_commit_from_any_git_provider():
     content = _deployment_row(deployment)["content"]
     assert "Commit: abc123" in content
     assert "Branch: develop" in content
+
+
+def test_rows_drop_control_characters():
+    # A NUL in a commit message would make Postgres refuse the whole load.
+    deployment = _deployment("dpl_1", "web\x00site", state="ERROR")
+    deployment["errorMessage"] = "boom\x00\x1b at line 3"
+    deployment["meta"]["githubCommitMessage"] = "fix\x07 the\x00 build"
+    project = _project("prj_web", "web\x00site")
+    for row in (_deployment_row(deployment), _project_row(project)):
+        for value in row.values():
+            assert value is None or not any(ch in value for ch in "\x00\x07\x1b")
+    assert "Commit message: fix the build" in _deployment_row(deployment)["content"]
 
 
 def test_deployment_row_names_preview_when_target_is_null():
@@ -544,9 +558,10 @@ def test_vercel_source_declares_document_marker():
     assert document_source_tag(source) == "vercel"
 
 
-def test_vercel_source_requires_a_token(monkeypatch):
-    monkeypatch.delenv("VERCEL_TOKEN", raising=False)
-    with pytest.raises(ValueError, match="VERCEL_TOKEN"):
+def test_vercel_source_requires_a_token_and_reads_no_environment(monkeypatch):
+    # Environment variables are the example's business, not the factory's.
+    monkeypatch.setenv("VERCEL_TOKEN", "from-the-environment")
+    with pytest.raises(ValueError, match="token required"):
         vercel_source()
 
 
@@ -919,20 +934,34 @@ def test_a_project_named_like_an_id_is_still_found(dlt_mod, tmp_path):
     assert sent == {("prj_9f3k", "prj_web")}
 
 
-def test_a_reused_source_moves_its_window(dlt_mod, tmp_path):
+def test_a_reused_source_moves_its_window(dlt_mod, tmp_path, monkeypatch):
     # The window is worked out per run. If it were fixed when the source was
-    # built, a long-lived source would never let old deployments age out.
+    # built, a long-lived source would never let old deployments age out. The
+    # connector's clock is replaced, so a wall-clock jump can't flip the result.
+    from datetime import datetime as real_datetime
+    from datetime import timedelta, timezone
+
+    from cognee_community_connector_vercel import vercel
+
+    start = real_datetime(2026, 10, 1, tzinfo=timezone.utc)
+    ticks = iter([start, start + timedelta(hours=1)])
+
+    class Clock(real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return next(ticks)
+
+    monkeypatch.setattr(vercel, "datetime", Clock)
     fake = _fleet()
     source = vercel_source(token="test-token", service=fake.session())
     pipeline = _pipeline(dlt_mod, tmp_path)
     pipeline.run(source)
     first = {params["since"] for params in _deployment_calls(fake)}
     fake.calls.clear()
-    time.sleep(0.01)
     pipeline.run(source)
     second = {params["since"] for params in _deployment_calls(fake)}
     assert len(first) == len(second) == 1
-    assert int(second.pop()) > int(first.pop())
+    assert int(second.pop()) - int(first.pop()) == 3_600_000, "one hour later"
 
 
 def test_more_than_20_ids_are_filtered_after_listing(dlt_mod, tmp_path):
@@ -1080,8 +1109,8 @@ def test_skipped_projects_saved_by_an_earlier_commit_are_read(monkeypatch):
     state = {"forgotten_projects": ["web"]}
     vercel, warnings = _guard_missing_harness(monkeypatch, state)
     vercel._guard_missing({"web", "prj_api"}, [_project("prj_api", "api")], 1, False, {})
-    assert warnings[-1][1:] == ("web", "an earlier run")
-    assert state["forgotten_projects"] == {"web": "an earlier run"}
+    assert warnings[-1][1:] == ("web", "time unknown")
+    assert state["forgotten_projects"] == {"web": "time unknown"}
 
 
 def test_the_projects_hand_over_refuses_a_missing_or_reused_list():
@@ -1292,6 +1321,15 @@ def test_an_older_cognee_is_refused(monkeypatch):
         vercel_source(token="test-token")
 
 
+def test_a_cognee_without_the_scope_attribute_is_refused(monkeypatch):
+    # A dev build can carry the version number but not PIPELINE_SCOPE_ATTR yet.
+    from cognee.tasks.ingestion import dlt_utils
+
+    monkeypatch.delattr(dlt_utils, "PIPELINE_SCOPE_ATTR")
+    with pytest.raises(RuntimeError, match=r"cognee>=1\.6\.1"):
+        vercel_source(token="test-token")
+
+
 def test_an_account_that_suddenly_lists_no_projects_aborts(dlt_mod, tmp_path):
     # A token for the wrong team answers with a valid, empty list. Under replace
     # that would forget every project, deployment and log.
@@ -1423,6 +1461,7 @@ def test_sync_stats_count_the_rows_of_the_last_run(dlt_mod, tmp_path):
         "deployments": 3,
         "build_logs": 1,
         "failed_rate_limit": 0,
+        "failed_auth": 0,
         "skipped_projects": [],
     }
 
@@ -1644,6 +1683,98 @@ def test_a_dropped_connection_gets_one_short_retry(dlt_mod, tmp_path, monkeypatc
     pipeline = _run_sync(dlt_mod, tmp_path, fake, service=_session_on(fake))
     assert set(_read(pipeline, VERCEL_DEPLOYMENTS_TABLE)) == {"dpl_ok1", "dpl_ok2", "dpl_err"}
     assert dropped and len(slept) == 1 and slept[0] <= 5
+
+
+def _fail_first_try_of(*paths):
+    """A fail() that answers 503 to the first request of each path, then lets it through."""
+    failed = set()
+
+    def fail(path, params):
+        if path in paths and path not in failed:
+            failed.add(path)
+            return 503
+        return None
+
+    return fail
+
+
+def test_a_run_gets_one_retry_in_total(dlt_mod, tmp_path, monkeypatch):
+    # Every wait is spent inside cognee's staging lock, so the retry is for the
+    # whole run, not one per request: a second blip in the same run stops it.
+    slept = _record_sleeps(monkeypatch)
+    fake = _fleet()
+    fake.retry_after = "1000"
+    fake.fail = _fail_first_try_of("/v10/projects", "/v7/deployments")
+    with pytest.raises(PipelineStepFailed, match="503"):
+        _run_sync(dlt_mod, tmp_path, fake, service=_session_on(fake))
+    assert slept == [5], "one wait for the run"
+    assert len(_deployment_calls(fake)) == 1, "the second blip of the run is not retried"
+
+
+def test_each_run_starts_with_its_own_retry(dlt_mod, tmp_path, monkeypatch):
+    slept = _record_sleeps(monkeypatch)
+    fake = _fleet()
+    fake.retry_after = "1000"
+    source = vercel_source(token="test-token", service=_session_on(fake))
+    pipeline = _pipeline(dlt_mod, tmp_path)
+    for _ in range(2):  # one blip per run, retried in both runs
+        fake.fail = _fail_first_try_of("/v10/projects")
+        pipeline.run(source)
+    assert slept == [5, 5]
+    assert set(_read(pipeline, VERCEL_PROJECTS_TABLE)) == {"prj_web", "prj_api"}
+
+
+def test_a_request_that_times_out_is_not_retried(dlt_mod, tmp_path, monkeypatch):
+    # A hang already cost 30 s under the staging lock; a retry would double it.
+    slept = _record_sleeps(monkeypatch)
+    fake = _fleet()
+    fake.fail = lambda path, params: (
+        requests.ReadTimeout("read timed out") if path == "/v10/projects" else None
+    )
+    with pytest.raises(PipelineStepFailed, match="ReadTimeout failed on /v10/projects"):
+        _run_sync(dlt_mod, tmp_path, fake, service=_session_on(fake))
+    assert len([call for call in fake.calls if call[0] == "/v10/projects"]) == 1
+    assert slept == []
+
+
+def _error_in(exc: BaseException):
+    """The VercelHTTPError somewhere in a pipeline error's chain."""
+    from cognee_community_connector_vercel import VercelHTTPError
+
+    seen = getattr(exc, "exception", None) or exc
+    while seen is not None:
+        if isinstance(seen, VercelHTTPError):
+            return seen
+        seen = seen.__cause__ or seen.__context__
+    return None
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_a_rejected_token_raises_a_named_error_without_the_query(dlt_mod, tmp_path, status):
+    from cognee_community_connector_vercel import VercelAuthError
+
+    fake = _fleet()
+    fake.fail = lambda path, params: status if path == "/v10/projects" else None
+    source = vercel_source(token="test-token", team_id="team_1", service=fake.session())
+    with pytest.raises(PipelineStepFailed) as raised:
+        _pipeline(dlt_mod, tmp_path).run(source)
+
+    error = _error_in(raised.value)
+    assert isinstance(error, VercelAuthError) and error.status == status
+    assert f"HTTP {status} on /v10/projects: check the token" in str(raised.value)
+    # The team id is part of the table name by design; the query must not show.
+    assert "teamId=" not in str(raised.value) and "test-token" not in str(raised.value)
+    assert source.cognee_sync_stats["failed_auth"] == 1
+
+
+def test_a_server_error_names_the_status_and_endpoint_only(dlt_mod, tmp_path):
+    fake = _fleet()
+    fake.fail = lambda path, params: 500 if path == "/v7/deployments" else None
+    with pytest.raises(PipelineStepFailed, match="HTTP 500 on /v7/deployments") as raised:
+        _run_sync(dlt_mod, tmp_path, fake, team_id="team_1", project_ids=["web"])
+    assert _error_in(raised.value).status == 500
+    for secret in ("teamId=", "projectId=", "since=", "test-token"):
+        assert secret not in str(raised.value)
 
 
 def test_each_request_times_out_after_30_seconds(dlt_mod, tmp_path):
