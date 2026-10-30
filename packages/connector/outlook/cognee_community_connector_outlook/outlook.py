@@ -31,7 +31,7 @@ from datetime import date, datetime, timedelta, timezone, tzinfo
 from email.utils import parsedate_to_datetime
 from functools import cache
 from typing import Any
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
+from zoneinfo import ZoneInfo, available_timezones
 
 import requests
 from cognee.shared.logging_utils import get_logger
@@ -335,25 +335,23 @@ def _needs_resync(exc: HTTPError) -> bool:
 
 # Lookup results besides the item itself and None for a confirmed 404.
 _FAILED = object()  # this item could not be read
+_UNAVAILABLE = object()  # Graph answered this item with a 5xx
 _SKIPPED = object()  # not asked: Graph failed on an earlier lookup this run
 
 
 class _Lookups:
     """Looks single events up by id, one unreadable event at a time.
 
-    A 4xx or a body that is not JSON fails only that event.  A 5xx is Graph's
-    trouble, not the event's: it and every lookup after it this run are
-    skipped and wait for the next run, so a struggling Graph is not asked once
-    per event.  A 401 and a 429 raise: every later request would fail the same
-    way.
+    A 4xx or a body that is not JSON fails only that event.  A 5xx makes that
+    event unavailable and skips every lookup after it this run, so a
+    struggling Graph is not asked once per event.  A 401 and a 429 raise:
+    every later request would fail the same way.
     """
 
     def __init__(self, client: RESTClient, check_active: Callable[[], None] | None) -> None:
         self.client = client
         self.check_active = check_active
         self.unavailable = False
-        # The path that met the 5xx, so the next run can ask it last.
-        self.unavailable_on: str | None = None
 
     def get(self, path: str) -> Any:
         if self.unavailable:
@@ -367,8 +365,7 @@ class _Lookups:
             response.raise_for_status()
         if status >= 500:
             self.unavailable = True
-            self.unavailable_on = path
-            return _SKIPPED
+            return _UNAVAILABLE
         if status >= 400:
             return _FAILED
         try:
@@ -385,10 +382,13 @@ def _attempts(saved: Any) -> dict[str, int]:
     return dict.fromkeys(saved or [], 1)
 
 
-def _least_tried_first(ids: set[str], attempts: dict[str, int], last: str | None) -> list[str]:
+def _least_tried_first(
+    ids: set[str], attempts: dict[str, int], outage: dict[str, int]
+) -> list[str]:
     # An event that keeps failing goes last, so it cannot starve the others:
-    # by its count of 4xx, or, when a 5xx stopped the last run on it, first of all.
-    return sorted(ids, key=lambda i: (i == last, attempts.get(i, 0), i))
+    # first by its runs of 5xx in a row, which stop every lookup behind it,
+    # then by its count of 4xx.
+    return sorted(ids, key=lambda i: (outage.get(i, 0), attempts.get(i, 0), i))
 
 
 # ---------------------------------------------------------------------------
@@ -516,32 +516,39 @@ def _iter_rows(
 def _mail_state_after_failure(mail_state: dict, progress: dict) -> dict:
     """The old mail state plus the messages yielded before the part failed.
 
-    Their rows still load, so their folders are added to ``members``; the
-    next round then forgets one that was deleted meanwhile.  Nothing is
-    removed: the old delta links replay those removals again.
+    Their rows still load, so their folders are added to ``members``.  Those
+    folders also lose their delta link: an old link need not replay the
+    removal of a message it never saw, so the next run lists them fresh and
+    forgets what is no longer there.
     """
+    yielded = progress.get("yielded", [])
+    if not yielded:
+        return dict(mail_state)
     members = {k: list(v) for k, v in mail_state.get("members", {}).items()}
-    for message_id, folder in progress.get("yielded", []):
+    for message_id, folder in yielded:
         folders = members.setdefault(message_id, [])
         if folder not in folders:
             folders.append(folder)
-    return {**mail_state, "members": members} if members else dict(mail_state)
+    touched = {folder for _, folder in yielded}
+    links = {f: link for f, link in mail_state.get("delta_links", {}).items() if f not in touched}
+    return {**mail_state, "members": members, "delta_links": links}
 
 
 def _calendar_state_after_failure(calendar_state: dict, progress: dict) -> dict:
     """The old calendar state plus the events yielded before the part failed.
 
     Their rows still load, so they join ``known``, which is what the next
-    round checks a removal against.  Lookup attempts counted before the
-    failure are kept too, so an id that always comes first still reaches
-    the limit.
+    round checks a removal against.  Lookup attempts and runs of 5xx counted
+    before the failure are kept too, so an id that always comes first still
+    reaches the limit.
     """
     yielded = progress.get("yielded", set())
-    if not (yielded or progress.get("recheck") or progress.get("retry_masters")):
+    counters = ("recheck", "retry_masters", "outage")
+    if not (yielded or any(progress.get(key) for key in counters)):
         return dict(calendar_state)
     new_state = dict(calendar_state)
     new_state["known"] = sorted(set(calendar_state.get("known", [])) | yielded)
-    for key in ("recheck", "retry_masters"):
+    for key in counters:
         new_state[key] = {**_attempts(calendar_state.get(key)), **progress.get(key, {})}
     return new_state
 
@@ -708,7 +715,9 @@ def _sync_mail(
                 "Outlook: a mail folder failed (HTTP %s); it is retried on the next run.",
                 getattr(error, "status", None),
             )
-            if old_links.get(folder):
+            if old_links.get(folder) and not any(f == folder for _, f in yielded):
+                # Only a folder that yielded nothing keeps its old link; one
+                # that did is listed fresh next run, like above.
                 new_links[folder] = old_links[folder]
             continue
         if link:
@@ -816,6 +825,7 @@ def _sync_calendar(
     yielded: set[str] = progress.setdefault("yielded", set())
     next_masters: dict[str, int] = progress.setdefault("retry_masters", {})
     next_recheck: dict[str, int] = progress.setdefault("recheck", {})
+    next_outage: dict[str, int] = progress.setdefault("outage", {})
     known: set[str] = set(calendar_state.get("known", []))
     # Failed lookups per id: a removal still to confirm, and a series master
     # still to fetch.  Delta rounds won't list them again.
@@ -894,33 +904,41 @@ def _sync_calendar(
     for event_id in sorted(cancelled & known):
         forget(event_id)
 
-    lookups = _Lookups(client, check_active)
-    # The event whose lookup met a 5xx last run; a 5xx is not counted, so
-    # this is what keeps it from going first every run.
-    slow = calendar_state.get("slow_lookup")
+    # Runs in a row whose lookup of an id met a 5xx.  One 5xx says nothing
+    # about the event, but one that never recovers has to end somewhere.
+    outage = _attempts(calendar_state.get("outage"))
 
     def lookup_failed(event_id: str, result: Any, attempts: dict[str, int]) -> int | None:
         """Attempts so far, or None once the event is given up.
 
-        Only a 4xx or a body that is not JSON counts; a skipped lookup, after
-        a 5xx, says nothing about the event.
+        A 4xx or a body that is not JSON counts as an attempt.  A 5xx only
+        counts toward its own limit of runs in a row, and a skipped lookup
+        keeps both counts as they were.
         """
         tries = attempts.get(event_id, 0) + (result is _FAILED)
-        if tries >= MAX_LOOKUP_ATTEMPTS:
+        runs = outage.get(event_id, 0) + (result is _UNAVAILABLE)
+        if result is _FAILED:
+            runs = 0
+        if tries >= MAX_LOOKUP_ATTEMPTS or runs >= MAX_LOOKUP_ATTEMPTS:
             stats["events_given_up"] += 1
             logger.warning("Outlook: an event could not be read for 3 runs; giving up on it.")
             return None
         stats["events_failed"] += 1
+        if runs:
+            next_outage[event_id] = runs
         return tries
 
     # Occurrences prove their series is alive and changed: the master holds
     # the title, attendees and recurrence, and Graph may not list it in the
     # round (a series that started before the window), so fetch it by id.
+    # Masters and removals each get their own lookups, so a master that
+    # keeps answering 5xx never holds up the removals behind it.
+    lookups = _Lookups(client, check_active)
     for master_id in _least_tried_first(
-        (series_ids | set(retry_masters)) - seen, retry_masters, slow
+        (series_ids | set(retry_masters)) - seen, retry_masters, outage
     ):
         master = lookups.get(f"/me/events/{master_id}")
-        if master is _FAILED or master is _SKIPPED:
+        if master in (_FAILED, _UNAVAILABLE, _SKIPPED):
             tries = lookup_failed(master_id, master, retry_masters)
             if tries is not None:
                 next_masters[master_id] = tries
@@ -942,11 +960,12 @@ def _sync_calendar(
 
     # Only events that were stored: a deleted series also reports every
     # occurrence, and none of those were ever ingested.
-    for event_id in _least_tried_first((removed - seen) & known, recheck, slow):
+    lookups = _Lookups(client, check_active)
+    for event_id in _least_tried_first((removed - seen) & known, recheck, outage):
         # Graph also reports an event that left the window as removed, so
         # check it before forgetting anything.
         event = lookups.get(f"/me/events/{event_id}")
-        if event is _FAILED or event is _SKIPPED:
+        if event in (_FAILED, _UNAVAILABLE, _SKIPPED):
             tries = lookup_failed(event_id, event, recheck)
             if tries is None:
                 # Unreadable for several runs, so nothing says it is gone: stop
@@ -969,9 +988,7 @@ def _sync_calendar(
         "known": sorted(known),
         "recheck": next_recheck,
         "retry_masters": next_masters,
-        "slow_lookup": lookups.unavailable_on.rsplit("/", 1)[-1]
-        if lookups.unavailable_on
-        else None,
+        "outage": next_outage,
     }
     return new_state, deletes
 
@@ -1055,16 +1072,13 @@ def _zone(name: str | None) -> tzinfo | None:
     Checked against the zone list rather than the files, so a directory like
     "America" or a wrong case like "europe/berlin" is refused on every system.
     """
-    if not name:
+    if not name or not isinstance(name, str):
         return None
     if name.upper() in ("UTC", "ETC/UTC"):
         return UTC
     if name not in _iana_names():
         return None
-    try:
-        return ZoneInfo(name)
-    except (ZoneInfoNotFoundError, ValueError, OSError):
-        return None
+    return ZoneInfo(name)
 
 
 def _event_zone(name: str | None) -> tzinfo | None:
@@ -1146,6 +1160,8 @@ def _normalize_mail_folders(mail_folders: list[str] | str | None) -> tuple[str, 
         mail_folders = list(DEFAULT_MAIL_FOLDERS)
     elif isinstance(mail_folders, str):
         mail_folders = [mail_folders]
+    elif not isinstance(mail_folders, (list, tuple, set, frozenset)):
+        raise ValueError("mail_folders must be a folder name or id, or a list of them.")
     folders = []
     for folder in mail_folders:
         if not isinstance(folder, str):

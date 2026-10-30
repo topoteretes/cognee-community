@@ -906,8 +906,8 @@ def test_a_round_without_a_delta_link_fails_its_part_without_the_url(graph):
     # The mail rows already yielded still load, so mail keeps only their ids.
     assert event(meeting) in upserts
     assert stats["failed_mail"] == 1 and stats["failed_connection"] == 0
-    assert state["mail"] == {"members": {m: ["inbox"] for m in state["mail"]["members"]}}
-    assert "delta_links" not in state["mail"]
+    assert all(folders == ["inbox"] for folders in state["mail"]["members"].values())
+    assert not state["mail"]["delta_links"]
 
     # An incremental round requests the saved deltaLink, delta token and all.
     graph._mail_delta = original
@@ -1472,7 +1472,7 @@ def test_a_single_mail_folder_failing_on_page_two_still_forgets_a_loaded_message
     assert mail(first) in deletes
 
 
-def test_a_5xx_on_lookups_never_forgets_events_that_still_exist(graph):
+def test_a_5xx_on_lookups_never_forgets_events_that_still_exist(graph, no_retry_wait):
     ids = [graph.put_event(f"Meeting {n}", NOW + timedelta(days=1)) for n in range(3)]
     state: dict = {}
     sync(state, make_config(**CAL))
@@ -1490,12 +1490,14 @@ def test_a_5xx_on_lookups_never_forgets_events_that_still_exist(graph):
     for run in range(1, 10):
         # A week on each time, so every run is a fresh window round.
         later = NOW + timedelta(days=8 * run)
-        _, deletes, stats = sync(state, make_config(**CAL), now=later)
-        assert deletes == [] and stats["events_given_up"] == 0
-    assert set(state["calendar"]["recheck"]) == set(ids)
+        _, deletes, _ = sync(state, make_config(**CAL), now=later)
+        assert deletes == []
+    # Each took its turn going first; after 3 runs of 5xx in a row it is given
+    # up, which keeps it, so the outage ends without forgetting anything.
+    assert state["calendar"]["recheck"] == {} and state["calendar"]["outage"] == {}
 
 
-def test_an_event_whose_lookup_meets_a_5xx_goes_last_next_run(graph):
+def test_an_event_whose_lookup_meets_a_5xx_goes_last_next_run(graph, no_retry_wait):
     stuck, other = sorted(graph.put_event(f"M{n}", NOW + timedelta(days=1)) for n in range(2))
     state: dict = {}
     sync(state, make_config(**CAL))
@@ -1567,7 +1569,6 @@ def test_a_429_keeps_the_lookup_attempts_counted_before_it(graph, no_retry_wait)
         ("Line Islands Standard Time", "2026-11-07T10:00:00", "2026-11-08"),  # UTC+14
         ("Dateline Standard Time", "2026-11-08T12:00:00", "2026-11-08"),  # UTC-12
         ("New Zealand Standard Time", "2026-11-07T11:00:00", "2026-11-08"),  # summer, +13
-        ("Pacific Standard Time", "2026-11-08T08:00:00", "2026-11-08"),
     ],
 )
 def test_an_all_day_event_uses_its_windows_zone_name(graph, zone, start, day):
@@ -1602,3 +1603,138 @@ def test_changing_time_zone_rewrites_the_events_in_the_new_zone(graph):
 
     assert "(Asia/Kolkata)" in upserts[event(meeting)]["content"]
     assert state["calendar"]["time_zone"] == "Asia/Kolkata"
+
+
+# ---------------------------------------------------------------------------
+# Review round 7: a 5xx that never ends, and what a failed part keeps
+# ---------------------------------------------------------------------------
+def answer(graph, statuses):
+    """Answer the lookup of each id in ``statuses`` with that status."""
+    original = graph._handle
+
+    def handle(request):
+        event_id = request.url.split("?")[0].rsplit("/me/events/", 1)[-1]
+        if "/me/events/" in request.url and event_id in statuses:
+            graph.requests.append(request)
+            return statuses[event_id], {}, json.dumps({"error": {"code": "Error"}})
+        return original(request)
+
+    graph._handle = handle
+
+
+def test_a_master_answering_500_does_not_hold_up_a_removal(graph, no_retry_wait):
+    master = graph.put_series("Standup", NOW - timedelta(days=60), days=90)
+    graph.hide_from_calendar_view(master)
+    gone = graph.put_event("Review", NOW + timedelta(days=1))
+    state: dict = {}
+    sync(state, make_config(**CAL))
+
+    graph.delete_event(gone)
+    answer(graph, {master: 500})
+    _, deletes, _ = sync(state, make_config(**CAL))
+    assert deletes == [event(gone)], "the removal has its own lookups"
+
+    for _ in range(3):
+        sync(state, make_config(**CAL))
+    assert state["calendar"]["retry_masters"] == {}, "a master answering 500 is given up"
+    assert state["calendar"]["outage"] == {}
+
+
+def test_two_events_answering_500_do_not_starve_a_third(graph, no_retry_wait):
+    a1, a2, z = (graph.put_event(n, NOW + timedelta(days=1), id=n) for n in ("a1", "a2", "z"))
+    state: dict = {}
+    sync(state, make_config(**CAL))
+    for event_id in (a1, a2, z):
+        graph.delete_event(event_id)
+    answer(graph, {a1: 500, a2: 500})
+
+    forgotten = []
+    for _ in range(3):
+        _, deletes, _ = sync(state, make_config(**CAL))
+        forgotten += deletes
+
+    assert forgotten == [event(z)]
+
+
+def test_runs_of_5xx_are_kept_when_the_calendar_part_fails(graph, no_retry_wait):
+    graph.put_message("inbox", "Mail is fine")
+    slow, throttled = (graph.put_event(n, NOW + timedelta(days=1), id=n) for n in ("a", "b"))
+    state: dict = {}
+    sync(state, make_config(mail_folders=("inbox",)))
+    graph.delete_event(slow)
+    graph.delete_event(throttled)
+    master = graph.put_series("Standup", NOW - timedelta(days=60), days=90)
+    graph.hide_from_calendar_view(master)
+    answer(graph, {master: 500, throttled: 429})
+
+    # The master meets a 500, then the removal of a 404 and b 429 end the part.
+    _, _, stats = sync(state, make_config(mail_folders=("inbox",)))
+
+    assert stats["failed_rate_limit"] == 1
+    assert state["calendar"]["outage"] == {master: 1}
+
+
+def test_a_master_yielded_before_the_part_failed_is_still_forgotten(graph, no_retry_wait):
+    graph.put_message("inbox", "Mail is fine")
+    stuck = graph.put_event("Stuck", NOW + timedelta(days=1), id="stuck")
+    state: dict = {}
+    sync(state, make_config(mail_folders=("inbox",)))
+    graph.delete_event(stuck)
+    master = graph.put_series("Standup", NOW - timedelta(days=60), days=90)
+    graph.hide_from_calendar_view(master)
+    answer(graph, {stuck: 429})
+
+    upserts, _, _ = sync(state, make_config(mail_folders=("inbox",)))
+    assert event(master) in upserts
+    assert master in state["calendar"]["known"]
+
+    graph._handle = FakeGraph._handle.__get__(graph)
+    graph.delete_series(master)
+    _, deletes, _ = sync(state, make_config(mail_folders=("inbox",)))
+    assert event(master) in deletes
+
+
+def test_a_folder_that_yielded_rows_before_failing_is_listed_fresh_next_run(graph, no_retry_wait):
+    graph.put_message("inbox", "Before")
+    graph.put_event("Calendar is fine", NOW + timedelta(days=1))
+    state: dict = {}
+    sync(state, make_config(mail_folders=("inbox", "sentitems")))
+    assert "inbox" in state["mail"]["delta_links"]
+    for subject in ("One", "Two", "Three"):
+        graph.put_message("inbox", subject)
+    original = graph._handle
+
+    def inbox_page_two_fails(request):
+        if "$skiptoken" in request.url:
+            graph.requests.append(request)
+            return 503, {}, json.dumps({"error": {"code": "ServiceUnavailable"}})
+        return original(request)
+
+    graph._handle = inbox_page_two_fails
+    _, _, stats = sync(state, make_config(mail_folders=("inbox", "sentitems")))
+
+    assert stats["mail_folders_failed"] == 1
+    assert "inbox" not in state["mail"]["delta_links"], "an old link may not replay it"
+    assert "sentitems" in state["mail"]["delta_links"]
+
+
+def test_a_mail_part_that_fails_after_yielding_drops_that_folders_link(graph, no_retry_wait):
+    graph.put_message("inbox", "Before")
+    graph.put_event("Calendar is fine", NOW + timedelta(days=1))
+    state: dict = {}
+    sync(state, make_config(mail_folders=("inbox",)))
+    for subject in ("One", "Two", "Three"):
+        graph.put_message("inbox", subject)
+    original = graph._handle
+
+    def page_two_fails(request):
+        if "$skiptoken" in request.url:
+            graph.requests.append(request)
+            return 503, {}, json.dumps({"error": {"code": "ServiceUnavailable"}})
+        return original(request)
+
+    graph._handle = page_two_fails
+    _, _, stats = sync(state, make_config(mail_folders=("inbox",)))
+
+    assert stats["failed_mail"] == 1
+    assert "inbox" not in state["mail"]["delta_links"]

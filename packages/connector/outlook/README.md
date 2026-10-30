@@ -136,9 +136,11 @@ totals the other connectors publish; and `failed_auth`, `failed_rate_limit`,
   the `base_url` host; a page link that points anywhere else fails that folder instead.
 - **Rows stream page by page.** New and changed messages and events are handed to cognee
   as each page arrives, so a big mailbox is never held in memory. Forgets and the new
-  delta links wait until a round has finished. dlt still loads the rows of a round that
-  fails halfway, so the ids it yielded are kept in the state: an event or message
-  deleted before the next run is then forgotten instead of left behind.
+  delta links wait until a round has finished. When one part fails and the other
+  finishes, dlt still loads the rows the failed part already yielded, so their ids are
+  kept in the state, and a mail folder that yielded rows before failing is listed fresh
+  next run: an event or message deleted meanwhile is then forgotten instead of left
+  behind. When nothing finishes, the run raises and nothing is loaded or saved.
 - **Mail:** one Graph delta query per selected folder
   (`mailFolders/{folder}/messages/delta`). The first run lists the folder; later runs
   get only what changed. The `@odata.deltaLink` only arrives on the last page, so it is
@@ -179,14 +181,17 @@ totals the other connectors publish; and `failed_auth`, `failed_rate_limit`,
   stored are looked up and forgotten: deleting a series reports every occurrence, and
   those were never ingested. Cancelled meetings are forgotten.
 - **One unreadable event never stops the calendar.** A lookup that fails with a 4xx, or
-  answers with something that is not JSON, keeps that event, counts it in
-  `events_failed`, and asks again next run, while every other event syncs as usual.
-  A 5xx is Graph's trouble, not the event's, so it is not counted: that lookup and the
-  remaining ones wait for the next run, where the event that met the 5xx goes last.
-  After 3 runs of 4xx answers the connector gives up on an event: it stops checking it
-  and keeps it, like an event that left the window, and a series master stops being
-  fetched. Both count in `events_given_up`. A 401, a 429 and a lost connection still end the run,
-  since every later request would fail the same way.
+  answers with something that is not JSON, keeps that event and asks again next run,
+  while every other event syncs as usual. After the first 5xx the remaining lookups of
+  that loop wait for the next run; series masters and removals are looked up in
+  separate loops, so a master that fails never holds up a removal. `events_failed`
+  counts every lookup to retry, the skipped ones included. An event or master that met a
+  5xx goes after the others next run, and the more runs in a row it did, the later.
+  The connector gives up on one after 3 failed answers (4xx or not JSON), or after 3
+  runs in a row of 5xx: it stops checking a removed event and keeps it, like an event
+  that left the window, and stops fetching a series master. Both count in
+  `events_given_up`. A 401, a 429 and a lost connection still end the run, since every
+  later request would fail the same way.
 - Deleted items are emitted as `{"id": ..., "_deleted": True}` with a `hard_delete`
   column. dlt removes them on `merge`, and cognee's orphan cleanup removes them from the
   graph and vector stores.
