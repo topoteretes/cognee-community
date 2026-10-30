@@ -56,7 +56,7 @@ def _to_float32_bytes(vec) -> bytes:
 @singledispatch
 def _serialize_for_json(obj: Any) -> Any:
     """Convert objects to JSON-serializable format.
-    This id default serialization: return the object as-is.
+    This is default serialization: return the object as-is.
 
     Args:
         obj: Object to serialize (UUID, dict, list, or any other type).
@@ -141,7 +141,7 @@ def _build_scored_results_from_ft(
         else:
             result_id = key_str
 
-        # Extrat score
+        # Extract score
         score = (
             fields.get(b"__vector_score")
             if b"__vector_score" in fields
