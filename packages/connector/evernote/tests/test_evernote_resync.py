@@ -13,6 +13,9 @@ Tests verify:
 - expunged notebook and tag GUIDs are dropped from persisted maps
 - resync followed by an incremental run uses the new cursor
 - getSyncState().currentTime is None leaves state["last_sync_time"] unchanged
+- scope change (notebook or tag widen/narrow/None transition) triggers a full resync
+- scope unchanged stays incremental
+- failure during pass 1 on scope change leaves state and state["scope"] unchanged
 """
 
 from types import SimpleNamespace
@@ -432,3 +435,234 @@ def test_trashed_note_not_in_state_note_ids_still_yields_tombstone():
 
     tombstone_ids = {r["id"] for r in rows if r.get("_deleted")}
     assert "n-trashed" in tombstone_ids
+
+
+def test_scope_widen_triggers_full_resync():
+    """Widening notebook scope triggers full resync from USN 0 even if updateCount unchanged."""
+    nb_a = SimpleNamespace(guid="nb-a", name="NotebookA")
+    nb_b = SimpleNamespace(guid="nb-b", name="NotebookB")
+    note_a = SimpleNamespace(guid="note-a", title="A", notebookGuid="nb-a", active=True)
+    note_b = SimpleNamespace(guid="note-b", title="B", notebookGuid="nb-b", active=True)
+
+    # Run 1: scoped to NotebookA
+    chunk1 = SyncChunk(
+        chunkHighUSN=10,
+        updateCount=10,
+        notebooks=[nb_a, nb_b],
+        notes=[note_a],
+    )
+    client1 = FakeResyncEvernoteClient(chunks=[chunk1], update_count=10)
+    state: dict = {}
+    rows1 = list(_sync_records(client1, state, notebook_names=["NotebookA"]))
+
+    assert len(rows1) == 1
+    assert rows1[0]["id"] == "note-a"
+    assert state["last_usn"] == 10
+    assert state["scope"] == {"notebooks": ["NotebookA"], "tags": None}
+    assert state["note_ids"] == ["note-a"]
+
+    # Run 2: widen scope to NotebookA and NotebookB, server updateCount is still 10!
+    chunk2 = SyncChunk(
+        chunkHighUSN=10,
+        updateCount=10,
+        notebooks=[nb_a, nb_b],
+        notes=[note_a, note_b],
+    )
+    client2 = FakeResyncEvernoteClient(chunks=[chunk2], update_count=10)
+    rows2 = list(_sync_records(client2, state, notebook_names=["NotebookA", "NotebookB"]))
+
+    # Assert read started from USN 0 because scope changed
+    assert client2.get_filtered_sync_chunk_calls[0][0] == 0
+    active_ids = {r["id"] for r in rows2 if not r.get("_deleted")}
+    assert active_ids == {"note-a", "note-b"}
+    assert state["scope"] == {"notebooks": ["NotebookA", "NotebookB"], "tags": None}
+    assert set(state["note_ids"]) == {"note-a", "note-b"}
+
+
+def test_scope_narrow_tombstones_out_of_scope_notes():
+    """Narrowing notebook scope triggers a full resync and tombstones notes no longer in scope."""
+    nb_a = SimpleNamespace(guid="nb-a", name="NotebookA")
+    nb_b = SimpleNamespace(guid="nb-b", name="NotebookB")
+    note_a = SimpleNamespace(guid="note-a", title="A", notebookGuid="nb-a", active=True)
+    note_b = SimpleNamespace(guid="note-b", title="B", notebookGuid="nb-b", active=True)
+
+    # Run 1: scoped to both
+    chunk1 = SyncChunk(
+        chunkHighUSN=10,
+        updateCount=10,
+        notebooks=[nb_a, nb_b],
+        notes=[note_a, note_b],
+    )
+    client1 = FakeResyncEvernoteClient(chunks=[chunk1], update_count=10)
+    state: dict = {}
+    list(_sync_records(client1, state, notebook_names=["NotebookA", "NotebookB"]))
+    assert set(state["note_ids"]) == {"note-a", "note-b"}
+
+    # Run 2: narrow to NotebookA only, server updateCount unchanged
+    chunk2 = SyncChunk(
+        chunkHighUSN=10,
+        updateCount=10,
+        notebooks=[nb_a, nb_b],
+        notes=[note_a, note_b],
+    )
+    client2 = FakeResyncEvernoteClient(chunks=[chunk2], update_count=10)
+    rows2 = list(_sync_records(client2, state, notebook_names=["NotebookA"]))
+
+    assert client2.get_filtered_sync_chunk_calls[0][0] == 0
+    active_ids = {r["id"] for r in rows2 if not r.get("_deleted")}
+    tombstone_ids = {r["id"] for r in rows2 if r.get("_deleted")}
+
+    assert active_ids == {"note-a"}
+    assert "note-b" in tombstone_ids
+    assert state["note_ids"] == ["note-a"]
+    assert state["scope"] == {"notebooks": ["NotebookA"], "tags": None}
+
+
+def test_scope_narrow_listing_failure_leaves_state_unchanged():
+    """Listing error on scope change yields nothing and leaves state and scope unchanged."""
+    nb_a = SimpleNamespace(guid="nb-a", name="NotebookA")
+    nb_b = SimpleNamespace(guid="nb-b", name="NotebookB")
+    note_a = SimpleNamespace(guid="note-a", title="A", notebookGuid="nb-a", active=True)
+    note_b = SimpleNamespace(guid="note-b", title="B", notebookGuid="nb-b", active=True)
+
+    chunk1 = SyncChunk(
+        chunkHighUSN=10,
+        updateCount=10,
+        notebooks=[nb_a, nb_b],
+        notes=[note_a, note_b],
+    )
+    client1 = FakeResyncEvernoteClient(chunks=[chunk1], update_count=10)
+    state: dict = {}
+    list(_sync_records(client1, state, notebook_names=["NotebookA", "NotebookB"]))
+
+    initial_scope = dict(state["scope"])
+    initial_note_ids = list(state["note_ids"])
+    initial_usn = state["last_usn"]
+
+    client2 = FakeResyncEvernoteClient(update_count=10)
+    client2.get_filtered_sync_chunk = lambda *_: (_ for _ in ()).throw(
+        RuntimeError("Chunk fetch failed")
+    )
+
+    gen = _sync_records(client2, state, notebook_names=["NotebookA"])
+    with pytest.raises(RuntimeError, match="Chunk fetch failed"):
+        next(gen)
+
+    # State including state["scope"] and state["note_ids"] must be untouched
+    assert state["scope"] == initial_scope
+    assert state["note_ids"] == initial_note_ids
+    assert state["last_usn"] == initial_usn
+
+
+def test_scope_unchanged_stays_incremental():
+    """When scope is unchanged, sync remains incremental (uses afterUSN = last_usn or shortcuts)."""
+    nb_a = SimpleNamespace(guid="nb-a", name="NotebookA")
+    note_a1 = SimpleNamespace(guid="note-a1", title="A1", notebookGuid="nb-a", active=True)
+
+    # Run 1
+    chunk1 = SyncChunk(
+        chunkHighUSN=10,
+        updateCount=10,
+        notebooks=[nb_a],
+        notes=[note_a1],
+    )
+    client1 = FakeResyncEvernoteClient(chunks=[chunk1], update_count=10)
+    state: dict = {}
+    list(_sync_records(client1, state, notebook_names=["NotebookA"]))
+    assert state["last_usn"] == 10
+
+    # Run 2: same scope, updateCount == last_usn -> shortcut triggers, no chunk calls
+    client2 = FakeResyncEvernoteClient(update_count=10)
+    rows2 = list(_sync_records(client2, state, notebook_names=["NotebookA"]))
+    assert client2.get_filtered_sync_chunk_calls == []
+    # Materialize table schema marker yielded
+    assert len(rows2) == 1
+
+    # Run 3: same scope, updateCount > last_usn -> incremental sync from afterUSN = 10
+    note_a2 = SimpleNamespace(guid="note-a2", title="A2", notebookGuid="nb-a", active=True)
+    chunk3 = SyncChunk(
+        chunkHighUSN=15,
+        updateCount=15,
+        notebooks=[nb_a],
+        notes=[note_a2],
+    )
+    client3 = FakeResyncEvernoteClient(chunks=[chunk3], update_count=15)
+    rows3 = list(_sync_records(client3, state, notebook_names=["NotebookA"]))
+    assert client3.get_filtered_sync_chunk_calls[0][0] == 10
+    active_ids = {r["id"] for r in rows3 if not r.get("_deleted")}
+    assert active_ids == {"note-a2"}
+    assert state["last_usn"] == 15
+
+
+def test_tag_scope_change_triggers_full_resync():
+    """Changing tag scope triggers a full resync from USN 0 even if updateCount is unchanged."""
+    tag1 = SimpleNamespace(guid="t1", name="Tag1")
+    tag2 = SimpleNamespace(guid="t2", name="Tag2")
+    note1 = SimpleNamespace(guid="n1", title="N1", tagGuids=["t1"], active=True)
+    note2 = SimpleNamespace(guid="n2", title="N2", tagGuids=["t2"], active=True)
+
+    # Run 1: tag_names=["Tag1"]
+    chunk1 = SyncChunk(
+        chunkHighUSN=10,
+        updateCount=10,
+        tags=[tag1, tag2],
+        notes=[note1],
+    )
+    client1 = FakeResyncEvernoteClient(chunks=[chunk1], update_count=10)
+    state: dict = {}
+    rows1 = list(_sync_records(client1, state, tag_names=["Tag1"]))
+    assert len(rows1) == 1
+    assert rows1[0]["id"] == "n1"
+    assert state["scope"] == {"notebooks": None, "tags": ["Tag1"]}
+
+    # Run 2: tag_names=["Tag1", "Tag2"], server updateCount unchanged
+    chunk2 = SyncChunk(
+        chunkHighUSN=10,
+        updateCount=10,
+        tags=[tag1, tag2],
+        notes=[note1, note2],
+    )
+    client2 = FakeResyncEvernoteClient(chunks=[chunk2], update_count=10)
+    rows2 = list(_sync_records(client2, state, tag_names=["Tag1", "Tag2"]))
+    assert client2.get_filtered_sync_chunk_calls[0][0] == 0
+    active_ids = {r["id"] for r in rows2 if not r.get("_deleted")}
+    assert active_ids == {"n1", "n2"}
+    assert state["scope"] == {"notebooks": None, "tags": ["Tag1", "Tag2"]}
+
+
+def test_scope_none_to_list_transition():
+    """Transitioning from no scope filter (None) to a list triggers a full resync."""
+    nb = SimpleNamespace(guid="nb1", name="Engineering")
+    note = SimpleNamespace(guid="n1", title="N1", notebookGuid="nb1", active=True)
+
+    chunk1 = SyncChunk(chunkHighUSN=10, updateCount=10, notebooks=[nb], notes=[note])
+    client1 = FakeResyncEvernoteClient(chunks=[chunk1], update_count=10)
+    state: dict = {}
+    list(_sync_records(client1, state))
+    assert state["scope"] == {"notebooks": None, "tags": None}
+
+    # Run 2: scope added
+    chunk2 = SyncChunk(chunkHighUSN=10, updateCount=10, notebooks=[nb], notes=[note])
+    client2 = FakeResyncEvernoteClient(chunks=[chunk2], update_count=10)
+    list(_sync_records(client2, state, notebook_names=["Engineering"]))
+    assert client2.get_filtered_sync_chunk_calls[0][0] == 0
+    assert state["scope"] == {"notebooks": ["Engineering"], "tags": None}
+
+
+def test_scope_list_to_none_transition():
+    """Transitioning from a list filter to no filter (None) triggers a full resync."""
+    nb = SimpleNamespace(guid="nb1", name="Engineering")
+    note = SimpleNamespace(guid="n1", title="N1", notebookGuid="nb1", active=True)
+
+    chunk1 = SyncChunk(chunkHighUSN=10, updateCount=10, notebooks=[nb], notes=[note])
+    client1 = FakeResyncEvernoteClient(chunks=[chunk1], update_count=10)
+    state: dict = {}
+    list(_sync_records(client1, state, notebook_names=["Engineering"]))
+    assert state["scope"] == {"notebooks": ["Engineering"], "tags": None}
+
+    # Run 2: scope removed (None)
+    chunk2 = SyncChunk(chunkHighUSN=10, updateCount=10, notebooks=[nb], notes=[note])
+    client2 = FakeResyncEvernoteClient(chunks=[chunk2], update_count=10)
+    list(_sync_records(client2, state))
+    assert client2.get_filtered_sync_chunk_calls[0][0] == 0
+    assert state["scope"] == {"notebooks": None, "tags": None}

@@ -438,9 +438,25 @@ def _sync_records(
     last_usn = state.get("last_usn", 0)
     last_sync_time = state.get("last_sync_time")
 
-    # Step 2: Determine if this run is a FULL resync
+    # Compute the current scope signature for change detection.
+    # None means "all notebooks/tags"; a sorted list means a specific selection.
+    current_scope_signature = {
+        "notebooks": sorted(set(notebook_names)) if notebook_names is not None else None,
+        "tags": sorted(set(tag_names)) if tag_names is not None else None,
+    }
+
+    # Step 2: Determine if this run is a FULL resync.
+    # Scope change is evaluated first so it cannot be short-circuited by the
+    # "server updateCount == last_usn" shortcut that follows.
+    # A legacy state without "scope" defaults to unscoped (None, None).
+    persisted_scope = state.get("scope", {"notebooks": None, "tags": None})
+    scope_changed = has_last_usn and persisted_scope != current_scope_signature
+    if scope_changed:
+        log.info("Evernote scope changed, triggering full resync.")
+
     is_full_resync = (
         full_resync
+        or scope_changed
         or (
             has_last_usn
             and full_sync_before is not None
@@ -631,6 +647,7 @@ def _sync_records(
     state["tags"] = tag_map
     state["note_ids"] = sorted(updated_note_ids)
     state["account"] = bind
+    state["scope"] = current_scope_signature
 
 
 def evernote_source(

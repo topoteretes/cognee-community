@@ -128,7 +128,8 @@ Sync state is tracked using Evernote's Update Sequence Number (USN) cursor store
 - **First run**: Pulls metadata and notes starting from USN 0 and checkpoints `last_usn`, `last_sync_time`, notebook/tag ID maps, and `note_ids`.
 - **Incremental runs**: Only requests sync chunks with `afterUSN = state["last_usn"]`. If server `updateCount == state["last_usn"]`, nothing changed and no chunk calls are made.
 - **Transactional state persistence**: The cursor is updated in dlt resource state only after a completely successful run. If an extraction fails or is interrupted, state remains untouched and the next run safely retries from the old cursor.
-- **Resync triggers**: A full resync (re-evaluating from USN 0) occurs automatically if `full_resync=True`, if the server's `fullSyncBefore` exceeds `state["last_sync_time"]`, or if the server's `updateCount` is lower than `state["last_usn"]`.
+- **Resync triggers**: A full resync (re-evaluating from USN 0) occurs automatically if `full_resync=True`, if the server's `fullSyncBefore` exceeds `state["last_sync_time"]`, if the server's `updateCount` is lower than `state["last_usn"]`, or if `notebook_names` / `tag_names` scope changes.
+- **Scope changes**: Changing `notebook_names` or `tag_names` is detected by comparing the current scope signature against the persisted `state["scope"]`. When the scope has changed, the run is treated as a full resync (starting from USN 0), including deletion reconciliation for notes that were in the previous scope but are no longer requested.
 - **Account binding**: The resource state records `account` (e.g. `production:12345` or `sandbox:12345`). Attempting to reuse an existing resource state with a different Evernote user ID or environment raises `EvernoteError` before making any chunk calls.
 
 ## How Deletions Work
@@ -147,6 +148,7 @@ Filter ingested notes with `notebook_names` and `tag_names`:
 - **Both provided**: Notes must match **both** filters (must reside in one of the selected notebooks AND carry at least one of the selected tags).
 - **Exact matching**: Names are compared strictly and case-sensitively against server notebook and tag names.
 - **Unknown names**: Passing a notebook or tag name that does not exist in the Evernote account raises `EvernoteError`.
+- **Scope changes trigger full resync**: Changing `notebook_names` or `tag_names` between runs automatically triggers a full resync with deletion reconciliation — notes no longer in scope are tombstoned and removed from cognee's memory.
 
 ## Limitations
 

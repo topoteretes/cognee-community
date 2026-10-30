@@ -405,3 +405,81 @@ async def test_evernote_ingestion_large_batch(persistent_environment):
     assert len(data) == 60
     guids = {_get_metadata(d)["external_id"] for d in data}
     assert guids == {f"note-{i}" for i in range(60)}
+
+
+@pytest.mark.asyncio
+async def test_evernote_scope_change_triggers_resync_in_cognee(persistent_environment):
+    """Scope change triggers full resync in cognee with deletion reconciliation."""
+    dataset = "evernote_scope_resync_dataset"
+    nb_a = SimpleNamespace(guid="nb-a", name="NotebookA")
+    nb_b = SimpleNamespace(guid="nb-b", name="NotebookB")
+    note_a = SimpleNamespace(
+        guid="note-a",
+        title="Note A",
+        notebookGuid="nb-a",
+        tagGuids=[],
+        active=True,
+        created=1609459200000,
+        updated=1609459200000,
+    )
+    note_b = SimpleNamespace(
+        guid="note-b",
+        title="Note B",
+        notebookGuid="nb-b",
+        tagGuids=[],
+        active=True,
+        created=1609459200000,
+        updated=1609459200000,
+    )
+
+    contents = {
+        "note-a": "<en-note><div>Body for Note A</div></en-note>",
+        "note-b": "<en-note><div>Body for Note B</div></en-note>",
+    }
+
+    # Run 1: Scope to NotebookA only
+    chunk1 = SyncChunk(
+        chunkHighUSN=10,
+        updateCount=10,
+        notebooks=[nb_a, nb_b],
+        notes=[note_a, note_b],
+    )
+    client1 = FakeEvernoteClient(chunks=[chunk1], note_contents=contents, update_count=10)
+    source1 = evernote_source(token="fake-token", client=client1, notebook_names=["NotebookA"])
+    await cognee.add(source1, dataset_name=dataset, write_disposition="merge")
+
+    data1 = await _get_evernote_dataset_data(dataset)
+    assert len(data1) == 1
+    assert {_get_metadata(d)["external_id"] for d in data1} == {"note-a"}
+
+    # Run 2: Widen scope to NotebookA and NotebookB, NO server changes (updateCount=10)
+    chunk2 = SyncChunk(
+        chunkHighUSN=10,
+        updateCount=10,
+        notebooks=[nb_a, nb_b],
+        notes=[note_a, note_b],
+    )
+    client2 = FakeEvernoteClient(chunks=[chunk2], note_contents=contents, update_count=10)
+    source2 = evernote_source(
+        token="fake-token", client=client2, notebook_names=["NotebookA", "NotebookB"]
+    )
+    await cognee.add(source2, dataset_name=dataset, write_disposition="merge")
+
+    data2 = await _get_evernote_dataset_data(dataset)
+    assert len(data2) == 2
+    assert {_get_metadata(d)["external_id"] for d in data2} == {"note-a", "note-b"}
+
+    # Run 3: Narrow scope back to NotebookA only, NO server changes (updateCount=10)
+    chunk3 = SyncChunk(
+        chunkHighUSN=10,
+        updateCount=10,
+        notebooks=[nb_a, nb_b],
+        notes=[note_a, note_b],
+    )
+    client3 = FakeEvernoteClient(chunks=[chunk3], note_contents=contents, update_count=10)
+    source3 = evernote_source(token="fake-token", client=client3, notebook_names=["NotebookA"])
+    await cognee.add(source3, dataset_name=dataset, write_disposition="merge")
+
+    data3 = await _get_evernote_dataset_data(dataset)
+    assert len(data3) == 1
+    assert {_get_metadata(d)["external_id"] for d in data3} == {"note-a"}
