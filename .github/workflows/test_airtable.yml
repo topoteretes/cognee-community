@@ -1,0 +1,126 @@
+name: Test Airtable connector
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - packages/connector/airtable/**
+      - .github/workflows/test_airtable.yml
+  push:
+    branches: [main]
+    paths:
+      - packages/connector/airtable/**
+      - .github/workflows/test_airtable.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: airtable-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  TELEMETRY_DISABLED: "true"
+  RUNTIME__DLTHUB_TELEMETRY: "false"
+  UV_NO_SOURCES: "true"
+
+jobs:
+  unit:
+    name: Unit / Python ${{ matrix.python }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12"]
+    defaults:
+      run:
+        working-directory: packages/connector/airtable
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          version: "0.5.9"
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+          cache-dependency-glob: packages/connector/airtable/uv.lock
+      - name: Install locked release dependencies
+        run: uv sync --frozen --all-extras
+      - name: Verify dependency provenance
+        run: |
+          uv run --frozen python - <<'PY'
+          from importlib.metadata import version
+          from pathlib import Path
+          import cognee
+          import dlt
+          for name, module, expected in [("cognee", cognee, "1.6.3"), ("dlt", dlt, "1.30.0")]:
+              location = Path(module.__file__).resolve()
+              print(name, version(name), location)
+              assert version(name) == expected
+              assert "site-packages" in location.parts
+          PY
+      - name: Unit tests (no skips permitted)
+        run: |
+          uv run --frozen pytest tests/unit -q --junitxml=unit-results.xml
+          uv run --frozen python - <<'PY'
+          import xml.etree.ElementTree as ET
+          suites = list(ET.parse("unit-results.xml").getroot().iter("testsuite"))
+          assert sum(int(s.attrib["tests"]) for s in suites) > 0
+          assert sum(int(s.attrib.get("skipped", 0)) for s in suites) == 0
+          PY
+      - name: Lint and format checks
+        run: |
+          uv run --frozen ruff check .
+          uv run --frozen ruff format --check .
+
+  integration:
+    name: Storage integration and installed wheel / Python 3.12
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: packages/connector/airtable
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          version: "0.5.9"
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: packages/connector/airtable/uv.lock
+      - name: Install locked release dependencies
+        run: uv sync --frozen --all-extras
+      - name: Storage integration tests (no skips permitted)
+        run: |
+          uv run --frozen pytest tests/integration -q --junitxml=integration-results.xml
+          uv run --frozen python - <<'PY'
+          import xml.etree.ElementTree as ET
+          suites = list(ET.parse("integration-results.xml").getroot().iter("testsuite"))
+          assert sum(int(s.attrib["tests"]) for s in suites) > 0
+          assert sum(int(s.attrib.get("skipped", 0)) for s in suites) == 0
+          PY
+      - name: Build wheel and source distribution
+        run: uv build
+      - name: Install wheel outside checkout and ingest a fixture
+        shell: bash
+        run: |
+          uv export --frozen --no-dev --no-emit-project --no-hashes --output-file "$RUNNER_TEMP/airtable-constraints.txt"
+          uv venv --python 3.12 "$RUNNER_TEMP/airtable-wheel"
+          uv pip install --python "$RUNNER_TEMP/airtable-wheel/bin/python" --constraint "$RUNNER_TEMP/airtable-constraints.txt" dist/*.whl
+          cp examples/offline_smoke.py "$RUNNER_TEMP/airtable-wheel-smoke.py"
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/airtable-wheel/bin/python" - <<'PY'
+          from importlib.metadata import version
+          from pathlib import Path
+          import cognee
+          import dlt
+          import cognee_community_connector_airtable as connector
+          for name, module, expected in [("cognee", cognee, "1.6.3"), ("dlt", dlt, "1.30.0")]:
+              location = Path(module.__file__).resolve()
+              print(name, version(name), location)
+              assert version(name) == expected
+              assert "site-packages" in location.parts
+          assert "site-packages" in Path(connector.__file__).resolve().parts
+          PY
+          "$RUNNER_TEMP/airtable-wheel/bin/python" "$RUNNER_TEMP/airtable-wheel-smoke.py"
