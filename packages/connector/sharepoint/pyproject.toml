@@ -1,0 +1,35 @@
+[project]
+name = "cognee-community-connector-sharepoint"
+version = "0.1.0"
+description = "SharePoint / OneDrive data-source connector for cognee — sync document libraries into memory (incremental + forget-on-delete)"
+readme = "README.md"
+requires-python = ">=3.11,<=3.13"
+dependencies = [
+    "cognee==1.4.2",
+    "dlt[sqlalchemy]>=1.9.0,<2",
+    "msal>=1.28.0,<2",
+    "requests>=2.31.0,<3",
+    "python-docx>=1.1.0,<2",
+    "openpyxl>=3.1.0,<4",
+]
+
+[project.urls]
+Homepage = "https://github.com/topoteretes/cognee"
+Repository = "https://github.com/topoteretes/cognee-community"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cognee_community_connector_sharepoint"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "N", "B", "UP", "C4", "PGH", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
