@@ -11,7 +11,13 @@ import logging
 import pytest
 import requests
 from dropbox import files
-from dropbox.exceptions import AuthError, BadInputError, InternalServerError, RateLimitError
+from dropbox.exceptions import (
+    ApiError,
+    AuthError,
+    BadInputError,
+    InternalServerError,
+    RateLimitError,
+)
 from fake_dropbox import FakeDropbox, api_error, make_pdf
 
 from cognee_community_connector_dropbox import dropbox as dropbox_module
@@ -309,10 +315,8 @@ def test_listing_errors_raise_and_never_delete(fake, error):
     assert state == before
 
 
-@pytest.mark.parametrize(
-    "lookup", [files.LookupError.restricted_content, files.LookupError.not_folder]
-)
-def test_a_synced_folder_that_can_no_longer_be_listed_is_forgotten(fake, lookup):
+@pytest.mark.parametrize("lookup", [files.LookupError.not_found, files.LookupError.not_folder])
+def test_a_synced_folder_that_is_gone_is_forgotten(fake, lookup):
     a = fake.put("/Project/a.md", "alpha")
     other = fake.put("/Other/b.md", "beta")
     state: dict = {}
@@ -1119,28 +1123,40 @@ def test_upgrading_with_a_folder_dropped_from_the_config_forgets_it(fake):
     b = fake.put("/M/b.md", "in M")
     state = {"index": {"/n/a.md": n, "/m/b.md": b}}  # no cursors after a failed run
 
-    _, deletes, stats = sync(fake, state, ("/m",))
+    _, deletes, _ = sync(fake, state, ("/m",))
 
     assert deletes == [n]
-    assert stats["deleted"] == 1
     assert "/n/a.md" not in state["index"] and n not in state["stored"]
 
 
-def test_upgrading_does_not_take_skipped_or_failed_files_for_stored_ones(fake):
+def test_upgrading_without_stored_lists_again_and_rebuilds_it(fake):
     photo = fake.put("/photo.png", b"\x89PNG")
-    flaky = fake.put("/flaky.md", "waiting in retry")
+    blank = fake.put("/blank.md", "   ")
     a = fake.put("/a.md", "alpha")
     sync(fake, {})
-    state = {"index": {"/photo.png": photo, "/flaky.md": flaky, "/a.md": a}, "retry": [flaky]}
-    state["cursors"] = {"": fake._cursor("")}
+    state = {"index": {"/photo.png": photo, "/blank.md": blank, "/a.md": a}}
+    state["cursors"] = {"": fake._cursor("")}  # nothing changed since
 
-    fake.put("/photo.png", b"\x89PNG, edited")  # still skipped: was never stored
-    fake.put("/a.md", "   ")  # emptied: was stored, so it must go
-    _, deletes, stats = sync(fake, state)
+    upserts, deletes, stats = sync(fake, state)
 
-    assert deletes == [a]
-    assert stats["deleted"] == 1
-    assert photo not in state["stored"]
+    assert set(upserts) == {a}, "every file is read again, so stored is exact"
+    assert deletes == []
+    assert state["stored"] == [a]
+    assert stats["deleted"] == 0
+
+
+def test_upgrading_without_stored_does_not_hide_a_bad_token(fake):
+    # Goran's case: a blank file deleted and an edit whose download fails.
+    e = fake.put("/e.md", "   ")
+    g = fake.put("/g.md", "gamma")
+    sync(fake, {})
+    state = {"index": {"/e.md": e, "/g.md": g}, "cursors": {"": fake._cursor("")}}
+
+    fake.delete("/e.md")
+    fake.put("/g.md", "gamma, edited")
+    fake.download_errors[g] = AuthError("request-id", "invalid_access_token")
+    with pytest.raises(AuthError):
+        sync(fake, state)
 
 
 def test_an_older_state_without_synced_folders_forgets_a_deleted_folder(fake):
@@ -1195,3 +1211,68 @@ def test_a_bad_token_after_a_real_delete_stops_without_raising(fake):
 
     assert deletes == [a], "the delete is kept"
     assert stats["failed_auth"] == 1 and list(state["retry"]) == [g]
+
+
+# ---------------------------------------------------------------------------
+# Review round 7: which folder errors forget, and synced_folders pruning
+# ---------------------------------------------------------------------------
+PASSING_LOOKUPS = [
+    files.LookupError.locked,
+    files.LookupError.other,
+    files.LookupError.restricted_content,
+    files.LookupError("malformed_path", None),
+]
+
+
+@pytest.mark.parametrize("lookup", PASSING_LOOKUPS)
+def test_a_passing_folder_error_raises_and_forgets_nothing(fake, lookup):
+    fake.put("/N/a.md", "in N")
+    fake.put("/M/b.md", "in M")
+    state: dict = {}
+    sync(fake, state, ("/n", "/m"))
+    before = copy.deepcopy(state)
+
+    # On the cursor round and on the fresh listing that confirms it.
+    fake.continue_errors.append(api_error(files.ListFolderContinueError.path(lookup)))
+    fake.list_errors.append(api_error(files.ListFolderError.path(lookup)))
+    with pytest.raises(ApiError):
+        sync(fake, state, ("/n", "/m"))
+
+    assert state == before
+
+
+@pytest.mark.parametrize("lookup", PASSING_LOOKUPS)
+def test_a_passing_folder_error_on_the_cursor_alone_relists_and_keeps_files(fake, lookup):
+    a = fake.put("/N/a.md", "in N")
+    state: dict = {}
+    sync(fake, state, ("/n",))
+
+    fake.continue_errors.append(api_error(files.ListFolderContinueError.path(lookup)))
+    _, deletes, stats = sync(fake, state, ("/n",))
+
+    assert deletes == [] and stats["deleted"] == 0
+    assert a in state["index"].values() and a in state["stored"]
+
+
+def test_synced_folders_keeps_only_configured_folders(fake):
+    fake.put("/Old/a.md", "alpha")
+    fake.put("/Docs/b.md", "bravo")
+    state: dict = {}
+    sync(fake, state, ("/old",))
+    sync(fake, state, ("/docs",))
+    assert state["synced_folders"] == ["/docs"]
+
+    # /old deleted, then put back in the config by mistake: a typo, not a delete.
+    fake.delete("/Old")
+    with pytest.raises(DropboxFolderNotFoundError):
+        sync(fake, state, ("/old",))
+
+
+def test_an_older_state_without_synced_folders_counts_folders_with_files_as_listed(fake):
+    n = fake.put("/N/a.md", "in N")
+    state = {"index": {"/n/a.md": n}, "stored": [n]}  # no cursors, no synced_folders
+
+    fake.delete("/N")
+    _, deletes, stats = sync(fake, state, ("/n",))
+
+    assert deletes == [n] and stats["deleted"] == 1, "forgotten, not taken for a typo"

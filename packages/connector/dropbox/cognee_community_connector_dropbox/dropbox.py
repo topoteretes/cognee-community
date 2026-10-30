@@ -185,6 +185,11 @@ def _path_lookup_error(exc: ApiError) -> Any:
     return None
 
 
+def _is_gone(lookup: Any) -> bool:
+    """Dropbox says the path is not there, or is no longer a folder."""
+    return lookup.is_not_found() or lookup.is_not_folder()
+
+
 def _is_not_found(exc: ApiError) -> bool:
     lookup = _path_lookup_error(exc)
     return lookup is not None and lookup.is_not_found()
@@ -348,14 +353,19 @@ def _iter_rows(
     # Skipped and failed files are indexed too, so the index alone can't say
     # what is in cognee, and a folder listed once and gone later is forgotten
     # like a delete while one never listed is taken for a typo.  State saved
-    # before these keys existed is migrated by _migrated_stored and
-    # _migrated_synced_folders.
-    stored: set[str] = set(state["stored"]) if "stored" in state else _migrated_stored(index, retry)
+    # before synced_folders existed is migrated by _migrated_synced_folders.
     synced_folders: set[str] = (
         set(state["synced_folders"])
         if "synced_folders" in state
         else _migrated_synced_folders(index, old_cursors, config.folder_paths)
     )
+    if "stored" in state:
+        stored: set[str] = set(state["stored"])
+    else:
+        # Saved before stored existed: the index can't tell which files made it
+        # into cognee, so list every folder again and let the rows rebuild it.
+        stored = set()
+        old_cursors = {}
     new_cursors: dict[str, str] = {}
     # Ids whose path went away this round. Held until every folder is read,
     # because a move shows up as a deleted old path plus the same id elsewhere.
@@ -420,19 +430,27 @@ def _iter_rows(
             try:
                 entries, new_cursors[folder] = _list_folder(session, folder)
             except ApiError as exc:
-                if _path_lookup_error(exc) is None:
+                lookup = _path_lookup_error(exc)
+                if lookup is None:
                     raise
-                if folder not in synced_folders:
+                if folder not in synced_folders and (
+                    _is_gone(lookup) or lookup.is_restricted_content()
+                ):
                     # Never listed: most likely a typo in folder_paths, which
                     # would otherwise just produce an empty dataset.
                     raise DropboxFolderNotFoundError(
                         "A configured Dropbox folder was not found, or is not a folder "
                         "you can read. Check folder_paths."
                     ) from None
-                # Synced before and now gone, replaced by a file, or restricted:
-                # none of these comes back by retrying, and raising would stop
-                # every other folder on every run, so forget it like a delete.
-                logger.warning("Dropbox: a synced folder can no longer be listed; forgetting it.")
+                if not _is_gone(lookup):
+                    # Locked, restricted, malformed or a tag Dropbox adds later:
+                    # nothing says the files are gone, so raise like any other
+                    # listing error and leave the state as it was.
+                    raise
+                # Synced before and now deleted or replaced by a file: that
+                # does not come back by retrying, and raising would stop every
+                # other folder on every run, so forget it like a delete.
+                logger.warning("Dropbox: a synced folder is gone; forgetting it.")
                 forget(folder)
                 continue
             synced_folders.add(folder)
@@ -547,26 +565,13 @@ def _iter_rows(
     state["index"] = index
     state["cursors"] = new_cursors
     state["stored"] = sorted(stored)
-    state["synced_folders"] = sorted(synced_folders)
+    # Only configured folders: one dropped from the config and added back later
+    # must pass the typo check again instead of counting as listed.
+    state["synced_folders"] = sorted(synced_folders & set(config.folder_paths))
     state["retry"] = next_retry
     if next_retry:
         logger.warning("Dropbox: %d file(s) failed and will be retried next run.", len(next_retry))
     logger.info("Dropbox: sync stats %s", stats)
-
-
-def _migrated_stored(index: dict[str, str], retry: dict[str, int]) -> set[str]:
-    """What state saved before ``stored`` existed most likely had in cognee.
-
-    That state only has the index, which also holds files that were skipped
-    or failed.  Those with a type we never read, and those still waiting in
-    retry, were not stored; the rest is the best that can be told.
-    """
-    readable = TEXT_EXTENSIONS | {PDF_EXTENSION}
-    return {
-        file_id
-        for path, file_id in index.items()
-        if posixpath.splitext(path)[1] in readable and file_id not in retry
-    }
 
 
 def _migrated_synced_folders(

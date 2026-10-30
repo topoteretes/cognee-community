@@ -121,16 +121,17 @@ in both.
   folder gone, when a file leaves the synced folders, or when a file that was stored
   turns unreadable for good: skipped now, or given up after 3 failed runs, so its old
   text does not stay in memory as if it were current. A network error, a 5xx, a rate
-  limit or a bad token removes nothing. A reset cursor (`409 reset`) triggers a fresh
-  listing reconciled against the index.
+  limit, a bad token, or a folder Dropbox reports as locked, restricted or malformed
+  removes nothing. A reset cursor (`409 reset`) triggers a fresh listing reconciled
+  against the index.
 - **Folders.** A configured folder that was never listed raises
   `DropboxFolderNotFoundError`, since it is most likely a typo or not a folder you can
-  read. A folder that was synced and can no longer be listed later, because it was
-  deleted, replaced by a file or restricted, is forgotten like a delete, and later runs
-  keep syncing the other folders: the state remembers which folders were listed at least
-  once. State saved by the first version, which kept only the index after a run with a
-  failed download, is migrated: folders with files in the index count as listed, and
-  files of a type that is never read, or still waiting in retry, count as not stored.
+  read. A folder that was synced and later reported as `not_found` or `not_folder`,
+  because it was deleted or replaced by a file, is forgotten like a delete, and later
+  runs keep syncing the other folders: the state remembers which configured folders were
+  listed at least once. Any other listing error on it raises and changes nothing. State saved
+  before the `stored` key existed can't tell which files reached cognee, so the first
+  run after upgrading lists every folder again and sends every file once more.
 - **Failed downloads are retried by id.** The cursor always moves forward. A file that
   failed to download (a 5xx or a network error) is kept in a `retry` map in dlt state with
   its number of attempts, and fetched again by id next run, which costs two requests:
