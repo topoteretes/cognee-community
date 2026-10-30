@@ -23,7 +23,8 @@ from typing import Any
 
 logger = logging.getLogger("polar_connector")
 
-BASE_URL = "https://api.polar.sh/v1"
+PROD_BASE_URL = "https://api.polar.sh/v1"
+SANDBOX_BASE_URL = "https://sandbox-api.polar.sh/v1"
 PAGE_SIZE = 100
 DEFAULT_TIMEOUT = 30
 DEFAULT_RETRIES = 3
@@ -32,16 +33,24 @@ DEFAULT_RETRIES = 3
 class PolarClient:
     """HTTP client for Polar.sh REST API."""
 
-    def __init__(self, access_token: str | None = None, organization_id: str | None = None):
+    def __init__(
+        self,
+        access_token: str | None = None,
+        organization_id: str | None = None,
+        sandbox: bool = False,
+    ):
         self.access_token = access_token or os.getenv("POLAR_ACCESS_TOKEN")
         self.organization_id = organization_id or os.getenv("POLAR_ORGANIZATION_ID")
+        self.sandbox = sandbox or os.getenv("POLAR_SANDBOX", "").lower() in ("true", "1", "yes")
+
         if not self.access_token:
             raise ValueError("Polar access token is required. Pass access_token or set POLAR_ACCESS_TOKEN.")
 
+        self.base_url = SANDBOX_BASE_URL if self.sandbox else PROD_BASE_URL
         self.headers = {
             "Authorization": f"Bearer {self.access_token}",
             "Accept": "application/json",
-            "User-Agent": "cognee-community-connector-polar/0.1.0"
+            "User-Agent": "cognee-community-connector-polar/0.1.0",
         }
 
     def _fetch_json(self, url: str) -> dict[str, Any]:
@@ -50,7 +59,7 @@ class PolarClient:
             return json.loads(r.read().decode("utf-8"))
 
     def get_paginated(self, endpoint: str, params: dict | None = None) -> Iterator[dict[str, Any]]:
-        """Yield items from paginated Polar endpoints."""
+        """Yield items from paginated Polar endpoints with retries and rate limit safety."""
         query = {"page": 1, "limit": PAGE_SIZE}
         if self.organization_id:
             query["organization_id"] = self.organization_id
@@ -59,7 +68,7 @@ class PolarClient:
 
         while True:
             encoded_query = urllib.parse.urlencode(query)
-            full_url = f"{BASE_URL}/{endpoint.lstrip('/')}?{encoded_query}"
+            full_url = f"{self.base_url}/{endpoint.lstrip('/')}?{encoded_query}"
 
             data = None
             for attempt in range(DEFAULT_RETRIES):
@@ -68,7 +77,7 @@ class PolarClient:
                     break
                 except Exception as e:
                     if attempt == DEFAULT_RETRIES - 1:
-                        logger.error("Failed fetching Polar endpoint %s: %s", endpoint, e)
+                        logger.error("Failed fetching Polar endpoint %s after %d retries: %s", endpoint, DEFAULT_RETRIES, e)
                         return
                     time.sleep(1 + attempt)
 
@@ -92,7 +101,8 @@ class PolarClient:
 def polar_source(
     access_token: str | None = None,
     organization_id: str | None = None,
-    resources: tuple[str, ...] = ("customers", "subscriptions", "products", "benefit_grants")
+    sandbox: bool = False,
+    resources: tuple[str, ...] = ("customers", "subscriptions", "products", "benefit_grants"),
 ):
     """
     DLT source returning resources for Polar customers, subscriptions, products, and benefit grants.
@@ -102,10 +112,15 @@ def polar_source(
     except ImportError:
         dlt = None
 
-    client = PolarClient(access_token=access_token, organization_id=organization_id)
+    client = PolarClient(
+        access_token=access_token,
+        organization_id=organization_id,
+        sandbox=sandbox,
+    )
 
     def customers() -> Iterator[dict[str, Any]]:
         for c in client.get_paginated("customers"):
+            # Exclude sensitive billing addresses and payment specifics by selecting safe context fields
             yield {
                 "id": f"polar:customer:{c.get('id')}",
                 "customer_id": c.get("id"),
@@ -113,7 +128,7 @@ def polar_source(
                 "name": c.get("name"),
                 "created_at": c.get("created_at"),
                 "organization_id": c.get("organization_id"),
-                "text": f"Polar Customer: {c.get('name') or c.get('email')} ({c.get('email')})"
+                "text": f"Polar Customer: {c.get('name') or c.get('email')} ({c.get('email')})",
             }
 
     def subscriptions() -> Iterator[dict[str, Any]]:
@@ -123,11 +138,13 @@ def polar_source(
                 "subscription_id": s.get("id"),
                 "status": s.get("status"),
                 "user_id": s.get("user_id"),
+                "customer_id": s.get("customer_id"),
                 "product_id": s.get("product_id"),
                 "price_id": s.get("price_id"),
+                "cancel_at_period_end": s.get("cancel_at_period_end", False),
                 "current_period_start": s.get("current_period_start"),
                 "current_period_end": s.get("current_period_end"),
-                "text": f"Polar Subscription {s.get('id')} — Status: {s.get('status')} for Product {s.get('product_id')}"
+                "text": f"Polar Subscription {s.get('id')} — Status: {s.get('status')} for Product {s.get('product_id')}",
             }
 
     def products() -> Iterator[dict[str, Any]]:
@@ -138,13 +155,29 @@ def polar_source(
                 "name": p.get("name"),
                 "description": p.get("description"),
                 "is_archived": p.get("is_archived", False),
-                "text": f"Polar Product: {p.get('name')}\nDescription: {p.get('description')}"
+                "is_recurring": p.get("is_recurring", False),
+                "text": f"Polar Product: {p.get('name')}\nDescription: {p.get('description')}",
+            }
+
+    def benefit_grants() -> Iterator[dict[str, Any]]:
+        for b in client.get_paginated("customer-benefit-grants"):
+            # Exclude secret keys or sensitive tokens from benefit properties
+            yield {
+                "id": f"polar:benefit_grant:{b.get('id')}",
+                "benefit_grant_id": b.get("id"),
+                "customer_id": b.get("customer_id"),
+                "benefit_id": b.get("benefit_id"),
+                "is_granted": b.get("is_granted", True),
+                "granted_at": b.get("granted_at"),
+                "revoked_at": b.get("revoked_at"),
+                "text": f"Polar Benefit Grant {b.get('id')} — Granted: {b.get('is_granted', True)} for Customer {b.get('customer_id')}",
             }
 
     if dlt is not None:
         cust_res = dlt.resource(name="polar_customers", primary_key="id", write_disposition="merge")(customers)
         sub_res = dlt.resource(name="polar_subscriptions", primary_key="id", write_disposition="merge")(subscriptions)
         prod_res = dlt.resource(name="polar_products", primary_key="id", write_disposition="merge")(products)
+        grant_res = dlt.resource(name="polar_benefit_grants", primary_key="id", write_disposition="merge")(benefit_grants)
 
         @dlt.source(name="polar")
         def _source():
@@ -155,12 +188,19 @@ def polar_source(
                 selected.append(sub_res)
             if "products" in resources:
                 selected.append(prod_res)
+            if "benefit_grants" in resources:
+                selected.append(grant_res)
             return selected
 
         return _source()
     else:
-        return {
-            "customers": list(customers()),
-            "subscriptions": list(subscriptions()),
-            "products": list(products())
-        }
+        result = {}
+        if "customers" in resources:
+            result["customers"] = list(customers())
+        if "subscriptions" in resources:
+            result["subscriptions"] = list(subscriptions())
+        if "products" in resources:
+            result["products"] = list(products())
+        if "benefit_grants" in resources:
+            result["benefit_grants"] = list(benefit_grants())
+        return result
