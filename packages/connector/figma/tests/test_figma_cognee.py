@@ -22,7 +22,7 @@ import importlib
 import importlib.util
 import os
 import pathlib
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import cognee
 import pytest
@@ -229,7 +229,7 @@ async def test_unchanged_resync_does_not_call_the_llm_again(clean_environment):
 
 
 @pytest.mark.asyncio
-async def test_a_file_and_its_comments_share_a_node_set(clean_environment):
+async def test_files_and_their_comments_share_one_node_set_per_folder(clean_environment):
     figma = _fake_figma()
     figma.comment("file-a", f"Should {CHARLIE} co-brand the contract screen?")
 
@@ -237,8 +237,32 @@ async def test_a_file_and_its_comments_share_a_node_set(clean_environment):
 
     nodes, _ = await (await get_graph_engine()).get_graph_data()
     node_sets = {props.get("name") for _id, props in nodes if props.get("type") == "NodeSet"}
-    assert "figma:Logistics portal (file-a)" in node_sets
-    assert "figma:Finance prospect (file-b)" in node_sets
+    # Both files and the comment thread are in Design: one node set, not one per file.
+    assert {name for name in node_sets if name and name.startswith("figma:")} == {"figma:Design"}
+
+
+@pytest.mark.asyncio
+async def test_a_sync_cut_short_by_the_budget_keeps_what_it_has(clean_environment):
+    figma = _fake_figma()
+
+    async def sync_with_budget():
+        await cognee.add(
+            figma_source(TOKEN, folder_ids=[DESIGN], max_file_fetches=1, session=figma.session()),
+            dataset_name=DATASET,
+        )
+        await cognee.cognify(datasets=[DATASET])
+
+    await sync_with_budget()
+    first = await _dataset_documents()
+    assert len(first) == 1, "only one node tree fits the budget"
+
+    await sync_with_budget()
+    second = await _dataset_documents()
+    assert set(second) == {"file:file-a", "file:file-b"}
+    # The document from the first run was not forgotten or re-ingested.
+    (kept,) = first
+    assert second[kept] == first[kept]
+    assert await _graph_has(ALPHA) and await _graph_has(BRAVO)
 
 
 @pytest.mark.asyncio
@@ -327,7 +351,7 @@ async def test_expiring_token_is_refreshed_before_use(clean_environment, monkeyp
     monkeypatch.setattr(integration, "_post_token_request", _refresh)
     credential = await _connect(
         token_payload={"access_token": "stale-token", "refresh_token": "refresh-1"},
-        token_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+        token_expires_at=datetime.now(timezone.utc) + timedelta(minutes=1),
     )
 
     assert await integration.access_token_for(credential) == "fresh-token"
@@ -350,7 +374,7 @@ async def test_packaged_example_runs_end_to_end(clean_environment, monkeypatch, 
     monkeypatch.setattr(
         example,
         "figma_source",
-        lambda **kwargs: figma_source(**kwargs, session=figma.session()),
+        lambda *args, **kwargs: figma_source(*args, **kwargs, session=figma.session()),
     )
 
     await example.main()

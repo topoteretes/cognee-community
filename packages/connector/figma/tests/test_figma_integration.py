@@ -7,7 +7,7 @@ are covered end to end in ``test_figma_cognee.py``.
 """
 
 import base64
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -121,7 +121,7 @@ async def test_rejected_code_exchange_fails_without_echoing_the_body(oauth_serve
 
 
 def test_parse_installation_keeps_secrets_out_of_metadata():
-    before = datetime.now(UTC)
+    before = datetime.now(timezone.utc)
     installation = FigmaIntegration().parse_installation(
         {
             "user_id_string": "1234567890",

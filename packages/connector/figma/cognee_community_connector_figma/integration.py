@@ -30,7 +30,7 @@ import asyncio
 import base64
 import logging
 import re
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from typing import Any
 from urllib.parse import urlencode
@@ -43,14 +43,26 @@ from cognee.modules.integrations.base import (
 )
 from cognee.modules.integrations.credentials import (
     decrypt_token_payload,
-    record_sync_result,
     require_active_credential,
     update_refreshed_credential,
+)
+from cognee.modules.integrations.ingestion import (
+    empty_resource,
+    extraction_checkpoint,
+    run_sync,
+    source_counts,
 )
 from cognee.modules.integrations.models.IntegrationCredential import IntegrationCredential
 from pydantic_settings import SettingsConfigDict
 
-from cognee_community_connector_figma.figma import figma_client_config, figma_source, list_folders
+from cognee_community_connector_figma.figma import (
+    DEFAULT_RESOURCE_NAME,
+    comments_table,
+    figma_client_config,
+    figma_source,
+    files_table,
+    list_folders,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -270,11 +282,6 @@ class FigmaIntegration(OAuthIntegration):
 # Sync
 # ---------------------------------------------------------------------------
 
-# One sync per account at a time: overlapping runs would race on the same
-# dlt pipeline state. Process-local, like core's Google syncs; a multi-worker
-# deployment needs a distributed lease instead.
-_running_syncs: set[str] = set()
-
 
 def dataset_name_for_account(label: str, account_id: str = "") -> str:
     """Keep the account's dataset stable and disambiguate slug collisions."""
@@ -284,49 +291,74 @@ def dataset_name_for_account(label: str, account_id: str = "") -> str:
 
 
 async def sync_figma(credential: IntegrationCredential, session: Any = None) -> None:
-    """Sync the account's selected folders into its dataset and record the outcome."""
+    """Sync the account's selected folders into its dataset and record the outcome.
+
+    Goes through core's ``run_sync``, which allows one sync per account at a
+    time and stamps how it went on the connection.
+    """
     from cognee.api.v1.remember.remember import remember
     from cognee.modules.users.methods import get_user
 
-    account_id = str(credential.provider_account_id)
-    if account_id in _running_syncs:
-        logger.info("Figma sync for user %s is already running; skipping.", account_id)
-        return
-    _running_syncs.add(account_id)
-    try:
-        credential = await require_active_credential(credential)
+    async def _sync(
+        credential: IntegrationCredential, counts: dict[str, int]
+    ) -> tuple[str, dict[str, int]]:
         selected = (credential.provider_metadata or {}).get("selected_folder_ids")
-        if selected is None:
-            selection: dict[str, Any] = {"team_ids": configured_team_ids()}
-        elif isinstance(selected, list) and all(
-            isinstance(folder_id, str) and folder_id for folder_id in selected
+        if selected is not None and not (
+            isinstance(selected, list)
+            and all(isinstance(folder_id, str) and folder_id for folder_id in selected)
         ):
-            # An empty list is a real selection: nothing. It still runs, so
-            # the empty snapshot forgets whatever an earlier sync stored.
-            selection = {"folder_ids": selected}
-        else:
             raise ValueError("Figma selection must be a list of folder ids or null")
 
-        token = await access_token_for(credential)
         owner = await get_user(credential.user_id)
+        dataset = FigmaIntegration().dataset_name(credential)
+        if selected == []:
+            await _forget_synced(credential, owner, dataset)
+            return SYNC_STATUS_OK, counts
+
+        source = figma_source(
+            await access_token_for(credential),
+            team_ids=configured_team_ids() if selected is None else None,
+            folder_ids=selected,
+            check_active=extraction_checkpoint(credential),
+            session=session,
+        )
+        try:
+            result = await remember(
+                source, dataset_name=dataset, user=owner, self_improvement=False
+            )
+        finally:
+            # Also when the run raised, so the connection says how far it got
+            # and why it stopped (failed_budget or failed_rate_limit).
+            counts.update(source_counts(source))
+        if counts.get("failed") or getattr(result, "status", None) == "errored":
+            counts["failed"] = max(1, counts.get("failed", 0))
+            return SYNC_STATUS_DEGRADED, counts
+        return SYNC_STATUS_OK, counts
+
+    await run_sync(FIGMA_PROVIDER, credential, _sync)
+
+
+async def _forget_synced(credential: IntegrationCredential, owner: Any, dataset: str) -> None:
+    """Empty both staging tables, so an emptied selection forgets what was synced.
+
+    ``figma_source`` refuses an empty selection (a typo must not purge a
+    dataset), so a deliberately empty one is an explicit replace of each table
+    with nothing, the way core's own integrations retire a deselected scope.
+    """
+    from cognee.api.v1.remember.remember import remember
+
+    for table in (files_table(DEFAULT_RESOURCE_NAME), comments_table(DEFAULT_RESOURCE_NAME)):
         result = await remember(
-            figma_source(token, session=session, **selection),
-            dataset_name=FigmaIntegration().dataset_name(credential),
+            empty_resource(FIGMA_PROVIDER, table, extraction_checkpoint(credential)),
+            dataset_name=dataset,
             user=owner,
+            write_disposition="replace",
+            primary_key="id",
+            max_rows_per_table=0,
             self_improvement=False,
         )
-    except Exception:
-        await record_sync_result(credential, status=SYNC_STATUS_DEGRADED, failed=1)
-        raise
-    finally:
-        _running_syncs.discard(account_id)
-
-    errored = getattr(result, "status", None) == "errored"
-    await record_sync_result(
-        credential,
-        status=SYNC_STATUS_DEGRADED if errored else SYNC_STATUS_OK,
-        failed=1 if errored else 0,
-    )
+        if getattr(result, "status", None) == "errored":
+            raise RuntimeError("Failed to forget the Figma data of an emptied selection")
 
 
 # ---------------------------------------------------------------------------
@@ -345,8 +377,8 @@ async def access_token_for(credential: IntegrationCredential) -> str:
     if expires_at is not None:
         # SQLite stores no timezone; the value is written as UTC.
         if expires_at.tzinfo is None:
-            expires_at = expires_at.replace(tzinfo=UTC)
-        if expires_at - _REFRESH_MARGIN <= datetime.now(UTC):
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at - _REFRESH_MARGIN <= datetime.now(timezone.utc):
             await FigmaIntegration().refresh(credential)
             # refresh() writes through its own session, so the instance we
             # were handed still carries the old ciphertext. Read it back.
@@ -390,4 +422,4 @@ async def _get_me(access_token: str) -> dict[str, Any]:
 def _expires_at(expires_in: Any) -> datetime | None:
     if not expires_in:
         return None
-    return datetime.now(UTC) + timedelta(seconds=int(expires_in))
+    return datetime.now(timezone.utc) + timedelta(seconds=int(expires_in))

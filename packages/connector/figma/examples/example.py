@@ -71,9 +71,14 @@ async def main() -> None:
         return
 
     print("Syncing Figma files and comment threads into cognee ...")
-    # The token comes from the environment. The default write_disposition
-    # ("replace") is what this source expects: each run is a full snapshot.
-    await cognee.remember(figma_source(**selection), dataset_name=DATASET_NAME)
+    # The default write_disposition ("replace") is what this source expects:
+    # each run is a full snapshot.
+    source = figma_source(
+        os.environ.get("FIGMA_ACCESS_TOKEN"),
+        personal_access_token=os.environ.get("FIGMA_PERSONAL_ACCESS_TOKEN"),
+        **selection,
+    )
+    await cognee.remember(source, dataset_name=DATASET_NAME)
 
     answer = await cognee.search(
         query_text="What design decisions were discussed in the comments?",
