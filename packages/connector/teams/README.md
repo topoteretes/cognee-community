@@ -17,9 +17,10 @@ retries).
 
 ## Requirements
 
-Pinned to cognee 1.6.4. The connector relies on document-mode (`DOCUMENT_SOURCE_ATTR`),
-table-scoped document cleanup (`DOCUMENT_SYNC_VERSION`) and per-dataset pipeline state
-(`PIPELINE_SCOPE_ATTR`). `teams_source` raises on a cognee that lacks table-scoped cleanup.
+Needs cognee 1.6.4 or later 1.x (the lockfile pins 1.6.4). The connector relies on
+document-mode (`DOCUMENT_SOURCE_ATTR`), table-scoped document cleanup (`DOCUMENT_SYNC_VERSION`),
+per-dataset pipeline state (`PIPELINE_SCOPE_ATTR`) and `guarded_rows`. `teams_source` raises on a
+cognee that lacks them. Python 3.11 to 3.13.
 
 ## Install
 
@@ -57,8 +58,10 @@ Choose what to ingest:
 
 | Argument | Effect |
 | --- | --- |
-| `team_ids=[...]` | Sync these teams. Omit it to sync every team the app can list (needs `Team.ReadBasic.All`). |
-| `channel_ids=[...]` | Only sync these channels within the selected teams. |
+| `team_ids=[...]` | Sync these teams. Omit it to sync every team the app can list (needs `Team.ReadBasic.All`). An empty list is refused, not read as "every team". |
+| `channel_ids=[...]` | Only sync these channels within the selected teams. An empty list is refused. |
+| `resource_name="teams_threads"` | The dlt table name, which also scopes the sync state. Give each tenant its own name in a shared dataset: a second tenant under the same name is refused. |
+| `check_active=...` | Optional callback a host runs before every request and around every row. It stops the sync by raising. |
 
 Only **standard** channels are read. 1:1 chats, group chats, private channels and shared
 channels are never fetched. See `examples/example.py` for the full flow.
@@ -147,22 +150,32 @@ for the manifest format.
 
   dlt removes tombstoned rows on `merge`. cognee's `orphan_cleanup` then removes them from the
   graph and vector stores.
-- **Failure safety.** Errors are never swallowed: a `401`/`403`, retries exhausted on a
-  `429`/`5xx`, or a network failure. The run aborts before dlt commits the new cursors, so
-  nothing is deleted and the next run retries from the same point. A listing that suddenly
-  returns no channels at all is treated as suspicious and forgets nothing.
+- **Failure safety.** Errors are never swallowed: a `401`, retries exhausted on a `429`/`5xx`,
+  a network failure, a `404` while reading a thread's replies, or Graph repeating a `nextLink`.
+  The run aborts before dlt commits the new cursors, so nothing is deleted and the next run
+  retries from the same point. A listing that suddenly returns no channels at all is treated as
+  suspicious and forgets nothing. A channel the app may not read (`403`) is skipped and kept as it
+  is, so one inaccessible channel does not block the rest. If no selected channel can be read the
+  run fails with a hint about admin consent, so a missing consent never looks like an empty sync.
+- **Throttling.** `429` and `5xx` responses are retried by dlt, honouring `Retry-After`, but each
+  wait is capped at 60 seconds: cognee holds a process-wide lock while a sync runs, so a long
+  backoff must fail the run (the next one resumes) instead of stalling other syncs behind it.
 
 **Limitations.** Graph only reports a deletion while the message stays in the listing with
 `deletedDateTime` set. If a retention policy purges a message outright, its thread stays in
 memory until its channel is removed or you re-sync into a fresh dataset. Threads with no text
-(only images or cards) are not ingested. Use one `teams_source` per tenant per dataset: the
-staging table and the cursors are shared by every team the source reads.
+(only images or cards) are not ingested. Syncing two tenants into one dataset needs a different
+`resource_name` for each, because the table and the cursors belong to the name.
 
 ## Testing
 
 ```bash
-uv run --with pytest --with pytest-asyncio pytest tests/
+uv sync --group dev
+uv run pytest tests/
 ```
+
+CI (`.github/workflows/teams_connector_tests.yml`) runs the same tests on Python 3.11, 3.12 and
+3.13, plus ruff and a wheel build.
 
 The tests need no tenant. Graph is served by an in-memory fake mounted as a `requests`
 transport adapter, so the real dlt OAuth2, `rest_api`, paging and retry code runs. They cover:
@@ -171,7 +184,9 @@ transport adapter, so the real dlt OAuth2, `rest_api`, paging and retry code run
 - the token flow and paging past 50 threads and past the inline reply page
 - the chain-timestamp stop rule (an unchanged channel costs one request)
 - edits, reply deletion, root deletion, channel removal and deselection, and team removal
-- `Retry-After` handling, and safety on a failed walk
+- `Retry-After` handling (capped), safety on a failed walk, an unreadable channel being skipped,
+  a repeated `nextLink`, a missing reply page, and the client secret staying out of errors
+- `resource_name` and selection validation, and a second tenant being refused
 - a real `dlt` merge that proves a tombstone removes the row
 - an end-to-end `cognee.add` + `cognify` run (LLM mocked) proving an unchanged re-sync makes no
   LLM call, an edited thread is replaced and re-extracted, and a deleted thread's entity (the last
