@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<testsuites>
+  <testsuite name="pytest" errors="0" failures="0" skipped="0" tests="2" time="0.008">
+    <testcase classname="search.test_index" name="test_search_splits_words" file="search/test_index.py" line="4" time="0.001"/>
+    <testcase classname="search.test_index" name="test_search_drops_blanks" file="search/test_index.py" line="9" time="0.001"/>
+  </testsuite>
+</testsuites>

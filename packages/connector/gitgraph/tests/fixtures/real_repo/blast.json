@@ -1,0 +1,367 @@
+{
+  "base": "91d76cc690ac35a253651e886a4f0b34d745a232",
+  "changed_files": [
+    "nanochat/common.py"
+  ],
+  "changed_symbols": [
+    "nanochat/common.py::compute_cleanup",
+    "nanochat/common.py::compute_init",
+    "nanochat/common.py::get_dist_info",
+    "nanochat/common.py::is_ddp_initialized",
+    "nanochat/common.py::is_ddp_requested"
+  ],
+  "ci_failures": [],
+  "co_changed": [
+    {
+      "path": "scripts/base_train.py",
+      "shas": [
+        "306bc380ab62b9adb82f71d1c4eb606428329bbd",
+        "722da4f54399ab9b28c04044d1d56b51e19b6f69",
+        "786119d593e808d3f1e0f9c7c13baab63fa80f31",
+        "c6abcdfe3a23f3cc3656e4132a606e8753415fca",
+        "df600b6ed5f9047bf19b75e743b0dbbb1d0bca76"
+      ]
+    },
+    {
+      "path": "scripts/base_eval.py",
+      "shas": [
+        "786119d593e808d3f1e0f9c7c13baab63fa80f31",
+        "c72b8b230966fa072f777c59e1b78eb83e39b3b0",
+        "cf587acb1a51003463c7eda250e95842802b80fd",
+        "df600b6ed5f9047bf19b75e743b0dbbb1d0bca76"
+      ]
+    },
+    {
+      "path": "nanochat/checkpoint_manager.py",
+      "shas": [
+        "c6abcdfe3a23f3cc3656e4132a606e8753415fca",
+        "c72b8b230966fa072f777c59e1b78eb83e39b3b0"
+      ]
+    },
+    {
+      "path": "nanochat/dataloader.py",
+      "shas": [
+        "722da4f54399ab9b28c04044d1d56b51e19b6f69",
+        "c6abcdfe3a23f3cc3656e4132a606e8753415fca"
+      ]
+    },
+    {
+      "path": "nanochat/report.py",
+      "shas": [
+        "c72b8b230966fa072f777c59e1b78eb83e39b3b0",
+        "df600b6ed5f9047bf19b75e743b0dbbb1d0bca76"
+      ]
+    },
+    {
+      "path": "scripts/base_loss.py",
+      "shas": [
+        "786119d593e808d3f1e0f9c7c13baab63fa80f31",
+        "df600b6ed5f9047bf19b75e743b0dbbb1d0bca76"
+      ]
+    },
+    {
+      "path": "tasks/spellingbee.py",
+      "shas": [
+        "8892470f2975d80e6ef8c2f25d72d890beb50398",
+        "c72b8b230966fa072f777c59e1b78eb83e39b3b0"
+      ]
+    },
+    {
+      "path": "dev/runcpu.sh",
+      "shas": [
+        "cf587acb1a51003463c7eda250e95842802b80fd"
+      ]
+    },
+    {
+      "path": "nanochat/engine.py",
+      "shas": [
+        "8892470f2975d80e6ef8c2f25d72d890beb50398"
+      ]
+    },
+    {
+      "path": "nanochat/gpt.py",
+      "shas": [
+        "306bc380ab62b9adb82f71d1c4eb606428329bbd"
+      ]
+    },
+    {
+      "path": "nanochat/loss_eval.py",
+      "shas": [
+        "306bc380ab62b9adb82f71d1c4eb606428329bbd"
+      ]
+    },
+    {
+      "path": "pyproject.toml",
+      "shas": [
+        "306bc380ab62b9adb82f71d1c4eb606428329bbd"
+      ]
+    },
+    {
+      "path": "run1000.sh",
+      "shas": [
+        "cf587acb1a51003463c7eda250e95842802b80fd"
+      ]
+    },
+    {
+      "path": "scripts/chat_eval.py",
+      "shas": [
+        "8892470f2975d80e6ef8c2f25d72d890beb50398"
+      ]
+    },
+    {
+      "path": "scripts/chat_sft.py",
+      "shas": [
+        "8892470f2975d80e6ef8c2f25d72d890beb50398"
+      ]
+    },
+    {
+      "path": "scripts/chat_web.py",
+      "shas": [
+        "c72b8b230966fa072f777c59e1b78eb83e39b3b0"
+      ]
+    },
+    {
+      "path": "scripts/mid_train.py",
+      "shas": [
+        "8892470f2975d80e6ef8c2f25d72d890beb50398"
+      ]
+    },
+    {
+      "path": "speedrun.sh",
+      "shas": [
+        "cf587acb1a51003463c7eda250e95842802b80fd"
+      ]
+    },
+    {
+      "path": "tasks/customjson.py",
+      "shas": [
+        "c72b8b230966fa072f777c59e1b78eb83e39b3b0"
+      ]
+    },
+    {
+      "path": "tests/test_rustbpe.py",
+      "shas": [
+        "c72b8b230966fa072f777c59e1b78eb83e39b3b0"
+      ]
+    },
+    {
+      "path": "uv.lock",
+      "shas": [
+        "306bc380ab62b9adb82f71d1c4eb606428329bbd"
+      ]
+    }
+  ],
+  "computed_from": "rows",
+  "files": [
+    {
+      "file": "nanochat/dataloader.py",
+      "hops": 1,
+      "path": [
+        "nanochat/common.py::get_dist_info",
+        "nanochat/dataloader.py::tokenizing_distributed_data_loader_with_state"
+      ]
+    },
+    {
+      "file": "nanochat/engine.py",
+      "hops": 1,
+      "path": [
+        "nanochat/common.py::compute_init",
+        "nanochat/engine.py"
+      ]
+    },
+    {
+      "file": "nanochat/gpt.py",
+      "hops": 1,
+      "path": [
+        "nanochat/common.py::get_dist_info",
+        "nanochat/gpt.py::GPT.setup_optimizers"
+      ]
+    },
+    {
+      "file": "nanochat/report.py",
+      "hops": 1,
+      "path": [
+        "nanochat/common.py::get_dist_info",
+        "nanochat/report.py::get_report"
+      ]
+    },
+    {
+      "file": "scripts/base_eval.py",
+      "hops": 1,
+      "path": [
+        "nanochat/common.py::compute_cleanup",
+        "scripts/base_eval.py::main"
+      ]
+    },
+    {
+      "file": "scripts/base_loss.py",
+      "hops": 1,
+      "path": [
+        "nanochat/common.py::compute_cleanup",
+        "scripts/base_loss.py"
+      ]
+    },
+    {
+      "file": "scripts/base_train.py",
+      "hops": 1,
+      "path": [
+        "nanochat/common.py::compute_cleanup",
+        "scripts/base_train.py"
+      ]
+    },
+    {
+      "file": "scripts/chat_cli.py",
+      "hops": 1,
+      "path": [
+        "nanochat/common.py::compute_init",
+        "scripts/chat_cli.py"
+      ]
+    },
+    {
+      "file": "scripts/chat_eval.py",
+      "hops": 1,
+      "path": [
+        "nanochat/common.py::get_dist_info",
+        "scripts/chat_eval.py::run_categorical_eval"
+      ]
+    },
+    {
+      "file": "scripts/chat_rl.py",
+      "hops": 1,
+      "path": [
+        "nanochat/common.py::compute_cleanup",
+        "scripts/chat_rl.py"
+      ]
+    },
+    {
+      "file": "scripts/chat_sft.py",
+      "hops": 1,
+      "path": [
+        "nanochat/common.py::compute_cleanup",
+        "scripts/chat_sft.py"
+      ]
+    },
+    {
+      "file": "scripts/chat_web.py",
+      "hops": 1,
+      "path": [
+        "nanochat/common.py::compute_init",
+        "scripts/chat_web.py"
+      ]
+    },
+    {
+      "file": "scripts/mid_train.py",
+      "hops": 1,
+      "path": [
+        "nanochat/common.py::compute_cleanup",
+        "scripts/mid_train.py"
+      ]
+    },
+    {
+      "file": "scripts/tok_eval.py",
+      "hops": 2,
+      "path": [
+        "nanochat/common.py::get_dist_info",
+        "nanochat/report.py::get_report",
+        "scripts/tok_eval.py"
+      ]
+    },
+    {
+      "file": "scripts/tok_train.py",
+      "hops": 2,
+      "path": [
+        "nanochat/common.py::get_dist_info",
+        "nanochat/report.py::get_report",
+        "scripts/tok_train.py"
+      ]
+    }
+  ],
+  "head": "2f2d7ab80cd07a8b5fab9feebcb185fd3ca37339",
+  "max_hops": 4,
+  "services": [
+    {
+      "hops": 1,
+      "name": "scripts",
+      "path": [
+        "nanochat/common.py::compute_cleanup",
+        "scripts/base_eval.py::main"
+      ]
+    }
+  ],
+  "symbols": [
+    {
+      "file": "nanochat/dataloader.py",
+      "hops": 2,
+      "id": "nanochat/dataloader.py::tokenizing_distributed_data_loader",
+      "path": [
+        "nanochat/common.py::get_dist_info",
+        "nanochat/dataloader.py::tokenizing_distributed_data_loader_with_state",
+        "nanochat/dataloader.py::tokenizing_distributed_data_loader"
+      ]
+    },
+    {
+      "file": "nanochat/dataloader.py",
+      "hops": 1,
+      "id": "nanochat/dataloader.py::tokenizing_distributed_data_loader_with_state",
+      "path": [
+        "nanochat/common.py::get_dist_info",
+        "nanochat/dataloader.py::tokenizing_distributed_data_loader_with_state"
+      ]
+    },
+    {
+      "file": "nanochat/gpt.py",
+      "hops": 1,
+      "id": "nanochat/gpt.py::GPT.setup_optimizers",
+      "path": [
+        "nanochat/common.py::get_dist_info",
+        "nanochat/gpt.py::GPT.setup_optimizers"
+      ]
+    },
+    {
+      "file": "nanochat/report.py",
+      "hops": 1,
+      "id": "nanochat/report.py::get_report",
+      "path": [
+        "nanochat/common.py::get_dist_info",
+        "nanochat/report.py::get_report"
+      ]
+    },
+    {
+      "file": "scripts/base_eval.py",
+      "hops": 1,
+      "id": "scripts/base_eval.py::main",
+      "path": [
+        "nanochat/common.py::compute_cleanup",
+        "scripts/base_eval.py::main"
+      ]
+    },
+    {
+      "file": "scripts/chat_eval.py",
+      "hops": 1,
+      "id": "scripts/chat_eval.py::run_categorical_eval",
+      "path": [
+        "nanochat/common.py::get_dist_info",
+        "scripts/chat_eval.py::run_categorical_eval"
+      ]
+    },
+    {
+      "file": "scripts/chat_eval.py",
+      "hops": 2,
+      "id": "scripts/chat_eval.py::run_chat_eval",
+      "path": [
+        "nanochat/common.py::get_dist_info",
+        "scripts/chat_eval.py::run_categorical_eval",
+        "scripts/chat_eval.py::run_chat_eval"
+      ]
+    },
+    {
+      "file": "scripts/chat_eval.py",
+      "hops": 1,
+      "id": "scripts/chat_eval.py::run_generative_eval",
+      "path": [
+        "nanochat/common.py::get_dist_info",
+        "scripts/chat_eval.py::run_generative_eval"
+      ]
+    }
+  ]
+}
