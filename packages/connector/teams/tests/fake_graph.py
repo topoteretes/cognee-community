@@ -40,6 +40,10 @@ class FakeGraph(BaseAdapter):
         self.threads: dict[tuple[str, str], dict[str, dict]] = {}
         self.requests: list[tuple[str, str]] = []
         self.token_requests = 0
+        # Serve a nextLink that points back at the same page, as a buggy server might.
+        self.repeat_next_link = False
+        # Answer the token request with this status instead of a token.
+        self.token_status = 200
         # (path substring, status, headers): served once instead of the real
         # response, to simulate throttling or outages.
         self.failures: list[tuple[str, int, dict]] = []
@@ -124,6 +128,8 @@ class FakeGraph(BaseAdapter):
 
         if url.hostname == LOGIN_HOST:
             self.token_requests += 1
+            if self.token_status != 200:
+                return self._json(request, self.token_status, {"error": "invalid_client"})
             body = parse_qs(request.body if isinstance(request.body, str) else "")
             assert body.get("grant_type") == ["client_credentials"]
             assert body.get("scope") == ["https://graph.microsoft.com/.default"]
@@ -176,7 +182,9 @@ class FakeGraph(BaseAdapter):
         ordered = sorted(threads.values(), key=_chain_modified, reverse=True)
         page = ordered[offset : offset + top]
         body = {"value": [self._root_view(team_id, channel_id, root) for root in page]}
-        if offset + top < len(ordered):
+        if self.repeat_next_link and ordered:
+            body["@odata.nextLink"] = request.url
+        elif offset + top < len(ordered):
             params = urlencode({"$top": top, "$expand": "replies", "$skiptoken": offset + top})
             body["@odata.nextLink"] = (
                 f"{GRAPH_ROOT}/teams/{team_id}/channels/{channel_id}/messages?{params}"

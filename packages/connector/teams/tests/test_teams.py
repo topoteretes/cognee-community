@@ -169,20 +169,40 @@ def test_build_document_data_item_tags_source():
     assert item.data.startswith("# General: Kickoff")
 
 
-def test_teams_source_declares_document_marker_and_tenant_scope():
+def test_teams_source_declares_document_marker_and_scopes_state_by_resource_name():
     from cognee.tasks.ingestion.dlt_utils import (
         PIPELINE_SCOPE_ATTR,
         document_source_tag,
         pipeline_name_for_source,
     )
 
-    source = teams_source("tenant", "client", "secret", team_ids=[TEAM])
+    default = teams_source("tenant", "client", "secret", team_ids=[TEAM])
+    named = teams_source("tenant", "client", "secret", team_ids=[TEAM], resource_name="teams_acme")
 
-    assert document_source_tag(source) == "teams"
+    assert document_source_tag(default) == "teams"
+    # The scope is the resource (table) name, so emptying the resource by name
+    # resolves to the same dlt pipeline that synced it.
+    assert getattr(default, PIPELINE_SCOPE_ATTR) == default.name == "teams_threads"
+    assert getattr(named, PIPELINE_SCOPE_ATTR) == named.name == "teams_acme"
     # Cursors get a pipeline of their own per dataset, not the shared default.
-    assert getattr(source, PIPELINE_SCOPE_ATTR) == "teams:tenant"
-    assert pipeline_name_for_source(source, "teams") != pipeline_name_for_source(source, "other")
-    assert pipeline_name_for_source(source, "teams") != "ingest_dlt_source"
+    assert pipeline_name_for_source(default, "teams") != pipeline_name_for_source(default, "other")
+    assert pipeline_name_for_source(default, "teams") != "ingest_dlt_source"
+    assert pipeline_name_for_source(default, "teams") != pipeline_name_for_source(named, "teams")
+
+
+@pytest.mark.parametrize("name", ["", "Teams", "teams-acme", "x" * 65, None])
+def test_resource_name_must_be_a_stable_snake_case_name(name):
+    with pytest.raises(ValueError, match="resource_name"):
+        teams_source("tenant", "client", "secret", resource_name=name)
+
+
+def test_empty_selections_are_refused_instead_of_meaning_everything():
+    with pytest.raises(ValueError, match="team_ids must not be empty"):
+        teams_source("tenant", "client", "secret", team_ids=[])
+    with pytest.raises(ValueError, match="channel_ids must not be empty"):
+        teams_source("tenant", "client", "secret", channel_ids=[])
+    # A lone id is accepted as a one-item list.
+    assert teams_source("tenant", "client", "secret", team_ids=TEAM).name == "teams_threads"
 
 
 def test_credentials_fall_back_to_env_and_are_required(monkeypatch):
@@ -416,11 +436,115 @@ def test_failed_walk_keeps_the_channel_cursor(graph):
     before = dict(state["channels"][f"{TEAM}:{GENERAL}"])
 
     graph.post(TEAM, GENERAL, "new")
-    graph.fail_once(f"{GENERAL}/messages", 403)
-    with pytest.raises(Exception, match="403"):
+    graph.fail_once(f"{GENERAL}/messages", 503)
+    with pytest.raises(Exception, match="503"):
         _sync(graph, state, channel_ids={GENERAL})
 
     assert state["channels"][f"{TEAM}:{GENERAL}"] == before
+
+
+def test_an_unreadable_channel_is_skipped_and_kept_while_the_rest_sync(graph):
+    general = graph.post(TEAM, GENERAL, "general topic")
+    random = graph.post(TEAM, RANDOM, "random topic")
+    state = {}
+    _sync(graph, state)
+    general_entry = dict(state["channels"][f"{TEAM}:{GENERAL}"])
+
+    new_random = graph.post(TEAM, RANDOM, "later random topic")
+    graph.fail_once(f"{GENERAL}/messages", 403)
+    rows = _sync(graph, state)
+
+    # Random synced; General kept exactly as it was, with nothing forgotten.
+    assert _thread_id(RANDOM, new_random) in _live(rows)
+    assert _tombstones(rows) == set()
+    assert state["channels"][f"{TEAM}:{GENERAL}"] == general_entry
+    assert state["channels"][f"{TEAM}:{GENERAL}"]["threads"] == [general]
+    assert random in state["channels"][f"{TEAM}:{RANDOM}"]["threads"]
+
+
+def test_run_fails_when_no_selected_channel_is_readable(graph):
+    graph.post(TEAM, GENERAL, "a")
+    graph.post(TEAM, RANDOM, "b")
+    graph.fail_once(f"{GENERAL}/messages", 403)
+    graph.fail_once(f"{RANDOM}/messages", 403)
+
+    # A missing admin consent must not look like a successful, empty sync.
+    with pytest.raises(RuntimeError, match="admin consent"):
+        _sync(graph, {})
+
+
+def test_a_repeated_next_link_fails_instead_of_looping_forever(graph):
+    for i in range(3):
+        graph.post(TEAM, GENERAL, f"message {i}")
+    graph.repeat_next_link = True
+
+    with pytest.raises(RuntimeError, match="same nextLink twice"):
+        _sync(graph, {}, channel_ids={GENERAL})
+
+
+def test_a_missing_reply_page_fails_instead_of_truncating_the_thread(graph):
+    graph.inline_reply_limit = 2
+    root = graph.post(TEAM, GENERAL, "big thread")
+    for i in range(5):
+        graph.reply(TEAM, GENERAL, root, f"reply {i}")
+    graph.fail_once("/replies", 404)
+
+    # Skipping the 404 would load the thread with only its first replies.
+    with pytest.raises(Exception, match="404"):
+        _sync(graph, {}, channel_ids={GENERAL})
+
+
+def test_check_active_runs_before_every_request_and_can_stop_the_sync(graph):
+    graph.post(TEAM, GENERAL, "a")
+    calls = []
+    config = graph_client_config("tenant", "client", "secret", session=graph.session())
+    channels = list_channels(config, [TEAM], None, check_active=lambda: calls.append("list"))
+    list(sync_threads(graph_rest_client(config), channels, {}, lambda: calls.append("walk")))
+    assert calls.count("list") >= 2
+    assert calls.count("walk") >= len(graph.message_requests())
+
+    def revoked():
+        raise RuntimeError("access revoked")
+
+    graph.requests.clear()
+    with pytest.raises(RuntimeError, match="access revoked"):
+        list(sync_threads(graph_rest_client(config), channels, {}, revoked))
+    assert graph.requests == []  # stopped before the first Graph request
+
+
+def test_default_session_caps_a_long_retry_after(graph, monkeypatch):
+    from cognee_community_connector_teams.graph import MAX_RETRY_DELAY_SECONDS
+
+    waits = []
+    monkeypatch.setattr("tenacity.nap.time.sleep", waits.append)
+    graph.post(TEAM, GENERAL, "c")
+    graph.fail_once("/channels", 429, {"Retry-After": "3600"})
+    config = graph_client_config("tenant", "client", "secret")  # the default session
+    graph.mount_on(config["session"])
+
+    channels = list_channels(config, [TEAM], {GENERAL})
+
+    assert [channel["id"] for channel in channels] == [GENERAL]
+    # An hour-long Retry-After becomes a short wait; cognee holds a process-wide
+    # lock while a sync runs, so it must not stall behind Graph's backoff.
+    assert waits == [MAX_RETRY_DELAY_SECONDS]
+
+
+def test_a_failed_token_request_does_not_leak_the_client_secret(graph):
+    graph.token_status = 401
+    secret = "s3cr3t-do-not-log-me"
+    config = graph_client_config("tenant", "client", secret, session=graph.session())
+
+    with pytest.raises(Exception) as excinfo:
+        list_channels(config, [TEAM])
+
+    error = excinfo.value
+    chain = []
+    while error is not None:
+        chain.append(f"{error!r} {error}")
+        error = error.__cause__ or error.__context__
+    assert "401" in " ".join(chain)
+    assert secret not in " ".join(chain)
 
 
 def test_throttled_requests_are_retried_with_retry_after(graph):
@@ -506,6 +630,25 @@ def test_replace_runs_fall_back_to_full_snapshots(graph, tmp_path):
     # and loads a complete snapshot: unchanged threads stay, deleted ones drop.
     assert set(_read_threads(pipeline)) == {_thread_id(GENERAL, keep)}
     assert len(graph.message_requests()) == 2
+
+
+def test_a_second_tenant_under_the_same_resource_name_is_refused(graph, tmp_path):
+    graph.post(TEAM, GENERAL, "c")
+    pipeline = _pipeline(tmp_path)
+    _run(pipeline, graph)
+
+    other = teams_source(
+        "other-tenant", "client", "secret", team_ids=[TEAM], session=graph.session()
+    )
+    with pytest.raises(Exception, match="another tenant"):
+        pipeline.run(other)
+
+    # Its own resource_name gives it its own table and cursors.
+    separate = teams_source(
+        "other-tenant", "client", "secret", team_ids=[TEAM],
+        resource_name="teams_other", session=graph.session(),
+    )  # fmt: skip
+    pipeline.run(separate)
 
 
 def test_failed_run_keeps_cursor_so_the_next_run_catches_up(graph, tmp_path):

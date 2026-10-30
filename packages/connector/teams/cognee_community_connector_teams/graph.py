@@ -15,14 +15,17 @@ declarative resources cannot express.
 * **Paging**: Graph returns the next page as an absolute ``@odata.nextLink``
   URL in the body. ``JSONLinkPaginator`` follows it and drops the original
   query params, which the link already carries.
-* **Retries**: dlt's default HTTP session retries 429 and 5xx responses and
-  honours Graph's ``Retry-After`` header, so throttling is handled without
-  extra code.
+* **Retries**: dlt's retrying session retries 429 and 5xx responses and
+  honours Graph's ``Retry-After`` header. Each wait is capped at
+  ``MAX_RETRY_DELAY_SECONDS``: cognee holds a process-wide dlt lock while a
+  sync runs, so a long ``Retry-After`` must fail the run (the next run resumes
+  from the same cursors) rather than stall every other sync behind it.
 """
 
 import os
 from typing import Any
 
+from dlt.sources.helpers.requests import Client
 from dlt.sources.helpers.rest_client import RESTClient
 from dlt.sources.helpers.rest_client.auth import OAuth2ClientCredentials
 from dlt.sources.helpers.rest_client.paginators import JSONLinkPaginator
@@ -40,6 +43,9 @@ GRAPH_DATA_SELECTOR = "value"
 TENANT_ID_ENV = "MS_GRAPH_TENANT_ID"
 CLIENT_ID_ENV = "MS_GRAPH_CLIENT_ID"
 CLIENT_SECRET_ENV = "MS_GRAPH_CLIENT_SECRET"
+
+# Longest single wait on a 429/5xx retry; dlt retries up to 5 times.
+MAX_RETRY_DELAY_SECONDS = 60
 
 _TOKEN_URL = "https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
 
@@ -86,14 +92,18 @@ def graph_client_config(
         client_secret: Client secret value. Falls back to
             ``MS_GRAPH_CLIENT_SECRET``.
         session: ``requests`` session used for both the token request and the
-            Graph calls (mainly a test-injection point). When omitted, dlt's
-            retrying session is used.
+            Graph calls (mainly a test-injection point). When omitted, a dlt
+            retrying session with a capped ``Retry-After`` wait is used.
 
     Returns:
         A dict usable as ``RESTAPIConfig["client"]`` or with
         :func:`graph_rest_client`.
     """
     tenant_id, client_id, client_secret = graph_credentials(tenant_id, client_id, client_secret)
+    if session is None:
+        session = Client(
+            raise_for_status=False, request_max_retry_delay=MAX_RETRY_DELAY_SECONDS
+        ).session
 
     auth = OAuth2ClientCredentials(
         access_token_url=_TOKEN_URL.format(tenant_id=tenant_id),
@@ -106,9 +116,8 @@ def graph_client_config(
         "base_url": GRAPH_BASE_URL,
         "auth": auth,
         "paginator": JSONLinkPaginator(next_url_path=GRAPH_NEXT_LINK_PATH),
+        "session": session,
     }
-    if session is not None:
-        config["session"] = session
     return config
 
 

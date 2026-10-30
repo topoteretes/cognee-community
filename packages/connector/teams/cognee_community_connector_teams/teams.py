@@ -48,14 +48,16 @@ Design
   tombstoned; archived channels stay listed and keep their threads. dlt
   removes the rows on ``merge``, and cognee's ``orphan_cleanup`` then forgets
   them from the graph and vector stores.
-* **Failure safety**: errors (401/403, exhausted 429/5xx retries, network) are
-  not swallowed. They abort the run before dlt commits the new cursors, so
-  nothing is deleted and the next run retries from the same point.
+* **Failure safety**: errors (401, exhausted 429/5xx retries, network, a
+  repeated ``nextLink``) are not swallowed. They abort the run before dlt
+  commits the new cursors, so nothing is deleted and the next run retries from
+  the same point. A channel answering 403 is skipped and kept as it is; if
+  every channel does, the run fails.
 """
 
 import html
 import re
-from collections.abc import Generator, Iterator
+from collections.abc import Callable, Generator, Iterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -63,8 +65,10 @@ import dlt
 from cognee.shared.logging_utils import get_logger
 from cognee.tasks.ingestion import dlt_utils
 from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
+from dlt.common.normalizers.naming.snake_case import NamingConvention
 from dlt.sources.rest_api import rest_api_resources
 from dlt.sources.rest_api.config_setup import create_response_hooks
+from requests import HTTPError
 
 from cognee_community_connector_teams.graph import (
     GRAPH_DATA_SELECTOR,
@@ -108,9 +112,11 @@ def teams_source(
     *,
     team_ids: list[str] | None = None,
     channel_ids: list[str] | None = None,
+    resource_name: str = TEAMS_TABLE_NAME,
+    check_active: Callable[[], None] | None = None,
     session: Any = None,
 ):
-    """Create a dlt source that yields Teams channel threads as documents.
+    """Create a dlt resource that yields Teams channel threads as documents.
 
     Args:
         tenant_id: Directory (tenant) id of the Entra ID app registration.
@@ -119,25 +125,39 @@ def teams_source(
         client_secret: Client secret value. Falls back to
             ``MS_GRAPH_CLIENT_SECRET``.
         team_ids: Teams to ingest. When omitted, every team the app can list
-            is synced (needs ``Team.ReadBasic.All``).
+            is synced (needs ``Team.ReadBasic.All``). Must not be empty.
         channel_ids: Restrict ingestion to these channel ids within the
             selected teams. A channel dropped from this list is forgotten on
-            the next sync.
+            the next sync. Must not be empty.
+        resource_name: dlt resource (table) name, which also scopes the sync
+            state. Give each tenant its own name in a shared dataset: a second
+            tenant under the same name is refused.
+        check_active: Optional host authorization checkpoint, called before
+            every request and around every row; it stops the sync by raising.
         session: ``requests`` session for the token and Graph calls (mainly a
-            test-injection point); when omitted dlt's retrying session is used.
+            test-injection point); when omitted a dlt retrying session with a
+            capped ``Retry-After`` wait is used.
 
     Returns:
-        A dlt source for ``cognee.remember(..., write_disposition="merge")``.
+        A dlt resource for ``cognee.remember(..., write_disposition="merge")``.
     """
-    if getattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 0) < 1:
-        raise RuntimeError("Teams sync requires cognee>=1.6.3 (table-scoped document cleanup).")
+    if getattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 0) < 1 or not (
+        hasattr(dlt_utils, "PIPELINE_SCOPE_ATTR") and hasattr(dlt_utils, "guarded_rows")
+    ):
+        raise RuntimeError(
+            "The Teams connector needs table-scoped document cleanup, "
+            "PIPELINE_SCOPE_ATTR and guarded_rows (cognee>=1.6.4)."
+        )
+    _check_resource_name(resource_name)
+    team_ids = _check_ids("team_ids", team_ids)
+    channel_ids = _check_ids("channel_ids", channel_ids)
 
     tenant_id, client_id, client_secret = graph_credentials(tenant_id, client_id, client_secret)
     client_config = graph_client_config(tenant_id, client_id, client_secret, session=session)
     selected_channels = set(channel_ids) if channel_ids else None
 
     @dlt.resource(
-        name=TEAMS_TABLE_NAME,
+        name=resource_name,
         primary_key="id",
         write_disposition="merge",
         # _deleted is a boolean hard-delete marker: rows where it is True are
@@ -146,24 +166,48 @@ def teams_source(
         columns={"_deleted": {"data_type": "bool", "hard_delete": True}},
     )
     def teams_threads():
-        channels = list_channels(client_config, team_ids, selected_channels)
-        yield from sync_threads(
-            graph_rest_client(client_config), channels, dlt.current.resource_state()
-        )
+        state = dlt.current.resource_state()
+        if state.setdefault("tenant_id", tenant_id) != tenant_id:
+            raise ValueError(
+                f"resource_name {resource_name!r} already syncs another tenant; "
+                "give each tenant its own resource_name."
+            )
+        channels = list_channels(client_config, team_ids, selected_channels, check_active)
+        rows = sync_threads(graph_rest_client(client_config), channels, state, check_active)
+        yield from dlt_utils.guarded_rows(rows, check_active)
 
-    @dlt.source(name=TEAMS_SOURCE_NAME)
-    def _teams():
-        return teams_threads
-
-    source = _teams()
+    resource = teams_threads()
     # Opt into the document ingestion path (thread → text document → cognify).
     # resolve_dlt_sources reads this marker; it never imports this connector.
-    setattr(source, DOCUMENT_SOURCE_ATTR, TEAMS_SOURCE_NAME)
-    # Keep the per-channel cursors in a pipeline of their own, so syncing into
-    # two datasets in turn does not restore one dataset's cursors into the other.
-    # One source per tenant per dataset: the staging table name is fixed.
-    setattr(source, dlt_utils.PIPELINE_SCOPE_ATTR, f"{TEAMS_SOURCE_NAME}:{tenant_id}")
-    return source
+    setattr(resource, DOCUMENT_SOURCE_ATTR, TEAMS_SOURCE_NAME)
+    # Give the cursors a dlt pipeline of their own, so syncing into two datasets
+    # (or two tenants) in turn does not restore one's cursors into the other.
+    setattr(resource, dlt_utils.PIPELINE_SCOPE_ATTR, resource_name)
+    return resource
+
+
+def _check_resource_name(name: Any) -> None:
+    """A non-empty name of at most 64 characters that dlt keeps as it is.
+
+    It names the table and scopes the state: an empty name would lose that
+    scope, and two names dlt normalizes alike would share a table.
+    """
+    if not isinstance(name, str) or not name:
+        raise ValueError("resource_name must be a non-empty string")
+    if len(name) > 64:
+        raise ValueError("resource_name must be at most 64 characters")
+    if NamingConvention().normalize_table_identifier(name) != name:
+        raise ValueError("resource_name must be lowercase snake_case (letters, digits, _)")
+
+
+def _check_ids(label: str, ids: list[str] | str | None) -> list[str] | None:
+    """Accept one id or a list; an empty selection is refused, not read as "all"."""
+    if ids is None:
+        return None
+    ids = [ids] if isinstance(ids, str) else list(ids)
+    if not ids:
+        raise ValueError(f"{label} must not be empty; omit it to sync everything")
+    return ids
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +219,7 @@ def list_channels(
     client_config: dict[str, Any],
     team_ids: list[str] | None,
     channel_ids: set[str] | None = None,
+    check_active: Callable[[], None] | None = None,
 ) -> list[dict]:
     """Return the standard channels of the selected teams via dlt's ``rest_api``.
 
@@ -217,28 +262,62 @@ def list_channels(
             },
         ],
     }
+    if check_active is not None:
+        check_active()
     resources = {resource.name: resource for resource in rest_api_resources(config)}
-    channels = list(resources["channels"])
+    channels = []
+    for channel in resources["channels"]:
+        if check_active is not None:
+            check_active()
+        channels.append(channel)
     if channel_ids is not None:
         channels = [channel for channel in channels if channel.get("id") in channel_ids]
     return channels
 
 
-def _walk_channel(client, team_id: str, channel_id: str) -> Iterator[tuple[dict, list[dict]]]:
+def _paginate(
+    client, path_or_url: str, check_active: Callable[[], None] | None = None, **kwargs: Any
+) -> Iterator[Any]:
+    """Yield the pages of a Graph collection, one request at a time.
+
+    ``check_active`` runs before every request. A ``nextLink`` seen twice means
+    the paginator would loop forever, so it fails the run instead.
+    """
+    pages = client.paginate(path_or_url, **kwargs)
+    seen: set[str] = set()
+    while True:
+        if check_active is not None:
+            check_active()
+        page = next(pages, None)
+        if page is None:
+            return
+        yield page
+        if page.paginator.has_next_page:
+            link = page.request.url
+            if link in seen:
+                raise RuntimeError(f"Graph returned the same nextLink twice: {link}")
+            seen.add(link)
+
+
+def _walk_channel(
+    client, team_id: str, channel_id: str, check_active: Callable[[], None] | None = None
+) -> Iterator[tuple[dict, list[dict]]]:
     """Yield ``(root, replies)`` for a channel's threads, newest chain first.
 
     Pages are fetched lazily, so a caller that stops iterating stops paging.
     Replies past the inline page (``replies@odata.nextLink``) are fetched
     before the thread is yielded, so the caller always sees the whole thread.
+    A 404 on the channel ends its walk (it vanished), but a 404 while reading
+    replies is an error: skipping it would render the thread without them.
     """
     path = f"teams/{team_id}/channels/{channel_id}/messages"
     params = {"$top": _PAGE_SIZE, "$expand": "replies"}
-    for page in client.paginate(path, params=params, hooks=_IGNORE_NOT_FOUND):
+    for page in _paginate(client, path, check_active, params=params, hooks=_IGNORE_NOT_FOUND):
         for root in page:
             replies = list(root.get("replies") or [])
             next_link = root.get("replies@odata.nextLink")
             if next_link:
-                for reply_page in client.paginate(next_link, hooks=_IGNORE_NOT_FOUND):
+                for reply_page in _paginate(client, next_link, check_active):
                     replies.extend(reply_page)
             yield root, replies
 
@@ -248,21 +327,49 @@ def _walk_channel(client, team_id: str, channel_id: str) -> Iterator[tuple[dict,
 # ---------------------------------------------------------------------------
 
 
-def sync_threads(client, channels: list[dict], state: dict) -> Iterator[dict[str, Any]]:
+def sync_threads(
+    client,
+    channels: list[dict],
+    state: dict,
+    check_active: Callable[[], None] | None = None,
+) -> Iterator[dict[str, Any]]:
     """Yield changed threads since the last run, plus hard-delete markers.
 
     ``state["channels"]`` maps ``<team>:<channel>`` to that channel's cursor
     and the root ids of the threads it contributed. A channel's entry is only
     replaced after its walk finishes, and dlt only commits the state when the
     whole run loads, so a failed run leaves every cursor where it was.
+
+    A channel the app may not read (HTTP 403) is skipped and kept as it is, so
+    one inaccessible channel does not block the rest. If no channel can be
+    read the run fails, so a missing admin consent is not mistaken for success.
     """
     known: dict[str, dict] = state.setdefault("channels", {})
     current: set[str] = set()
+    skipped = 0
 
     for channel in channels:
         key = _channel_key(channel["_teams_id"], channel["id"])
         current.add(key)
-        known[key] = yield from _sync_channel(client, channel, known.get(key) or {})
+        try:
+            known[key] = yield from _sync_channel(
+                client, channel, known.get(key) or {}, check_active
+            )
+        except HTTPError as exc:
+            if exc.response is None or exc.response.status_code != 403:
+                raise
+            skipped += 1
+            logger.warning(
+                "Teams: the app cannot read channel %s (HTTP 403); keeping what it "
+                "contributed and moving on.",
+                channel.get("displayName") or key,
+            )
+
+    if channels and skipped == len(channels):
+        raise RuntimeError(
+            "Teams: the app cannot read any of the selected channels (HTTP 403). "
+            "Check that admin consent was granted for ChannelMessage.Read.All."
+        )
 
     vanished = set(known) - current
     if vanished and not current:
@@ -287,7 +394,9 @@ def sync_threads(client, channels: list[dict], state: dict) -> Iterator[dict[str
             yield _deleted_row(_thread_id(entry["team_id"], entry["channel_id"], root_id))
 
 
-def _sync_channel(client, channel: dict, entry: dict) -> Generator[dict, None, dict]:
+def _sync_channel(
+    client, channel: dict, entry: dict, check_active: Callable[[], None] | None = None
+) -> Generator[dict, None, dict]:
     """Walk one channel back to its cursor, yielding rows; return its new entry.
 
     The entry is returned (not written to state here) so the caller only
@@ -303,7 +412,7 @@ def _sync_channel(client, channel: dict, entry: dict) -> Generator[dict, None, d
     newest = cursor
     changed = deleted = 0
 
-    for root, replies in _walk_channel(client, team_id, channel_id):
+    for root, replies in _walk_channel(client, team_id, channel_id, check_active):
         chain_time = _chain_time(root, replies)
         if stop_before and chain_time and chain_time < stop_before:
             # Threads are sorted by chain time, so the rest are older still.
