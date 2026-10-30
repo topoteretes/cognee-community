@@ -1,0 +1,20 @@
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+name = "cognee-community-connector-intercom"
+version = "0.1.0"
+description = "Intercom connector for cognee"
+authors = ["WeMakeDevs <wemakedevs@example.com>"]
+readme = "README.md"
+packages = [{include = "cognee_community_connector_intercom"}]
+
+[tool.poetry.dependencies]
+python = ">=3.10,<3.15"
+dlt = "*"
+requests = "*"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.3.3"
+pytest-asyncio = "^0.24.0"
