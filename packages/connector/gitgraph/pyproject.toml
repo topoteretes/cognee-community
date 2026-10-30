@@ -9,7 +9,11 @@ dependencies = [
   "cognee>=1.6.5,<2",
   "dlt[sqlalchemy]>=1.16,<2",
   "GitPython>=3.1,<4",
+  "networkx>=3,<4",
 ]
+
+[project.scripts]
+cognee-gitgraph = "cognee_community_connector_gitgraph.cli:main"
 
 [dependency-groups]
 dev = ["pytest>=8,<9", "pytest-asyncio>=1,<2", "ruff>=0.13,<1"]

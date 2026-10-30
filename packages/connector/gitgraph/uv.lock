@@ -620,6 +620,8 @@ dependencies = [
     { name = "cognee" },
     { name = "dlt", extra = ["sqlalchemy"] },
     { name = "gitpython" },
+    { name = "networkx", version = "3.6.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "networkx", version = "3.7", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
 ]
 
 [package.dev-dependencies]
@@ -634,6 +636,7 @@ requires-dist = [
     { name = "cognee", specifier = ">=1.6.5,<2" },
     { name = "dlt", extras = ["sqlalchemy"], specifier = ">=1.16,<2" },
     { name = "gitpython", specifier = ">=3.1,<4" },
+    { name = "networkx", specifier = ">=3,<4" },
 ]
 
 [package.metadata.requires-dev]

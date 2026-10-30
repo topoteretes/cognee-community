@@ -1,6 +1,6 @@
 # GitGraph connector for Cognee
 
-Load a git repository into Cognee's graph: commits, file changes, Python symbols and references, and CI test failures from JUnit XML.
+Load a git repository into Cognee's graph: commits, file changes, Python symbols and references, and CI test failures from JUnit XML. From that data it computes the blast radius of a pull request: which functions call the code you changed, how many hops away they are, which top-level services they live in, and which CI failures belong to those services.
 
 Nothing here calls an LLM. The rows are extracted from git, Python's `ast` module and JUnit XML, and they are loaded as a relational manifest: each table row becomes a node linked to its table node, with no per-row text to embed or summarise. That keeps a sync deterministic, cheap and key-free. Cognee's own ingestion still runs its local embedding model and graph extraction step, which need no API key but download local models on the first run.
 
@@ -71,6 +71,30 @@ Every table uses dlt's `replace` write disposition with `id` as the primary key,
 
 To drop a dataset, use `cognee.forget(dataset="gitgraph")`.
 
+## Blast radius
+
+`blast_radius(tables, changed, max_hops=4)` is a pure function over the extracted rows (graph traversal with NetworkX, no LLM). `tables` maps a table name to its rows, for example from `extract_commits` and `extract_symbols`, and `changed` is a list of repo paths (every symbol in the file changes), `path:line` items or `path:start-end` line ranges (the innermost symbols the range overlaps). It returns JSON-serialisable data with `changed_files`, `changed_symbols`, `symbols`, `files`, `services`, `co_changed` and `ci_failures`, every list sorted.
+
+## CLI
+
+The package installs a `cognee-gitgraph` command:
+
+```bash
+cognee-gitgraph blast --repo PATH --base REF --head REF [--ci FILE_OR_DIR]... [--hops N] [--json] [--remember] [--verbose] [--html PATH]
+cognee-gitgraph demo [--json] [--verbose] [--html PATH]
+```
+
+- `--ci` may be repeated; each is a JUnit XML file or a directory of them.
+- `--hops` is how many caller hops to follow (default 4).
+- `--json` prints the result as JSON instead of the text report.
+- `--remember` also loads the repo into Cognee (with `self_improvement=False`) and links the rows, using one dataset per head commit named `gitgraph-<first 12 characters of the head sha>`. Cognee's progress output is hidden unless `--verbose` is given.
+- `--html PATH` also writes a self-contained 3D page of the blast radius: red nodes are the changed symbols, amber nodes are at risk, grey nodes are safe. The 3d-force-graph library (MIT) is inlined from `cognee_community_connector_gitgraph/vendor/`, so the page makes no network request.
+- The diff is `base...head`. Symbols are read from `head`; history is read from both refs. A symbol counts as changed when one of the diff's changed line ranges on `head` overlaps its lines.
+- Co-changed files leave out commits that touch more than 20 files. The text report shows the top 10; `--json` lists them all.
+- A bad repo, ref or CI path prints `error: ...` to stderr and exits with status 2.
+
+`cognee-gitgraph demo` builds a small sample monorepo and blasts a branch of it.
+
 ## Tests
 
 ```bash
@@ -91,4 +115,4 @@ The tests need no API key. They need the network only on the first run, for Cogn
 
 ## License
 
-Apache-2.0, same as Cognee.
+Apache-2.0, same as Cognee. The vendored 3d-force-graph library keeps its own MIT license in `cognee_community_connector_gitgraph/vendor/LICENSE.txt`.
