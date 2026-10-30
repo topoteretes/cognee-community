@@ -366,3 +366,42 @@ async def test_evernote_incremental_ingestion_with_cursor(persistent_environment
     guids_run2 = {_get_metadata(d)["external_id"] for d in data2}
     assert guids_run2 == {"n1", "n3"}
     assert "n2" not in guids_run2
+
+
+@pytest.mark.asyncio
+async def test_evernote_ingestion_large_batch(persistent_environment):
+    """Ingest 60 notes with max_rows_per_table=0 and assert all 60 Data records exist."""
+    dataset = "evernote_large_batch_dataset"
+    nb = SimpleNamespace(guid="nb-1", name="Engineering")
+    notes = [
+        SimpleNamespace(
+            guid=f"note-{i}",
+            title=f"Note {i}",
+            notebookGuid="nb-1",
+            tagGuids=[],
+            active=True,
+            created=1609459200000,
+            updated=1609459200000,
+        )
+        for i in range(60)
+    ]
+    contents = {f"note-{i}": f"<en-note><div>Body {i}</div></en-note>" for i in range(60)}
+    chunk = SyncChunk(
+        chunkHighUSN=10,
+        updateCount=10,
+        notebooks=[nb],
+        notes=notes,
+    )
+    client = FakeEvernoteClient(chunks=[chunk], note_contents=contents, update_count=10)
+    source = evernote_source(token="fake-token", client=client)
+    await cognee.add(
+        source,
+        dataset_name=dataset,
+        write_disposition="merge",
+        max_rows_per_table=0,
+    )
+
+    data = await _get_evernote_dataset_data(dataset)
+    assert len(data) == 60
+    guids = {_get_metadata(d)["external_id"] for d in data}
+    assert guids == {f"note-{i}" for i in range(60)}
