@@ -45,15 +45,14 @@ answer = await cognee.search(
 Scope what you ingest with `page_ids=[...]` or `database_ids=[...]`; omit both to sync
 every page the integration can see. See `examples/example.py` for the full flow.
 
-## How sync + forget-on-delete work
+## How sync, incremental caching + forget-on-delete work
 
-The source is a **full snapshot**: `write_disposition="replace"` rewrites staging with
-exactly the pages currently visible to the integration on each run. Notion has no delete
-feed and hides archived/trashed/unshared pages from listings, so a deleted page simply
-drops out of the snapshot and cognee's existing `orphan_cleanup` removes it from the graph
-and vector stores. Unchanged pages keep a stable content-hash `data_id`, so they are not
-re-ingested or re-cognified. A render error aborts the run (leaving memory untouched)
-rather than letting a partial snapshot forget live pages.
+The source is an **authoritative full snapshot with incremental block rendering**:
+1. `write_disposition="replace"` rewrites staging with exactly the pages currently visible to the integration on each run. Notion has no delete feed and hides archived/trashed/unshared pages from listings, so a deleted page simply drops out of the snapshot and cognee's existing `orphan_cleanup` removes it from the graph and vector stores.
+2. **Incremental block caching**: The connector stores rendered page contents in `dlt.current.source_state()` under `"notion_page_cache"` keyed by page ID and Notion's `last_edited_time` watermark. On subsequent syncs, pages whose `last_edited_time` has not changed reuse the cached content and make zero `blocks.children` API calls.
+3. When a page is modified, its `last_edited_time` advances, causing only that specific page's block children to be re-fetched and re-rendered.
+4. Pages that are deleted, trashed, or unshared are evicted from the state cache and disappear from the snapshot.
+5. A render error aborts the run (leaving memory and cache untouched) rather than letting a partial snapshot accidentally forget live pages.
 
 ## Setup
 
