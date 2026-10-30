@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>LogRocket connector test-data generator</title>
+    <script src="https://cdn.logr-in.com/LogRocket.min.js" crossorigin="anonymous"></script>
+    <script>
+      const connectorAppID = new URLSearchParams(window.location.search).get("app");
+      const connectorConfigured = /^[A-Za-z0-9_-]+\/[A-Za-z0-9_-]+$/.test(connectorAppID || "");
+      if (connectorConfigured) {
+        window.LogRocket?.init(connectorAppID, { shouldCaptureIP: false });
+      }
+    </script>
+    <style>
+      :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+      body { max-width: 760px; margin: 3rem auto; padding: 0 1rem; line-height: 1.5; }
+      button { margin: .35rem; padding: .7rem 1rem; cursor: pointer; }
+      #status { min-height: 1.5rem; padding: .75rem; background: color-mix(in srgb, CanvasText 8%, Canvas); }
+      code { overflow-wrap: anywhere; }
+    </style>
+  </head>
+  <body>
+    <h1>LogRocket connector test data</h1>
+    <p>
+      This page records synthetic data in the project passed through the <code>app</code> query
+      parameter. Use only invented values.
+      JavaScript exceptions are the most reliable issue sample and work on every plan.
+    </p>
+
+    <button id="event">Record custom event</button>
+    <button id="caught-error">Capture test exception</button>
+    <button id="uncaught-error">Throw uncaught test exception</button>
+    <button id="network-error">Make failed request</button>
+    <button id="dead-click">Dead-click target</button>
+    <button id="rage-click">Rage-click target</button>
+
+    <p id="status" role="status">LogRocket initialized. Interact with the buttons.</p>
+
+    <script>
+      const status = document.querySelector("#status");
+
+      if (connectorConfigured) {
+        window.LogRocket?.identify("connector-test-user", {
+          name: "Connector Test User",
+          environment: "connector-test",
+        });
+        window.LogRocket?.track("connector_test_page_loaded", {
+          fixture: "logrocket-4782",
+        });
+        status.textContent = `LogRocket initialized for ${connectorAppID}.`;
+      } else {
+        status.textContent = "Missing or invalid ?app=organization/project query parameter.";
+        document.querySelectorAll("button").forEach((button) => { button.disabled = true; });
+      }
+
+      document.querySelector("#event").addEventListener("click", () => {
+        window.LogRocket?.track("connector_test_checkout", {
+          fixture: "logrocket-4782",
+          outcome: "synthetic-success",
+        });
+        status.textContent = "Custom event recorded.";
+      });
+
+      document.querySelector("#caught-error").addEventListener("click", () => {
+        const error = new Error("ConnectorFixtureError: synthetic checkout failure 4782");
+        window.LogRocket?.captureException(error, {
+          tags: { fixture: "logrocket-4782" },
+          extra: { pageName: "ConnectorTestData" },
+        });
+        status.textContent = "Synthetic exception sent with captureException().";
+      });
+
+      document.querySelector("#uncaught-error").addEventListener("click", () => {
+        status.textContent = "An uncaught synthetic exception will fire now.";
+        setTimeout(() => {
+          throw new Error("ConnectorFixtureUncaughtError: synthetic failure 4782");
+        }, 0);
+      });
+
+      document.querySelector("#network-error").addEventListener("click", async () => {
+        status.textContent = "Sending a request that should return HTTP 404.";
+        await fetch(`/connector-fixture-missing-${Date.now()}.json`);
+      });
+
+      // Intentionally no listeners: repeated clicks can exercise paid-plan
+      // dead-click and rage-click detection.
+    </script>
+  </body>
+</html>
