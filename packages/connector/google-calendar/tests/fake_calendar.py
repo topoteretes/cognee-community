@@ -9,7 +9,7 @@ come back as ``status: cancelled`` stubs.
 """
 
 import itertools
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 
 class HttpError(Exception):
@@ -87,13 +87,15 @@ class FakeCalendar:
         }
         return self._save(calendar, event)
 
-    def put_all_day(self, calendar: str, summary: str, day: str, **fields) -> str:
+    def put_all_day(self, calendar: str, summary: str, day: str, days: int = 1, **fields) -> str:
+        # Like the real API, end.date is exclusive: the day after the last day.
+        end = date.fromisoformat(day) + timedelta(days=days)
         return self.put_event(
             calendar,
             summary,
             datetime(2026, 1, 1),
             start={"date": day},
-            end={"date": day},
+            end={"date": end.isoformat()},
             **fields,
         )
 
