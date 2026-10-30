@@ -253,11 +253,14 @@ class _Names:
 
 
 # Bots fill required embed fields with zero-width characters, which strip() keeps.
-_ZERO_WIDTH = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u2060\ufeff"))
+_FILLER = dict.fromkeys(map(ord, "\u200b\u2060\ufeff"))
+# ZWNJ and ZWJ join emoji and Persian or Indic words, so they stay in real text.
+_JOINERS = "\u200c\u200d"
 
 
 def _clean(value: Any) -> str:
-    return str(value or "").translate(_ZERO_WIDTH).strip()
+    text = str(value or "").translate(_FILLER).strip()
+    return text if text.strip(_JOINERS).strip() else ""
 
 
 def _extras(message: dict) -> list[str]:

@@ -280,6 +280,22 @@ def test_zero_width_text_counts_as_empty(discord):
     message = discord.message(GENERAL, TODAY, "", embeds=[embed])
     assert render_message(message, NAMES) == "[09:00] Priya Shah: [embed: T | v]"
     assert render_message(discord.message(GENERAL, TODAY, "\u200b \ufeff"), NAMES) is None
+    assert render_message(discord.message(GENERAL, TODAY, "\u200d\u2060\u200c"), NAMES) is None
+
+
+def test_joiners_in_real_text_are_kept(discord):
+    family = "family \U0001f468\u200d\U0001f469\u200d\U0001f467"
+    flag = "\U0001f3f3\ufe0f\u200d\U0001f308"
+    persian = "\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645"
+    embed = {"type": "rich", "fields": [{"name": "\u200d", "value": flag}]}
+    poll = {"question": {"text": persian}, "answers": [{"poll_media": {"text": family}}]}
+    message = discord.message(
+        GENERAL, TODAY, f"\u200b{family} {flag} {persian}\ufeff", embeds=[embed], poll=poll
+    )
+    assert render_message(message, NAMES) == (
+        f"[09:00] Priya Shah: {family} {flag} {persian} [embed: {flag}] "
+        f"[poll: {persian} ({family})]"
+    )
 
 
 def test_render_day_for_a_forum_post():
