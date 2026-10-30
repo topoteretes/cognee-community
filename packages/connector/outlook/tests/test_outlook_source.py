@@ -446,3 +446,32 @@ def test_an_injected_client_is_never_closed(monkeypatch, tmp_path):
 def test_default_folders_are_inbox_and_sent_items():
     assert _normalize_mail_folders(None) == ("inbox", "sentitems")
     assert _normalize_mail_folders("SentItems") == ("sentitems",)
+
+
+@pytest.mark.parametrize("zone", ["America", "europe/berlin", "Not/AZone"])
+def test_a_time_zone_that_is_not_an_iana_name_is_refused_everywhere(zone):
+    with pytest.raises(ValueError, match="time_zone"):
+        outlook_source(access_token="t", time_zone=zone)
+
+
+@pytest.mark.parametrize("folders", [[None], [1], ["inbox", 2]])
+def test_a_mail_folder_that_is_not_a_string_names_the_argument(folders):
+    with pytest.raises(ValueError, match="mail_folders"):
+        outlook_source(folders, access_token="t")
+
+
+def test_an_injected_client_gets_a_fresh_wait_budget_every_run(monkeypatch, tmp_path):
+    import dlt
+
+    graph = FakeGraph()
+    graph.put_message("inbox", "Hello")
+    monkeypatch.setenv("DLT_DATA_DIR", str(tmp_path))
+    service = build_graph_client(GraphAuth(GraphTokenProvider(access_token="t"), BASE), BASE)
+    service.session.wait_left = 0.0  # spent by an earlier run
+    pipeline = dlt.pipeline("outlook_budget_test", dev_mode=True)
+
+    with responses.RequestsMock(assert_all_requests_are_fired=False) as mock:
+        graph.install(mock)
+        pipeline.extract(outlook_source(["inbox"], include_calendar=False, service=service))
+
+    assert service.session.wait_left == outlook_module.WAIT_BUDGET_SECONDS

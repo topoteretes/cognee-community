@@ -566,9 +566,9 @@ def test_an_event_that_stays_unreadable_is_given_up_after_three_runs(graph):
         assert deletes == [] and stats["events_failed"] == 1
         assert state["calendar"]["recheck"] == {stuck: run}
 
-    # Graph no longer lists it and it stayed unreadable: forget it, stop asking.
+    # Unreadable is not gone: stop asking, but keep it, since errors never delete.
     _, deletes, stats = sync(state, make_config(**CAL))
-    assert deletes == [event(stuck)]
+    assert deletes == []
     assert stats["events_given_up"] == 1 and stats["events_failed"] == 0
     assert state["calendar"]["recheck"] == {} and stuck not in state["calendar"]["known"]
 
@@ -577,7 +577,7 @@ def test_an_event_that_stays_unreadable_is_given_up_after_three_runs(graph):
     assert len(lookups) == 3, "never looked up again"
 
 
-def test_series_master_that_fails_to_load_is_fetched_next_run(graph):
+def test_series_master_that_fails_to_load_is_fetched_next_run(graph, no_retry_wait):
     master = graph.put_series("Standup", NOW - timedelta(days=60), days=90)
     graph.hide_from_calendar_view(master)
     original = graph._handle
@@ -595,7 +595,7 @@ def test_series_master_that_fails_to_load_is_fetched_next_run(graph):
 
     assert event(master) not in upserts
     assert stats["events_failed"] == 1
-    assert state["calendar"]["retry_masters"] == {master: 1}
+    assert state["calendar"]["retry_masters"] == {master: 0}, "a 5xx is not the event's fault"
 
     broken = False
     upserts, _, _ = sync(state, make_config(**CAL))
@@ -903,10 +903,11 @@ def test_a_round_without_a_delta_link_fails_its_part_without_the_url(graph):
     upserts, _, _ = sync(state, make_config(mail_folders=("inbox",)), stats=stats)
 
     # Not a lost connection: only mail fails, and the calendar still finishes.
-    # Mail rows already yielded come again next run, which merge makes harmless.
+    # The mail rows already yielded still load, so mail keeps only their ids.
     assert event(meeting) in upserts
     assert stats["failed_mail"] == 1 and stats["failed_connection"] == 0
-    assert "mail" not in state
+    assert state["mail"] == {"members": {m: ["inbox"] for m in state["mail"]["members"]}}
+    assert "delta_links" not in state["mail"]
 
     # An incremental round requests the saved deltaLink, delta token and all.
     graph._mail_delta = original
@@ -1411,3 +1412,193 @@ def test_a_folder_that_keeps_failing_holds_back_deletes_for_three_runs_only(grap
     _, deletes, _ = sync(state, config)
     assert deletes == [mail(gone)], "a broken folder never blocks deletes for good"
     assert state["mail"]["pending"] == {}
+
+
+# ---------------------------------------------------------------------------
+# Review round 6: rows yielded before a part fails, lookups, zones
+# ---------------------------------------------------------------------------
+def test_a_calendar_round_failing_on_page_two_still_forgets_a_loaded_event(graph, no_retry_wait):
+    graph.put_message("inbox", "Mail is fine")
+    for day in (1, 2, 3):
+        graph.put_event(f"Meeting {day}", NOW + timedelta(days=day))
+    state: dict = {}
+    original = graph._handle
+
+    def page_two_fails(request):
+        if "$skiptoken" in request.url:
+            graph.requests.append(request)
+            return 503, {}, json.dumps({"error": {"code": "ServiceUnavailable"}})
+        return original(request)
+
+    graph._handle = page_two_fails
+    upserts, _, stats = sync(state, make_config(mail_folders=("inbox",)))
+    loaded = [i for i in upserts if i.startswith("event:")]
+    assert len(loaded) == 2 and stats["failed_calendar"] == 1
+    assert sorted(event(i) for i in state["calendar"]["known"]) == sorted(loaded)
+
+    graph._handle = original
+    gone = loaded[0].removeprefix("event:")
+    graph.delete_event(gone)
+    _, deletes, _ = sync(state, make_config(mail_folders=("inbox",)))
+
+    assert deletes == [event(gone)], "the loaded row does not stay behind"
+
+
+def test_a_single_mail_folder_failing_on_page_two_still_forgets_a_loaded_message(
+    graph, no_retry_wait
+):
+    for subject in ("One", "Two", "Three"):
+        graph.put_message("inbox", subject)
+    graph.put_event("Calendar is fine", NOW + timedelta(days=1))  # one page
+    state: dict = {}
+    original = graph._handle
+
+    def page_two_fails(request):
+        if "$skiptoken" in request.url:
+            graph.requests.append(request)
+            return 503, {}, json.dumps({"error": {"code": "ServiceUnavailable"}})
+        return original(request)
+
+    graph._handle = page_two_fails
+    upserts, _, stats = sync(state, make_config(mail_folders=("inbox",)))
+    loaded = [i for i in upserts if i.startswith("mail:")]
+    assert len(loaded) == 2 and stats["failed_mail"] == 1
+    first = loaded[0].removeprefix("mail:")
+
+    graph._handle = original
+    graph.delete_message(first, "inbox")
+    _, deletes, _ = sync(state, make_config(mail_folders=("inbox",)))
+
+    assert mail(first) in deletes
+
+
+def test_a_5xx_on_lookups_never_forgets_events_that_still_exist(graph):
+    ids = [graph.put_event(f"Meeting {n}", NOW + timedelta(days=1)) for n in range(3)]
+    state: dict = {}
+    sync(state, make_config(**CAL))
+    for event_id in ids:
+        graph.hide_from_calendar_view(event_id)  # left the window, still there
+    original = graph._handle
+
+    def lookups_unavailable(request):
+        if "/me/events/" in request.url:
+            graph.requests.append(request)
+            return 503, {}, json.dumps({"error": {"code": "ServiceUnavailable"}})
+        return original(request)
+
+    graph._handle = lookups_unavailable
+    for run in range(1, 10):
+        # A week on each time, so every run is a fresh window round.
+        later = NOW + timedelta(days=8 * run)
+        _, deletes, stats = sync(state, make_config(**CAL), now=later)
+        assert deletes == [] and stats["events_given_up"] == 0
+    assert set(state["calendar"]["recheck"]) == set(ids)
+
+
+def test_an_event_whose_lookup_meets_a_5xx_goes_last_next_run(graph):
+    stuck, other = sorted(graph.put_event(f"M{n}", NOW + timedelta(days=1)) for n in range(2))
+    state: dict = {}
+    sync(state, make_config(**CAL))
+    graph.delete_event(stuck)
+    graph.delete_event(other)
+    original = graph._handle
+
+    def stuck_is_unavailable(request):
+        if request.url.split("?")[0].endswith(f"/me/events/{stuck}"):
+            graph.requests.append(request)
+            return 500, {}, json.dumps({"error": {"code": "InternalServerError"}})
+        return original(request)
+
+    graph._handle = stuck_is_unavailable
+    _, deletes, _ = sync(state, make_config(**CAL))
+    assert deletes == [], "the 5xx on the first lookup skips the rest"
+    _, deletes, _ = sync(state, make_config(**CAL))
+    assert deletes == [event(other)], "the stuck one went last, so the other got its turn"
+
+
+def test_a_master_that_was_never_stored_is_not_tombstoned(graph):
+    master = graph.put_series("Standup", NOW - timedelta(days=60), days=90)
+    graph.hide_from_calendar_view(master)
+    original = graph._handle
+
+    def master_gone(request):
+        if request.url.split("?")[0].endswith(f"/me/events/{master}"):
+            graph.requests.append(request)
+            return 404, {}, json.dumps({"error": {"code": "ErrorItemNotFound"}})
+        return original(request)
+
+    graph._handle = master_gone
+    _, deletes, _ = sync({}, make_config(**CAL))
+
+    assert deletes == []
+
+
+def test_a_429_keeps_the_lookup_attempts_counted_before_it(graph, no_retry_wait):
+    first, second = sorted(graph.put_event(f"M{n}", NOW + timedelta(days=1)) for n in range(2))
+    state: dict = {}
+    sync(state, make_config(**CAL))
+    graph.delete_event(first)
+    graph.delete_event(second)
+    original = graph._handle
+
+    def first_forbidden_then_throttled(request):
+        path = request.url.split("?")[0]
+        if path.endswith(f"/me/events/{first}"):
+            graph.requests.append(request)
+            return 403, {}, json.dumps({"error": {"code": "ErrorAccessDenied"}})
+        if path.endswith(f"/me/events/{second}"):
+            graph.requests.append(request)
+            return 429, {}, json.dumps({"error": {"code": "TooManyRequests"}})
+        return original(request)
+
+    graph._handle = first_forbidden_then_throttled
+    with pytest.raises(OutlookError):
+        sync(state, make_config(**CAL))
+    # The run raised, so dlt saves nothing; one that finishes mail keeps the count.
+    _, _, stats = sync(state, make_config(mail_folders=("inbox",)))
+    assert stats["failed_rate_limit"] == 1
+    assert state["calendar"]["recheck"][first] == 1
+
+
+@pytest.mark.parametrize(
+    "zone, start, day",
+    [
+        ("Tonga Standard Time", "2026-11-07T11:00:00", "2026-11-08"),  # UTC+13
+        ("Line Islands Standard Time", "2026-11-07T10:00:00", "2026-11-08"),  # UTC+14
+        ("Dateline Standard Time", "2026-11-08T12:00:00", "2026-11-08"),  # UTC-12
+        ("New Zealand Standard Time", "2026-11-07T11:00:00", "2026-11-08"),  # summer, +13
+        ("Pacific Standard Time", "2026-11-08T08:00:00", "2026-11-08"),
+    ],
+)
+def test_an_all_day_event_uses_its_windows_zone_name(graph, zone, start, day):
+    holiday = graph.put_event("Holiday", NOW + timedelta(days=2), isAllDay=True)
+    graph.events[holiday].update(
+        start={"dateTime": f"{start}.0000000", "timeZone": "UTC"},
+        end={
+            "dateTime": f"{start}.0000000".replace(start[:10], _next_day(start)),
+            "timeZone": "UTC",
+        },
+        originalStartTimeZone=zone,
+        originalEndTimeZone=zone,
+    )
+
+    upserts, _, _ = sync({}, make_config(**CAL))
+
+    assert f"When: all day, {day}" in upserts[event(holiday)]["content"].splitlines()
+
+
+def _next_day(start: str) -> str:
+    from datetime import date
+
+    return (date.fromisoformat(start[:10]) + timedelta(days=1)).isoformat()
+
+
+def test_changing_time_zone_rewrites_the_events_in_the_new_zone(graph):
+    meeting = graph.put_event("Planning", NOW + timedelta(days=1))
+    state: dict = {}
+    sync(state, make_config(**CAL))
+
+    upserts, _, _ = sync(state, make_config(**CAL, time_zone="Asia/Kolkata"))
+
+    assert "(Asia/Kolkata)" in upserts[event(meeting)]["content"]
+    assert state["calendar"]["time_zone"] == "Asia/Kolkata"

@@ -29,8 +29,9 @@ from collections.abc import Callable, Generator, Iterator
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone, tzinfo
 from email.utils import parsedate_to_datetime
+from functools import cache
 from typing import Any
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 
 import requests
 from cognee.shared.logging_utils import get_logger
@@ -40,6 +41,7 @@ from dlt.sources.helpers.requests.session import Session
 from dlt.sources.helpers.rest_client import RESTClient
 from dlt.sources.helpers.rest_client.paginators import BaseNextUrlPaginator
 from requests import HTTPError, RequestException
+from tzlocal.windows_tz import win_tz
 
 from .graph_auth import (
     CALENDARS_READ,
@@ -339,16 +341,19 @@ _SKIPPED = object()  # not asked: Graph failed on an earlier lookup this run
 class _Lookups:
     """Looks single events up by id, one unreadable event at a time.
 
-    A 4xx or a body that is not JSON fails only that event.  After the first
-    5xx the remaining lookups wait for the next run, so a struggling Graph is
-    not asked once per event.  A 401 and a 429 raise: every later request would
-    fail the same way.
+    A 4xx or a body that is not JSON fails only that event.  A 5xx is Graph's
+    trouble, not the event's: it and every lookup after it this run are
+    skipped and wait for the next run, so a struggling Graph is not asked once
+    per event.  A 401 and a 429 raise: every later request would fail the same
+    way.
     """
 
     def __init__(self, client: RESTClient, check_active: Callable[[], None] | None) -> None:
         self.client = client
         self.check_active = check_active
         self.unavailable = False
+        # The path that met the 5xx, so the next run can ask it last.
+        self.unavailable_on: str | None = None
 
     def get(self, path: str) -> Any:
         if self.unavailable:
@@ -362,6 +367,8 @@ class _Lookups:
             response.raise_for_status()
         if status >= 500:
             self.unavailable = True
+            self.unavailable_on = path
+            return _SKIPPED
         if status >= 400:
             return _FAILED
         try:
@@ -378,9 +385,10 @@ def _attempts(saved: Any) -> dict[str, int]:
     return dict.fromkeys(saved or [], 1)
 
 
-def _least_tried_first(ids: set[str], attempts: dict[str, int]) -> list[str]:
-    # An event that keeps failing goes last, so it cannot starve the others.
-    return sorted(ids, key=lambda i: (attempts.get(i, 0), i))
+def _least_tried_first(ids: set[str], attempts: dict[str, int], last: str | None) -> list[str]:
+    # An event that keeps failing goes last, so it cannot starve the others:
+    # by its count of 4xx, or, when a 5xx stopped the last run on it, first of all.
+    return sorted(ids, key=lambda i: (i == last, attempts.get(i, 0), i))
 
 
 # ---------------------------------------------------------------------------
@@ -415,10 +423,10 @@ def _iter_rows(
 
     ``state`` is a plain dict standing in for dlt's resource state, so this is
     directly unit-testable.  Upserts are yielded page by page as Graph returns
-    them; merge makes a repeated one harmless when a part fails and runs again.
-    Tombstones and the new state only come once a part has finished.  Mail and
-    calendar each keep their old state when they fail; the run raises only when
-    neither finished.
+    them.  Tombstones and the new state only come once a part has finished.
+    Mail and calendar each keep their old state when they fail, plus the ids
+    they already yielded, since dlt still loads those rows; the run raises
+    only when neither finished.
     """
     if stats is None:
         stats = {}
@@ -431,19 +439,35 @@ def _iter_rows(
 
     parts = [p for p in ("mail", "calendar") if getattr(config, f"include_{p}")]
     finished: dict[str, tuple[dict, list[str]]] = {}
+    # Old state of a failed part, with what it yielded before failing.
+    kept: dict[str, dict] = {}
     last_error: Exception | None = None
     for part in parts:
         part_stats = dict.fromkeys(_PART_STATS[part], 0)
+        progress: dict[str, Any] = {}
         try:
             if part == "mail":
                 new_state, deletes = yield from _sync_mail(
-                    client, config, state.get("mail", {}), part_stats, check_active
+                    client, config, state.get("mail", {}), part_stats, check_active, progress
                 )
             else:
                 new_state, deletes = yield from _sync_calendar(
-                    client, config, state.get("calendar", {}), part_stats, now, check_active
+                    client,
+                    config,
+                    state.get("calendar", {}),
+                    part_stats,
+                    now,
+                    check_active,
+                    progress,
                 )
         except (RequestException, OutlookError, GraphLoginRequiredError) as exc:
+            old = state.get(part, {})
+            if part == "mail":
+                after = _mail_state_after_failure(old, progress)
+            else:
+                after = _calendar_state_after_failure(old, progress)
+            if after != old:
+                kept[part] = after
             last_error, reason = _part_failure(exc)
             for key in _YIELDED_STATS:
                 stats[key] += part_stats.get(key, 0)
@@ -477,6 +501,8 @@ def _iter_rows(
         for row_id in deletes:
             yield {"id": row_id, "_deleted": True}
 
+    for part, new_state in kept.items():
+        state[part] = new_state
     for part, (new_state, _deletes) in finished.items():
         state[part] = new_state
     logger.info(
@@ -485,6 +511,39 @@ def _iter_rows(
         stats["deleted"],
         stats["failed"],
     )
+
+
+def _mail_state_after_failure(mail_state: dict, progress: dict) -> dict:
+    """The old mail state plus the messages yielded before the part failed.
+
+    Their rows still load, so their folders are added to ``members``; the
+    next round then forgets one that was deleted meanwhile.  Nothing is
+    removed: the old delta links replay those removals again.
+    """
+    members = {k: list(v) for k, v in mail_state.get("members", {}).items()}
+    for message_id, folder in progress.get("yielded", []):
+        folders = members.setdefault(message_id, [])
+        if folder not in folders:
+            folders.append(folder)
+    return {**mail_state, "members": members} if members else dict(mail_state)
+
+
+def _calendar_state_after_failure(calendar_state: dict, progress: dict) -> dict:
+    """The old calendar state plus the events yielded before the part failed.
+
+    Their rows still load, so they join ``known``, which is what the next
+    round checks a removal against.  Lookup attempts counted before the
+    failure are kept too, so an id that always comes first still reaches
+    the limit.
+    """
+    yielded = progress.get("yielded", set())
+    if not (yielded or progress.get("recheck") or progress.get("retry_masters")):
+        return dict(calendar_state)
+    new_state = dict(calendar_state)
+    new_state["known"] = sorted(set(calendar_state.get("known", [])) | yielded)
+    for key in ("recheck", "retry_masters"):
+        new_state[key] = {**_attempts(calendar_state.get(key)), **progress.get(key, {})}
+    return new_state
 
 
 def _graph_error(exc: RequestException) -> OutlookError:
@@ -521,13 +580,18 @@ def _sync_mail(
     mail_state: dict,
     stats: dict[str, int],
     check_active: Callable[[], None] | None = None,
+    progress: dict[str, Any] | None = None,
 ) -> Generator[dict, None, tuple[dict, list[str]]]:
     """One delta round per selected folder.
 
     Yields upserts page by page and returns the new mail state and the ids to
     forget.  A folder that fails keeps its old delta link while the others
-    sync; the part only fails when every folder did.
+    sync; the part only fails when every folder did.  ``progress["yielded"]``
+    lists each (message id, folder) yielded, for a part that fails.
     """
+    yielded: list[tuple[str, str]] = []
+    if progress is not None:
+        progress["yielded"] = yielded
     options = {
         "bodies": config.include_mail_bodies,
         "received_after": config.mail_received_after,
@@ -579,6 +643,7 @@ def _sync_mail(
                 if message_id not in emitted:
                     emitted.add(message_id)
                     stats["mail_changed"] += 1
+                    yielded.append((message_id, folder))
                     yield _mail_row(item, folder, config.include_mail_bodies)
         if fresh:
             # A fresh round lists the whole folder: what it lacks has left it.
@@ -738,12 +803,19 @@ def _sync_calendar(
     stats: dict[str, int],
     now: datetime,
     check_active: Callable[[], None] | None = None,
+    progress: dict[str, Any] | None = None,
 ) -> Generator[dict, None, tuple[dict, list[str]]]:
     """One delta round over the date window.
 
     Yields upserts page by page and returns the new calendar state and the
-    ids to forget.
+    ids to forget.  ``progress`` holds the event ids yielded and the lookup
+    attempts counted so far, for a part that fails.
     """
+    if progress is None:
+        progress = {}
+    yielded: set[str] = progress.setdefault("yielded", set())
+    next_masters: dict[str, int] = progress.setdefault("retry_masters", {})
+    next_recheck: dict[str, int] = progress.setdefault("recheck", {})
     known: set[str] = set(calendar_state.get("known", []))
     # Failed lookups per id: a removal still to confirm, and a series master
     # still to fetch.  Delta rounds won't list them again.
@@ -759,6 +831,8 @@ def _sync_calendar(
     snapshot = (
         not link
         or calendar_state.get("window") != window
+        # Rows carry times in this zone, so a new one rewrites them all.
+        or calendar_state.get("time_zone", config.time_zone) != config.time_zone
         or opened_at is None
         or now - datetime.fromisoformat(opened_at)
         >= timedelta(days=config.calendar_window_refresh_days)
@@ -794,6 +868,7 @@ def _sync_calendar(
                     cancelled.add(event_id)
                 else:
                     known.add(event_id)
+                    yielded.add(event_id)
                     stats["events_changed"] += 1
                     yield _event_row(item, zone)
         return delta.delta_link
@@ -820,9 +895,16 @@ def _sync_calendar(
         forget(event_id)
 
     lookups = _Lookups(client, check_active)
+    # The event whose lookup met a 5xx last run; a 5xx is not counted, so
+    # this is what keeps it from going first every run.
+    slow = calendar_state.get("slow_lookup")
 
     def lookup_failed(event_id: str, result: Any, attempts: dict[str, int]) -> int | None:
-        """Attempts so far, or None once the event is given up."""
+        """Attempts so far, or None once the event is given up.
+
+        Only a 4xx or a body that is not JSON counts; a skipped lookup, after
+        a 5xx, says nothing about the event.
+        """
         tries = attempts.get(event_id, 0) + (result is _FAILED)
         if tries >= MAX_LOOKUP_ATTEMPTS:
             stats["events_given_up"] += 1
@@ -834,8 +916,9 @@ def _sync_calendar(
     # Occurrences prove their series is alive and changed: the master holds
     # the title, attendees and recurrence, and Graph may not list it in the
     # round (a series that started before the window), so fetch it by id.
-    next_masters: dict[str, int] = {}
-    for master_id in _least_tried_first((series_ids | set(retry_masters)) - seen, retry_masters):
+    for master_id in _least_tried_first(
+        (series_ids | set(retry_masters)) - seen, retry_masters, slow
+    ):
         master = lookups.get(f"/me/events/{master_id}")
         if master is _FAILED or master is _SKIPPED:
             tries = lookup_failed(master_id, master, retry_masters)
@@ -846,6 +929,7 @@ def _sync_calendar(
                 forget(master_id)
         else:
             known.add(master_id)
+            yielded.add(master_id)
             stats["events_changed"] += 1
             yield _event_row(master, zone)
     seen |= series_ids
@@ -856,19 +940,18 @@ def _sync_calendar(
         removed |= known - seen
     removed |= set(recheck)
 
-    next_recheck: dict[str, int] = {}
     # Only events that were stored: a deleted series also reports every
     # occurrence, and none of those were ever ingested.
-    for event_id in _least_tried_first((removed - seen) & known, recheck):
+    for event_id in _least_tried_first((removed - seen) & known, recheck, slow):
         # Graph also reports an event that left the window as removed, so
         # check it before forgetting anything.
         event = lookups.get(f"/me/events/{event_id}")
         if event is _FAILED or event is _SKIPPED:
             tries = lookup_failed(event_id, event, recheck)
             if tries is None:
-                # Graph no longer lists it and it has not been readable for
-                # several runs: forget it rather than keep it unchecked forever.
-                forget(event_id)
+                # Unreadable for several runs, so nothing says it is gone: stop
+                # tracking it and keep it, like an event that left the window.
+                known.discard(event_id)
             else:
                 next_recheck[event_id] = tries
         elif event is None or event.get("isCancelled"):
@@ -882,9 +965,13 @@ def _sync_calendar(
         "delta_link": link,
         "opened_at": opened_at,
         "window": window,
+        "time_zone": config.time_zone,
         "known": sorted(known),
         "recheck": next_recheck,
         "retry_masters": next_masters,
+        "slow_lookup": lookups.unavailable_on.rsplit("/", 1)[-1]
+        if lookups.unavailable_on
+        else None,
     }
     return new_state, deletes
 
@@ -957,16 +1044,32 @@ def _people(recipients: list[dict] | None) -> str:
     return ", ".join(_person(r) for r in recipients or []) or "none"
 
 
+@cache
+def _iana_names() -> frozenset[str]:
+    return frozenset(available_timezones())
+
+
 def _zone(name: str | None) -> tzinfo | None:
-    """A time zone by IANA name, or None when Python does not know the name."""
+    """A time zone by IANA name, or None when Python does not know the name.
+
+    Checked against the zone list rather than the files, so a directory like
+    "America" or a wrong case like "europe/berlin" is refused on every system.
+    """
     if not name:
         return None
     if name.upper() in ("UTC", "ETC/UTC"):
         return UTC
+    if name not in _iana_names():
+        return None
     try:
         return ZoneInfo(name)
-    except (ZoneInfoNotFoundError, ValueError):
+    except (ZoneInfoNotFoundError, ValueError, OSError):
         return None
+
+
+def _event_zone(name: str | None) -> tzinfo | None:
+    """An event's own zone: Graph names it the Windows way, like "Tonga Standard Time"."""
+    return _zone(win_tz.get(name, name) if name else name)
 
 
 def _moment(value: dict | None) -> datetime | None:
@@ -1000,11 +1103,11 @@ def _day(moment: datetime, original_zone: str | None) -> date:
     """The calendar day an all-day boundary falls on.
 
     An all-day event starts at midnight in its own zone, which UTC shows as
-    another hour.  The event's zone gives the day when Python knows its name;
-    otherwise the nearest midnight does, right for every zone within 12 hours
-    of UTC.
+    another hour.  The event's zone gives the day, by Windows or IANA name;
+    for a custom zone the nearest midnight does, right for every zone within
+    12 hours of UTC.
     """
-    zone = _zone(original_zone)
+    zone = _event_zone(original_zone)
     if zone is not None:
         local = moment.astimezone(zone)
         if (local.hour, local.minute) == (0, 0):
@@ -1045,6 +1148,8 @@ def _normalize_mail_folders(mail_folders: list[str] | str | None) -> tuple[str, 
         mail_folders = [mail_folders]
     folders = []
     for folder in mail_folders:
+        if not isinstance(folder, str):
+            raise ValueError("mail_folders must be folder names or ids, as strings.")
         folder = folder.strip()
         if folder:
             folders.append(folder.lower() if folder.lower() in WELL_KNOWN_FOLDERS else folder)
@@ -1218,12 +1323,15 @@ def outlook_source(
     )
     def outlook_items() -> Iterator[dict]:
         # A client per run: its retry wait budget is per run, and it is closed
-        # when the run ends.
+        # when the run ends.  An injected client lives longer, so its budget
+        # starts over here.
         client = (
             service
             if service is not None
             else build_graph_client(GraphAuth(provider, base_url), base_url, check_active)
         )
+        if isinstance(getattr(client, "session", None), _GraphSession):
+            client.session.wait_left = float(WAIT_BUDGET_SECONDS)
         try:
             rows = _iter_rows(
                 client, config, dlt.current.resource_state(), stats, check_active=check_active

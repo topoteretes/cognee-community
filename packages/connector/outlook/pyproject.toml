@@ -10,6 +10,8 @@ dependencies = [
     "cognee>=1.6.3,<2",
     "dlt[sqlalchemy]>=1.9.0,<2",
     "msal>=1.28.0,<2",
+    # Windows zone names to IANA, for the day of an all-day event.
+    "tzlocal>=4,<6",
 ]
 
 [project.urls]

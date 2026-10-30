@@ -127,13 +127,18 @@ totals the other connectors publish; and `failed_auth`, `failed_rate_limit`,
   more than 60 seconds, and all waits of one run share 2 minutes, since cognee holds its
   dlt staging lock during a sync. With a `check_active`, waits are slept in 1 second steps
   and it is asked between them and before the retry, so a revoked connection stops a wait
-  within a second. After that the request fails and the next run picks it up.
+  within a second. After that the request fails and the next run picks it up. The
+  budget counts sleeps only: a Graph that hangs instead of answering is bounded by
+  dlt's request timeout on each of those attempts. With `service=`, the connector resets
+  that client's budget at the start of every run; a client that is not built by
+  `build_graph_client` brings its own retries.
 - **The token only goes to Graph.** The bearer token is attached only to requests for
   the `base_url` host; a page link that points anywhere else fails that folder instead.
 - **Rows stream page by page.** New and changed messages and events are handed to cognee
   as each page arrives, so a big mailbox is never held in memory. Forgets and the new
-  delta links wait until a round has finished; a round that fails halfway is read again
-  next run, and `merge` makes the repeated rows harmless.
+  delta links wait until a round has finished. dlt still loads the rows of a round that
+  fails halfway, so the ids it yielded are kept in the state: an event or message
+  deleted before the next run is then forgotten instead of left behind.
 - **Mail:** one Graph delta query per selected folder
   (`mailFolders/{folder}/messages/delta`). The first run lists the folder; later runs
   get only what changed. The `@odata.deltaLink` only arrives on the last page, so it is
@@ -151,8 +156,12 @@ totals the other connectors publish; and `failed_auth`, `failed_rate_limit`,
   occurrences of a series show up in a round, its master is fetched by id, so an edited
   title or attendee list is picked up even when Graph does not list the master itself,
   as with a series that started before the window.
-- **Times** are asked for in UTC and written in `time_zone`. All-day events are written
-  as dates in the event's own zone, so a holiday in India is not shown a day early.
+- **Times** are asked for in UTC and written in `time_zone`. Changing `time_zone` starts
+  a fresh calendar round, so the events in the window are written again in the new zone;
+  an event that already left the window keeps its old text. All-day events are written
+  as dates in the event's own zone, which Graph names the Windows way, like
+  `Tonga Standard Time`; it is mapped to IANA with `tzlocal`, so a holiday in India or
+  New Zealand is not shown a day early.
 - **Immutable ids:** every request sends `Prefer: IdType="ImmutableId"`, so a message
   keeps its id when it moves between folders.
 - **Moves are not deletes.** The connector keeps, per message, the synced folders it is
@@ -172,15 +181,17 @@ totals the other connectors publish; and `failed_auth`, `failed_rate_limit`,
 - **One unreadable event never stops the calendar.** A lookup that fails with a 4xx, or
   answers with something that is not JSON, keeps that event, counts it in
   `events_failed`, and asks again next run, while every other event syncs as usual.
-  After the first 5xx the remaining lookups wait for the next run instead of each
-  waiting on a struggling Graph. After 3 runs of failed lookups the connector gives up:
-  a removal Graph reported is forgotten, a series master stops being fetched, and both
-  count in `events_given_up`. A 401, a 429 and a lost connection still end the run,
+  A 5xx is Graph's trouble, not the event's, so it is not counted: that lookup and the
+  remaining ones wait for the next run, where the event that met the 5xx goes last.
+  After 3 runs of 4xx answers the connector gives up on an event: it stops checking it
+  and keeps it, like an event that left the window, and a series master stops being
+  fetched. Both count in `events_given_up`. A 401, a 429 and a lost connection still end the run,
   since every later request would fail the same way.
 - Deleted items are emitted as `{"id": ..., "_deleted": True}` with a `hard_delete`
   column. dlt removes them on `merge`, and cognee's orphan cleanup removes them from the
   graph and vector stores.
-- **Errors never delete.** An expired delta token (`410 Gone`, `syncStateNotFound`)
+- **Errors never delete.** Only a 404, a cancellation, or mail leaving every synced
+  folder forgets anything. An expired delta token (`410 Gone`, `syncStateNotFound`)
   starts a fresh round for that folder or the calendar, reconciled like a snapshot. A
   synced folder that disappears is looked up first and only forgotten on a confirmed
   404. A folder in `mail_folders` that was never synced and does not exist raises
@@ -259,7 +270,8 @@ uv run pytest tests/
 
 No Microsoft account or API key is needed. `tests/fake_graph.py` is an in-memory
 Microsoft Graph served over HTTP with `responses`, so dlt's real `RESTClient`, the
-`@odata.nextLink` paginator and its retries run unchanged. It keeps a change log per
+`@odata.nextLink` paginator and the connector's own retries in `_GraphSession` run
+unchanged. It keeps a change log per
 folder and for the calendar and replays it through delta tokens.
 
 - `test_outlook_sync.py` covers paging and rows streamed page by page, the `Prefer`
