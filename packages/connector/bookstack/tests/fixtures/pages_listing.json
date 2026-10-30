@@ -1,0 +1,31 @@
+{
+  "data": [
+    {
+      "id": 42,
+      "book_id": 5,
+      "chapter_id": 3,
+      "name": "Deployment Pipeline Configuration",
+      "slug": "deployment-pipeline",
+      "url": "https://wiki.example.com/books/engineering/page/deployment-pipeline",
+      "created_at": "2026-01-15T10:00:00Z",
+      "updated_at": "2026-01-16T14:30:00Z",
+      "owned_by": {"name": "Admin User", "id": 1},
+      "tags": [{"name": "infrastructure"}, {"name": "deployment"}]
+    },
+    {
+      "id": 43,
+      "book_id": 5,
+      "chapter_id": null,
+      "name": "Onboarding Guide",
+      "slug": "onboarding-guide",
+      "url": "https://wiki.example.com/books/engineering/page/onboarding-guide",
+      "created_at": "2026-02-01T09:00:00Z",
+      "updated_at": "2026-09-10T11:00:00Z",
+      "owned_by": {"name": "HR Team", "id": 2},
+      "tags": [{"name": "onboarding"}, {"name": "hr"}]
+    }
+  ],
+  "total": 2,
+  "from": 0,
+  "count": 2
+}
