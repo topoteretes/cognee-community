@@ -17,7 +17,7 @@ from cognee.infrastructure.databases.vector.embeddings.LiteLLMEmbeddingEngine im
     LiteLLMEmbeddingEngine,
 )
 from cognee.infrastructure.llm import LLMGateway
-from fake_ahrefs import FakeAhrefs
+from fake_ahrefs import API_KEY, FakeAhrefs
 
 import cognee_community_connector_ahrefs.ahrefs as module
 from cognee_community_connector_ahrefs import ahrefs_source
@@ -90,8 +90,17 @@ async def clean_environment(tmp_path, monkeypatch):
     monkeypatch.setattr(add_data_points_module, "index_graph_edges", _noop_index)
     monkeypatch.setattr(LLMGateway, "acreate_structured_output", _mock_structured_output)
 
+    # cognee 1.6.5 wraps vectors in an EmbeddingResult; older cores take a bare list.
+    contract = importlib.import_module(
+        "cognee.infrastructure.databases.vector.embeddings.EmbeddingEngine"
+    )
+    embedding_result = getattr(contract, "EmbeddingResult", None)
+
     async def _mock_embed_text(self, text):
-        return [[0.0] * self.get_vector_size() for _ in text]
+        vectors = [[0.0] * self.get_vector_size() for _ in text]
+        if embedding_result is not None:
+            return embedding_result(vectors=vectors, tokens=0)
+        return vectors
 
     monkeypatch.setattr(LiteLLMEmbeddingEngine, "embed_text", _mock_embed_text)
 
@@ -106,7 +115,7 @@ async def _sync(api):
     sources = ahrefs_source(
         [TARGET],
         reports=["domain_rating", "backlinks"],
-        api_key="test-key",
+        api_key=API_KEY,
         session=api.session(),
     )
     await cognee.remember(

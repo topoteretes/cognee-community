@@ -15,8 +15,8 @@ units Ahrefs charged.
 
 ## Requirements
 
-- cognee **1.6.3** (pinned). The connector uses `PIPELINE_SCOPE_ATTR` and `guarded_rows`.
-- Python 3.11 to 3.13.
+- cognee 1.6.3 or later, below 2. Tested with 1.6.3 and 1.6.6.
+- Python 3.10 to 3.14.
 - An Ahrefs plan with API access, or the free test targets `ahrefs.com` and `wordcount.com`.
 
 ## Install
@@ -80,12 +80,19 @@ added. A report whose rows did not change keeps the same content and is not rebu
 | `backlinks_limit` | `50` | Strongest backlinks tracked per target |
 | `keywords_limit` | `50` | Best-ranked keywords kept per target and snapshot |
 | `country` | all | Two-letter country for keyword rankings |
-| `lost_lookback_days` | `90` | How far back lost backlinks are read; sync more often than this |
+| `lost_lookback_days` | `90` | How far back lost backlinks are read, and at least back to the last sync |
 | `keep_snapshots` | `12` | Keyword and Site Audit snapshots kept per target or project |
-| `name` | `ahrefs` | Prefix of the source and table names; one per Ahrefs account in a dataset |
+| `resource_name` | `ahrefs` | Prefix of the table, source and sync state names: `<resource_name>_<report>` |
+| `check_active` | – | Host checkpoint, called before every request and around every row |
+| `session` / `service` | – | A `requests` session for the API, mainly for tests |
 
-After a run, `source.cognee_sync_stats` holds counts only: requests, estimated and used
-units, rows, deleted rows, limited results and the units left on the key.
+Give each Ahrefs account or configuration its own `resource_name` when several sync into
+one dataset. Each one then keeps its own tables and sync state, so one sync never forgets
+the other's targets.
+
+After a run, `cognee_sync_stats` on the source and on its resource holds int counts only:
+`requests`, `retries`, `units_estimated`, `units_used`, `rows`, `deleted`, `truncated`,
+`failed_auth`, `failed_rate_limit`, and the units left on the key and the workspace.
 
 ## What each report stores
 
@@ -125,7 +132,8 @@ and 200 for keywords. A Site Audit project costs 50 units.
 - **Domain Rating** is a dated series. The first sync reads `history_months`. Later syncs
   read from the last stored date, so the open month is refreshed and new months are added.
 - **Backlinks** are the strongest `backlinks_limit` links, with the links lost in the last
-  `lost_lookback_days`.
+  `lost_lookback_days`, or since the last sync if that is longer ago. A long pause between
+  syncs does not hide a lost link.
   - The list is limited, so a link that is missing from it is **never** forgotten. If 500
     links are stored and the next call returns 100, the other 400 stay as they were last
     seen.
@@ -139,10 +147,16 @@ and 200 for keywords. A Site Audit project costs 50 units.
 - Forgotten rows are emitted as `{"id": ..., "_deleted": True}` with a `hard_delete`
   column. dlt removes them on `merge`, cognee rebuilds the report from the remaining rows,
   and the forgotten rows leave the graph and vector stores.
-- **Errors never delete.**
-  - 429 and 5xx are retried by dlt, with `Retry-After`.
-  - 401, 403 and errors that remain after the retries raise, and dlt keeps the previous
-    rows and state.
+- **Errors never delete.** Every request is made before the first row is emitted, and the
+  state is written only after the last row. A failed run changes nothing.
+  - 429, 5xx and dropped connections are tried 4 times in total. The wait is `Retry-After`
+    when Ahrefs sends it, else 2, 4 and 8 seconds.
+  - If Ahrefs asks to wait more than 60 seconds, the run stops with
+    `AhrefsRateLimitError` and does not sleep. cognee holds its dlt staging lock during a
+    sync, so a long sleep would block other syncs.
+  - Other errors, like 400, 401 and 403, raise `AhrefsAPIError` at once. The message has
+    the status, the endpoint and Ahrefs' own error text, with the key masked.
+  - Each request has a 60-second timeout.
   - Only a confirmed 404 for a whole Site Audit project forgets it.
 
 ## Privacy
@@ -160,13 +174,13 @@ and 200 for keywords. A Site Audit project costs 50 units.
 - The rows become cognee data. Their text is embedded by your configured embedding
   provider. The relational path does not send rows to an LLM to build the graph.
 - dlt state stores the row ids, the last Domain Rating date and the snapshot dates.
-- Logs and `cognee_sync_stats` contain counts only.
+- Logs and `cognee_sync_stats` contain counts only. The API key is never in an error or a
+  log line; a test checks this for every error status.
 - Keep the API key out of code and version control. Use `AHREFS_API_KEY`.
 
 ## Limitations
 
 - Backlinks outside the strongest `backlinks_limit` are not tracked.
-- A lost backlink is only seen within `lost_lookback_days`; sync more often than that.
 - If every row of a report is forgotten (for example, every tracked link is lost),
   cognee keeps the last data of that report: its relational path does not delete on an
   empty read. Forget that data item or the dataset with `cognee.forget`.
@@ -176,6 +190,7 @@ and 200 for keywords. A Site Audit project costs 50 units.
 ## Testing
 
 ```bash
+uv sync --group dev
 uv run pytest tests/
 ```
 
@@ -184,13 +199,18 @@ mounted on a `requests` session, so every request still goes through dlt's `rest
 code. It answers with one page, honors `limit`, and sets the unit cost header.
 
 - `test_ahrefs_sync.py` covers the request shape, the Domain Rating date cursor, the
-  500-to-100 backlinks case, lost links, the same link twice, keyword and Site Audit
-  snapshots with retention and same-day replacement, a deleted Site Audit project, a
-  removed target, 401/403/429/500 that never delete, unit headers, the usage check for the
-  key and the workspace, and free targets.
+  500-to-100 backlinks case, lost links, the same link twice, a long pause between syncs,
+  keyword and Site Audit snapshots with retention and same-day replacement, a deleted
+  Site Audit project, a removed target, and errors that never delete. It checks retries
+  for 429, 5xx and dropped connections, a long `Retry-After` that stops the run, the
+  timeout, `check_active` before every request and retry, the key never showing in an
+  error or log, unit headers, the usage check and free targets. Random histories (seeded)
+  compare backlinks and snapshots with a simple model over 40 syncs each.
 - `test_ahrefs_source.py` covers the factory: one source per report on the relational
-  path, argument checks, the `max_units` budget, the cost formula, free targets, and a real
-  dlt run where a failed sync keeps the rows and the next sync forgets a lost link.
+  path, argument checks, `resource_name`, the `service` alias, the `max_units` budget, the
+  cost formula and free targets. Real dlt runs check that a failed sync keeps the rows,
+  that two accounts in one dataset keep their own rows and state, and that 2,000 links over
+  6 syncs keep staging equal to the model.
 - `test_ahrefs_forget.py` runs the real `cognee.remember` (LLM and embeddings mocked) and
   checks that a lost backlink leaves the graph while the other link and the Domain Rating
   report stay.

@@ -1,13 +1,12 @@
 [project]
 name = "cognee-community-connector-ahrefs"
 version = "0.1.0"
-description = "Ahrefs data-source connector for cognee — dated SEO snapshots (Domain Rating + backlinks) with forget-on-delete"
+description = "Ahrefs data-source connector for cognee — Domain Rating, backlinks, keywords and Site Audit as dated rows (incremental + forget-on-delete)"
 readme = "README.md"
-requires-python = ">=3.11,<3.14"
+requires-python = ">=3.10,<3.15"
 dependencies = [
-    # Requires table-scoped document cleanup (DOCUMENT_SYNC_VERSION),
-    # PIPELINE_SCOPE_ATTR and guarded_rows, first shipped together in cognee 1.6.1.
-    "cognee==1.6.3",
+    # PIPELINE_SCOPE_ATTR and guarded_rows ship in cognee 1.6.1 and later.
+    "cognee>=1.6.3,<2",
     "dlt[sqlalchemy]>=1.9.0,<2",
 ]
 
@@ -24,7 +23,7 @@ packages = ["cognee_community_connector_ahrefs"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "N", "B", "UP", "C4", "PGH", "SIM", "RUF"]
@@ -36,4 +35,5 @@ select = ["E", "W", "F", "I", "N", "B", "UP", "C4", "PGH", "SIM", "RUF"]
 dev = [
     "pytest>=8,<9",
     "pytest-asyncio>=0.23,<2",
+    "ruff>=0.6",
 ]

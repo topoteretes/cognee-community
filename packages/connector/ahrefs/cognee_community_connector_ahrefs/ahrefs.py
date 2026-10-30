@@ -1,70 +1,21 @@
-"""Ahrefs connector for cognee — ``dlt`` sources that keep dated SEO data in memory.
+"""Ahrefs connector for cognee: dated SEO rows for Domain Rating, backlinks,
+organic keywords and Site Audit issues, one ``dlt`` source per report.
 
-Sync Domain Rating history, backlinks, organic keyword rankings and Site Audit
-issues into cognee.  The sources produced here are handed directly to
-:func:`cognee.remember`::
-
-    import cognee
-    from cognee_community_connector_ahrefs import ahrefs_source
-
-    await cognee.remember(
-        ahrefs_source(targets=["example.com"], reports=["domain_rating", "backlinks"]),
-        dataset_name="seo",
-        primary_key="id",
-        write_disposition="merge",   # incremental upserts + forget-on-delete
-        max_rows_per_table=0,        # 0 = no row cap (reports exceed the default 50)
-    )
-
-Design
-------
-* **One source per report** — ``ahrefs_source`` returns one ``dlt`` source per
-  selected report, so each report is its own cognee data item.  Syncing Domain
-  Rating does not rebuild the backlinks in memory, and a report that returns
-  nothing new leaves its data as it is.
-* **Relational path** — rows are SEO metrics, not prose, so no document-source
-  marker is set.  cognee builds the graph from the rows without an LLM, and
-  every ISO date cell becomes a ``Timestamp`` edge, so trends stay queryable.
-* **Transport** — every call goes through dlt's declarative ``rest_api``
-  source: Bearer auth, one page per request (Ahrefs has no page cursor), and
-  dlt's retries for 429 and 5xx with ``Retry-After``.
-* **Cost** — the API is billed in units.  Only Domain Rating is on by default.
-  The worst-case cost of a sync is checked against ``max_units`` when the
-  sources are built, then against the units left on the key (a free endpoint)
-  before the first paid request.  Each request asks only for 1-unit fields,
-  and the units Ahrefs reports as spent are kept in ``cognee_sync_stats``.
-* **Sync per report**
-  - Domain Rating: a dated series.  The first run reads ``history_months``;
-    later runs read from the last stored date, so the open period is refreshed.
-  - Backlinks: the strongest ``backlinks_limit`` links, with links lost in the
-    last ``lost_lookback_days``.  The list is limited, so a link that is
-    missing from it is never forgotten.  Only a link Ahrefs marks as lost is.
-  - Organic keywords and Site Audit issues: one dated snapshot per day.  The
-    last ``keep_snapshots`` snapshots are kept; older ones are forgotten.
-* **Forget-on-delete** — lost backlinks, snapshots past retention, targets or
-  projects removed from the config, and a Site Audit project that answers 404
-  are emitted with the ``_deleted`` hard-delete marker.  cognee rebuilds the
-  report from staging and drops the rest from the graph and vector stores.
-* **Errors never delete** — 401, 403, 429 and 5xx raise after dlt's retries,
-  and dlt keeps the previous state and rows.
-
-Limitations
------------
-* Backlinks outside the strongest ``backlinks_limit`` are not tracked; a link
-  that drops out of that list stays as it was last seen.
-* If every row of a report is forgotten, cognee keeps the last data of that
-  report (its relational path does not delete on an empty read).  Forget the
-  data item or the dataset in that case.
+The rows take cognee's relational path. Every call goes through dlt's
+``rest_api`` source. See the README for the sync and cost design.
 """
 
 import contextlib
 import os
 import re
+import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Any
 from urllib.parse import urlparse
 
+import requests
 from cognee.shared.logging_utils import get_logger
 from cognee.tasks.ingestion import dlt_utils
 
@@ -97,8 +48,30 @@ KEYWORD_FIELDS = ("keyword", "keyword_country", "best_position", "best_position_
 MODES = ("exact", "prefix", "domain", "subdomains")
 HISTORY_GROUPINGS = ("daily", "weekly", "monthly")
 DEFAULT_MAX_UNITS = 1000
+DEFAULT_RESOURCE_NAME = "ahrefs"
 
-_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+# Retries for 429, 5xx and network errors. A longer Retry-After stops the run
+# instead of sleeping, because cognee holds its dlt staging lock meanwhile.
+MAX_ATTEMPTS = 4
+MAX_RETRY_AFTER = 60.0
+REQUEST_TIMEOUT = 60.0
+_RETRY_STATUSES = (429, 500, 502, 503, 504)
+
+# Table names are <resource_name>_<report>; the longest suffix has 17 characters
+# and Postgres cuts identifiers at 63.
+_RESOURCE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
+
+
+class AhrefsAPIError(RuntimeError):
+    """Ahrefs answered with an error, or did not answer. Never holds the key."""
+
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
+
+
+class AhrefsRateLimitError(AhrefsAPIError):
+    """Ahrefs kept answering 429, or asked to wait longer than ``MAX_RETRY_AFTER``."""
 
 
 class AhrefsUnitsError(RuntimeError):
@@ -123,34 +96,51 @@ def _today() -> date:
     return date.today()
 
 
+def _sleep(seconds: float) -> None:
+    time.sleep(seconds)
+
+
 # ---------------------------------------------------------------------------
-# Transport: dlt rest_api
+# Transport: dlt rest_api with bounded retries
 # ---------------------------------------------------------------------------
 Fetch = Callable[[str, dict, str], list[dict]]
 
 
-def _make_fetch(api_key: str, session: Any, stats: dict) -> Fetch:
+class _TimeoutSession(requests.Session):
+    """A session that never waits forever on one request."""
+
+    def send(self, request, **kwargs):
+        kwargs["timeout"] = kwargs.get("timeout") or REQUEST_TIMEOUT
+        return super().send(request, **kwargs)
+
+
+def _make_fetch(
+    api_key: str,
+    session: Any,
+    stats: dict,
+    check_active: Callable[[], None] | None = None,
+) -> Fetch:
     """Return ``fetch(path, params, data_selector) -> rows`` built on dlt's rest_api."""
     from dlt.sources.rest_api import rest_api_resources
+
+    session = session if session is not None else _TimeoutSession()
 
     def record_cost(response, *_args, **_kwargs) -> None:
         stats["requests"] += 1
         with contextlib.suppress(TypeError, ValueError):
             stats["units_used"] += int(response.headers.get("x-api-units-cost-total-actual", 0))
 
-    def fetch(path: str, params: dict, data_selector: str) -> list[dict]:
-        client: dict[str, Any] = {
-            "base_url": API_BASE_URL,
-            "auth": {"type": "bearer", "token": api_key},
-            "headers": {"Accept": "application/json"},
-            # Ahrefs answers in one page; a bigger result needs a bigger `limit`.
-            "paginator": "single_page",
-        }
-        if session is not None:
-            client["session"] = session
+    def request_once(path: str, params: dict, data_selector: str) -> list[dict]:
         (resource,) = rest_api_resources(
             {
-                "client": client,
+                "client": {
+                    "base_url": API_BASE_URL,
+                    "auth": {"type": "bearer", "token": api_key},
+                    "headers": {"Accept": "application/json"},
+                    # Ahrefs answers in one page; a bigger result needs a bigger `limit`.
+                    "paginator": "single_page",
+                    "session": session,
+                },
                 "resources": [
                     {
                         "name": "ahrefs_request",
@@ -166,19 +156,97 @@ def _make_fetch(api_key: str, session: Any, stats: dict) -> Fetch:
         )
         return list(resource)
 
+    def fetch(path: str, params: dict, data_selector: str) -> list[dict]:
+        attempt = 0
+        while True:
+            attempt += 1
+            if check_active is not None:
+                check_active()
+            try:
+                return request_once(path, params, data_selector)
+            except Exception as exc:
+                response = _http_response(exc)
+                if response is None and not _is_network_error(exc):
+                    raise
+                status = response.status_code if response is not None else None
+                reason = _error_text(response, api_key)
+                if status in (401, 403):
+                    stats["failed_auth"] += 1
+                if status is not None and status not in _RETRY_STATUSES:
+                    raise AhrefsAPIError(
+                        f"Ahrefs answered {status} for {path}{reason}.", status
+                    ) from None
+                delay = _retry_delay(response, attempt)
+                too_long = delay > MAX_RETRY_AFTER
+                if too_long or attempt >= MAX_ATTEMPTS:
+                    what = f"answered {status}" if status else "did not answer"
+                    when = f" and asked to wait {delay:.0f}s" if too_long else ""
+                    tries = "" if too_long else f" after {attempt} attempts"
+                    message = (
+                        f"Ahrefs {what} for {path}{when}{tries}{reason}. "
+                        "The sync stopped and changed nothing; run it again later."
+                    )
+                    if status == 429:
+                        stats["failed_rate_limit"] += 1
+                        raise AhrefsRateLimitError(message, status) from None
+                    raise AhrefsAPIError(message, status) from None
+                stats["retries"] += 1
+                logger.warning(
+                    "Ahrefs %s: %s, retrying in %.0fs (%d/%d).",
+                    path,
+                    status or "network error",
+                    delay,
+                    attempt,
+                    MAX_ATTEMPTS,
+                )
+                _sleep(delay)
+
     return fetch
 
 
-def _http_status(exc: BaseException) -> int | None:
-    """HTTP status behind an error raised while dlt iterated a rest_api resource."""
+def _http_response(exc: BaseException) -> Any:
+    """The HTTP response behind an error raised while dlt iterated a rest_api resource."""
     seen = set()
-    while exc is not None and id(exc) not in seen:
-        seen.add(id(exc))
-        status = getattr(getattr(exc, "response", None), "status_code", None)
-        if status is not None:
-            return int(status)
-        exc = exc.__cause__ or exc.__context__
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        response = getattr(current, "response", None)
+        if response is not None and getattr(response, "status_code", None) is not None:
+            return response
+        current = current.__cause__ or current.__context__
     return None
+
+
+def _is_network_error(exc: BaseException) -> bool:
+    seen = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, (requests.ConnectionError, requests.Timeout)):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _error_text(response: Any, api_key: str) -> str:
+    """Ahrefs' own error message, short, with the key masked."""
+    if response is None:
+        return ""
+    try:
+        text = str(response.json().get("error") or "")
+    except (ValueError, AttributeError):  # no JSON body, or not an object
+        text = ""
+    text = text.replace(api_key, "***")[:200]
+    return f": {text}" if text else ""
+
+
+def _retry_delay(response: Any, attempt: int) -> float:
+    """Retry-After when Ahrefs sends it, else 2, 4, 8 seconds."""
+    header = response.headers.get("Retry-After") if response is not None else None
+    try:
+        return max(0.0, float(header))
+    except (TypeError, ValueError):
+        return float(2**attempt)
 
 
 def _check_units(fetch: Fetch, needed: int, stats: dict) -> None:
@@ -233,6 +301,20 @@ def _estimate(report: str, config: _Config) -> int:
 # ---------------------------------------------------------------------------
 # Sync state machine (pure given a fetch + state dict — unit-testable)
 # ---------------------------------------------------------------------------
+def _new_stats(estimate: int) -> dict[str, int]:
+    return {
+        "requests": 0,
+        "retries": 0,
+        "units_estimated": estimate,
+        "units_used": 0,
+        "rows": 0,
+        "deleted": 0,
+        "truncated": 0,
+        "failed_auth": 0,
+        "failed_rate_limit": 0,
+    }
+
+
 def _iter_rows(
     report: str,
     fetch: Fetch,
@@ -248,7 +330,7 @@ def _iter_rows(
     after the last one, so a failed run changes nothing.
     """
     stats.clear()
-    stats.update(requests=0, units_estimated=estimate, units_used=0, rows=0, deleted=0, truncated=0)
+    stats.update(_new_stats(estimate))
 
     old_scopes: dict[str, dict] = dict(state.get("scopes", {}))
     active = config.project_ids if report == "site_audit" else config.targets
@@ -325,7 +407,10 @@ def _sync_domain_rating(fetch, config, target, scope_state, today, rows, deletes
 
 
 def _sync_backlinks(fetch, config, target, scope_state, today, rows, deletes, stats):
+    # Read lost links back to the last sync at least, so a long pause between
+    # syncs cannot hide a lost link.
     since = (today - timedelta(days=config.lost_lookback_days)).isoformat()
+    since = min(since, scope_state.get("last_synced") or since)
     items = fetch(
         "site-explorer/all-backlinks",
         {
@@ -342,11 +427,6 @@ def _sync_backlinks(fetch, config, target, scope_state, today, rows, deletes, st
     )
     if len(items) >= config.backlinks_limit:
         stats["truncated"] += 1
-        logger.info(
-            "Ahrefs backlinks: the result hit backlinks_limit=%d; links outside it are kept "
-            "as last seen, never forgotten.",
-            config.backlinks_limit,
-        )
 
     # The same link can appear more than once on a page. Live wins over lost.
     links: dict[str, dict] = {}
@@ -381,7 +461,7 @@ def _sync_backlinks(fetch, config, target, scope_state, today, rows, deletes, st
                 "_deleted": False,
             }
         )
-    return {"known": sorted(known)}
+    return {"known": sorted(known), "last_synced": today.isoformat()}
 
 
 def _sync_organic_keywords(fetch, config, target, scope_state, today, rows, deletes, stats):
@@ -426,8 +506,8 @@ def _sync_site_audit(fetch, config, project_id, scope_state, today, rows, delete
     snapshot = today.isoformat()
     try:
         items = fetch("site-audit/issues", {"project_id": project_id}, "issues")
-    except Exception as exc:
-        if _http_status(exc) != 404:
+    except AhrefsAPIError as exc:
+        if exc.status != 404:
             raise
         # The project was deleted or this key cannot see it any more.
         logger.warning("Ahrefs Site Audit: a project was not found; forgetting its issues.")
@@ -506,14 +586,16 @@ def ahrefs_source(
     country: str | None = None,
     lost_lookback_days: int = 90,
     keep_snapshots: int = 12,
-    name: str = "ahrefs",
+    resource_name: str = DEFAULT_RESOURCE_NAME,
     check_active: Callable[[], None] | None = None,
     session: Any = None,
+    service: Any = None,
 ) -> list:
     """Return one ``dlt`` source per selected report.
 
     Hand the list to ``cognee.remember(...)`` with ``write_disposition="merge"``,
-    ``primary_key="id"`` and ``max_rows_per_table=0``.
+    ``primary_key="id"``, ``max_rows_per_table=0``, ``incremental_loading=False``
+    and ``data_cache=False``.
 
     Args:
         targets: Domains or URLs for the Site Explorer reports, like ``["example.com"]``.
@@ -529,16 +611,22 @@ def ahrefs_source(
         backlinks_limit: Strongest backlinks tracked per target.
         keywords_limit: Best-ranked keywords kept per target and snapshot.
         country: Two-letter country for keyword rankings.  All countries when omitted.
-        lost_lookback_days: How far back lost backlinks are read.  Sync more
-            often than this, or a lost link may be missed.
+        lost_lookback_days: How far back lost backlinks are read, at least back
+            to the last sync.
         keep_snapshots: Keyword and Site Audit snapshots kept per target or project.
-        name: Prefix of the source and table names.  Give each Ahrefs account
-            its own name when several sync into one dataset.
-        check_active: Optional host authorization checkpoint during extraction.
-        session: A ``requests`` session for the API, mainly for tests.  Without
-            it, dlt's session retries 429 and 5xx.
+        resource_name: Prefix of the table, source and sync state names
+            (``<resource_name>_<report>``).  Give each Ahrefs account or
+            configuration its own name when several sync into one dataset.
+        check_active: Optional host authorization checkpoint, called before
+            every request and around every row.
+        session: A ``requests`` session for the API, mainly for tests.
+            ``service`` is an alias.
     """
     import dlt
+
+    if session is not None and service is not None and session is not service:
+        raise ValueError("Pass session= or service=, not both.")
+    session = session if session is not None else service
 
     selected = _normalize_reports(reports)
     config = _Config(
@@ -553,8 +641,12 @@ def ahrefs_source(
         lost_lookback_days=_at_least("lost_lookback_days", lost_lookback_days, 1),
         keep_snapshots=_at_least("keep_snapshots", keep_snapshots, 1),
     )
-    if not _NAME_RE.match(name):
-        raise ValueError("name must start with a letter and use only a-z, 0-9 and _.")
+    _at_least("max_units", max_units, 0)
+    if not isinstance(resource_name, str) or not _RESOURCE_NAME_RE.match(resource_name):
+        raise ValueError(
+            "resource_name must start with a letter, use only a-z, 0-9 and _, "
+            "and have at most 40 characters."
+        )
     if any(r in TARGET_REPORTS for r in selected) and not config.targets:
         # An empty list would forget every synced row, so refuse it.
         raise ValueError('targets is empty. Pass domains like ["example.com"].')
@@ -577,15 +669,22 @@ def ahrefs_source(
 
     return [
         _report_source(
-            dlt, report, name, config, resolved_key, estimates[report], session, check_active
+            dlt,
+            report,
+            resource_name,
+            config,
+            resolved_key,
+            estimates[report],
+            session,
+            check_active,
         )
         for report in selected
     ]
 
 
-def _report_source(dlt, report, name, config, api_key, estimate, session, check_active):
-    table_name = f"{name}_{report}"
-    stats: dict[str, int] = {}
+def _report_source(dlt, report, resource_name, config, api_key, estimate, session, check_active):
+    table_name = f"{resource_name}_{report}"
+    stats: dict[str, int] = _new_stats(estimate)
 
     @dlt.resource(
         name=table_name,
@@ -597,7 +696,7 @@ def _report_source(dlt, report, name, config, api_key, estimate, session, check_
         columns={"_deleted": {"data_type": "bool", "hard_delete": True}},
     )
     def report_rows():
-        fetch = _make_fetch(api_key, session, stats)
+        fetch = _make_fetch(api_key, session, stats, check_active)
         yield from dlt_utils.guarded_rows(
             _iter_rows(report, fetch, config, dlt.current.resource_state(), stats, estimate),
             check_active,
@@ -608,10 +707,12 @@ def _report_source(dlt, report, name, config, api_key, estimate, session, check_
         return report_rows
 
     source = ahrefs_report()
-    # Keeps this report's dlt state apart from other sources in the dataset.
+    # The pipeline scope, the source, the resource and the table share one name,
+    # so this report's dlt state stays apart from every other source.
     setattr(source, dlt_utils.PIPELINE_SCOPE_ATTR, table_name)
-    # Host-readable diagnostics contain counts only, never targets or rows.
+    # Host-readable diagnostics contain counts only, never targets, rows or the key.
     source.cognee_sync_stats = stats
+    source.resources[table_name].cognee_sync_stats = stats
     return source
 
 
@@ -644,6 +745,6 @@ def _one_of(field: str, value: str, allowed: tuple[str, ...]) -> str:
 
 
 def _at_least(field: str, value: int, minimum: int) -> int:
-    if not isinstance(value, int) or value < minimum:
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
         raise ValueError(f"{field} must be an integer of at least {minimum}.")
     return value

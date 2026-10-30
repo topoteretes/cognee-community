@@ -6,10 +6,14 @@ lost link, a limited result, a removed target, a failed request, ...) and
 checks the rows the connector yields and the state it keeps for the next run.
 """
 
+import logging
+import random
+import re
 from datetime import date
 
 import pytest
-from fake_ahrefs import FakeAhrefs
+import requests
+from fake_ahrefs import API_KEY, FakeAhrefs
 
 import cognee_community_connector_ahrefs.ahrefs as module
 
@@ -20,6 +24,14 @@ TARGET = "example.com"
 @pytest.fixture(autouse=True)
 def fixed_today(monkeypatch):
     monkeypatch.setattr(module, "_today", lambda: TODAY)
+
+
+@pytest.fixture(autouse=True)
+def sleeps(monkeypatch):
+    """Record retry waits instead of sleeping."""
+    waits: list[float] = []
+    monkeypatch.setattr(module, "_sleep", waits.append)
+    return waits
 
 
 @pytest.fixture
@@ -44,10 +56,10 @@ def config(**overrides):
     return module._Config(**values)
 
 
-def sync(api, report, state, **overrides):
+def sync(api, report, state, check_active=None, **overrides):
     cfg = config(**overrides)
     stats: dict = {}
-    fetch = module._make_fetch("test-key", api.session(), stats)
+    fetch = module._make_fetch(API_KEY, api.session(), stats, check_active)
     rows = list(module._iter_rows(report, fetch, cfg, state, stats, module._estimate(report, cfg)))
     upserts = {row["id"]: row for row in rows if not row["_deleted"]}
     deletes = sorted(row["id"] for row in rows if row["_deleted"])
@@ -352,8 +364,18 @@ def test_removing_a_target_forgets_its_rows(api):
     assert set(state["scopes"]) == {"other.test"}
 
 
-@pytest.mark.parametrize("status", [401, 403, 429, 500])
-def test_errors_never_delete_and_keep_the_state(api, status):
+@pytest.mark.parametrize(
+    ("status", "error", "attempts"),
+    [
+        (400, module.AhrefsAPIError, 1),
+        (401, module.AhrefsAPIError, 1),
+        (403, module.AhrefsAPIError, 1),
+        (429, module.AhrefsRateLimitError, 4),
+        (500, module.AhrefsAPIError, 4),
+        (503, module.AhrefsAPIError, 4),
+    ],
+)
+def test_errors_never_delete_and_keep_the_state(api, status, error, attempts):
     api.backlinks[TARGET] = [link(1), link(2)]
     state: dict = {}
     sync(api, "backlinks", state)
@@ -361,10 +383,12 @@ def test_errors_never_delete_and_keep_the_state(api, status):
 
     api.backlinks[TARGET] = [link(1), link(2, is_lost=True, last_seen="2026-10-10")]
     api.fail["site-explorer/all-backlinks"] = status
-    with pytest.raises(Exception) as caught:
+    api.calls.clear()
+    with pytest.raises(error) as caught:
         sync(api, "backlinks", state)
 
-    assert module._http_status(caught.value) == status
+    assert caught.value.status == status
+    assert api.paths().count("site-explorer/all-backlinks") == attempts
     assert state == saved
 
 
@@ -374,12 +398,288 @@ def test_a_site_audit_server_error_does_not_forget_the_project(api):
     sync(api, "site_audit", state)
     api.fail["site-audit/issues"] = 500
 
-    with pytest.raises(Exception) as caught:
+    with pytest.raises(module.AhrefsAPIError) as caught:
         sync(api, "site_audit", state)
 
-    assert module._http_status(caught.value) == 500
-
+    assert caught.value.status == 500
     assert list(state["scopes"]) == ["42"]
+
+
+# ---------------------------------------------------------------------------
+# Retries and rate limits
+# ---------------------------------------------------------------------------
+def test_a_short_429_is_retried_after_retry_after(api, sleeps):
+    api.domain_ratings[TARGET] = [{"date": "2026-10-01", "domain_rating": 70}]
+    api.queue["site-explorer/domain-rating-history"] = [(429, {"Retry-After": "3"})]
+
+    upserts, _, stats = sync(api, "domain_rating", {})
+
+    assert set(upserts) == {f"{TARGET}|2026-10-01"}
+    assert sleeps == [3.0]
+    assert stats["retries"] == 1
+    assert stats["failed_rate_limit"] == 0
+
+
+def test_a_long_retry_after_stops_the_run_without_sleeping(api, sleeps):
+    api.domain_ratings[TARGET] = [{"date": "2026-10-01", "domain_rating": 70}]
+    api.queue["site-explorer/domain-rating-history"] = [(429, {"Retry-After": "86400"})]
+    state: dict = {}
+
+    with pytest.raises(module.AhrefsRateLimitError, match="asked to wait 86400s") as caught:
+        sync(api, "domain_rating", state)
+
+    assert caught.value.status == 429
+    assert sleeps == []
+    assert api.paths().count("site-explorer/domain-rating-history") == 1
+    assert state == {}
+
+
+def test_a_server_error_with_a_long_retry_after_stops_too(api, sleeps):
+    api.queue["site-explorer/domain-rating-history"] = [(503, {"Retry-After": "3600"})]
+
+    with pytest.raises(module.AhrefsAPIError, match="asked to wait 3600s") as caught:
+        sync(api, "domain_rating", {})
+
+    assert caught.value.status == 503
+    assert not isinstance(caught.value, module.AhrefsRateLimitError)
+    assert sleeps == []
+
+
+def test_an_error_body_that_is_not_json_still_gives_a_clear_error(api):
+    api.queue["site-explorer/domain-rating-history"] = [(400, {"content-type": "text/html"})]
+
+    with pytest.raises(module.AhrefsAPIError, match="answered 400 for"):
+        sync(api, "domain_rating", {})
+
+
+def test_server_errors_back_off_and_then_succeed(api, sleeps):
+    api.domain_ratings[TARGET] = [{"date": "2026-10-01", "domain_rating": 70}]
+    api.queue["site-explorer/domain-rating-history"] = [502, 503, 500]
+
+    upserts, _, stats = sync(api, "domain_rating", {})
+
+    assert set(upserts) == {f"{TARGET}|2026-10-01"}
+    assert sleeps == [2.0, 4.0, 8.0]
+    assert stats["retries"] == 3
+
+
+def test_a_dropped_connection_is_retried(api, sleeps):
+    api.domain_ratings[TARGET] = [{"date": "2026-10-01", "domain_rating": 70}]
+    api.queue["site-explorer/domain-rating-history"] = ["network", "network"]
+
+    upserts, _, stats = sync(api, "domain_rating", {})
+
+    assert set(upserts) == {f"{TARGET}|2026-10-01"}
+    assert stats["retries"] == 2
+
+
+def test_a_connection_that_stays_down_raises_a_clear_error(api, sleeps):
+    api.queue["site-explorer/domain-rating-history"] = ["network"] * 4
+
+    with pytest.raises(
+        module.AhrefsAPIError, match=r"did not answer .* after 4 attempts"
+    ) as caught:
+        sync(api, "domain_rating", {})
+
+    assert caught.value.status is None
+    assert len(sleeps) == 3
+
+
+def test_ahrefs_error_text_is_kept_with_the_key_masked(api):
+    api.fail["site-explorer/domain-rating-history"] = 400
+
+    with pytest.raises(module.AhrefsAPIError, match=re.escape("answered 400 for")) as caught:
+        sync(api, "domain_rating", {})
+
+    assert str(caught.value).endswith(": failed for ***.")
+
+
+@pytest.mark.parametrize("answer", [400, 401, 403, 404, 429, 500, 503, "network"])
+def test_the_api_key_never_shows_in_errors_or_logs(api, caplog, answer):
+    caplog.set_level(logging.DEBUG)
+    if answer == 404:
+        report, scopes = "site_audit", {"42": {"snapshots": {"2026-10-01": ["42|x"]}}}
+    else:
+        report, scopes = "domain_rating", {}
+        path = "site-explorer/domain-rating-history"
+        api.queue[path] = ["network" if answer == "network" else (answer, {"Retry-After": "1"})] * 4
+
+    texts = []
+    try:
+        sync(api, report, {"scopes": scopes})
+    except Exception as exc:
+        current: BaseException | None = exc
+        while current is not None:
+            texts += [str(current), repr(current)]
+            current = current.__cause__ or current.__context__
+
+    texts += [record.getMessage() for record in caplog.records]
+    assert texts, "the scenario should raise or log something"
+    assert all(API_KEY not in text for text in texts)
+
+
+def test_auth_failures_are_counted(api):
+    stats = module._new_stats(0)
+    fetch = module._make_fetch("wrong-key", api.session(), stats)
+
+    with pytest.raises(module.AhrefsAPIError) as caught:
+        fetch("site-explorer/domain-rating-history", {"target": TARGET}, "domain_ratings")
+
+    assert caught.value.status == 401
+    assert stats["failed_auth"] == 1
+    assert "wrong-key" not in str(caught.value)
+
+
+def test_requests_without_a_session_get_a_timeout(monkeypatch):
+    seen: dict = {}
+
+    def capture(self, request, **kwargs):
+        seen["timeout"] = kwargs.get("timeout")
+        raise requests.ConnectionError("offline")
+
+    monkeypatch.setattr(requests.Session, "send", capture)
+    fetch = module._make_fetch(API_KEY, None, module._new_stats(0))
+
+    with pytest.raises(module.AhrefsAPIError):
+        fetch("site-explorer/domain-rating-history", {"target": TARGET}, "domain_ratings")
+
+    assert seen["timeout"] == module.REQUEST_TIMEOUT
+
+
+# ---------------------------------------------------------------------------
+# check_active
+# ---------------------------------------------------------------------------
+def test_check_active_runs_before_every_request(api):
+    api.backlinks[TARGET] = [link(1)]
+    api.usage.update(units_limit_api_key=10_000)
+    checks = []
+
+    sync(api, "backlinks", {}, check_active=lambda: checks.append(len(api.calls)))
+
+    # Before the usage check (0 calls made) and before the report (1 call made).
+    assert checks == [0, 1]
+
+
+def test_check_active_stops_the_run_before_the_next_request(api):
+    api.backlinks[TARGET] = [link(1)]
+    api.usage.update(units_limit_api_key=10_000)
+    state: dict = {}
+
+    def revoke():
+        if len(api.calls) == 1:
+            raise PermissionError("connection revoked")
+
+    with pytest.raises(PermissionError):
+        sync(api, "backlinks", state, check_active=revoke)
+
+    assert api.paths() == ["subscription-info/limits-and-usage"]
+    assert state == {}
+
+
+def test_check_active_runs_before_each_retry(api):
+    api.domain_ratings[TARGET] = [{"date": "2026-10-01", "domain_rating": 70}]
+    api.queue["site-explorer/domain-rating-history"] = [503, 503]
+    checks = []
+
+    sync(api, "domain_rating", {}, check_active=lambda: checks.append(1))
+
+    # The free usage check, then three attempts at the report.
+    assert len(checks) == 4
+
+
+# ---------------------------------------------------------------------------
+# Long pauses between syncs
+# ---------------------------------------------------------------------------
+def test_lost_links_are_read_back_to_the_last_sync(api, monkeypatch):
+    api.backlinks[TARGET] = [link(1), link(2)]
+    state: dict = {}
+    sync(api, "backlinks", state)
+
+    # 200 days later: the link was lost 150 days ago, outside the 90-day window.
+    monkeypatch.setattr(module, "_today", lambda: date(2027, 5, 3))
+    api.backlinks[TARGET] = [link(1), link(2, is_lost=True, last_seen="2026-12-04")]
+    _, deletes, _ = sync(api, "backlinks", state)
+
+    assert api.calls[-1][1]["history"] == "since:2026-10-15"
+    assert deletes == [link_id(2)]
+
+
+# ---------------------------------------------------------------------------
+# Stress: many random syncs against an independent model
+# ---------------------------------------------------------------------------
+def _key(row: dict) -> str:
+    return f"{TARGET}|{row['url_from']}|{row['url_to']}|{row['anchor']}"
+
+
+@pytest.mark.parametrize("seed", range(5))
+def test_random_backlink_histories_match_a_simple_model(api, monkeypatch, seed):
+    """Upstream adds, loses and reranks links, and the limit changes between syncs.
+
+    The model of what memory must hold does not use the connector's code:
+    every link Ahrefs returned live, minus the links it later returned lost.
+    A link that is only missing from a result is never forgotten.
+    """
+    rng = random.Random(seed)
+    upstream: dict[int, dict] = {}
+    memory: dict[str, dict] = {}
+    expected: set[str] = set()
+    state: dict = {}
+    next_id = 0
+    day = date(2026, 1, 1)
+
+    for _ in range(40):
+        day = date.fromordinal(day.toordinal() + rng.randint(1, 30))
+        for _ in range(rng.randint(0, 15)):
+            upstream[next_id] = link(next_id, dr=float(rng.randint(0, 100)))
+            next_id += 1
+        live = [n for n in sorted(upstream) if not upstream[n]["is_lost"]]
+        for n in rng.sample(live, k=min(len(live), rng.randint(0, 5))):
+            upstream[n] = {**upstream[n], "is_lost": True, "last_seen": day.isoformat()}
+        for n in rng.sample(sorted(upstream), k=min(len(upstream), rng.randint(0, 5))):
+            upstream[n] = {**upstream[n], "domain_rating_source": float(rng.randint(0, 100))}
+        monkeypatch.setattr(module, "_today", lambda d=day: d)
+        api.backlinks[TARGET] = list(upstream.values())
+
+        upserts, deletes, _ = sync(
+            api, "backlinks", state, backlinks_limit=rng.choice([5, 20, 60, 500])
+        )
+
+        for row in api.last_backlinks:
+            (expected.discard if row["is_lost"] else expected.add)(_key(row))
+        lost = {_key(row) for row in upstream.values() if row["is_lost"]}
+        assert set(deletes) <= lost, "only links Ahrefs marked lost may be forgotten"
+        for row_id in deletes:
+            memory.pop(row_id, None)
+        memory.update(upserts)
+        assert set(memory) == expected
+        assert set(state["scopes"][TARGET]["known"]) == expected
+
+
+@pytest.mark.parametrize("seed", range(5))
+def test_random_snapshot_histories_keep_exactly_the_last_snapshots(api, monkeypatch, seed):
+    rng = random.Random(seed)
+    words = ["seo", "crm", "api", "dlt", "graph", "agent", "rank"]
+    memory: dict[str, dict] = {}
+    model: dict[str, set[str]] = {}  # snapshot day -> row ids
+    state: dict = {}
+    day = date(2026, 1, 1)
+
+    for _ in range(40):
+        if rng.random() < 0.8:  # sometimes sync twice on one day
+            day = date.fromordinal(day.toordinal() + rng.randint(1, 10))
+        picked = rng.sample(words, rng.randint(0, len(words)))
+        api.keywords[TARGET] = [keyword(w, rng.randint(1, 100)) for w in picked]
+        monkeypatch.setattr(module, "_today", lambda d=day: d)
+
+        upserts, deletes, _ = sync(api, "organic_keywords", state, keep_snapshots=4)
+
+        model[day.isoformat()] = {f"{TARGET}|{day.isoformat()}|us|{w}" for w in picked}
+        model = {d: ids for d, ids in model.items() if ids}
+        model = {d: model[d] for d in sorted(model)[-4:]}
+        for row_id in deletes:
+            memory.pop(row_id, None)
+        memory.update(upserts)
+        assert set(memory) == set().union(*model.values())
 
 
 # ---------------------------------------------------------------------------

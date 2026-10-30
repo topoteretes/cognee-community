@@ -12,6 +12,7 @@ from urllib.parse import parse_qs, urlparse
 import requests
 from requests.adapters import BaseAdapter
 
+API_KEY = "test-key"
 BASE_COST = 50
 
 
@@ -32,9 +33,14 @@ class FakeAhrefs(BaseAdapter):
             "units_limit_workspace": None,
             "units_usage_workspace": 0,
         }
-        # path -> status code to answer with instead of data
+        # path -> status code to answer with on every call
         self.fail: dict[str, int] = {}
+        # path -> answers to give once each, in order, before the real one:
+        # an int status, a (status, headers) pair, or "network" for a dropped connection
+        self.queue: dict[str, list] = {}
         self.calls: list[tuple[str, dict]] = []
+        # The full backlink records of the last answer, for model checks in tests.
+        self.last_backlinks: list[dict] = []
 
     def session(self) -> requests.Session:
         session = requests.Session()
@@ -51,10 +57,18 @@ class FakeAhrefs(BaseAdapter):
         params = {k: v[0] for k, v in parse_qs(url.query).items()}
         self.calls.append((path, params))
 
-        if request.headers.get("Authorization") != "Bearer test-key":
+        if request.headers.get("Authorization") != f"Bearer {API_KEY}":
             return _response(request, 401, {"error": "bad key"})
+        queued = self.queue.get(path)
+        if queued:
+            answer = queued.pop(0)
+            if answer == "network":
+                raise requests.ConnectionError("connection reset")
+            status, headers = answer if isinstance(answer, tuple) else (answer, {})
+            # Some APIs echo what they got; the connector must mask the key.
+            return _response(request, status, {"error": f"failed for {API_KEY}"}, 0, headers)
         if path in self.fail:
-            return _response(request, self.fail[path], {"error": "failed"})
+            return _response(request, self.fail[path], {"error": f"failed for {API_KEY}"})
 
         handler = {
             "subscription-info/limits-and-usage": self._usage,
@@ -90,6 +104,7 @@ class FakeAhrefs(BaseAdapter):
         ]
         links.sort(key=lambda link: link.get("domain_rating_source") or 0, reverse=True)
         links = links[: int(params["limit"])]
+        self.last_backlinks = [dict(link) for link in links]
         fields = params["select"].split(",")
         rows = [{f: link.get(f) for f in fields} for link in links]
         return 200, {"backlinks": rows}, _cost(len(fields), len(rows))
@@ -113,12 +128,14 @@ def _cost(fields: int, rows: int) -> int:
     return max(BASE_COST, fields * rows)
 
 
-def _response(request, status: int, body: dict, units: int = 0) -> requests.Response:
+def _response(request, status, body, units=0, headers=None) -> requests.Response:
     response = requests.Response()
     response.status_code = status
     response.headers["content-type"] = "application/json"
     response.headers["x-api-units-cost-total-actual"] = str(units)
-    response._content = json.dumps(body).encode()
+    response.headers.update(headers or {})
+    html = response.headers["content-type"] == "text/html"
+    response._content = b"<html>Bad Gateway</html>" if html else json.dumps(body).encode()
     response.url = request.url
     response.request = request
     response.reason = "OK" if status == 200 else "Error"
