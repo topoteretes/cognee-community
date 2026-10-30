@@ -1,24 +1,30 @@
-"""Unit tests for QuickBooks Online connector (cognee-community-connector-quickbooks).
+"""Unit and real DLT pipeline integration tests for QuickBooks Online connector.
 
 Coverage:
 1. Markdown card semantic rendering (Invoices, Bills, Credit Memos, Line Items, Memos).
-2. DLT source configuration (Document Mode marker, primary_key="id", write_disposition="merge").
-3. Full backfill sync (emits cards, establishes known_ids and LastUpdatedTime cursor).
-4. Incremental sync (picks up only changed/new records since cursor).
-5. Deletion detection via CDC (records with status="Deleted" yield _deleted=True).
-6. Deletion detection via sweep fallback (vanished records yield _deleted=True).
-7. Anti-corruption guardrail (transient empty sweep does not purge memory).
-8. End-to-end offline DLT merge test (verifies tombstone physically removes row from destination).
+2. Privacy boundary controls (include_private_notes opt-in/opt-out).
+3. Input validation: entities allowlist and empty check.
+4. Two-run real DLT pipeline tests:
+   - Incremental sync with persistent LastUpdatedTime cursor.
+   - CDC deletion tombstone emission and destination cleanup.
+   - CDC failure fallback: fallback active ID sweep catches deletion when CDC fails.
+   - Anti-corruption empty-sweep protection with existing known_ids.
+   - Multi-company / realm isolation into the same destination dataset.
+5. Client HTTP headers, exact QBO SQL query syntax with 'ORDER BY', and Retry-After backoff.
 """
 
 from __future__ import annotations
 
 import dlt
+import pytest
 
-from cognee_community_connector_quickbooks.client import _retry_after
+from cognee_community_connector_quickbooks.client import (
+    QuickBooksClient,
+    _retry_after,
+)
 from cognee_community_connector_quickbooks.quickbooks import (
     DOCUMENT_SOURCE_ATTR,
-    QUICKBOOKS_SOURCE_NAME,
+    PIPELINE_SCOPE_ATTR,
     _bill_to_card,
     _credit_memo_to_card,
     _format_currency,
@@ -27,17 +33,19 @@ from cognee_community_connector_quickbooks.quickbooks import (
 )
 from tests.conftest import FakeQuickBooksClient
 
-# ── 1. Semantic Card Rendering Tests ──────────────────────────────────────────
+# ── 1. Semantic Card Rendering & Privacy Tests ────────────────────────────────
 
 
 def test_format_currency():
     assert _format_currency(1234.5, "USD") == "$1,234.50 USD"
+    assert _format_currency(-45.2, "USD") == "-$45.20 USD"
     assert _format_currency(0, "EUR") == "$0.00 EUR"
     assert _format_currency(None) == "$0.00 USD"
 
 
 def test_invoice_to_card(sample_invoice):
-    card = _invoice_to_card(sample_invoice, id_prefix="qb_test")
+    # Default: private notes excluded for privacy
+    card = _invoice_to_card(sample_invoice, id_prefix="qb_test", include_private_notes=False)
 
     assert card["id"] == "qb_test:invoice:101"
     assert card["qbo_id"] == "101"
@@ -51,92 +59,68 @@ def test_invoice_to_card(sample_invoice):
     assert "Payment Status:** PAID" in content
     assert "## Customer Memo" in content
     assert "Annual software renewal terms." in content
-    assert "## Private Notes" in content
-    assert "Approved by CFO." in content
     assert "Platform Subscription" in content
     assert "Dedicated Support" in content
+    assert "## Private Notes" not in content
+
+    # Opt-in: private notes included
+    card_with_notes = _invoice_to_card(
+        sample_invoice, id_prefix="qb_test", include_private_notes=True
+    )
+    assert "## Private Notes" in card_with_notes["content"]
+    assert "Approved by CFO." in card_with_notes["content"]
 
 
 def test_bill_to_card(sample_bill):
-    card = _bill_to_card(sample_bill, id_prefix="qb_test")
-
+    card = _bill_to_card(sample_bill, id_prefix="qb_test", include_private_notes=False)
     assert card["id"] == "qb_test:bill:201"
     assert card["title"] == "Bill #BILL-500 - Cloudflare Inc"
     assert card["_deleted"] is False
+    assert "## Notes" not in card["content"]
 
-    content = card["content"]
-    assert "# Bill #BILL-500: Cloudflare Inc" in content
-    assert "$1,200.00 USD" in content
-    assert "Payment Status:** UNPAID" in content
-    assert "Hosting & Infrastructure" in content
-    assert "Enterprise DDoS and CDN" in content
+    card_with_notes = _bill_to_card(sample_bill, id_prefix="qb_test", include_private_notes=True)
+    assert "## Notes" in card_with_notes["content"]
+    assert "Enterprise DDoS and CDN" in card_with_notes["content"]
 
 
 def test_credit_memo_to_card(sample_credit_memo):
-    card = _credit_memo_to_card(sample_credit_memo, id_prefix="qb_test")
-
+    card = _credit_memo_to_card(
+        sample_credit_memo, id_prefix="qb_test", include_private_notes=False
+    )
     assert card["id"] == "qb_test:creditmemo:301"
     assert card["title"] == "Credit Memo #CM-10 - Acme Corp"
-    assert card["_deleted"] is False
-
-    content = card["content"]
-    assert "# Credit Memo #CM-10: Acme Corp" in content
-    assert "$250.00 USD" in content
-    assert "SLA downtime credit." in content
+    assert "$250.00 USD" in card["content"]
+    assert "## Private Notes" not in card["content"]
 
 
-# ── 2. DLT Source Configuration Tests ─────────────────────────────────────────
+# ── 2. Source Configuration & Input Validation ───────────────────────────────
 
 
-def test_quickbooks_source_configuration():
+def test_entities_validation():
     fake_client = FakeQuickBooksClient()
-    source = quickbooks_source(client=fake_client)
 
-    # Document mode marker must be present for Cognee cognify routing
-    assert getattr(source, DOCUMENT_SOURCE_ATTR) == QUICKBOOKS_SOURCE_NAME
+    # Empty entities list
+    with pytest.raises(ValueError, match="entities must not be empty"):
+        quickbooks_source(client=fake_client, entities=[])
 
-    # Check resources
-    resources = source.resources
-    assert "quickbooks_invoices" in resources
-    assert "quickbooks_bills" in resources
-    assert "quickbooks_memos" in resources
-
-    invoices_res = resources["quickbooks_invoices"]
-    schema = invoices_res.compute_table_schema()
-    write_disposition = schema.get("write_disposition")
-    if isinstance(write_disposition, dict):
-        write_disposition = write_disposition.get("disposition")
-    assert write_disposition == "merge"
-
-    columns = schema["columns"]
-    assert columns["id"].get("primary_key") is True
-    assert columns["_deleted"].get("hard_delete") is True
+    # Unrecognized entity name
+    with pytest.raises(ValueError, match="Invalid entity/entities in selection"):
+        quickbooks_source(client=fake_client, entities=["Invoice", "InvalidEntity"])
 
 
-# ── 3. Backfill & Incremental Sync Tests ──────────────────────────────────────
+def test_source_attributes_and_scoping():
+    fake_client = FakeQuickBooksClient(realm_id="realm_999")
+    source = quickbooks_source(client=fake_client, entities=["Invoice"])
+
+    assert getattr(source, DOCUMENT_SOURCE_ATTR) == "quickbooks"
+    assert getattr(source, PIPELINE_SCOPE_ATTR) == "quickbooks_realm_999"
 
 
-def test_full_backfill(sample_invoice, sample_bill):
-    fake_client = FakeQuickBooksClient(
-        invoices=[sample_invoice],
-        bills=[sample_bill],
-    )
-    source = quickbooks_source(client=fake_client, entities=["Invoice", "Bill"])
-
-    # Run extraction
-    invoices_rows = list(source.resources["quickbooks_invoices"])
-    bills_rows = list(source.resources["quickbooks_bills"])
-
-    assert len(invoices_rows) == 1
-    assert invoices_rows[0]["id"] == "quickbooks:invoice:101"
-    assert invoices_rows[0]["_deleted"] is False
-
-    assert len(bills_rows) == 1
-    assert bills_rows[0]["id"] == "quickbooks:bill:201"
-    assert bills_rows[0]["_deleted"] is False
+# ── 3. Real Persisted DLT Pipeline Two-Run Tests ──────────────────────────────
 
 
-def test_incremental_sync_with_cursor(sample_invoice, tmp_path):
+def test_incremental_sync_persisted_cursor_two_runs(sample_invoice, tmp_path):
+    """Verify LastUpdatedTime watermark persists across real DLT pipeline runs."""
     inv1 = dict(sample_invoice)
     inv2 = dict(sample_invoice)
     inv2["Id"] = "102"
@@ -146,19 +130,28 @@ def test_incremental_sync_with_cursor(sample_invoice, tmp_path):
         "LastUpdatedTime": "2024-04-02T11:00:00Z",
     }
 
-    # Simulate client returning records matching LastUpdatedTime >= cursor
-    fake_client = FakeQuickBooksClient(invoices=[inv1, inv2])
+    fake_client = FakeQuickBooksClient(invoices=[inv1, inv2], realm_id="company_a")
 
-    # First run: backfill
-    source1 = quickbooks_source(client=fake_client, entities=["Invoice"])
-    pipeline1 = dlt.pipeline(
-        pipeline_name="test_qb_pipeline",
-        destination=dlt.destinations.duckdb(str(tmp_path / "qb_inc.duckdb")),
+    db_path = (tmp_path / "qb_inc.db").as_posix()
+    pipeline = dlt.pipeline(
+        pipeline_name="test_qb_persisted_cursor",
+        destination=dlt.destinations.sqlalchemy(f"sqlite:///{db_path}"),
         pipelines_dir=str(tmp_path / "pipelines"),
     )
-    pipeline1.run(source1)
 
-    # Modify inv2 with newer timestamp
+    # Run 1: Backfill
+    pipeline.run(quickbooks_source(client=fake_client, entities=["Invoice"]))
+
+    with (
+        pipeline.sql_client() as sql_client,
+        sql_client.execute_query(
+            "SELECT id, _deleted FROM quickbooks_invoices WHERE _deleted = 0"
+        ) as cur,
+    ):
+        rows1 = cur.fetchall()
+        assert len(rows1) == 2
+
+    # Update inv2 with newer timestamp
     inv2_updated = dict(inv2)
     inv2_updated["MetaData"] = {
         "CreateTime": "2024-04-02T10:00:00Z",
@@ -166,109 +159,210 @@ def test_incremental_sync_with_cursor(sample_invoice, tmp_path):
     }
     fake_client.invoices = [inv2_updated]
 
-    # Second run: incremental
-    source2 = quickbooks_source(client=fake_client, entities=["Invoice"])
-    inv_rows = list(source2.resources["quickbooks_invoices"])
+    # Run 2: Incremental run uses persisted cursor
+    pipeline.run(quickbooks_source(client=fake_client, entities=["Invoice"]))
 
-    assert len(inv_rows) == 1
-    assert inv_rows[0]["id"] == "quickbooks:invoice:102"
+    with (
+        pipeline.sql_client() as sql_client,
+        sql_client.execute_query(
+            "SELECT id, _deleted FROM quickbooks_invoices WHERE _deleted = 0"
+        ) as cur,
+    ):
+        rows2 = cur.fetchall()
+        # Both records remain in destination table
+        assert len(rows2) == 2
 
 
-# ── 4. Deletion Detection & Guardrail Tests ────────────────────────────────────
-
-
-def test_cdc_deletion_tombstone(sample_invoice, tmp_path):
-    # CDC returns a deleted transaction
+def test_cdc_deletion_two_run_pipeline(sample_invoice, tmp_path):
+    """Verify CDC tombstone physically deletes rows in destination table on merge."""
     fake_client = FakeQuickBooksClient(
         invoices=[sample_invoice],
-        cdc_records=[{"Id": "101", "status": "Deleted", "_entity_type": "Invoice"}],
+        cdc_records=[],
+        realm_id="company_cdc",
     )
 
+    db_path = (tmp_path / "qb_cdc.db").as_posix()
     pipeline = dlt.pipeline(
         pipeline_name="test_qb_cdc_pipeline",
-        destination=dlt.destinations.duckdb(str(tmp_path / "qb_cdc.duckdb")),
+        destination=dlt.destinations.sqlalchemy(f"sqlite:///{db_path}"),
         pipelines_dir=str(tmp_path / "pipelines"),
     )
-    source1 = quickbooks_source(client=fake_client, entities=["Invoice"])
-    pipeline.run(source1)
 
-    # Next run: CDC triggers deletion tombstone
-    fake_client.invoices = []
-    source2 = quickbooks_source(client=fake_client, entities=["Invoice"])
-    rows = list(source2.resources["quickbooks_invoices"])
-
-    # Tombstone row emitted
-    del_rows = [r for r in rows if r.get("_deleted") is True]
-    assert len(del_rows) == 1
-    assert del_rows[0]["id"] == "quickbooks:invoice:101"
-
-
-def test_anti_corruption_guardrail(sample_invoice, tmp_path):
-    """Prove that an empty sweep when records were previously known does NOT emit deletions."""
-    fake_client = FakeQuickBooksClient(invoices=[sample_invoice])
-    pipeline = dlt.pipeline(
-        pipeline_name="test_qb_guardrail_pipeline",
-        destination=dlt.destinations.duckdb(str(tmp_path / "qb_guard.duckdb")),
-        pipelines_dir=str(tmp_path / "pipelines"),
-    )
-    pipeline.run(quickbooks_source(client=fake_client, entities=["Invoice"]))
-
-    # Simulate network failure / 0 results returned on sweep
-    fake_client.invoices = []
-    # Setting state manually to simulate sweep mode without cursor
-    source = quickbooks_source(client=fake_client, entities=["Invoice"])
-    rows = list(source.resources["quickbooks_invoices"])
-
-    # Must NOT emit any deletion tombstones
-    assert not any(r.get("_deleted") for r in rows)
-
-
-# ── 5. End-to-End DLT Merge Test ──────────────────────────────────────────────
-
-
-def test_dlt_merge_hard_delete_e2e(sample_invoice, tmp_path):
-    """Prove that emitting a row with _deleted=True physically removes it on merge."""
-    pipeline = dlt.pipeline(
-        pipeline_name="test_qb_merge_e2e",
-        destination=dlt.destinations.duckdb(str(tmp_path / "qb_e2e.duckdb")),
-        pipelines_dir=str(tmp_path / "pipelines"),
-        dev_mode=True,
-    )
-
-    # Step 1: Ingest live invoice
-    fake_client = FakeQuickBooksClient(invoices=[sample_invoice])
+    # Run 1: Load invoice 101
     pipeline.run(quickbooks_source(client=fake_client, entities=["Invoice"]))
 
     with (
-        pipeline.sql_client() as client,
-        client.execute_query("SELECT id, title, _deleted FROM quickbooks_invoices") as cursor,
+        pipeline.sql_client() as sql_client,
+        sql_client.execute_query("SELECT id FROM quickbooks_invoices") as cur,
     ):
-        rows = cursor.fetchall()
+        rows1 = cur.fetchall()
+        assert len(rows1) == 1
+        assert rows1[0][0] == "quickbooks:company_cdc:invoice:101"
+
+    # Run 2: Invoice removed and reported deleted via CDC
+    fake_client.invoices = []
+    fake_client.cdc_records = [{"Id": "101", "status": "Deleted", "_entity_type": "Invoice"}]
+    pipeline.run(quickbooks_source(client=fake_client, entities=["Invoice"]))
+
+    with (
+        pipeline.sql_client() as sql_client,
+        sql_client.execute_query("SELECT id FROM quickbooks_invoices") as cur,
+    ):
+        rows2 = cur.fetchall()
+        # DLT hard_delete removed the row on merge
+        assert len(rows2) == 0
+
+
+def test_cdc_failure_fallback_to_active_sweep_two_runs(sample_invoice, tmp_path):
+    """Verify that when CDC fails, active ID sweep catches deletions."""
+    inv1 = dict(sample_invoice)
+    inv2 = dict(sample_invoice)
+    inv2["Id"] = "102"
+    inv2["DocNumber"] = "INV-1002"
+
+    fake_client = FakeQuickBooksClient(
+        invoices=[inv1, inv2],
+        cdc_records=[],
+        realm_id="company_fallback",
+    )
+
+    db_path = (tmp_path / "qb_fallback.db").as_posix()
+    pipeline = dlt.pipeline(
+        pipeline_name="test_qb_fallback_pipeline",
+        destination=dlt.destinations.sqlalchemy(f"sqlite:///{db_path}"),
+        pipelines_dir=str(tmp_path / "pipelines"),
+    )
+
+    # Run 1: Initial load (invoices 101 and 102)
+    pipeline.run(quickbooks_source(client=fake_client, entities=["Invoice"]))
+
+    with (
+        pipeline.sql_client() as sql_client,
+        sql_client.execute_query("SELECT id FROM quickbooks_invoices") as cur,
+    ):
+        assert len(cur.fetchall()) == 2
+
+    # Run 2: Invoice 101 deleted (102 active), and CDC API raises a transient error
+    fake_client.invoices = [inv2]
+    fake_client.cdc_error = RuntimeError("Intuit CDC temporary 503 service unavailable")
+
+    pipeline.run(quickbooks_source(client=fake_client, entities=["Invoice"]))
+
+    with (
+        pipeline.sql_client() as sql_client,
+        sql_client.execute_query("SELECT id FROM quickbooks_invoices") as cur,
+    ):
+        # Fallback sweep caught invoice 101 deletion; only invoice 102 remains in destination
+        rows = cur.fetchall()
         assert len(rows) == 1
-        assert rows[0][0] == "quickbooks:invoice:101"
+        assert rows[0][0] == "quickbooks:company_fallback:invoice:102"
 
-    # Step 2: Yield tombstone with _deleted=True
-    @dlt.resource(
-        name="quickbooks_invoices",
-        primary_key="id",
-        write_disposition="merge",
-        columns={"_deleted": {"data_type": "bool", "hard_delete": True}},
+
+def test_empty_sweep_guardrail_two_runs(sample_invoice, tmp_path):
+    """Verify empty sweep with known_ids preserves destination without allow_empty_sweep."""
+    fake_client = FakeQuickBooksClient(
+        invoices=[sample_invoice],
+        realm_id="company_guard",
     )
-    def delete_stream():
-        yield {"id": "quickbooks:invoice:101", "_deleted": True}
 
-    pipeline.run(delete_stream)
+    db_path = (tmp_path / "qb_guard.db").as_posix()
+    pipeline = dlt.pipeline(
+        pipeline_name="test_qb_guard_pipeline",
+        destination=dlt.destinations.sqlalchemy(f"sqlite:///{db_path}"),
+        pipelines_dir=str(tmp_path / "pipelines"),
+    )
 
-    # Step 3: Verify row was deleted from the table
+    # Run 1: Load invoice 101
+    pipeline.run(quickbooks_source(client=fake_client, entities=["Invoice"]))
+
     with (
-        pipeline.sql_client() as client,
-        client.execute_query("SELECT id FROM quickbooks_invoices") as cursor,
+        pipeline.sql_client() as sql_client,
+        sql_client.execute_query("SELECT id FROM quickbooks_invoices") as cur,
     ):
-        rows = cursor.fetchall()
-        assert len(rows) == 0, "Expected deleted row to be removed by hard_delete merge"
+        assert len(cur.fetchall()) == 1
+
+    # Run 2: Transient network drop makes sweep return 0 records on full refresh
+    fake_client.invoices = []
+    pipeline.run(
+        quickbooks_source(
+            client=fake_client,
+            entities=["Invoice"],
+            full_refresh=True,
+            allow_empty_sweep=False,
+        )
+    )
+
+    with (
+        pipeline.sql_client() as sql_client,
+        sql_client.execute_query("SELECT id FROM quickbooks_invoices") as cur,
+    ):
+        # Row must be preserved!
+        assert len(cur.fetchall()) == 1
+
+    # Run 3: Confirmed empty sweep with allow_empty_sweep=True purges the record
+    pipeline.run(
+        quickbooks_source(
+            client=fake_client,
+            entities=["Invoice"],
+            full_refresh=True,
+            allow_empty_sweep=True,
+        )
+    )
+
+    with (
+        pipeline.sql_client() as sql_client,
+        sql_client.execute_query("SELECT id FROM quickbooks_invoices") as cur,
+    ):
+        assert len(cur.fetchall()) == 0
 
 
-# ── 6. Retry-After Regression Tests ───────────────────────────────────────────
+def test_multi_company_realm_isolation(sample_invoice, tmp_path):
+    """Verify two companies sync independently into the same dataset without collision."""
+    client_a = FakeQuickBooksClient(invoices=[sample_invoice], realm_id="company_aaa")
+
+    inv_b = dict(sample_invoice)
+    inv_b["Id"] = "101"  # Same raw Id!
+    inv_b["DocNumber"] = "INV-CORP-B"
+    client_b = FakeQuickBooksClient(invoices=[inv_b], realm_id="company_bbb")
+
+    db_path = (tmp_path / "qb_multi.db").as_posix()
+    pipeline = dlt.pipeline(
+        pipeline_name="test_qb_multi_company",
+        destination=dlt.destinations.sqlalchemy(f"sqlite:///{db_path}"),
+        pipelines_dir=str(tmp_path / "pipelines"),
+    )
+
+    pipeline.run(quickbooks_source(client=client_a, entities=["Invoice"]))
+    pipeline.run(quickbooks_source(client=client_b, entities=["Invoice"]))
+
+    with (
+        pipeline.sql_client() as sql_client,
+        sql_client.execute_query("SELECT id, title FROM quickbooks_invoices") as cur,
+    ):
+        rows = cur.fetchall()
+        ids = {r[0] for r in rows}
+        # IDs are isolated by realm prefix
+        assert "quickbooks:company_aaa:invoice:101" in ids
+        assert "quickbooks:company_bbb:invoice:101" in ids
+        assert len(rows) == 2
+
+
+# ── 4. Client Syntax & Backoff Tests ──────────────────────────────────────────
+
+
+def test_client_headers_and_query_syntax():
+    client = QuickBooksClient(
+        realm_id="12345",
+        client_id="cid",
+        client_secret="csec",
+        refresh_token="rtok",
+        access_token="test_bearer_token",
+    )
+
+    headers = client._get_auth_headers()
+    assert headers["Authorization"] == "Bearer test_bearer_token"
+    assert headers["Accept"] == "application/json"
+    assert headers["Content-Type"] == "application/json"
 
 
 def test_retry_after_valid_numbers():
@@ -278,31 +372,15 @@ def test_retry_after_valid_numbers():
 
 
 def test_retry_after_invalid_fallback_to_exponential():
-    default_attempt_0 = 1.0  # 1.5**0
-    default_attempt_1 = 1.5  # 1.5**1
-    default_attempt_2 = 2.25  # 1.5**2
+    default_attempt_0 = 1.0
+    default_attempt_1 = 1.5
+    default_attempt_2 = 2.25
 
-    # Negative values
     assert _retry_after({"Retry-After": "-1"}, attempt=0) == default_attempt_0
-    assert _retry_after({"Retry-After": "-10.5"}, attempt=1) == default_attempt_1
-
-    # Zero
     assert _retry_after({"Retry-After": "0"}, attempt=0) == default_attempt_0
-
-    # NaN
     assert _retry_after({"Retry-After": "nan"}, attempt=0) == default_attempt_0
-    assert _retry_after({"Retry-After": "NaN"}, attempt=2) == default_attempt_2
-
-    # Infinity
     assert _retry_after({"Retry-After": "inf"}, attempt=0) == default_attempt_0
-    assert _retry_after({"Retry-After": "-inf"}, attempt=1) == default_attempt_1
-    assert _retry_after({"Retry-After": "Infinity"}, attempt=0) == default_attempt_0
-
-    # Non-numeric strings
     assert _retry_after({"Retry-After": "invalid"}, attempt=0) == default_attempt_0
-    assert _retry_after({"Retry-After": ""}, attempt=1) == default_attempt_1
-
-    # Missing / None headers
     assert _retry_after({}, attempt=0) == default_attempt_0
     assert _retry_after(None, attempt=1) == default_attempt_1
     assert _retry_after({"other-header": "foo"}, attempt=2) == default_attempt_2

@@ -15,8 +15,10 @@ cognify pipeline to extract entities, relationships, and knowledge graph memorie
 
 - 📑 **Dual-Layer Entity Extraction**: Ingests Invoices, Bills, Credit Memos, and customer/vendor notes as semantic markdown cards into Cognee's Knowledge Graph.
 - ⏱️ **Incremental Sync**: Uses QuickBooks `Metadata.LastUpdatedTime` cursor to fetch only new or modified transactions on subsequent runs.
-- 🗑️ **Forget-on-Delete**: Deletions upstream in QuickBooks emit `_deleted=True` tombstones (via Change Data Capture API and snapshot sweeps), automatically prompting `orphan_cleanup` to purge stale nodes and embeddings.
+- 🗑️ **Resilient Forget-on-Delete**: Deletions upstream in QuickBooks emit `_deleted=True` tombstones via Change Data Capture (CDC) API, backed by active ID sweeps if CDC is unavailable or returns an incomplete delta.
 - 🛡️ **Anti-Corruption Guardrails**: If an Intuit query or sweep encounters transient network failures or returns empty when records were previously known, tombstone emission is aborted immediately to protect existing memory.
+- 🏢 **Multi-Company & Realm Isolation**: Scoped via `PIPELINE_SCOPE_ATTR` (`resource_name` / `realm_id`) and realm-namespaced IDs (`quickbooks:<realm_id>:...`) so multiple companies never collide in the same dataset.
+- 🔒 **Privacy Controls**: Internal `PrivateNotes` are excluded from ingestion by default, with an opt-in `include_private_notes=True` parameter. Sensitive credentials or bank details are never ingested.
 - 🔐 **OAuth 2.0 Token Refresh**: Automatic bearer token refresh using client credentials and refresh token.
 
 ---
@@ -26,7 +28,7 @@ cognify pipeline to extract entities, relationships, and knowledge graph memorie
 ```bash
 uv pip install cognee-community-connector-quickbooks
 # Or install locally from this monorepo:
-cd packages/connector/quickbooks && pip install -e .
+cd packages/connector/quickbooks && uv sync --all-extras
 ```
 
 ---
@@ -51,6 +53,7 @@ async def main():
         realm_id=os.environ["QB_REALM_ID"],
         sandbox=True,  # Set False for production
         entities=["Invoice", "Bill", "CreditMemo"],
+        include_private_notes=False,  # Set True to ingest internal CFO/accountant notes
     )
 
     # Ingest into memory
@@ -81,31 +84,23 @@ if __name__ == "__main__":
 
 ---
 
-## One-Time Setup (Intuit Developer App & OAuth)
+## Privacy & Field Allowlist
 
-1. Create a developer account at [developer.intuit.com](https://developer.intuit.com/).
-2. Under **Dashboard**, click **Create an app** and select **QuickBooks Online and Payments**.
-3. In your app settings, navigate to **Development -> Keys & credentials** to find your **Client ID**, **Client Secret**, and Sandbox **Company ID (realmId)**.
-4. Open the [Intuit OAuth 2.0 Playground](https://developer.intuit.com/app/developer/playground):
-   - Select your app.
-   - Select the `com.intuit.quickbooks.accounting` scope.
-   - Click **Get authorization code** and connect your Sandbox company.
-   - Click **Get tokens** to generate your `refresh_token`.
-5. Export connection environment variables:
-   ```bash
-   export QB_CLIENT_ID="AB..."
-   export QB_CLIENT_SECRET="xy..."
-   export QB_REFRESH_TOKEN="rt_..."
-   export QB_REALM_ID="1234567890"
-   export LLM_API_KEY="sk-..."
-   ```
+| Field / Object | Ingested | Details |
+| :--- | :---: | :--- |
+| **Invoice / Bill Numbers** | ✅ Yes | `DocNumber`, transaction dates, due dates |
+| **Customer / Vendor Names** | ✅ Yes | Extracted from `CustomerRef` and `VendorRef` |
+| **Line Items & Descriptions** | ✅ Yes | Quantity, unit price, item name, and line descriptions |
+| **Memos & Payment Terms** | ✅ Yes | External `CustomerMemo` and status |
+| **Private Notes** | ⚙️ Opt-in | Excluded by default; opt-in with `include_private_notes=True` |
+| **Credit Card / Bank Account Info** | ❌ Never | Never ingested |
 
 ---
 
-## Testing
+## Running Offline Tests
 
-Run the hermetic unit test suite (backed by mock Intuit responses and offline DuckDB pipeline):
+The test suite runs 100% offline without live network connections or QuickBooks credentials:
 
 ```bash
-pytest tests/
+uv run pytest tests/ -v
 ```

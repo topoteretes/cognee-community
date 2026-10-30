@@ -5,7 +5,7 @@ description = "QuickBooks Online data-source connector for cognee — sync invoi
 readme = "README.md"
 requires-python = ">=3.11,<=3.13"
 dependencies = [
-    "cognee>=1.4.0",
+    "cognee>=1.6.4,<2",
     "dlt[sqlalchemy]>=1.9.0,<2",
     "requests>=2.31.0,<3",
 ]
@@ -13,6 +13,9 @@ dependencies = [
 [project.urls]
 Homepage = "https://github.com/topoteretes/cognee"
 Repository = "https://github.com/topoteretes/cognee-community"
+
+[dependency-groups]
+dev = ["pytest>=8,<9", "pytest-asyncio>=1,<2", "ruff>=0.13,<1"]
 
 [build-system]
 requires = ["hatchling"]

@@ -51,20 +51,25 @@ class QuickBooksAuthError(QuickBooksError):
 
 
 class QuickBooksRateLimitError(QuickBooksError):
-    """Raised when Intuit rate limits (HTTP 429) are exhausted."""
+    """Raised when QuickBooks API rate limit (429) is exceeded after maximum retries."""
 
 
 class QuickBooksAPIError(QuickBooksError):
-    """Raised when Intuit API returns an unexpected error."""
+    """Raised when QuickBooks API returns a server or request error."""
 
-    def __init__(self, message: str, status_code: int | None = None, response_body: Any = None):
+    def __init__(
+        self,
+        message: str,
+        status_code: int | None = None,
+        response_body: str | None = None,
+    ):
         super().__init__(message)
         self.status_code = status_code
         self.response_body = response_body
 
 
 class QuickBooksClient:
-    """HTTP client for QuickBooks Online V3 REST API."""
+    """HTTP client for QuickBooks Online Accounting API v3 with Bearer OAuth 2.0."""
 
     def __init__(
         self,
@@ -120,17 +125,20 @@ class QuickBooksClient:
             raise QuickBooksAuthError(f"Token refresh request failed: {exc}") from exc
 
         if resp.status_code != 200:
-            raise QuickBooksAuthError(
-                f"Failed to refresh QuickBooks token (status {resp.status_code}): {resp.text}"
-            )
+            raise QuickBooksAuthError(f"OAuth refresh failed ({resp.status_code}): {resp.text}")
 
         data = resp.json()
-        self.access_token = data.get("access_token")
-        if data.get("refresh_token"):
-            self.refresh_token = data.get("refresh_token")
+        new_access = data.get("access_token")
+        new_refresh = data.get("refresh_token")
 
-        if not self.access_token:
-            raise QuickBooksAuthError("No access_token returned by Intuit OAuth server.")
+        if not new_access:
+            raise QuickBooksAuthError(
+                "QuickBooks did not return access_token in token refresh response."
+            )
+
+        self.access_token = new_access
+        if new_refresh:
+            self.refresh_token = new_refresh
 
         return self.access_token
 
@@ -146,7 +154,7 @@ class QuickBooksClient:
         return {
             "Authorization": f"Bearer {self.access_token}",
             "Accept": "application/json",
-            "Content-Type": "application/text",
+            "Content-Type": "application/json",
         }
 
     def request(
@@ -236,7 +244,6 @@ class QuickBooksClient:
         """Run a QuickBooks Online query (SQL-like syntax)."""
         data = self.request("GET", "query", params={"query": query_str})
         query_response = data.get("QueryResponse", {})
-        # QueryResponse contains a list keyed by the entity name (e.g. "Invoice", "Bill")
         for _key, val in query_response.items():
             if isinstance(val, list):
                 return val
@@ -254,11 +261,11 @@ class QuickBooksClient:
         while True:
             if last_updated_time:
                 # Query syntax: Metadata.LastUpdatedTime >= 'YYYY-MM-DDTHH:MM:SSZ'
-                # Note: QBO query requires single quotes around timestamps
+                # Standard Intuit QBO syntax: ORDER BY with space
                 q = (
                     f"SELECT * FROM {entity_name} "
                     f"WHERE Metadata.LastUpdatedTime >= '{last_updated_time}' "
-                    f"ORDERBY Metadata.LastUpdatedTime "
+                    f"ORDER BY Metadata.LastUpdatedTime "
                     f"STARTPOSITION {start_position} MAXRESULTS {page_size}"
                 )
             else:
@@ -277,6 +284,31 @@ class QuickBooksClient:
                 break
 
             start_position += len(items)
+
+    def fetch_active_ids(self, entity_name: str, page_size: int = 500) -> set[str]:
+        """Fetch all currently active entity IDs via lightweight ID projection queries."""
+        active_ids: set[str] = set()
+        start_position = 1
+
+        while True:
+            q = (
+                f"SELECT Id FROM {entity_name} "
+                f"STARTPOSITION {start_position} MAXRESULTS {page_size}"
+            )
+            items = self.query(q)
+            if not items:
+                break
+
+            for item in items:
+                if "Id" in item:
+                    active_ids.add(str(item["Id"]))
+
+            if len(items) < page_size:
+                break
+
+            start_position += len(items)
+
+        return active_ids
 
     def fetch_cdc(self, entities: list[str], changed_since: str) -> list[dict[str, Any]]:
         """Query Change Data Capture (CDC) endpoint for modified and deleted items.
@@ -298,4 +330,5 @@ class QuickBooksClient:
                         for item in val:
                             item["_entity_type"] = key
                             records.append(item)
+
         return records

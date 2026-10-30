@@ -116,6 +116,7 @@ def sample_credit_memo():
         "CustomerMemo": {
             "value": "SLA downtime credit.",
         },
+        "PrivateNote": "Internal discount approval.",
         "MetaData": {
             "CreateTime": "2024-04-10T14:00:00Z",
             "LastUpdatedTime": "2024-04-10T14:05:00Z",
@@ -126,11 +127,21 @@ def sample_credit_memo():
 class FakeQuickBooksClient:
     """Mock QuickBooks API client backed by in-memory data with zero network calls."""
 
-    def __init__(self, invoices=None, bills=None, credit_memos=None, cdc_records=None):
+    def __init__(
+        self,
+        invoices=None,
+        bills=None,
+        credit_memos=None,
+        cdc_records=None,
+        realm_id="12345",
+        cdc_error: Exception | None = None,
+    ):
         self.invoices = list(invoices or [])
         self.bills = list(bills or [])
         self.credit_memos = list(credit_memos or [])
         self.cdc_records = list(cdc_records or [])
+        self.realm_id = realm_id
+        self.cdc_error = cdc_error
         self.query_history: list[str] = []
 
     def fetch_all(
@@ -158,5 +169,16 @@ class FakeQuickBooksClient:
 
         yield from filtered
 
+    def fetch_active_ids(self, entity_name: str, page_size: int = 500) -> set[str]:
+        items_map = {
+            "Invoice": self.invoices,
+            "Bill": self.bills,
+            "CreditMemo": self.credit_memos,
+        }
+        items = items_map.get(entity_name, [])
+        return {str(item["Id"]) for item in items if "Id" in item}
+
     def fetch_cdc(self, entities: list[str], changed_since: str):
+        if self.cdc_error:
+            raise self.cdc_error
         return self.cdc_records
