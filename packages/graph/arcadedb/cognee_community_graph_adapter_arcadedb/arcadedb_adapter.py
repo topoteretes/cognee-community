@@ -5,7 +5,6 @@ neo4j async Python driver. The Cypher queries are standard OpenCypher, compatibl
 with ArcadeDB's 97.8% TCK compliance.
 """
 
-import asyncio
 import json
 from collections import defaultdict
 from contextlib import asynccontextmanager
@@ -104,7 +103,12 @@ class ArcadeDBAdapter(GraphDBInterface):
         }
         return await self.query(query, params)
 
-    async def add_nodes(self, nodes: list[DataPoint]) -> None:
+    async def add_nodes(
+        self,
+        nodes: list[DataPoint],
+        source_ref_key: str | None = None,
+        pipeline_run_id: str | None = None,
+    ) -> None:
         query = """
         UNWIND $nodes AS node
         MERGE (n {id: node.node_id})
@@ -227,7 +231,12 @@ class ArcadeDBAdapter(GraphDBInterface):
 
         return await self.query(query, params)
 
-    async def add_edges(self, edges: list[tuple[str, str, str, dict[str, Any]]]) -> None:
+    async def add_edges(
+        self,
+        edges: list[tuple[str, str, str, dict[str, Any]]],
+        source_ref_key: str | None = None,
+        pipeline_run_id: str | None = None,
+    ) -> None:
         grouped: dict[str, list[tuple[str, str, dict[str, Any]]]] = defaultdict(list)
         for src, dst, rel_type, properties in edges:
             grouped[rel_type].append((src, dst, properties or {}))
@@ -330,9 +339,10 @@ class ArcadeDBAdapter(GraphDBInterface):
         return [result["successor"] for result in results]
 
     async def get_neighbors(self, node_id: str) -> list[dict[str, Any]]:
-        predecessors, successors = await asyncio.gather(
-            self.get_predecessors(node_id), self.get_successors(node_id)
-        )
+        # Execute reads sequentially. ArcadeDB can reject concurrent requests
+        # with ConcurrentModificationException under load.
+        predecessors = await self.get_predecessors(node_id)
+        successors = await self.get_successors(node_id)
         return predecessors + successors
 
     async def get_node(self, node_id: str) -> Optional[dict[str, Any]]:
@@ -364,10 +374,9 @@ class ArcadeDBAdapter(GraphDBInterface):
         RETURN node, relation, neighbour
         """
 
-        predecessors, successors = await asyncio.gather(
-            self.query(predecessors_query, {"node_id": str(node_id)}),
-            self.query(successors_query, {"node_id": str(node_id)}),
-        )
+        # Execute reads sequentially to avoid concurrent database requests.
+        predecessors = await self.query(predecessors_query, {"node_id": str(node_id)})
+        successors = await self.query(successors_query, {"node_id": str(node_id)})
 
         connections = []
 

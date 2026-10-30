@@ -1,0 +1,42 @@
+define
+  attribute node-id value string;
+  attribute name value string;
+  attribute node-type value string;          # DataPoint.type (class-name string)
+  attribute relationship-name value string;
+  attribute properties-json value string;    # JSON blob of remaining fields
+  attribute created-at value integer;        # ms epoch ('long' does not exist in TypeDB 3)
+  attribute updated-at value integer;
+  attribute edge-key value string;           # JSON [source, target, rel] MERGE identity
+  attribute source-ref-key value string;     # "source_ref:v1:{dataset}:{data}", one entity per key
+  attribute source-dataset-id value string;
+  attribute source-run-id value string;
+  attribute source-run-ref value string;     # "source_run_ref:v1:{run}:{key}", one entity per ref
+  attribute position value integer;          # attach order of a provenance link
+  attribute edge-object-id value string;     # cognee's deterministic feedback id for an edge
+  attribute metadata-key value string;  attribute metadata-value value string;
+
+  entity node,
+    owns node-id @key, owns name, owns node-type,
+    owns properties-json, owns created-at, owns updated-at,
+    plays edge:source, plays edge:target,
+    plays sourced-from:artifact, plays run-attached:artifact;
+
+  relation edge,
+    relates source, relates target,
+    owns edge-key @key, owns relationship-name,
+    owns properties-json, owns created-at, owns updated-at,
+    owns edge-object-id,
+    plays sourced-from:artifact, plays run-attached:artifact;
+
+  # Provenance: one entity per source ref / run ref, linked to every artifact
+  # it owns; the link's position is the attach order.
+  entity source-ref,
+    owns source-ref-key @key, owns source-dataset-id,
+    plays sourced-from:ref;
+  entity run-ref,
+    owns source-run-ref @key, owns source-run-id,
+    plays run-attached:run;
+  relation sourced-from, relates artifact, relates ref, owns position;
+  relation run-attached, relates artifact, relates run, owns position;
+
+  entity graph-metadata, owns metadata-key @key, owns metadata-value;

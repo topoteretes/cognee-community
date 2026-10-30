@@ -55,7 +55,12 @@ class MossAdapter(VectorDBInterface):
         api_key,
         embedding_engine: EmbeddingEngine,
         database_name: str = "cognee_db",
+        **kwargs,
     ):
+        # cognee >= 1.5.0 always passes vector_db_host / vector_db_port /
+        # vector_db_username / vector_db_password to registered adapters. Moss is
+        # a hosted service addressed by project id and project key, so they are
+        # absorbed by **kwargs and ignored.
         self.embedding_engine = embedding_engine
         self.database_name = database_name
         self.api_key = api_key

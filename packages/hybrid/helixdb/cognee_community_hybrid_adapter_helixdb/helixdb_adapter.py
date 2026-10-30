@@ -7,24 +7,14 @@ import os
 import tempfile
 from datetime import UTC, datetime
 from functools import partial
-from typing import TYPE_CHECKING, Any
+from typing import Any
 from uuid import UUID
-
-from cognee.infrastructure.databases.vector.models.ScoredResult import ScoredResult
-from cognee.infrastructure.engine.utils import parse_id
-
-if TYPE_CHECKING:
-    from cognee.infrastructure.databases.graph.graph_db_interface import (
-        GraphDBInterface,
-    )
-    from cognee.infrastructure.databases.vector.vector_db_interface import (
-        VectorDBInterface,
-    )
 
 import helix
 from cognee.infrastructure.databases.exceptions import MissingQueryParameterError
 from cognee.infrastructure.databases.graph.graph_db_interface import (
     EdgeData,
+    GraphDBInterface,
     Node,
     NodeData,
 )
@@ -32,7 +22,12 @@ from cognee.infrastructure.databases.vector.embeddings import get_embedding_engi
 from cognee.infrastructure.databases.vector.embeddings.EmbeddingEngine import (
     EmbeddingEngine,
 )
+from cognee.infrastructure.databases.vector.models.ScoredResult import ScoredResult
+from cognee.infrastructure.databases.vector.vector_db_interface import (
+    VectorDBInterface,
+)
 from cognee.infrastructure.engine import DataPoint
+from cognee.infrastructure.engine.utils import parse_id
 
 # ---------------------------------------------------------------------------
 # HQL Schema – written to schema.hx and deployed on first connect
@@ -145,7 +140,7 @@ class IndexSchema(DataPoint):
     metadata: dict = {"index_fields": ["text"]}
 
 
-class HelixDBAdapter:
+class HelixDBAdapter(VectorDBInterface, GraphDBInterface):
     """Hybrid graph-vector adapter for HelixDB.
 
     Implements both GraphDBInterface and VectorDBInterface so that a single
@@ -322,7 +317,12 @@ class HelixDBAdapter:
             },
         )
 
-    async def add_nodes(self, nodes: list[Node] | list[DataPoint]) -> None:
+    async def add_nodes(
+        self,
+        nodes: list[Node] | list[DataPoint],
+        source_ref_key: str | None = None,
+        pipeline_run_id: str | None = None,
+    ) -> None:
         for node in nodes:
             if isinstance(node, tuple) and len(node) == 2:
                 node_id, properties = node
@@ -412,6 +412,8 @@ class HelixDBAdapter:
     async def add_edges(
         self,
         edges: list[EdgeData] | list[tuple[str, str, str, dict[str, Any] | None]],
+        source_ref_key: str | None = None,
+        pipeline_run_id: str | None = None,
     ) -> None:
         for edge in edges:
             if isinstance(edge, tuple) and len(edge) == 4:
@@ -739,7 +741,13 @@ class HelixDBAdapter:
     async def has_collection(self, collection_name: str) -> bool:
         return collection_name in self._collections
 
-    async def create_data_points(self, data_points: list[DataPoint]) -> None:
+    async def create_data_points(self, collection_name: str, data_points: list[DataPoint]) -> None:
+        # HelixDB multiplexes all cognee collections into the shared
+        # CogneeNode/CogneeVector schema; collection_name is accepted for
+        # VectorDBInterface compatibility (cognee calls
+        # create_data_points(collection_name, data_points)) and tracked only
+        # for has_collection().
+        self._collections.add(collection_name)
         embeddable_values: list[Any] = []
         vector_map: dict[str, dict[str, int | None]] = {}
 
@@ -956,8 +964,3 @@ class HelixDBAdapter:
         # delete the containing node instead.
         for dp_id in data_point_ids:
             await self.delete_node(str(dp_id))
-
-
-if TYPE_CHECKING:
-    _a: GraphDBInterface = HelixDBAdapter("", 0, None)  # type: ignore[arg-type]
-    _b: VectorDBInterface = HelixDBAdapter("", 0, None)  # type: ignore[arg-type]

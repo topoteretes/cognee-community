@@ -66,6 +66,43 @@ async def test_add_edges_persists_all_relationship_types(graph_engine):
     assert edge_count_rows[0]["edge_count"] == 3
 
 
+async def test_get_graph_metrics_reports_real_counts(graph_engine):
+    # Two disconnected components: Alice-Apollo-Acme (3) and Bob-Zeus (2).
+    alice_id = uuid4()
+    apollo_id = uuid4()
+    acme_id = uuid4()
+    bob_id = uuid4()
+    zeus_id = uuid4()
+
+    await graph_engine.add_nodes(
+        [
+            Person(id=alice_id, name="Alice"),
+            Project(id=apollo_id, name="Apollo"),
+            Company(id=acme_id, name="Acme"),
+            Person(id=bob_id, name="Bob"),
+            Project(id=zeus_id, name="Zeus"),
+        ]
+    )
+
+    await graph_engine.add_edges(
+        [
+            (str(alice_id), str(apollo_id), "WORKS_ON", {"role": "developer"}),
+            (str(alice_id), str(acme_id), "EMPLOYED_BY", {"since": "2025"}),
+            (str(bob_id), str(zeus_id), "WORKS_ON", {"role": "designer"}),
+        ]
+    )
+
+    metrics = await graph_engine.get_graph_metrics(include_optional=True)
+
+    assert metrics["num_nodes"] == 5
+    assert metrics["num_edges"] == 3
+    assert metrics["mean_degree"] == (2 * 3) / 5
+    assert metrics["edge_density"] == 3 / (5 * 4)
+    assert metrics["num_connected_components"] == 2
+    assert sorted(metrics["sizes_of_connected_components"], reverse=True) == [3, 2]
+    assert metrics["num_selfloops"] == 0
+
+
 async def main():
     cognee.config.set_relational_db_config({"db_provider": "sqlite"})
     cognee.config.set_graph_database_provider("memgraph")
@@ -99,6 +136,9 @@ async def main():
     await graph_engine.delete_graph()
 
     await test_add_edges_persists_all_relationship_types(graph_engine)
+
+    await graph_engine.delete_graph()
+    await test_get_graph_metrics_reports_real_counts(graph_engine)
 
 
 if __name__ == "__main__":

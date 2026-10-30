@@ -234,7 +234,7 @@ def find_node(nodes: list[Node], condition: callable) -> Node:
 async def extract_code_parts(
     tree_root: Node,
     script_path: str,
-    existing_nodes: list[DataPoint] = {},  # noqa: B006
+    existing_nodes: dict[str, DataPoint] | None = None,
 ) -> AsyncGenerator[DataPoint, None]:
     """
     Extract code parts from a given AST node tree asynchronously.
@@ -252,14 +252,21 @@ async def extract_code_parts(
 
         - tree_root (Node): The root node of the AST tree containing code parts to extract.
         - script_path (str): The file path of the script from which the AST was generated.
-        - existing_nodes (list[DataPoint]): A dictionary that holds already extracted
-          DataPoint nodes to avoid duplicates. (default {})
+        - existing_nodes (dict[str, DataPoint] | None): A dictionary that holds already
+          extracted DataPoint nodes to avoid duplicates within this call. Defaults to a fresh
+          empty dict per call. (default None)
 
     Returns:
     --------
 
         Yields DataPoint nodes representing imported modules, functions, and classes.
     """
+    # Use a per-call cache. A mutable default ({}) would be shared across every call, which
+    # deduplicates same-named definitions across different files and leaks the file_path of
+    # whichever file was parsed first.
+    if existing_nodes is None:
+        existing_nodes = {}
+
     for child_node in tree_root.children:
         if child_node.type == "import_statement" or child_node.type == "import_from_statement":
             parts = child_node.text.decode("utf-8").split()

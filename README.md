@@ -75,6 +75,9 @@ To use different LLM providers, for more info check out our <a href="https://doc
 ### Run an example to verify installation
 
 Navigate to the package directory of your choice and run the example, usually found in the **examples** directory.
+
+*All packages are located in the **packages** directory. In that directory, plugins are sorted by category: for example, adapters for various graph databases would be located under `packages/graph`.*
+
 You can run them either via uv, or poetry:
 
 ```bash
@@ -99,6 +102,7 @@ poetry run python ./examples/example.py
 | `cognee-community-graph-adapter-networkx`    | Graph    | Networkx graph database adapter for cognee         |
 | `cognee-community-graph-adapter-spanner`    | Graph    | Google Cloud Spanner (Spanner Graph) adapter for cognee |
 | `cognee-community-graph-adapter-turingdb`   | Graph    | TuringDB graph database adapter for cognee         |
+| `cognee-community-graph-adapter-typedb`     | Graph    | TypeDB graph database adapter for cognee           |
 | `cognee-community-graph-adapter-pggraph`    | Graph    | pgGraph adapter for cognee (Postgres + graph extension, experimental) |
 | `cognee-community-hybrid-adapter-duckdb`     | Hybrid   | DuckDB hybrid database adapter for cognee          |
 | `cognee-community-hybrid-adapter-falkor`     | Hybrid   | FalkorDB hybrid database adapter for cognee        |
@@ -113,11 +117,13 @@ are contained in one package (i.e. all tasks used in one pipeline are packaged t
 
 | Package Name                       | Type       | Description                    |
 |------------------------------------|------------|--------------------------------|
+| `cognee-community-connector-onenote` | Connector | [Selected OneNote notebooks with incremental content fetching](packages/connector/onenote/README.md) |
 | `cognee-community-pipeline-codify`     | Pipeline   | Custom codify pipeline package                                        |
 | `cognee-community-retriever-code`      | Retriever  | Custom CODE retriever package                                         |
 | `cognee-community-tasks-codify`        | Task       | Custom codify tasks package                                           |
 | `cognee-community-tasks-scrapegraph`   | Task       | Web scraping tasks powered by [ScrapeGraphAI](https://github.com/ScrapeGraphAI/scrapegraph-py) |
 | `cognee-community-tasks-exa`           | Task       | Web search tasks powered by [Exa](https://exa.ai)                     |
+| `cognee-community-tasks-firecrawl`     | Task       | Web scraping and search tasks powered by [Firecrawl](https://www.firecrawl.dev/?utm_source=cognee-community&utm_medium=github&utm_campaign=cognee-firecrawl-tasks) |
 
 ## Repository Structure
 

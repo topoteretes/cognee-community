@@ -39,6 +39,18 @@ Also, specify the dataset handler in the .env file:
 VECTOR_DATASET_DATABASE_HANDLER="qdrant"
 ```
 
+## Dataset isolation
+
+Datasets share collections, but stored point IDs are namespaced by `database_name`.
+Two datasets can therefore store the same Cognee entity ID independently. Search
+and retrieval return the original Cognee IDs so they still match graph nodes.
+Use a distinct `database_name` for each dataset when constructing adapters directly.
+
+Existing points with unscoped IDs remain readable and deletable only by their
+owning dataset. Re-ingesting a point writes its dataset-specific ID and then
+removes that dataset's legacy copy. Data overwritten by an older adapter must
+be re-ingested from its source; this change cannot recover it automatically.
+
 ## Quantization
 
 The adapter supports Qdrant's quantization methods, including TurboQuant (introduced in Qdrant 1.18). Quantization compresses stored vectors and reduces memory cost; it is disabled by default.
@@ -72,6 +84,7 @@ Setting `QDRANT_QUANTIZATION` only affects newly created collections. To enable 
 
 ```python
 from cognee.infrastructure.databases.vector import get_vector_engine
+
 adapter = get_vector_engine()
 await adapter.update_quantization("Entity_name")
 await adapter.update_quantization("DocumentChunk_text")

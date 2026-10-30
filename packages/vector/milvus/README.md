@@ -47,15 +47,18 @@ cognee.config.vector_db_key("your_milvus_token")  # If authentication is enabled
 
 ```python
 import cognee
-from community.adapters.vector.milvus import MilvusAdapter
 
-# Register the adapter
-cognee.use_vector_adapter("milvus", MilvusAdapter)
+# Register the adapter (importing the module registers "milvus" with cognee)
+from cognee_community_vector_adapter_milvus import register  # noqa: F401
 
 # Configure Milvus
-cognee.config.vector_db_provider("milvus")
-cognee.config.vector_db_url("./milvus.db")
-cognee.config.vector_db_key("")
+cognee.config.set_vector_db_config(
+    {
+        "vector_db_provider": "milvus",
+        "vector_db_url": "./milvus.db",
+        "vector_db_key": "",
+    }
+)
 
 # Use Cognee normally
 await cognee.add("Your data here")
@@ -76,7 +79,8 @@ results = await cognee.search("search query")
 Run the tests to verify the adapter works correctly:
 
 ```bash
-python community/tests/test_milvus.py
+pytest tests/unit             # offline contract tests, no server needed
+python tests/test_milvus.py   # integration test, needs Milvus + LLM keys
 ```
 
 ## Dependencies

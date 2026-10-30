@@ -33,6 +33,7 @@ on:
     branches: [ main ]
     paths:
       - 'packages/pipeline/codify_pipeline/**'
+      - 'packages/task/codify_tasks/**'
 
 jobs:
   test-codify:
@@ -63,6 +64,12 @@ jobs:
           python-version: "3.11.x"
           package-path: packages/pipeline/codify_pipeline
           event-type: ${{ inputs.event-type }}
+
+      # Test the repo's own codify tasks instead of the published wheel, so
+      # changes to packages/task/codify_tasks are exercised by this workflow.
+      - name: Install local codify tasks
+        working-directory: ./packages/pipeline/codify_pipeline
+        run: poetry run pip install --no-deps ../../task/codify_tasks
 
       - name: Run Codify Example
         working-directory: ./packages/pipeline/codify_pipeline

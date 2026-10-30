@@ -55,7 +55,9 @@ The adapter requires the following credentials:
 
 ```python
 from cognee.infrastructure.databases.vector.embeddings.EmbeddingEngine import EmbeddingEngine
-from packages.vector.cognee_community_vector_adapter_opensearch.cognee_community_vector_adapter_opensearch import OpenSearchAdapter
+from packages.vector.cognee_community_vector_adapter_opensearch.cognee_community_vector_adapter_opensearch import (
+    OpenSearchAdapter,
+)
 import json
 import base64
 
@@ -77,7 +79,7 @@ embedding_engine = EmbeddingEngine(...)  # Your embedding engine
 adapter = OpenSearchAdapter(
     url="https://your-open-search-url-including-port-if-any",
     api_key=api_key,
-    embedding_engine=embedding_engine
+    embedding_engine=embedding_engine,
 )
 
 # Create a collection (index)
@@ -87,16 +89,10 @@ await adapter.create_collection("my_collection")
 await adapter.create_data_points("my_collection", data_points)
 
 # Search
-results = await adapter.search(
-    collection_name="my_collection",
-    query_text="search query",
-    limit=10
-)
+results = await adapter.search(collection_name="my_collection", query_text="search query", limit=10)
 
 # Batch search
 results = await adapter.batch_search(
-    collection_name="my_collection",
-    query_texts=["query1", "query2"],
-    limit=10
+    collection_name="my_collection", query_texts=["query1", "query2"], limit=10
 )
 ```

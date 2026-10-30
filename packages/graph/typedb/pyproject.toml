@@ -1,0 +1,61 @@
+[project]
+name = "cognee-community-graph-adapter-typedb"
+version = "0.1.0"
+description = "TypeDB graph database adapter for cognee"
+authors = [
+    {name = "TypeDB"},
+]
+dependencies = [
+    "cognee==1.6.1",
+    "typedb-driver>=3.12.0,<4",
+    # Transitive via cognee; pinned to the version cognee 1.6.1 locks, so CI
+    # resolves the litellm the upstream release was tested against. cognee 1.6.x
+    # caps the range itself (>=1.83.7,<1.97.0); 1.96.2 ships abi3 wheels that
+    # install on every Python this package supports.
+    "litellm==1.96.2",
+    "starlette>=0.48.0",
+    "instructor>=1.11"
+]
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+]
+# The Anthropic + local-embeddings setup in .env.example (examples, e2e tier).
+llm = [
+    "anthropic>=0.40",
+    "fastembed>=0.4",
+    "onnxruntime>=1.17",
+]
+
+[project.urls]
+Homepage = "https://github.com/topoteretes/cognee"
+Repository = "https://github.com/topoteretes/cognee-community"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cognee_community_graph_adapter_typedb"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "N", "B", "UP", "C4", "PGH", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+# RUF012: pydantic model fields on DataPoint subclasses are not class vars.
+"tests/**" = ["RUF012"]
+# Dataset handler module is CamelCase by cognee convention (Neo4jDatasetDatabaseHandler.py etc.).
+"cognee_community_graph_adapter_typedb/TypeDBDatasetDatabaseHandler.py" = ["N999"]

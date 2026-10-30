@@ -43,7 +43,7 @@ embedding_engine = EmbeddingEngine(...)  # Your embedding engine
 adapter = AzureAISearchAdapter(
     endpoint="https://your-service.search.windows.net",
     api_key="your-api-key",
-    embedding_engine=embedding_engine
+    embedding_engine=embedding_engine,
 )
 
 # Create a collection (index)
@@ -53,17 +53,11 @@ await adapter.create_collection("my_collection")
 await adapter.create_data_points("my_collection", data_points)
 
 # Search
-results = await adapter.search(
-    collection_name="my_collection",
-    query_text="search query",
-    limit=10
-)
+results = await adapter.search(collection_name="my_collection", query_text="search query", limit=10)
 
 # Batch search
 results = await adapter.batch_search(
-    collection_name="my_collection",
-    query_texts=["query1", "query2"],
-    limit=10
+    collection_name="my_collection", query_texts=["query1", "query2"], limit=10
 )
 ```
 

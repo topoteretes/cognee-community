@@ -55,11 +55,14 @@ async def test_local_file_deletion(data_text, file_location):
 
 
 async def test_getting_of_documents(dataset_name_1):
-    # Test getting of documents for search per dataset
+    # Test getting of documents for search per dataset.
+    # cognee 1.4.1 takes dataset UUIDs (not names), so resolve the name first.
+    from cognee.modules.data.methods import get_datasets_by_name
     from cognee.modules.users.permissions.methods import get_document_ids_for_user
 
     user = await get_default_user()
-    document_ids = await get_document_ids_for_user(user.id, [dataset_name_1])
+    dataset_1 = (await get_datasets_by_name([dataset_name_1], user.id))[0]
+    document_ids = await get_document_ids_for_user(user.id, [dataset_1.id])
     assert len(document_ids) == 1, (
         f"Number of expected documents doesn't match {len(document_ids)} != 1"
     )

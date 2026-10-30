@@ -284,7 +284,12 @@ class TurbopufferGraphAdapter(GraphDBInterface):
         # Never truncate the properties blob (non-filterable; holds e.g. chunk text).
         return _truncate_large_values(row, skip_keys={"properties"})
 
-    async def add_nodes(self, nodes: Union[List[Tuple[str, Dict]], List[DataPoint]]) -> None:
+    async def add_nodes(
+        self,
+        nodes: Union[List[Tuple[str, Dict]], List[DataPoint]],
+        source_ref_key: Optional[str] = None,
+        pipeline_run_id: Optional[str] = None,
+    ) -> None:
         if not nodes:
             return
 
@@ -311,7 +316,10 @@ class TurbopufferGraphAdapter(GraphDBInterface):
         )
 
     async def add_edges(
-        self, edges: Union[List, List[Tuple[str, str, str, Optional[Dict[str, Any]]]]]
+        self,
+        edges: Union[List, List[Tuple[str, str, str, Optional[Dict[str, Any]]]]],
+        source_ref_key: Optional[str] = None,
+        pipeline_run_id: Optional[str] = None,
     ) -> None:
         if not edges:
             return

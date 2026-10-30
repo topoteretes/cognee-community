@@ -58,7 +58,9 @@ jobs:
       - name: Community Setup
         uses: ./.github/actions/community_setup
         with:
-          python-version: ${{ inputs.python-version }}
+          # scrapegraph_tasks requires Python >=3.12 (latest ScrapeGraph SDK),
+          # so this job cannot inherit the suite-wide default (3.11.x).
+          python-version: '3.12.x'
           package-path: packages/task/scrapegraph_tasks
           event-type: ${{ inputs.event-type }}
 

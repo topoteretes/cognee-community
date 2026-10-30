@@ -32,8 +32,15 @@ class OpenGaussAdapter(VectorDBInterface):
         index_type: str = "",
         distance_strategy: str = "",
         embedding_dimension: int = 0,
+        **kwargs,
     ):
-        """Initialize adapter with connection URL, embedding engine, and index config."""
+        """Initialize adapter with connection URL, embedding engine, and index config.
+
+        cognee >= 1.5.0 always passes vector_db_host / vector_db_port /
+        vector_db_username / vector_db_password to registered adapters. This
+        adapter connects with a full libpq connection string (``url``), so they
+        are absorbed by **kwargs and ignored.
+        """
         self.url = url
         self.database_name = database_name
         self.schema_name = schema_name or os.getenv("OPENGAUSS_SCHEMA_NAME", "cognee")

@@ -1,0 +1,152 @@
+name: Test TypeDB Community Adapter
+
+# Two jobs against a dockerized TypeDB 3.x server:
+#   test-typedb      offline unit tier + CRUD/analytics integration tests
+#                    (no secrets: the adapter is tested directly)
+#   test-typedb-e2e  cognee's shared graph-backend e2e suite + dataset
+#                    deletion through the per-dataset handler (needs the
+#                    LLM / embedding secrets)
+
+on:
+  workflow_call:
+    inputs:
+      event-type:
+        required: false
+        type: string
+        default: "regular-testing-event"
+    secrets:
+      LLM_MODEL:
+        required: true
+      LLM_ENDPOINT:
+        required: true
+      LLM_API_KEY:
+        required: true
+      LLM_API_VERSION:
+        required: true
+      EMBEDDING_MODEL:
+        required: true
+      EMBEDDING_ENDPOINT:
+        required: true
+      EMBEDDING_API_KEY:
+        required: true
+      EMBEDDING_API_VERSION:
+        required: true
+  workflow_dispatch:
+  pull_request:
+    branches: [ main, dev ]
+    paths:
+      - 'packages/graph/typedb/**'
+
+concurrency:
+  group: typedb-test-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test-typedb:
+    name: "TypeDB Community Adapter Test"
+    runs-on: ubuntu-22.04
+    services:
+      typedb:
+        # Pinned to the server version matching the typedb-driver pin; the
+        # adapter relies on the TypeQL `given` stage (3.12+).
+        image: typedb/typedb:3.12.3
+        ports:
+          - 1729:1729
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Community Setup
+        uses: ./.github/actions/community_setup
+        with:
+          python-version: '3.11.x'
+          package-path: packages/graph/typedb
+          event-type: ${{ inputs.event-type }}
+
+      - name: Wait for TypeDB
+        # Fail loudly if the server never comes up — the integration tests
+        # skip themselves when the port is closed, which must not read as
+        # a green run.
+        run: |
+          for i in {1..30}; do
+            if nc -z localhost 1729; then
+              echo "TypeDB is ready"
+              exit 0
+            fi
+            echo "Waiting for TypeDB..."
+            sleep 2
+          done
+          echo "TypeDB did not become ready" >&2
+          exit 1
+
+      - name: Run TypeDB Adapter Tests
+        env:
+          GRAPH_DATABASE_URL: '127.0.0.1:1729'
+        working-directory: ./packages/graph/typedb
+        run: poetry run pytest tests/unit tests/integration -q
+
+  test-typedb-e2e:
+    name: "TypeDB Community Adapter E2E Test"
+    runs-on: ubuntu-22.04
+    needs: test-typedb
+    services:
+      typedb:
+        image: typedb/typedb:3.12.3
+        ports:
+          - 1729:1729
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Community Setup
+        uses: ./.github/actions/community_setup
+        with:
+          python-version: '3.11.x'
+          package-path: packages/graph/typedb
+          event-type: ${{ inputs.event-type }}
+
+      - name: Wait for TypeDB
+        run: |
+          for i in {1..30}; do
+            if nc -z localhost 1729; then
+              echo "TypeDB is ready"
+              exit 0
+            fi
+            echo "Waiting for TypeDB..."
+            sleep 2
+          done
+          echo "TypeDB did not become ready" >&2
+          exit 1
+
+      - name: Require LLM and embedding secrets
+        # The e2e tests skip without keys; a skipped tier must not read as green.
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          EMBEDDING_API_KEY: ${{ secrets.EMBEDDING_API_KEY }}
+        run: |
+          for name in LLM_API_KEY EMBEDDING_API_KEY; do
+            if [ -z "${!name}" ]; then
+              echo "::error::$name secret is not available; the e2e tier cannot run" >&2
+              exit 1
+            fi
+          done
+
+      - name: Run TypeDB E2E Tests
+        env:
+          RUN_E2E_TESTS: '1'
+          # The service container is this job's own: drop leaked dataset databases.
+          TYPEDB_E2E_SWEEP: '1'
+          ENV: 'dev'
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+          LLM_ENDPOINT: ${{ secrets.LLM_ENDPOINT }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_API_VERSION: ${{ secrets.LLM_API_VERSION }}
+          EMBEDDING_MODEL: ${{ secrets.EMBEDDING_MODEL }}
+          EMBEDDING_ENDPOINT: ${{ secrets.EMBEDDING_ENDPOINT }}
+          EMBEDDING_API_KEY: ${{ secrets.EMBEDDING_API_KEY }}
+          EMBEDDING_API_VERSION: ${{ secrets.EMBEDDING_API_VERSION }}
+          GRAPH_DATABASE_PROVIDER: 'typedb'
+          GRAPH_DATABASE_URL: '127.0.0.1:1729'
+          GRAPH_DATASET_DATABASE_HANDLER: 'typedb'
+        working-directory: ./packages/graph/typedb
+        run: poetry run pytest tests/e2e -q

@@ -1,0 +1,21 @@
+# TypeDB 3.x for the cognee TypeDB adapter (host port 1730 avoids a local
+# TypeDB on 1729). Point cognee at it with GRAPH_DATABASE_URL=127.0.0.1:1730.
+services:
+  typedb:
+    # Pinned to the server version the adapter is tested against; the TypeQL
+    # `given` stage it relies on needs 3.12+.
+    image: typedb/typedb:3.12.3
+    container_name: cognee-community-typedb
+    ports:
+      - "1730:1729"
+    volumes:
+      - typedb-data:/var/lib/typedb/data  # the image's declared data volume
+    healthcheck:
+      # The image ships no nc/curl; bash's /dev/tcp is enough for "port open".
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/1729"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  typedb-data:

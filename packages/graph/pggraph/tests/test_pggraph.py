@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
-from cognee.infrastructure.databases.graph.postgres.adapter import PostgresAdapter
+from cognee.infrastructure.databases.graph.postgres_demo.adapter import PostgresDemoAdapter
 from cognee_community_graph_adapter_pggraph import PgGraphAdapter, register
 from cognee_community_graph_adapter_pggraph.connection import (
     _normalize_scheme,
@@ -57,7 +57,7 @@ async def test_falls_back_when_pggraph_traversal_fails():
         AsyncMock(side_effect=RuntimeError("pgGraph unavailable")),
     ):
         with patch.object(
-            PostgresAdapter,
+            PostgresDemoAdapter,
             "get_neighbors",
             AsyncMock(return_value=[{"id": "b", "name": "B", "type": "Entity"}]),
         ) as postgres_neighbors:
@@ -125,7 +125,7 @@ class TestFactoryShapedConstruction:
             "cognee_community_graph_adapter_pggraph.pggraph_adapter.resolve_connection_string",
             side_effect=fake_resolver,
         ):
-            with patch.object(PostgresAdapter, "__init__", return_value=None):
+            with patch.object(PostgresDemoAdapter, "__init__", return_value=None):
                 PgGraphAdapter(
                     graph_database_url="",
                     graph_database_username="u",
@@ -151,7 +151,7 @@ class TestFactoryShapedConstruction:
             "cognee_community_graph_adapter_pggraph.pggraph_adapter.resolve_connection_string",
             side_effect=fake_resolver,
         ):
-            with patch.object(PostgresAdapter, "__init__", return_value=None):
+            with patch.object(PostgresDemoAdapter, "__init__", return_value=None):
                 PgGraphAdapter(
                     graph_database_name="explicit",
                     database_name="from_factory",
@@ -178,7 +178,7 @@ class TestStickyFallback:
         postgres_neighbors = AsyncMock(return_value=[])
 
         with patch.object(adapter, "_pggraph_get_neighbors", pg_neighbors):
-            with patch.object(PostgresAdapter, "get_neighbors", postgres_neighbors):
+            with patch.object(PostgresDemoAdapter, "get_neighbors", postgres_neighbors):
                 await PgGraphAdapter.get_neighbors(adapter, "a")
                 assert adapter._pggraph_ready is False
                 await PgGraphAdapter.get_neighbors(adapter, "b")
@@ -196,7 +196,7 @@ class TestStickyFallback:
         sql_nbhd = AsyncMock(return_value=([], []))
 
         with patch.object(adapter, "_pggraph_get_neighborhood", pg_nbhd):
-            with patch.object(adapter, "_postgres_get_neighborhood", sql_nbhd):
+            with patch.object(PostgresDemoAdapter, "get_neighborhood", sql_nbhd):
                 await PgGraphAdapter.get_neighborhood(adapter, ["a"], depth=2)
                 assert adapter._pggraph_ready is False
                 await PgGraphAdapter.get_neighborhood(adapter, ["b"], depth=2)

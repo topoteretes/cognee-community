@@ -61,10 +61,12 @@ from cognee_community_vector_adapter_opengauss import register
 
 load_dotenv()
 
-config.set_vector_db_config({
-    "vector_db_provider": "opengauss",
-    "vector_db_url": "postgresql://gaussdb:openGauss%40123@localhost:5432/postgres",
-})
+config.set_vector_db_config(
+    {
+        "vector_db_provider": "opengauss",
+        "vector_db_url": "postgresql://gaussdb:openGauss%40123@localhost:5432/postgres",
+    }
+)
 ```
 
 Required environment variables:
@@ -97,6 +99,7 @@ from cognee_community_vector_adapter_opengauss import register
 
 load_dotenv()
 
+
 async def main():
     # Set working directories
     root = pathlib.Path(__file__).parent
@@ -104,13 +107,15 @@ async def main():
     config.data_root_directory(str(root / ".cognee_data"))
 
     # Configure openGauss
-    config.set_vector_db_config({
-        "vector_db_provider": "opengauss",
-        "vector_db_url": os.getenv(
-            "OPENGAUSS_URL",
-            "postgresql://gaussdb:openGauss%40123@localhost:5432/postgres",
-        ),
-    })
+    config.set_vector_db_config(
+        {
+            "vector_db_provider": "opengauss",
+            "vector_db_url": os.getenv(
+                "OPENGAUSS_URL",
+                "postgresql://gaussdb:openGauss%40123@localhost:5432/postgres",
+            ),
+        }
+    )
 
     # Add and process data
     await add("Natural language processing is a subfield of AI.")
@@ -119,6 +124,7 @@ async def main():
     # Search
     results = await search("Tell me about NLP", query_type=SearchType.GRAPH_COMPLETION)
     print(results)
+
 
 asyncio.run(main())
 ```

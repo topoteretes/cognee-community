@@ -80,3 +80,10 @@ jobs:
           VECTOR_DB_PROVIDER: 'duckdb'
         working-directory: ./packages/hybrid/duckdb
         run: poetry run python tests/test_duckdb.py
+
+      - name: Run DuckDB Search Ordering Regression Test
+        env:
+          ENV: 'dev'
+          ENABLE_BACKEND_ACCESS_CONTROL: False
+        working-directory: ./packages/hybrid/duckdb
+        run: poetry run python tests/test_search_ordering.py

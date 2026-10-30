@@ -1,11 +1,23 @@
 [project]
 name = "cognee-community-vector-adapter-moss"
-version = "0.1.1"
+version = "0.2.1"
 description = "Moss vector database adapter for cognee"
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
 dependencies = [
     "moss>=1.0.0",
-    "cognee>=1.0.0",
+    "cognee==1.6.1",
+    # Transitive via cognee; pinned to the version cognee 1.6.1 locks, so CI
+    # resolves the litellm the upstream release was tested against. cognee 1.6.x
+    # caps the range itself (>=1.83.7,<1.97.0); 1.96.2 ships abi3 wheels that
+    # install on every Python this package supports.
+    "litellm==1.96.2",
     "python-dotenv>=0.19.0"
 ]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cognee_community_vector_adapter_moss"]

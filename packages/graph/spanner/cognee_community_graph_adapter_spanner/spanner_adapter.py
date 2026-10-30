@@ -202,6 +202,8 @@ class SpannerGraphAdapter(GraphDBInterface):
     async def add_nodes(
         self,
         nodes: list[tuple[str, dict[str, Any]]] | list[DataPoint],
+        source_ref_key: str | None = None,
+        pipeline_run_id: str | None = None,
     ) -> None:
         if not nodes:
             return
@@ -339,6 +341,8 @@ class SpannerGraphAdapter(GraphDBInterface):
         self,
         edges: list[tuple[str, str, str, dict[str, Any]]]
         | list[tuple[str, str, str, dict[str, Any] | None]],
+        source_ref_key: str | None = None,
+        pipeline_run_id: str | None = None,
     ) -> None:
         if not edges:
             return

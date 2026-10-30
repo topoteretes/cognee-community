@@ -71,21 +71,26 @@ import cognee
 from cognee.infrastructure.databases.graph import get_graph_engine
 from cognee_community_graph_adapter_spanner import register
 
+
 async def main():
     register()
     cognee.config.set_graph_database_provider("spanner")
 
     # Option A: single URL (project_id/instance_id/database_id)
-    cognee.config.set_graph_db_config({
-        "graph_database_url": "my-project/my-instance/my-database",
-    })
+    cognee.config.set_graph_db_config(
+        {
+            "graph_database_url": "my-project/my-instance/my-database",
+        }
+    )
 
     # Option B: separate parameters
-    cognee.config.set_graph_db_config({
-        "project_id": "my-project",
-        "instance_id": "my-instance",
-        "database_id": "my-database",
-    })
+    cognee.config.set_graph_db_config(
+        {
+            "project_id": "my-project",
+            "instance_id": "my-instance",
+            "database_id": "my-database",
+        }
+    )
 
     # Optional: custom credentials (defaults to Application Default Credentials)
     # cognee.config.set_graph_db_config({
@@ -103,6 +108,7 @@ async def main():
     )
     graph_engine = await get_graph_engine()
     nodes, edges = await graph_engine.get_graph_data()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
