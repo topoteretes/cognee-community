@@ -1,0 +1,21 @@
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+name = "cognee-community-connector-npm"
+version = "0.1.0"
+description = "npm package registry public REST API community connector for Cognee"
+authors = ["Bhomvrat Rai <bhomvratrai@gmail.com>"]
+readme = "README.md"
+packages = [{include = "cognee_community_connector_npm"}]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+aiohttp = "^3.9.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0.0"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
