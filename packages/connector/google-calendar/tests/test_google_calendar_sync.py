@@ -111,6 +111,7 @@ def test_event_row_shape_and_content(cal):
 
 def test_all_day_event_and_omitted_attendees(cal):
     holiday = cal.put_all_day("primary", "Diwali", "2026-11-08")
+    trip = cal.put_all_day("primary", "Trip", "2026-11-08", days=3)
     big = cal.put_event(
         "primary",
         "All hands",
@@ -121,7 +122,10 @@ def test_all_day_event_and_omitted_attendees(cal):
 
     upserts, _, _ = sync(cal, {})
 
-    assert "When: all day, 2026-11-08 to 2026-11-08" in upserts[rid(holiday)]["content"]
+    # Google's end.date is exclusive, so the stored span ends the day before it.
+    assert "When: all day, 2026-11-08\n" in upserts[rid(holiday)]["content"]
+    assert "2026-11-09" not in upserts[rid(holiday)]["content"]
+    assert "When: all day, 2026-11-08 to 2026-11-10\n" in upserts[rid(trip)]["content"]
     assert "and more not listed by Google" in upserts[rid(big)]["content"]
 
 
