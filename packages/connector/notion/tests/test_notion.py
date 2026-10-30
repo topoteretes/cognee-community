@@ -416,3 +416,58 @@ def test_render_error_aborts_sync(dlt_mod, tmp_path):
     )
     with pytest.raises(Exception):  # noqa: B017 - dlt wraps the source error in PipelineStepFailed
         pipeline.run(notion_source(client=fake))
+
+
+def test_incremental_sync_skips_unchanged_blocks(dlt_mod, tmp_path):
+    from cognee_community_connector_notion.notion import notion_source
+
+    block_calls = []
+
+    def mock_blocks_list(block_id=None, **kwargs):
+        block_calls.append(block_id)
+        return {"results": [_block("paragraph", f"Content for {block_id}")], "has_more": False}
+
+    fake = FakeNotionClient(
+        pages=[
+            _page("p1", "2024-01-01T00:00:00.000Z", "Alpha"),
+            _page("p2", "2024-01-01T00:00:00.000Z", "Beta"),
+        ],
+        blocks={},
+    )
+    fake.blocks = SimpleNamespace(children=SimpleNamespace(list=mock_blocks_list))
+
+    db_path = (tmp_path / "incremental.db").as_posix()
+    pipelines_dir = str(tmp_path / "dlt_pipelines")
+    pipeline = dlt_mod.pipeline(
+        pipeline_name="notion_incremental_test",
+        destination=dlt_mod.destinations.sqlalchemy(f"sqlite:///{db_path}"),
+        dataset_name="notion_ds",
+        pipelines_dir=pipelines_dir,
+    )
+
+    # First sync - renders both pages
+    pipeline.run(notion_source(client=fake))
+    assert len(block_calls) == 2
+    assert "p1" in block_calls and "p2" in block_calls
+
+    # Second sync - no changes to last_edited_time: zero API calls
+    block_calls.clear()
+    pipeline.run(notion_source(client=fake))
+    assert len(block_calls) == 0
+
+    # Third sync - edit page p1: only p1 re-renders
+    fake._pages[0]["last_edited_time"] = "2024-01-02T00:00:00.000Z"
+    block_calls.clear()
+    pipeline.run(notion_source(client=fake))
+    assert block_calls == ["p1"]
+
+    # Fourth sync - delete p2: snapshot drops p2, cache pruned
+    fake._pages = [fake._pages[0]]
+    block_calls.clear()
+    pipeline.run(notion_source(client=fake))
+    assert len(block_calls) == 0
+    with pipeline.sql_client() as sql_client:
+        rows = sql_client.execute_sql("SELECT id FROM notion_pages")
+        ids = [r[0] for r in rows]
+    assert ids == ["p1"]
+
