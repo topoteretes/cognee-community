@@ -169,7 +169,6 @@ def test_render_card_includes_fields_checklists_and_comments(trello):
     assert row["url"] == "https://trello.com/c/c1"
     assert row[NODE_SET] == [f"trello:{BOARD}"]
     assert row["content"] == (
-        "Board: Product\n"
         "List: To do\n"
         "Labels: bug, green\n"
         "Members: Priya Shah\n"
@@ -335,6 +334,16 @@ def test_card_over_1000_comments_is_read_from_the_board_feed(trello):
     assert _comment_calls(trello) == [f"/boards/{BOARD}/actions"] * 2
 
 
+def test_card_with_exactly_1000_comments_is_read_from_the_board_feed(trello):
+    trello.add_card("c1", "Export")
+    for index in range(1000):
+        trello.comment("c1", f"comment-{index:04d}")
+    rows = _run(trello, {})
+    card = next(row for row in rows if row["id"] == "card:c1")
+    assert card["content"].count("comment-") == 1000
+    assert all(not path.startswith("/cards/") for path in _comment_calls(trello))
+
+
 def test_card_endpoint_stopping_at_1000_comments_raises_naming_the_card(trello):
     trello.add_card("c1", "Export")
     for index in range(1001):
@@ -410,6 +419,15 @@ def test_changing_an_include_flag_rerenders_the_cards(trello, flag):
     on = _run(trello, state)
     assert _ids(on) == ["card:c1"]
     assert "note" in on[0]["content"] and "QA:" in on[0]["content"]
+
+
+def test_board_rename_reprocesses_only_the_board(trello):
+    trello.add_card("c1", "Export")
+    state = {}
+    _run(trello, state)
+    trello.boards[BOARD]["name"] = "Product 2027"
+    trello.act(BOARD, "updateBoard", board={"id": BOARD})
+    assert _ids(_run(trello, state)) == [f"board:{BOARD}"]
 
 
 def test_deleted_card_is_forgotten(trello):
@@ -525,8 +543,8 @@ def test_request_budget_stops_inside_a_board_and_resumes(trello):
         stats = _stats()
         emitted.append(_ids(_run(trello, state, stats=stats, max_requests=10)))
         paused.append(stats.get("failed_budget", 0))
-        # A spent budget is a pause, not a failure.
-        assert stats["failed"] == 0
+        # A cut run is incomplete, so failed is set with the budget as the reason.
+        assert stats["failed"] == paused[-1]
     assert emitted == [[f"board:{BOARD}", "card:c0"], ["card:c1"], ["card:c2"], []]
     assert paused == [1, 1, 0, 0]
 
@@ -541,12 +559,79 @@ def test_deleted_card_is_forgotten_even_when_every_run_is_cut_short(trello):
     trello.boards[BOARD]["cards"].clear()
     trello.act(BOARD, "deleteCard", card={"id": "c1"})
     trello.act("b2", "updateCard", card={"id": "c2"})
-    # Each run finishes one board before the budget stops it; the pass spans both runs.
+    # Each run finishes one board before the budget stops it; the pass spans both runs,
+    # and the second is cut again before it can confirm c1, which stays an orphan.
     first = _run(trello, state, board_ids=("b1", "b2"), max_requests=5)
     assert {"id": "card:c1", "_deleted": True} not in first
     second = _run(trello, state, board_ids=("b1", "b2"), max_requests=5)
-    assert {"id": "card:c1", "_deleted": True} in second
+    assert second == [] and state["pass"]["orphans"] == ["c1"]
+    third = _run(trello, state, board_ids=("b1", "b2"), max_requests=5)
+    assert {"id": "card:c1", "_deleted": True} in third
     assert state["pass"] == {"present": {}, "orphans": []}
+
+
+@pytest.mark.parametrize("archive_old_board", [False, True])
+def test_card_moved_to_a_board_the_pass_already_read_survives(trello, archive_old_board):
+    trello.add_board("b2", "Ops")
+    trello.add_card("c1", "Export", board_id="b2")
+    ids = ("b1", "b2")
+    state = {}
+    _run(trello, state, board_ids=ids)
+
+    # The budget stops the run after b1, then c1 moves from b2 to b1.
+    stats = _stats()
+    _run(trello, state, stats=stats, board_ids=ids, max_requests=3)
+    assert stats["failed_budget"] == 1 and list(state["pass"]["present"]) == [BOARD]
+    trello.move_card("c1", "b2", BOARD)
+    if archive_old_board:
+        trello.boards["b2"]["closed"] = True
+
+    # The pass completes on b2 without c1 in either listing; Trello says it is on b1.
+    rows = _run(trello, state, board_ids=ids)
+    assert {"id": "card:c1", "_deleted": True} not in rows
+    moved = next(r for r in rows if r["id"] == "card:c1")
+    assert moved[NODE_SET] == [f"trello:{BOARD}"]
+    assert _run(trello, state, board_ids=ids) == []
+
+
+def test_card_in_a_list_archived_after_the_listing_is_forgotten(trello):
+    trello.add_card("c1", "Export")
+    state = {}
+    _run(trello, state)
+    trello.boards[BOARD]["lists"][0]["closed"] = True
+    trello.act(BOARD, "updateList", list={"id": "l1"})
+    assert {"id": "card:c1", "_deleted": True} in _run(trello, state)
+
+
+def test_card_out_of_reach_is_forgotten_but_an_expired_token_forgets_nothing(trello):
+    trello.add_board("b2", "Ops")
+    trello.add_card("c1", "Export")
+    trello.add_card("c2", "Deploy")
+    state = {}
+    _run(trello, state, board_ids=("b1", "b2"))
+    # c1 moved to a board this token cannot read, which answers 401 for the card.
+    trello.boards[BOARD]["cards"] = [trello.card("c2")]
+    trello.act(BOARD, "moveCardFromBoard", card={"id": "c1"})
+    trello.errors["c1"] = 401
+
+    expiring = copy.deepcopy(state)
+    real_get = trello.get
+    checks = []
+
+    def token_expires_after_the_first_check(path, params=None):
+        if path == "/members/me":
+            checks.append(path)
+            if len(checks) > 1:
+                raise TrelloAuthError("Trello rejected the API key or token (HTTP 401)")
+        return real_get(path, params)
+
+    trello.get = token_expires_after_the_first_check
+    with pytest.raises(TrelloAuthError):
+        _run(trello, expiring, board_ids=("b1", "b2"))
+    assert expiring["pass"]["orphans"] == ["c1"]
+
+    trello.get = real_get
+    assert {"id": "card:c1", "_deleted": True} in _run(trello, state, board_ids=("b1", "b2"))
 
 
 def test_card_moved_off_a_removed_board_survives(trello):
@@ -662,15 +747,27 @@ def test_source_declares_document_path_and_scope(trello):
     assert spaced.startswith("trello_acme_team_") and dashed.startswith("trello_acme_team_")
     assert spaced != dashed
     assert trello_source(workspace_id="acme", service=trello).name == "trello_acme"
-    assert trello_source(service=trello).name == "trello_my_boards"
 
 
-def test_several_boards_need_a_resource_name(trello):
+@pytest.mark.parametrize("board_ids", [["b1", "b2"], None, []])
+def test_several_or_all_boards_need_a_resource_name(trello, board_ids):
+    # Two accounts syncing all their boards into one dataset would share a constant name.
     with pytest.raises(ValueError, match="resource_name"):
-        trello_source(["b1", "b2"], service=trello)
-    assert trello_source(["b1", "b2"], service=trello, resource_name="trello_team").name == (
+        trello_source(board_ids, service=trello)
+    assert trello_source(board_ids, service=trello, resource_name="trello_team").name == (
         "trello_team"
     )
+
+
+def test_board_ids_as_a_bare_string_raises(trello):
+    with pytest.raises(TypeError, match="not a string"):
+        trello_source("abc", service=trello)
+
+
+def test_a_cognee_without_node_sets_is_refused(trello, monkeypatch):
+    monkeypatch.setattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 1)
+    with pytest.raises(RuntimeError, match="node sets"):
+        trello_source([BOARD], service=trello)
 
 
 def test_missing_credentials_raise_without_reading_the_environment(monkeypatch):

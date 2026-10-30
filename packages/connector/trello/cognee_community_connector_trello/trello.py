@@ -33,7 +33,9 @@ Design
 * **Forget-on-delete.** A deleted, hidden or deselected board is forgotten right
   after the board listing. Card tombstones are decided once a pass has visited
   every selected board, which can span several runs when the budget cuts them
-  short, so a card moved between two boards is never lost. A board listed in
+  short, and each card that no board of the pass listed is confirmed with Trello
+  before it is forgotten, since it may have moved to a board the pass had already
+  read. A board listed in
   ``board_ids`` that cannot be read raises instead of being forgotten.
 * **A run is bounded.** On a rate limit, an expired token after progress, or a
   spent request budget it stops cleanly, keeps the boards and cards it finished,
@@ -248,8 +250,9 @@ def render_card(
     due = _date(card.get("due"))
     if due and card.get("dueComplete"):
         due += " (done)"
+    # The board name stays out: it is on the board document and the node set, and in
+    # every card it would make a board rename re-process the whole board.
     fields = [
-        ("Board", str(board.get("name") or "")),
         ("List", str(_card_list(card, board).get("name") or "")),
         ("Labels", ", ".join(_label_names(card.get("labels") or []))),
         ("Members", ", ".join(member_names)),
@@ -408,8 +411,9 @@ class _Walker:
         them card by card costs fewer requests."""
         counts = [_comment_count(cards[cid]) for cid in wanted]
         total = sum(_comment_count(card) for card in cards.values())
-        # The card endpoint stops at 1000 comments, so a bigger card needs the feed.
-        if max(counts, default=0) <= _CARD_ACTIONS_MAX and (
+        # The card endpoint stops at 1000 comments, so a card with 1000 or more needs
+        # the feed: a full last page cannot tell 1000 from more.
+        if max(counts, default=0) < _CARD_ACTIONS_MAX and (
             sum(1 for count in counts if count) <= total // _ACTIONS_PAGE + 1
         ):
             return None
@@ -635,21 +639,50 @@ class _Walker:
             yield {"id": f"board:{board_id}", "_deleted": True}
 
     def _forget(self, boards: dict[str, dict], visit: dict, ids: list[str]) -> Iterator[dict]:
-        """Card tombstones, decided once a pass has seen every board, so a card moved
-        between two selected boards is never deleted."""
+        """Card tombstones, decided once a pass has seen every board. A card that no
+        board of the pass listed is confirmed with Trello first, since it can have
+        moved to a board after the pass read that board."""
         present = {board_id: set(visit["present"][board_id]) for board_id in ids}
         live = set().union(*present.values())
         for board_id in ids:
-            entry = boards[board_id]
-            for cid in [cid for cid in entry["cards"] if cid not in present[board_id]]:
-                del entry["cards"][cid]
-                if cid not in live:
-                    self.stats["deleted"] += 1
-                    yield {"id": f"card:{cid}", "_deleted": True}
-        for cid in visit["orphans"]:
-            if cid not in live:
+            cards = boards[board_id]["cards"]
+            gone = [cid for cid in cards if cid not in present[board_id]]
+            for cid in gone:
+                del cards[cid]
+            visit["orphans"] = sorted(set(visit["orphans"]) | set(gone))
+        # A card leaves the orphans once decided, so a run cut short while confirming
+        # them goes on with the rest.
+        for cid in list(visit["orphans"]):
+            if cid not in live and not self._still_selected(cid, ids):
                 self.stats["deleted"] += 1
                 yield {"id": f"card:{cid}", "_deleted": True}
+            visit["orphans"].remove(cid)
+
+    def _still_selected(self, card_id: str, ids: list[str]) -> bool:
+        """Whether a card is on a selected board and not left out as archived. Such a
+        card moved there after the pass read that board, so the next pass syncs it."""
+        if not ids:
+            return False
+        params = {"fields": "idBoard,idList,closed", "board": "true", "board_fields": "closed"}
+        try:
+            card = self._get(f"/cards/{card_id}", {**params, "list": "true"})
+        except TrelloAPIError as exc:
+            if exc.status != 404:
+                raise
+            return False
+        except (TrelloAuthError, _CutShortError) as exc:
+            if isinstance(exc, _CutShortError) and exc.reason != "auth":
+                raise
+            # A card on a board the token cannot read answers 401 too, so check the
+            # token again: when it still works, the card is out of reach.
+            self._get("/members/me", {"fields": "id"})
+            return False
+        if str(card.get("idBoard")) not in ids:
+            return False
+        if self.config.include_archived:
+            return True
+        board = {**(card.get("board") or {}), "lists": [card["list"]] if card.get("list") else []}
+        return not _archived(card, board)
 
 
 def _iter_rows(
@@ -664,9 +697,8 @@ def _iter_rows(
     try:
         yield from walker.rows()
     except _CutShortError as cut:
-        # A spent budget is a planned pause, not a failure; failed_budget says why.
-        if cut.reason != "budget":
-            stats["failed"] = 1
+        # Every cut leaves the sync incomplete, so failed is set; failed_<reason> says why.
+        stats["failed"] = 1
         stats[f"failed_{cut.reason}"] = 1
         logger.warning("Trello sync stopped early (%s); it resumes on the next run.", cut.reason)
 
@@ -675,12 +707,13 @@ def _iter_rows(
 # Public factory
 # ---------------------------------------------------------------------------
 def _default_resource_name(board_ids: list[str] | None, workspace_id: str | None) -> str:
-    if board_ids and len(board_ids) > 1:
+    if (board_ids and len(board_ids) > 1) or not (board_ids or workspace_id):
         raise ValueError(
-            "Pass a resource_name when syncing several boards: it scopes this sync's "
-            "state and cleanup, and two sources sharing one would delete each other's cards."
+            "Pass a resource_name when syncing several boards or all of your boards: it "
+            "scopes this sync's state and cleanup, and two sources sharing one would "
+            "delete each other's cards."
         )
-    scope = board_ids[0] if board_ids else workspace_id or "my_boards"
+    scope = board_ids[0] if board_ids else workspace_id
     slug = re.sub(r"[^a-z0-9]+", "_", scope.lower()).strip("_")
     if slug != scope:
         # "Acme Co" and "acme-co" share a slug, so the raw value keeps them apart.
@@ -710,7 +743,7 @@ def trello_source(
     and ``primary_key="id"``.
 
     Args:
-        board_ids: Boards to sync. A listed board that cannot be read raises. Defaults
+        board_ids: List of boards to sync. A listed board that cannot be read raises. Defaults
             to every board of ``workspace_id``, or every board the token's user belongs to.
         workspace_id: Sync every board of this workspace (id or name).
         api_key: Trello API key.
@@ -721,11 +754,12 @@ def trello_source(
         full_resync: Re-render every card, reading all comments again.
         max_requests: Request budget of one run, checked before each request once a
             card or board is saved. A bigger account finishes over several runs, which
-            visit the boards in turn; a spent budget sets ``failed_budget`` but not
-            ``failed``.
+            visit the boards in turn; a spent budget sets ``failed`` and
+            ``failed_budget``.
         resource_name: Stable name of this sync, which scopes its state and cleanup.
             Defaults to one derived from the board or workspace; required when
-            ``board_ids`` lists several boards.
+            ``board_ids`` lists several boards, or when neither ``board_ids`` nor
+            ``workspace_id`` is given.
         check_active: Optional host authorization checkpoint, called before each request.
         service: Pre-built client (see :class:`TrelloClient`). Mainly an injection
             point for tests and hosts. ``client`` is accepted as an alias.
@@ -739,11 +773,15 @@ def trello_source(
     except ImportError as exc:
         raise ImportError('The Trello connector requires dlt: pip install "cognee[dlt]".') from exc
 
-    if getattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 0) < 1:
+    # Version 2 adds node sets, which every row carries.
+    if getattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 0) < 2:
         raise RuntimeError(
-            "Trello sync requires a cognee build with table-scoped DLT document cleanup."
+            "Trello sync requires a cognee build with table-scoped DLT document cleanup "
+            "and node sets."
         )
 
+    if isinstance(board_ids, str):
+        raise TypeError("board_ids must be a list of board ids, not a string")
     name = resource_name or _default_resource_name(board_ids, workspace_id)
     service = service or client
     if service is None:

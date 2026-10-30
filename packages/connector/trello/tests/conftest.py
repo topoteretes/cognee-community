@@ -86,6 +86,7 @@ class FakeTrello:
         return card
 
     def move_card(self, card_id, source, target):
+        """Trello moves the card's comment actions into the target board's feed too."""
         card = self.card(card_id, source)
         self.boards[source]["cards"].remove(card)
         self.boards[target]["cards"].append(card)
@@ -136,6 +137,23 @@ class FakeTrello:
                 if (organization is None or b["idOrganization"] == organization)
                 and (params["filter"] == "all" or not b["closed"])
             ]
+        match = re.fullmatch(r"/cards/(\w+)", path)
+        if match:
+            card_id = match.group(1)
+            self._fail(card_id)
+            for board in self.boards.values():
+                card = next((c for c in board["cards"] if c["id"] == card_id), None)
+                if card:
+                    lists = [i for i in board["lists"] if i["id"] == card["idList"]]
+                    return {
+                        "id": card_id,
+                        "idBoard": board["id"],
+                        "idList": card["idList"],
+                        "closed": card["closed"],
+                        "board": {"id": board["id"], "closed": board["closed"]},
+                        "list": lists[0] if lists else None,
+                    }
+            raise TrelloAPIError("Trello request failed: HTTP 404", status=404)
         match = re.fullmatch(r"/cards/(\w+)/actions", path)
         if match:
             self._fail(match.group(1))
