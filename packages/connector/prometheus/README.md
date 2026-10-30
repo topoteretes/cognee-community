@@ -23,7 +23,7 @@ import cognee
 from cognee_community_connector_prometheus import prometheus_source
 
 await cognee.remember(
-    prometheus_source(base_url="http://localhost:9090"),  # or PROMETHEUS_URL from env
+    prometheus_source(base_url="http://localhost:9090"),
     dataset_name="prometheus",  # give the connector its own dataset
     self_improvement=False,  # skip the enrichment pass on repeated syncs
 )
@@ -37,9 +37,9 @@ answer = await cognee.search(
 
 | Argument | Default | What it does |
 |---|---|---|
-| `base_url` | `PROMETHEUS_URL` | Server URL, including any `--web.route-prefix` path. |
-| `username`, `password` | `PROMETHEUS_USERNAME`, `PROMETHEUS_PASSWORD` | Basic auth. |
-| `token` | `PROMETHEUS_TOKEN` | Bearer token, for a proxy that expects one. Use a token or basic auth, not both. |
+| `base_url` | required | Server URL, including any `--web.route-prefix` path. The factory reads no environment variables; the example reads `PROMETHEUS_URL` and the credentials below. |
+| `username`, `password` | none | Basic auth. |
+| `token` | none | Bearer token, for a proxy that expects one. Use a token or basic auth, not both. |
 | `headers` | none | Extra headers sent with every request. |
 | `rule_type` | both | `"alert"` or `"record"` to read one kind of rule. Also applied after reading, for a server that ignores it. |
 | `rule_groups` | all groups | A list of rule groups to read. Also applied after reading. Without `rule_type`, a listed group the server does not have stops the run. |
@@ -48,12 +48,13 @@ answer = await cognee.search(
 | `allow_empty_metrics` | `False` | Let one sync through whose metric metadata has under half the metrics of the last sync. Separate from `allow_empty`, so forgetting rules never forgets metrics by accident. |
 | `resource_name` | from the address, e.g. `prometheus_localhost_9090_<hash>` | Prefix of the staging tables. Each server gets its own by default; the hash of the exact address keeps `prom-eu` and `prom.eu` apart. |
 | `check_active` | none | Called before every response is used. Raise from it to stop a sync whose access was revoked. |
-| `service` | dlt's session, kept short | `requests.Session` to send requests through. By default a 429 stops the run with memory unchanged, because waiting would hold cognee's staging lock and the next run re-reads everything. A 5xx or a dropped connection gets one retry after at most 5 s. Each request times out after 30 s. `session` is accepted as another name for it. |
+| `service` | dlt's session, kept short | `requests.Session` to send requests through. By default a 429 stops the run with memory unchanged, because waiting would hold cognee's staging lock and the next run re-reads everything. The first 5xx or dropped connection of a run gets one retry after at most 5 s, and any later one stops the run, so retries add at most 5 s per run. A timeout is not retried: each request times out after 30 s. `session` is accepted as another name for it. |
 
 All arguments are keyword-only. After a run, `source.cognee_sync_stats` holds the row count of
 each table (`rules`, and `metrics` with metadata on) and `failed_rate_limit`, the number of 429
-answers that stopped the run, plus `skipped_groups`, the `rule_groups` entries a run skipped because
-an earlier `allow_empty=True` run accepted them as gone. The counts are cleared when a run starts
+answers that stopped the run, `failed_auth`, the number of 401 or 403 answers, plus
+`skipped_groups`, the `rule_groups` entries skipped in this run, including the ones this run
+accepted with `allow_empty=True`. The counts are cleared when a run starts
 and logged when it ends. A table that empties after holding rows logs a warning.
 
 See `examples/example.py` for the full flow.
@@ -92,6 +93,9 @@ Prometheus has no change feed for rules, but the whole rule list is one request.
   carries `warnings` aborts the run and leaves memory untouched. Thanos Querier answers `success`
   with a warning and only the reachable rulers' groups when one is down. A partial snapshot would
   otherwise be forgotten as if it were a deletion.
+- A failed request raises `PrometheusHTTPError` (`PrometheusAuthError` for a 401 or 403, which is
+  also counted in `failed_auth`). Its message names the status and the endpoint only; the query,
+  which carries the rule groups filtered on, stays out of it. The response is on `.response`.
 - A server that suddenly has no rules at all, after an earlier sync found some, aborts the run too.
   Rule files that did not load, or a filter that matches nothing, look exactly like that. The
   check counts the rules left after `rule_type` and `rule_groups`, so a server that ignores the
@@ -148,7 +152,7 @@ Nothing has been released yet, but if you ran this connector from an earlier com
 
 1. Find the server URL. If Prometheus runs with `--web.route-prefix=/prom`, the URL includes
    `/prom`.
-2. Set it as `PROMETHEUS_URL` (or pass `base_url=...`), plus credentials if a proxy needs them,
+2. Pass it as `base_url=...` (the example reads it from `PROMETHEUS_URL`), plus credentials if a proxy needs them,
    and your `LLM_API_KEY` like any other cognee run.
 
 ## Testing

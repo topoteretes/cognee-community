@@ -1,3 +1,7 @@
-from cognee_community_connector_prometheus.prometheus import prometheus_source
+from cognee_community_connector_prometheus.prometheus import (
+    PrometheusAuthError,
+    PrometheusHTTPError,
+    prometheus_source,
+)
 
-__all__ = ["prometheus_source"]
+__all__ = ["PrometheusAuthError", "PrometheusHTTPError", "prometheus_source"]

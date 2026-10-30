@@ -19,7 +19,6 @@ Rules the code keeps:
 
 import hashlib
 import json
-import os
 import re
 from collections import Counter
 from collections.abc import Callable
@@ -30,8 +29,10 @@ from urllib.parse import urlsplit
 import dlt
 from cognee.shared.logging_utils import get_logger
 from cognee.tasks.ingestion import dlt_utils
+from dlt.extract.exceptions import ResourceExtractionError
 from dlt.sources.helpers.requests import Client
 from dlt.sources.rest_api import rest_api_resources
+from requests import exceptions as http_errors
 
 logger = get_logger("prometheus_connector")
 
@@ -68,9 +69,9 @@ _KNOWN_ANNOTATIONS = (
 # Seconds before one request gives up. dlt's default is 60, and the wait happens
 # inside cognee's staging lock, which every other dlt ingestion waits on.
 _REQUEST_TIMEOUT = 30
-# Longest wait before the one retry a 5xx or a dropped connection gets. dlt's
-# own cap is 300 s, four times per request; a few seconds rides out a blip
-# without holding the staging lock for long. A 429 is never retried.
+# Longest wait before the one retry a run gets, for a 5xx or a dropped
+# connection. dlt's own cap is 300 s, four times per request; one short wait
+# per run rides out a blip without holding the staging lock for long.
 _RETRY_WAIT = 5
 # Control characters other than tab and newline. A NUL would make Postgres
 # refuse the whole load, so every sync would fail while that rule exists.
@@ -98,12 +99,13 @@ def prometheus_source(
 
     Args:
         base_url: Prometheus server URL, including any path prefix set with
-            ``--web.route-prefix``. Falls back to ``PROMETHEUS_URL``.
+            ``--web.route-prefix``. Required. The factory reads no environment
+            variables; the example reads ``PROMETHEUS_URL`` and the credentials.
         username: Basic-auth user, for a server behind a proxy or started with a
-            web config file. Falls back to ``PROMETHEUS_USERNAME``.
-        password: Basic-auth password. Falls back to ``PROMETHEUS_PASSWORD``.
-        token: Bearer token, for a server behind a proxy that expects one. Falls
-            back to ``PROMETHEUS_TOKEN``. Use either a token or basic auth.
+            web config file.
+        password: Basic-auth password.
+        token: Bearer token, for a server behind a proxy that expects one. Use
+            either a token or basic auth.
         headers: Extra headers sent with every request.
         rule_type: ``"alert"`` or ``"record"`` to ingest only one kind of rule.
             ``None`` ingests both.
@@ -132,10 +134,10 @@ def prometheus_source(
             aborts and memory stays as it was.
         service: ``requests.Session`` to send requests through, mainly for tests.
             By default dlt's session is used, set so a sync never waits long
-            inside cognee's staging lock: a 429 stops the run, a 5xx or a
-            dropped connection gets one retry after at most 5 s, and each
-            request times out after 30 s. ``session`` is accepted as another
-            name for it.
+            inside cognee's staging lock: a 429 stops the run, the first 5xx or
+            dropped connection of a run gets one retry after at most 5 s and
+            any later one stops it, a timeout is not retried, and each request
+            times out after 30 s. ``session`` is accepted as another name for it.
 
     Returns:
         A dlt source for ``cognee.add(...)`` / ``cognee.remember(...)``. Its
@@ -144,11 +146,15 @@ def prometheus_source(
     # cognee marks its document-sync behaviour with this number. Version 1, in
     # 1.6.1, is the one that scopes orphan cleanup by staging table, which two
     # tables under one tag need. Later versions only add to it.
-    if getattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 0) < 1:
+    # A dev build of cognee can carry the version but not the scope attribute
+    # yet, so both are checked.
+    if getattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 0) < 1 or not hasattr(
+        dlt_utils, "PIPELINE_SCOPE_ATTR"
+    ):
         raise RuntimeError("The Prometheus connector needs cognee>=1.6.1 (table-scoped cleanup).")
-    url = base_url or os.environ.get("PROMETHEUS_URL")
+    url = base_url
     if not url:
-        raise ValueError("Prometheus URL required: pass base_url= or set PROMETHEUS_URL.")
+        raise ValueError("Prometheus URL required: pass base_url=.")
     parts = urlsplit(url)
     if parts.query or parts.fragment or url.endswith(("?", "#")):
         # dlt appends "api/v1/rules" to the base URL as text, after any query.
@@ -165,12 +171,6 @@ def prometheus_source(
         )
     rules_table, metrics_table = f"{name}_rules", f"{name}_metrics"
     active = [_still_active(check_active)] if check_active else []
-    if token is None and username is None and password is None:
-        # Only when no credentials were passed, so an explicit choice is never
-        # mixed with the other kind from the environment.
-        username = os.environ.get("PROMETHEUS_USERNAME")
-        password = os.environ.get("PROMETHEUS_PASSWORD")
-        token = os.environ.get("PROMETHEUS_TOKEN")
     if token and (username or password):
         raise ValueError("Pass either a bearer token or basic-auth credentials, not both.")
     if bool(username) != bool(password):
@@ -243,25 +243,18 @@ def prometheus_source(
     rules = dlt.resource(
         _rule_documents, name=rules_table, primary_key="id", write_disposition="replace"
     )
-    loaded = [rules(by_name[_RULE_GROUPS], rule_type, rule_groups, allow_empty, stats, rules_table)]
+    budget = getattr(http, "retry_budget", None)
+    loaded = [
+        rules(
+            by_name[_RULE_GROUPS], rule_type, rule_groups, allow_empty, stats, budget, rules_table
+        )
+    ]
 
     if include_metadata:
-
-        @dlt.transformer(name=metrics_table, primary_key="id", write_disposition="replace")
-        def prometheus_metrics(bodies):
-            # Prometheus builds metadata from live scrape targets, so right after a
-            # restart it answers with nothing, then fills in target by target over
-            # a scrape interval. A sync in that window would forget the metrics of
-            # every target not scraped yet. A server that never had targets just
-            # loads no metrics.
-            for body in bodies if isinstance(bodies, list) else [bodies]:
-                data = body.get("data") if isinstance(body, dict) else None
-                rows = list(_metric_rows(data or {}))
-                _guard_metric_drop(len(rows), allow_empty_metrics)
-                yield rows
-                _finish(stats, "metrics", metrics_table, len(rows))
-
-        loaded.append(by_name[_METADATA] | prometheus_metrics)
+        metrics = dlt.resource(
+            _metric_documents, name=metrics_table, primary_key="id", write_disposition="replace"
+        )
+        loaded.append(metrics(by_name[_METADATA], allow_empty_metrics, stats, metrics_table))
 
     # max_table_nesting=0: rows are flat already, and this keeps dlt from ever
     # unpacking a nested value into a child table that cognee would read back.
@@ -302,22 +295,58 @@ def _default_resource_name(parts) -> str:
     return "_".join(part for part in (PROMETHEUS_SOURCE_NAME, slug, digest) if part)
 
 
+class _RetryBudget:
+    """One retry for a whole run, used as dlt's retry condition.
+
+    Every wait happens inside cognee's staging lock, which every other dlt
+    ingestion in the process waits on, and dlt would otherwise retry each
+    request on its own. With this, the first 5xx or dropped connection of a run
+    is retried once after at most ``_RETRY_WAIT`` seconds, and any later one
+    stops the run. A timeout is not retried, so a request that hangs costs
+    ``_REQUEST_TIMEOUT`` once, and a 429 never is.
+    """
+
+    _RETRIED = (http_errors.ConnectionError, http_errors.ChunkedEncodingError)
+
+    def __init__(self):
+        self.left = 1
+
+    def reset(self) -> None:
+        self.left = 1
+
+    def __call__(self, response, exception) -> bool:
+        if isinstance(exception, http_errors.Timeout):
+            return False  # ConnectTimeout is also a ConnectionError; it is not retried
+        failed = isinstance(exception, self._RETRIED) or (
+            response is not None and 500 <= response.status_code < 600
+        )
+        if not failed or self.left <= 0:
+            return False
+        self.left -= 1
+        return True
+
+
 def _default_session():
     """dlt's session, kept short because it runs inside cognee's staging lock.
 
-    A 5xx or a dropped connection gets one retry after at most ``_RETRY_WAIT``
-    seconds, so one blip doesn't fail the run. A 429 is never retried: it is
-    left out of the retried codes, and ``_rate_limited`` stops the run from
-    inside the request before dlt's retry would see the answer anyway. Each try
-    gives up after ``_REQUEST_TIMEOUT``.
+    dlt's own retry rules are switched off (no status codes, no exceptions), and
+    ``_RetryBudget`` decides instead: one retry per run for a 5xx or a dropped
+    connection, after at most ``_RETRY_WAIT`` seconds. A timeout and a 429 are
+    never retried; ``_rate_limited`` also stops the run on a 429 from inside the
+    request. Each request gives up after ``_REQUEST_TIMEOUT``.
     """
-    return Client(
+    budget = _RetryBudget()
+    session = Client(
         raise_for_status=False,
-        status_codes=tuple(range(500, 600)),  # dlt's default list also has 429
+        status_codes=(),
+        exceptions=(),
+        retry_condition=budget,
         request_max_attempts=2,
         request_max_retry_delay=_RETRY_WAIT,
         request_timeout=_REQUEST_TIMEOUT,
     ).session
+    session.retry_budget = budget
+    return session
 
 
 def _rate_limited(stats: dict):
@@ -345,15 +374,20 @@ def _rule_documents(
     rule_groups: list[str] | None,
     allow_empty: bool,
     stats: dict,
+    budget: "_RetryBudget | None",
     table: str,
 ):
     """One document per rule, from the single rules page of this run."""
     # Before the first request of the run: clear the counts, so a failed run
-    # never shows the last good run's numbers as its own.
+    # never shows the last good run's numbers as its own, and give the run its
+    # one retry.
+    if budget is not None:
+        budget.reset()
     stats.clear()
     stats["failed_rate_limit"] = 0
+    stats["failed_auth"] = 0
     stats["skipped_groups"] = []
-    pages = list(raw)
+    pages = list(_items(raw, stats))
     data = pages[0] if len(pages) == 1 else None
     groups = data.get("groups") if isinstance(data, dict) else None
     # A fresh counter per run, so a source object that is run twice keeps its
@@ -364,6 +398,93 @@ def _rule_documents(
     _guard_empty("rules", len(rows), allow_empty)
     yield rows
     _finish(stats, "rules", table, len(rows))
+
+
+def _metric_documents(raw, allow_empty_metrics: bool, stats: dict, table: str):
+    """One document per metric, from the single metadata page of this run.
+
+    Prometheus builds metadata from live scrape targets, so right after a
+    restart it answers with nothing, then fills in target by target over a
+    scrape interval. A sync in that window would forget the metrics of every
+    target not scraped yet. A server that never had targets just loads no
+    metrics.
+    """
+    pages = list(_items(raw, stats))
+    body = pages[0] if len(pages) == 1 else None
+    data = body.get("data") if isinstance(body, dict) else None
+    rows = list(_metric_rows(data or {}))
+    _guard_metric_drop(len(rows), allow_empty_metrics)
+    yield rows
+    _finish(stats, "metrics", table, len(rows))
+
+
+def _items(resource, stats: dict) -> Any:
+    """Every item of a raw rest_api resource. dlt hands them over one at a time.
+
+    A failed request reaches this point as dlt's error, whose text carries the
+    full URL, query included (the rule groups filtered on). It is replaced by a
+    ``PrometheusHTTPError`` that names only the status and the endpoint.
+    """
+    try:
+        yield from resource
+    except (ResourceExtractionError, http_errors.RequestException) as exc:
+        mapped = _http_error(exc, stats)
+        if mapped is None:
+            raise
+        raise mapped from None
+
+
+class PrometheusHTTPError(RuntimeError):
+    """A request to Prometheus failed. The message has the status and endpoint only.
+
+    The response, when there was one, is on ``response`` for callers that need
+    more; its URL carries the query, so it is kept out of the message.
+    """
+
+    def __init__(self, status: int | None, endpoint: str, response=None, reason: str = ""):
+        self.status = status
+        self.endpoint = endpoint
+        self.response = response
+        what = f"HTTP {status}" if status else f"{reason or 'request'} failed"
+        super().__init__(f"Prometheus: {what} on {endpoint}. Aborting; memory is unchanged.")
+
+
+class PrometheusAuthError(PrometheusHTTPError):
+    """401 or 403: the credentials are wrong, or the proxy refuses them."""
+
+    def __init__(self, status: int, endpoint: str, response=None):
+        super().__init__(status, endpoint, response)
+        self.args = (
+            f"Prometheus: HTTP {status} on {endpoint}: check the credentials. Aborting; "
+            "memory is unchanged.",
+        )
+
+
+def _http_error(exc: BaseException, stats: dict) -> PrometheusHTTPError | None:
+    """The PrometheusHTTPError for a failed request under dlt's extraction errors.
+
+    Only dlt's wrappers are looked through. Any other exception, such as the
+    connector's own checks, keeps its message, and so does a body that is not
+    JSON (requests counts that as a request error too).
+    """
+    seen: BaseException | None = exc
+    while isinstance(seen, ResourceExtractionError):
+        seen = seen.__cause__ or seen.__context__
+    if isinstance(seen, PrometheusHTTPError):
+        return seen
+    if isinstance(seen, http_errors.HTTPError) and seen.response is not None:
+        response = seen.response
+        endpoint = urlsplit(response.url).path
+        if response.status_code in (401, 403):
+            stats["failed_auth"] = stats.get("failed_auth", 0) + 1
+            return PrometheusAuthError(response.status_code, endpoint, response)
+        return PrometheusHTTPError(response.status_code, endpoint, response)
+    if isinstance(seen, http_errors.RequestException) and not isinstance(
+        seen, http_errors.InvalidJSONError
+    ):
+        url = seen.request.url if seen.request is not None else ""
+        return PrometheusHTTPError(None, urlsplit(url or "").path, reason=type(seen).__name__)
+    return None
 
 
 def _guard_missing_groups(
@@ -391,7 +512,7 @@ def _guard_missing_groups(
     missing = sorted(set(rule_groups) - present)
     accepted = state.get("forgotten_groups") or {}
     if isinstance(accepted, list):  # written by an earlier commit, time unknown
-        accepted = dict.fromkeys(accepted, "an earlier run")
+        accepted = dict.fromkeys(accepted, "time unknown")
     new = [group for group in missing if group not in accepted]
     if new and not allow_empty:
         raise ValueError(
@@ -404,8 +525,8 @@ def _guard_missing_groups(
     kept = {group: accepted.get(group, now) for group in missing}
     for when in sorted(set(kept.values())):
         logger.warning(
-            "Prometheus: skipping %s rule groups of rule_groups: not on the server, "
-            "accepted as gone by the allow_empty=True run of %s",
+            "Prometheus: skipping %s rule groups of rule_groups: not on the server; an "
+            "allow_empty=True run accepted them as gone (%s)",
             sum(1 for group in missing if kept[group] == when),
             when,
         )
@@ -544,6 +665,8 @@ def _rule_rows(
         if rule_groups and group.get("name") not in rule_groups:
             continue
         for rule in rules:
+            if not isinstance(rule, dict):
+                raise ValueError("Prometheus: a rule that is not an object. Aborting.")
             if kind and rule.get("type") != kind:
                 continue
             yield _rule_row(group, rule, seen)

@@ -50,7 +50,12 @@ async def main() -> None:
 
     # rule_type="alert" or rule_groups=[...] narrow what is read;
     # include_metadata=True adds one document per metric with its help text.
-    source = prometheus_source(base_url=base_url)
+    source = prometheus_source(
+        base_url=base_url,
+        username=os.environ.get("PROMETHEUS_USERNAME"),
+        password=os.environ.get("PROMETHEUS_PASSWORD"),
+        token=os.environ.get("PROMETHEUS_TOKEN"),
+    )
 
     print(f"Syncing rules from {base_url} into cognee ...")
     # self_improvement=False: a re-sync should not trigger the whole-graph

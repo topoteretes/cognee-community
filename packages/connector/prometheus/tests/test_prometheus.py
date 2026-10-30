@@ -103,6 +103,8 @@ class FakePrometheus(BaseAdapter):
 
         failure = self.fail(url.path) if self.fail else None
         if isinstance(failure, Exception):
+            if isinstance(failure, requests.RequestException) and failure.request is None:
+                failure.request = request  # as requests' own adapter sets it
             raise failure  # e.g. a dropped connection
         if failure:
             response = self._response(request, *failure)
@@ -412,6 +414,21 @@ def test_an_older_cognee_is_refused(monkeypatch):
         prometheus_source(base_url=BASE_URL)
 
 
+def test_a_cognee_without_the_scope_attribute_is_refused(monkeypatch):
+    # A dev build can carry the version number but not PIPELINE_SCOPE_ATTR yet.
+    from cognee.tasks.ingestion import dlt_utils
+
+    monkeypatch.delattr(dlt_utils, "PIPELINE_SCOPE_ATTR")
+    with pytest.raises(RuntimeError, match=r"cognee>=1\.6\.1"):
+        prometheus_source(base_url=BASE_URL)
+
+
+def test_a_rule_that_is_not_an_object_aborts():
+    groups = [{"name": "g", "file": "f", "rules": ["not a rule"]}]
+    with pytest.raises(ValueError, match="not an object"):
+        list(_rule_rows(groups, Counter()))
+
+
 def _guard_groups_harness(monkeypatch, state):
     from cognee_community_connector_prometheus import prometheus
 
@@ -461,8 +478,8 @@ def test_skipped_groups_saved_by_an_earlier_commit_are_read(monkeypatch):
     prometheus, warnings = _guard_groups_harness(monkeypatch, state)
     on_server = [{"name": "node-health", "rules": []}]
     prometheus._guard_missing_groups(on_server, None, ["node-health", "gone-a"], False, {})
-    assert warnings[-1][1:] == (1, "an earlier run")
-    assert state["forgotten_groups"] == {"gone-a": "an earlier run"}
+    assert warnings[-1][1:] == (1, "time unknown")
+    assert state["forgotten_groups"] == {"gone-a": "time unknown"}
 
 
 def test_source_takes_keyword_arguments_only():
@@ -487,19 +504,21 @@ def test_rows_do_not_depend_on_the_order_of_labels_or_annotations():
     assert _rules(shuffled) == _rules(body)
 
 
-def test_explicit_credentials_are_not_mixed_with_the_environment(dlt_mod, tmp_path, monkeypatch):
-    # A token exported for something else must not turn explicit basic auth into
-    # a "both" error, and must not be sent.
+def test_the_factory_reads_no_environment(dlt_mod, tmp_path, monkeypatch):
+    # Environment variables are the example's business, not the factory's: an
+    # exported token is neither mixed with explicit basic auth nor sent.
     monkeypatch.setenv("PROMETHEUS_TOKEN", "from-env")
+    monkeypatch.setenv("PROMETHEUS_URL", BASE_URL)
+    with pytest.raises(ValueError, match="URL required"):
+        prometheus_source()
     fake = FakePrometheus()
     _run_sync(dlt_mod, tmp_path, fake, username="ops", password="pw")
     ((_, _, headers),) = fake.calls
     assert headers["Authorization"] == "Basic " + base64.b64encode(b"ops:pw").decode()
 
 
-def test_source_requires_a_url(monkeypatch):
-    monkeypatch.delenv("PROMETHEUS_URL", raising=False)
-    with pytest.raises(ValueError, match="PROMETHEUS_URL"):
+def test_source_requires_a_url():
+    with pytest.raises(ValueError, match="URL required"):
         prometheus_source()
 
 
@@ -723,6 +742,7 @@ def test_sync_stats_count_the_rows_of_the_last_run(dlt_mod, tmp_path):
         "rules": len(_read(pipeline)),
         "metrics": len(_read(pipeline, METRICS)),
         "failed_rate_limit": 0,
+        "failed_auth": 0,
         "skipped_groups": [],
     }
     assert source.cognee_sync_stats["rules"] > 0
@@ -891,6 +911,105 @@ def test_a_dropped_connection_gets_one_short_retry(dlt_mod, tmp_path, monkeypatc
     fake.fail = drop_once
     assert _read(_run_sync(dlt_mod, tmp_path, fake, service=_session_on(fake)))
     assert dropped and len(slept) == 1 and slept[0] <= 5
+
+
+def test_a_run_gets_one_retry_in_total(dlt_mod, tmp_path, monkeypatch):
+    # Every wait is spent inside cognee's staging lock, so the retry is for the
+    # whole run, not one per request: a second blip in the same run stops it.
+    slept = _record_sleeps(monkeypatch)
+    fake = FakePrometheus()
+    fake.retry_after = "1000"
+    failed = set()
+
+    def first_try_of_each(path):
+        if path not in failed:
+            failed.add(path)
+            return (503, b"")
+        return None
+
+    fake.fail = first_try_of_each
+    with pytest.raises(PipelineStepFailed, match="HTTP 503"):
+        _run_sync(dlt_mod, tmp_path, fake, service=_session_on(fake), include_metadata=True)
+    assert slept == [5], "one wait for the run"
+    metadata_calls = [call for call in fake.calls if call[0].endswith("/api/v1/metadata")]
+    assert len(metadata_calls) == 1, "the second blip of the run is not retried"
+
+
+def _fail_first_try():
+    """A fail() that answers 503 to the first request it sees, then lets everything through."""
+    failed = []
+
+    def fail(path):
+        if failed:
+            return None
+        failed.append(path)
+        return (503, b"")
+
+    return fail
+
+
+def test_each_run_starts_with_its_own_retry(dlt_mod, tmp_path, monkeypatch):
+    slept = _record_sleeps(monkeypatch)
+    fake = FakePrometheus()
+    fake.retry_after = "1000"
+    source = prometheus_source(base_url=BASE_URL, service=_session_on(fake))
+    pipeline = _pipeline(dlt_mod, tmp_path)
+    for _ in range(2):  # one blip per run, retried in both runs
+        fake.fail = _fail_first_try()
+        pipeline.run(source)
+    assert slept == [5, 5]
+    assert _read(pipeline)
+
+
+def test_a_request_that_times_out_is_not_retried(dlt_mod, tmp_path, monkeypatch):
+    # A hang already cost 30 s under the staging lock; a retry would double it.
+    slept = _record_sleeps(monkeypatch)
+    fake = FakePrometheus()
+    fake.fail = lambda path: requests.ReadTimeout("read timed out")
+    with pytest.raises(PipelineStepFailed, match="ReadTimeout failed on /api/v1/rules"):
+        _run_sync(dlt_mod, tmp_path, fake, service=_session_on(fake))
+    assert len(fake.rule_calls()) == 1 and slept == []
+
+
+def _error_in(exc):
+    """The PrometheusHTTPError somewhere in a pipeline error's chain."""
+    from cognee_community_connector_prometheus import PrometheusHTTPError
+
+    seen = getattr(exc, "exception", None) or exc
+    while seen is not None:
+        if isinstance(seen, PrometheusHTTPError):
+            return seen
+        seen = seen.__cause__ or seen.__context__
+    return None
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_rejected_credentials_raise_a_named_error_without_the_query(dlt_mod, tmp_path, status):
+    from cognee_community_connector_prometheus import PrometheusAuthError
+
+    fake = FakePrometheus()
+    fake.fail = lambda path: (status, b"")
+    source = prometheus_source(
+        base_url=BASE_URL, service=fake.session(), rule_groups=["checkout-availability"]
+    )
+    with pytest.raises(PipelineStepFailed) as raised:
+        _pipeline(dlt_mod, tmp_path).run(source)
+
+    error = _error_in(raised.value)
+    assert isinstance(error, PrometheusAuthError) and error.status == status
+    assert f"HTTP {status} on /api/v1/rules: check the credentials" in str(raised.value)
+    # Group names are the caller's labels; the query that carries them stays out.
+    assert "checkout-availability" not in str(raised.value)
+    assert "rule_group" not in str(raised.value)
+    assert source.cognee_sync_stats["failed_auth"] == 1
+
+
+def test_a_server_error_names_the_status_and_endpoint_only(dlt_mod, tmp_path):
+    fake = FakePrometheus()
+    fake.fail = lambda path: (500, b"") if path.endswith("/api/v1/metadata") else None
+    with pytest.raises(PipelineStepFailed, match="HTTP 500 on /api/v1/metadata") as raised:
+        _run_sync(dlt_mod, tmp_path, fake, include_metadata=True)
+    assert _error_in(raised.value).status == 500
 
 
 def test_each_request_times_out_after_30_seconds(dlt_mod, tmp_path):
