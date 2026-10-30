@@ -1,0 +1,138 @@
+{
+ "status": "success",
+ "data": {
+  "groups": [
+   {
+    "name": "checkout-availability",
+    "file": "/etc/prometheus/rules/app.yml",
+    "rules": [
+     {
+      "state": "inactive",
+      "name": "CheckoutHighErrorRate",
+      "query": "sum(rate(prometheus_http_requests_total{code=~\"5..\"}[5m])) / sum(rate(prometheus_http_requests_total[5m])) > 0.05",
+      "duration": 600,
+      "keepFiringFor": 0,
+      "labels": {
+       "severity": "page",
+       "team": "payments"
+      },
+      "annotations": {
+       "description": "The checkout API error ratio has been above 5% for 10 minutes. Customers cannot pay.",
+       "runbook_url": "https://runbooks.example.com/checkout/high-error-rate",
+       "summary": "Checkout is returning 5xx for more than 5% of requests"
+      },
+      "alerts": [],
+      "health": "ok",
+      "evaluationTime": 0.000779544,
+      "lastEvaluation": "2026-10-15T07:44:51.986058994Z",
+      "type": "alerting"
+     },
+     {
+      "state": "inactive",
+      "name": "CheckoutHighErrorRate",
+      "query": "sum(rate(prometheus_http_requests_total{code=~\"5..\"}[5m])) / sum(rate(prometheus_http_requests_total[5m])) > 0.01",
+      "duration": 1800,
+      "keepFiringFor": 0,
+      "labels": {
+       "severity": "ticket",
+       "team": "payments"
+      },
+      "annotations": {
+       "runbook_url": "https://runbooks.example.com/checkout/high-error-rate",
+       "summary": "Checkout 5xx ratio above 1%"
+      },
+      "alerts": [],
+      "health": "ok",
+      "evaluationTime": 0.000676013,
+      "lastEvaluation": "2026-10-15T07:44:51.986849043Z",
+      "type": "alerting"
+     },
+     {
+      "state": "firing",
+      "name": "HeartbeatAlwaysFiring",
+      "query": "vector(1)",
+      "duration": 0,
+      "keepFiringFor": 0,
+      "labels": {
+       "severity": "none"
+      },
+      "annotations": {
+       "summary": "Always firing, proves the pipeline is alive"
+      },
+      "alerts": [
+       {
+        "labels": {
+         "alertname": "HeartbeatAlwaysFiring",
+         "severity": "none"
+        },
+        "annotations": {
+         "summary": "Always firing, proves the pipeline is alive"
+        },
+        "state": "firing",
+        "activeAt": "2026-10-15T07:41:21.98424743Z",
+        "value": "1e+00"
+       }
+      ],
+      "health": "ok",
+      "evaluationTime": 0.000401232,
+      "lastEvaluation": "2026-10-15T07:44:51.987535656Z",
+      "type": "alerting"
+     }
+    ],
+    "interval": 30,
+    "limit": 0,
+    "evaluationTime": 0.001938078,
+    "lastEvaluation": "2026-10-15T07:44:51.986005065Z"
+   },
+   {
+    "name": "checkout-recording",
+    "file": "/etc/prometheus/rules/app.yml",
+    "rules": [
+     {
+      "name": "job:prometheus_http_requests:rate5m",
+      "query": "sum by (job) (rate(prometheus_http_requests_total[5m]))",
+      "labels": {},
+      "health": "ok",
+      "evaluationTime": 0.001327244,
+      "lastEvaluation": "2026-10-15T07:44:56.126003583Z",
+      "type": "recording"
+     }
+    ],
+    "interval": 5,
+    "limit": 0,
+    "evaluationTime": 0.001409688,
+    "lastEvaluation": "2026-10-15T07:44:56.125930142Z"
+   },
+   {
+    "name": "node-health",
+    "file": "/etc/prometheus/rules/infra.yml",
+    "rules": [
+     {
+      "state": "inactive",
+      "name": "ScrapeTargetDown",
+      "query": "up == 0",
+      "duration": 120,
+      "keepFiringFor": 300,
+      "labels": {
+       "severity": "page",
+       "team": "platform"
+      },
+      "annotations": {
+       "runbook_url": "https://runbooks.example.com/platform/target-down",
+       "summary": "{{ $labels.job }} target {{ $labels.instance }} is down"
+      },
+      "alerts": [],
+      "health": "ok",
+      "evaluationTime": 0.000295575,
+      "lastEvaluation": "2026-10-15T07:44:58.340060573Z",
+      "type": "alerting"
+     }
+    ],
+    "interval": 5,
+    "limit": 0,
+    "evaluationTime": 0.000353026,
+    "lastEvaluation": "2026-10-15T07:44:58.340010364Z"
+   }
+  ]
+ }
+}
