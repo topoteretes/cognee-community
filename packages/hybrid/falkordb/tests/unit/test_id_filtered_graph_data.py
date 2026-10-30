@@ -2,8 +2,8 @@
 
 Verifies the id-scoped subgraph projection used by cognee's
 GraphCompletionRetriever: node/edge tuple shapes, edge direction taken from
-properties(r), and seed<->seed de-dup. No FalkorDB connection is required —
-uses a mock driver, same style as test_query_return_type.py.
+startNode(r)/endNode(r), and seed<->seed de-dup. No FalkorDB connection is
+required — uses a mock driver, same style as test_query_return_type.py.
 """
 
 import asyncio
@@ -45,6 +45,8 @@ def test_projects_nodes_and_directed_edges():
             {"id": "n1", "name": "neighbor"},
             "RELATES_TO",
             {"source_node_id": "s1", "target_node_id": "n1"},
+            "s1",
+            "n1",
         ],
     ]
     adapter, _ = _make_adapter_with_mock_query(rows)
@@ -56,38 +58,25 @@ def test_projects_nodes_and_directed_edges():
     assert edges == [("s1", "n1", "RELATES_TO", {"source_node_id": "s1", "target_node_id": "n1"})]
 
 
-def test_direction_from_rel_props_not_match_order():
-    # Undirected match can bind `a` to the target end; direction must come from
-    # properties(r), so the edge stays s1 -> n1 even though a == n1 here.
-    rows = [
-        [
-            {"id": "n1"},
-            {"id": "s1"},
-            "RELATES_TO",
-            {"source_node_id": "s1", "target_node_id": "n1"},
-        ],
-    ]
+def test_direction_from_start_end_nodes_not_match_order():
+    # Undirected match can bind `a` to the target end, and not every edge stores
+    # source_node_id / target_node_id. Direction must come from
+    # startNode(r) / endNode(r), so the edge stays s1 -> n1 even though a == n1.
+    rows = [[{"id": "n1"}, {"id": "s1"}, "RELATES_TO", {}, "s1", "n1"]]
     adapter, _ = _make_adapter_with_mock_query(rows)
     _, edges = asyncio.run(adapter.get_id_filtered_graph_data(["s1"]))
-    assert edges == [("s1", "n1", "RELATES_TO", {"source_node_id": "s1", "target_node_id": "n1"})]
+    assert edges == [("s1", "n1", "RELATES_TO", {})]
 
 
 def test_seed_to_seed_edge_deduped():
     # Undirected match returns a seed<->seed edge twice (once per anchor).
     e = {"source_node_id": "s1", "target_node_id": "s2"}
     rows = [
-        [{"id": "s1"}, {"id": "s2"}, "REL", e],
-        [{"id": "s2"}, {"id": "s1"}, "REL", e],
+        [{"id": "s1"}, {"id": "s2"}, "REL", e, "s1", "s2"],
+        [{"id": "s2"}, {"id": "s1"}, "REL", e, "s1", "s2"],
     ]
     adapter, _ = _make_adapter_with_mock_query(rows)
     nodes, edges = asyncio.run(adapter.get_id_filtered_graph_data(["s1", "s2"]))
     assert {n[0] for n in nodes} == {"s1", "s2"}
     assert len(edges) == 1
     assert edges[0][:3] == ("s1", "s2", "REL")
-
-
-def test_falls_back_to_endpoints_when_rel_props_lack_ids():
-    rows = [[{"id": "s1"}, {"id": "n1"}, "REL", {}]]
-    adapter, _ = _make_adapter_with_mock_query(rows)
-    _, edges = asyncio.run(adapter.get_id_filtered_graph_data(["s1"]))
-    assert edges == [("s1", "n1", "REL", {})]

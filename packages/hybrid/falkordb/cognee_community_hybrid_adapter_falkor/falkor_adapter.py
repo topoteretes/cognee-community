@@ -1578,9 +1578,10 @@ class FalkorDBAdapter(VectorDBInterface, GraphDBInterface):
         cognee mints ~one relationship TYPE per relationship name (easily tens of
         thousands on a real graph) and FalkorDB keeps one adjacency matrix per
         type, so an unanchored untyped match probes every per-type matrix for
-        every node. Edge direction is taken from ``properties(r).source_node_id``
-        / ``target_node_id`` so it survives the undirected match; a seed<->seed
-        edge returned twice (once per anchor) is de-duped.
+        every node. Edge direction is taken from ``startNode(r)`` / ``endNode(r)``
+        so it survives the undirected match and does not depend on the
+        ``source_node_id`` / ``target_node_id`` edge properties (not every edge
+        has them); a seed<->seed edge returned twice (once per anchor) is de-duped.
 
         Returns the same tuple shape as ``get_graph_data``::
 
@@ -1596,7 +1597,8 @@ class FalkorDBAdapter(VectorDBInterface, GraphDBInterface):
         MATCH (a)-[r]-(b)
         WHERE a.id IN $ids
         RETURN properties(a) AS a_props, properties(b) AS b_props,
-               type(r) AS rel_type, properties(r) AS rel_props
+               type(r) AS rel_type, properties(r) AS rel_props,
+               startNode(r).id AS source_id, endNode(r).id AS target_id
         """
         result = await self.query(query, {"ids": list(target_ids)})
 
@@ -1604,15 +1606,16 @@ class FalkorDBAdapter(VectorDBInterface, GraphDBInterface):
         edges: dict = {}
         if result.result_set:
             for record in result.result_set:
-                # FalkorDB returns values by index: a_props, b_props, type, rel_props
+                # FalkorDB returns values by index:
+                # a_props, b_props, type, rel_props, source_id, target_id
                 a_props = self._deserialize_node_properties(record[0])
                 b_props = self._deserialize_node_properties(record[1])
                 rel_type = record[2]
                 rel_props = record[3] or {}
                 nodes[a_props["id"]] = (a_props["id"], a_props)
                 nodes[b_props["id"]] = (b_props["id"], b_props)
-                source_id = rel_props.get("source_node_id", a_props["id"])
-                target_id = rel_props.get("target_node_id", b_props["id"])
+                source_id = str(record[4])
+                target_id = str(record[5])
                 edges[(source_id, target_id, rel_type)] = (
                     source_id,
                     target_id,
