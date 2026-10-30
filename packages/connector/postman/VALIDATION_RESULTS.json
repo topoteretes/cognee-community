@@ -1,0 +1,308 @@
+{
+  "recorded_date": "2026-10-20",
+  "tested_module_sha256": "27a3c558cc0b412759d0c2bb43b33579e2126f41377d507dd96d2084a944fcc8",
+  "baseline_before_changes": "1c317f272ac0619d4de389409ac7c050db7f69a4",
+  "offline_matrix": [
+    {
+      "python": "3.12.13",
+      "cognee": "1.6.3",
+      "dlt": "1.30.0",
+      "httpx": "0.28.1",
+      "pytest": "9.1.1",
+      "module_sha256": "27a3c558cc0b412759d0c2bb43b33579e2126f41377d507dd96d2084a944fcc8",
+      "result": "passed",
+      "pytest_summary": "185 passed, 1 skipped, 13 warnings in 21.88s",
+      "console_sha256": "8ab66c11f5289582aea22fff3c2be0b45f64f8d287033ad8862d060150d11d30",
+      "command": "COGNEE_LOG_FILE=false TELEMETRY_DISABLED=1 RUNTIME__DLTHUB_TELEMETRY=false python -m pytest tests -q",
+      "installation": "installed wheel"
+    },
+    {
+      "python": "3.10.20",
+      "cognee": "1.6.3",
+      "dlt": "1.29.0",
+      "httpx": "0.28.1",
+      "pytest": "9.1.1",
+      "module_sha256": "27a3c558cc0b412759d0c2bb43b33579e2126f41377d507dd96d2084a944fcc8",
+      "result": "passed",
+      "pytest_summary": "185 passed, 1 skipped, 13 warnings in 23.73s",
+      "console_sha256": "2b3d87519c9437dcda6eff12954a8dcddb53d875667fc9082aa6daa91a3b0910",
+      "command": "COGNEE_LOG_FILE=false TELEMETRY_DISABLED=1 RUNTIME__DLTHUB_TELEMETRY=false python -m pytest tests -q",
+      "installation": "installed wheel"
+    },
+    {
+      "python": "3.14.8",
+      "cognee": "1.6.5",
+      "dlt": "1.30.0",
+      "httpx": "0.28.1",
+      "pytest": "9.1.1",
+      "module_sha256": "27a3c558cc0b412759d0c2bb43b33579e2126f41377d507dd96d2084a944fcc8",
+      "result": "passed",
+      "pytest_summary": "185 passed, 1 skipped, 13 warnings in 23.63s",
+      "console_sha256": "719acffb92d8b88cdbbbd70c56090bffe734267dd6f655e50d5cfbb730dcc0c9",
+      "command": "COGNEE_LOG_FILE=false TELEMETRY_DISABLED=1 RUNTIME__DLTHUB_TELEMETRY=false python -m pytest tests -q",
+      "installation": "installed wheel"
+    }
+  ],
+  "locked_development_environment": {
+    "python": "3.12.13",
+    "cognee": "1.6.5",
+    "dlt": "1.30.0",
+    "httpx": "0.28.1",
+    "pytest": "9.1.1",
+    "module_sha256": "27a3c558cc0b412759d0c2bb43b33579e2126f41377d507dd96d2084a944fcc8",
+    "result": "passed",
+    "pytest_summary": "185 passed, 1 skipped, 13 warnings in 14.40s",
+    "console_sha256": "1c3d47a013805add6fb5f167a0e856655263e60d8d7a4beba495f1d2cb726962",
+    "command": "COGNEE_LOG_FILE=false TELEMETRY_DISABLED=1 RUNTIME__DLTHUB_TELEMETRY=false python -m pytest tests -q",
+    "installation": "editable locked development environment",
+    "uv": "0.11.23",
+    "uv_lock_sha256": "cfe83ac42eb6515bf1c15688ca381be990f07d9923bdddc3679a27355dbaddf4",
+    "lock_check": "passed",
+    "ruff_check": "passed",
+    "ruff_format_check": "21 files already formatted",
+    "install_command": "uv sync --locked --extra test --python 3.12",
+    "scope": "macOS ARM64; other lock branches not executed by this receipt."
+  },
+  "regression_baseline": {
+    "commit": "1c317f272ac0619d4de389409ac7c050db7f69a4",
+    "pytest_summary": "50 failed, 4 passed, 1 warning in 0.69s",
+    "console_sha256": "c24c0880bf8dd8b2322e1ccf3261a9a9cc2c7b01a1db13db711455a9a52af183",
+    "scope": "Current round5 counterexamples against an isolated copy of the committed baseline; module path asserted before pytest. These failures are expected reproductions, not current-code failures."
+  },
+  "model_integration": {
+    "result": "passed",
+    "pytest_summary": "1 passed, 17 warnings in 20.08s",
+    "cognee": "1.6.3",
+    "python": "3.12.13",
+    "provider": "fake",
+    "stores": "real SQLite/Ladybug/LanceDB",
+    "models": "cached GLiNER2.5 and bge-small",
+    "scope": "remember with sibling isolation, refused explicit disappearance retaining stores, then confirmed final cleanup",
+    "command": "POSTMAN_MODEL_TEST=1 python -m pytest tests/test_cognee_scope_lifecycle.py -q",
+    "console_sha256": "01497e9f3dbcc5b62b18400c4008bb328955dfe37a4e80be71b3ec645a201a09"
+  },
+  "authenticated_lifecycle": {
+    "result": "passed",
+    "python": "3.12.13",
+    "cognee": "1.6.3",
+    "dlt": "1.30.0",
+    "command": "python tests/support/postman_lifecycle.py --allow-provider-writes",
+    "writes": "Only two owned synthetic collections; saved requests never executed.",
+    "steps": [
+      {
+        "step": "initial",
+        "data_rows": 2,
+        "graph_nodes": 20,
+        "graph_edges": 23,
+        "vector_rows": {
+          "DocumentChunk_text": 2,
+          "EdgeType_relationship_name": 23,
+          "EntityType_name": 8,
+          "Entity_name": 8,
+          "TextDocument_name": 2,
+          "TextSummary_text": 2
+        }
+      },
+      {
+        "step": "unchanged",
+        "data_rows": 2,
+        "graph_nodes": 20,
+        "graph_edges": 23,
+        "vector_rows": {
+          "DocumentChunk_text": 2,
+          "EdgeType_relationship_name": 23,
+          "EntityType_name": 8,
+          "Entity_name": 8,
+          "TextDocument_name": 2,
+          "TextSummary_text": 2
+        }
+      },
+      {
+        "step": "selection_deselected",
+        "data_rows": 1,
+        "graph_nodes": 11,
+        "graph_edges": 11,
+        "vector_rows": {
+          "DocumentChunk_text": 1,
+          "EdgeType_relationship_name": 11,
+          "EntityType_name": 6,
+          "Entity_name": 4,
+          "TextDocument_name": 1,
+          "TextSummary_text": 1
+        }
+      },
+      {
+        "step": "selection_restored",
+        "data_rows": 2,
+        "graph_nodes": 20,
+        "graph_edges": 23,
+        "vector_rows": {
+          "DocumentChunk_text": 2,
+          "EdgeType_relationship_name": 23,
+          "EntityType_name": 8,
+          "Entity_name": 8,
+          "TextDocument_name": 2,
+          "TextSummary_text": 2
+        }
+      },
+      {
+        "step": "edited",
+        "data_rows": 2,
+        "graph_nodes": 20,
+        "graph_edges": 22,
+        "vector_rows": {
+          "DocumentChunk_text": 2,
+          "EdgeType_relationship_name": 22,
+          "EntityType_name": 8,
+          "Entity_name": 8,
+          "TextDocument_name": 2,
+          "TextSummary_text": 2
+        }
+      },
+      {
+        "step": "docs_only_collection",
+        "data_rows": 2,
+        "graph_nodes": 18,
+        "graph_edges": 22,
+        "vector_rows": {
+          "DocumentChunk_text": 2,
+          "EdgeType_relationship_name": 22,
+          "EntityType_name": 7,
+          "Entity_name": 7,
+          "TextDocument_name": 2,
+          "TextSummary_text": 2
+        }
+      },
+      {
+        "step": "final_request_deleted",
+        "data_rows": 1,
+        "graph_nodes": 11,
+        "graph_edges": 11,
+        "vector_rows": {
+          "DocumentChunk_text": 1,
+          "EdgeType_relationship_name": 11,
+          "EntityType_name": 6,
+          "Entity_name": 4,
+          "TextDocument_name": 1,
+          "TextSummary_text": 1
+        }
+      },
+      {
+        "step": "request_restored",
+        "data_rows": 2,
+        "graph_nodes": 20,
+        "graph_edges": 22,
+        "vector_rows": {
+          "DocumentChunk_text": 2,
+          "EdgeType_relationship_name": 22,
+          "EntityType_name": 8,
+          "Entity_name": 8,
+          "TextDocument_name": 2,
+          "TextSummary_text": 2
+        }
+      },
+      {
+        "step": "selected_missing_refused_stores_unchanged",
+        "data_rows": 2,
+        "graph_nodes": 20,
+        "graph_edges": 22,
+        "vector_rows": {
+          "DocumentChunk_text": 2,
+          "EdgeType_relationship_name": 22,
+          "EntityType_name": 8,
+          "Entity_name": 8,
+          "TextDocument_name": 2,
+          "TextSummary_text": 2
+        }
+      },
+      {
+        "step": "confirmed_collection_deleted_next_sync",
+        "data_rows": 1,
+        "graph_nodes": 11,
+        "graph_edges": 11,
+        "vector_rows": {
+          "DocumentChunk_text": 1,
+          "EdgeType_relationship_name": 11,
+          "EntityType_name": 6,
+          "Entity_name": 4,
+          "TextDocument_name": 1,
+          "TextSummary_text": 1
+        }
+      },
+      {
+        "step": "final_missing_refused_stores_unchanged",
+        "data_rows": 1,
+        "graph_nodes": 11,
+        "graph_edges": 11,
+        "vector_rows": {
+          "DocumentChunk_text": 1,
+          "EdgeType_relationship_name": 11,
+          "EntityType_name": 6,
+          "Entity_name": 4,
+          "TextDocument_name": 1,
+          "TextSummary_text": 1
+        }
+      },
+      {
+        "step": "confirmed_last_collection_deleted",
+        "data_rows": 0,
+        "graph_nodes": 0,
+        "graph_edges": 0,
+        "vector_rows": {
+          "DocumentChunk_text": 0,
+          "EdgeType_relationship_name": 0,
+          "EntityType_name": 0,
+          "Entity_name": 0,
+          "TextDocument_name": 0,
+          "TextSummary_text": 0
+        }
+      },
+      {
+        "step": "empty_replay",
+        "data_rows": 0,
+        "graph_nodes": 0,
+        "graph_edges": 0,
+        "vector_rows": {
+          "DocumentChunk_text": 0,
+          "EdgeType_relationship_name": 0,
+          "EntityType_name": 0,
+          "Entity_name": 0,
+          "TextDocument_name": 0,
+          "TextSummary_text": 0
+        }
+      }
+    ],
+    "console_sha256": "dcaaf25b72419e138d41a6b75e4fb526bd63653cd5c9338efc431cd61d4699a7",
+    "postflight": {
+      "remaining_collections": 1,
+      "synthetic_collections": 0,
+      "private_key_scan_passed": true
+    },
+    "independent_store_verifier": {
+      "result": "passed",
+      "console_sha256": "cf4c3cba13a6626d2857e310f883362f0d7a6b8f6102c29e769ba286179ad556",
+      "scope": "Standalone process inspected actual Data, graph and every LanceDB table; empty."
+    }
+  },
+  "independent_review": {
+    "model": "gpt-6-astra",
+    "effort": "medium",
+    "verdict": "Final code/documentation/evidence review clean within reviewed scope; no actionable material findings.",
+    "pytest_summary": "185 passed, 1 skipped, 13 warnings in 17.95s",
+    "console_sha256": "321396a702239013f0a67bd00616f5987e342527e3ae3335f3a34ee998a689f6",
+    "additional_checks": "26 further credential cases and a multi-step legacy migration/replay/refusal/confirmation/deselection sequence passed.",
+    "scope": "Independently ran full locked offline suite and extra cases, Ruff and whitespace checks; audited source/wheel/lock and all referenced receipt hashes/summaries,13 lifecycle records and postflight. Matrix/model/provider/store-verifier runs were inspected as author-recorded evidence, not independently repeated."
+  },
+  "limits": [
+    "Receipts apply to listed versions and synthetic fixtures, not every backend/platform or secret.",
+    "Optional model test skipped in full suites; separate local-model pass recorded.",
+    "Global exact-value prose replacement skips values below8characters including explicit redact_values; contextual auth patterns still apply.",
+    "Automatic all-visible removals can remove one collection by default; pending UIDs never expire and require explicit confirmation or reappearance before budget reuse.",
+    "Persistent state required; empty inventories and explicitly selected missing UIDs require confirmation. No same-scope concurrency, atomic provider snapshot or response byte budget claimed."
+  ],
+  "final_receipt_audit": {
+    "reviewer": "Astra MEDIUM",
+    "result": "passed",
+    "scope": "Current source/wheel/lock hashes matched; nine existing console hashes, summaries,13 lifecycle records and postflight/verifier receipts were consistent. No independent provider/model rerun."
+  }
+}
