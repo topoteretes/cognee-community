@@ -6,12 +6,17 @@ readme = "README.md"
 requires-python = ">=3.11,<3.14"
 dependencies = [
     # Needs document-mode (DOCUMENT_SOURCE_ATTR), table-scoped document cleanup
-    # (DOCUMENT_SYNC_VERSION) and PIPELINE_SCOPE_ATTR, all in cognee 1.6.x.
-    "cognee==1.6.4",
+    # (DOCUMENT_SYNC_VERSION), PIPELINE_SCOPE_ATTR and guarded_rows, all in
+    # cognee 1.6.4 and later 1.x releases.
+    "cognee>=1.6.4,<2",
     # dlt's rest_api source + RESTClient (OAuth2 client credentials, JSON link
     # paging, Retry-After aware retries) does all the Microsoft Graph I/O.
     "dlt[sqlalchemy]>=1.9.0,<2",
+    "requests>=2.31.0,<3",
 ]
+
+[dependency-groups]
+dev = ["pytest>=8,<9", "pytest-asyncio>=1,<2"]
 
 [project.urls]
 Homepage = "https://github.com/topoteretes/cognee"
