@@ -11,7 +11,8 @@ Three layers, all runnable in CI without a Figma account:
   forget-on-delete path.
 * dlt-pipeline tests (temp sqlite destination) proving that ``replace``
   drops deleted rows, that the render cache survives ``replace`` runs in
-  source state, and that a failed run keeps both staging and the cache.
+  source state, that a failed run keeps both staging and the cache, and that
+  two ``resource_name`` s keep their snapshots apart.
 """
 
 from types import SimpleNamespace
@@ -26,9 +27,13 @@ from cognee_community_connector_figma.figma import (
     FIGMA_COMMENTS_TABLE_NAME,
     FIGMA_SOURCE_NAME,
     FIGMA_TABLE_NAME,
+    FigmaSelectionEmptyError,
+    _parse_time,
     comment_thread_rows,
+    comments_table,
     figma_client_config,
     figma_source,
+    files_table,
     list_files,
     list_folders,
     render_document,
@@ -63,12 +68,22 @@ def _config(figma, **kwargs):
     return figma_client_config(TOKEN, session=figma.session(), **kwargs)
 
 
-def _sync(figma, state, team_ids=(TEAM,), folder_ids=None, file_keys=None, comments=True):
+def _sync(
+    figma,
+    state,
+    team_ids=(TEAM,),
+    folder_ids=None,
+    file_keys=None,
+    comments=True,
+    stats=None,
+    **options,
+):
     """Run one sync against the fake; return {table: {id: row}}."""
     config = _config(figma)
     files = list_files(config, list(team_ids) or None, folder_ids, file_keys)
     tables: dict[str, dict] = {FIGMA_TABLE_NAME: {}, FIGMA_COMMENTS_TABLE_NAME: {}}
-    for table, row in sync_files(config, files, state, include_comments=comments):
+    rows = sync_files(config, files, state, include_comments=comments, stats=stats, **options)
+    for table, row in rows:
         tables[table][row["id"]] = row
     return tables
 
@@ -196,7 +211,9 @@ def test_comment_threads_render_root_then_replies_with_authors_and_status():
         _comment("9", "", "2026-01-01T09:00:00Z"),  # no text: no document
     ]
 
-    rows = comment_thread_rows("key", "Checkout", comments, {"2:1": "Checkout / Payment"})
+    rows = comment_thread_rows(
+        "key", "Checkout", comments, {"2:1": "Checkout / Payment"}, ["Design"]
+    )
 
     assert rows == [
         {
@@ -212,7 +229,7 @@ def test_comment_threads_render_root_then_replies_with_authors_and_status():
                 "Reply from Bob (2026-01-01 09:05 UTC):\nAgreed, use the pill."
             ),
             "url": "https://www.figma.com/file/key",
-            "cognee_node_set": ["Checkout (key)"],
+            "cognee_node_set": ["Design"],
         }
     ]
 
@@ -249,7 +266,12 @@ def test_figma_source_declares_document_marker_and_pipeline_scope():
     source = figma_source(TOKEN, folder_ids=[DESIGN])
 
     assert document_source_tag(source) == "figma"
-    assert getattr(source, PIPELINE_SCOPE_ATTR) == "figma"
+    # The scope is the resource's own name, so emptying that resource by name
+    # reaches the same pipeline.
+    assert getattr(source, PIPELINE_SCOPE_ATTR) == "figma_files"
+    assert source.cognee_sync_stats == {}
+    named = figma_source(TOKEN, folder_ids=[DESIGN], resource_name="design")
+    assert getattr(named, PIPELINE_SCOPE_ATTR) == "design_files"
 
 
 def test_source_refuses_a_cognee_without_node_set_support(monkeypatch):
@@ -261,20 +283,39 @@ def test_source_refuses_a_cognee_without_node_set_support(monkeypatch):
         figma_source(TOKEN, folder_ids=[DESIGN])
 
 
-def test_a_selection_is_required_but_may_be_explicitly_empty():
+def test_a_selection_is_required_and_no_selector_may_be_empty():
     with pytest.raises(ValueError, match="team_ids=, folder_ids= or file_keys="):
         figma_source(TOKEN)
-    figma_source(TOKEN, folder_ids=[])
+    # An empty selection would forget everything synced before.
+    for selector in ("team_ids", "folder_ids", "file_keys"):
+        with pytest.raises(ValueError, match=f"{selector} is empty"):
+            figma_source(TOKEN, **{"folder_ids": [DESIGN], selector: []})
 
 
-def test_tokens_fall_back_to_env_and_are_required(monkeypatch):
-    monkeypatch.delenv("FIGMA_ACCESS_TOKEN", raising=False)
-    monkeypatch.delenv("FIGMA_PERSONAL_ACCESS_TOKEN", raising=False)
-    with pytest.raises(ValueError, match="FIGMA_ACCESS_TOKEN"):
+def test_a_lone_id_is_accepted_as_a_list():
+    figma_source(TOKEN, folder_ids=DESIGN)
+
+
+def test_resource_name_and_budget_are_validated():
+    with pytest.raises(ValueError, match="resource_name"):
+        figma_source(TOKEN, folder_ids=[DESIGN], resource_name="Design Team")
+    with pytest.raises(ValueError, match="max_file_fetches"):
+        figma_source(TOKEN, folder_ids=[DESIGN], max_file_fetches=0)
+
+
+def test_a_token_is_required_and_never_read_from_the_environment(monkeypatch):
+    monkeypatch.setenv("FIGMA_ACCESS_TOKEN", "from-env")
+    monkeypatch.setenv("FIGMA_PERSONAL_ACCESS_TOKEN", "from-env")
+    with pytest.raises(ValueError, match="Figma token required"):
         figma_client_config()
 
-    monkeypatch.setenv("FIGMA_ACCESS_TOKEN", "oauth")
-    assert figma_client_config()["auth"].token == "oauth"
+
+@pytest.mark.parametrize("secret", ["abc123\n", " abc123", "abc 123", "abc\t123"])
+def test_a_token_with_whitespace_is_refused_without_echoing_it(secret):
+    for options in ({"access_token": secret}, {"personal_access_token": secret}):
+        with pytest.raises(ValueError, match="whitespace or control characters") as error:
+            figma_client_config(**options)
+        assert "abc" not in str(error.value)
 
 
 def test_personal_access_token_is_sent_as_x_figma_token(figma):
@@ -344,8 +385,14 @@ def test_first_sync_ingests_files_and_comment_threads(figma):
     thread = _threads(tables)[f"comment:file-a:{root}"]
     assert "Pinned on: Flows / Welcome" in thread["content"]
     assert "Reply from Bob" in thread["content"]
-    # A file and its comment threads share a node set, so they search together.
-    assert onboarding["cognee_node_set"] == thread["cognee_node_set"] == ["Onboarding (file-a)"]
+    # A file and its comment threads share their folder's node set, so a search
+    # can be limited to one folder; it is one per folder, not one per file.
+    assert onboarding["cognee_node_set"] == thread["cognee_node_set"] == ["Design"]
+    assert {row["cognee_node_set"][0] for row in _files(tables).values()} == {
+        "Design",
+        "Checkout",
+        "Marketing",
+    }
 
 
 def test_unchanged_files_come_from_the_cache_without_fetching_node_trees(figma):
@@ -376,10 +423,10 @@ def test_rename_and_folder_rename_show_up_without_fetching_node_trees(figma):
     renamed = _files(tables)["file:file-a"]
     assert renamed["title"] == "Sign-up"
     assert "Folder: Product design" in renamed["content"]
-    assert renamed["cognee_node_set"] == ["Sign-up (file-a)"]
+    assert renamed["cognee_node_set"] == ["Product design"]
     (thread,) = _threads(tables).values()
     assert 'file "Sign-up"' in thread["content"]
-    assert thread["cognee_node_set"] == ["Sign-up (file-a)"]
+    assert thread["cognee_node_set"] == ["Product design"]
 
 
 def test_only_files_whose_stamp_moved_are_fetched_again(figma):
@@ -503,13 +550,163 @@ def test_file_deleted_between_listing_and_fetch_is_forgotten(figma):
     assert "file-a" not in state["files"]
 
 
-def test_explicitly_empty_selection_yields_an_empty_snapshot(figma):
+def test_a_selection_that_suddenly_lists_no_files_raises_instead_of_forgetting(figma):
     state = {}
     _sync(figma, state)
+    before = {key: dict(entry) for key, entry in state["files"].items()}
 
-    tables = _sync(figma, state, team_ids=(), folder_ids=[])
+    with pytest.raises(FigmaSelectionEmptyError, match="3 were synced before"):
+        _sync(figma, state, team_ids=(), folder_ids=["mistyped-folder"])
+
+    assert state["files"] == before
+
+
+def test_an_empty_folder_on_a_first_run_syncs_nothing(figma):
+    figma.add_folder(TEAM, "folder-empty", "Empty")
+
+    tables = _sync(figma, {}, team_ids=(), folder_ids=["folder-empty"])
 
     assert _files(tables) == {} and _threads(tables) == {}
+
+
+# ---------------------------------------------------------------------------
+# A run that cannot finish: the file budget and Figma's rate limit
+# ---------------------------------------------------------------------------
+
+
+def _edit_all(figma, text_for):
+    for key in ("file-a", "file-b", "file-c"):
+        figma.edit(key, {"Page": [frame("Frame", text(text_for(key)))]})
+
+
+def test_the_file_budget_defers_the_rest_and_later_runs_converge(figma):
+    state, stats = {}, {}
+
+    first = _sync(figma, state, max_file_fetches=2, stats=stats)
+
+    # A file never synced waits for the next run; nothing else is affected.
+    assert len(figma.file_requests()) == 2 and len(_files(first)) == 2
+    assert stats == {
+        "scanned": 3,
+        "fetched": 2,
+        "skipped": 0,
+        "deleted": 0,
+        "threads": 0,
+        "failed": 1,
+        "failed_budget": 1,
+    }
+
+    second = _sync(figma, state, max_file_fetches=2, stats=stats)
+
+    assert set(_files(second)) == {"file:file-a", "file:file-b", "file:file-c"}
+    assert stats["fetched"] == 1 and stats["skipped"] == 2 and "failed" not in stats
+
+
+def test_a_changed_file_over_budget_keeps_its_last_synced_text(figma):
+    state = {}
+    _sync(figma, state)
+    _edit_all(figma, lambda key: f"new text of {key}")
+
+    tables = _sync(figma, state, max_file_fetches=1)
+
+    contents = [row["content"] for row in _files(tables).values()]
+    # Everything is still there, and exactly one file moved on.
+    assert len(contents) == 3
+    assert sum("new text of" in content for content in contents) == 1
+
+    tables = _sync(figma, state, max_file_fetches=1)
+    assert sum("new text of" in row["content"] for row in _files(tables).values()) == 2
+    tables = _sync(figma, state, max_file_fetches=1)
+    assert all("new text of" in row["content"] for row in _files(tables).values())
+
+
+def test_a_rate_limit_that_outlasts_the_retries_stops_fetching_without_forgetting(figma):
+    state, stats = {}, {}
+    figma.comment("file-c", "Keep this thread")
+    _sync(figma, state)
+    _edit_all(figma, lambda key: f"new text of {key}")
+    for key in ("file-a", "file-b", "file-c"):
+        figma.fail_always(f"/v1/files/{key}", 429, {"Retry-After": "0"})
+
+    tables = _sync(figma, state, stats=stats)
+
+    assert set(_files(tables)) == {"file:file-a", "file:file-b", "file:file-c"}
+    assert not any("new text of" in row["content"] for row in _files(tables).values())
+    assert len(_threads(tables)) == 1, "comments of kept files are still read"
+    assert stats["failed_rate_limit"] == 1 and stats["failed"] == 3
+    assert "failed_budget" not in stats
+
+    figma.recover()
+    tables = _sync(figma, state, stats=stats)
+    assert all("new text of" in row["content"] for row in _files(tables).values())
+    assert "failed" not in stats
+
+
+def test_other_errors_still_abort_instead_of_deferring(figma):
+    state = {}
+    _sync(figma, state)
+    figma.edit("file-a", {"Flows": []})
+    figma.fail_always("/v1/files/file-a", 500)
+
+    with pytest.raises(Exception, match="500"):
+        _sync(figma, state)
+
+
+def test_sync_stats_count_what_each_run_did(figma):
+    state, stats = {}, {}
+    root = figma.comment("file-a", "hello")
+    figma.comment("file-a", "reply", parent=root)
+
+    _sync(figma, state, stats=stats)
+    assert stats == {"scanned": 3, "fetched": 3, "skipped": 0, "deleted": 0, "threads": 1}
+
+    _sync(figma, state, stats=stats)
+    assert stats == {"scanned": 3, "fetched": 0, "skipped": 3, "deleted": 0, "threads": 1}
+
+    figma.delete_file("file-b")
+    _sync(figma, state, stats=stats)
+    assert stats == {"scanned": 2, "fetched": 0, "skipped": 2, "deleted": 1, "threads": 1}
+
+
+def test_check_active_runs_before_every_request_and_can_stop_a_sync(figma):
+    calls = []
+    config = figma_client_config(
+        TOKEN, session=figma.session(), check_active=lambda: calls.append(1)
+    )
+    files = list_files(config, folder_ids=[OTHER])
+    list(sync_files(config, files, {}))
+    assert len(calls) == len(figma.requests) > 0
+
+    calls.clear()
+
+    def revoked():
+        calls.append(1)
+        if len(calls) > 1:
+            raise RuntimeError("connection revoked")
+
+    config = figma_client_config(TOKEN, session=figma.session(), check_active=revoked)
+    figma.requests.clear()
+    with pytest.raises(Exception, match="connection revoked"):
+        list_files(config, team_ids=[TEAM])
+    assert len(figma.requests) == 1, "no request is made once access is gone"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("2026-01-02T10:00:00Z", "2026-01-02T10:00:00+00:00"),
+        ("2026-01-02T10:00:00.5Z", "2026-01-02T10:00:00.500000+00:00"),
+        ("2026-01-02T10:00:00.123456789Z", "2026-01-02T10:00:00.123456+00:00"),
+        ("2026-01-02T12:00:00+02:00", "2026-01-02T12:00:00+02:00"),
+        ("2026-01-02T10:00:00", "2026-01-02T10:00:00+00:00"),
+    ],
+)
+def test_timestamps_parse_on_every_supported_python(raw, expected):
+    assert _parse_time(raw).isoformat() == expected
+
+
+def test_an_unparseable_timestamp_is_ignored():
+    assert _parse_time("yesterday") is None and _parse_time(None) is None
 
 
 # ---------------------------------------------------------------------------
@@ -551,10 +748,10 @@ def test_throttled_requests_are_retried_with_retry_after(figma):
 # ---------------------------------------------------------------------------
 
 
-def _pipeline(tmp_path):
+def _pipeline(tmp_path, name="figma_test"):
     db_path = (tmp_path / "figma.db").as_posix()
     return dlt.pipeline(
-        pipeline_name="figma_test",
+        pipeline_name=name,
         destination=dlt.destinations.sqlalchemy(f"sqlite:///{db_path}"),
         dataset_name="figma_ds",
         pipelines_dir=str(tmp_path / "state"),
@@ -582,12 +779,8 @@ def test_pipeline_replaces_the_snapshot_and_keeps_the_cache_across_runs(figma, t
     assert set(_read(pipeline, FIGMA_COMMENTS_TABLE_NAME)) == {f"comment:file-a:{root}"}
     # The node-set column is stored as json on both tables, not a child table.
     for table in (FIGMA_TABLE_NAME, FIGMA_COMMENTS_TABLE_NAME):
-        assert (
-            "Onboarding (file-a)"
-            in _read(pipeline, table, "cognee_node_set")[
-                "file:file-a" if table == FIGMA_TABLE_NAME else f"comment:file-a:{root}"
-            ]
-        )
+        row_id = "file:file-a" if table == FIGMA_TABLE_NAME else f"comment:file-a:{root}"
+        assert "Design" in _read(pipeline, table, "cognee_node_set")[row_id]
 
     figma.delete_file("file-b")
     figma.delete_comment("file-a", root)
@@ -615,3 +808,21 @@ def test_failed_run_keeps_staging_and_cache_so_the_next_run_catches_up(figma, tm
 
     _run(pipeline, figma)
     assert "Summer sale" in _read(pipeline, FIGMA_TABLE_NAME)["file:file-c"]
+
+
+def test_resource_names_keep_two_selections_in_one_dataset_apart(figma, tmp_path):
+    design = _pipeline(tmp_path, "design")
+    marketing = _pipeline(tmp_path, "marketing")
+    _run(design, figma, resource_name="design", team_ids=None, folder_ids=[DESIGN])
+    _run(marketing, figma, resource_name="marketing", team_ids=None, folder_ids=[OTHER])
+    assert set(_read(design, files_table("design"))) == {"file:file-a", "file:file-b"}
+    assert set(_read(design, files_table("marketing"))) == {"file:file-c"}
+    assert comments_table("design") == "design_comments"
+
+    figma.delete_file("file-a")
+    _run(design, figma, resource_name="design", team_ids=None, folder_ids=[DESIGN])
+
+    # Each name has its own tables and cache, so one selection's run never
+    # forgets the other's files.
+    assert set(_read(design, files_table("design"))) == {"file:file-b"}
+    assert set(_read(design, files_table("marketing"))) == {"file:file-c"}

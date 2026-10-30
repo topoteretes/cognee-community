@@ -12,6 +12,8 @@ authors — and yields it as documents for cognee's ingestion pipeline::
         dataset_name="figma",
     )
 
+Credentials are passed in; the source reads no environment variables.
+
 Design
 ------
 * **Scope**: a Figma file is a node canvas, not prose. Only text is kept:
@@ -19,13 +21,14 @@ Design
   layers (and of FigJam stickies, shapes and connectors) and comments.
   Geometry, styles, images and vector data are never fetched. Hidden layers
   and Figma's default layer names ("Frame 12") are skipped as noise.
-* **Documents**: one row per file in ``figma_files`` (``file:<key>``) and one
-  row per comment thread in ``figma_comments`` (``comment:<key>:<root id>``),
+* **Documents**: one row per file in ``<resource_name>_files`` (``file:<key>``)
+  and one row per comment thread in ``<resource_name>_comments``
+  (``comment:<key>:<root id>``),
   so each design discussion stays together in context for cognify. The
   source declares ``cognee_document_source = "figma"``, so rows flow through
   the normal cognify entity-extraction pipeline instead of the relational
-  dlt-row path. A file and its comment threads share one node set
-  (``figma:<file name> (<file key>)``), so they can be searched together.
+  dlt-row path. A file and its comment threads share the node set of their
+  folder (``figma:<folder name>``), so a search can be limited to one folder.
 * **Selection**: ``team_ids`` (every folder of the team), ``folder_ids``
   (formerly "projects"; subfolders included) and ``file_keys``. Listing
   folders needs the ``folders:read`` scope, which Figma grants to private
@@ -42,24 +45,30 @@ Design
   title and folder come from the fresh listing every run, so a rename or a
   move shows up even if it does not move the stamp. Comments do not bump a
   file's stamp, so they are re-read every run with one cheap request per
-  file. Unchanged rows keep a stable
-  content-hash ``data_id``, so cognee does not re-ingest or re-cognify them.
+  file. Unchanged rows keep a stable content-hash ``data_id``, so cognee does
+  not re-ingest or re-cognify them.
+* **A run that cannot finish**: at most ``max_file_fetches`` node trees are
+  fetched per run, and a rate limit that outlasts dlt's retries stops the
+  fetching early. The files not reached keep their last synced text (a file
+  never synced waits), so nothing is forgotten and the next run continues
+  with them. ``source.cognee_sync_stats`` reports it.
 * **Forget-on-delete**: a deleted, trashed or moved-out file drops out of the
   listing (or answers 404), and a deleted comment drops out of its file's
   comment list. Either way it is absent from the snapshot, and cognee's
   ``orphan_cleanup`` removes it from the graph and vector stores.
-* **Failure safety**: errors (401/403, exhausted 429/5xx retries, network)
-  are not swallowed. They abort the run before dlt commits the new snapshot
-  and state, so nothing is forgotten and the next run starts over.
+* **Failure safety**: other errors (401/403, 5xx after retries, network) are
+  not swallowed. They abort the run before dlt commits the new snapshot and
+  state, so nothing is forgotten and the next run starts over. A selection
+  that suddenly lists no files raises instead of forgetting the dataset.
 """
 
-import os
 import re
-from collections.abc import Iterator
-from datetime import UTC, datetime
+from collections.abc import Callable, Iterator
+from datetime import datetime, timezone
 from typing import Any
 
 import dlt
+import requests
 from cognee.shared.logging_utils import get_logger
 from cognee.tasks.ingestion import dlt_utils
 from cognee.tasks.ingestion.dlt_utils import (
@@ -67,27 +76,38 @@ from cognee.tasks.ingestion.dlt_utils import (
     NODE_SET_COLUMN,
     NODE_SET_COLUMN_HINT,
     PIPELINE_SCOPE_ATTR,
+    guarded_rows,
 )
+from dlt.sources.helpers.requests import Client
 from dlt.sources.helpers.rest_client import RESTClient
 from dlt.sources.helpers.rest_client.auth import APIKeyAuth, BearerTokenAuth
 from dlt.sources.helpers.rest_client.paginators import SinglePagePaginator
 from dlt.sources.rest_api import rest_api_resources
 from dlt.sources.rest_api.config_setup import create_response_hooks
+from requests.adapters import BaseAdapter
 
 logger = get_logger("figma_connector")
 
-# dlt resource / staging-table names. Comment threads are routed to their own
-# table from the same resource, so one snapshot covers both.
-FIGMA_TABLE_NAME = "figma_files"
-FIGMA_COMMENTS_TABLE_NAME = "figma_comments"
+# The provider tag on every document (cognee's cleanup matches on it).
 FIGMA_SOURCE_NAME = "figma"
+# Default ``resource_name``: it names the dlt resource, the pipeline scope and
+# the staging tables (``<name>_files``, ``<name>_comments``). Comment threads
+# are routed to their own table from the same resource, so one snapshot
+# covers both.
+DEFAULT_RESOURCE_NAME = "figma"
+FIGMA_TABLE_NAME = f"{DEFAULT_RESOURCE_NAME}_files"
+FIGMA_COMMENTS_TABLE_NAME = f"{DEFAULT_RESOURCE_NAME}_comments"
+# Node-tree fetches (``GET /v1/files/:key``) allowed per run. They are in
+# Figma's strictest rate-limit tier, so a large team is brought in over a few
+# runs instead of failing one run for good.
+DEFAULT_MAX_FILE_FETCHES = 100
 
 FIGMA_BASE_URL = "https://api.figma.com/"
 # /file/ redirects to the right editor (design, FigJam board, slides).
 FIGMA_FILE_URL = "https://www.figma.com/file/{key}"
 
-ACCESS_TOKEN_ENV = "FIGMA_ACCESS_TOKEN"
-PERSONAL_ACCESS_TOKEN_ENV = "FIGMA_PERSONAL_ACCESS_TOKEN"
+# A file's node-set name when its folder is unknown.
+_DEFAULT_NODE_SET = "files"
 
 # Bump when rendering changes, so cached rows from an older connector are
 # re-rendered instead of being re-emitted as they were.
@@ -122,35 +142,35 @@ def figma_client_config(
     *,
     personal_access_token: str | None = None,
     session: Any = None,
+    check_active: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Return the ``rest_api`` client block for the Figma REST API.
 
     Args:
         access_token: OAuth2 access token, sent as ``Authorization: Bearer``.
-            Falls back to ``FIGMA_ACCESS_TOKEN``.
         personal_access_token: Personal access token, sent as
-            ``X-Figma-Token``. Falls back to ``FIGMA_PERSONAL_ACCESS_TOKEN``.
-            Used only when no OAuth token is given.
+            ``X-Figma-Token``. Used only when no OAuth token is given.
         session: ``requests`` session for the Figma calls (mainly a
             test-injection point). When omitted, dlt's retrying session is
             used, which honours Figma's ``Retry-After`` on 429.
+        check_active: Called before every HTTP attempt, retries included;
+            raises to stop a sync whose access was revoked mid-run (for hosts).
 
     Returns:
         A dict usable as ``RESTAPIConfig["client"]`` or with
         :func:`figma_rest_client`.
+
+    Raises:
+        ValueError: no token was given, or it holds whitespace or control
+            characters (a pasted trailing newline is the usual cause). The
+            message never contains the token.
     """
-    access_token = access_token or os.environ.get(ACCESS_TOKEN_ENV)
     if access_token:
-        auth: Any = BearerTokenAuth(token=access_token)
+        auth: Any = BearerTokenAuth(token=_checked_token(access_token))
+    elif personal_access_token:
+        auth = APIKeyAuth(name="X-Figma-Token", api_key=_checked_token(personal_access_token))
     else:
-        personal_access_token = personal_access_token or os.environ.get(PERSONAL_ACCESS_TOKEN_ENV)
-        if not personal_access_token:
-            raise ValueError(
-                "Figma token required: pass access_token= (OAuth2) or "
-                f"personal_access_token=, or set {ACCESS_TOKEN_ENV} or "
-                f"{PERSONAL_ACCESS_TOKEN_ENV}."
-            )
-        auth = APIKeyAuth(name="X-Figma-Token", api_key=personal_access_token)
+        raise ValueError("Figma token required: pass access_token= or personal_access_token=.")
 
     config: dict[str, Any] = {
         "base_url": FIGMA_BASE_URL,
@@ -158,9 +178,47 @@ def figma_client_config(
         # No Figma endpoint used here is paged; saying so stops dlt guessing.
         "paginator": SinglePagePaginator(),
     }
+    if check_active is not None:
+        # Wrap whichever adapter serves Figma, so the check also runs before
+        # each retry that dlt's retrying session makes.
+        session = session if session is not None else Client(raise_for_status=False).session
+        session.mount(
+            FIGMA_BASE_URL,
+            _CheckedAdapter(session.get_adapter(FIGMA_BASE_URL), check_active),
+        )
     if session is not None:
         config["session"] = session
     return config
+
+
+def _checked_token(token: str) -> str:
+    """Return ``token`` unchanged, or raise without echoing it.
+
+    ``requests`` refuses a header value with a newline and the error quotes
+    it, which would put the token into logs, so it is refused here instead.
+    """
+    if any(char.isspace() or ord(char) < 32 for char in token):
+        raise ValueError(
+            "The Figma token contains whitespace or control characters; "
+            "check it for a trailing newline."
+        )
+    return token
+
+
+class _CheckedAdapter(BaseAdapter):
+    """Runs a host's ``check_active`` before every request an adapter sends."""
+
+    def __init__(self, inner: BaseAdapter, check_active: Callable[[], None]):
+        super().__init__()
+        self._inner = inner
+        self._check_active = check_active
+
+    def send(self, request, **kwargs):
+        self._check_active()
+        return self._inner.send(request, **kwargs)
+
+    def close(self):
+        self._inner.close()
 
 
 def figma_rest_client(client_config: dict[str, Any]) -> RESTClient:
@@ -178,66 +236,99 @@ def figma_source(
     access_token: str | None = None,
     *,
     personal_access_token: str | None = None,
-    team_ids: list[str] | None = None,
-    folder_ids: list[str] | None = None,
-    file_keys: list[str] | None = None,
+    team_ids: list[str] | str | None = None,
+    folder_ids: list[str] | str | None = None,
+    file_keys: list[str] | str | None = None,
     include_comments: bool = True,
+    max_file_fetches: int | None = DEFAULT_MAX_FILE_FETCHES,
+    resource_name: str = DEFAULT_RESOURCE_NAME,
     session: Any = None,
+    check_active: Callable[[], None] | None = None,
 ):
     """Create a dlt source that yields Figma files and comment threads as documents.
 
     Args:
-        access_token: OAuth2 access token. Falls back to ``FIGMA_ACCESS_TOKEN``.
+        access_token: OAuth2 access token.
         personal_access_token: Personal access token, used when no OAuth token
-            is given. Falls back to ``FIGMA_PERSONAL_ACCESS_TOKEN``.
+            is given.
         team_ids: Sync every folder (and subfolder) of these teams. Figma has
             no API that lists a user's teams; the id is in the team page URL.
         folder_ids: Sync these folders ("projects" in older Figma) and their
             subfolders.
         file_keys: Sync these files. The only selector that works with a
             public OAuth app, which cannot list folders.
-        include_comments: Also ingest comment threads (default ``True``).
 
-            At least one selector is required. An explicitly empty selection
-            (``folder_ids=[]``) is valid and selects nothing: the snapshot is
-            empty, so everything synced earlier is forgotten.
+            At least one selector is required and none may be empty: an empty
+            selection would forget everything synced before. Omit a selector
+            you do not use.
+        include_comments: Also ingest comment threads (default ``True``).
+        max_file_fetches: Most node trees fetched per run (``None`` for no
+            limit). Files over the budget keep their last synced text and are
+            fetched next run, so a team too large for Figma's rate limit
+            still converges.
+        resource_name: Names the dlt resource, the pipeline scope and the
+            staging tables (``<name>_files``, ``<name>_comments``): lower case
+            letters, digits and underscores. Give each selection its own name
+            when several sync into one dataset; sources that share one replace
+            each other's snapshot.
         session: ``requests`` session for the Figma calls (mainly a
             test-injection point); when omitted dlt's retrying session is used.
+        check_active: Called before every Figma request and between rows;
+            raises to stop a sync whose access was revoked mid-run (for hosts).
 
     Returns:
         A dlt source for ``cognee.add(...)`` / ``cognee.remember(...)``. Leave
         ``write_disposition`` at its default ``"replace"``: the source is a
-        full snapshot.
+        full snapshot. ``source.cognee_sync_stats`` holds the counts of the
+        last run (never content): ``scanned``, ``fetched``, ``skipped``,
+        ``deleted``, ``threads``, and ``failed`` with ``failed_budget`` or
+        ``failed_rate_limit`` when files were left for the next run.
     """
     if getattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 0) < 2:
         raise RuntimeError(
             "The Figma connector requires a cognee build with table-scoped document "
             "cleanup and per-row node sets (DOCUMENT_SYNC_VERSION 2, cognee 1.6.4)."
         )
-    if team_ids is None and folder_ids is None and file_keys is None:
+    if not re.fullmatch(r"[a-z][a-z0-9_]*", resource_name):
+        raise ValueError("resource_name must be lower case letters, digits and underscores.")
+    if max_file_fetches is not None and max_file_fetches < 1:
+        raise ValueError("max_file_fetches must be at least 1, or None for no limit.")
+    selection = {
+        "team_ids": _id_list("team_ids", team_ids),
+        "folder_ids": _id_list("folder_ids", folder_ids),
+        "file_keys": _id_list("file_keys", file_keys),
+    }
+    if not any(selection.values()):
         raise ValueError(
             "Select what to ingest: pass team_ids=, folder_ids= or file_keys=. Figma "
             "cannot list a user's files without one of them."
         )
     client_config = figma_client_config(
-        access_token, personal_access_token=personal_access_token, session=session
+        access_token,
+        personal_access_token=personal_access_token,
+        session=session,
+        check_active=check_active,
     )
+    stats: dict[str, int] = {}
 
     @dlt.resource(
-        name=FIGMA_TABLE_NAME,
+        name=files_table(resource_name),
         primary_key="id",
         write_disposition="replace",
         columns=NODE_SET_COLUMN_HINT,
     )
     def figma_files():
-        files = list_files(client_config, team_ids, folder_ids, file_keys)
+        files = list_files(client_config, **selection)
         rows = sync_files(
             client_config,
             files,
             dlt.current.source_state(),
+            resource_name=resource_name,
             include_comments=include_comments,
+            max_file_fetches=max_file_fetches,
+            stats=stats,
         )
-        for table_name, row in rows:
+        for table_name, row in guarded_rows(rows, check_active):
             yield dlt.mark.with_table_name(row, table_name)
 
     @dlt.source(name=FIGMA_SOURCE_NAME)
@@ -249,10 +340,37 @@ def figma_source(
     # cognify). resolve_dlt_sources reads this marker; it never imports this
     # connector.
     setattr(source, DOCUMENT_SOURCE_ATTR, FIGMA_SOURCE_NAME)
-    # Give the source its own dlt pipeline per dataset, so the render cache in
-    # its source state is not shared with unrelated dlt sources.
-    setattr(source, PIPELINE_SCOPE_ATTR, FIGMA_SOURCE_NAME)
+    # Give the source its own dlt pipeline per dataset and name, so the render
+    # cache in its source state is not shared with other selections or
+    # unrelated dlt sources. The scope is the resource's own name, so emptying
+    # that resource by name (see the integration) reaches the same pipeline.
+    setattr(source, PIPELINE_SCOPE_ATTR, files_table(resource_name))
+    # Counts of the last run, for hosts that record how a sync went.
+    source.cognee_sync_stats = stats
     return source
+
+
+def files_table(resource_name: str) -> str:
+    """Name of the staging table (and dlt resource) holding the file documents."""
+    return f"{resource_name}_files"
+
+
+def comments_table(resource_name: str) -> str:
+    """Name of the staging table holding the comment-thread documents."""
+    return f"{resource_name}_comments"
+
+
+def _id_list(name: str, ids: list[str] | str | None) -> list[str] | None:
+    """Normalise one selector: ``None`` stays unset, a lone id becomes a list, empty raises."""
+    if ids is None:
+        return None
+    if isinstance(ids, str):
+        ids = [ids]
+    ids = [str(value).strip() for value in ids if str(value).strip()]
+    if not ids:
+        # An empty selection would forget everything synced before.
+        raise ValueError(f"{name} is empty; omit it to leave that selector unused.")
+    return ids
 
 
 # ---------------------------------------------------------------------------
@@ -409,11 +527,19 @@ def _rest_api_children(
 # ---------------------------------------------------------------------------
 
 
+class FigmaSelectionEmptyError(RuntimeError):
+    """The selection listed no files although an earlier run synced some."""
+
+
 def sync_files(
     client_config: dict[str, Any],
     files: list[dict],
     state: dict,
+    *,
+    resource_name: str = DEFAULT_RESOURCE_NAME,
     include_comments: bool = True,
+    max_file_fetches: int | None = DEFAULT_MAX_FILE_FETCHES,
+    stats: dict[str, int] | None = None,
 ) -> Iterator[tuple[str, dict[str, Any]]]:
     """Yield ``(table_name, row)`` for the full snapshot of ``files``.
 
@@ -425,19 +551,50 @@ def sync_files(
     listing (or answered 404) are dropped, so the cache never outgrows the
     selection. ``state`` is only persisted by dlt when the whole run loads,
     so a failed run leaves the cache as it was.
+
+    At most ``max_file_fetches`` node trees are fetched per run, and a rate
+    limit that outlasts dlt's retries stops the fetching too. Either way the
+    files not fetched keep what was last synced (their cache entry, stamp
+    included, so the next run fetches them first), and a file never synced
+    is left out until a later run reaches it. Nothing is forgotten because of
+    it, and the sync converges over a few runs.
+
+    Raises:
+        FigmaSelectionEmptyError: ``files`` is empty although the cache holds
+            files. That usually means a mistyped or inaccessible selection,
+            and forgetting everything on it would purge the dataset.
     """
+    stats = stats if stats is not None else {}
+    stats.clear()
     if state.get("cache_version") != _CACHE_VERSION:
         state["files"] = {}
         state["cache_version"] = _CACHE_VERSION
     cache: dict[str, dict] = state.setdefault("files", {})
 
-    changed = {
-        file["key"]
+    if not files and cache:
+        raise FigmaSelectionEmptyError(
+            f"The Figma selection listed no files, but {len(cache)} were synced before. "
+            "Check the team, folder and file ids and the token's access. To forget them "
+            "on purpose, forget the dataset instead."
+        )
+
+    stale = [
+        file
         for file in files
         if not file.get("modified")
         or (cache.get(file["key"]) or {}).get("modified") != file["modified"]
-    }
-    fetched = _fetch_files(client_config, [file for file in files if file["key"] in changed])
+    ]
+    stale_keys = {file["key"] for file in stale}
+    to_fetch = stale if max_file_fetches is None else stale[:max_file_fetches]
+    fetched, rate_limited = _fetch_files(client_config, to_fetch)
+    # Everything stale that was not fetched and is not simply gone (404) waits
+    # for the next run. A 404 cannot be told apart from an unfetched file once
+    # the fetching stopped early, so those wait too; they are forgotten as
+    # soon as a run fetches them or the listing drops them.
+    deferred = (
+        {file["key"] for file in to_fetch if file["key"] not in fetched} if rate_limited else set()
+    )
+    deferred |= {file["key"] for file in stale[len(to_fetch) :]}
 
     entries: dict[str, dict] = {}
     for file in files:
@@ -452,7 +609,11 @@ def sync_files(
                 "body": body,
                 "locations": locations,
             }
-        elif key not in changed:
+        elif key in deferred:
+            # Keep the old rendering, and the old stamp so the next run retries.
+            if key in cache:
+                entries[key] = cache[key]
+        elif key not in stale_keys:
             entries[key] = cache[key]
         else:
             # Listed, but its node tree answered 404: it was deleted mid-run.
@@ -465,29 +626,55 @@ def sync_files(
         entry = entries.get(file["key"])
         if entry is None:
             continue
-        yield FIGMA_TABLE_NAME, _file_row(file, entry)
+        yield files_table(resource_name), _file_row(file, entry)
         for row in comment_thread_rows(
-            file["key"], file["name"], comments.get(file["key"], []), entry["locations"]
+            file["key"],
+            file["name"],
+            comments.get(file["key"], []),
+            entry["locations"],
+            _node_set(file.get("folder")),
         ):
             threads += 1
-            yield FIGMA_COMMENTS_TABLE_NAME, row
+            yield comments_table(resource_name), row
 
+    forgotten = set(cache) - set(entries)
     cache.clear()
     cache.update(entries)
+
+    stats.update(
+        scanned=len(files),
+        fetched=len(fetched),
+        skipped=len(entries) - len(fetched) - len(deferred & set(entries)),
+        deleted=len(forgotten - deferred),
+        threads=threads,
+    )
+    if deferred:
+        stats["failed"] = len(deferred)
+        stats["failed_rate_limit" if rate_limited else "failed_budget"] = 1
+        logger.warning(
+            "Figma: %d file(s) wait for the next run (%s); what was synced is kept.",
+            len(deferred),
+            "Figma's rate limit" if rate_limited else f"the budget of {max_file_fetches} fetches",
+        )
     logger.info(
-        "Figma: synced %d file(s) (%d fetched, %d from cache) and %d comment thread(s).",
+        "Figma: synced %d file(s) (%d fetched, %d from cache) and %d comment thread(s), "
+        "%d forgotten.",
         len(entries),
         len(fetched),
-        len(entries) - len(fetched),
+        stats["skipped"],
         threads,
+        stats["deleted"],
     )
 
 
-def _fetch_files(client_config: dict[str, Any], files: list[dict]) -> dict[str, dict]:
+def _fetch_files(client_config: dict[str, Any], files: list[dict]) -> tuple[dict[str, dict], bool]:
     """Fetch the node trees of ``files``, keyed by file key; 404s are left out.
 
-    ``geometry`` is not requested, so Figma leaves vector paths out of the
-    response; the tree is rendered to text straight away by the caller.
+    Returns the node trees read and whether a rate limit that outlasted dlt's
+    retries cut the fetching short: the trees read before it are kept, and
+    every other error still aborts. ``geometry`` is not requested, so Figma
+    leaves vector paths out of the response; the tree is rendered to text
+    straight away by the caller.
     """
     documents = _rest_api_children(
         client_config,
@@ -503,7 +690,27 @@ def _fetch_files(client_config: dict[str, Any], files: list[dict]) -> dict[str, 
             },
         },
     )
-    return {document["_changed_files_key"]: document for document in documents}
+    fetched: dict[str, dict] = {}
+    try:
+        for document in documents:
+            fetched[document["_changed_files_key"]] = document
+    except Exception as exc:
+        if not _is_rate_limited(exc):
+            raise
+        return fetched, True
+    return fetched, False
+
+
+def _is_rate_limited(exc: BaseException) -> bool:
+    """True when ``exc`` is, or was caused by, an HTTP 429 that exhausted dlt's retries."""
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        response = getattr(exc, "response", None)
+        if isinstance(exc, requests.HTTPError) and getattr(response, "status_code", None) == 429:
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
 
 
 def _fetch_comments(client_config: dict[str, Any], keys: list[str]) -> dict[str, list[dict]]:
@@ -579,7 +786,7 @@ def _file_row(file: dict, entry: dict) -> dict[str, Any]:
         "title": file["name"],
         "content": "\n".join([*header, entry["body"]]).strip(),
         "url": FIGMA_FILE_URL.format(key=file["key"]),
-        NODE_SET_COLUMN: _node_set(file["key"], file["name"]),
+        NODE_SET_COLUMN: _node_set(file.get("folder")),
     }
 
 
@@ -621,7 +828,11 @@ def _render_nodes(nodes: list[dict], page_name: str, locations: dict[str, str]) 
 
 
 def comment_thread_rows(
-    file_key: str, file_name: str, comments: list[dict], locations: dict[str, str]
+    file_key: str,
+    file_name: str,
+    comments: list[dict],
+    locations: dict[str, str],
+    node_set: list[str],
 ) -> list[dict[str, Any]]:
     """Group a file's comments into threads and render one row per thread.
 
@@ -641,14 +852,19 @@ def comment_thread_rows(
             replies.get(root["id"], []),
             key=lambda comment: (comment.get("created_at") or "", comment["id"]),
         )
-        row = _thread_to_row(file_key, file_name, root, thread, locations)
+        row = _thread_to_row(file_key, file_name, root, thread, locations, node_set)
         if row is not None:
             rows.append(row)
     return rows
 
 
 def _thread_to_row(
-    file_key: str, file_name: str, root: dict, replies: list[dict], locations: dict[str, str]
+    file_key: str,
+    file_name: str,
+    root: dict,
+    replies: list[dict],
+    locations: dict[str, str],
+    node_set: list[str],
 ) -> dict[str, Any] | None:
     """Render one comment thread to a document row, or None when it has no text."""
     messages = [_render_comment(root, heading="")]
@@ -669,7 +885,7 @@ def _thread_to_row(
         "title": _thread_title(file_name, root),
         "content": "\n".join(header) + "\n\n" + "\n\n".join(messages),
         "url": FIGMA_FILE_URL.format(key=file_key),
-        NODE_SET_COLUMN: _node_set(file_key, file_name),
+        NODE_SET_COLUMN: node_set,
     }
 
 
@@ -701,18 +917,29 @@ def _file_id(file_key: str) -> str:
     return f"file:{file_key}"
 
 
-def _node_set(file_key: str, file_name: str) -> list[str]:
-    """The node set a file and its comment threads share (cognee adds the ``figma:`` prefix)."""
-    return [f"{file_name} ({file_key})"]
+def _node_set(folder: str | None) -> list[str]:
+    """The node set a file and its comment threads share (cognee adds the ``figma:`` prefix).
+
+    One per folder rather than per file: a node set per record would give a
+    large team thousands of them, and every document already carries its file
+    key in its id. Node sets are part of a row's identity, so a folder rename
+    re-ingests the files in it.
+    """
+    return [(folder or "").strip() or _DEFAULT_NODE_SET]
 
 
 def _parse_time(value: str | None) -> datetime | None:
-    """Parse a Figma ISO-8601 timestamp to UTC."""
+    """Parse a Figma ISO-8601 timestamp to UTC.
+
+    Python 3.10's ``fromisoformat`` rejects a trailing ``Z`` and fractions that
+    are not 3 or 6 digits, so both are normalised first.
+    """
     if not value:
         return None
+    text = re.sub(r"\.(\d+)", lambda match: "." + match.group(1)[:6].ljust(6, "0"), value)
     try:
-        parsed = datetime.fromisoformat(value)
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError:
         logger.warning("Figma: ignoring unparseable timestamp %r.", value)
         return None
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)

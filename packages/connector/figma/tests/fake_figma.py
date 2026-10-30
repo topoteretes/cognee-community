@@ -19,7 +19,7 @@ It mirrors the Figma behaviour the connector relies on:
 """
 
 import json
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, unquote, urlsplit
 
 import requests
@@ -49,10 +49,11 @@ class FakeFigma(BaseAdapter):
         self.files: dict[str, dict] = {}
         self.comments: dict[str, list[dict]] = {}
         self.requests: list[str] = []
-        # (path substring, status, headers): served once instead of the real
-        # response, to simulate throttling or outages.
-        self.failures: list[tuple[str, int, dict]] = []
-        self._clock = datetime(2026, 1, 1, tzinfo=UTC)
+        # Served instead of the real response, to simulate throttling or
+        # outages: {"path", "status", "headers", "exact", "times"} (``times`` is
+        # None for a failure that never lifts).
+        self.failures: list[dict] = []
+        self._clock = datetime(2026, 1, 1, tzinfo=timezone.utc)
         self._next_id = 100
 
     # -- fixture builders --------------------------------------------------
@@ -149,7 +150,24 @@ class FakeFigma(BaseAdapter):
         ]
 
     def fail_once(self, path_fragment: str, status: int, headers: dict | None = None) -> None:
-        self.failures.append((path_fragment, status, headers or {}))
+        self.failures.append(self._failure(path_fragment, status, headers, 1, exact=False))
+
+    def fail_always(self, path: str, status: int, headers: dict | None = None) -> None:
+        """Fail every request to exactly ``path`` until :meth:`recover`."""
+        self.failures.append(self._failure(path, status, headers, None, exact=True))
+
+    def recover(self) -> None:
+        self.failures.clear()
+
+    @staticmethod
+    def _failure(path, status, headers, times, exact) -> dict:
+        return {
+            "path": path,
+            "status": status,
+            "headers": headers or {},
+            "exact": exact,
+            "times": times,
+        }
 
     def file_requests(self) -> list[str]:
         """Node-tree fetches (``GET /v1/files/:key``) seen so far."""
@@ -170,10 +188,16 @@ class FakeFigma(BaseAdapter):
 
         path = unquote(url.path)
         self.requests.append(path)
-        for index, (fragment, status, headers) in enumerate(self.failures):
-            if fragment in path:
-                del self.failures[index]
-                return self._json(request, status, {"status": status, "err": "fail"}, headers)
+        for failure in self.failures:
+            if (path == failure["path"]) if failure["exact"] else (failure["path"] in path):
+                if failure["times"] is not None:
+                    failure["times"] -= 1
+                    if failure["times"] <= 0:
+                        self.failures.remove(failure)
+                status = failure["status"]
+                return self._json(
+                    request, status, {"status": status, "err": "fail"}, failure["headers"]
+                )
 
         parts = path.strip("/").split("/")
         match parts:
