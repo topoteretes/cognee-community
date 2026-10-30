@@ -1,0 +1,18 @@
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+name = "cognee-community-connector-atcoder"
+version = "0.1.0"
+description = "AtCoder competitive programming submissions, contest history, and problem difficulty connector for Cognee"
+authors = ["Bhomvrat Rai <bhomvratrai@gmail.com>"]
+readme = "README.md"
+packages = [{include = "cognee_community_connector_atcoder"}]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+requests = ">=2.28.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=7.0.0"
