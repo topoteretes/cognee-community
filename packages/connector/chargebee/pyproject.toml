@@ -1,0 +1,19 @@
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+name = "cognee-community-connector-chargebee"
+version = "0.1.0"
+description = "Chargebee data-source connector for Cognee"
+authors = ["Atharva Ramawat"]
+readme = "README.md"
+packages = [{include = "cognee_community_connector_chargebee"}]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+dlt = "^0.4.0"
+requests = "^2.31.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0.0"
