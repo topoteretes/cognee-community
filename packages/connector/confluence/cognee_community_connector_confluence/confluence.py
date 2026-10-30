@@ -24,6 +24,13 @@ subsystem; the source produced here is handed directly to
 
 Design
 ------
+* **Document mode** — the resource sets ``DOCUMENT_SOURCE_ATTR``, so each page
+  is ingested as its own text document and flows through normal cognify entity
+  extraction.  A dlt source *without* that marker lands on the relational
+  manifest path, which skips extraction and, because the manifest keeps a stable
+  id, stops syncing edits/new pages/deletions after the first run
+  (topoteretes/cognee#5564).  The page text rides in the ``content`` column —
+  the one document-mode ingestion actually reads.
 * **Auth** — Confluence Cloud API token.  Pass the account ``email`` and an
   `API token <https://id.atlassian.com/manage-profile/security/api-tokens>`_;
   they are sent as HTTP Basic auth.  Access is read-only — the connector only
@@ -62,8 +69,19 @@ from collections.abc import Iterator
 from typing import Any
 
 from cognee.shared.logging_utils import get_logger
+from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR, PIPELINE_SCOPE_ATTR
 
 logger = get_logger("confluence_connector")
+
+# system_metadata["source"] tag for this connector's rows. Setting
+# DOCUMENT_SOURCE_ATTR to it opts each page into cognee's document-mode
+# ingestion — one text document per page, routed through normal cognify entity
+# extraction. Without it the pages land on the relational manifest path, which
+# skips extraction and, because the manifest keeps a stable id, stops picking up
+# edits/new pages/deletions on later syncs (see topoteretes/cognee#5564).
+CONFLUENCE_SOURCE_NAME = "confluence"
+# dlt resource / staging-table name for Confluence pages.
+CONFLUENCE_RESOURCE_NAME = "confluence_pages"
 
 # Confluence Cloud REST API v2 lives under this path on the site.
 _API_BASE = "/wiki/api/v2"
@@ -155,7 +173,11 @@ def _page_to_row(page: dict, body: str, base_url: str) -> dict[str, Any]:
         "space_id": str(page.get("spaceId") or ""),
         "url": webui,
         "version_when": _version_when(page),
-        "body": body,
+        # The document text column MUST be named ``content`` — that is the column
+        # cognee's document-mode ingestion (_build_document_data_item) reads. It
+        # used to be ``body``, which document mode never looks at, so pages were
+        # ingested as empty documents (topoteretes/cognee#5564).
+        "content": body,
         # Hard-delete marker (always False for live pages). Vanished pages are
         # emitted separately with _deleted=True.
         "_deleted": False,
@@ -322,7 +344,7 @@ def confluence_source(
         raise ValueError("confluence_source requires email and api_token (or an injected session).")
 
     @dlt.resource(
-        name="confluence_pages",
+        name=CONFLUENCE_RESOURCE_NAME,
         primary_key="id",
         write_disposition="merge",
         # _deleted is a boolean hard-delete marker: rows where it is True are
@@ -341,4 +363,10 @@ def confluence_source(
             include_comments=include_comments,
         )
 
+    # Opt into document-mode ingestion: each page row becomes a text document
+    # routed through normal cognify entity extraction (resolve_dlt_sources reads
+    # this marker; it never imports this connector). PIPELINE_SCOPE_ATTR keeps
+    # the incremental cursor stable across alternating destination datasets.
+    setattr(confluence_pages, DOCUMENT_SOURCE_ATTR, CONFLUENCE_SOURCE_NAME)
+    setattr(confluence_pages, PIPELINE_SCOPE_ATTR, CONFLUENCE_RESOURCE_NAME)
     return confluence_pages
