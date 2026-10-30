@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<testsuites>
+  <testsuite name="pytest" errors="0" failures="1" skipped="0" tests="3" time="0.112" timestamp="2024-01-09T12:05:00">
+    <properties>
+      <property name="GITHUB_SHA" value="3f2a9c1d5e7b8a60412c9d3e4f5a6b7c8d9e0f1a"/>
+    </properties>
+    <testcase classname="orders.test_cart" name="test_get_cart_has_session" file="orders/test_cart.py" line="6" time="0.003"/>
+    <testcase classname="orders.test_checkout" name="test_checkout_returns_cart" file="orders/test_checkout.py" line="5" time="0.002"/>
+    <testcase classname="orders.test_checkout" name="test_checkout_rejects_bad_token" file="orders/test_checkout.py" line="11" time="0.004">
+      <failure message="assert False is True">def test_checkout_rejects_bad_token():
+        cart = checkout("bad")
+&gt;       assert cart["session"]["valid"] is True
+E       assert False is True
+
+orders/test_checkout.py:13: AssertionError</failure>
+    </testcase>
+  </testsuite>
+</testsuites>

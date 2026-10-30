@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<testsuites>
+  <testsuite name="pytest" errors="1" failures="0" skipped="0" tests="2" time="0.051">
+    <testcase classname="billing.test_invoice" name="test_charge_valid_token" time="0.001"/>
+    <testcase classname="billing.test_invoice" name="test_charge_with_max_age" time="0.002">
+      <error message="TypeError: charge() got an unexpected keyword argument 'max_age'">Traceback (most recent call last):
+  File "billing/test_invoice.py", line 9, in test_charge_with_max_age
+    charge("tok-1", 5, max_age=60)
+TypeError: charge() got an unexpected keyword argument 'max_age'</error>
+    </testcase>
+  </testsuite>
+</testsuites>
