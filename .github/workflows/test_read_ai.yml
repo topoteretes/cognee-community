@@ -1,0 +1,73 @@
+name: Test Read.ai Connector
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'packages/connector/read-ai/**'
+      - '.github/workflows/test_read_ai.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'packages/connector/read-ai/**'
+      - '.github/workflows/test_read_ai.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: read-ai-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.12', '3.13']
+    defaults:
+      run:
+        working-directory: packages/connector/read-ai
+    env:
+      DO_NOT_TRACK: '1'
+      TELEMETRY_DISABLED: 'true'
+      COGNEE_LOG_FILE: 'false'
+      RUNTIME__DLTHUB_TELEMETRY: 'false'
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Isolate connector and Cognee storage
+        run: |
+          printf '%s\n' \
+            "READ_AI_STATE_DIR=$RUNNER_TEMP/read-ai-state" \
+            "READ_AI_RATE_DIR=$RUNNER_TEMP/read-ai-rates" \
+            "SYSTEM_ROOT_DIRECTORY=$RUNNER_TEMP/read-ai-system" \
+            "DATA_ROOT_DIRECTORY=$RUNNER_TEMP/read-ai-data" >> "$GITHUB_ENV"
+      - name: Set up uv and Python
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+          cache-dependency-glob: packages/connector/read-ai/uv.lock
+      - name: Install locked dependencies
+        run: uv sync --locked
+      - name: Lint and check format
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+      - name: Run offline acceptance tests
+        run: uv run pytest tests/ -q
+      - name: Run offline example
+        run: uv run python examples/offline.py
+      - name: Build distributions
+        run: uv build
+      - name: Verify installed wheel outside the source tree
+        run: |
+          uv pip install --python .venv/bin/python --no-deps --reinstall dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$GITHUB_WORKSPACE/packages/connector/read-ai/.venv/bin/python" -c 'import cognee_community_connector_read_ai as m; assert "site-packages" in m.__file__; print(m.__file__)'
