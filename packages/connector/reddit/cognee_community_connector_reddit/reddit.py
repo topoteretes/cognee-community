@@ -32,8 +32,9 @@ Design
 * **Changes and deletions** of posts already synced are read from ``/api/info``,
   100 posts a request. A post is forgotten only when Reddit says it was removed or
   deleted, or no longer returns it while its subreddit answers. A post that just
-  drops off a listing stays. Threads of recent posts whose comment count, text or
-  edit time changed are read again.
+  drops off a listing stays. A thread whose comment count, text or edit time
+  changed is read again, and every stored thread at least once in 48 hours, so
+  deleted comments and accounts leave memory as Reddit's Data API Terms require.
 * **Comment trees** come from the second of the two listings ``/comments/<id>``
   returns. ``more`` stubs are expanded one ``/api/morechildren`` request at a time,
   within a depth and a per-thread request limit; a thread cut short says so.
@@ -84,8 +85,9 @@ _PAGE = 100
 # Reddit replaces replies deeper than 10 with "continue this thread".
 DEFAULT_MAX_COMMENT_DEPTH = 8
 DEFAULT_MAX_MORE_REQUESTS = 5
-# Comments of a post mostly arrive in its first days.
-DEFAULT_REFRESH_DAYS = 7
+# Reddit recommends re-reading stored content at least this often, so deleted comments
+# and accounts leave memory. A constant, so no setting can break that promise.
+_RESCAN_SECONDS = 48 * 3600
 DEFAULT_FIRST_SYNC_POSTS = 100
 # The comment count /comments/<id> loads before it leaves "more" stubs.
 _COMMENT_LIMIT = 500
@@ -94,6 +96,9 @@ _TOKEN_MARGIN = 60.0
 _SUBREDDIT = re.compile(r"[A-Za-z0-9_]{2,21}")
 _RESOURCE_NAME = re.compile(r"[a-z0-9_]{1,64}")
 _GONE_TEXT = ("[deleted]", "[removed]")
+# Reddit's placeholder for the author of a deleted account.
+_DELETED_AUTHOR = "[deleted]"
+_DELETED_ACCOUNT = "[deleted account]"
 _UNREADABLE = (403, 404)
 _STATS = (
     "scanned",
@@ -329,6 +334,11 @@ def _gone(post: dict) -> bool:
     return bool(post.get("removed_by_category")) or _text(post.get("selftext")) in _GONE_TEXT
 
 
+def _author(value: Any) -> str:
+    name = _text(value)
+    return f"u/{name}" if name and name != _DELETED_AUTHOR else _DELETED_ACCOUNT
+
+
 def _indent(text: str, prefix: str) -> str:
     lines = text.splitlines() or [""]
     return "\n".join([lines[0]] + [prefix + "  " + line for line in lines[1:]])
@@ -345,14 +355,14 @@ def _render_comments(comments: list[dict], depth: int = 0) -> list[str]:
                 continue
             lines.append(f"{prefix}- [deleted]")
         else:
-            lines.append(f"{prefix}- u/{comment['author']}: {_indent(body, prefix)}")
+            lines.append(f"{prefix}- {_author(comment['author'])}: {_indent(body, prefix)}")
         lines.extend(replies)
     return lines
 
 
 def render_post(post: dict, comments: list[dict] | None, truncated: bool) -> dict[str, Any]:
     subreddit = _text(post.get("subreddit"))
-    header = [f"Subreddit: r/{subreddit}", f"Author: u/{_text(post.get('author'))}"]
+    header = [f"Subreddit: r/{subreddit}", f"Author: {_author(post.get('author'))}"]
     if flair := _text(post.get("link_flair_text")):
         header.append(f"Flair: {flair}")
     created = post.get("created_utc")
@@ -474,7 +484,6 @@ class _RedditConfig:
     include_comments: bool = True
     max_comment_depth: int = DEFAULT_MAX_COMMENT_DEPTH
     max_more_requests: int = DEFAULT_MAX_MORE_REQUESTS
-    refresh_days: float = DEFAULT_REFRESH_DAYS
     first_sync_posts: int = DEFAULT_FIRST_SYNC_POSTS
     max_requests: int = DEFAULT_MAX_REQUESTS
 
@@ -551,14 +560,15 @@ class _Walker:
                 yield from self._forget(key, post_id)
             del self.subs[key]
         self.pending[:] = [p for p in self.pending if p[0] in selected]
-        # Threads a run cut short left go first, so a small budget still drains them.
-        yield from self._drain()
+        # Threads a run cut short left go first, so a small budget still drains them, but
+        # only half of it: the deletion checks of a long queue must still get their turn.
+        yield from self._drain(max(1, self.config.max_requests // 2))
         for key, name in sorted(selected.items()):
             yield from self._sync(key, name)
         yield from self._drain()
 
-    def _drain(self) -> Iterator[dict]:
-        while self.pending:
+    def _drain(self, limit: int | None = None) -> Iterator[dict]:
+        while self.pending and (limit is None or self.requests < limit):
             key, post_id = self.pending[0]
             yield from self._read_thread(key, post_id)
             self.pending.pop(0)
@@ -693,8 +703,8 @@ class _Walker:
                 continue
             self.stats["scanned"] += 1
             entry = posts[post_id]
-            recent = self.now - float(entry.get("utc", 0)) <= self.config.refresh_days * 86400
-            if entry.get("meta") == _meta(post) or not recent:
+            due = self.now - float(entry.get("read", 0)) >= _RESCAN_SECONDS
+            if entry.get("meta") == _meta(post) and not due:
                 self.stats["unchanged"] += 1
                 continue
             yield from self._take(key, post)
@@ -778,6 +788,7 @@ class _Walker:
         previous = posts.get(post["id"])
         posts[post["id"]] = {
             "utc": post.get("created_utc"),
+            "read": self.now,
             "meta": _meta(post),
             "hash": _digest(row),
             "doc": True,
@@ -809,9 +820,8 @@ def _iter_rows(
     try:
         yield from walker.rows()
     except _CutShortError as cut:
-        # A spent budget is a planned pause, not a failure; failed_budget says why.
-        if cut.reason != "budget":
-            stats["failed"] = 1
+        # Every cut leaves the sync incomplete, so failed is set; failed_<reason> says why.
+        stats["failed"] = 1
         stats[f"failed_{cut.reason}"] = 1
         logger.warning("Reddit sync stopped early (%s); it continues on the next run.", cut.reason)
         return
@@ -827,6 +837,8 @@ def _iter_rows(
 # Public factory
 # ---------------------------------------------------------------------------
 def _clean_subreddits(subreddits: list[str] | None) -> tuple[str, ...]:
+    if isinstance(subreddits, str):
+        raise TypeError("subreddits must be a list of names, not a string")
     names: dict[str, str] = {}
     for raw in subreddits or ():
         name = str(raw).strip()
@@ -843,7 +855,9 @@ def _default_resource_name(subreddits: tuple[str, ...]) -> str:
     keys = sorted(name.lower() for name in subreddits)
     # Joining names with "_" can collide ("a_b" + "c", "a" + "b_c"); the hash cannot.
     scope = _digest(keys)[:8]
-    return f"reddit_{'_'.join(keys)[:46].strip('_')}_{scope}"
+    # dlt folds repeated underscores, so the name keeps none it would change.
+    slug = re.sub(r"_+", "_", "_".join(keys))[:46].strip("_")
+    return f"reddit_{slug}_{scope}"
 
 
 def _positive(value: Any, what: str, minimum: int = 1) -> int:
@@ -863,7 +877,6 @@ def reddit_source(
     include_comments: bool = True,
     max_comment_depth: int = DEFAULT_MAX_COMMENT_DEPTH,
     max_more_requests: int = DEFAULT_MAX_MORE_REQUESTS,
-    refresh_days: float = DEFAULT_REFRESH_DAYS,
     first_sync_posts: int = DEFAULT_FIRST_SYNC_POSTS,
     max_requests: int = DEFAULT_MAX_REQUESTS,
     resource_name: str | None = None,
@@ -891,15 +904,13 @@ def reddit_source(
         max_comment_depth: Deepest reply level read (0 is a top-level comment).
         max_more_requests: ``/api/morechildren`` requests per thread, each loading up
             to 100 hidden comments. A thread cut short says so in its text.
-        refresh_days: Posts newer than this are read again when their text, edit
-            time or comment count changes. Older posts are only checked for deletion.
         first_sync_posts: Newest posts read from each subreddit on its first sync.
         max_requests: Request budget of one run, checked once a listing, a check or
             a thread is finished. A bigger sync finishes over several runs; a spent
-            budget sets ``failed_budget`` but not ``failed``.
+            budget sets ``failed`` and ``failed_budget``.
         resource_name: Staging table name, which scopes this sync's state and
-            cleanup: lowercase letters, digits and underscores, up to 64. Defaults to
-            one derived from the subreddits.
+            cleanup: lowercase letters, digits and underscores, up to 64, that dlt
+            keeps as they are. Defaults to one derived from the subreddits.
         check_active: Optional host authorization checkpoint, called before each
             request, during rate limit waits and around each row.
         service: Pre-built client (see :class:`RedditClient`). Mainly an injection
@@ -911,23 +922,23 @@ def reddit_source(
         ``cognee_node_set`` column.
     """
     import dlt
+    from dlt.common.normalizers.naming.snake_case import NamingConvention
 
-    if isinstance(refresh_days, bool) or not isinstance(refresh_days, (int, float)):
-        raise ValueError("refresh_days must be a number of days")
-    if refresh_days < 0:
-        raise ValueError("refresh_days must not be negative")
     config = _RedditConfig(
         subreddits=_clean_subreddits(subreddits),
         include_comments=bool(include_comments),
         max_comment_depth=_positive(max_comment_depth, "max_comment_depth", 0),
         max_more_requests=_positive(max_more_requests, "max_more_requests", 0),
-        refresh_days=float(refresh_days),
         first_sync_posts=_positive(first_sync_posts, "first_sync_posts"),
         max_requests=_positive(max_requests, "max_requests"),
     )
-    if resource_name is not None and not _RESOURCE_NAME.fullmatch(resource_name):
+    if resource_name is not None and (
+        not _RESOURCE_NAME.fullmatch(resource_name)
+        or NamingConvention().normalize_table_identifier(resource_name) != resource_name
+    ):
         raise ValueError(
-            "resource_name must be lowercase letters, digits and underscores, up to 64 characters"
+            "resource_name must be lowercase letters, digits and underscores, up to 64 "
+            "characters, that dlt keeps as they are"
         )
     name = resource_name or _default_resource_name(config.subreddits)
     service = service or client

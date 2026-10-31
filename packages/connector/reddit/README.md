@@ -70,10 +70,9 @@ Run the same call again to sync only what changed. See `examples/example.py`.
 | `include_comments` | `True` | Ingest each post's comment thread with it. |
 | `max_comment_depth` | `8` | Deepest reply level read, 0 being a top-level comment. Reddit itself cuts threads at depth 10. |
 | `max_more_requests` | `5` | `/api/morechildren` requests per thread, each loading up to 100 hidden comments. |
-| `refresh_days` | `7` | Posts newer than this are read again when their text, edit time or comment count changes. Older posts are only checked for deletion. |
 | `first_sync_posts` | `100` | Newest posts read from each subreddit on its first sync. |
 | `max_requests` | `100` | Request budget of one run, Reddit's per-minute limit. A bigger sync finishes over several runs. |
-| `resource_name` | derived | Staging table, which scopes this sync's state and cleanup: lowercase letters, digits and underscores, up to 64. Derived from the subreddits (`reddit_learnpython_python_<hash>`), so two syncs into one dataset never delete each other's posts. |
+| `resource_name` | derived | Staging table, which scopes this sync's state and cleanup: lowercase letters, digits and underscores, up to 64, that dlt keeps as they are. Derived from the subreddits (`reddit_learnpython_python_<hash>`), so two syncs into one dataset never delete each other's posts. |
 
 ## What a post looks like
 
@@ -92,12 +91,14 @@ Comments:
   - u/alice: Thanks, trying it.
 - [deleted]
   - u/carol: pipx still does the job.
+- [deleted account]: Worked for me too.
 ```
 
 The document's title is the post's title, its URL the post's permalink, and its node set
 `r/<subreddit>`, so `recall` can be scoped to one subreddit. A link post also shows its link.
 Scores, upvotes and other counters are left out, so votes alone never re-process a post. A
-deleted or removed comment is left out, or shown as `[deleted]` when it has replies. A thread
+deleted or removed comment is left out, or shown as `[deleted]` when it has replies. The
+author of a deleted account is shown as `[deleted account]`, never by name. A thread
 whose comments were not all loaded (deeper than `max_comment_depth`, "continue this thread",
 or more hidden comments than `max_more_requests` loads) ends with
 `(Some comments of this thread were not loaded.)`.
@@ -110,14 +111,21 @@ or more hidden comments than `max_more_requests` loads) ends with
   first sync reads the newest `first_sync_posts` posts; Reddit's listings reach back about
   1,000 posts.
 - **Changes and deletions** of synced posts are read from `/api/info`, 100 posts a request,
-  picking up from where the last run stopped, so every post gets its turn. A post newer than
-  `refresh_days` whose text, flair, link, edit time or comment count changed has its thread
-  read again; a thread whose text comes out the same is not emitted again.
+  picking up from where the last run stopped, so every post gets its turn. A post whose text,
+  flair, link, author, edit time or comment count changed has its thread read again; a thread
+  whose text comes out the same is not emitted again.
+- **Re-read every 48 hours.** Reddit recommends re-reading stored content at least every 48
+  hours, since `/api/info` does not report a deleted comment. Every stored thread is read
+  again once its last read is 48 hours old, which removes deleted comments and the usernames
+  of deleted accounts. This is a fixed rule, not a setting. The connector only works while it
+  runs, so **schedule a run at least every 48 hours**, and a store too big for `max_requests`
+  needs more runs or a bigger budget: each stored thread costs at least one request per 48
+  hours.
 - **Forget-on-delete.** A post is removed from memory when Reddit reports it removed
   (`removed_by_category` set, or its text `[removed]`) or deleted (`[deleted]`), when
   `/api/info` no longer returns it, when its thread answers 404, and when its subreddit is
   no longer selected. A post that only drops off the `/new` listing stays, and so does a post
-  whose author deleted their account (its text is still there).
+  whose author deleted their account: its text is still there, and only the name goes.
 - **Nothing is forgotten by mistake.** A subreddit that answers 403 or 404, or redirects (it
   does not exist), on a later sync is left as it is, counted in `unreadable`, and its posts are
   not checked that run, since a private subreddit's posts disappear from `/api/info` too. An
@@ -125,16 +133,17 @@ or more hidden comments than `max_more_requests` loads) ends with
   run confirms it.
 - **A run is bounded.** `max_requests` counts every request and is checked once a listing, a
   check or a thread is finished, so every run makes progress; the threads a run did not reach
-  are kept in state and read first by the next. Reddit's rate limit headers are followed: a
+  are kept in state and the next run starts with them, for up to half of its budget, so the
+  deletion checks always get their turn. Reddit's rate limit headers are followed: a
   used-up window, a `Retry-After`, 429s and 5xx are waited out up to 60 seconds each and five
-  minutes a run. A longer wait stops the run with `failed` and `failed_rate_limit`, and a token
-  rejected after the first request (revoked mid-run) with `failed` and `failed_auth`. A spent
-  budget is a planned pause and sets only `failed_budget`. Credentials rejected on the first
+  minutes a run. A longer wait stops the run with `failed` and `failed_rate_limit`, a token
+  rejected after the first request (revoked mid-run) with `failed` and `failed_auth`, and a
+  spent budget with `failed` and `failed_budget`. Credentials rejected on the first
   request raise, and any other error raises so dlt keeps the previous state.
 
-Two limits to know: comment edits, and comments deleted after a thread was read, show only once
-the post itself changes or gets new comments within `refresh_days`, since `/api/info` reports
-no change for them. And a post older than `refresh_days` keeps the text it had then.
+One limit to know: a comment edit or deletion shows up at the next re-read, within 48 hours,
+or sooner if the post itself changes. Posts of a subreddit that turned private or was banned
+cannot be read back, so they stay as they are until it answers again or you deselect it.
 
 `cognee_sync_stats` always carries `scanned`, `emitted`, `unchanged`, `deleted` and `gone`
 posts, `unreadable` subreddits and threads, `truncated` threads, `skipped` malformed listing
@@ -149,6 +158,14 @@ what was ingested. The connector only reads: it never posts, comments, votes or 
 client secret and password are only sent to `www.reddit.com` for a token, the token only to
 `oauth.reddit.com`, and none of them is written into documents, state or error messages.
 
+cognee processes the text with the language and embedding models you configure. With a hosted
+provider (OpenAI is cognee's default), Reddit text is sent to that provider under your own
+account; set a local model, for example through Ollama, to keep it on your machine. Do not
+use what you ingest to train models. Your use of Reddit data is subject to Reddit's
+[Data API Terms](https://www.redditinc.com/policies/data-api-terms) and
+[Responsible Builder Policy](https://support.reddithelp.com/hc/en-us/articles/42728983564564-Responsible-Builder-Policy),
+and access needs Reddit's approval for your own use case.
+
 ## Testing
 
 ```bash
@@ -162,7 +179,11 @@ flat list, "continue this thread" stubs, `/api/info` leaving out what it cannot 
 quarantined subreddit's 403. The tests run the client against a mocked HTTP transport (both
 grants, token renewal, rate limit headers, retries, redirects not followed, errors without
 secrets), check rendering on the recorded thread, drive the sync (the `before` cursor and its
-fallbacks, edits, comments, votes, the refresh window, every deletion case, unreadable
+fallbacks, edits, comments, votes, the 48 hour re-read, deleted accounts, every deletion case, unreadable
 subreddits, `more` expansion and truncation, budget, rate limit and revoked-token stops),
 run it through a real dlt pipeline, and run `cognee.remember` end to end to prove a removed
 post leaves the graph.
+
+**Not yet run against the live API.** Reddit approves Data API access per use case, and the
+request for this connector is still pending. Everything above runs on recorded responses, so
+no live request has been made yet.

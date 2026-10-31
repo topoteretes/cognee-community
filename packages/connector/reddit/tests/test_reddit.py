@@ -493,16 +493,40 @@ def test_a_thread_whose_text_came_out_the_same_is_not_emitted(reddit):
     assert stats["unchanged"] == 1 and _threads(reddit) == [f"/comments/{post['id']}"]
 
 
-def test_an_old_post_is_only_checked_for_deletion(reddit):
+def test_a_post_changed_at_any_age_is_read_again(reddit):
     post = reddit.add_post("Python", "Old", "body")
     state = {}
     _run(reddit, state)
     reddit.now += 30 * DAY
     reddit.edit(post, selftext="changed much later")
-    reddit.calls.clear()
-    assert _run(reddit, state) == [] and _threads(reddit) == []
+    rows = _run(reddit, state)
+    assert _live(rows) == [f"t3_{post['id']}"] and "changed much later" in rows[0]["content"]
     reddit.remove(post)
     assert _gone(_run(reddit, state)) == [f"t3_{post['id']}"]
+
+
+def test_every_stored_thread_is_read_again_within_48_hours(reddit):
+    post = reddit.add_post("Python", "Q", "body")
+    comment = reddit.comment(post, "Bye soon", author="carol")
+    state = {}
+    assert "u/carol: Bye soon" in _run(reddit, state)[0]["content"]
+
+    # Nothing on the post itself shows that the comment went.
+    comment["body"] = "[deleted]"
+    comment["author"] = "[deleted]"
+    reddit.now += 47 * 3600
+    reddit.calls.clear()
+    assert _run(reddit, state) == [] and _threads(reddit) == []
+
+    reddit.now += 3600
+    rows = _run(reddit, state)
+    assert [r["id"] for r in rows] == [f"t3_{post['id']}"]
+    assert "carol" not in rows[0]["content"] and "Bye soon" not in rows[0]["content"]
+
+    # The clock starts again from that read, and an unchanged thread is not emitted.
+    reddit.now += 48 * 3600
+    reddit.calls.clear()
+    assert _run(reddit, state) == [] and _threads(reddit) == [f"/comments/{post['id']}"]
 
 
 # ---------------------------------------------------------------------------
@@ -546,12 +570,20 @@ def test_the_recorded_removed_post_counts_as_gone():
     assert posts[0]["selftext"] == "[removed]"
 
 
-def test_a_deleted_account_alone_keeps_the_post(reddit):
-    post = reddit.add_post("Python", "Q", "Still here")
+def test_a_deleted_account_keeps_the_post_but_loses_its_name(reddit):
+    post = reddit.add_post("Python", "Q", "Still here", author="carol")
+    reply = reddit.comment(post, "Me too", author="dave")
     state = {}
-    _run(reddit, state)
+    first = _run(reddit, state)[0]["content"]
+    assert "Author: u/carol" in first and "u/dave: Me too" in first
+
     post["author"] = "[deleted]"
-    assert _gone(_run(reddit, state)) == []
+    reply["author"] = "[deleted]"
+    rows = _run(reddit, state)
+    assert _gone(rows) == [] and len(rows) == 1
+    content = rows[0]["content"]
+    assert "Author: [deleted account]" in content and "- [deleted account]: Me too" in content
+    assert "carol" not in content and "dave" not in content and "u/[deleted]" not in content
 
 
 def test_a_post_that_drops_off_the_listing_stays(reddit):
@@ -721,7 +753,7 @@ def test_a_listing_in_another_shape_raises_and_malformed_posts_are_skipped(reddi
 # ---------------------------------------------------------------------------
 # Sync: bounded runs
 # ---------------------------------------------------------------------------
-def test_budget_pauses_without_failing_and_resumes(reddit):
+def test_budget_pauses_and_resumes(reddit):
     posts = [reddit.add_post("Python", f"P{i}", "x") for i in range(6)]
     state = {}
     seen = set()
@@ -732,7 +764,8 @@ def test_budget_pauses_without_failing_and_resumes(reddit):
         runs.append(stats["failed_budget"])
         if not stats["failed_budget"]:
             break
-        assert stats["failed"] == 0
+        # A cut run is incomplete, so failed is set with the budget as the reason.
+        assert stats["failed"] == 1
     assert runs[0] == 1 and len(runs) > 1
     assert seen == {f"t3_{p['id']}" for p in posts} and state["pending"] == []
 
@@ -760,18 +793,20 @@ def test_a_request_budget_of_one_still_finds_posts_after_a_lost_anchor(reddit):
 
 
 def test_every_synced_post_gets_its_deletion_check_in_turn(reddit):
-    posts = [reddit.add_post("Python", f"P{i}", "x") for i in range(230)]
+    posts = [reddit.add_post("Python", f"P{i}", "x") for i in range(430)]
     state = {}
-    _run(reddit, state, max_requests=1000, first_sync_posts=300)
+    _run(reddit, state, max_requests=2000, first_sync_posts=500)
     reddit.now += 30 * DAY
-    # Only posts of the last batch go, so only a rotation reaches them.
+    # Only posts of the last batch go, so only a rotation reaches them, past a queue
+    # of hundreds of threads that are all due for their 48 hour re-read.
     removed = sorted(posts, key=lambda p: p["id"])[-10:]
     for post in removed:
         reddit.remove(post)
     gone = set()
-    for _ in range(4):
-        gone.update(_gone(_run(reddit, state, max_requests=3)))
+    for _ in range(3):
+        gone.update(_gone(_run(reddit, state, max_requests=6)))
     assert gone == {f"t3_{p['id']}" for p in removed}
+    assert len(state["pending"]) > 300
 
 
 def test_a_rate_limit_stops_cleanly_and_keeps_progress(reddit):
@@ -862,12 +897,26 @@ def test_resource_name_is_validated():
         ({"first_sync_posts": 0}, "first_sync_posts"),
         ({"max_comment_depth": -1}, "max_comment_depth"),
         ({"max_more_requests": True}, "max_more_requests"),
-        ({"refresh_days": -1}, "refresh_days"),
     ],
 )
 def test_settings_are_validated(kwargs, message):
     with pytest.raises(ValueError, match=message):
         _name(**kwargs)
+
+
+def test_subreddits_as_a_bare_string_raises():
+    with pytest.raises(TypeError, match="not a string"):
+        reddit_source(subreddits="python", service=FakeReddit())
+
+
+def test_derived_name_is_one_dlt_keeps():
+    name = reddit_source(subreddits=["a__b", "c_"], service=FakeReddit()).name
+    assert "__" not in name and name.startswith("reddit_a_b_c")
+
+
+def test_resource_name_dlt_would_change_is_rejected():
+    with pytest.raises(ValueError, match="resource_name"):
+        reddit_source(subreddits=["Python"], service=FakeReddit(), resource_name="1reddit")
 
 
 def test_credentials_are_required_and_checked_up_front(monkeypatch):
