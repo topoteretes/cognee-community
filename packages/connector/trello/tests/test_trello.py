@@ -856,6 +856,12 @@ def test_invalid_resource_name_is_rejected(trello, name):
         trello_source([BOARD], service=trello, resource_name=name)
 
 
+@pytest.mark.parametrize("workspace", ["日本チーム", "---", "Ünïcödé"])
+def test_derived_resource_name_is_valid_without_ascii_letters(trello, workspace):
+    name = trello_source(workspace_id=workspace, service=trello).name
+    assert name.startswith("trello_") and "__" not in name
+
+
 def test_derived_resource_name_stays_valid_for_a_long_workspace(trello):
     names = {
         trello_source(workspace_id=workspace, service=trello).name

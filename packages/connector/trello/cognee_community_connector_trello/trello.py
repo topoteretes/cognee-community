@@ -746,8 +746,9 @@ def _default_resource_name(board_ids: list[str] | None, workspace_id: str | None
     slug = re.sub(r"[^a-z0-9]+", "_", scope.lower()).strip("_")
     digest = hashlib.sha256(scope.encode()).hexdigest()[:8]
     if slug != scope:
-        # "Acme Co" and "acme-co" share a slug, so the raw value keeps them apart.
-        slug += "_" + digest
+        # "Acme Co" and "acme-co" share a slug, so the raw value keeps them apart. A
+        # name with no ASCII letter or digit has an empty slug and keeps only the hash.
+        slug = f"{slug}_{digest}" if slug else digest
     if len("trello_" + slug) > _MAX_RESOURCE_NAME:
         # A long workspace name is cut, and the hash keeps cut names apart.
         slug = slug[: _MAX_RESOURCE_NAME - len("trello__") - len(digest)].rstrip("_")
