@@ -118,6 +118,7 @@ are contained in one package (i.e. all tasks used in one pipeline are packaged t
 | Package Name                       | Type       | Description                    |
 |------------------------------------|------------|--------------------------------|
 | `cognee-community-connector-onenote` | Connector | [Selected OneNote notebooks with incremental content fetching](packages/connector/onenote/README.md) |
+| `cognee-community-connector-twitch` | Connector | [Followed Twitch channels, VODs and clips with incremental sync and deletion](packages/connector/twitch/README.md) |
 | `cognee-community-pipeline-codify`     | Pipeline   | Custom codify pipeline package                                        |
 | `cognee-community-retriever-code`      | Retriever  | Custom CODE retriever package                                         |
 | `cognee-community-tasks-codify`        | Task       | Custom codify tasks package                                           |
