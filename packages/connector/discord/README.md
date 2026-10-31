@@ -37,11 +37,16 @@ export DISCORD_GUILD_ID="..."
 ## Usage
 
 ```python
+import os
+
 import cognee
 from cognee_community_connector_discord import discord_source
 
 await cognee.remember(
-    discord_source(),  # DISCORD_GUILD_ID and DISCORD_BOT_TOKEN from env
+    discord_source(
+        guild_id=os.environ["DISCORD_GUILD_ID"],
+        token=os.environ["DISCORD_BOT_TOKEN"],
+    ),
     dataset_name="discord",
     primary_key="id",
     write_disposition="merge",  # REQUIRED, the add pipeline defaults to "replace"
@@ -67,7 +72,7 @@ Run the same call again to sync only what changed. See `examples/example.py`.
 | `rescan_days` | `7` | Recent days re-read on every run to catch edits and deletions, never further back than `since_days`. With `0` only the cursor's day and newer messages are read. |
 | `full_resync` | `False` | Re-read the whole `since_days` history once. A resync the budget cuts short resumes where it stopped on the next run with the flag still set, channels it already finished keep getting new messages meanwhile, and changing `since_days` starts it over. |
 | `max_requests` | `2000` | Request budget of one run, checked once a new day or a whole channel is done. A bigger server finishes over several runs. |
-| `resource_name` | `discord_messages` | Staging table. Use a different name per sync scope that shares a dataset. |
+| `resource_name` | `discord_<guild id>` | Staging table, which scopes this sync's state and cleanup, so two servers in one dataset never forget each other's channels. Use a different name per channel selection of one server that shares a dataset. A name you pass must be lowercase snake_case (letters, digits, `_`) of at most 64 characters. |
 
 Channels the bot cannot read are left as they are and counted in `unreadable`, but each
 one costs a refused request per sync, so pass `channel_ids` on servers with many private

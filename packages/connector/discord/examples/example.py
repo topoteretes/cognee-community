@@ -43,7 +43,10 @@ async def main() -> None:
         return
 
     # Narrow the sync with channel_ids=[...] or since_days=... on a big server.
-    source = discord_source()
+    # The factory never reads the environment; the example passes the settings in.
+    source = discord_source(
+        guild_id=os.environ["DISCORD_GUILD_ID"], token=os.environ["DISCORD_BOT_TOKEN"]
+    )
 
     print("Syncing Discord messages into cognee ...")
     await cognee.remember(

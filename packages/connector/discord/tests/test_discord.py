@@ -957,13 +957,108 @@ def test_source_declares_document_path_and_scope(discord):
     assert source.name == "discord_acme"
 
 
-def test_missing_settings_name_the_env_vars(monkeypatch):
-    monkeypatch.delenv("DISCORD_GUILD_ID", raising=False)
-    monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
-    with pytest.raises(ValueError, match="DISCORD_GUILD_ID"):
+def test_settings_are_explicit_and_never_read_from_the_environment(monkeypatch):
+    monkeypatch.setenv("DISCORD_GUILD_ID", GUILD)
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "from-env")
+    with pytest.raises(ValueError, match="guild_id is required"):
         discord_source()
-    with pytest.raises(ValueError, match="DISCORD_BOT_TOKEN"):
+    with pytest.raises(ValueError, match="bot token is required"):
         discord_source(guild_id=GUILD)
+
+
+@pytest.mark.parametrize(
+    ("path", "answer", "match"),
+    [
+        (f"/guilds/{GUILD}/channels", {"message": "nope"}, "channel list"),
+        (f"/guilds/{GUILD}/threads/active", {}, "active thread list"),
+        (f"/guilds/{GUILD}/threads/active", {"threads": None}, "active thread list"),
+    ],
+)
+def test_listing_without_its_list_raises_and_forgets_nothing(
+    discord, fixed_now, path, answer, match
+):
+    discord.thread("81", GENERAL, "export bug")
+    discord.message("81", TODAY, "trace")
+    state = {}
+    _run(discord, state)
+    real_get = discord.get
+    discord.get = lambda p, params=None: answer if p == path else real_get(p, params)
+    with pytest.raises(DiscordAPIError, match=match):
+        _run(discord, state)
+    assert "81" in state["containers"]
+
+
+def test_default_name_is_per_server(discord):
+    # Two servers syncing into one dataset must not share a table and its cleanup.
+    first = discord_source(guild_id="900", service=discord)
+    second = discord_source(guild_id="901", service=discord)
+    assert (first.name, second.name) == ("discord_900", "discord_901")
+    assert getattr(first, dlt_utils.PIPELINE_SCOPE_ATTR) == "discord_900"
+
+
+@pytest.mark.parametrize("name", ["", "Discord-Team", "discord team", "d" * 65, 7])
+def test_invalid_resource_name_is_rejected(discord, name):
+    with pytest.raises(ValueError, match="resource_name"):
+        discord_source(guild_id=GUILD, service=discord, resource_name=name)
+
+
+def test_client_checks_access_around_every_wait():
+    checks, requests = [], []
+
+    def revoke_after_the_first_check():
+        checks.append(True)
+        if len(checks) > 1:
+            raise PermissionError("access revoked")
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(503)
+
+    client = DiscordClient(
+        "tok-1",
+        http=httpx.Client(transport=httpx.MockTransport(handler)),
+        sleep=lambda seconds: None,
+        check_active=revoke_after_the_first_check,
+    )
+    with pytest.raises(PermissionError):
+        client.get("/users/@me")
+    # Checked before the wait and again after it, so the retry never goes out.
+    assert len(requests) == 1 and len(checks) == 2
+
+
+def test_client_closes_only_the_http_client_it_made():
+    def transport():
+        return httpx.MockTransport(lambda request: httpx.Response(200, json={}))
+
+    injected = httpx.Client(transport=transport())
+    DiscordClient("tok-1", http=injected).close()
+    assert not injected.is_closed
+
+    owned = DiscordClient("tok-1")
+    owned._http = made = httpx.Client(transport=transport())
+    owned._owned = True
+    owned.close()
+    assert made.is_closed and owned._http is None
+
+
+def test_owned_client_is_closed_after_a_run(dlt_mod, tmp_path, discord, fixed_now, monkeypatch):
+    from cognee_community_connector_discord import discord as discord_module
+
+    closed = []
+
+    class Owned:
+        def __init__(self, token, **kwargs):
+            pass
+
+        def get(self, path, params=None):
+            return discord.get(path, params)
+
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(discord_module, "DiscordClient", Owned)
+    _pipeline(dlt_mod, tmp_path).run(discord_source(guild_id=GUILD, token="tok"))
+    assert closed == [True]
 
 
 # ---------------------------------------------------------------------------
@@ -987,7 +1082,7 @@ def _pipeline(dlt, tmp_path):
 def _staged(pipeline):
     with (
         pipeline.sql_client() as client,
-        client.execute_query("SELECT id, content FROM discord_messages") as cursor,
+        client.execute_query(f"SELECT id, content FROM discord_{GUILD}") as cursor,
     ):
         return {row[0]: row[1] for row in cursor.fetchall()}
 

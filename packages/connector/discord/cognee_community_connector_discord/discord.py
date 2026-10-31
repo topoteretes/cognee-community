@@ -8,7 +8,7 @@ incrementally and with forget-on-delete. The resource is handed directly to
     from cognee_community_connector_discord import discord_source
 
     await cognee.remember(
-        discord_source(guild_id="<server id>"),  # DISCORD_BOT_TOKEN from env
+        discord_source(guild_id="<server id>", token=token),
         dataset_name="discord",
         primary_key="id",
         write_disposition="merge",  # REQUIRED, the add pipeline defaults to "replace"
@@ -47,7 +47,6 @@ can read what was ingested.
 
 import hashlib
 import json
-import os
 import re
 import time
 from collections.abc import Callable, Iterator
@@ -168,25 +167,48 @@ class DiscordClient:
     """
 
     def __init__(
-        self, token: str, *, http: Any = None, sleep: Callable[[float], None] = time.sleep
+        self,
+        token: str,
+        *,
+        http: Any = None,
+        sleep: Callable[[float], None] = time.sleep,
+        check_active: Callable[[], None] | None = None,
     ):
         token = (token or "").strip().removeprefix("Bot ").strip()
         # Reject early and without echoing the value: httpx would put an invalid
         # header value, token included, into its exception.
         if not token or not token.isascii() or not token.isprintable() or " " in token:
             raise ValueError("The Discord bot token is empty or has an invalid format")
-        import httpx
 
         self._headers = {"Authorization": f"Bot {token}", "User-Agent": USER_AGENT}
-        self._http = http or httpx.Client(timeout=_TIMEOUT)
+        # An injected client belongs to the caller; one made here is closed by close().
+        self._http = http
+        self._owned = http is None
         self._sleep = sleep
+        self._check_active = check_active
 
     def __repr__(self) -> str:
         return "DiscordClient(token=<redacted>)"
 
+    def close(self) -> None:
+        """Close the HTTP client this object made; the next request opens a new one."""
+        if self._owned and self._http is not None:
+            self._http.close()
+            self._http = None
+
+    def _wait(self, seconds: float) -> None:
+        # The host may revoke access while a request waits, so ask before and after.
+        if self._check_active is not None:
+            self._check_active()
+        self._sleep(seconds)
+        if self._check_active is not None:
+            self._check_active()
+
     def get(self, path: str, params: dict[str, Any] | None = None) -> Any:
         import httpx
 
+        if self._http is None:
+            self._http = httpx.Client(timeout=_TIMEOUT)
         for attempt in range(_RETRIES):
             last = attempt == _RETRIES - 1
             try:
@@ -194,7 +216,7 @@ class DiscordClient:
             except httpx.TransportError as exc:
                 if last:
                     raise DiscordAPIError(f"Discord request failed: {type(exc).__name__}") from exc
-                self._sleep(float(2**attempt))
+                self._wait(float(2**attempt))
                 continue
             status = response.status_code
             if status == 429:
@@ -203,10 +225,10 @@ class DiscordClient:
                 wait = wait if wait is not None else _float(response.headers.get("Retry-After"))
                 if last or (wait is not None and wait > _MAX_RETRY_SLEEP):
                     raise DiscordRateLimitedError("Discord rate limit exceeded (HTTP 429)")
-                self._sleep(wait if wait is not None else float(2**attempt))
+                self._wait(wait if wait is not None else float(2**attempt))
                 continue
             if status >= 500 and not last:
-                self._sleep(float(2**attempt))
+                self._wait(float(2**attempt))
                 continue
             if status == 401:
                 raise DiscordAuthError("Discord rejected the bot token (HTTP 401)")
@@ -222,7 +244,7 @@ class DiscordClient:
             # an IP for too many 401/403/429 responses.
             if response.headers.get("X-RateLimit-Remaining") == "0":
                 reset = _float(response.headers.get("X-RateLimit-Reset-After")) or 0.0
-                self._sleep(min(reset, _MAX_RETRY_SLEEP))
+                self._wait(min(reset, _MAX_RETRY_SLEEP))
             return response.json()
         raise DiscordAPIError("Discord request failed")  # pragma: no cover
 
@@ -541,6 +563,9 @@ class _Walker:
             for r in self.get(f"/guilds/{config.guild_id}/roles")
         }
         channels = self.get(f"/guilds/{config.guild_id}/channels")
+        # A 200 that is not a list must not read as "every channel was deleted".
+        if not isinstance(channels, list):
+            raise DiscordAPIError("Discord answered without a channel list")
 
         wanted = set(config.channel_ids)
         selected = {
@@ -579,8 +604,11 @@ class _Walker:
         self, selected: dict[str, dict], hidden: set[str], hidden_private: set[str]
     ) -> dict[str, dict]:
         config = self.config
-        active = self.get(f"/guilds/{config.guild_id}/threads/active") or {}
-        threads = list(active.get("threads") or [])
+        active = self.get(f"/guilds/{config.guild_id}/threads/active")
+        # Nor one without its thread list "every active thread was deleted".
+        if not isinstance(active, dict) or not isinstance(active.get("threads"), list):
+            raise DiscordAPIError("Discord answered without an active thread list")
+        threads = list(active["threads"])
         for cid, channel in selected.items():
             try:
                 threads.extend(_archived_threads(self, cid, private=False))
@@ -851,6 +879,26 @@ def _iter_rows(
 # ---------------------------------------------------------------------------
 # Public factory
 # ---------------------------------------------------------------------------
+# dlt table names stay readable up to this length; the merged Asana connector uses it too.
+_MAX_RESOURCE_NAME = 64
+
+
+def _check_resource_name(name: Any) -> None:
+    """A non-empty name of at most 64 characters that dlt keeps as it is.
+
+    It names the table and scopes the state: an empty name would lose that scope,
+    and two names dlt normalizes alike ("Foo-Bar", "foo_bar") would share a table.
+    """
+    from dlt.common.normalizers.naming.snake_case import NamingConvention
+
+    if not isinstance(name, str) or not name:
+        raise ValueError("resource_name must be a non-empty string")
+    if len(name) > _MAX_RESOURCE_NAME:
+        raise ValueError(f"resource_name must be at most {_MAX_RESOURCE_NAME} characters")
+    if NamingConvention().normalize_table_identifier(name) != name:
+        raise ValueError("resource_name must be lowercase snake_case (letters, digits, _)")
+
+
 def discord_source(
     guild_id: str | None = None,
     token: str | None = None,
@@ -864,7 +912,7 @@ def discord_source(
     rescan_days: int = DEFAULT_RESCAN_DAYS,
     full_resync: bool = False,
     max_requests: int = DEFAULT_MAX_REQUESTS,
-    resource_name: str = "discord_messages",
+    resource_name: str | None = None,
     check_active: Callable[[], None] | None = None,
     service: Any = None,
     client: Any = None,
@@ -875,8 +923,8 @@ def discord_source(
     and ``primary_key="id"``.
 
     Args:
-        guild_id: The server id (``DISCORD_GUILD_ID``).
-        token: Bot token (``DISCORD_BOT_TOKEN``).
+        guild_id: The server id. Required; the factory never reads the environment.
+        token: Bot token. Required unless ``service`` is given.
         channel_ids: Channel ids to sync. A listed channel that is missing or cannot
             be read raises. Defaults to every text, announcement, forum and media
             channel of the server.
@@ -894,10 +942,13 @@ def discord_source(
         max_requests: Request budget of one run, checked before each request once a
             new day or a whole channel is done. A bigger server finishes over several
             runs; a spent budget sets ``failed_budget`` but not ``failed``.
-        resource_name: Staging table name. Use a different one per sync scope
-            that shares a dataset.
+        resource_name: Staging table name, which scopes this sync's state and cleanup.
+            Defaults to ``discord_<guild id>``. Use a different one per channel
+            selection of one server that shares a dataset. A name you pass must be
+            lowercase snake_case of at most 64 characters.
         check_active: Optional host authorization checkpoint, called before each
-            request and around each row.
+            request and around each row, and in the client built here around every
+            retry or rate-limit wait.
         service: Pre-built client (see :class:`DiscordClient`). Mainly an injection
             point for tests and hosts. ``client`` is accepted as an alias.
 
@@ -915,18 +966,26 @@ def discord_source(
             "Discord sync requires a cognee build with table-scoped DLT document cleanup."
         )
 
-    resolved_guild = guild_id or os.getenv("DISCORD_GUILD_ID")
-    if not resolved_guild:
-        raise ValueError("guild_id is required (pass it explicitly or set DISCORD_GUILD_ID).")
+    # Credentials and the server come from the caller only; the example reads the
+    # environment, the factory never does.
+    if not guild_id or not str(guild_id).strip():
+        raise ValueError("guild_id is required: pass the server id explicitly.")
+    guild = str(guild_id).strip()
+    # One table and state per server by default, so two servers in one dataset never
+    # forget each other's channels.
+    name = resource_name
+    if name is None:
+        name = "discord_" + re.sub(r"[^a-z0-9]+", "_", guild.lower())
+    _check_resource_name(name)
     service = service or client
-    if service is None:
-        resolved_token = token or os.getenv("DISCORD_BOT_TOKEN")
-        if not resolved_token:
-            raise ValueError("A bot token is required (pass token= or set DISCORD_BOT_TOKEN).")
-        service = DiscordClient(resolved_token)
+    owned = service is None
+    if owned:
+        if not token:
+            raise ValueError("A bot token is required: pass token= or a pre-built service.")
+        service = DiscordClient(token, check_active=check_active)
 
     config = _DiscordConfig(
-        guild_id=str(resolved_guild),
+        guild_id=guild,
         channel_ids=tuple(str(c) for c in channel_ids or ()),
         include_threads=include_threads,
         include_forums=include_forums,
@@ -940,7 +999,7 @@ def discord_source(
     stats: dict[str, int] = {}
 
     @dlt.resource(
-        name=resource_name,
+        name=name,
         primary_key="id",
         write_disposition="merge",
         columns={"_deleted": {"data_type": "bool", "hard_delete": True}},
@@ -949,10 +1008,15 @@ def discord_source(
         stats.clear()
         state = dlt.current.resource_state()
         rows = _iter_rows(service, config, state, stats, check_active=check_active)
-        yield from dlt_utils.guarded_rows(rows, check_active)
+        try:
+            yield from dlt_utils.guarded_rows(rows, check_active)
+        finally:
+            # Also on errors and when dlt stops early; an injected service is the caller's.
+            if owned:
+                service.close()
 
     resource = discord_messages()
     setattr(resource, DOCUMENT_SOURCE_ATTR, "discord")
-    setattr(resource, dlt_utils.PIPELINE_SCOPE_ATTR, resource_name)
+    setattr(resource, dlt_utils.PIPELINE_SCOPE_ATTR, name)
     resource.cognee_sync_stats = stats
     return resource
