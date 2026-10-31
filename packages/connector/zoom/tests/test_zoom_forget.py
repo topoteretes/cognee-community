@@ -90,7 +90,7 @@ async def clean_environment(tmp_path, monkeypatch, clock):
 
 async def _sync(zoom):
     await cognee.remember(
-        zoom_source(client=zoom),
+        zoom_source(client=zoom, resource_name="zoom_meetings"),
         dataset_name=DATASET,
         primary_key="id",
         write_disposition="merge",

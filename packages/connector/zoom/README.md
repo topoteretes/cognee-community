@@ -73,7 +73,7 @@ Run the same call again to sync only what changed. See `examples/example.py`.
 | `include_chat` | `True` | Ingest the in-meeting chat saved with the recording. |
 | `include_direct_messages` | `False` | Also ingest the chat's direct messages (see Privacy). |
 | `transcript_wait_hours` | `24` | How long a meeting whose files are not ready is held back (see below). |
-| `resource_name` | `zoom_<account id>` | Staging table, which scopes this sync's state and cleanup. Use a different name per sync scope that shares a dataset. |
+| `resource_name` | `zoom_<account id>` | Staging table, which scopes this sync's state and cleanup. Use a different name per sync scope that shares a dataset; required with a pre-built `service` and no `account_id`. A name you pass must be lowercase snake_case (letters, digits, `_`) of at most 64 characters. |
 
 Video and audio files are never downloaded.
 
@@ -84,8 +84,9 @@ Video and audio files are never downloaded.
   changes, a run lists recording metadata for the whole window, one month per request
   (Zoom's limit) and 300 meetings per page, for each user. Runs in between list only
   the last month, so a run with no changes costs one request per user. Transcript and
-  chat files are downloaded only for meetings that are new or whose files changed. The
-  trade-off: a change to an older meeting, or a deletion, shows up within a day.
+  chat files are downloaded only for meetings that are new or whose files changed, and a
+  meeting whose topic, date, duration, host name or share link changed is rendered again.
+  The trade-off: a change to an older meeting, or a deletion, shows up within a day.
 - **Meeting instances.** Recurring meetings reuse their meeting number, so each
   document is keyed by the instance `uuid` and instances never overwrite each other.
 - **Transcripts that are not ready yet.** Zoom creates the transcript some minutes after
@@ -109,8 +110,12 @@ Video and audio files are never downloaded.
   over 60 seconds (Zoom's daily limits), a 429 that outlasts the retries, more than five
   minutes of retry waits in one run, or an expired token after progress stops the run
   cleanly: it keeps what it finished and reports why in `cognee_sync_stats` (`failed`,
-  plus `failed_rate_limit` or `failed_auth`). Any other failure aborts the sync and dlt
-  keeps the previous state.
+  plus `failed_rate_limit` or `failed_auth`; every key is present on every run). Any other
+  failure aborts the sync and dlt keeps the previous state.
+- **Host checks and cleanup.** `check_active` is called before every request and around
+  each row, and the client built from the credentials also calls it before and after each
+  retry wait. That client is closed at the end of every run, also on errors; a `service`
+  you pass in stays yours to close.
 
 `cognee_sync_stats` also counts `listed`, `pending`, `unchanged`, `emitted` and
 `deleted` meetings, and `skipped_files`.

@@ -96,6 +96,8 @@ _STATS = (
     "deleted",
     "skipped_files",
     "failed",
+    "failed_rate_limit",
+    "failed_auth",
 )
 
 
@@ -168,17 +170,18 @@ class ZoomClient:
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
         max_sleep: float = DEFAULT_MAX_SLEEP,
+        check_active: Callable[[], None] | None = None,
     ):
         if not (account_id and client_id and client_secret):
             raise ValueError("Zoom account_id, client_id and client_secret must all be set")
-        import httpx
 
         basic = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
         self._basic_auth = f"Basic {basic}"
         self._account_id = account_id
-        # httpx drops the Authorization header when a redirect leaves the host,
-        # so the token is not sent to the storage host behind a download_url.
-        self._http = http or httpx.Client(timeout=_TIMEOUT, follow_redirects=True)
+        # An injected client belongs to the caller; one made here is closed by close().
+        self._http = http
+        self._owned = http is None
+        self._check_active = check_active
         self._sleep = sleep
         self._clock = clock
         self._max_sleep = max_sleep
@@ -194,15 +197,30 @@ class ZoomClient:
         """Start a new run's retry wait budget."""
         self._slept = 0.0
 
+    def close(self) -> None:
+        """Close the HTTP client this object made; the next request opens a new one."""
+        if self._owned and self._http is not None:
+            self._http.close()
+            self._http = None
+
     def _wait(self, delay: float) -> None:
         if self._slept + delay > self._max_sleep:
             raise ZoomRateLimitedError("Zoom retries used up the wait budget of this run")
         self._slept += delay
+        # The host may revoke access while a request waits, so ask before and after.
+        if self._check_active is not None:
+            self._check_active()
         self._sleep(delay)
+        if self._check_active is not None:
+            self._check_active()
 
     def _send(self, method: str, url: str, **kwargs: Any) -> Any:
         import httpx
 
+        if self._http is None:
+            # httpx drops the Authorization header when a redirect leaves the host,
+            # so the token is not sent to the storage host behind a download_url.
+            self._http = httpx.Client(timeout=_TIMEOUT, follow_redirects=True)
         attempt = 0
         while True:
             last = attempt == _RETRIES - 1
@@ -498,15 +516,18 @@ def _text_files(meeting: dict, config: _ZoomConfig) -> list[dict]:
     return sorted(files, key=lambda f: (str(f.get("recording_start") or ""), str(f.get("id"))))
 
 
-def _signature(meeting: dict, config: _ZoomConfig) -> str:
+def _signature(meeting: dict, config: _ZoomConfig, host: str) -> str:
     files = [
         [f.get("file_type"), f.get("id"), f.get("status"), f.get("file_size")]
         for f in _text_files(meeting, config)
     ]
+    # Everything the document renders, so a renamed host or a new share link is synced.
     payload = [
         meeting.get("topic"),
         meeting.get("start_time"),
         meeting.get("duration"),
+        meeting.get("share_url"),
+        host,
         files,
         config.include_direct_messages,
     ]
@@ -609,7 +630,7 @@ def _sync(
         if _is_pending(meeting, config, current):
             stats["pending"] += 1
             continue
-        signature = _signature(meeting, config)
+        signature = _signature(meeting, config, hosts.get(meeting.get("host_id"), ""))
         if known.get(uuid) == signature:
             stats["unchanged"] += 1
             continue
@@ -638,6 +659,22 @@ def _sync(
     state["full_listing"] = current.isoformat()
 
 
+class _Checked:
+    """Asks the host's ``check_active`` before every request of the wrapped client."""
+
+    def __init__(self, client: Any, check_active: Callable[[], None]):
+        self._client = client
+        self._check_active = check_active
+
+    def get(self, *args: Any, **kwargs: Any) -> Any:
+        self._check_active()
+        return self._client.get(*args, **kwargs)
+
+    def download(self, *args: Any, **kwargs: Any) -> Any:
+        self._check_active()
+        return self._client.download(*args, **kwargs)
+
+
 def _iter_rows(
     client: Any,
     config: _ZoomConfig,
@@ -645,6 +682,7 @@ def _iter_rows(
     stats: dict[str, int],
     *,
     now: Callable[[], datetime] | None = None,
+    check_active: Callable[[], None] | None = None,
 ) -> Iterator[dict]:
     """Yield changed meetings and tombstones. Pure of dlt, so tests drive it with a dict."""
     for key in _STATS:
@@ -652,6 +690,8 @@ def _iter_rows(
     reset = getattr(client, "reset_sleep_budget", None)
     if reset is not None:
         reset()
+    if check_active is not None:
+        client = _Checked(client, check_active)
     try:
         yield from _sync(client, config, state, stats, (now or _utcnow)())
     except (ZoomRateLimitedError, ZoomAuthError) as exc:
@@ -681,14 +721,44 @@ def _parse_since(since: date | str | None) -> date | None:
     return date.fromisoformat(since)
 
 
+# dlt table names stay readable up to this length; the merged Asana connector uses it too.
+_MAX_RESOURCE_NAME = 64
+
+
 def _default_resource_name(account_id: str | None) -> str:
     if not account_id:
-        return "zoom_meetings"
+        raise ValueError(
+            "Pass a resource_name or account_id with a pre-built service: it scopes this "
+            "sync's state and cleanup, and two accounts sharing one would delete each "
+            "other's meetings."
+        )
     slug = re.sub(r"[^a-z0-9]+", "_", account_id.lower()).strip("_")
     if slug != account_id:
-        # Account ids are case sensitive, so the raw value keeps them apart.
-        slug += "_" + hashlib.sha256(account_id.encode()).hexdigest()[:8]
-    return "zoom_" + slug
+        # Account ids are case sensitive, so the raw value keeps them apart. An id with
+        # no ASCII letter or digit keeps only the hash.
+        digest = hashlib.sha256(account_id.encode()).hexdigest()[:8]
+        slug = f"{slug}_{digest}" if slug else digest
+    name = "zoom_" + slug
+    if len(name) > _MAX_RESOURCE_NAME:
+        digest = hashlib.sha256(account_id.encode()).hexdigest()[:8]
+        name = name[: _MAX_RESOURCE_NAME - len(digest) - 1].rstrip("_") + "_" + digest
+    return name
+
+
+def _check_resource_name(name: Any) -> None:
+    """A non-empty name of at most 64 characters that dlt keeps as it is.
+
+    It names the table and scopes the state: an empty name would lose that scope,
+    and two names dlt normalizes alike ("Foo-Bar", "foo_bar") would share a table.
+    """
+    from dlt.common.normalizers.naming.snake_case import NamingConvention
+
+    if not isinstance(name, str) or not name:
+        raise ValueError("resource_name must be a non-empty string")
+    if len(name) > _MAX_RESOURCE_NAME:
+        raise ValueError(f"resource_name must be at most {_MAX_RESOURCE_NAME} characters")
+    if NamingConvention().normalize_table_identifier(name) != name:
+        raise ValueError("resource_name must be lowercase snake_case (letters, digits, _)")
 
 
 def zoom_source(
@@ -729,8 +799,12 @@ def zoom_source(
         transcript_wait_hours: How long a meeting whose files are not ready is
             held back before it is ingested with whatever is ready.
         resource_name: Staging table name, which scopes this sync's state and
-            cleanup. Defaults to one derived from ``account_id``.
-        check_active: Optional host authorization checkpoint, called around each row.
+            cleanup. Defaults to one derived from ``account_id``; required with a
+            pre-built service and no ``account_id``. A name you pass must be
+            lowercase snake_case of at most 64 characters.
+        check_active: Optional host authorization checkpoint, called before every
+            request, around each row and, in the client built here, around every
+            retry wait.
         service: Pre-built client (see :class:`ZoomClient`). Mainly an injection
             point for tests and hosts. ``client`` is accepted as an alias.
 
@@ -749,16 +823,23 @@ def zoom_source(
         )
 
     service = service or client
-    if service is None:
+    owned = service is None
+    if owned:
         if not (account_id and client_id and client_secret):
             raise ValueError(
                 "Zoom credentials missing: pass account_id, client_id and client_secret, "
                 "or a pre-built service."
             )
         service = ZoomClient(
-            account_id=account_id, client_id=client_id, client_secret=client_secret
+            account_id=account_id,
+            client_id=client_id,
+            client_secret=client_secret,
+            check_active=check_active,
         )
-    name = resource_name or _default_resource_name(account_id)
+    name = resource_name
+    if name is None:
+        name = _default_resource_name(account_id)
+    _check_resource_name(name)
 
     config = _ZoomConfig(
         user_ids=tuple(user_ids or ()),
@@ -778,8 +859,14 @@ def zoom_source(
     )
     def zoom_meetings():
         stats.clear()
-        rows = _iter_rows(service, config, dlt.current.resource_state(), stats)
-        yield from dlt_utils.guarded_rows(rows, check_active)
+        state = dlt.current.resource_state()
+        rows = _iter_rows(service, config, state, stats, check_active=check_active)
+        try:
+            yield from dlt_utils.guarded_rows(rows, check_active)
+        finally:
+            # Also on errors and when dlt stops early; an injected service is the caller's.
+            if owned:
+                service.close()
 
     resource = zoom_meetings()
     setattr(resource, DOCUMENT_SOURCE_ATTR, "zoom")

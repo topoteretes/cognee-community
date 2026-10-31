@@ -431,6 +431,34 @@ def test_unchanged_meetings_are_not_downloaded_again(zoom):
     assert zoom.downloads == []
 
 
+@pytest.mark.parametrize("change", ["host", "share_url"])
+def test_a_renamed_host_or_new_share_link_is_synced(zoom, change):
+    zoom.add_meeting("m1", transcript=VTT)
+    state = {}
+    _run(zoom, state)
+    if change == "host":
+        zoom.users["active"][0]["display_name"] = "Priya S."
+    else:
+        zoom.meetings["m1"]["share_url"] = "https://zoom.test/rec/share/new"
+    rows = _run(zoom, state)
+    assert [row["id"] for row in rows] == ["meeting:m1"]
+    assert "Priya S." in rows[0]["content"] if change == "host" else rows[0]["url"].endswith("/new")
+
+
+def test_check_active_runs_before_every_request(zoom):
+    zoom.add_meeting("m1", transcript=VTT)
+    calls = []
+
+    def check_active():
+        calls.append(len(zoom.calls))
+        if len(calls) == 3:
+            raise PermissionError("revoked")
+
+    with pytest.raises(PermissionError):
+        list(_iter_rows(zoom, _config(), {}, {}, now=lambda: NOW, check_active=check_active))
+    assert calls == [0, 1, 2] and len(zoom.calls) == 2
+
+
 def test_only_new_meetings_are_downloaded(zoom):
     zoom.add_meeting("m1", transcript=VTT)
     state = {}
@@ -710,7 +738,21 @@ def test_source_declares_document_path_and_scope(zoom):
     assert getattr(source, dlt_utils.DOCUMENT_SOURCE_ATTR) == "zoom"
     assert getattr(source, dlt_utils.PIPELINE_SCOPE_ATTR) == "zoom_team_a"
     assert source.name == "zoom_team_a"
-    assert zoom_source(client=zoom).name == "zoom_meetings"
+    # A pre-built service with no account id has nothing to derive a name from.
+    with pytest.raises(ValueError, match="Pass a resource_name"):
+        zoom_source(client=zoom)
+
+
+@pytest.mark.parametrize("name", ["", "Zoom-Team", "zoom team", "z" * 65, 7])
+def test_invalid_resource_name_is_rejected(zoom, name):
+    with pytest.raises(ValueError, match="resource_name"):
+        zoom_source(service=zoom, resource_name=name)
+
+
+@pytest.mark.parametrize("account", ["\u65e5\u672c", "---", "a" * 80])
+def test_derived_resource_name_stays_valid(zoom, account):
+    name = zoom_source(account, service=zoom).name
+    assert name.startswith("zoom_") and "__" not in name and len(name) <= 64
 
 
 def test_default_resource_name_comes_from_the_account(zoom):
@@ -719,11 +761,68 @@ def test_default_resource_name_comes_from_the_account(zoom):
     assert upper.startswith("zoom_abc_1_") and lower == "zoom_abc_1"
 
 
+def test_client_checks_access_around_every_wait():
+    checks = []
+
+    def revoke_after_the_first_check():
+        checks.append(True)
+        if len(checks) > 1:
+            raise PermissionError("access revoked")
+
+    api = _Api({("POST", "zoom.us/oauth/token"): [httpx.Response(503)]})
+    client, _ = _client(api, check_active=revoke_after_the_first_check)
+    with pytest.raises(PermissionError):
+        client.get("/users")
+    # Checked before the wait and again after it, so the retry never goes out.
+    assert len(api.requests) == 1 and len(checks) == 2
+
+
+def test_client_closes_only_the_http_client_it_made():
+    def transport():
+        return httpx.MockTransport(lambda request: httpx.Response(200, json={}))
+
+    injected = httpx.Client(transport=transport())
+    ZoomClient("acc", "cid", "secret", http=injected).close()
+    assert not injected.is_closed
+
+    owned = ZoomClient("acc", "cid", "secret")
+    owned._http = made = httpx.Client(transport=transport())
+    owned.close()
+    assert made.is_closed and owned._http is None
+
+
+def test_owned_client_is_closed_after_a_run(zoom, monkeypatch):
+    closed = []
+
+    class Owned:
+        def __init__(self, **kwargs):
+            pass
+
+        def get(self, path, params=None):
+            return zoom.get(path, params)
+
+        def download(self, url):
+            return zoom.download(url)
+
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(zoom_module, "ZoomClient", Owned)
+    source = zoom_source("acc", "cid", "secret")
+    assert list(source) == [] and closed == [True]
+    assert {"failed_rate_limit", "failed_auth"} <= set(source.cognee_sync_stats)
+
+
 def test_credentials_are_passed_by_name(monkeypatch):
     seen = {}
     monkeypatch.setattr(zoom_module, "ZoomClient", lambda **kwargs: seen.update(kwargs) or "c")
     zoom_source("acc", "cid", "secret")
-    assert seen == {"account_id": "acc", "client_id": "cid", "client_secret": "secret"}
+    assert seen == {
+        "account_id": "acc",
+        "client_id": "cid",
+        "client_secret": "secret",
+        "check_active": None,
+    }
 
 
 def test_missing_credentials_raise(monkeypatch):
@@ -763,12 +862,12 @@ def test_pipeline_resyncs_only_changes_and_forgets_deletions(dlt_mod, tmp_path, 
     zoom.add_meeting("m2", topic="Retro", transcript=VTT)
     pipeline = _pipeline(dlt_mod, tmp_path)
 
-    pipeline.run(zoom_source(client=zoom))
+    pipeline.run(zoom_source(client=zoom, resource_name="zoom_meetings"))
     assert set(_staged(pipeline)) == {"meeting:m1", "meeting:m2"}
 
     # The cursor lives in dlt state, so a fresh source object resumes from it.
     zoom.downloads.clear()
-    source = zoom_source(client=zoom)
+    source = zoom_source(client=zoom, resource_name="zoom_meetings")
     pipeline.run(source)
     assert zoom.downloads == []
     assert source.cognee_sync_stats["unchanged"] == 2
@@ -776,7 +875,7 @@ def test_pipeline_resyncs_only_changes_and_forgets_deletions(dlt_mod, tmp_path, 
     del zoom.meetings["m2"]
     zoom.add_meeting("m3", start="2026-10-07T09:00:00Z", transcript=VTT)
     clock[0] = TOMORROW
-    pipeline.run(zoom_source(client=zoom))
+    pipeline.run(zoom_source(client=zoom, resource_name="zoom_meetings"))
     assert set(_staged(pipeline)) == {"meeting:m1", "meeting:m3"}
 
 
@@ -804,15 +903,15 @@ def test_failed_run_keeps_staging_and_cursor(dlt_mod, tmp_path, zoom, clock):
     zoom.add_meeting("m1", transcript=VTT)
     zoom.add_meeting("m2", topic="Retro", transcript=VTT)
     pipeline = _pipeline(dlt_mod, tmp_path)
-    pipeline.run(zoom_source(client=zoom))
+    pipeline.run(zoom_source(client=zoom, resource_name="zoom_meetings"))
 
     del zoom.meetings["m1"]
     zoom.fail_path = "/recordings"
     clock[0] = TOMORROW
     with pytest.raises(Exception, match="503"):
-        pipeline.run(zoom_source(client=zoom))
+        pipeline.run(zoom_source(client=zoom, resource_name="zoom_meetings"))
     assert set(_staged(pipeline)) == {"meeting:m1", "meeting:m2"}
 
     zoom.fail_path = None
-    pipeline.run(zoom_source(client=zoom))
+    pipeline.run(zoom_source(client=zoom, resource_name="zoom_meetings"))
     assert set(_staged(pipeline)) == {"meeting:m2"}
