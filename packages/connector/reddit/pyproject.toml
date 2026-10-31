@@ -1,0 +1,42 @@
+[project]
+name = "cognee-community-connector-reddit"
+version = "0.1.0"
+description = "Reddit data-source connector for cognee: sync subreddit posts and their comment threads into memory (incremental + forget-on-delete)"
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    # Needs document-mode routing (DOCUMENT_SOURCE_ATTR), the table-scoped
+    # orphan cleanup, PIPELINE_SCOPE_ATTR, guarded_rows and the per-row
+    # node_set column, in cognee 1.6.3 and later 1.x releases.
+    "cognee>=1.6.3,<2",
+    # cognee 1.6 imports dlt.common.time.ensure_pendulum_datetime_utc, added in 1.16.
+    "dlt[sqlalchemy]>=1.16.0,<2",
+    "httpx>=0.27,<1",
+]
+
+[project.urls]
+Homepage = "https://github.com/topoteretes/cognee"
+Repository = "https://github.com/topoteretes/cognee-community"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cognee_community_connector_reddit"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "N", "B", "UP", "C4", "PGH", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]

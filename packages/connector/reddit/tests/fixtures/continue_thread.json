@@ -1,0 +1,15 @@
+{
+ "request": "part of GET https://oauth.reddit.com/comments/6otocc/_/dkk4q9c?context=100&raw_json=1",
+ "response": {
+  "data": {
+   "children": [],
+   "count": 0,
+   "depth": 10,
+   "id": "_",
+   "name": "t1__",
+   "parent_id": "t1_dkk4q9z"
+  },
+  "kind": "more"
+ },
+ "source": "TestComment.test_parent__chain (one more node)"
+}
