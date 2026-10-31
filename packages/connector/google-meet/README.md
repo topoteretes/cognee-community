@@ -146,8 +146,12 @@ A transcript is its own document, one line per spoken entry:
 - **Two kinds of rows:** a conference document and a transcript document. They are separate
   on purpose: deleting a transcript forgets the words but keeps the attendance record.
 - **Deleted transcripts:** Meet keeps listing a transcript after its Google Doc is deleted, so
-  Drive is the delete signal. Every run checks the synced Docs; a trashed or missing Doc is
-  forgotten. Deleted items are emitted as `{"id": ..., "_deleted": True}` with a
+  Drive is the delete signal. Each run checks up to 100 synced Docs, carrying on after the
+  last one the previous run checked, so a big history costs at most 100 requests a run and
+  every Doc gets its turn; a trashed or missing Doc is forgotten. The first 5xx from Drive
+  pauses the checks until the next run instead of asking a struggling Drive once per Doc,
+  and the next run starts after that Doc, so one that keeps failing never holds back the
+  rest. A paused check loses nothing, so on its own it does not fail the run. Deleted items are emitted as `{"id": ..., "_deleted": True}` with a
   `hard_delete` column. dlt removes them on `merge`, and cognee's orphan cleanup removes them
   from the graph and vector stores.
 - **Expiry is not a delete:** Meet deletes a conference record 30 days after it ends. The
@@ -208,7 +212,8 @@ This connector reads personal data. Be clear about what it does:
 
 **How deletion is honoured**
 
-- A transcript whose Doc is deleted or trashed is forgotten on the **next sync**. Run syncs
+- A transcript whose Doc is deleted or trashed is forgotten on the **next sync**, or, with
+  more than 100 synced transcripts, within the next few syncs as the checks rotate. Run syncs
   in the foreground: forgetting happens as part of `remember`.
 - Turning `include_transcripts` off forgets the transcripts already synced.
 - To remove everything at once, forget the whole dataset with `cognee.forget`.
@@ -243,7 +248,8 @@ manual check: lists come newest first, an empty list is `{}`, and every list cal
   on a later page, a failing conference that stays pending while the others finish, auth and
   rate limits (also a 403 with a rate-limit reason), a lost connection and a revoked refresh
   token that end the run but keep what finished, a space that cannot be read, a transcript
-  given up on after a day, rows yielded per conference,
+  given up on after a day, rows yielded per conference, Doc checks capped per run, rotating,
+  and paused by a Drive 5xx without holding back the next Doc,
   `check_active` before every request, retries with one wait budget per run that a revoked
   connection can cancel, errors that will not pass never retried, a participant order that does not depend on Google's,
   no ids or names in logs or errors, no Drive calls when checks are off, turning

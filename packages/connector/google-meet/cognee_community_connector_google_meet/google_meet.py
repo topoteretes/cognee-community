@@ -83,6 +83,9 @@ RETENTION = timedelta(days=30)
 # A transcript still not written this long after its conference ended is
 # given up on, so the conference stops being read again every run.
 TRANSCRIPT_WAIT = timedelta(days=1)
+# Synced transcript Docs checked in Drive per run.  The checks rotate, so a big
+# history costs this many requests a run instead of one per transcript ever synced.
+MAX_DOC_CHECKS = 100
 ID_PREFIX = "gmeet:"
 # Google's reasons for a 403 that is a quota rejection. Same list as cognee's gmail.py.
 _RATE_LIMIT_REASONS = ("rateLimitExceeded", "userRateLimitExceeded")
@@ -479,7 +482,8 @@ def _iter_rows(
     last row.  A conference that fails stays pending and is retried; the run
     raises only when nothing finished, which is before anything was yielded,
     because dlt drops the state of a failed run and would throw the finished
-    work away.
+    work away.  A Doc check that paused on a 5xx does not count as a failed
+    run on its own, so where the next checks start is saved.
     """
     stats.clear()
     stats.update(
@@ -498,6 +502,11 @@ def _iter_rows(
     # A conference that fails or is not reached this run stays pending.
     pending: dict[str, str] = dict(state.get("pending", {}))
     known: dict[str, str] = dict(state.get("transcripts", {}))
+    # The last transcript whose Doc was checked: the next check starts after it.
+    checked_through: str | None = state.get("checked_through")
+    # A Doc check that met a 5xx and paused the rest.  It loses nothing, so on
+    # its own it does not fail the run: where the next checks start must be saved.
+    paused: GoogleMeetError | None = None
     failures = _Failures(stats)
     finished = 0
 
@@ -515,15 +524,22 @@ def _iter_rows(
         known = {}
     elif config.uses_drive:
         # Meet still lists a transcript after its Doc is deleted; Drive does not.
-        for row_id, doc_id in sorted(known.items()):
+        # Each run carries on after the last Doc checked, so one that keeps
+        # failing never holds back the ones after it.
+        watched = sorted(row_id for row_id, doc_id in known.items() if doc_id)
+        for row_id in _rotated(watched, checked_through)[:MAX_DOC_CHECKS]:
             if failures.stopped:
                 break
-            if not doc_id:
-                continue
+            checked_through = row_id
             try:
-                exists = _doc_exists(services.drive, doc_id, calls)
+                exists = _doc_exists(services.drive, known[row_id], calls)
             except GoogleMeetError as error:
                 failures.record(error, "transcript_check")  # errors never delete
+                if error.status is not None and error.status >= 500:
+                    # Drive is struggling: the rest wait for the next run
+                    # instead of each asking it again.
+                    paused = error
+                    break
                 continue
             finished += 1
             if not exists:
@@ -584,7 +600,7 @@ def _iter_rows(
             started = _parse_time(record["startTime"])
             newest = started if newest is None else max(newest, started)
 
-    if failures.last is not None and not finished:
+    if failures.last is not None and not finished and failures.last is not paused:
         # Nothing finished, so there is no state to save and nothing is lost by raising.
         last = failures.last
         raise GoogleMeetError(
@@ -597,7 +613,14 @@ def _iter_rows(
     state["done"] = done
     state["pending"] = pending
     state["transcripts"] = known
+    state["checked_through"] = checked_through
     logger.info("Google Meet: sync stats %s", stats)
+
+
+def _rotated(ids: list[str], after: str | None) -> list[str]:
+    """``ids`` in order, starting with the first one after ``after``."""
+    start = next((i for i, row_id in enumerate(ids) if after is None or row_id > after), 0)
+    return ids[start:] + ids[:start]
 
 
 def _list_records(meet: Any, since: str | None, calls: _Calls) -> list[dict]:

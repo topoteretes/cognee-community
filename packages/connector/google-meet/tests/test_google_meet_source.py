@@ -303,3 +303,11 @@ def test_clients_passed_in_are_left_open_for_their_owner(tmp_path):
     _run(google_meet_source(services=MeetServices(meet=meet, drive=drive)), tmp_path)
 
     assert (meet.closed, drive.closed) == (0, 0)
+
+
+def test_a_cognee_without_table_scoped_cleanup_is_refused(monkeypatch):
+    # Older cognee would let this source's deletes clean up another source's rows.
+    monkeypatch.setattr(module.dlt_utils, "DOCUMENT_SYNC_VERSION", 0)
+
+    with pytest.raises(RuntimeError, match="Upgrade Cognee"):
+        google_meet_source(services=MeetServices(meet=FakeMeet(), drive=FakeDrive()))

@@ -391,6 +391,19 @@ def test_several_transcripts_in_one_conference_and_one_still_running(meet, drive
     assert set(state["transcripts"]) == {transcript_id(first), transcript_id(second)}
 
 
+def test_a_transcript_synced_earlier_still_counts_when_the_conference_is_read_again(meet, drive):
+    conference = meeting(meet)
+    meet.add_transcript(conference)
+    meet.add_transcript(conference, state="STARTED")  # Google never finishes this one
+    state: dict = {}
+    sync(meet, drive, state)
+
+    # A day later the second one is given up; the first was synced last run.
+    upserts, _, _ = sync(meet, drive, state, now=NOW + timedelta(days=2))
+
+    assert "Transcript: yes" in upserts[conf_id(conference)]["content"].splitlines()
+
+
 def test_empty_transcript_list_is_normal(meet, drive):
     # Personal accounts cannot transcribe: Meet answers {} with no list key.
     conference = meeting(meet)
@@ -477,7 +490,7 @@ def test_a_doc_that_cannot_be_checked_stays_watched_and_the_rest_syncs(meet, dri
     assert deletes == [transcript_id(transcript)], "checked again on the next run"
 
 
-@pytest.mark.parametrize("status", [401, 403, 429, 500])
+@pytest.mark.parametrize("status", [401, 403, 429])
 def test_a_drive_error_with_nothing_else_finished_raises_and_changes_nothing(meet, drive, status):
     conference = meeting(meet)
     meet.add_transcript(conference)
@@ -491,6 +504,20 @@ def test_a_drive_error_with_nothing_else_finished_raises_and_changes_nothing(mee
         sync(meet, drive, state)
 
     assert state == before
+
+
+def test_a_drive_5xx_with_nothing_else_finished_pauses_and_saves_where_to_resume(meet, drive):
+    conference = meeting(meet)
+    transcript = meet.add_transcript(conference)
+    state: dict = {}
+    sync(meet, drive, state)
+
+    drive.fail_next.extend([500] * 4)
+    _, deletes, stats = sync(meet, drive, state)
+
+    assert deletes == [] and stats["failed_transcript_check"] == 1
+    assert transcript_id(transcript) in state["transcripts"], "errors never delete"
+    assert state["checked_through"] == transcript_id(transcript)
 
 
 def test_without_drive_checks_drive_is_never_called(meet):
@@ -1053,3 +1080,67 @@ def test_rows_are_yielded_per_conference_not_held_until_the_end(meet, drive):
     # The second conference has not been read yet.
     assert not any(second in str(params) for params in meet.calls_to("participants"))
     assert [row["id"] for row in rows] == [conf_id(second)]
+
+
+# ---------------------------------------------------------------------------
+# Doc checks: what a big history and a struggling Drive cost
+# ---------------------------------------------------------------------------
+def synced_transcripts(meet, drive, count):
+    """``count`` synced transcripts, as (row id, Doc id) in the order they are checked."""
+    conference = meeting(meet)
+    for n in range(count):
+        meet.add_transcript(conference, doc_id=f"doc-{n}")
+    state: dict = {}
+    sync(meet, drive, state)
+    return state, sorted(state["transcripts"].items())
+
+
+def test_a_drive_answering_5xx_is_asked_once_a_run_not_once_per_doc(meet, drive):
+    state, docs = synced_transcripts(meet, drive, 3)
+    for _, doc_id in docs:
+        drive.errors[doc_id] = 500
+    drive.calls.clear()
+
+    _, deletes, stats = sync(meet, drive, state)
+
+    assert deletes == [], "errors never delete"
+    assert set(drive.calls) == {docs[0][1]}, "the rest wait for the next run"
+    assert stats["failed_transcript_check"] == 1
+
+
+def test_a_doc_that_keeps_failing_does_not_hold_back_the_next_one(meet, drive):
+    state, docs = synced_transcripts(meet, drive, 2)
+    (_, stuck_doc), (gone_row, gone_doc) = docs
+    drive.errors[stuck_doc] = 500
+    drive.delete(gone_doc)
+
+    _, first, _ = sync(meet, drive, state)
+    _, second, _ = sync(meet, drive, state)
+
+    assert first == [], "the 5xx on the first Doc stops this run's checks"
+    assert second == [gone_row], "the next run starts after it"
+
+
+def test_a_4xx_on_one_doc_does_not_stop_the_others(meet, drive):
+    state, docs = synced_transcripts(meet, drive, 2)
+    (_, forbidden_doc), (gone_row, gone_doc) = docs
+    drive.errors[forbidden_doc] = 403
+    drive.delete(gone_doc)
+
+    _, deletes, _ = sync(meet, drive, state)
+
+    assert deletes == [gone_row]
+
+
+def test_doc_checks_are_capped_per_run_and_rotate_through_all(meet, drive, monkeypatch):
+    monkeypatch.setattr(meet_module, "MAX_DOC_CHECKS", 2)
+    state, docs = synced_transcripts(meet, drive, 3)
+    gone_row, gone_doc = docs[2]
+    drive.delete(gone_doc)
+    drive.calls.clear()
+
+    _, first, _ = sync(meet, drive, state)
+    assert first == [] and drive.calls == [docs[0][1], docs[1][1]]
+
+    _, second, _ = sync(meet, drive, state)
+    assert second == [gone_row], "the third Doc gets its turn on the next run"
