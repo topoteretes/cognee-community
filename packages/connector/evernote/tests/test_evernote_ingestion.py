@@ -213,6 +213,7 @@ async def test_evernote_ingestion_lifecycle(persistent_environment):
 
     # Assert 3: An edited note updates its Data record
     contents["noteA"] = "<en-note><div>Alice architecture document REVISED v2</div></en-note>"
+    client.note_contents["noteA"] = contents["noteA"]
     note_a_edited = SimpleNamespace(
         guid="noteA",
         title="Note A Title",

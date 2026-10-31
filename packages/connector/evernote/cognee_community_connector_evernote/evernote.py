@@ -7,7 +7,6 @@ incremental synchronization via Evernote sync chunks and forget-on-delete.
 import os
 import time
 from collections.abc import Callable, Generator
-from datetime import UTC, datetime
 from html.parser import HTMLParser
 from typing import Any
 
@@ -25,6 +24,7 @@ from evernote.edam.notestore import NoteStore
 from evernote.edam.notestore.ttypes import SyncChunkFilter
 from evernote.edam.userstore import UserStore
 from thrift.protocol.TBinaryProtocol import TBinaryProtocol
+from thrift.Thrift import TException
 from thrift.transport.THttpClient import THttpClient
 from thrift.transport.TTransport import TTransportException
 
@@ -50,6 +50,29 @@ class NoteNotFoundError(EvernoteError):
 class EvernoteRateLimitError(EvernoteError):
     """Raised when Evernote rate limit retries are exhausted or wait exceeds cap."""
 
+    def __init__(self, message: str, retry_after: float | int | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+def _error_code_name(code: Any) -> str:
+    """Format an EDAM error code as 'NAME (VALUE)' or fallback to its string representation."""
+    name = getattr(code, "name", None)
+    if not name and hasattr(EDAMErrorCode, "_VALUES_TO_NAMES"):
+        name = getattr(EDAMErrorCode, "_VALUES_TO_NAMES", {}).get(code)
+    if not name:
+        try:
+            name = EDAMErrorCode(code).name
+        except (ValueError, TypeError, KeyError):
+            name = None
+    if name:
+        try:
+            val = int(code)
+            return f"{name} ({val})"
+        except (ValueError, TypeError):
+            return str(name)
+    return str(code)
+
 
 class EvernoteApi:
     """Wrapper around Thrift UserStore and NoteStore clients."""
@@ -63,7 +86,7 @@ class EvernoteApi:
         sleep_fn: Callable[[float], None] = time.sleep,
         max_retries: int = 3,
         timeout_seconds: float = 30,
-        max_rate_limit_wait: float = 300,
+        max_rate_limit_wait: float = 30,
     ) -> None:
         self._token = token
         self.sandbox = sandbox
@@ -134,27 +157,31 @@ class EvernoteApi:
 
     def _handle_exception(self, exc: Exception, guid: str | None = None) -> None:
         if isinstance(exc, EDAMUserException):
+            code_str = _error_code_name(exc.errorCode)
             if exc.errorCode in (EDAMErrorCode.INVALID_AUTH, EDAMErrorCode.AUTH_EXPIRED):
-                code_name = getattr(exc.errorCode, "name", str(exc.errorCode))
-                raise EvernoteAuthError(f"Evernote authentication failed ({code_name})") from None
+                raise EvernoteAuthError(f"Evernote authentication failed ({code_str})") from exc
             if exc.errorCode == EDAMErrorCode.PERMISSION_DENIED:
-                code_name = getattr(exc.errorCode, "name", str(exc.errorCode))
-                raise EvernotePermissionError(f"Evernote permission denied ({code_name})") from None
-            raise EvernoteError(f"Evernote user error: {exc.errorCode}") from None
+                raise EvernotePermissionError(f"Evernote permission denied ({code_str})") from exc
+            raise EvernoteError(f"Evernote user error: {code_str}") from exc
 
         if isinstance(exc, EDAMNotFoundException):
             target = guid or getattr(exc, "key", "")
-            raise NoteNotFoundError(f"Evernote note not found: {target}") from None
+            raise NoteNotFoundError(f"Evernote note not found: {target}") from exc
+
+        if isinstance(exc, EDAMSystemException):
+            code_str = _error_code_name(exc.errorCode)
+            raise EvernoteError(f"Evernote system error: {code_str}") from exc
 
         if isinstance(
             exc, (EvernoteError, EvernoteAuthError, EvernotePermissionError, NoteNotFoundError)
         ):
             raise exc
 
-        raise EvernoteError(f"Evernote API call failed: {exc.__class__.__name__}") from None
+        raise EvernoteError(f"Evernote API call failed: {exc.__class__.__name__}") from exc
 
     def _call_with_retry(self, fn: Any, *args: Any, guid: str | None = None, **kwargs: Any) -> Any:
         attempt = 0
+        total_rate_limit_slept = 0.0
         while True:
             try:
                 return fn(*args, **kwargs)
@@ -164,28 +191,40 @@ class EvernoteApi:
                     if duration > self.max_rate_limit_wait:
                         raise EvernoteRateLimitError(
                             f"Evernote rate limit duration ({duration:.0f}s) exceeds "
-                            f"maximum allowed wait ({self.max_rate_limit_wait:.0f}s)"
-                        ) from None
+                            f"maximum allowed wait ({self.max_rate_limit_wait:.0f}s)",
+                            retry_after=duration,
+                        ) from exc
+                    if total_rate_limit_slept + duration > self.max_rate_limit_wait:
+                        total_s = total_rate_limit_slept + duration
+                        raise EvernoteRateLimitError(
+                            f"Evernote total rate limit wait ({total_s:.0f}s) exceeds "
+                            f"maximum allowed wait ({self.max_rate_limit_wait:.0f}s)",
+                            retry_after=duration,
+                        ) from exc
                     attempt += 1
                     if attempt > self.max_retries:
                         raise EvernoteRateLimitError(
-                            "Evernote rate limit reached and retry attempts exhausted"
-                        ) from None
+                            "Evernote rate limit reached and retry attempts exhausted",
+                            retry_after=duration,
+                        ) from exc
                     self.sleep_fn(duration)
+                    total_rate_limit_slept += duration
                     continue
                 self._handle_exception(exc, guid=guid)
-            except (TTransportException, ConnectionError, TimeoutError, OSError) as exc:
+            except (EDAMUserException, EDAMNotFoundException) as exc:
+                self._handle_exception(exc, guid=guid)
+            except (TTransportException, ConnectionError, TimeoutError, OSError, EOFError) as exc:
                 attempt += 1
                 if attempt > self.max_retries:
                     err_type = exc.__class__.__name__
                     raise EvernoteError(
                         f"Evernote transport failed after {self.max_retries} retries: {err_type}"
-                    ) from None
+                    ) from exc
                 backoff = float(2 ** (attempt - 1))
                 self.sleep_fn(backoff)
                 continue
-            except Exception as exc:
-                self._handle_exception(exc, guid=guid)
+            except (TException, EOFError) as exc:  # noqa: B025
+                raise EvernoteError(f"Evernote API call failed: {exc.__class__.__name__}") from exc
 
     def get_sync_state(self) -> Any:
         """Fetch current sync state from NoteStore."""
@@ -288,11 +327,8 @@ def enml_to_text(enml: str) -> str:
         return ""
 
     parser = ENMLToTextParser()
-    try:
-        parser.feed(enml)
-        parser.close()
-    except Exception:
-        pass
+    parser.feed(enml)
+    parser.close()
 
     raw = "".join(parser.pieces)
     lines = [line.rstrip() for line in raw.splitlines()]
@@ -314,16 +350,6 @@ def enml_to_text(enml: str) -> str:
     return "\n".join(collapsed)
 
 
-def _timestamp_to_iso(ts_ms: int | float | None) -> str | None:
-    if ts_ms is None:
-        return None
-    try:
-        dt = datetime.fromtimestamp(ts_ms / 1000.0, tz=UTC)
-        return dt.isoformat()
-    except Exception:
-        return None
-
-
 def note_to_row(
     note: Any,
     content_text: str,
@@ -339,30 +365,30 @@ def note_to_row(
         tag_names: Optional mapping from tag GUID to human tag name.
 
     Returns:
-        Dict formatted for dlt ingestion with keys: id, title, content, notebook_guid,
-        notebook, tags, created, updated, _deleted.
+        Dict formatted for dlt ingestion with keys: id, title, content, _deleted.
     """
     notebook_guid = getattr(note, "notebookGuid", None)
     notebook_map = notebook_names or {}
-    notebook_name = notebook_map.get(notebook_guid, notebook_guid or "")
+    notebook_name = notebook_map.get(notebook_guid) if notebook_guid else None
 
     tag_map = tag_names or {}
     tag_guids = getattr(note, "tagGuids", None) or []
-    resolved_tags = [tag_map.get(g, g or "") for g in tag_guids]
-    tags_str = ", ".join(t for t in resolved_tags if t)
+    resolved_tags = [tag_map.get(g) for g in tag_guids]
+    valid_tags = [t for t in resolved_tags if t]
+    sorted_tags = sorted(valid_tags, key=lambda s: s.casefold())
 
-    created_iso = _timestamp_to_iso(getattr(note, "created", None))
-    updated_iso = _timestamp_to_iso(getattr(note, "updated", None))
+    header_lines: list[str] = []
+    if notebook_name:
+        header_lines.append(f"Notebook: {notebook_name}")
+    if sorted_tags:
+        header_lines.append(f"Tags: {', '.join(sorted_tags)}")
+
+    full_content = "\n".join(header_lines) + "\n\n" + content_text if header_lines else content_text
 
     return {
         "id": getattr(note, "guid", None),
         "title": getattr(note, "title", "") or "",
-        "content": content_text,
-        "notebook_guid": notebook_guid,
-        "notebook": notebook_name,
-        "tags": tags_str,
-        "created": created_iso,
-        "updated": updated_iso,
+        "content": full_content,
         "_deleted": False,
     }
 

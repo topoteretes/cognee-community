@@ -329,8 +329,8 @@ def test_maps_are_rebuilt_on_full_resync():
     rows = list(_sync_records(client, state, full_resync=True))
 
     assert len(rows) == 1
-    # Note has the new renamed notebook name
-    assert rows[0]["notebook"] == "Engineering Reorganized"
+    # Note has the new renamed notebook name in content header
+    assert "Notebook: Engineering Reorganized" in rows[0]["content"]
     # State maps discarded old tag and updated notebook name
     assert state["notebooks"] == {"nb-1": "Engineering Reorganized"}
     assert state["tags"] == {}

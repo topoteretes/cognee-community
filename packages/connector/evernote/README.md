@@ -5,8 +5,9 @@ ingest Evernote notes (with notebook and tag metadata) into cognee as documents,
 incremental synchronization via sync chunks, a persisted USN cursor, and forget-on-delete.
 
 It exposes a `dlt` resource you pass to `cognee.add(...)` or `cognee.remember(...)`. Notes are
-extracted with their ENML content converted to clean plain text, scoped by notebook or tag,
-and ingested as **normal documents** flowing through cognee's document-mode pipeline.
+extracted with their ENML content converted to clean plain text (prefixed with optional
+`Notebook: <name>` and `Tags: <tags>` header lines for semantic search), scoped by notebook
+or tag, and ingested as **normal documents** flowing through cognee's document-mode pipeline.
 
 ## Install
 

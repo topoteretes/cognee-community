@@ -13,6 +13,7 @@ from evernote.edam.error.ttypes import (
     EDAMSystemException,
     EDAMUserException,
 )
+from thrift.protocol.TProtocol import TProtocolException
 from thrift.transport.TTransport import TTransportException
 
 from cognee_community_connector_evernote import (
@@ -23,7 +24,10 @@ from cognee_community_connector_evernote import (
     NoteNotFoundError,
     evernote_source,
 )
-from cognee_community_connector_evernote.evernote import EvernotePermissionError
+from cognee_community_connector_evernote.evernote import (
+    EvernotePermissionError,
+    _error_code_name,
+)
 
 
 class FakeUserStore:
@@ -136,15 +140,15 @@ def test_notestore_url_resolved_once_and_cached():
     assert user_store.calls[0] == ("getUserUrls", "my-token")
 
 
-def test_rate_limit_retry_and_success():
-    """Rate-limiting error sleeps for rateLimitDuration and retries up to success."""
+def test_rate_limit_10_once_then_success():
+    """Rate-limiting error of 10s sleeps once and succeeds on retry."""
     sleep_calls = []
     user_store = FakeUserStore()
     note_store = FakeNoteStore()
     rate_limit_error = EDAMSystemException(
         errorCode=EDAMErrorCode.RATE_LIMIT_REACHED,
         message="Too many requests",
-        rateLimitDuration=30,
+        rateLimitDuration=10,
     )
     note_store.sync_state_side_effects = [rate_limit_error, "recovered-state"]
 
@@ -158,7 +162,7 @@ def test_rate_limit_retry_and_success():
 
     state = api.get_sync_state()
     assert state == "recovered-state"
-    assert sleep_calls == [30.0]
+    assert sleep_calls == [10.0]
     assert len(note_store.calls) == 2
 
 
@@ -169,7 +173,7 @@ def test_rate_limit_gives_up_after_max_retries():
     note_store = FakeNoteStore()
     rate_limit_error = EDAMSystemException(
         errorCode=EDAMErrorCode.RATE_LIMIT_REACHED,
-        rateLimitDuration=15,
+        rateLimitDuration=5,
     )
     note_store.sync_state_side_effects = [rate_limit_error] * 5
 
@@ -181,21 +185,22 @@ def test_rate_limit_gives_up_after_max_retries():
         max_retries=2,
     )
 
-    with pytest.raises(EvernoteRateLimitError, match="Evernote rate limit reached"):
+    with pytest.raises(EvernoteRateLimitError, match="Evernote rate limit reached") as exc_info:
         api.get_sync_state()
 
     assert len(sleep_calls) == 2
-    assert sleep_calls == [15.0, 15.0]
+    assert sleep_calls == [5.0, 5.0]
+    assert exc_info.value.retry_after == 5.0
 
 
 def test_rate_limit_exceeding_max_wait_raises_without_sleeping():
-    """Rate-limiting error exceeding max_rate_limit_wait raises immediately without sleeping."""
+    """Rate-limiting error with 299s wait never sleeps and sets retry_after attribute."""
     sleep_calls = []
     user_store = FakeUserStore()
     note_store = FakeNoteStore()
     rate_limit_error = EDAMSystemException(
         errorCode=EDAMErrorCode.RATE_LIMIT_REACHED,
-        rateLimitDuration=500,
+        rateLimitDuration=299,
     )
     note_store.sync_state_side_effects = [rate_limit_error]
 
@@ -204,13 +209,42 @@ def test_rate_limit_exceeding_max_wait_raises_without_sleeping():
         user_store=user_store,
         note_store=note_store,
         sleep_fn=sleep_calls.append,
-        max_rate_limit_wait=300,
     )
 
-    with pytest.raises(EvernoteRateLimitError, match=r"500s.*exceeds maximum allowed wait.*300s"):
+    with pytest.raises(
+        EvernoteRateLimitError, match=r"299s.*exceeds maximum allowed wait.*30s"
+    ) as exc_info:
         api.get_sync_state()
 
     assert len(sleep_calls) == 0
+    assert exc_info.value.retry_after == 299.0
+
+
+def test_rate_limit_repeated_10s_limits_cap_at_total_wait():
+    """Repeated 10s rate limits sleep until total sleep would exceed 30s, then raise."""
+    sleep_calls = []
+    user_store = FakeUserStore()
+    note_store = FakeNoteStore()
+    rate_limit_error = EDAMSystemException(
+        errorCode=EDAMErrorCode.RATE_LIMIT_REACHED,
+        rateLimitDuration=10,
+    )
+    note_store.sync_state_side_effects = [rate_limit_error] * 10
+
+    api = EvernoteApi(
+        token="my-token",
+        user_store=user_store,
+        note_store=note_store,
+        sleep_fn=sleep_calls.append,
+        max_retries=10,
+    )
+
+    with pytest.raises(EvernoteRateLimitError) as exc_info:
+        api.get_sync_state()
+
+    assert sum(sleep_calls) <= 30.0
+    assert sleep_calls == [10.0, 10.0, 10.0]
+    assert exc_info.value.retry_after == 10.0
 
 
 def test_transport_timeout_is_configured():
@@ -270,6 +304,139 @@ def test_transient_transport_error_exhaustion():
 
     assert len(sleep_calls) == 2
     assert sleep_calls == [1.0, 2.0]
+
+
+def test_eof_error_retried_with_backoff_then_raises_evernote_error():
+    """EOFError is retried with backoff and raises EvernoteError when retries are exhausted."""
+    sleep_calls = []
+    user_store = FakeUserStore()
+    note_store = FakeNoteStore()
+    note_store.sync_state_side_effects = [EOFError("unexpected EOF")] * 5
+
+    api = EvernoteApi(
+        token="my-token",
+        user_store=user_store,
+        note_store=note_store,
+        sleep_fn=sleep_calls.append,
+        max_retries=2,
+    )
+
+    with pytest.raises(
+        EvernoteError, match="Evernote transport failed after 2 retries: EOFError"
+    ) as exc_info:
+        api.get_sync_state()
+
+    assert len(sleep_calls) == 2
+    assert isinstance(exc_info.value.__cause__, EOFError)
+
+
+def test_tprotocol_exception_maps_to_evernote_error_with_cause():
+    """TProtocolException raises EvernoteError with type name in message and cause chained."""
+    user_store = FakeUserStore()
+    note_store = FakeNoteStore()
+    tprot_exc = TProtocolException(message="invalid wire message")
+    note_store.sync_state_side_effects = [tprot_exc]
+
+    api = EvernoteApi(
+        token="my-token",
+        user_store=user_store,
+        note_store=note_store,
+    )
+
+    with pytest.raises(
+        EvernoteError, match="Evernote API call failed: TProtocolException"
+    ) as exc_info:
+        api.get_sync_state()
+
+    assert exc_info.value.__cause__ is tprot_exc
+
+
+def test_type_error_propagates_unchanged():
+    """TypeError from fake or transport propagates unchanged."""
+    user_store = FakeUserStore()
+    note_store = FakeNoteStore()
+    note_store.sync_state_side_effects = [TypeError("bad argument type")]
+
+    api = EvernoteApi(token="my-token", user_store=user_store, note_store=note_store)
+
+    with pytest.raises(TypeError, match="bad argument type"):
+        api.get_sync_state()
+
+
+def test_attribute_error_propagates_unchanged():
+    """AttributeError propagates unchanged."""
+    user_store = FakeUserStore()
+    note_store = FakeNoteStore()
+    note_store.sync_state_side_effects = [AttributeError("missing attribute")]
+
+    api = EvernoteApi(token="my-token", user_store=user_store, note_store=note_store)
+
+    with pytest.raises(AttributeError, match="missing attribute"):
+        api.get_sync_state()
+
+
+def test_error_code_name_helper():
+    """_error_code_name formats int codes, enum codes, and unknown codes."""
+    perm_code = int(EDAMErrorCode.PERMISSION_DENIED)
+    assert _error_code_name(EDAMErrorCode.PERMISSION_DENIED) == f"PERMISSION_DENIED ({perm_code})"
+    bad_data_code = int(EDAMErrorCode.BAD_DATA_FORMAT)
+    assert _error_code_name(bad_data_code) == f"BAD_DATA_FORMAT ({bad_data_code})"
+    assert _error_code_name(9999) == "9999"
+
+    class FakeEnumLike:
+        name = "CUSTOM_ERROR"
+
+        def __int__(self):
+            return 42
+
+    assert _error_code_name(FakeEnumLike()) == "CUSTOM_ERROR (42)"
+
+
+def test_error_code_name_in_exception_messages():
+    """_error_code_name is used across auth, permission, user, and system error messages."""
+    user_store = FakeUserStore()
+    note_store = FakeNoteStore()
+    api = EvernoteApi(token="my-token", user_store=user_store, note_store=note_store)
+
+    # Auth error
+    auth_code = int(EDAMErrorCode.INVALID_AUTH)
+    note_store.sync_state_side_effects = [EDAMUserException(errorCode=EDAMErrorCode.INVALID_AUTH)]
+    with pytest.raises(
+        EvernoteAuthError,
+        match=rf"Evernote authentication failed \(INVALID_AUTH \({auth_code}\)\)",
+    ):
+        api.get_sync_state()
+
+    # Permission denied
+    perm_code = int(EDAMErrorCode.PERMISSION_DENIED)
+    note_store.sync_state_side_effects = [
+        EDAMUserException(errorCode=EDAMErrorCode.PERMISSION_DENIED)
+    ]
+    with pytest.raises(
+        EvernotePermissionError,
+        match=rf"Evernote permission denied \(PERMISSION_DENIED \({perm_code}\)\)",
+    ):
+        api.get_sync_state()
+
+    # Generic user error
+    bad_data_code = int(EDAMErrorCode.BAD_DATA_FORMAT)
+    note_store.sync_state_side_effects = [
+        EDAMUserException(errorCode=EDAMErrorCode.BAD_DATA_FORMAT)
+    ]
+    with pytest.raises(
+        EvernoteError, match=rf"Evernote user error: BAD_DATA_FORMAT \({bad_data_code}\)"
+    ):
+        api.get_sync_state()
+
+    # System error
+    internal_code = int(EDAMErrorCode.INTERNAL_ERROR)
+    note_store.sync_state_side_effects = [
+        EDAMSystemException(errorCode=EDAMErrorCode.INTERNAL_ERROR)
+    ]
+    with pytest.raises(
+        EvernoteError, match=rf"Evernote system error: INTERNAL_ERROR \({internal_code}\)"
+    ):
+        api.get_sync_state()
 
 
 @pytest.mark.parametrize(

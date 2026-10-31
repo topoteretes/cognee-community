@@ -212,8 +212,8 @@ def test_changed_note_resolves_names_from_persisted_maps():
     rows = list(_sync_records(client, state))
 
     assert len(rows) == 1
-    assert rows[0]["notebook"] == "Persisted Notebook"
-    assert rows[0]["tags"] == "Persisted Tag"
+    assert "Notebook: Persisted Notebook" in rows[0]["content"]
+    assert "Tags: Persisted Tag" in rows[0]["content"]
 
 
 def test_multichunk_incremental_pagination_advances_cursor_to_last_chunk():

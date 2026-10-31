@@ -168,8 +168,9 @@ def test_scope_filtering_rows():
 
     assert len(active_rows) == 1
     assert active_rows[0]["id"] == "n-in"
-    assert active_rows[0]["notebook"] == "Work"
-    assert active_rows[0]["content"] == "Work project content"
+    assert "Notebook: Work" in active_rows[0]["content"]
+    assert "Tags: Projects" in active_rows[0]["content"]
+    assert "Work project content" in active_rows[0]["content"]
 
     assert len(tombstone_rows) == 1
     assert tombstone_rows[0]["id"] == "n-out"
@@ -289,7 +290,7 @@ def test_notebook_before_note_ordering_across_chunks():
 
     assert len(rows) == 1
     assert rows[0]["id"] == "n-cross"
-    assert rows[0]["notebook"] == "Late Notebook"
+    assert "Notebook: Late Notebook" in rows[0]["content"]
 
 
 def test_no_body_fetch_for_tombstoned_notes():

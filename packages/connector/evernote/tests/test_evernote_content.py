@@ -2,7 +2,13 @@
 
 from types import SimpleNamespace
 
-from cognee_community_connector_evernote.evernote import enml_to_text, note_to_row
+from evernote.edam.notestore.ttypes import SyncChunk
+
+from cognee_community_connector_evernote.evernote import (
+    _sync_records,
+    enml_to_text,
+    note_to_row,
+)
 
 
 def test_enml_headings():
@@ -111,6 +117,28 @@ def test_enml_malformed_markup_never_raises():
     assert "open tag without close" in text
 
 
+def test_enml_malformed_unclosed_comment_does_not_raise():
+    text = enml_to_text("<!-- unclosed comment <div>Visible</div>")
+    assert isinstance(text, str)
+
+
+def test_enml_malformed_unclosed_cdata_does_not_raise():
+    text = enml_to_text("<![CDATA[ unclosed cdata <div>Visible</div>")
+    assert isinstance(text, str)
+
+
+def test_enml_malformed_bogus_declaration_does_not_raise():
+    text = enml_to_text("<!BOGUS DECLARATION><div>Visible</div>")
+    assert isinstance(text, str)
+    assert "Visible" in text
+
+
+def test_enml_malformed_bad_entity_does_not_raise():
+    text = enml_to_text("<en-note><div>&bad_entity; &amp; &unknown</div></en-note>")
+    assert isinstance(text, str)
+    assert "&" in text
+
+
 def test_enml_unicode_text():
     enml = "<en-note><div>日本語のメモ 🚀 &amp; 한국어 🌟</div></en-note>"
     text = enml_to_text(enml)
@@ -138,8 +166,8 @@ def test_note_to_row_keys_and_values():
         title="My Sample Note",
         notebookGuid="nb-guid-001",
         tagGuids=["tag-01", "tag-02"],
-        created=1609459200000,  # 2021-01-01 00:00:00 UTC
-        updated=1612137600000,  # 2021-02-01 00:00:00 UTC
+        created=1609459200000,
+        updated=1612137600000,
     )
     notebook_names = {"nb-guid-001": "Work Notebook"}
     tag_names = {"tag-01": "Productivity", "tag-02": "Cognee"}
@@ -155,83 +183,135 @@ def test_note_to_row_keys_and_values():
         "id",
         "title",
         "content",
-        "notebook_guid",
-        "notebook",
-        "tags",
-        "created",
-        "updated",
         "_deleted",
     }
     assert set(row.keys()) == expected_keys
     assert row["id"] == "note-guid-001"
     assert row["title"] == "My Sample Note"
-    assert row["content"] == "Sample note plain text"
-    assert row["notebook_guid"] == "nb-guid-001"
-    assert row["notebook"] == "Work Notebook"
+    assert (
+        row["content"]
+        == "Notebook: Work Notebook\nTags: Cognee, Productivity\n\nSample note plain text"
+    )
     assert row["_deleted"] is False
 
 
-def test_note_to_row_tags_is_comma_separated_string():
+def test_note_to_row_no_notebook_line_when_unknown():
     note = SimpleNamespace(
         guid="note-002",
-        title="Tags Test",
-        notebookGuid="nb-001",
-        tagGuids=["tag-a", "tag-b"],
-        created=1609459200000,
-        updated=1609459200000,
+        title="No Notebook Test",
+        notebookGuid="unknown-nb-guid",
+        tagGuids=["tag-01"],
     )
-    tag_names = {"tag-a": "Important", "tag-b": "Follow-Up"}
+    row = note_to_row(
+        note=note,
+        content_text="Body content",
+        notebook_names={},
+        tag_names={"tag-01": "TagOne"},
+    )
+    assert row["content"] == "Tags: TagOne\n\nBody content"
+    assert "Notebook:" not in row["content"]
 
-    row = note_to_row(note=note, content_text="", notebook_names={}, tag_names=tag_names)
-    assert isinstance(row["tags"], str)
-    assert not isinstance(row["tags"], list)
-    assert row["tags"] == "Important, Follow-Up"
 
-
-def test_note_to_row_created_updated_iso_utc():
+def test_note_to_row_no_tags_line_when_empty_or_unknown():
     note = SimpleNamespace(
         guid="note-003",
-        title="Time Test",
-        notebookGuid=None,
-        tagGuids=None,
-        created=1609459200000,  # 2021-01-01T00:00:00+00:00
-        updated=1640995200000,  # 2022-01-01T00:00:00+00:00
+        title="No Tags Test",
+        notebookGuid="nb-01",
+        tagGuids=["unknown-tag"],
     )
-    row = note_to_row(note=note, content_text="", notebook_names=None, tag_names=None)
-    assert row["created"] == "2021-01-01T00:00:00+00:00"
-    assert row["updated"] == "2022-01-01T00:00:00+00:00"
+    row = note_to_row(
+        note=note,
+        content_text="Body content",
+        notebook_names={"nb-01": "Personal"},
+        tag_names={},
+    )
+    assert row["content"] == "Notebook: Personal\n\nBody content"
+    assert "Tags:" not in row["content"]
 
 
-def test_note_to_row_degrades_unknown_guids():
+def test_note_to_row_neither_header_has_no_leading_blank_line():
     note = SimpleNamespace(
         guid="note-004",
-        title="Unknown GUIDs Test",
-        notebookGuid="unknown-nb-guid",
-        tagGuids=["unknown-tag-guid"],
-        created=None,
-        updated=None,
+        title="Plain Body Test",
+        notebookGuid=None,
+        tagGuids=[],
     )
-    row = note_to_row(note=note, content_text="", notebook_names={}, tag_names={})
-    # Unknown notebook GUID degrades to the GUID
-    assert row["notebook"] == "unknown-nb-guid"
-    # Unknown tag GUID degrades to the GUID
-    assert row["tags"] == "unknown-tag-guid"
-    assert row["created"] is None
-    assert row["updated"] is None
+    row = note_to_row(
+        note=note,
+        content_text="Just the body text",
+        notebook_names=None,
+        tag_names=None,
+    )
+    assert row["content"] == "Just the body text"
+    assert not row["content"].startswith("\n")
 
 
-def test_note_to_row_degrades_empty_guids_to_empty_string():
+def test_note_to_row_tags_sorted_case_insensitively():
     note = SimpleNamespace(
         guid="note-005",
-        title="Missing GUIDs Test",
+        title="Sorted Tags Test",
         notebookGuid=None,
-        tagGuids=None,
-        created=None,
-        updated=None,
+        tagGuids=["t1", "t2", "t3"],
     )
-    row = note_to_row(note=note, content_text="", notebook_names=None, tag_names=None)
-    assert row["notebook"] == ""
-    assert row["tags"] == ""
+    tag_names = {"t1": "zebra", "t2": "Apple", "t3": "banana"}
+    row = note_to_row(
+        note=note,
+        content_text="Body",
+        notebook_names=None,
+        tag_names=tag_names,
+    )
+    assert row["content"] == "Tags: Apple, banana, zebra\n\nBody"
+
+
+def test_tag_only_edit_changes_content():
+    note1 = SimpleNamespace(guid="n1", title="Title", notebookGuid=None, tagGuids=["t1"])
+    note2 = SimpleNamespace(guid="n1", title="Title", notebookGuid=None, tagGuids=["t2"])
+    tag_names = {"t1": "TagA", "t2": "TagB"}
+
+    row1 = note_to_row(note1, "Body text", notebook_names=None, tag_names=tag_names)
+    row2 = note_to_row(note2, "Body text", notebook_names=None, tag_names=tag_names)
+
+    assert row1["content"] != row2["content"]
+    assert "Tags: TagA" in row1["content"]
+    assert "Tags: TagB" in row2["content"]
+
+
+def test_empty_body_still_tombstones_even_with_notebook_and_tags():
+    class FakeEmptyBodyClient:
+        def get_user_id(self):
+            return 12345
+
+        def get_sync_state(self):
+            return SimpleNamespace(currentTime=1000, updateCount=10, fullSyncBefore=0)
+
+        def get_filtered_sync_chunk(self, after_usn, max_entries, filter_obj):
+            note = SimpleNamespace(
+                guid="empty-note",
+                title="",
+                notebookGuid="nb-1",
+                tagGuids=["tag-1"],
+                active=True,
+            )
+            nb = SimpleNamespace(guid="nb-1", name="Work")
+            tag = SimpleNamespace(guid="tag-1", name="Urgent")
+            chunk = SyncChunk(
+                chunkHighUSN=10,
+                updateCount=10,
+                notebooks=[nb],
+                tags=[tag],
+                notes=[note],
+            )
+            return chunk
+
+        def get_note_content(self, guid):
+            return "<en-note></en-note>"
+
+    client = FakeEmptyBodyClient()
+    state = {}
+    rows = list(_sync_records(client, state))
+    tombstones = [r for r in rows if r.get("_deleted")]
+    assert len(tombstones) == 1
+    assert tombstones[0]["id"] == "empty-note"
 
 
 def test_note_to_row_does_not_invent_url():
