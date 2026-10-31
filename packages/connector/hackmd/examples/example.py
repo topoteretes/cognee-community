@@ -45,6 +45,8 @@ async def main() -> None:
     source = hackmd_source(
         token=os.environ["HACKMD_API_TOKEN"],
         team_paths=[team] if team else None,
+        # Required with personal notes: it names this sync's state and cleanup.
+        resource_name="hackmd_example",
     )
 
     print("Syncing HackMD into cognee ...")

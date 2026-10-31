@@ -39,7 +39,11 @@ import cognee
 from cognee_community_connector_hackmd import hackmd_source
 
 await cognee.remember(
-    hackmd_source(token=os.environ["HACKMD_API_TOKEN"], team_paths=["my-team"]),
+    hackmd_source(
+        token=os.environ["HACKMD_API_TOKEN"],
+        team_paths=["my-team"],
+        resource_name="hackmd_notes",  # required with personal notes (the default)
+    ),
     dataset_name="hackmd",
     primary_key="id",
     write_disposition="merge",  # REQUIRED, the add pipeline defaults to "replace"
@@ -62,7 +66,7 @@ Run the same call again to sync only what changed. See `examples/example.py`.
 | `folders` | none | Only notes inside a folder with one of these names, at any depth (`folders=["RFCs"]` also takes `RFCs / 2026`). |
 | `base_url` | `https://api.hackmd.io/v1` | API address. |
 | `max_requests` | `100` | Request budget of one run, one HackMD rate-limit window. A bigger workspace finishes over several runs. |
-| `resource_name` | derived | Staging table, which scopes this sync's state and cleanup: lowercase letters, digits and underscores, up to 64. Derived from the workspaces (`hackmd_me`, `hackmd_me_my_team`, ...), plus a short hash of the filters when `tags` or `folders` is set, so two filtered syncs into one dataset never delete each other's notes. |
+| `resource_name` | derived | Staging table, which scopes this sync's state and cleanup: lowercase letters, digits and underscores, up to 64. **Required** when `personal` is on, since the token's account is not known up front and two accounts sharing one name would delete each other's notes. A team-only sync derives it from the team paths (`hackmd_my_team`, ...), plus a short hash of the filters when `tags` or `folders` is set, so two filtered syncs into one dataset never delete each other's notes. Keep the same explicit name when you change the selection in place: a different name is a different sync, which leaves the old one's notes where they are. |
 
 Selecting nothing (`personal=False` and no `team_paths`) raises, rather than reading as
 "every note was deleted".
@@ -111,14 +115,17 @@ finishes over several months, or on Prime.
   workspaces is forgotten in one and added in the other.
 - **Access removed is not deletion.** A team that answers 403 or 404 (the token lost
   access, or left the team) and a note that answers 403 are left unchanged and counted in
-  `unreadable`. A listing that comes back empty while notes were synced before forgets
-  nothing until the next run confirms it, and a listing that is not a list raises.
+  `unreadable`. A listed note that answers 404 is left unchanged and counted in `gone`;
+  the next listing forgets it once it is no longer listed. A listing that comes back empty
+  while notes were synced before forgets nothing until the next run confirms it, a
+  listing with an entry that has no id processes the other notes but forgets nothing, and
+  a listing that is not a list raises.
 - **A run is bounded.** A used-up quota (HTTP 429 `quota_exceeded`) stops the run at once
   with `failed` and `failed_quota`, since a retry would only use more of it. Other 429s
   and 5xx are retried, honoring `Retry-After`; a `Retry-After` over 60 seconds, a 429
   that outlasts the retries, or more than five minutes of retry waits stops the run with
-  `failed` and `failed_rate_limit`. A spent `max_requests` budget is a planned pause and
-  sets only `failed_budget`. A token rejected after the run's first request stops it
+  `failed` and `failed_rate_limit`. A spent `max_requests` budget stops it with `failed`
+  and `failed_budget`, since the sync is incomplete. A token rejected after the run's first request stops it
   with `failed` and `failed_auth`; a token rejected on the first request raises. In every
   stop the finished notes are kept and the next run starts after the last one, and any
   other error raises so dlt keeps the previous state.

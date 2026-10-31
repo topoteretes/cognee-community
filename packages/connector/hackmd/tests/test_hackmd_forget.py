@@ -94,7 +94,7 @@ async def clean_environment(tmp_path, monkeypatch):
 
 async def _sync(hackmd):
     await cognee.remember(
-        hackmd_source(client=hackmd),
+        hackmd_source(client=hackmd, resource_name="hackmd_notes"),
         dataset_name=DATASET,
         primary_key="id",
         write_disposition="merge",

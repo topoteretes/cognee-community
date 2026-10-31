@@ -28,7 +28,9 @@ Design
 * **Forget-on-delete.** A note missing from its workspace listing (deleted,
   moved out, no longer shared), filtered out, or in a workspace that is no longer
   selected is emitted as a hard-delete tombstone. A 403 or 404 on a team (access
-  removed) is never read as deletion: that team is left as it is.
+  removed) is never read as deletion: that team is left as it is. A listed note
+  that answers 404, and a listing with an entry that has no id, forget nothing;
+  the next complete listing decides.
 * **A run is bounded.** HackMD counts every request against a monthly quota
   (400 on the free plan, per workspace). A used-up quota, a long rate limit, a
   spent retry wait budget or a spent request budget stops the run cleanly, keeps
@@ -360,8 +362,9 @@ class _Walker:
             yield {"id": _row_id(workspace, note_id), "_deleted": True}
 
     # -- the listings ------------------------------------------------------
-    def _list(self, workspace: str) -> list[dict] | None:
-        """The workspace's wanted notes, or ``None`` when its team cannot be read."""
+    def _list(self, workspace: str) -> tuple[list[dict], bool] | None:
+        """The workspace's wanted notes and whether the listing was complete, or
+        ``None`` when its team cannot be read."""
         try:
             listing = self._call(_notes_path(workspace))
         except HackMDAPIError as exc:
@@ -379,17 +382,22 @@ class _Walker:
         if not isinstance(listing, list):
             raise HackMDAPIError("HackMD answered a note listing that is not a list")
         notes = []
+        complete = True
         for note in listing:
             if not isinstance(note, dict) or not isinstance(note.get("id"), str):
+                # A note without an id cannot be told apart from a known one, so this
+                # listing is not complete enough to decide what is missing.
                 self.stats["skipped"] += 1
+                complete = False
                 continue
             self.stats["scanned"] += 1
             if _wanted(note, self.config):
                 notes.append(note)
         if not listing and self.known.get(workspace, {}).get("notes"):
-            return self._confirm_empty(workspace)
+            empty = self._confirm_empty(workspace)
+            return None if empty is None else (empty, True)
         self.state.get("empty", {}).pop(workspace, None)
-        return notes
+        return notes, complete
 
     def _confirm_empty(self, workspace: str) -> list[dict] | None:
         """An empty listing of a workspace that had notes is confirmed by the next run."""
@@ -413,13 +421,21 @@ class _Walker:
             del self.known[workspace]
         changed: list[tuple[str, dict]] = []
         for workspace in selected:
-            notes = self._list(workspace)
-            if notes is None:
+            listing = self._list(workspace)
+            if listing is None:
                 continue
+            notes, complete = listing
             known = self.known.setdefault(workspace, {}).setdefault("notes", {})
             listed = {note["id"]: note for note in notes}
-            # Decided from the listing, so a run cut short later still forgets them.
-            yield from self._forget(workspace, [n for n in known if n not in listed])
+            # Decided from the listing, so a run cut short later still forgets them; a
+            # listing with unidentifiable items forgets nothing.
+            if complete:
+                yield from self._forget(workspace, [n for n in known if n not in listed])
+            else:
+                logger.warning(
+                    "HackMD listed notes without an id in %s; nothing is forgotten from it.",
+                    workspace,
+                )
             for note_id, note in listed.items():
                 entry = known.get(note_id)
                 if (
@@ -453,10 +469,10 @@ class _Walker:
             body = self._call(path)
         except HackMDAPIError as exc:
             if exc.status == _DELETED:
-                # Deleted between the listing and this read.
+                # Deleted after the listing, or hidden: either way the next complete
+                # listing decides, so a note it still lists is never forgotten here.
+                logger.warning("HackMD: note %s answered 404, left unchanged.", note_id)
                 self.stats["gone"] += 1
-                if note_id in self.known[workspace]["notes"]:
-                    yield from self._forget(workspace, [note_id])
                 return
             if exc.status != _FORBIDDEN:
                 raise
@@ -496,9 +512,8 @@ def _iter_rows(
     try:
         yield from _Walker(client, config, state, stats, check_active).rows()
     except _CutShortError as cut:
-        # A spent budget is a planned pause, not a failure; failed_budget says why.
-        if cut.reason != "budget":
-            stats["failed"] = 1
+        # Every cut leaves the sync incomplete, so failed is set; failed_<reason> says why.
+        stats["failed"] = 1
         stats[f"failed_{cut.reason}"] = 1
         logger.warning("HackMD sync stopped early (%s); it resumes on the next run.", cut.reason)
         return
@@ -516,14 +531,21 @@ def _iter_rows(
 def _slug(value: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
     if slug != value:
-        # Team paths are case sensitive, so the raw value keeps them apart.
-        slug += "_" + hashlib.sha256(value.encode()).hexdigest()[:8]
+        # Team paths are case sensitive, so the raw value keeps them apart. A path with
+        # no ASCII letter or digit keeps only the hash.
+        digest = hashlib.sha256(value.encode()).hexdigest()[:8]
+        slug = f"{slug}_{digest}" if slug else digest
     return slug
 
 
 def _default_resource_name(config: _HackMDConfig) -> str:
-    parts = (["me"] if config.personal else []) + [_slug(p) for p in config.team_paths]
-    name = "hackmd_" + "_".join(parts)
+    if config.personal:
+        raise ValueError(
+            "Pass a resource_name when syncing personal notes: the token's account is not "
+            "known up front, and two accounts sharing one name would delete each other's "
+            "notes."
+        )
+    name = "hackmd_" + "_".join(_slug(p) for p in config.team_paths)
     if config.tags or config.folders:
         # Two filtered syncs into one dataset must not share state and cleanup.
         filters = _digest([sorted(config.tags), sorted(config.folders)])[:8]
@@ -570,10 +592,11 @@ def hackmd_source(
         base_url: API base URL, default ``https://api.hackmd.io/v1``.
         max_requests: Request budget of one run, checked once a note is finished.
             A bigger workspace finishes over several runs; a spent budget sets
-            ``failed_budget`` but not ``failed``.
+            ``failed`` and ``failed_budget``.
         resource_name: Staging table name, which scopes this sync's state and
-            cleanup: lowercase letters, digits and underscores, up to 64. Defaults
-            to one derived from the workspaces and filters.
+            cleanup: lowercase letters, digits and underscores, up to 64, that dlt
+            keeps as they are. Required when ``personal`` is on; a team-only sync
+            derives one from the team paths and filters.
         check_active: Optional host authorization checkpoint, called before each
             request, during retry waits and around each row.
         service: Pre-built client (see :class:`HackMDClient`). Mainly an injection
@@ -584,6 +607,7 @@ def hackmd_source(
         ``write_disposition="merge"`` and a ``_deleted`` hard-delete column.
     """
     import dlt
+    from dlt.common.normalizers.naming.snake_case import NamingConvention
 
     paths = _names(team_paths, "team paths")
     for path in paths:
@@ -598,9 +622,13 @@ def hackmd_source(
         folders=_names(folders, "folders"),
         max_requests=int(max_requests),
     )
-    if resource_name is not None and not _RESOURCE_NAME.fullmatch(resource_name):
+    if resource_name is not None and (
+        not _RESOURCE_NAME.fullmatch(resource_name)
+        or NamingConvention().normalize_table_identifier(resource_name) != resource_name
+    ):
         raise ValueError(
-            "resource_name must be lowercase letters, digits and underscores, up to 64 characters"
+            "resource_name must be lowercase letters, digits and underscores, up to 64 "
+            "characters, that dlt keeps as they are"
         )
     name = resource_name or _default_resource_name(config)
     service = service or client

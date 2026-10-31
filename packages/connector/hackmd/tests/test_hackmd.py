@@ -450,15 +450,32 @@ def test_malformed_listing_items_are_skipped(hackmd):
     assert _ids(rows) == [_personal_id(a)] and stats["skipped"] == 2
 
 
-def test_a_note_deleted_after_the_listing_is_forgotten(hackmd):
+def test_malformed_listing_forgets_no_known_note(hackmd):
     a = hackmd.add_note("A", "a")
+    b = hackmd.add_note("B", "b")
+    state = {}
+    _run(hackmd, state, team_paths=())
+    # b is still there, but the listing carries an item without an id in its place.
+    hackmd.listing_body = [*hackmd._listing({a["id"]: a}), {"title": "B", "id": None}]
+    stats = {}
+    assert _gone(_run(hackmd, state, stats, team_paths=())) == []
+    assert b["id"] in state["workspaces"]["me"]["notes"] and stats["skipped"] == 1
+
+
+def test_a_note_deleted_after_the_listing_is_forgotten_by_the_next_listing(hackmd):
+    a = hackmd.add_note("A", "a")
+    hackmd.add_note("B", "b")  # keeps the listing non-empty once a is gone
     state = {}
     _run(hackmd, state, team_paths=())
     hackmd.edit(a, "new")
     hackmd.errors[f"/notes/{a['id']}"] = 404
     stats = {}
-    rows = _run(hackmd, state, stats, team_paths=())
-    assert _gone(rows) == [_personal_id(a)] and stats["gone"] == 1
+    # Still listed, so it is kept; the 404 alone never forgets a note.
+    assert _run(hackmd, state, stats, team_paths=()) == [] and stats["gone"] == 1
+    assert a["id"] in state["workspaces"]["me"]["notes"]
+
+    del hackmd.personal[a["id"]]
+    assert _gone(_run(hackmd, state, team_paths=())) == [_personal_id(a)]
 
 
 def test_a_new_note_deleted_after_the_listing_emits_nothing(hackmd):
@@ -541,14 +558,15 @@ def test_a_token_revoked_during_the_run_keeps_what_is_done(hackmd):
     assert notes[0]["id"] in state["workspaces"]["me"]["notes"]
 
 
-def test_budget_pauses_without_failing_and_resumes(hackmd):
+def test_budget_pauses_and_resumes(hackmd):
     notes = [hackmd.add_note(f"N{i}", f"text {i}") for i in range(5)]
     state = {}
     seen = []
     for _ in range(10):
         stats = {}
         seen += _live(_run(hackmd, state, stats, team_paths=(), max_requests=3))
-        assert stats["failed"] == 0
+        # A cut run is incomplete, so failed is set with the budget as the reason.
+        assert stats["failed"] == stats["failed_budget"]
         if not stats["failed_budget"]:
             break
     assert sorted(seen) == sorted(_personal_id(n) for n in notes)
@@ -608,19 +626,32 @@ def test_default_resource_names_follow_the_scope():
     def name(**kwargs):
         return getattr(hackmd_source(service=FakeHackMD(), **kwargs), dlt_utils.PIPELINE_SCOPE_ATTR)
 
-    assert name() == "hackmd_me"
-    assert name(team_paths=["eng"]) == "hackmd_me_eng"
-    assert name(personal=False, team_paths=["eng"]) == "hackmd_eng"
+    # Personal notes have no account identity up front, so two accounts in one
+    # dataset would share a constant name.
+    for kwargs in ({}, {"team_paths": ["eng"]}, {"tags": ["rfc"]}):
+        with pytest.raises(ValueError, match="Pass a resource_name"):
+            name(**kwargs)
+    assert name(resource_name="hackmd_mine") == "hackmd_mine"
+    team = {"personal": False}
+    assert name(team_paths=["eng"], **team) == "hackmd_eng"
     # Case keeps team paths apart.
-    assert name(team_paths=["Eng"]) != name(team_paths=["eng"])
+    assert name(team_paths=["Eng"], **team) != name(team_paths=["eng"], **team)
     # Filters scope their own state, so two filtered syncs never share cleanup.
-    assert name(tags=["rfc"]) != name(tags=["meeting"]) != name()
-    assert len(name(team_paths=["t" * 80])) <= 64
+    rfc = name(team_paths=["eng"], tags=["rfc"], **team)
+    assert (
+        rfc
+        != name(team_paths=["eng"], tags=["meeting"], **team)
+        != name(team_paths=["eng"], **team)
+    )
+    assert len(name(team_paths=["t" * 80], **team)) <= 64
+    for path in ["\u65e5\u672c", "---"]:
+        derived = name(team_paths=[path], **team)
+        assert derived.startswith("hackmd_") and "__" not in derived
 
 
 def test_resource_name_is_validated():
     fake = FakeHackMD()
-    for bad in ["", "  ", "Hackmd", "hack-md", "a" * 65]:
+    for bad in ["", "  ", "Hackmd", "hack-md", "a" * 65, "1hackmd"]:
         with pytest.raises(ValueError, match="resource_name"):
             hackmd_source(service=fake, resource_name=bad)
     assert hackmd_source(service=fake, resource_name="hackmd_rfcs").name == "hackmd_rfcs"
@@ -640,13 +671,13 @@ def test_selection_is_validated():
 def test_a_token_is_required_and_checked_up_front(monkeypatch):
     monkeypatch.setenv("HACKMD_API_TOKEN", "from-env")
     with pytest.raises(ValueError, match="token is required"):
-        hackmd_source()
+        hackmd_source(resource_name="hackmd_mine")
     with pytest.raises(ValueError, match="invalid format"):
-        hackmd_source(token="has space")
+        hackmd_source(token="has space", resource_name="hackmd_mine")
 
 
 def test_resource_carries_the_document_contract():
-    resource = hackmd_source(service=FakeHackMD(), team_paths=["eng"])
+    resource = hackmd_source(service=FakeHackMD(), personal=False, team_paths=["eng"])
     assert getattr(resource, dlt_utils.DOCUMENT_SOURCE_ATTR) == "hackmd"
     assert getattr(resource, dlt_utils.PIPELINE_SCOPE_ATTR) == resource.name
     assert resource.cognee_sync_stats == {}
@@ -655,7 +686,7 @@ def test_resource_carries_the_document_contract():
 def test_client_is_an_alias_of_service():
     fake = FakeHackMD()
     fake.add_note("A", "a")
-    resource = hackmd_source(client=fake)
+    resource = hackmd_source(client=fake, resource_name="hackmd_mine")
     rows = list(resource)
     assert [r["title"] for r in rows] == ["A"]
 
@@ -675,8 +706,8 @@ def test_an_owned_client_is_closed_after_the_run(monkeypatch):
             self.closed = True
 
     monkeypatch.setattr(hackmd_module, "HackMDClient", Recording)
-    list(hackmd_source(token=TOKEN))
-    list(hackmd_source(token=TOKEN))
+    list(hackmd_source(token=TOKEN, resource_name="hackmd_mine"))
+    list(hackmd_source(token=TOKEN, resource_name="hackmd_mine"))
     assert len(built) == 2 and all(c.closed for c in built)
 
 
@@ -736,15 +767,14 @@ def test_two_sources_in_one_dataset_leave_each_other_alone(dlt_mod, tmp_path, ha
     rfc = hackmd.add_note("RFC", "r", tags=["rfc"])
     meeting = hackmd.add_note("Sync", "s", tags=["meeting"])
     pipeline = _pipeline(dlt_mod, tmp_path)
-    rfcs = hackmd_source(service=hackmd, tags=["rfc"])
-    meetings = hackmd_source(service=hackmd, tags=["meeting"])
-    assert rfcs.name != meetings.name
+    rfcs = hackmd_source(service=hackmd, tags=["rfc"], resource_name="hackmd_rfcs")
+    meetings = hackmd_source(service=hackmd, tags=["meeting"], resource_name="hackmd_meetings")
     pipeline.run(rfcs)
     pipeline.run(meetings)
 
     del hackmd.personal[rfc["id"]]
-    pipeline.run(hackmd_source(service=hackmd, tags=["rfc"]))
-    pipeline.run(hackmd_source(service=hackmd, tags=["meeting"]))
+    pipeline.run(hackmd_source(service=hackmd, tags=["rfc"], resource_name="hackmd_rfcs"))
+    pipeline.run(hackmd_source(service=hackmd, tags=["meeting"], resource_name="hackmd_meetings"))
     assert _staged(pipeline, rfcs.name) == set()
     assert _staged(pipeline, meetings.name) == {_personal_id(meeting)}
 
@@ -770,6 +800,6 @@ def test_failed_run_keeps_staging_and_state(dlt_mod, tmp_path, hackmd):
 
 def test_stats_are_plain_json(hackmd):
     hackmd.add_note("A", "a")
-    resource = hackmd_source(service=hackmd)
+    resource = hackmd_source(service=hackmd, resource_name="hackmd_mine")
     list(resource)
     assert json.loads(json.dumps(resource.cognee_sync_stats))["emitted"] == 1
