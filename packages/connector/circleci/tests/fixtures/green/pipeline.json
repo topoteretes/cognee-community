@@ -1,0 +1,31 @@
+{
+  "id": "1b70b7ee-4034-4f6c-924c-0f16bf30d03b",
+  "errors": [],
+  "project_slug": "gh/rokadepiyush49-rgb/cognee-circleci-fixture",
+  "updated_at": "2026-10-07T21:33:09.507Z",
+  "number": 2,
+  "state": "created",
+  "created_at": "2026-10-07T21:33:09.382Z",
+  "warnings": [],
+  "trigger": {
+    "received_at": "2026-10-07T21:33:09.130Z",
+    "type": "webhook",
+    "actor": {
+      "login": "rokadepiyush49-rgb",
+      "avatar_url": "https://avatars.githubusercontent.com/u/236336623?v=4"
+    }
+  },
+  "vcs": {
+    "origin_repository_url": "https://github.com/rokadepiyush49-rgb/cognee-circleci-fixture",
+    "target_repository_url": "https://github.com/rokadepiyush49-rgb/cognee-circleci-fixture",
+    "review_url": "",
+    "revision": "c93b3648479c74130330f8d51816623980dc037d",
+    "review_id": "",
+    "provider_name": "GitHub",
+    "commit": {
+      "body": "",
+      "subject": "trigger green"
+    },
+    "branch": "green"
+  }
+}
