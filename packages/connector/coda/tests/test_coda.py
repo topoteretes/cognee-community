@@ -322,8 +322,9 @@ def test_table_that_answers_403_is_kept(doc):
     state = {}
     _run(doc, state)
     doc.errors[f"/docs/{DOC}/tables/grid-1"] = 403
-    assert _run(doc, state) == []
-    assert "grid-1" in state["docs"][DOC]["tables"]
+    stats = {}
+    assert _run(doc, state, stats=stats) == []
+    assert "grid-1" in state["docs"][DOC]["tables"] and stats["unreadable"] == 1
 
 
 def test_new_table_that_answers_403_is_skipped(doc):
@@ -356,10 +357,29 @@ def test_deleted_page_and_table_are_forgotten(doc):
     _run(doc, state)
     doc.pages[DOC] = [p for p in doc.pages[DOC] if p["id"] != "canvas-1"]
     doc.tables[DOC].clear()
-    assert _run(doc, state) == [
-        {"id": f"page:{DOC}:canvas-1", "_deleted": True},
-        {"id": f"table:{DOC}:grid-1", "_deleted": True},
-    ]
+    # The page goes at once; an empty table listing is confirmed by the next run.
+    assert _run(doc, state) == [{"id": f"page:{DOC}:canvas-1", "_deleted": True}]
+    assert state["docs"][DOC]["tables"]
+    assert _run(doc, state) == [{"id": f"table:{DOC}:grid-1", "_deleted": True}]
+
+
+def test_table_listing_that_comes_back_is_not_forgotten(doc):
+    state = {}
+    _run(doc, state)
+    saved = list(doc.tables[DOC])
+    doc.tables[DOC].clear()
+    assert _run(doc, state) == []
+    doc.tables[DOC][:] = saved
+    assert _run(doc, state) == []
+    doc.tables[DOC].clear()
+    assert _run(doc, state) == []  # a fresh empty answer starts a new confirmation
+
+
+def test_deselected_tables_are_forgotten_at_once(doc):
+    state = {}
+    _run(doc, state)
+    rows = _run(doc, state, include_tables=False)
+    assert rows == [{"id": f"table:{DOC}:grid-1", "_deleted": True}]
 
 
 def test_page_deleted_during_the_sync_forgets_only_that_page(doc):
@@ -406,8 +426,9 @@ def test_page_whose_access_was_removed_is_kept(doc):
     _run(doc, state)
     doc.touch(doc.pages[DOC][0])
     doc.export_errors["canvas-1"] = 403
-    assert _run(doc, state) == []
-    assert "canvas-1" in state["docs"][DOC]["pages"]
+    stats = {}
+    assert _run(doc, state, stats=stats) == []
+    assert "canvas-1" in state["docs"][DOC]["pages"] and stats["unreadable"] == 1
 
 
 def test_selected_doc_that_was_never_readable_raises(coda):
@@ -458,14 +479,15 @@ def test_rate_limit_stops_cleanly_keeping_finished_docs(doc):
     assert _ids(rows) == ["page:ZzOther1:p-other"]
 
 
-def test_budget_pauses_without_failing_and_resumes(doc):
+def test_budget_pauses_and_resumes(doc):
     doc.add_doc("ZzOther1", "Other")
     doc.add_page("p-other", "Notes", "text", doc_id="ZzOther1")
     state = {}
     stats = {}
     rows = _run(doc, state, stats=stats, doc_ids=(DOC, "ZzOther1"), max_requests=1)
     assert _ids(rows) == [f"page:{DOC}:canvas-1", f"table:{DOC}:grid-1"]
-    assert stats["failed_budget"] == 1 and stats["failed"] == 0
+    # A cut run is incomplete, so failed is set with the budget as the reason.
+    assert stats["failed_budget"] == 1 and stats["failed"] == 1
     rows = _run(doc, state, doc_ids=(DOC, "ZzOther1"), max_requests=1)
     assert _ids(rows) == ["page:ZzOther1:p-other"]
 
@@ -506,11 +528,63 @@ def test_check_active_runs_before_every_request(doc):
 def test_doc_deleted_during_the_sync_is_forgotten(doc):
     state = {}
     _run(doc, state)
-    doc.errors[f"/docs/{DOC}/pages"] = 404  # found, then gone before its pages are read
+    real_get = doc.get
+    doc_calls = []
+
+    def gone_after_it_was_found(path, params=None):
+        # Found by the doc lookup, then gone: its pages and the doc both answer 404.
+        if path == f"/docs/{DOC}":
+            doc_calls.append(path)
+            if len(doc_calls) > 1:
+                raise CodaAPIError("Coda request failed: HTTP 404", status=404)
+        if path == f"/docs/{DOC}/pages":
+            raise CodaAPIError("Coda request failed: HTTP 404", status=404)
+        return real_get(path, params)
+
+    doc.get = gone_after_it_was_found
     stats = {}
     rows = _run(doc, state, stats=stats)
     assert _ids(rows) == [f"page:{DOC}:canvas-1", f"table:{DOC}:grid-1"]
+    assert all(row["_deleted"] for row in rows)
     assert stats["gone"] == 1 and state["docs"] == {}
+
+
+def test_cut_inside_a_doc_keeps_its_finished_pages(doc):
+    doc.add_page("canvas-2", "Notes", "second")
+    real_export = doc.export_markdown
+    limited = {"canvas-2"}
+
+    def export(doc_id, page_id):
+        if page_id in limited:
+            raise CodaRateLimitedError("Coda rate limit exceeded (HTTP 429)")
+        return real_export(doc_id, page_id)
+
+    doc.export_markdown = export
+    state, stats = {}, {}
+    rows = _run(doc, state, stats=stats)
+    # The first page is kept with its row; the doc is read again from the rest.
+    assert _ids(rows) == [f"page:{DOC}:canvas-1"]
+    assert stats["failed"] == 1 and stats["failed_rate_limit"] == 1
+    assert set(state["docs"][DOC]["pages"]) == {"canvas-1"}
+    assert "name" not in state["docs"][DOC]
+
+    limited.clear()
+    doc.exports.clear()
+    rows = _run(doc, state)
+    assert doc.exports == ["canvas-1", "canvas-2"]  # the doc name is new to the state
+    assert f"page:{DOC}:canvas-2" in _ids(rows) and f"table:{DOC}:grid-1" in _ids(rows)
+    assert state["docs"][DOC]["name"] == "Launch plan"
+
+
+def test_child_404_of_a_readable_doc_forgets_nothing(doc):
+    state = {}
+    _run(doc, state)
+    doc.errors[f"/docs/{DOC}/pages"] = 404  # the doc itself still answers
+    stats = {}
+    assert _run(doc, state, stats=stats) == []
+    assert stats["gone"] == 0 and stats["unreadable"] == 1
+    assert set(state["docs"][DOC]["pages"]) == {"canvas-1"}
+    assert set(state["docs"][DOC]["tables"]) == {"grid-1"}
 
 
 def test_doc_left_out_of_the_selection_is_forgotten(doc):
@@ -571,9 +645,66 @@ def test_default_resource_name_follows_the_scope(coda):
     )
     assert upper.startswith("coda_abc123_") and upper != lower
     assert coda_source(service=coda, workspace_id="ws-1").name.startswith("coda_ws_1_")
-    assert coda_source(service=coda).name == "coda_my_docs"
+    # Two accounts syncing all their docs into one dataset would share a constant name.
+    for doc_ids in (None, [], [DOC, "other"]):
+        with pytest.raises(ValueError, match="Pass a resource_name"):
+            coda_source(doc_ids, service=coda)
+    assert coda_source(service=coda, resource_name="coda_mine").name == "coda_mine"
+
+
+@pytest.mark.parametrize("name", ["", "Coda-Team", "coda team", "c" * 65, 7])
+def test_invalid_resource_name_is_rejected(coda, name):
     with pytest.raises(ValueError, match="resource_name"):
-        coda_source([DOC, "other"], service=coda)
+        coda_source([DOC], service=coda, resource_name=name)
+
+
+def test_doc_ids_as_a_bare_string_raises(coda):
+    with pytest.raises(TypeError, match="not a string"):
+        coda_source(DOC, service=coda)
+
+
+@pytest.mark.parametrize("value", ["日本", "---", "x" * 80])
+def test_derived_resource_name_stays_valid(coda, value):
+    name = coda_source([value], service=coda).name
+    assert name.startswith("coda_") and "__" not in name and len(name) <= 64
+
+
+def test_client_checks_access_around_every_wait():
+    checks, requests = [], []
+
+    def revoke_after_the_first_check():
+        checks.append(True)
+        if len(checks) > 1:
+            raise PermissionError("access revoked")
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(503)
+
+    client = CodaClient(
+        "tok-1",
+        http=httpx.Client(transport=httpx.MockTransport(handler)),
+        sleep=lambda seconds: None,
+        check_active=revoke_after_the_first_check,
+    )
+    with pytest.raises(PermissionError):
+        client.get("/docs")
+    # Checked before the wait and again after it, so the retry never goes out.
+    assert len(requests) == 1 and len(checks) == 2
+
+
+def test_client_closes_only_the_http_client_it_made():
+    def transport():
+        return httpx.MockTransport(lambda request: httpx.Response(200, json={}))
+
+    injected = httpx.Client(transport=transport())
+    CodaClient("tok-1", http=injected).close()
+    assert not injected.is_closed
+
+    owned = CodaClient("tok-1")
+    owned._http = made = httpx.Client(transport=transport())
+    owned.close()
+    assert made.is_closed and owned._http is None
 
 
 def test_missing_token_raises_without_reading_the_environment(monkeypatch):
@@ -586,7 +717,11 @@ def test_client_is_built_with_keyword_arguments(monkeypatch):
     seen = {}
     monkeypatch.setattr(coda_module, "CodaClient", lambda **kwargs: seen.update(kwargs) or "c")
     coda_source([DOC], token="tok", base_url="https://docs.superhuman.com/apis/v1")
-    assert seen == {"token": "tok", "base_url": "https://docs.superhuman.com/apis/v1"}
+    assert seen == {
+        "token": "tok",
+        "base_url": "https://docs.superhuman.com/apis/v1",
+        "check_active": None,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -630,9 +765,36 @@ def test_pipeline_resyncs_only_changes_and_forgets_deletions(dlt_mod, tmp_path, 
     pipeline.run(source)
     assert doc.exports == [] and source.cognee_sync_stats["emitted"] == 0
 
+    # An empty table listing is confirmed by the next run before tables are forgotten.
     doc.tables[DOC].clear()
     pipeline.run(_source(doc))
+    assert _staged(pipeline) == {f"page:{DOC}:canvas-1", f"table:{DOC}:grid-1"}
+    pipeline.run(_source(doc))
     assert _staged(pipeline) == {f"page:{DOC}:canvas-1"}
+
+
+def test_owned_client_is_closed_and_stats_carry_every_key(dlt_mod, tmp_path, doc, monkeypatch):
+    closed = []
+
+    class Owned:
+        def __init__(self, **kwargs):
+            pass
+
+        def get(self, path, params=None):
+            return doc.get(path, params)
+
+        def export_markdown(self, doc_id, page_id):
+            return doc.export_markdown(doc_id, page_id)
+
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(coda_module, "CodaClient", Owned)
+    source = coda_source([DOC], token="tok")
+    _pipeline(dlt_mod, tmp_path).run(source)
+    assert closed == [True]
+    assert source.cognee_sync_stats["failed"] == 0
+    assert {"failed_rate_limit", "failed_budget"} <= set(source.cognee_sync_stats)
 
 
 def test_two_sources_in_one_dataset_leave_each_other_alone(dlt_mod, tmp_path, doc):
@@ -643,8 +805,9 @@ def test_two_sources_in_one_dataset_leave_each_other_alone(dlt_mod, tmp_path, do
     pipeline.run(_source(other, "coda_b"))
 
     doc.tables[DOC].clear()
-    pipeline.run(_source(doc, "coda_a"))
-    pipeline.run(_source(other, "coda_b"))
+    for _ in range(2):  # the second run confirms the empty table listing
+        pipeline.run(_source(doc, "coda_a"))
+        pipeline.run(_source(other, "coda_b"))
     assert _staged(pipeline, "coda_a") == {f"page:{DOC}:canvas-1"}
     assert _staged(pipeline, "coda_b") == {f"page:{DOC}:p-b"}
 
@@ -661,4 +824,5 @@ def test_failed_run_keeps_staging_and_state(dlt_mod, tmp_path, doc):
 
     doc.errors.clear()
     pipeline.run(_source(doc))
+    pipeline.run(_source(doc))  # confirms the empty table listing
     assert _staged(pipeline) == {f"page:{DOC}:canvas-1"}

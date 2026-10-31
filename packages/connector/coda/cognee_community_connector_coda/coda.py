@@ -29,12 +29,13 @@ Design
   their rows read again.
 * **Forget-on-delete.** A page or table missing from its doc's listing, a doc
   that answers 404 or 410, and a doc that leaves the listing or the selection
-  are emitted as hard-delete tombstones. A 403 (access removed) is never read as
-  deletion: that doc or page is left as it is.
+  are emitted as hard-delete tombstones; a 404 from a child listing is confirmed
+  on the doc first, and an empty table listing by the next run. A 403 (access
+  removed) is never read as deletion: that doc, page or table is left as it is.
 * **A run is bounded.** A long rate limit, a spent retry wait budget or a spent
-  request budget stops the run cleanly, keeps the docs it finished and reports
-  why in ``cognee_sync_stats``. Any other failure raises, and dlt rolls the state
-  of a failed run back.
+  request budget stops the run cleanly, keeps the docs, pages and tables it
+  finished and reports why in ``cognee_sync_stats``. Any other failure raises,
+  and dlt rolls the state of a failed run back.
 
 Privacy
 -------
@@ -86,6 +87,8 @@ _STATS = (
     "gone",
     "unreadable",
     "failed",
+    "failed_rate_limit",
+    "failed_budget",
 )
 
 
@@ -139,38 +142,57 @@ class CodaClient:
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
         max_sleep: float = DEFAULT_MAX_SLEEP,
+        check_active: Callable[[], None] | None = None,
     ):
         token = (token or "").strip()
         # Reject early and without echoing the value: httpx would put an invalid
         # header value, token included, into its exception.
         if not token or not token.isascii() or not token.isprintable() or " " in token:
             raise ValueError("The Coda API token is empty or has an invalid format")
-        import httpx
 
         self.base_url = base_url.rstrip("/")
         self._headers = {"Authorization": f"Bearer {token}"}
-        self._http = http or httpx.Client(timeout=_TIMEOUT, follow_redirects=True)
+        # An injected client belongs to the caller; one made here is closed by close().
+        self._http = http
+        self._owned = http is None
         self._sleep = sleep
         self._clock = clock
         self._max_sleep = max_sleep
         self._slept = 0.0
+        self._check_active = check_active
 
     def __repr__(self) -> str:
         return "CodaClient(token=<redacted>)"
+
+    def close(self) -> None:
+        """Close the HTTP client this object made; the next request opens a new one."""
+        if self._owned and self._http is not None:
+            self._http.close()
+            self._http = None
 
     def reset_sleep_budget(self) -> None:
         """Start a new run's retry wait budget."""
         self._slept = 0.0
 
+    def _pause(self, delay: float) -> None:
+        # The host may revoke access while a request waits, so ask before and after.
+        if self._check_active is not None:
+            self._check_active()
+        self._sleep(delay)
+        if self._check_active is not None:
+            self._check_active()
+
     def _wait(self, delay: float) -> None:
         if self._slept + delay > self._max_sleep:
             raise CodaRateLimitedError("Coda retries used up the wait budget of this run")
         self._slept += delay
-        self._sleep(delay)
+        self._pause(delay)
 
     def _send(self, method: str, url: str, headers: dict[str, str], **kwargs: Any) -> Any:
         import httpx
 
+        if self._http is None:
+            self._http = httpx.Client(timeout=_TIMEOUT, follow_redirects=True)
         attempt = 0
         while True:
             last = attempt == _RETRIES - 1
@@ -220,7 +242,7 @@ class CodaClient:
                 raise CodaAPIError("Coda page export failed")
             if self._clock() >= deadline:
                 raise CodaAPIError("Coda page export timed out")
-            self._sleep(delay)
+            self._pause(delay)
             delay = min(delay * 2, 5.0)
 
 
@@ -389,8 +411,8 @@ class _Walker:
         """Yield one doc's changed pages and tables and their tombstones, updating ``entry``."""
         doc_id = doc["id"]
         # A renamed doc changes every document's header, so everything is rendered again.
+        # The new name is stored only once the whole doc is done (see ``rows``).
         renamed = entry.get("name") != doc.get("name")
-        entry["name"] = doc.get("name")
 
         listed_pages = list(self._items(f"/docs/{doc_id}/pages"))
         # Every Coda doc has at least one page, so an empty listing is not an answer:
@@ -399,14 +421,28 @@ class _Walker:
         if keep_pages and entry.get("pages"):
             logger.warning("Coda listed no pages for doc %s; its pages are left unchanged.", doc_id)
         pages = [p for p in listed_pages if _wanted_page(p, self.config)]
-        tables = []
+        tables, keep_tables = [], False
         if self.config.include_tables:
-            listed = self._items(f"/docs/{doc_id}/tables", {"tableTypes": _TABLE_TYPES})
+            listed = list(self._items(f"/docs/{doc_id}/tables", {"tableTypes": _TABLE_TYPES}))
+            if listed or not entry.get("tables"):
+                entry.pop("empty_tables", None)
+            elif not entry.get("empty_tables"):
+                # A doc can lose all its tables, but one empty answer is confirmed by the
+                # next run before the known tables are forgotten.
+                entry["empty_tables"] = True
+                keep_tables = True
+                logger.warning(
+                    "Coda listed no tables for doc %s; they are kept until the next run "
+                    "confirms it.",
+                    doc_id,
+                )
+            else:
+                entry.pop("empty_tables")
             details = (self._table(doc_id, table, entry) for table in listed)
             tables = [table for table in details if table is not None]
 
         yield from self._sync_kind(doc, "pages", pages, entry, renamed, keep_pages)
-        yield from self._sync_kind(doc, "tables", tables, entry, renamed, False)
+        yield from self._sync_kind(doc, "tables", tables, entry, renamed, keep_tables)
 
     def _sync_kind(
         self, doc: dict, kind: str, items: list[dict], entry: dict, renamed: bool, keep: bool
@@ -427,6 +463,7 @@ class _Walker:
                 if exc.status == _FORBIDDEN:
                     # Access removed for this item only: keep what is known.
                     logger.warning("Coda: %s %s answered 403, left unchanged.", kind, item["id"])
+                    self.stats["unreadable"] += 1
                     continue
                 if exc.status not in _DELETED:
                     raise
@@ -461,6 +498,7 @@ class _Walker:
             if exc.status != _FORBIDDEN:
                 raise
         logger.warning("Coda: table %s answered 403, left unchanged.", table["id"])
+        self.stats["unreadable"] += 1
         known = (entry.get("tables") or {}).get(table["id"])
         # Access removed: a known table keeps its last version, an unknown one is skipped.
         return {**table, "updatedAt": known["updated"]} if known else None
@@ -486,25 +524,58 @@ class _Walker:
         if resume:
             order = [d for d in order if d["id"] > resume] + [d for d in order if d["id"] <= resume]
         for doc in order:
+            doc_id = doc["id"]
             # Work on a copy, so a doc that turns out to be unreadable keeps its old state.
-            entry = copy.deepcopy(self.known.get(doc["id"])) or {}
+            previous = self.known.get(doc_id) or {}
+            entry = copy.deepcopy(previous)
+            rows: list[dict] = []
             try:
-                rows = list(self._sync_doc(doc, entry))
+                # One by one, so the rows finished before a cut are still in hand.
+                for row in self._sync_doc(doc, entry):
+                    rows.append(row)
+            except _CutShortError:
+                # Keep what this doc finished, its rows and their state, so a doc too big
+                # for one run still moves forward; the rest is read again next run.
+                if entry != previous:
+                    self.known[doc_id] = entry
+                yield from rows
+                raise
             except CodaAPIError as exc:
                 if exc.status == _FORBIDDEN:
-                    self._unreadable(doc["id"])
+                    self._unreadable(doc_id)
                 elif exc.status in _DELETED:
-                    # Deleted while this run was reading it.
-                    self.stats["gone"] += 1
-                    yield from _forget(doc["id"], self.known.pop(doc["id"], {}), self.stats)
+                    yield from self._doc_gone(doc_id)
                 else:
                     raise
             else:
-                self.known[doc["id"]] = entry
+                entry["name"] = doc.get("name")
+                self.known[doc_id] = entry
                 yield from rows
-            self.state["resume"] = doc["id"]
+            self.state["resume"] = doc_id
             self.progressed = True
         self.state.pop("resume", None)
+
+    def _doc_gone(self, doc_id: str) -> Iterator[dict]:
+        """A page or table listing of the doc answered 404 or 410. The doc is forgotten
+        only when the doc itself answers so, never on a child request alone."""
+        try:
+            self._call(self.client.get, f"/docs/{doc_id}")
+        except CodaAPIError as exc:
+            if exc.status == _FORBIDDEN:
+                self._unreadable(doc_id)
+                return
+            if exc.status not in _DELETED:
+                raise
+            # Deleted while this run was reading it.
+            self.stats["gone"] += 1
+            yield from _forget(doc_id, self.known.pop(doc_id, {}), self.stats)
+            return
+        logger.warning(
+            "Coda: a listing of doc %s answered 404 while the doc is readable; it is left "
+            "unchanged.",
+            doc_id,
+        )
+        self.stats["unreadable"] += 1
 
     def _forget_unlisted(self, listed: set[str]) -> Iterator[dict]:
         """Docs that left the listing or the selection. Decided right after the doc
@@ -545,9 +616,8 @@ def _iter_rows(
     try:
         yield from _Walker(client, config, state, stats, check_active).rows()
     except _CutShortError as cut:
-        # A spent budget is a planned pause, not a failure; failed_budget says why.
-        if cut.reason != "budget":
-            stats["failed"] = 1
+        # Every cut leaves the sync incomplete, so failed is set; failed_<reason> says why.
+        stats["failed"] = 1
         stats[f"failed_{cut.reason}"] = 1
         logger.warning("Coda sync stopped early (%s); it resumes on the next run.", cut.reason)
         return
@@ -562,26 +632,54 @@ def _iter_rows(
 # ---------------------------------------------------------------------------
 # Public factory
 # ---------------------------------------------------------------------------
+# dlt table names stay readable up to this length; the merged Asana connector uses it too.
+_MAX_RESOURCE_NAME = 64
+
+
 def _slug(value: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
     if slug != value:
-        # Coda ids are case sensitive, so the raw value keeps them apart.
-        slug += "_" + hashlib.sha256(value.encode()).hexdigest()[:8]
+        # Coda ids are case sensitive, so the raw value keeps them apart. A value with
+        # no ASCII letter or digit keeps only the hash.
+        digest = hashlib.sha256(value.encode()).hexdigest()[:8]
+        slug = f"{slug}_{digest}" if slug else digest
     return slug
 
 
 def _default_resource_name(
     doc_ids: list[str] | None, workspace_id: str | None, folder_id: str | None
 ) -> str:
-    if doc_ids and len(doc_ids) > 1:
+    if (doc_ids and len(doc_ids) > 1) or not (doc_ids or workspace_id or folder_id):
         raise ValueError(
-            "Pass a resource_name when syncing several docs: it scopes this sync's state "
-            "and cleanup, and two sources sharing one would delete each other's documents."
+            "Pass a resource_name when syncing several docs or every doc of the token: "
+            "it scopes this sync's state and cleanup, and two sources sharing one would "
+            "delete each other's documents."
         )
     if doc_ids:
-        return "coda_" + _slug(doc_ids[0])
-    scope = "_".join(_slug(part) for part in (workspace_id, folder_id) if part)
-    return "coda_" + (scope or "my_docs")
+        name = "coda_" + _slug(str(doc_ids[0]))
+    else:
+        name = "coda_" + "_".join(_slug(part) for part in (workspace_id, folder_id) if part)
+    if len(name) > _MAX_RESOURCE_NAME:
+        # A long id is cut, and a hash of the whole name keeps cut names apart.
+        digest = hashlib.sha256(name.encode()).hexdigest()[:8]
+        name = name[: _MAX_RESOURCE_NAME - len(digest) - 1].rstrip("_") + "_" + digest
+    return name
+
+
+def _check_resource_name(name: Any) -> None:
+    """A non-empty name of at most 64 characters that dlt keeps as it is.
+
+    It names the table and scopes the state: an empty name would lose that scope,
+    and two names dlt normalizes alike ("Foo-Bar", "foo_bar") would share a table.
+    """
+    from dlt.common.normalizers.naming.snake_case import NamingConvention
+
+    if not isinstance(name, str) or not name:
+        raise ValueError("resource_name must be a non-empty string")
+    if len(name) > _MAX_RESOURCE_NAME:
+        raise ValueError(f"resource_name must be at most {_MAX_RESOURCE_NAME} characters")
+    if NamingConvention().normalize_table_identifier(name) != name:
+        raise ValueError("resource_name must be lowercase snake_case (letters, digits, _)")
 
 
 def coda_source(
@@ -618,12 +716,15 @@ def coda_source(
         base_url: API base URL, default ``https://coda.io/apis/v1``.
         max_requests: Request budget of one run, checked once a doc is finished. A
             bigger account finishes over several runs; a spent budget sets
-            ``failed_budget`` but not ``failed``.
+            ``failed`` and ``failed_budget``.
         resource_name: Staging table name, which scopes this sync's state and
             cleanup. Defaults to one derived from the doc, workspace or folder;
-            required when ``doc_ids`` lists several docs.
+            required when ``doc_ids`` lists several docs or nothing narrows the
+            selection. A name you pass must be lowercase snake_case of at most 64
+            characters.
         check_active: Optional host authorization checkpoint, called before each
-            request and around each row.
+            request and around each row, and in the client built here around every
+            retry wait and export poll.
         service: Pre-built client (see :class:`CodaClient`). Mainly an injection
             point for tests and hosts. ``client`` is accepted as an alias.
 
@@ -641,12 +742,20 @@ def coda_source(
             "Coda sync requires a cognee build with table-scoped DLT document cleanup."
         )
 
-    name = resource_name or _default_resource_name(doc_ids, workspace_id, folder_id)
+    if isinstance(doc_ids, str):
+        raise TypeError("doc_ids must be a list of doc ids, not a string")
+    name = resource_name
+    if name is None:
+        name = _default_resource_name(doc_ids, workspace_id, folder_id)
+    _check_resource_name(name)
     service = service or client
-    if service is None:
+    owned = service is None
+    if owned:
         if not token:
             raise ValueError("A Coda API token is required: pass token=, or a pre-built service.")
-        service = CodaClient(token=token, base_url=base_url or DEFAULT_BASE_URL)
+        service = CodaClient(
+            token=token, base_url=base_url or DEFAULT_BASE_URL, check_active=check_active
+        )
 
     config = _CodaConfig(
         doc_ids=tuple(doc_ids or ()),
@@ -669,7 +778,12 @@ def coda_source(
         stats.clear()
         state = dlt.current.resource_state()
         rows = _iter_rows(service, config, state, stats, check_active)
-        yield from dlt_utils.guarded_rows(rows, check_active)
+        try:
+            yield from dlt_utils.guarded_rows(rows, check_active)
+        finally:
+            # Also on errors and when dlt stops early; an injected service is the caller's.
+            if owned:
+                service.close()
 
     resource = coda_documents()
     setattr(resource, DOCUMENT_SOURCE_ATTR, "coda")

@@ -66,7 +66,7 @@ id `AbCDeFGH`). Run the same call again to sync only what changed. See `examples
 | `include_sync_pages` | `False` | Also ingest sync pages, which mirror a page of another doc. |
 | `base_url` | `https://coda.io/apis/v1` | API address. |
 | `max_requests` | `1000` | Request budget of one run (a page export counts as one). A bigger account finishes over several runs. |
-| `resource_name` | derived | Staging table, which scopes this sync's state and cleanup. Derived from the doc, the workspace and folder, or `coda_my_docs`; **required** when `doc_ids` lists several docs, since two sources sharing one would delete each other's documents. |
+| `resource_name` | derived | Staging table, which scopes this sync's state and cleanup. Derived from the doc, or the workspace and folder; **required** when `doc_ids` lists several docs or when no doc, workspace or folder is given, since two sources sharing one would delete each other's documents. A name you pass must be lowercase snake_case (letters, digits, `_`) of at most 64 characters. |
 
 ## What a table looks like
 
@@ -99,22 +99,30 @@ pages carry no content of their own and are skipped too.
   re-renders its pages and tables, since each document names its doc.
 - **Forget-on-delete.** A page or table that disappears from its doc, a doc that answers
   404 or 410, a doc that leaves the `/docs` listing, and a doc you remove from `doc_ids`
-  are removed from memory on the next sync. Removed and deselected docs are decided right
+  are removed from memory on the next sync. When a doc's page or table listing answers
+  404 or 410, the doc itself is asked first: it is forgotten only when it answers so too. Removed and deselected docs are decided right
   after the doc listing, so a run cut short by the budget still forgets them.
 - **Access removed is not deletion.** A doc or page that answers 403 (the token lost
-  access) is left unchanged and counted in `unreadable`. A `/docs` listing that comes back
-  empty while docs were synced before forgets nothing until the next run confirms it, an
-  empty page listing keeps the doc's pages (every Coda doc has at least one page), and an
-  answer without its `items` list raises.
+  access), and a page or table that does, is left unchanged and counted in `unreadable`.
+  A `/docs` listing that comes back empty while docs were synced before forgets nothing
+  until the next run confirms it, an empty page listing keeps the doc's pages (every Coda
+  doc has at least one page), an empty table listing keeps the doc's tables until the next
+  run confirms it (deselecting tables with `include_tables=False` forgets them at once),
+  and an answer without its `items` list raises.
 - **A run is bounded.** 429 and 5xx are retried, honoring `Retry-After`. A `Retry-After`
   over 60 seconds, a 429 that outlasts the retries, or more than five minutes of retry
-  waits stops the run cleanly with `failed` and `failed_rate_limit`; a spent
-  `max_requests` budget is a planned pause and sets only `failed_budget`. Either way the
-  finished docs are kept and the next run starts after the last one. A rejected token
+  waits stops the run cleanly with `failed` and `failed_rate_limit`, and a spent
+  `max_requests` budget with `failed` and `failed_budget`: the sync is incomplete either
+  way. The finished docs are kept, and so are the finished pages and tables of a doc the
+  stop cut in two; the next run starts again from that doc. A rejected token
   always raises, and any other error raises so dlt keeps the previous state.
 
 `cognee_sync_stats` counts `emitted`, `unchanged`, `deleted` and `gone` documents,
-`exported` pages, `unreadable` docs, and `failed` plus `failed_*` for a stopped run.
+`exported` pages, `unreadable` docs, pages and tables, and `failed` plus `failed_*` for a
+stopped run; every key is present on every run. `check_active` is called before every
+request, and the client built from `token` also calls it around every retry wait and
+export poll. That client is closed at the end of every run; a `service` you pass in stays
+yours.
 
 The export download link is a short-lived signed URL; the token is never sent to it.
 
