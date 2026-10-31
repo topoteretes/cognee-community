@@ -174,3 +174,5 @@ uv run ruff check .
 uv run ruff format --check .
 uv build
 ```
+
+This package implements topoteretes/cognee#4728.
