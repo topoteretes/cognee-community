@@ -320,3 +320,41 @@ def test_dropping_a_calendar_from_the_config_forgets_its_events(cal):
 
     assert deletes == [rid(team, "team@group.calendar.google.com")]
     assert set(state["calendars"]) == {"primary"}
+
+
+def test_primary_and_its_own_id_sync_as_one_calendar(cal):
+    event_id = cal.put_event("primary", "Standup", START)
+    state: dict = {}
+
+    upserts, deletes, stats = sync(cal, state, ("primary", PRIMARY))
+
+    assert set(upserts) == {rid(event_id)}
+    assert deletes == []
+    assert stats["calendars"] == 1
+    assert set(state["calendars"]) == {"primary"}
+
+
+def test_the_first_spelling_of_the_primary_calendar_is_kept(cal):
+    event_id = cal.put_event("primary", "Standup", START)
+    state: dict = {}
+
+    upserts, _, _ = sync(cal, state, (PRIMARY, "primary"))
+
+    assert set(upserts) == {rid(event_id, PRIMARY)}
+    assert set(state["calendars"]) == {PRIMARY}
+
+
+def test_a_duplicate_primary_copy_from_an_older_sync_is_forgotten(cal):
+    event_id = cal.put_event("primary", "Standup", START)
+    by_alias: dict = {}
+    by_id: dict = {}
+    sync(cal, by_alias, ("primary",))
+    sync(cal, by_id, (PRIMARY,))
+    # What an older sync with both spellings configured left behind.
+    state = {"calendars": {**by_alias["calendars"], **by_id["calendars"]}}
+
+    upserts, deletes, _ = sync(cal, state, ("primary", PRIMARY))
+
+    assert upserts == {}
+    assert deletes == [rid(event_id, PRIMARY)]
+    assert set(state["calendars"]) == {"primary"}
