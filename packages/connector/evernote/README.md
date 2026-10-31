@@ -126,19 +126,21 @@ answer = await cognee.search(
 ## How Incremental Sync Works
 
 Sync state is tracked using Evernote's Update Sequence Number (USN) cursor stored in dlt's persisted resource state (`dlt.current.resource_state()`):
-- **First run**: Pulls metadata and notes starting from USN 0 and checkpoints `last_usn`, `last_sync_time`, notebook/tag ID maps, and `note_ids`.
-- **Incremental runs**: Only requests sync chunks with `afterUSN = state["last_usn"]`. If server `updateCount == state["last_usn"]`, nothing changed and no chunk calls are made.
-- **Transactional state persistence**: The cursor is updated in dlt resource state only after a completely successful run. If an extraction fails or is interrupted, state remains untouched and the next run safely retries from the old cursor.
-- **Resync triggers**: A full resync (re-evaluating from USN 0) occurs automatically if `full_resync=True`, if the server's `fullSyncBefore` exceeds `state["last_sync_time"]`, if the server's `updateCount` is lower than `state["last_usn"]`, or if `notebook_names` / `tag_names` scope changes.
-- **Scope changes**: Changing `notebook_names` or `tag_names` is detected by comparing the current scope signature against the persisted `state["scope"]`. When the scope has changed, the run is treated as a full resync (starting from USN 0), including deletion reconciliation for notes that were in the previous scope but are no longer requested.
+- **State version**: The connector uses schema version `v = 1`. If an existing state lacks `v = 1` or has legacy list-formatted `note_ids`, it is treated as a first run and safely re-synced once, overwriting the state with version 1.
+- **First run**: Pulls metadata and notes starting from USN 0 and checkpoints `v`, `account`, `last_usn`, `last_sync_time`, notebook/tag ID maps, `note_ids` (`{note_guid: notebook_guid}`), and `scope`.
+- **Incremental runs**: Only requests sync chunks with `afterUSN = state["last_usn"]`. If server `updateCount == state["last_usn"]`, nothing changed on the server; no chunk calls are made and state keys (including `last_sync_time`) are left untouched, preventing spurious dlt pipeline state revisions.
+- **Transactional state persistence**: The cursor and state keys are updated in dlt resource state only after a completely successful run and only when their values actually changed. If an extraction fails or is interrupted, state remains untouched and the next run safely retries from the old cursor.
+- **Resync triggers**: A full resync (re-evaluating from USN 0) occurs automatically if `full_resync=True`, if the server's `fullSyncBefore` exceeds `state["last_sync_time"]`, if the server's `updateCount` is lower than `state["last_usn"]`, or if `notebook_names` / `tag_names` scope, missing persisted GUID lists, or resolved GUIDs change.
+- **Scope changes and swap detection**: Configured names are resolved to GUIDs every run. If names change or if another notebook/tag reuses a configured name with a different GUID (a scope swap), the run restarts pass 1 from USN 0 with fresh maps so previously ingested out-of-scope notes are tombstoned and newly in-scope notes load.
 - **Account binding**: The resource state records `account` (e.g. `production:12345` or `sandbox:12345`). Attempting to reuse an existing resource state with a different Evernote user ID or environment raises `EvernoteError` before making any chunk calls.
 
 ## How Deletions Work
 
 - Notes marked inactive (`active=False`, trashed) or listed in `expungedNotes` are emitted as tombstone records (`{"id": guid, "title": "", "content": "", "_deleted": True}`).
+- **Expunged notebooks**: When a notebook is expunged (`expungedNotebooks`), all notes previously ingested under that notebook GUID (tracked in `state["note_ids"]`) are emitted as tombstones and removed from state, deduplicated against `expungedNotes`. If a note was moved to another notebook in the same run's metadata, the new notebook GUID wins and the note is preserved.
 - Notes moved out of scope (e.g. moved to an unselected notebook or untagged) also emit tombstones so they are removed from the dataset.
 - A note whose body fetch raises `NoteNotFoundError` or whose converted body and title are both empty is also tombstoned.
-- During a full resync (`full_resync=True`, or triggered by server `fullSyncBefore` / lower `updateCount`), notes previously ingested by this resource (tracked in `state["note_ids"]`) that no longer appear in the server listing are reconciled and emitted as tombstones. This reconciliation sweep runs only after the complete server listing has succeeded.
+- During a full resync (`full_resync=True`, or triggered by server `fullSyncBefore` / lower `updateCount` / scope change), notes previously ingested by this resource (tracked in `state["note_ids"]`) that no longer appear in the server listing are reconciled and emitted as tombstones. This reconciliation sweep runs only after the complete server listing has succeeded.
 - Under `write_disposition="merge"`, dlt removes the tombstoned records from staging.
 - Cognee's cleanup removes the corresponding `Data` records.
 - **Test verification scope**: Tests in this package verify that the corresponding `Data` records are removed from cognee's dataset. (They do *not* assert or test graph or vector database store cleanups).
@@ -148,15 +150,14 @@ Sync state is tracked using Evernote's Update Sequence Number (USN) cursor store
 Filter ingested notes with `notebook_names` and `tag_names`:
 - **Both provided**: Notes must match **both** filters (must reside in one of the selected notebooks AND carry at least one of the selected tags).
 - **Exact matching**: Names are compared strictly and case-sensitively against server notebook and tag names.
-- **Unknown names**: Passing a notebook or tag name that does not exist in the Evernote account raises `EvernoteError`.
-- **Scope changes trigger full resync**: Changing `notebook_names` or `tag_names` between runs automatically triggers a full resync with deletion reconciliation — notes no longer in scope are tombstoned and removed from cognee's memory.
+- **Unknown or renamed names**: Passing a notebook or tag name that does not exist in the Evernote account raises `EvernoteError` ("Notebook/Tag name(s) not found: [...]. If a notebook/tag was renamed, update notebook_names/tag_names.") without writing any state.
+- **Scope changes trigger full resync**: Changing `notebook_names` or `tag_names`, or swapping the underlying notebook/tag GUID for a configured name, automatically triggers a full resync with deletion reconciliation — notes no longer in scope are tombstoned and removed from cognee's memory.
 
 ## Limitations
 
 - **No live-API validation**: Tested exclusively offline against fake clients and simulated sync chunks; has not been run against a live Evernote account.
 - **Pre-release dependency**: Relies on `evernote-plus==1.28.1.dev2` for Python 3 EDAM Thrift bindings.
-- **Notebook/tag renames**: Renaming a notebook or tag on the server updates the internal ID mapping on the next run, but does not re-emit unchanged notes (notes retain their previously rendered metadata until edited or until a `full_resync=True` run is performed).
-- **Expunged notebook behavior**: Evernote API behavior for notes inside an expunged notebook is UNKNOWN.
+- **Notebook/tag renames**: Renaming a notebook or tag changes the rendered text of its notes (`Notebook:` and `Tags:` header lines) only when those notes are next edited on the server or when `full_resync=True` is explicitly used.
 - **USN cursor advances on filtered objects**: If changes on the server only affect unrequested object types (e.g. saved searches or resources), the cursor in state may remain below the server's `updateCount` (this is harmless and may trigger one extra empty sync chunk check).
 - **Attachments**: Images, audio, PDFs, and binary attachments in ENML are replaced with text placeholders (`[Attachment: type=...]`) and their raw bytes are not ingested.
 

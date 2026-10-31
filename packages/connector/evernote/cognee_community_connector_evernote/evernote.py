@@ -30,6 +30,8 @@ from thrift.transport.TTransport import TTransportException
 
 logger = get_logger(__name__)
 
+STATE_VERSION = 1
+
 
 class EvernoteError(Exception):
     """Base exception for Evernote connector."""
@@ -454,35 +456,74 @@ def _sync_records(
             "use a different resource_name"
         )
 
+    # Detect old-shape or foreign state: if state is non-empty and missing/differing
+    # version, or note_ids is a list, treat it as a first run (full resync) and overwrite it.
+    is_old_or_foreign = bool(state) and (
+        state.get("v") != STATE_VERSION or isinstance(state.get("note_ids"), list)
+    )
+
     # Step 1: Call api.get_sync_state() first and read after_usn
     sync_state = api_client.get_sync_state() if hasattr(api_client, "get_sync_state") else None
     current_sync_time = getattr(sync_state, "currentTime", None)
     server_update_count = getattr(sync_state, "updateCount", None)
     full_sync_before = getattr(sync_state, "fullSyncBefore", None)
 
-    has_last_usn = "last_usn" in state
-    last_usn = state.get("last_usn", 0)
-    last_sync_time = state.get("last_sync_time")
+    has_last_usn = False if is_old_or_foreign else ("last_usn" in state)
+    last_usn = 0 if is_old_or_foreign else state.get("last_usn", 0)
+    last_sync_time = None if is_old_or_foreign else state.get("last_sync_time")
 
-    # Compute the current scope signature for change detection.
-    # None means "all notebooks/tags"; a sorted list means a specific selection.
-    current_scope_signature = {
-        "notebooks": sorted(set(notebook_names)) if notebook_names is not None else None,
-        "tags": sorted(set(tag_names)) if tag_names is not None else None,
-    }
+    if is_old_or_foreign:
+        prior_note_ids: set[str] = set()
+        updated_note_ids: dict[str, str] = {}
+    else:
+        raw_note_ids = state.get("note_ids")
+        if isinstance(raw_note_ids, dict):
+            prior_note_ids = set(raw_note_ids.keys())
+            updated_note_ids = dict(raw_note_ids)
+        elif isinstance(raw_note_ids, list):
+            prior_note_ids = set(raw_note_ids)
+            updated_note_ids = {}
+        else:
+            prior_note_ids = set()
+            updated_note_ids = {}
 
-    # Step 2: Determine if this run is a FULL resync.
-    # Scope change is evaluated first so it cannot be short-circuited by the
+    # Compute configured scope names
+    current_nb_names = sorted(set(notebook_names)) if notebook_names is not None else None
+    current_tag_names = sorted(set(tag_names)) if tag_names is not None else None
+
+    # Step 2: Determine if this run is a FULL resync upfront.
+    # Scope name changes are evaluated first so they cannot be short-circuited by the
     # "server updateCount == last_usn" shortcut that follows.
-    # A legacy state without "scope" defaults to unscoped (None, None).
-    persisted_scope = state.get("scope", {"notebooks": None, "tags": None})
-    scope_changed = has_last_usn and persisted_scope != current_scope_signature
-    if scope_changed:
-        log.info("Evernote scope changed, triggering full resync.")
+    persisted_scope = state.get("scope") or {}
+    persisted_nb_names = persisted_scope.get("notebooks")
+    persisted_tag_names = persisted_scope.get("tags")
+    persisted_nb_guids = persisted_scope.get("notebook_guids")
+    persisted_tag_guids = persisted_scope.get("tag_guids")
+
+    name_scope_changed = has_last_usn and (
+        persisted_nb_names != current_nb_names or persisted_tag_names != current_tag_names
+    )
+    if name_scope_changed:
+        log.info("Evernote scope names changed, triggering full resync.")
+
+    scope_missing_guids = has_last_usn and (
+        (
+            notebook_names is not None
+            and (not isinstance(persisted_nb_guids, list) or not persisted_nb_guids)
+        )
+        or (
+            tag_names is not None
+            and (not isinstance(persisted_tag_guids, list) or not persisted_tag_guids)
+        )
+    )
+    if scope_missing_guids:
+        log.info("Evernote configured scope lacks persisted GUID list, triggering full resync.")
 
     is_full_resync = (
         full_resync
-        or scope_changed
+        or is_old_or_foreign
+        or name_scope_changed
+        or scope_missing_guids
         or (
             has_last_usn
             and full_sync_before is not None
@@ -499,76 +540,128 @@ def _sync_records(
         and server_update_count is not None
         and server_update_count == last_usn
     ):
-        if current_sync_time is not None:
+        if state.get("v") != STATE_VERSION:
+            state["v"] = STATE_VERSION
+        if state.get("account") != bind:
+            state["account"] = bind
+        if "last_sync_time" not in state and current_sync_time is not None:
             state["last_sync_time"] = int(current_sync_time)
-        state["account"] = bind
         yield dlt.mark.materialize_table_schema()
         return
 
-    # Step 4: Iterate sync chunks from after_usn, starting notebook/tag maps from state
-    if is_full_resync or not has_last_usn:
-        after_usn = 0
-        notebook_map: dict[str, str] = {}
-        tag_map: dict[str, str] = {}
-    else:
-        after_usn = last_usn
-        notebook_map = dict(state.get("notebooks") or {})
-        tag_map = dict(state.get("tags") or {})
+    # Step 4: Pass 1 chunk iteration and GUID resolution loop
+    while True:
+        if is_full_resync or not has_last_usn:
+            after_usn = 0
+            notebook_map: dict[str, str] = {}
+            tag_map: dict[str, str] = {}
+        else:
+            after_usn = last_usn
+            notebook_map = dict(state.get("notebooks") or {})
+            tag_map = dict(state.get("tags") or {})
 
-    note_meta: dict[str, Any] = {}
-    expunged_guids: set[str] = set()
-    highest_chunk_usn: int | None = None
-    updated_note_ids: set[str] = set(state.get("note_ids") or [])
+        note_meta: dict[str, Any] = {}
+        expunged_guids: set[str] = set()
+        expunged_nb_guids: set[str] = set()
+        highest_chunk_usn: int | None = None
 
-    yielded_count = 0
-    tombstoned_count = 0
+        for chunk in iter_sync_chunks(api_client, after_usn=after_usn, max_entries=250):
+            chunk_usn = getattr(chunk, "chunkHighUSN", None)
+            if chunk_usn is not None and (
+                highest_chunk_usn is None or chunk_usn > highest_chunk_usn
+            ):
+                highest_chunk_usn = chunk_usn
+            for nb in getattr(chunk, "notebooks", None) or []:
+                notebook_map[nb.guid] = nb.name
+            for tag in getattr(chunk, "tags", None) or []:
+                tag_map[tag.guid] = tag.name
+            for note in getattr(chunk, "notes", None) or []:
+                note_meta[note.guid] = note
+            for guid in getattr(chunk, "expungedNotes", None) or []:
+                expunged_guids.add(guid)
+                note_meta.pop(guid, None)
+            for nb_guid in getattr(chunk, "expungedNotebooks", None) or []:
+                expunged_nb_guids.add(nb_guid)
+                notebook_map.pop(nb_guid, None)
+            for tag_guid in getattr(chunk, "expungedTags", None) or []:
+                tag_map.pop(tag_guid, None)
 
-    for chunk in iter_sync_chunks(api_client, after_usn=after_usn, max_entries=250):
-        chunk_usn = getattr(chunk, "chunkHighUSN", None)
-        if chunk_usn is not None and (highest_chunk_usn is None or chunk_usn > highest_chunk_usn):
-            highest_chunk_usn = chunk_usn
-        for nb in getattr(chunk, "notebooks", None) or []:
-            notebook_map[nb.guid] = nb.name
-        for tag in getattr(chunk, "tags", None) or []:
-            tag_map[tag.guid] = tag.name
-        for note in getattr(chunk, "notes", None) or []:
-            note_meta[note.guid] = note
-        for guid in getattr(chunk, "expungedNotes", None) or []:
-            expunged_guids.add(guid)
-            note_meta.pop(guid, None)
+        # Validate requested notebook_names and tag_names against MERGED maps
+        if notebook_names is not None:
+            requested_nbs = set(notebook_names)
+            found_nbs = set(notebook_map.values())
+            unknown_nbs = requested_nbs - found_nbs
+            if unknown_nbs:
+                raise EvernoteError(
+                    f"Notebook name(s) not found: {sorted(unknown_nbs)}. "
+                    "If a notebook was renamed, update notebook_names."
+                )
 
-        # UNKNOWN: How Evernote reports notes inside an expunged notebook (whether their GUIDs
-        # are also included in chunk.expungedNotes, whether they are orphaned, or whether
-        # the notebook deletion cascades on the server). No behavior is invented here.
-        for nb_guid in getattr(chunk, "expungedNotebooks", None) or []:
-            notebook_map.pop(nb_guid, None)
-        for tag_guid in getattr(chunk, "expungedTags", None) or []:
-            tag_map.pop(tag_guid, None)
+        if tag_names is not None:
+            requested_tags = set(tag_names)
+            found_tags = set(tag_map.values())
+            unknown_tags = requested_tags - found_tags
+            if unknown_tags:
+                raise EvernoteError(
+                    f"Tag name(s) not found: {sorted(unknown_tags)}. "
+                    "If a tag was renamed, update tag_names."
+                )
 
-    # Validate requested notebook_names and tag_names against MERGED maps
-    if notebook_names is not None:
-        requested_nbs = set(notebook_names)
-        found_nbs = set(notebook_map.values())
-        unknown_nbs = requested_nbs - found_nbs
-        if unknown_nbs:
-            raise EvernoteError(f"Unknown notebook name(s): {', '.join(sorted(unknown_nbs))}")
+        # Resolve configured notebook and tag names to GUIDs
+        allowed_nb_guids = (
+            {g for g, n in notebook_map.items() if n in set(notebook_names)}
+            if notebook_names is not None
+            else None
+        )
+        allowed_tag_guids = (
+            {g for g, n in tag_map.items() if n in set(tag_names)}
+            if tag_names is not None
+            else None
+        )
 
-    if tag_names is not None:
-        requested_tags = set(tag_names)
-        found_tags = set(tag_map.values())
-        unknown_tags = requested_tags - found_tags
-        if unknown_tags:
-            raise EvernoteError(f"Unknown tag name(s): {', '.join(sorted(unknown_tags))}")
+        resolved_nb_guids = sorted(allowed_nb_guids) if allowed_nb_guids is not None else None
+        resolved_tag_guids = sorted(allowed_tag_guids) if allowed_tag_guids is not None else None
 
-    # Compute allowed notebook and tag GUID sets
-    allowed_nb_guids = (
-        {g for g, n in notebook_map.items() if n in set(notebook_names)}
-        if notebook_names is not None
-        else None
-    )
-    allowed_tag_guids = (
-        {g for g, n in tag_map.items() if n in set(tag_names)} if tag_names is not None else None
-    )
+        # Check if resolved GUIDs changed from state
+        persisted_scope = state.get("scope") or {}
+        persisted_nb_guids = persisted_scope.get("notebook_guids")
+        persisted_tag_guids = persisted_scope.get("tag_guids")
+
+        guid_scope_changed = False
+        if has_last_usn:
+            if notebook_names is not None and (
+                persisted_nb_guids is None or resolved_nb_guids != persisted_nb_guids
+            ):
+                guid_scope_changed = True
+            if tag_names is not None and (
+                persisted_tag_guids is None or resolved_tag_guids != persisted_tag_guids
+            ):
+                guid_scope_changed = True
+
+        if guid_scope_changed and not is_full_resync:
+            log.info("Evernote scope GUIDs changed, triggering full resync.")
+            is_full_resync = True
+            continue
+
+        break
+
+    # Handle notes of expunged notebooks:
+    # Expunged notebook GUIDs were already removed from notebook_map during chunk
+    # processing (alongside expunged tags). Here we collect notes previously tracked
+    # under those notebooks, yield tombstones (deduplicated with expungedNotes), and
+    # remove them from note_ids. If a note appears in this run's metadata with a
+    # DIFFERENT notebook guid (moved out first), the newer guid wins and the note is
+    # NOT tombstoned.
+    for nb_guid in expunged_nb_guids:
+        for note_id, current_nb_guid in list(updated_note_ids.items()):
+            if current_nb_guid == nb_guid:
+                if (
+                    note_id in note_meta
+                    and getattr(note_meta[note_id], "notebookGuid", None) != nb_guid
+                ):
+                    continue
+                expunged_guids.add(note_id)
+                note_meta.pop(note_id, None)
 
     def _is_live_and_in_scope(note: Any) -> bool:
         if getattr(note, "active", True) is False or getattr(note, "deleted", None) is not None:
@@ -585,13 +678,8 @@ def _sync_records(
         return True
 
     # Pass 2: Emit tombstones and active in-scope notes
-    # state["note_ids"] is used ONLY for:
-    #   (a) the full-resync stale-id reconciliation sweep below, and
-    #   (b) final bookkeeping (add yielded ids, discard tombstoned ids).
-    # Every tombstone case (trashed, expunged, out-of-scope, NoteNotFound,
-    # empty content+title) is emitted unconditionally — regardless of whether
-    # the id was previously ingested.
-    prior_note_ids: set[str] = set(state.get("note_ids") or [])
+    yielded_count = 0
+    tombstoned_count = 0
 
     if is_full_resync:
         # Deletion reconciliation: tombstone ids that were ingested before but
@@ -603,13 +691,13 @@ def _sync_records(
         for stale_id in sorted(stale):
             yield {"id": stale_id, "title": "", "content": "", "_deleted": True}
             tombstoned_count += 1
-            updated_note_ids.discard(stale_id)
+            updated_note_ids.pop(stale_id, None)
 
     # 1. Expunged notes always yield tombstones
     for guid in sorted(expunged_guids):
         yield {"id": guid, "title": "", "content": "", "_deleted": True}
         tombstoned_count += 1
-        updated_note_ids.discard(guid)
+        updated_note_ids.pop(guid, None)
 
     # 2. Changed / snapshot note metadata
     for note in note_meta.values():
@@ -617,7 +705,7 @@ def _sync_records(
         if not _is_live_and_in_scope(note):
             yield {"id": guid, "title": "", "content": "", "_deleted": True}
             tombstoned_count += 1
-            updated_note_ids.discard(guid)
+            updated_note_ids.pop(guid, None)
             continue
 
         try:
@@ -625,7 +713,7 @@ def _sync_records(
         except NoteNotFoundError:
             yield {"id": guid, "title": "", "content": "", "_deleted": True}
             tombstoned_count += 1
-            updated_note_ids.discard(guid)
+            updated_note_ids.pop(guid, None)
             continue
 
         content_text = enml_to_text(enml)
@@ -634,7 +722,7 @@ def _sync_records(
         if not content_text:
             yield {"id": guid, "title": "", "content": "", "_deleted": True}
             tombstoned_count += 1
-            updated_note_ids.discard(guid)
+            updated_note_ids.pop(guid, None)
             continue
 
         row = note_to_row(
@@ -645,7 +733,7 @@ def _sync_records(
         )
         yield row
         yielded_count += 1
-        updated_note_ids.add(guid)
+        updated_note_ids[guid] = getattr(note, "notebookGuid", "")
 
     log.info(
         "Evernote sync complete: %d row(s) yielded, %d tombstone(s) emitted.",
@@ -658,22 +746,54 @@ def _sync_records(
 
     # Step 6: State is mutated ONLY after all rows and tombstones have been yielded
     # without error. Dlt persists resource state only when the run completes
-    # successfully, ensuring that any mid-run failure (e.g. transport, auth,
-    # rate-limit, or body fetch error) leaves the cursor and state untouched
-    # so the run can be safely retried from the old cursor.
-    if highest_chunk_usn is not None:
-        state["last_usn"] = highest_chunk_usn
-    elif "last_usn" not in state:
-        state["last_usn"] = after_usn
+    # successfully, ensuring that any mid-run failure leaves cursor and state untouched.
+    new_v = STATE_VERSION
+    new_account = bind
+    fallback_usn = state.get("last_usn", after_usn)
+    new_last_usn = highest_chunk_usn if highest_chunk_usn is not None else fallback_usn
+    new_notebooks = notebook_map
+    new_tags = tag_map
+    new_note_ids = dict(sorted(updated_note_ids.items()))
+    new_scope = {
+        "notebooks": current_nb_names,
+        "tags": current_tag_names,
+        "notebook_guids": resolved_nb_guids,
+        "tag_guids": resolved_tag_guids,
+    }
 
-    if current_sync_time is not None:
-        state["last_sync_time"] = int(current_sync_time)
+    something_changed = (
+        is_full_resync
+        or "last_sync_time" not in state
+        or state.get("last_usn") != new_last_usn
+        or yielded_count > 0
+        or tombstoned_count > 0
+        or state.get("notebooks") != new_notebooks
+        or state.get("tags") != new_tags
+        or state.get("scope") != new_scope
+        or state.get("note_ids") != new_note_ids
+    )
 
-    state["notebooks"] = notebook_map
-    state["tags"] = tag_map
-    state["note_ids"] = sorted(updated_note_ids)
-    state["account"] = bind
-    state["scope"] = current_scope_signature
+    if is_old_or_foreign:
+        state.clear()
+
+    if state.get("v") != new_v:
+        state["v"] = new_v
+    if state.get("account") != new_account:
+        state["account"] = new_account
+    if state.get("last_usn") != new_last_usn:
+        state["last_usn"] = new_last_usn
+    if something_changed and current_sync_time is not None:
+        new_sync_time = int(current_sync_time)
+        if state.get("last_sync_time") != new_sync_time:
+            state["last_sync_time"] = new_sync_time
+    if state.get("notebooks") != new_notebooks:
+        state["notebooks"] = new_notebooks
+    if state.get("tags") != new_tags:
+        state["tags"] = new_tags
+    if state.get("note_ids") != new_note_ids:
+        state["note_ids"] = new_note_ids
+    if state.get("scope") != new_scope:
+        state["scope"] = new_scope
 
 
 def evernote_source(

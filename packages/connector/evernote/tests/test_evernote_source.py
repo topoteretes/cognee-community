@@ -95,7 +95,13 @@ def test_scope_validation_unknown_notebook_name_raises():
         token="tok", notebook_names=["Marketing", "Engineering"], client=client
     )
 
-    with pytest.raises(Exception, match=r"Unknown notebook name\(s\): Marketing") as exc_info:
+    with pytest.raises(
+        Exception,
+        match=(
+            r"Notebook name\(s\) not found: .*\. If a notebook was renamed, "
+            r"update notebook_names\."
+        ),
+    ) as exc_info:
         list(source)
     assert isinstance(exc_info.value.__cause__, EvernoteError) or isinstance(
         exc_info.value, EvernoteError
@@ -110,7 +116,10 @@ def test_scope_validation_unknown_tag_name_raises():
 
     source = evernote_source(token="tok", tag_names=["Urgent", "Archive"], client=client)
 
-    with pytest.raises(Exception, match=r"Unknown tag name\(s\): Archive") as exc_info:
+    with pytest.raises(
+        Exception,
+        match=r"Tag name\(s\) not found: .*\. If a tag was renamed, update tag_names\.",
+    ) as exc_info:
         list(source)
     assert isinstance(exc_info.value.__cause__, EvernoteError) or isinstance(
         exc_info.value, EvernoteError

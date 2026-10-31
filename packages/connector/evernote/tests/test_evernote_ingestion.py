@@ -484,3 +484,50 @@ async def test_evernote_scope_change_triggers_resync_in_cognee(persistent_enviro
     data3 = await _get_evernote_dataset_data(dataset)
     assert len(data3) == 1
     assert {_get_metadata(d)["external_id"] for d in data3} == {"note-a"}
+
+
+@pytest.mark.asyncio
+async def test_expunged_notebook_deletes_notes_in_cognee(persistent_environment):
+    """When a notebook is expunged, its notes disappear from cognee's Data records."""
+    dataset = "test_expunged_nb_dataset"
+    nb_a = SimpleNamespace(guid="nb-a", name="NotebookA")
+    nb_b = SimpleNamespace(guid="nb-b", name="NotebookB")
+    note_a1 = SimpleNamespace(guid="a1", title="A1", notebookGuid="nb-a", active=True)
+    note_a2 = SimpleNamespace(guid="a2", title="A2", notebookGuid="nb-a", active=True)
+    note_b1 = SimpleNamespace(guid="b1", title="B1", notebookGuid="nb-b", active=True)
+
+    contents = {
+        "a1": "<en-note><div>A1 content</div></en-note>",
+        "a2": "<en-note><div>A2 content</div></en-note>",
+        "b1": "<en-note><div>B1 content</div></en-note>",
+    }
+
+    # Run 1: Ingest notebook A and B
+    chunk1 = SyncChunk(
+        chunkHighUSN=10,
+        updateCount=10,
+        notebooks=[nb_a, nb_b],
+        notes=[note_a1, note_a2, note_b1],
+    )
+    client1 = FakeEvernoteClient(chunks=[chunk1], note_contents=contents, update_count=10)
+    source1 = evernote_source(token="fake-token", client=client1)
+    await cognee.add(source1, dataset_name=dataset, write_disposition="merge")
+
+    data1 = await _get_evernote_dataset_data(dataset)
+    assert len(data1) == 3
+    assert {_get_metadata(d)["external_id"] for d in data1} == {"a1", "a2", "b1"}
+
+    # Run 2: Notebook A is expunged on server (without listing a1, a2 in expungedNotes)
+    chunk2 = SyncChunk(
+        chunkHighUSN=20,
+        updateCount=20,
+        expungedNotebooks=["nb-a"],
+    )
+    client2 = FakeEvernoteClient(chunks=[chunk2], note_contents=contents, update_count=20)
+    source2 = evernote_source(token="fake-token", client=client2)
+    await cognee.add(source2, dataset_name=dataset, write_disposition="merge")
+
+    # The Data records of a1 and a2 disappear; b1 stays
+    data2 = await _get_evernote_dataset_data(dataset)
+    assert len(data2) == 1
+    assert {_get_metadata(d)["external_id"] for d in data2} == {"b1"}

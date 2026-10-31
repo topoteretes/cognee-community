@@ -101,22 +101,25 @@ def test_first_run_starts_from_after_usn_zero_and_stores_state():
     after_usn, _, _ = client.get_filtered_sync_chunk_calls[0]
     assert after_usn == 0
 
+    assert state["v"] == 1
     assert state["last_usn"] == 50
     assert state["last_sync_time"] == 1609459200000
     assert state["notebooks"] == {"nb-1": "Engineering"}
     assert state["tags"] == {"t-1": "Urgent"}
-    assert state["note_ids"] == ["n-1", "n-2"]
+    assert state["note_ids"] == {"n-1": "nb-1", "n-2": "nb-1"}
 
 
 def test_second_run_with_no_server_changes_makes_no_chunk_call_and_yields_no_rows():
-    """Second run with no server changes makes no chunk call, yields no rows, updates sync time."""
+    """Second run with no server changes makes no chunk call and leaves sync time unchanged."""
     client = FakeCursorEvernoteClient(update_count=50, current_time=1609500000000)
     state = {
+        "v": 1,
         "last_usn": 50,
         "last_sync_time": 1609459200000,
+        "account": "production:12345",
         "notebooks": {"nb-1": "Engineering"},
         "tags": {},
-        "note_ids": ["n-1"],
+        "note_ids": {"n-1": "nb-1"},
     }
 
     rows = list(_sync_records(client, state))
@@ -126,9 +129,9 @@ def test_second_run_with_no_server_changes_makes_no_chunk_call_and_yields_no_row
     assert data_rows == []
     # No chunk calls made
     assert client.get_filtered_sync_chunk_calls == []
-    # last_usn unchanged, last_sync_time updated
+    # last_usn unchanged, last_sync_time unchanged when nothing changed on server
     assert state["last_usn"] == 50
-    assert state["last_sync_time"] == 1609500000000
+    assert state["last_sync_time"] == 1609459200000
 
 
 def test_second_run_after_changes_calls_get_filtered_sync_chunk_with_after_usn():
@@ -143,11 +146,13 @@ def test_second_run_after_changes_calls_get_filtered_sync_chunk_with_after_usn()
     )
     client = FakeCursorEvernoteClient(chunks=[chunk], update_count=75)
     state = {
+        "v": 1,
         "last_usn": 50,
         "last_sync_time": 1000,
+        "account": "production:12345",
         "notebooks": {"nb-1": "Engineering"},
         "tags": {},
-        "note_ids": ["n-old"],
+        "note_ids": {"n-old": "nb-1"},
     }
 
     rows = list(_sync_records(client, state))
@@ -158,7 +163,7 @@ def test_second_run_after_changes_calls_get_filtered_sync_chunk_with_after_usn()
     after_usn, _, _ = client.get_filtered_sync_chunk_calls[0]
     assert after_usn == 50
     assert state["last_usn"] == 75
-    assert state["note_ids"] == ["n-new", "n-old"]
+    assert state["note_ids"] == {"n-new": "nb-1", "n-old": "nb-1"}
 
 
 def test_only_changed_notes_have_body_fetched():
@@ -173,10 +178,12 @@ def test_only_changed_notes_have_body_fetched():
     )
     client = FakeCursorEvernoteClient(chunks=[chunk], update_count=100)
     state = {
+        "v": 1,
         "last_usn": 50,
+        "account": "production:12345",
         "notebooks": {"nb-1": "Engineering"},
         "tags": {},
-        "note_ids": ["n-existing"],
+        "note_ids": {"n-existing": "nb-1"},
     }
 
     list(_sync_records(client, state))
@@ -203,10 +210,12 @@ def test_changed_note_resolves_names_from_persisted_maps():
     )
     client = FakeCursorEvernoteClient(chunks=[chunk], update_count=100)
     state = {
+        "v": 1,
         "last_usn": 50,
+        "account": "production:12345",
         "notebooks": {"nb-old": "Persisted Notebook"},
         "tags": {"t-old": "Persisted Tag"},
-        "note_ids": [],
+        "note_ids": {},
     }
 
     rows = list(_sync_records(client, state))
@@ -234,13 +243,13 @@ def test_multichunk_incremental_pagination_advances_cursor_to_last_chunk():
         notes=[SimpleNamespace(guid="n-3", title="N3", active=True)],
     )
     client = FakeCursorEvernoteClient(chunks=[chunk1, chunk2, chunk3], update_count=100)
-    state = {"last_usn": 40}
+    state = {"v": 1, "last_usn": 40, "account": "production:12345", "note_ids": {}}
 
     rows = list(_sync_records(client, state))
 
     assert len(rows) == 3
     assert state["last_usn"] == 100
-    assert state["note_ids"] == ["n-1", "n-2", "n-3"]
+    assert state["note_ids"] == {"n-1": "", "n-2": "", "n-3": ""}
 
 
 def test_trashed_and_expunged_notes_yield_tombstones_and_leave_note_ids():
@@ -254,8 +263,10 @@ def test_trashed_and_expunged_notes_yield_tombstones_and_leave_note_ids():
     )
     client = FakeCursorEvernoteClient(chunks=[chunk], update_count=100)
     state = {
+        "v": 1,
         "last_usn": 40,
-        "note_ids": ["n-expunged", "n-survivor", "n-trashed"],
+        "account": "production:12345",
+        "note_ids": {"n-expunged": "nb-1", "n-survivor": "nb-1", "n-trashed": "nb-1"},
     }
 
     rows = list(_sync_records(client, state))
@@ -263,7 +274,7 @@ def test_trashed_and_expunged_notes_yield_tombstones_and_leave_note_ids():
     tombstone_ids = {r["id"] for r in rows if r.get("_deleted")}
     assert tombstone_ids == {"n-trashed", "n-expunged"}
     # Only the survivor remains in note_ids
-    assert state["note_ids"] == ["n-survivor"]
+    assert state["note_ids"] == {"n-survivor": "nb-1"}
 
 
 def test_note_moved_out_of_scope_yields_tombstone():
@@ -284,9 +295,17 @@ def test_note_moved_out_of_scope_yields_tombstone():
     )
     client = FakeCursorEvernoteClient(chunks=[chunk], update_count=100)
     state = {
+        "v": 1,
         "last_usn": 40,
+        "account": "production:12345",
         "notebooks": {"nb-in": "InScope", "nb-out": "OutOfScope"},
-        "note_ids": ["n-moved"],
+        "note_ids": {"n-moved": "nb-in"},
+        "scope": {
+            "notebooks": ["InScope"],
+            "tags": None,
+            "notebook_guids": ["nb-in"],
+            "tag_guids": None,
+        },
     }
 
     rows = list(_sync_records(client, state, notebook_names=["InScope"]))
@@ -294,7 +313,7 @@ def test_note_moved_out_of_scope_yields_tombstone():
     assert len(rows) == 1
     assert rows[0]["id"] == "n-moved"
     assert rows[0]["_deleted"] is True
-    assert state["note_ids"] == []
+    assert state["note_ids"] == {}
 
 
 def test_body_fetch_failure_mid_run_leaves_cursor_unchanged_and_retries_safely():
@@ -311,7 +330,7 @@ def test_body_fetch_failure_mid_run_leaves_cursor_unchanged_and_retries_safely()
         note_contents={"n-fail": RuntimeError("Connection reset during body fetch")},
         update_count=100,
     )
-    state = {"last_usn": 40, "note_ids": []}
+    state = {"v": 1, "last_usn": 40, "account": "production:12345", "note_ids": {}}
 
     # First attempt fails mid-run
     with pytest.raises(RuntimeError, match="Connection reset"):
@@ -319,7 +338,7 @@ def test_body_fetch_failure_mid_run_leaves_cursor_unchanged_and_retries_safely()
 
     # Cursor and state remain completely untouched
     assert state["last_usn"] == 40
-    assert state["note_ids"] == []
+    assert state["note_ids"] == {}
 
     # Second attempt succeeds
     chunk_retry = SyncChunk(
@@ -336,7 +355,7 @@ def test_body_fetch_failure_mid_run_leaves_cursor_unchanged_and_retries_safely()
 
     assert len(rows) == 2
     assert state["last_usn"] == 60
-    assert state["note_ids"] == ["n-fail", "n-ok"]
+    assert state["note_ids"] == {"n-fail": "", "n-ok": ""}
 
 
 def test_rate_limit_and_auth_error_leave_cursor_unchanged():
@@ -349,7 +368,7 @@ def test_rate_limit_and_auth_error_leave_cursor_unchanged():
     client_rate_limited.get_filtered_sync_chunk = lambda *_: (_ for _ in ()).throw(
         EvernoteRateLimitError("Rate limit exceeded")
     )
-    state = {"last_usn": 40, "note_ids": []}
+    state = {"v": 1, "last_usn": 40, "account": "production:12345", "note_ids": {}}
 
     with pytest.raises(EvernoteRateLimitError):
         list(_sync_records(client_rate_limited, state))
@@ -372,7 +391,12 @@ def test_server_update_count_less_than_last_usn_triggers_full_resync():
         notes=[SimpleNamespace(guid="n-resync", title="Resynced", active=True)],
     )
     client = FakeCursorEvernoteClient(chunks=[chunk], update_count=30)
-    state = {"last_usn": 50, "note_ids": ["n-old"]}
+    state = {
+        "v": 1,
+        "last_usn": 50,
+        "account": "production:12345",
+        "note_ids": {"n-old": "nb-1"},
+    }
 
     rows = list(_sync_records(client, state))
 
@@ -388,7 +412,7 @@ def test_server_update_count_less_than_last_usn_triggers_full_resync():
     assert active[0]["id"] == "n-resync"
     # New last_usn is stored
     assert state["last_usn"] == 30
-    assert state["note_ids"] == ["n-resync"]
+    assert state["note_ids"] == {"n-resync": ""}
 
 
 def test_dlt_pipeline_real_persistence_across_runs(tmp_path):
@@ -421,18 +445,88 @@ def test_dlt_pipeline_real_persistence_across_runs(tmp_path):
     # Read state from pipeline
     sources_state = pipeline.state.get("sources", {}).get("evernote_cursor_test", {})
     pipe_state = sources_state.get("resources", {}).get("evernote_notes", {})
+    assert pipe_state.get("v") == 1
     assert pipe_state.get("last_usn") == 50
-    assert pipe_state.get("note_ids") == ["n-1"]
+    assert pipe_state.get("note_ids") == {"n-1": "nb-1"}
 
     # Run 2: no changes (server updateCount == 50)
     client.update_count = 50
     client.current_time = 1609500000000
+    v1 = pipeline.state.get("_state_version")
     source2 = evernote_source(token="fake-tok", client=client)
     pipeline.run(source2, write_disposition="merge")
+    v2 = pipeline.state.get("_state_version")
+
+    # Pipeline state version must not increase on a no-change run
+    assert v2 == v1
 
     sources_state2 = pipeline.state.get("sources", {}).get("evernote_cursor_test", {})
     pipe_state2 = sources_state2.get("resources", {}).get("evernote_notes", {})
     assert pipe_state2.get("last_usn") == 50
-    assert pipe_state2.get("last_sync_time") == 1609500000000
+    # last_sync_time remains unchanged from run 1
+    assert pipe_state2.get("last_sync_time") == 1609459200000
+    # Deep equality of resource state across no-change runs
+    assert pipe_state2 == pipe_state
     # No chunk call was made during run 2
     assert len(client.get_filtered_sync_chunk_calls) == 1  # only run 1's call
+
+
+def test_two_consecutive_no_change_runs_leave_state_dict_deep_equal_and_sync_time_unchanged():
+    """Two consecutive no-change runs leave state dict deep equal with unchanged sync time."""
+    client = FakeCursorEvernoteClient(update_count=50, current_time=1609500000000)
+    state = {
+        "v": 1,
+        "account": "production:12345",
+        "last_usn": 50,
+        "last_sync_time": 1609459200000,
+        "notebooks": {"nb-1": "Engineering"},
+        "tags": {},
+        "note_ids": {"n-1": "nb-1"},
+        "scope": {"notebooks": None, "tags": None, "notebook_guids": None, "tag_guids": None},
+    }
+    initial_copy = dict(state)
+
+    # First no-change run
+    rows1 = list(_sync_records(client, state))
+    assert [r for r in rows1 if isinstance(r, dict)] == []
+    assert state == initial_copy
+    assert state["last_sync_time"] == 1609459200000
+
+    # Advance fake clock for second no-change run
+    client.current_time = 1609600000000
+    rows2 = list(_sync_records(client, state))
+    assert [r for r in rows2 if isinstance(r, dict)] == []
+    assert state == initial_copy
+    assert state["last_sync_time"] == 1609459200000
+
+
+def test_old_shape_state_triggers_full_resync_and_overwrites():
+    """Old-shape state (list note_ids, no 'v') triggers full resync and is overwritten."""
+    nb = SimpleNamespace(guid="nb-1", name="Engineering")
+    note1 = SimpleNamespace(guid="n-1", title="First Note", notebookGuid="nb-1", active=True)
+    chunk = SyncChunk(
+        chunkHighUSN=20,
+        updateCount=20,
+        notebooks=[nb],
+        notes=[note1],
+    )
+    client = FakeCursorEvernoteClient(chunks=[chunk], update_count=20, current_time=1609459200000)
+
+    # Old shape: no "v", note_ids is a list
+    state = {
+        "last_usn": 50,
+        "note_ids": ["old-1", "old-2"],
+        "notebooks": {"old-nb": "Old NB"},
+    }
+
+    rows = list(_sync_records(client, state))
+
+    # Must start from USN 0
+    assert len(rows) == 1
+    assert client.get_filtered_sync_chunk_calls[0][0] == 0
+    # Overwritten with target layout
+    assert state["v"] == 1
+    assert state["last_usn"] == 20
+    assert state["note_ids"] == {"n-1": "nb-1"}
+    assert state["notebooks"] == {"nb-1": "Engineering"}
+    assert isinstance(state["note_ids"], dict)
