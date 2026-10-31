@@ -52,8 +52,8 @@ _PAGE_SIZE = 50
 _OVERLAP_MS = 10 * 60 * 1000
 # A change search that keeps paging past this many tickets is replaced by a full read.
 _SEARCH_MAX = 2000
-# Deleted tickets and articles stay in the Recycle Bin for 60 days. A sync after a
-# longer gap could miss a delete, so a full read reconciles the stored ids after this.
+# Deleted tickets stay in the Recycle Bin for 60 days. A sync after a longer gap could
+# miss a delete, so a full read reconciles the stored ticket ids after this.
 _RECONCILE_AFTER_MS = 50 * 24 * 3600 * 1000
 # Stop cleanly when the day's API credits fall this low, leaving some for other apps.
 _MIN_CREDITS = 50
@@ -668,7 +668,8 @@ def sync_desk(
     The first run (and one after more than 50 days, when the Recycle Bin may have
     dropped deletes) reads every ticket; later runs ask the Search API for tickets
     modified since the cursor. Changed tickets are read again with their conversation.
-    Deletes come from the Recycle Bin. A ticket that moves out of the selected
+    Deleted tickets come from the Recycle Bin; deleted articles drop out of the article
+    listing, which is read in full. A ticket or article that moves out of the selected
     departments is forgotten. Running out of API credits or a rate limit stops the run
     cleanly: what was read is kept and the cursor stays, so the next run resumes. The
     state is written after the last row, and dlt keeps it only once the load succeeded.
@@ -753,8 +754,9 @@ def sync_desk(
             )
             listed = {f"ticket:{t.get('id')}" for t in changed}
             # A stored ticket missing from the listing (archived, say) is looked up on
-            # its own: only one that is really gone is forgotten.
-            for row_id in sorted(set(tickets) - listed):
+            # its own: only one that is really gone is forgotten. Tickets in the Recycle
+            # Bin are forgotten below without a lookup.
+            for row_id in sorted(set(tickets) - listed - binned):
                 ticket = run.ticket(row_id.split(":", 1)[1])
                 if ticket is None or not wanted(ticket):
                     forget.add(row_id)
@@ -772,18 +774,18 @@ def sync_desk(
                 continue
             if unchanged(tickets, row_id, record.get("modifiedTime")):
                 continue
-            ticket = run.ticket(tid)
-            if ticket is None or not wanted(ticket):
-                emit(row_id, None, tickets, None)
-                continue
             try:
+                ticket = run.ticket(tid)
+                if ticket is None or not wanted(ticket):
+                    emit(row_id, None, tickets, None)
+                    continue
                 threads, comments = run.conversation(tid, include_comments)
             except ZohoDeskAPIError as exc:
-                # A ticket deleted between the search and this read answers 403 or 404;
-                # it is skipped, not forgotten, and the Recycle Bin settles it next run.
+                # A ticket deleted after the Recycle Bin was read answers 403 or 404; it is
+                # skipped, not forgotten, and the Recycle Bin settles it next run.
                 if exc.status not in (403, 404, 422):
                     raise
-                logger.warning("Zoho Desk: a ticket's conversation is gone (HTTP %s).", exc.status)
+                logger.warning("Zoho Desk: a ticket could not be read (HTTP %s).", exc.status)
                 continue
             department = names.get(str(ticket.get("departmentId")), "")
             row = ticket_to_row(ticket, threads, comments, department)
@@ -886,7 +888,8 @@ def zoho_desk_source(
             article that moves out of them is forgotten.
         include_comments: Include ticket comments, labelled ``Internal comment`` (or
             ``Comment`` when public). Switching it re-reads every ticket.
-        include_articles: Include published knowledge-base articles.
+        include_articles: Include published knowledge-base articles. Turning it off
+            forgets them.
         resource_name: Table name and key of the sync state: lowercase letters and
             digits with single underscores, at most 51 characters. Give each
             organization its own. Keep it fixed across runs.

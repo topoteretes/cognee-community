@@ -143,9 +143,9 @@ Support tickets hold customers' personal data. What the connector does:
 
 **How deletion is honoured**
 
-- Deleted tickets (through the Recycle Bin) and deleted articles (through the Knowledge Base's trash) are forgotten on the **next sync**;
-  so are unpublished articles, and tickets and articles moved out of the selected
-  departments.
+- Deleted tickets (through the Recycle Bin) and deleted articles (through the Knowledge
+  Base's trash) are forgotten on the **next sync**; so are unpublished articles, and
+  tickets and articles moved out of the selected departments.
 - `cognee.forget(dataset=...)` alone is not enough: dlt keeps its staging copy of the rows,
   so the next sync brings forgotten tickets back. Delete the ticket in Zoho Desk, or narrow
   `departments`, and the next sync forgets it.
@@ -154,6 +154,10 @@ Support tickets hold customers' personal data. What the connector does:
 
 - A ticket restored from the Recycle Bin comes back once it changes again, or at the next
   full read (after 50 days).
+- A ticket deleted and then removed from the Recycle Bin before the next sync is only
+  forgotten at the next full read (after 50 days, or when `departments` or
+  `include_comments` change).
+- Each run reads the whole Recycle Bin (one request per 50 items).
 - Any change re-reads the whole ticket (one request per thread), so a long ticket costs a few
   credits each time it changes.
 - A search that finds more than 2,000 changed tickets is replaced by a full read.
@@ -174,8 +178,9 @@ behaviour seen on a real account.
 - `test_zoho_desk.py` covers rendering (customer, agent, internal thread and comment labels;
   names, never addresses or phone numbers; time order; HTML), the first full read and the
   Search API cursor, replies and comments added and edited, repeats in the overlap window, a
-  search index that lags, the Recycle Bin (and a just-deleted ticket the search still returns), trashed and purged articles, departments (selected, changed, moved out),
-  articles published, edited, unpublished and deleted, `include_comments` and
+  search index that lags, the Recycle Bin (a just-deleted ticket the search still returns,
+  a ticket deleted mid-run), trashed and purged articles, departments (selected, changed,
+  moved out), articles published, edited, unpublished and deleted, `include_comments` and
   `include_articles`, the full read after a long gap, archived tickets missing from the
   listing, listings that count from 1, the credit budget, rate limits, organizations, the
   HTTP client (token refresh, a 401 mid-run, 204, redirects, retries, the credentials), a

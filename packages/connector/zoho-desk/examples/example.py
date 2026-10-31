@@ -9,7 +9,8 @@ One-time setup (see the README for the details)
 1. Create a Self Client in the Zoho API console and exchange a code for a refresh token.
 2. Set ``ZOHO_DESK_DATA_CENTER`` (``com``, ``eu``, ``in``, ...), ``ZOHO_DESK_CLIENT_ID``,
    ``ZOHO_DESK_CLIENT_SECRET`` and ``ZOHO_DESK_REFRESH_TOKEN``. Optionally set
-   ``ZOHO_DESK_DEPARTMENTS`` to a comma-separated list of department ids.
+   ``ZOHO_DESK_DEPARTMENTS`` to a comma-separated list of department ids, and
+   ``ZOHO_DESK_ORG_ID`` when the account belongs to more than one organization.
 3. Set your ``LLM_API_KEY`` (as for any cognee run).
 
 Run it:
@@ -55,6 +56,7 @@ async def main():
         client_id=env["CLIENT_ID"],
         client_secret=env["CLIENT_SECRET"],
         refresh_token=env["REFRESH_TOKEN"],
+        org_id=os.environ.get("ZOHO_DESK_ORG_ID") or None,
         departments=departments or None,
     )
     result = await cognee.remember(source, dataset_name=DATASET_NAME, **ZOHO_DESK_REMEMBER_KWARGS)

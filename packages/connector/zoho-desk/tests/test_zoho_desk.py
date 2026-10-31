@@ -3,13 +3,14 @@
 Coverage: ticket and article rendering (customer, agent, internal thread and comment
 labels; names, never email addresses or phone numbers; time order; HTML), the first full
 read and the Search API cursor, replies and comments added and edited, repeats in the
-overlap window, a search index that lags, the Recycle Bin and a just-deleted ticket the
-search still returns, trashed and purged articles, departments (selected, moved
-out), articles published, edited, unpublished and deleted, include_comments and
-include_articles, the reconcile after a long gap, archived tickets missing from the
-listing, listings that count from 1, the credit budget, rate limits, organizations, the
-HTTP client (token refresh, a 401 mid-run, 204, redirects, retries, the credentials),
-config validation, check_active, the sync stats, and real dlt merges into SQLite.
+overlap window, a search index that lags, the Recycle Bin, a just-deleted ticket the
+search still returns and a ticket deleted mid-run, trashed and purged articles,
+departments (selected, moved out), articles published, edited, unpublished and deleted,
+include_comments and include_articles, the reconcile after a long gap, archived tickets
+missing from the listing, listings that count from 1, the credit budget, rate limits,
+organizations, the HTTP client (token refresh, a 401 mid-run, 204, redirects, retries,
+the credentials), config validation, check_active, the sync stats, and real dlt merges
+into SQLite.
 """
 
 import io
@@ -371,6 +372,41 @@ def test_after_a_long_gap_a_full_read_catches_deletes_the_bin_no_longer_holds():
     fake.now += 55 * DAY
     assert ids(sync(fake, state)) == [(f"ticket:{a}", True)]
     assert f"ticket:{b}" in state["tickets"]
+
+
+def test_a_full_read_forgets_a_binned_ticket_without_looking_it_up():
+    """A ticket in the Recycle Bin is not read on its own during a full read: reading a
+    trashed ticket can answer 403, which would fail the run."""
+    fake = FakeZohoDesk()
+    a = fake.ticket("A")
+    b = fake.ticket("B")
+    state = {}
+    sync(fake, state)
+    fake.delete_ticket(a)
+    fake.fail[f"/tickets/{a}"] = 403
+    fake.now += 55 * DAY  # long gap: full read
+    mark = len(fake.calls)
+    assert ids(sync(fake, state)) == [(f"ticket:{a}", True)]
+    assert f"/tickets/{a}" not in fake.calls[mark:]
+    assert f"ticket:{b}" in state["tickets"]
+
+
+def test_a_ticket_deleted_after_the_bin_was_read_is_skipped_not_forgotten():
+    """A ticket trashed between the Recycle Bin read and its own read answers 403: it is
+    skipped this run, the other changes still sync, and the bin settles it next run."""
+    fake = FakeZohoDesk()
+    a = fake.ticket("A")
+    b = fake.ticket("B")
+    state = {}
+    sync(fake, state)
+    fake.comment(a, "Changed")
+    fake.comment(b, "Changed too")
+    fake.fail[f"/tickets/{a}"] = 403
+    assert ids(sync(fake, state)) == [(f"ticket:{b}", False)]
+    assert f"ticket:{a}" in state["tickets"]
+    del fake.fail[f"/tickets/{a}"]
+    fake.delete_ticket(a)
+    assert ids(sync(fake, state)) == [(f"ticket:{a}", True)]
 
 
 def test_a_ticket_missing_from_the_full_listing_but_still_readable_is_kept():
