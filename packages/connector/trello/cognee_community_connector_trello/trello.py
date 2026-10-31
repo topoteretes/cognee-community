@@ -80,6 +80,8 @@ _RETRIES = 5
 _MAX_RETRY_WAIT = 60.0
 # 150 seconds of the per-token limit, enough for a few hundred changed cards.
 DEFAULT_MAX_REQUESTS = 1500
+# dlt table names stay readable up to this length; the merged Asana connector uses it too.
+_MAX_RESOURCE_NAME = 64
 # The card fields the documents use; badges carries the comment count.
 _CARD_FIELDS = "id,name,desc,idList,labels,idMembers,start,due,dueComplete,closed,shortUrl,badges"
 # Comment actions need only the text, the date and the author's name.
@@ -138,26 +140,45 @@ class TrelloClient:
         *,
         http: Any = None,
         sleep: Callable[[float], None] = time.sleep,
+        check_active: Callable[[], None] | None = None,
     ):
         for value in (api_key, token):
             # Reject early and without echoing the value: httpx would put an
             # invalid header value into its exception.
             if not value or not value.isascii() or not value.isprintable() or " " in value:
                 raise ValueError("The Trello API key or token is empty or has an invalid format")
-        import httpx
 
         self._headers = {
             "Authorization": f'OAuth oauth_consumer_key="{api_key}", oauth_token="{token}"'
         }
-        self._http = http or httpx.Client(timeout=_TIMEOUT)
+        # An injected client belongs to the caller; one made here is closed by close().
+        self._http = http
+        self._owned = http is None
         self._sleep = sleep
+        self._check_active = check_active
 
     def __repr__(self) -> str:
         return "TrelloClient(credentials=<redacted>)"
 
+    def close(self) -> None:
+        """Close the HTTP client this object made; the next request opens a new one."""
+        if self._owned and self._http is not None:
+            self._http.close()
+            self._http = None
+
+    def _wait(self, seconds: float) -> None:
+        # The host may revoke access while a retry waits, so ask before and after.
+        if self._check_active is not None:
+            self._check_active()
+        self._sleep(seconds)
+        if self._check_active is not None:
+            self._check_active()
+
     def get(self, path: str, params: dict[str, Any] | None = None) -> Any:
         import httpx
 
+        if self._http is None:
+            self._http = httpx.Client(timeout=_TIMEOUT)
         attempt = 0
         while True:
             last = attempt == _RETRIES - 1
@@ -166,7 +187,7 @@ class TrelloClient:
             except httpx.TransportError as exc:
                 if last:
                     raise TrelloAPIError(f"Trello request failed: {type(exc).__name__}") from None
-                self._sleep(float(2**attempt))
+                self._wait(float(2**attempt))
                 attempt += 1
                 continue
             status = response.status_code
@@ -174,9 +195,9 @@ class TrelloClient:
                 wait = _retry_after(response)
                 if last or (wait is not None and wait > _MAX_RETRY_WAIT):
                     raise TrelloRateLimitedError("Trello rate limit exceeded (HTTP 429)")
-                self._sleep(wait if wait is not None else float(2**attempt))
+                self._wait(wait if wait is not None else float(2**attempt))
             elif status >= 500 and not last:
-                self._sleep(float(2**attempt))
+                self._wait(float(2**attempt))
             elif status == 401:
                 raise TrelloAuthError("Trello rejected the API key or token (HTTP 401)")
             elif status != 200:
@@ -395,7 +416,12 @@ class _Walker:
     def _cards(self, board_id: str) -> list[dict]:
         # The nested form has no documented cap; /boards/{id}/cards takes a limit of 1000.
         params = {"fields": "id", "cards": "all", "card_fields": _CARD_FIELDS}
-        return self._get(f"/boards/{board_id}", params).get("cards") or []
+        board = self._get(f"/boards/{board_id}", params)
+        cards = board.get("cards") if isinstance(board, dict) else None
+        # A 200 without a card list must not read as "every card was deleted".
+        if not isinstance(cards, list):
+            raise TrelloAPIError(f"Trello answered without a card list for board {board_id}")
+        return cards
 
     def _checklists(self, board_id: str) -> dict[str, list[dict]]:
         by_card: dict[str, list[dict]] = {}
@@ -630,9 +656,12 @@ class _Walker:
     def _drop_board(self, board_id: str, boards: dict[str, dict], visit: dict) -> Iterator[dict]:
         """A deleted, hidden or deselected board: its document goes now, its cards wait
         for the end of the pass, in case one moved to another selected board."""
-        logger.warning("Forgetting Trello board %s and its cards.", board_id)
-        entry = boards.pop(board_id)
         visit["present"].pop(board_id, None)
+        entry = boards.pop(board_id, None)
+        if entry is None:
+            # Discovered this run and gone before its first save: nothing to forget.
+            return
+        logger.warning("Forgetting Trello board %s and its cards.", board_id)
         visit["orphans"] = sorted(set(visit["orphans"]) | set(entry["cards"]))
         if entry["board"]:
             self.stats["deleted"] += 1
@@ -713,12 +742,33 @@ def _default_resource_name(board_ids: list[str] | None, workspace_id: str | None
             "scopes this sync's state and cleanup, and two sources sharing one would "
             "delete each other's cards."
         )
-    scope = board_ids[0] if board_ids else workspace_id
+    scope = str(board_ids[0] if board_ids else workspace_id)
     slug = re.sub(r"[^a-z0-9]+", "_", scope.lower()).strip("_")
+    digest = hashlib.sha256(scope.encode()).hexdigest()[:8]
     if slug != scope:
         # "Acme Co" and "acme-co" share a slug, so the raw value keeps them apart.
-        slug += "_" + hashlib.sha256(scope.encode()).hexdigest()[:8]
+        slug += "_" + digest
+    if len("trello_" + slug) > _MAX_RESOURCE_NAME:
+        # A long workspace name is cut, and the hash keeps cut names apart.
+        slug = slug[: _MAX_RESOURCE_NAME - len("trello__") - len(digest)].rstrip("_")
+        slug += "_" + digest
     return "trello_" + slug
+
+
+def _check_resource_name(name: Any) -> None:
+    """A non-empty name of at most 64 characters that dlt keeps as it is.
+
+    It names the table and scopes the state: an empty name would lose that scope,
+    and two names dlt normalizes alike ("Foo-Bar", "foo_bar") would share a table.
+    """
+    from dlt.common.normalizers.naming.snake_case import NamingConvention
+
+    if not isinstance(name, str) or not name:
+        raise ValueError("resource_name must be a non-empty string")
+    if len(name) > _MAX_RESOURCE_NAME:
+        raise ValueError(f"resource_name must be at most {_MAX_RESOURCE_NAME} characters")
+    if NamingConvention().normalize_table_identifier(name) != name:
+        raise ValueError("resource_name must be lowercase snake_case (letters, digits, _)")
 
 
 def trello_source(
@@ -760,7 +810,8 @@ def trello_source(
             Defaults to one derived from the board or workspace; required when
             ``board_ids`` lists several boards, or when neither ``board_ids`` nor
             ``workspace_id`` is given.
-        check_active: Optional host authorization checkpoint, called before each request.
+        check_active: Optional host authorization checkpoint, called before each request
+            and, in the client built here, around every retry wait.
         service: Pre-built client (see :class:`TrelloClient`). Mainly an injection
             point for tests and hosts. ``client`` is accepted as an alias.
 
@@ -782,14 +833,18 @@ def trello_source(
 
     if isinstance(board_ids, str):
         raise TypeError("board_ids must be a list of board ids, not a string")
-    name = resource_name or _default_resource_name(board_ids, workspace_id)
+    name = (
+        _default_resource_name(board_ids, workspace_id) if resource_name is None else resource_name
+    )
+    _check_resource_name(name)
     service = service or client
-    if service is None:
+    owned = service is None
+    if owned:
         if not (api_key and token):
             raise ValueError(
                 "Trello credentials missing: pass api_key and token, or a pre-built service."
             )
-        service = TrelloClient(api_key=api_key, token=token)
+        service = TrelloClient(api_key=api_key, token=token, check_active=check_active)
 
     config = _TrelloConfig(
         board_ids=tuple(str(b) for b in board_ids or ()),
@@ -813,9 +868,23 @@ def trello_source(
     )
     def trello_cards():
         stats.clear()
-        stats.update(emitted=0, unchanged=0, deleted=0, gone=0, failed=0)
+        stats.update(
+            emitted=0,
+            unchanged=0,
+            deleted=0,
+            gone=0,
+            failed=0,
+            failed_rate_limit=0,
+            failed_auth=0,
+            failed_budget=0,
+        )
         rows = _iter_rows(service, config, dlt.current.resource_state(), stats, check_active)
-        yield from dlt_utils.guarded_rows(rows, check_active)
+        try:
+            yield from dlt_utils.guarded_rows(rows, check_active)
+        finally:
+            # Also on errors and when dlt stops early; an injected service is the caller's.
+            if owned:
+                service.close()
 
     resource = trello_cards()
     setattr(resource, DOCUMENT_SOURCE_ATTR, "trello")

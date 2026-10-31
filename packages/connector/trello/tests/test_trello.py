@@ -119,6 +119,47 @@ def test_client_stops_on_a_long_retry_after_or_endless_429():
     assert len(requests) == 5
 
 
+def test_client_checks_access_around_every_retry_wait():
+    checks = []
+
+    def revoke_after_the_first_check():
+        checks.append(True)
+        if len(checks) > 1:
+            raise PermissionError("access revoked")
+
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(503)
+
+    client = TrelloClient(
+        "key-1",
+        "tok-1",
+        http=httpx.Client(transport=httpx.MockTransport(handler)),
+        sleep=lambda seconds: None,
+        check_active=revoke_after_the_first_check,
+    )
+    with pytest.raises(PermissionError):
+        client.get("/members/me")
+    # Checked before the wait and again after it, so the retry never goes out.
+    assert len(requests) == 1 and len(checks) == 2
+
+
+def test_client_closes_only_the_http_client_it_made():
+    injected = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200, json={})))
+    TrelloClient("key-1", "tok-1", http=injected).close()
+    assert not injected.is_closed
+
+    owned = TrelloClient("key-1", "tok-1")
+    owned._http = made = httpx.Client(
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, json={}))
+    )
+    owned._owned = True
+    owned.close()
+    assert made.is_closed and owned._http is None
+
+
 def test_client_errors_carry_status_only():
     client, requests, _ = _client([httpx.Response(401, text="invalid token")])
     with pytest.raises(TrelloAuthError):
@@ -658,6 +699,30 @@ def test_empty_board_listing_waits_for_confirmation(trello):
     assert "empty_listing" not in state
 
 
+def test_new_board_that_answers_404_before_its_first_save_is_skipped(trello):
+    trello.add_board("b2", "Ops")
+    trello.add_card("c1", "Export")
+    trello.errors["b2"] = 404
+    state = {}
+    rows = _run(trello, state, board_ids=())
+    assert _ids(rows) == [f"board:{BOARD}", "card:c1"]
+    assert "b2" not in state["boards"]
+
+
+def test_board_answer_without_a_card_list_raises_and_forgets_nothing(trello):
+    trello.add_card("c1", "Export")
+    state = {}
+    _run(trello, state)
+    real_get = trello.get
+    trello.get = lambda path, params=None: (
+        {"id": BOARD} if params and "cards" in params else real_get(path, params)
+    )
+    trello.act(BOARD)
+    with pytest.raises(TrelloAPIError, match="card list"):
+        _run(trello, state)
+    assert "c1" in state["boards"][BOARD]["cards"]
+
+
 def test_board_listing_that_is_not_a_list_raises(trello):
     trello.add_card("c1", "Export")
     state = {}
@@ -782,7 +847,21 @@ def test_client_is_built_with_keyword_arguments(monkeypatch):
     seen = {}
     monkeypatch.setattr(trello_module, "TrelloClient", lambda **kwargs: seen.update(kwargs) or "c")
     trello_source([BOARD], api_key="key", token="tok")
-    assert seen == {"api_key": "key", "token": "tok"}
+    assert seen == {"api_key": "key", "token": "tok", "check_active": None}
+
+
+@pytest.mark.parametrize("name", ["", "Trello-Team", "trello team", "t" * 65, 7])
+def test_invalid_resource_name_is_rejected(trello, name):
+    with pytest.raises(ValueError, match="resource_name"):
+        trello_source([BOARD], service=trello, resource_name=name)
+
+
+def test_derived_resource_name_stays_valid_for_a_long_workspace(trello):
+    names = {
+        trello_source(workspace_id=workspace, service=trello).name
+        for workspace in ("a" * 80, "a" * 80 + "b")
+    }
+    assert len(names) == 2 and all(len(name) <= 64 for name in names)
 
 
 # ---------------------------------------------------------------------------
@@ -828,6 +907,29 @@ def test_pipeline_resyncs_only_changes_and_forgets_deletions(dlt_mod, tmp_path, 
     trello.act(BOARD, "deleteCard", card={"id": "c2"})
     pipeline.run(trello_source([BOARD], service=trello))
     assert _staged(pipeline) == {f"board:{BOARD}", "card:c1"}
+
+
+def test_owned_client_is_closed_and_stats_carry_every_key(dlt_mod, tmp_path, trello, monkeypatch):
+    from cognee_community_connector_trello import trello as trello_module
+
+    closed = []
+
+    class Owned:
+        def __init__(self, **kwargs):
+            pass
+
+        def get(self, path, params=None):
+            return trello.get(path, params)
+
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(trello_module, "TrelloClient", Owned)
+    source = trello_source([BOARD], api_key="key", token="tok")
+    _pipeline(dlt_mod, tmp_path).run(source)
+    assert closed == [True]
+    assert source.cognee_sync_stats["failed"] == 0
+    assert {"failed_rate_limit", "failed_auth", "failed_budget"} <= set(source.cognee_sync_stats)
 
 
 def test_two_sources_in_one_dataset_keep_their_own_cards(dlt_mod, tmp_path, trello):

@@ -70,7 +70,7 @@ the same call again to sync only what changed. See `examples/example.py`.
 | `include_checklists` | `True` | Add each card's checklists to its document. |
 | `full_resync` | `False` | Re-render every card and read all comments again. |
 | `max_requests` | `1500` | Request budget of one run, checked before each request once a card or board is saved. A bigger account finishes over several runs, which visit the boards in turn. |
-| `resource_name` | derived | Names this sync's state and cleanup. Derived from the board or the workspace (plus a short hash when it has capitals, spaces or punctuation); **required** when `board_ids` lists several boards or when neither `board_ids` nor `workspace_id` is given, since two sources sharing one would delete each other's cards. |
+| `resource_name` | derived | Names this sync's state and cleanup. Derived from the board or the workspace (plus a short hash when it has capitals, spaces or punctuation); **required** when `board_ids` lists several boards or when neither `board_ids` nor `workspace_id` is given, since two sources sharing one would delete each other's cards. A name you pass must be lowercase snake_case (letters, digits, `_`) of at most 64 characters, so dlt keeps it as it is; a derived name is cut to fit, with the hash keeping cut names apart. |
 
 Changing `include_comments` or `include_checklists` re-renders every card on the next run.
 
@@ -116,16 +116,22 @@ the only trace is `failed_auth` in `cognee_sync_stats`.
   pass read that board, and the next pass syncs it from there. It is forgotten when
   Trello answers 404, or 401 while the token still works (a board you cannot read). A
   run cut short during these checks goes on with the remaining cards. A board discovered through
-  `workspace_id` or your board list is forgotten when Trello answers 404, and a board
-  listing that comes back empty while boards were synced before forgets nothing until the
-  next run confirms it.
+  `workspace_id` or your board list is forgotten when Trello answers 404 (one that answers
+  404 before it was ever synced is skipped), and a board listing that comes back empty
+  while boards were synced before forgets nothing until the next run confirms it. A board
+  or card answer without its list raises instead of reading as "everything deleted".
 - **A run is bounded.** On a rate limit (Trello allows 100 requests per 10 seconds per
   token and 300 per key, and `Retry-After` is honoured up to 60 seconds), an expired token
   after progress, or a spent `max_requests` budget, the run stops cleanly, keeps the boards
   and cards it finished, and reports it in `cognee_sync_stats`: `failed` is set on every
   cut, since the sync is incomplete, with `failed_rate_limit`, `failed_auth` or
-  `failed_budget` saying why. The next run starts after the last board it finished. Any other error
-  raises, and dlt keeps the previous state.
+  `failed_budget` saying why; all of these keys are present on every run, `0` when unused.
+  The next run starts after the last board it finished. Any other error raises, and dlt
+  keeps the previous state.
+- **Host checks and cleanup.** `check_active` is called before every request, and the
+  client built from `api_key` and `token` also calls it before and after each retry wait,
+  so revoked access stops a run even mid-retry. That client is closed at the end of every
+  run, also on errors; a `service` you pass in stays yours to close.
 
 **Requests per run:** one `/members/me` check, then two per unchanged board (the feed and
 the board itself). A changed board adds two (its cards and checklists) plus the comment
