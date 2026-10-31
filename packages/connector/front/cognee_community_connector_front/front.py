@@ -533,15 +533,20 @@ class _Run:
         """
         try:
             self.client.get(f"/conversations/{conversation_id}")
+            return {
+                i["id"]
+                for i in self.pages(f"/conversations/{conversation_id}/inboxes")
+                if isinstance(i.get("id"), str)
+            }
         except FrontAPIError as exc:
-            if exc.status == 404 or (exc.status is not None and 300 <= exc.status < 400):
+            if _gone(exc):
                 return None
             raise
-        return {
-            i["id"]
-            for i in self.pages(f"/conversations/{conversation_id}/inboxes")
-            if isinstance(i.get("id"), str)
-        }
+
+
+def _gone(exc: FrontAPIError) -> bool:
+    """A 404 (deleted for good) or a 3xx (merged into another conversation)."""
+    return exc.status == 404 or (exc.status is not None and 300 <= exc.status < 400)
 
 
 def _check_owner(state: dict, owner: str) -> None:
@@ -647,8 +652,18 @@ def sync_inboxes(
             saved = known.get(cid)
             if saved and not rerender and all(saved.get(k) == v for k, v in stamp.items()):
                 continue
-            messages = run.messages(cid)
-            comments = run.comments(cid) if include_comments else []
+            try:
+                messages = run.messages(cid)
+                comments = run.comments(cid) if include_comments else []
+            except FrontAPIError as exc:
+                # Deleted or merged after the listing was read: skipped, not forgotten.
+                # The next listing no longer has it, and the lookup settles it then.
+                if not _gone(exc):
+                    raise
+                logger.warning(
+                    "Front: a conversation went away while syncing (HTTP %s).", exc.status
+                )
+                continue
             row = conversation_to_row(
                 conversation, messages, comments, inbox_states[inbox_id]["name"]
             )

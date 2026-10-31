@@ -1,15 +1,16 @@
 """Unit tests for the Front connector, against ``FakeFront`` (see fake_front.py).
 
-Coverage: conversation rendering (customer, teammate and internal comment labels,
-names not addresses, drafts left out, HTML and entities, time order, tags, node sets),
-the first sync and later runs that only re-read changed conversations, a tag-only
-change, comments added, edited and deleted, a deleted message, trash and restore,
-permanent delete (404), merge (301, never followed), a move out of and between the
-selected inboxes, archived conversations kept or left out, include_comments switched,
-a dropped inbox, paging, an inbox that fails or keeps failing, rate limits, the HTTP
-client (retries, dropped connections, long waits, redirects, a 200 without JSON, ids
-kept out of errors, the token, pacing from the rate-limit headers), config validation,
-check_active, the sync stats, and real dlt merges into SQLite.
+Coverage: conversation rendering (customer, teammate and internal comment labels, names
+not addresses, drafts left out, HTML and entities, time order, tags, node sets), the
+first sync and later runs that only re-read changed conversations, a tag-only change,
+comments added, edited and deleted, a deleted message, trash and restore, permanent
+delete (404), merge (301, never followed), a conversation deleted or merged mid-sync, a
+move out of and between the selected inboxes, archived conversations kept or left out,
+include_comments switched, a dropped inbox, paging, an inbox that fails or keeps
+failing, rate limits, the HTTP client (retries, dropped connections, long waits,
+redirects, a 200 without JSON, ids kept out of errors, the token, pacing from the rate-
+limit headers), config validation, check_active, the sync stats, and real dlt merges
+into SQLite.
 """
 
 import http.client
@@ -22,7 +23,7 @@ import pytest
 from dlt.destinations.exceptions import DatabaseUndefinedRelation
 from dlt.extract.exceptions import ResourceExtractionError
 from dlt.pipeline.exceptions import PipelineStepFailed
-from fake_front import API, BOB, FakeFront
+from fake_front import API, BOB, FakeFront, fail
 
 from cognee_community_connector_front import front_source
 from cognee_community_connector_front.front import (
@@ -258,6 +259,44 @@ def test_a_move_out_of_the_selection_forgets_and_a_move_between_selected_inboxes
     assert sorted(ids(rows)) == sorted([(a, False), (b, True)])
     moved = next(r for r in rows if r["id"] == a)
     assert moved["cognee_node_set"] == ["Billing"] and "Inbox: Billing" in moved["content"]
+
+
+def test_a_conversation_deleted_or_merged_while_syncing_is_skipped_then_forgotten():
+    """Deleted for good (404) or merged away (301) after the listing was read: its
+    messages cannot be read, so it is skipped this run while the others sync, and the
+    next run forgets it."""
+    for status in (404, 301):
+        fake = FakeFront()
+        a = fake.conversation("A")
+        b = fake.conversation("B")
+        state = {}
+        sync(fake, state)
+        fake.inbound(a, "Changed")
+        fake.inbound(b, "Changed too")
+        fake.fail[f"/conversations/{a}/messages"] = status
+        assert ids(sync(fake, state)) == [(b, False)]
+        assert a in state["conversations"]
+        del fake.fail[f"/conversations/{a}/messages"]
+        fake.purge(a)
+        assert ids(sync(fake, state)) == [(a, True)]
+
+
+def test_a_lookup_that_loses_the_conversation_midway_forgets_it():
+    fake = FakeFront()
+    a = fake.conversation("A")
+    state = {}
+    sync(fake, state)
+    real_get = fake.get
+
+    def get(path, params=None):
+        if path == f"/inboxes/{INBOX}/conversations":
+            return {"_results": [], "_pagination": {"next": None}}
+        if path == f"/conversations/{a}/inboxes":
+            fail(404)  # purged between the two lookup requests
+        return real_get(path, params)
+
+    fake.get = get
+    assert ids(sync(fake, state)) == [(a, True)]
 
 
 def test_a_conversation_missing_from_its_listing_but_still_selected_is_kept():

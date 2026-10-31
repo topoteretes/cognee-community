@@ -83,7 +83,7 @@ written), `deleted`, `skipped` (re-read but unchanged), `failed`, plus `failed_i
 | Each sync | Front's conversation listing is not ordered by `updated_at`, and adding or renaming a tag does not move `updated_at`, so every sync pages through the selected inboxes' listings in full (100 conversations a request). Only a conversation whose `updated_at`, tag names, status or inbox changed has its messages and comments read again. |
 | What moves `updated_at` | A new message, a deleted message, a comment added, edited or deleted, a subject edit, trash and restore, a merge (on the surviving conversation) and a move. These were checked on a Front account; see the connector issue. |
 | Deletes | A trashed conversation stays in the listing with `status="deleted"` and is forgotten; a restore brings it back. A stored conversation missing from a complete listing is looked up on its own: a 404 (deleted for good) or a 301 (merged into another) means it is forgotten, and so does a 200 in an inbox that is not selected (moved out). Forgetting uses the `_deleted` hard-delete marker, which dlt drops on `merge` and cognee's orphan cleanup removes from the graph, vector and relational stores. Front's `/events` is not used: deleting a comment or a conversation erases its earlier events instead of recording a delete. |
-| Merges | The 301 of a merged-away conversation is never followed (it would store the survivor's content under the old id). The survivor's `updated_at` moves, so it is read again with the merged messages. |
+| Merges | The 301 of a merged-away conversation is never followed (it would store the survivor's content under the old id). The survivor's `updated_at` moves, so it is read again with the merged messages. A conversation deleted or merged while a sync runs (its messages answer 404 or 301) is skipped that run and forgotten on the next. |
 | Archived | Kept by default; with `include_archived=False` left out and forgotten once archived. |
 | Dropped inboxes | Taking an inbox out of `inboxes` forgets its conversations on the next sync. |
 | Lost access | A failed inbox listing (403, 404, a 5xx after the retries) never forgets anything. The inbox is retried next run while the others still sync; once it has failed three runs in a row the run raises with the reason. A run where every inbox failed raises at once. |
@@ -166,11 +166,11 @@ behaviour seen on a real account.
   never addresses; drafts; HTML and entities; time order; tags; node sets), the first sync
   and later runs that only re-read changed conversations, a tag-only change, comments added,
   edited and deleted, a deleted message, trash and restore, permanent delete, merge (the 301
-  is never followed), moves out of and between selected inboxes, archived conversations kept
-  or left out, `include_comments` switched, a dropped inbox, paging, an inbox that fails or
-  keeps failing, rate limits, the HTTP client (retries, dropped connections, long waits,
-  redirects, a 200 without JSON, ids kept out of errors, the token, pacing), a sync through the real
-  client, config validation, `check_active`, the sync stats, and real dlt merges into SQLite
+  is never followed), a conversation deleted or merged mid-sync, moves out of and between
+  selected inboxes, archived conversations kept or left out, `include_comments` switched, a
+  dropped inbox, paging, an inbox that fails or keeps failing, rate limits, the HTTP client
+  (retries, dropped connections, long waits, redirects, a 200 without JSON, ids kept out of
+  errors, the token, pacing), a sync through the real client, config validation, `check_active`, the sync stats, and real dlt merges into SQLite
   (including a failed load and two accounts in one dataset).
 - `test_front_forget.py` runs the real cognee pipeline (LLM and embeddings mocked). It checks
   that trashed, deleted, merged-away, moved-out and dropped-inbox conversations lose their
