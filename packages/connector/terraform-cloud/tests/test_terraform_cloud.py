@@ -393,20 +393,22 @@ def test_plan_output_can_be_turned_off(org):
 
 
 def test_secrets_are_scrubbed_from_every_field(org):
-    org.add_workspace("ws-3", "secrets", description=f"Uses {AWS_KEY}")
+    org.add_workspace(
+        "ws-3", "secrets", description=f'Uses {AWS_KEY}, db_password = "blue sky river"'
+    )
     org.add_run(
         "ws-3",
         "run-1",
         "2026-10-15T10:00:00.000Z",
-        message="rotate password: hunter2hunter2",
+        message='rotate password: hunter2hunter2, api_key="two word key"',
         plan_log="│ Error: auth failed for postgres://admin:pa55word@db/app\n",
         commit={"commit-sha": "abc", "commit-message": f"use {AWS_KEY}"},
     )
     stats = _stats()
     text = json.dumps(_run(org, {}, stats=stats))
-    for secret in (AWS_KEY, "hunter2hunter2", "pa55word"):
+    for secret in (AWS_KEY, "hunter2hunter2", "pa55word", "sky river", "word key"):
         assert secret not in text
-    assert stats["redacted"] >= 4
+    assert stats["redacted"] >= 6
 
 
 def test_deleted_workspace_forgets_its_runs(org):

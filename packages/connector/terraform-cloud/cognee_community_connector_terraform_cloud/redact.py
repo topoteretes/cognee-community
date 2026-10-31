@@ -27,15 +27,31 @@ _PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 ]
 # Credentials inside a URL: scheme://user:password@host
 _URL_CREDENTIALS = re.compile(r"(\b[a-zA-Z][a-zA-Z0-9+.-]*://)[^/\s:@]+:[^/\s@]+@")
-# key = value / key: value where the key names a secret. Values in parentheses
-# such as "(sensitive value)" or "(known after apply)" are Terraform's own markers.
+# key = value / key: value where the key names a secret. A quoted value runs to its
+# closing quote, spaces and escaped quotes included; a bare one ends at a space or
+# comma. Values in parentheses such as "(sensitive value)" or "(known after apply)"
+# are Terraform's own markers. The key around the secret word is bounded, so long
+# dotted text cannot make the match quadratic.
 _SECRET_ASSIGNMENT = re.compile(
     r"""(?ix)
-    (\b[\w.-]*(?:password|passwd|secret|token|api[_-]?key|access[_-]?key
-        |private[_-]?key|client[_-]?secret|connection[_-]?string)[\w.-]*["']?\s*[=:]\s*)
-    (["']?)(?!\()(?![\[{])([^"'\s,]{4,})\2
+    (\b[\w.-]{0,64}?(?:password|passwd|secret|token|api[_-]?key|access[_-]?key
+        |private[_-]?key|client[_-]?secret|connection[_-]?string)[\w.-]{0,64}["']?\s*[=:]\s*)
+    (?:
+        "(?!\()((?:\\.|[^"\\\n]){4,})"
+      | '(?!\()((?:\\.|[^'\\\n]){4,})'
+      | (?!\()(?![\[{"'])([^"'\s,]{4,})
+    )
     """
 )
+
+
+def _redact_assignment(match: re.Match[str]) -> str:
+    key, double, single = match.group(1), match.group(2), match.group(3)
+    if double is not None:
+        return f'{key}"[REDACTED:secret]"'
+    if single is not None:
+        return f"{key}'[REDACTED:secret]'"
+    return f"{key}[REDACTED:secret]"
 
 
 def strip_ansi(text: str) -> str:
@@ -52,7 +68,5 @@ def scrub(text: str) -> tuple[str, int]:
         count += found
     text, found = _URL_CREDENTIALS.subn(r"\1[REDACTED:credentials]@", text)
     count += found
-    text, found = _SECRET_ASSIGNMENT.subn(
-        lambda m: f"{m.group(1)}{m.group(2)}[REDACTED:secret]{m.group(2)}", text
-    )
+    text, found = _SECRET_ASSIGNMENT.subn(_redact_assignment, text)
     return text, count + found

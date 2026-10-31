@@ -91,7 +91,8 @@ On top of that, every text field (run messages, commit messages, workspace descr
 the plan summary) goes through `redact.scrub` before it is emitted. It strips color codes
 first, then replaces private keys, AWS access keys, GitHub, GitLab, Slack and HCP Terraform
 tokens, JWTs, Azure account keys, credentials inside URLs and secret-looking `key = value`
-pairs with `[REDACTED:<kind>]`. The number of redactions is reported in
+pairs with `[REDACTED:<kind>]`. A quoted value is redacted whole, spaces and escaped quotes
+included (`password = "correct horse battery staple"`). The number of redactions is reported in
 `cognee_sync_stats["redacted"]`. Pattern matching lowers the risk, it cannot promise to
 catch every format, which is why values are left out in the first place.
 

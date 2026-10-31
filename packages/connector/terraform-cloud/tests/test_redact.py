@@ -4,6 +4,8 @@ Fixtures use documented fake values or strings built at runtime, so secret
 scanners do not flag this file.
 """
 
+import time
+
 import pytest
 
 from cognee_community_connector_terraform_cloud.redact import scrub
@@ -36,6 +38,41 @@ def test_each_secret_kind_is_redacted(text, secret, kind):
     assert secret not in scrubbed
     assert f"[REDACTED:{kind}]" in scrubbed
     assert count >= 1
+
+
+@pytest.mark.parametrize(
+    ("text", "secret", "expected"),
+    [
+        (
+            'password = "correct horse battery staple"',
+            "horse battery",
+            'password = "[REDACTED:secret]"',
+        ),
+        (
+            'export DB_PASSWORD="my secret pass"',
+            "secret pass",
+            'export DB_PASSWORD="[REDACTED:secret]"',
+        ),
+        ("api_key: 'two words here'", "words here", "api_key: '[REDACTED:secret]'"),
+        (
+            '{"client_secret": "with \\"quoted\\" part"}',
+            "quoted",
+            '{"client_secret": "[REDACTED:secret]"}',
+        ),
+        ("token=abc123 next", "abc123", "token=[REDACTED:secret] next"),
+    ],
+)
+def test_quoted_values_with_spaces_and_escapes_are_redacted_whole(text, secret, expected):
+    scrubbed, count = scrub(text)
+    assert secret not in scrubbed and count == 1
+    assert scrubbed == expected
+
+
+def test_long_dotted_text_is_scrubbed_in_linear_time():
+    # An unbounded key pattern backtracks quadratically here (about 17 s before).
+    start = time.perf_counter()
+    scrub("a." * 10_000 + "password")
+    assert time.perf_counter() - start < 5
 
 
 def test_color_codes_cannot_hide_a_secret():
