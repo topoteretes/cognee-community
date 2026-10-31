@@ -994,6 +994,9 @@ def test_default_name_is_per_server(discord):
     second = discord_source(guild_id="901", service=discord)
     assert (first.name, second.name) == ("discord_900", "discord_901")
     assert getattr(first, dlt_utils.PIPELINE_SCOPE_ATTR) == "discord_900"
+    # A non-numeric id still gives a valid, distinct name.
+    odd = {discord_source(guild_id=g, service=discord).name for g in ("Acme-1", "日本", "--")}
+    assert len(odd) == 3 and all("__" not in n and n.startswith("discord_") for n in odd)
 
 
 @pytest.mark.parametrize("name", ["", "Discord-Team", "discord team", "d" * 65, 7])

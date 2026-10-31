@@ -975,7 +975,12 @@ def discord_source(
     # forget each other's channels.
     name = resource_name
     if name is None:
-        name = "discord_" + re.sub(r"[^a-z0-9]+", "_", guild.lower())
+        # Guild ids are numeric; anything else keeps a valid name through its hash.
+        slug = re.sub(r"[^a-z0-9]+", "_", guild.lower()).strip("_")
+        if slug != guild:
+            digest = hashlib.sha256(guild.encode()).hexdigest()[:8]
+            slug = f"{slug}_{digest}" if slug else digest
+        name = "discord_" + slug
     _check_resource_name(name)
     service = service or client
     owned = service is None
