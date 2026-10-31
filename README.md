@@ -107,6 +107,13 @@ poetry run python ./examples/example.py
 | `cognee-community-hybrid-adapter-duckdb`     | Hybrid   | DuckDB hybrid database adapter for cognee          |
 | `cognee-community-hybrid-adapter-falkor`     | Hybrid   | FalkorDB hybrid database adapter for cognee        |
 
+## Data-source Connectors
+
+The [Google Cloud Storage connector](packages/connector/gcs/) imports UTF-8 text documents
+from a selected bucket prefix, with service-account or Application Default Credentials,
+incremental sync by object generation, and downstream cleanup when source objects are deleted.
+See its README for setup and examples.
+
 ## Custom Packages
 
 Custom packages are also a part of this repo, containing, for example, custom pipelines, tasks, and retrievers.
