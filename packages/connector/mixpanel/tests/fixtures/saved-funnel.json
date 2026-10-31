@@ -1,0 +1,77 @@
+{
+  "id": 101,
+  "name": "ConnectorTest Signup to Purchase — validation",
+  "type": "funnels",
+  "description": "Synthetic signup then purchase; seven-day window; plan=test.",
+  "params": {
+    "sections": {
+      "show": [
+        {
+          "type": "metric",
+          "behavior": {
+            "type": "funnel",
+            "resourceType": "events",
+            "behaviors": [
+              {
+                "type": "event",
+                "id": null,
+                "name": "ConnectorTestSignup",
+                "filters": [],
+                "filtersDeterminer": "all",
+                "funnelOrder": "loose"
+              },
+              {
+                "type": "event",
+                "id": null,
+                "name": "ConnectorTestPurchase",
+                "filters": [],
+                "filtersDeterminer": "all",
+                "funnelOrder": "loose"
+              }
+            ],
+            "conversionWindowDuration": 7,
+            "conversionWindowUnit": "day",
+            "funnelOrder": "loose",
+            "exclusions": [],
+            "aggregateBy": [],
+            "filter": []
+          },
+          "measurement": {
+            "math": "unique",
+            "property": null,
+            "stepIndex": null
+          }
+        }
+      ],
+      "time": [
+        {
+          "dateRangeType": "in the last",
+          "unit": "day",
+          "window": {
+            "unit": "day",
+            "value": 30
+          }
+        }
+      ],
+      "filter": [
+        {
+          "resourceType": "events",
+          "filterType": "string",
+          "defaultType": "string",
+          "filterValue": [
+            "test"
+          ],
+          "filterOperator": "equals",
+          "value": "plan"
+        }
+      ],
+      "group": [],
+      "formula": []
+    },
+    "displayOptions": {
+      "chartType": "funnel-steps"
+    },
+    "executedMigrations": []
+  },
+  "can_view": true
+}
