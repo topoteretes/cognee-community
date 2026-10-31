@@ -1,0 +1,46 @@
+[project]
+name = "cognee-community-connector-docusign"
+version = "0.1.0"
+description = "DocuSign data-source connector for cognee — sync signed agreements into memory (incremental + forget-on-delete)"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    # Needs document-mode (DOCUMENT_SOURCE_ATTR), table-scoped document cleanup
+    # (DOCUMENT_SYNC_VERSION), PIPELINE_SCOPE_ATTR and the cognee_node_set
+    # column, all in cognee 1.6.x.
+    "cognee==1.6.4",
+    "dlt[sqlalchemy]>=1.9.0,<2",
+    # RS256 signing of the JWT grant assertion.
+    "PyJWT[crypto]>=2.8,<3",
+    # Text layer of the signed PDFs.
+    "pypdf>=4,<7",
+    "requests>=2.31",
+]
+
+[dependency-groups]
+dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+
+[project.urls]
+Homepage = "https://github.com/topoteretes/cognee"
+Repository = "https://github.com/topoteretes/cognee-community"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cognee_community_connector_docusign"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "N", "B", "UP", "C4", "PGH", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
