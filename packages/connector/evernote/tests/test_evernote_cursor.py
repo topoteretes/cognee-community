@@ -363,15 +363,15 @@ def test_rate_limit_and_auth_error_leave_cursor_unchanged():
     note = SimpleNamespace(guid="n-1", title="N1", active=True)
     chunk = SyncChunk(chunkHighUSN=60, updateCount=100, notes=[note])
 
-    # 1. Rate limit error during chunk iteration
+    # 1. Rate limit during chunk iteration ends cleanly with warning; cursor untouched
     client_rate_limited = FakeCursorEvernoteClient(chunks=[chunk], update_count=100)
     client_rate_limited.get_filtered_sync_chunk = lambda *_: (_ for _ in ()).throw(
         EvernoteRateLimitError("Rate limit exceeded")
     )
     state = {"v": 1, "last_usn": 40, "account": "production:12345", "note_ids": {}}
 
-    with pytest.raises(EvernoteRateLimitError):
-        list(_sync_records(client_rate_limited, state))
+    records = [r for r in _sync_records(client_rate_limited, state) if isinstance(r, dict)]
+    assert records == []
     assert state["last_usn"] == 40
 
     # 2. Auth error during sync state check

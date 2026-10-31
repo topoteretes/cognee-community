@@ -439,12 +439,21 @@ def _sync_records(
     tag_names: list[str] | None = None,
     sandbox: bool = False,
     full_resync: bool = False,
+    max_notes_per_run: int | None = 100,
 ) -> Generator[Any, None, None]:
     """Execute the two-pass sync algorithm using the provided state dict.
 
     Updates state only after all rows have been yielded without exception.
+    `max_notes_per_run` limits the number of note bodies fetched in a single run
+    (default 100, a conservative batch limit). Pass None for unlimited.
     """
     log = get_logger("evernote_connector")
+
+    # An empty configured list [] behaves identically to None (no filter)
+    if notebook_names is not None and not notebook_names:
+        notebook_names = None
+    if tag_names is not None and not tag_names:
+        tag_names = None
 
     # Step 0: Account binding
     user_id = api_client.get_user_id()
@@ -461,9 +470,21 @@ def _sync_records(
     is_old_or_foreign = bool(state) and (
         state.get("v") != STATE_VERSION or isinstance(state.get("note_ids"), list)
     )
+    if is_old_or_foreign:
+        state.pop("partial", None)
 
     # Step 1: Call api.get_sync_state() first and read after_usn
-    sync_state = api_client.get_sync_state() if hasattr(api_client, "get_sync_state") else None
+    try:
+        sync_state = api_client.get_sync_state() if hasattr(api_client, "get_sync_state") else None
+    except EvernoteRateLimitError as e:
+        log.warning(
+            "Evernote rate limit reached getting sync state: %s (retry_after=%s)",
+            e,
+            getattr(e, "retry_after", None),
+        )
+        yield dlt.mark.materialize_table_schema()
+        return
+
     current_sync_time = getattr(sync_state, "currentTime", None)
     server_update_count = getattr(sync_state, "updateCount", None)
     full_sync_before = getattr(sync_state, "fullSyncBefore", None)
@@ -490,6 +511,30 @@ def _sync_records(
     # Compute configured scope names
     current_nb_names = sorted(set(notebook_names)) if notebook_names is not None else None
     current_tag_names = sorted(set(tag_names)) if tag_names is not None else None
+
+    current_scope_signature = {
+        "notebooks": current_nb_names,
+        "tags": current_tag_names,
+    }
+
+    # Partial sync recovery
+    partial = state.get("partial")
+    if not isinstance(partial, dict):
+        partial = None
+
+    partial_scope_matches = False
+    resume_usn = 0
+    if partial is not None:
+        partial_scope = partial.get("scope")
+        if partial_scope == current_scope_signature:
+            partial_scope_matches = True
+            resume_usn = int(partial.get("resume_usn", 0) or 0)
+        else:
+            # Scope signature differs: discard partial and start fresh
+            state.pop("partial", None)
+            partial = None
+
+    is_resuming_full = partial_scope_matches and bool(partial.get("full", False))
 
     # Step 2: Determine if this run is a FULL resync upfront.
     # Scope name changes are evaluated first so they cannot be short-circuited by the
@@ -520,7 +565,8 @@ def _sync_records(
         log.info("Evernote configured scope lacks persisted GUID list, triggering full resync.")
 
     is_full_resync = (
-        full_resync
+        is_resuming_full
+        or full_resync
         or is_old_or_foreign
         or name_scope_changed
         or scope_missing_guids
@@ -533,9 +579,15 @@ def _sync_records(
         or (has_last_usn and server_update_count is not None and server_update_count < last_usn)
     )
 
+    if is_full_resync and not is_resuming_full:
+        # A new full resync with no matching partial starts fresh with resume_usn=0
+        resume_usn = 0
+
     # Step 3: Server updateCount == last_usn means nothing changed on server (incremental only)
+    has_partial = bool(state.get("partial"))
     if (
         not is_full_resync
+        and not has_partial
         and has_last_usn
         and server_update_count is not None
         and server_update_count == last_usn
@@ -565,26 +617,35 @@ def _sync_records(
         expunged_nb_guids: set[str] = set()
         highest_chunk_usn: int | None = None
 
-        for chunk in iter_sync_chunks(api_client, after_usn=after_usn, max_entries=250):
-            chunk_usn = getattr(chunk, "chunkHighUSN", None)
-            if chunk_usn is not None and (
-                highest_chunk_usn is None or chunk_usn > highest_chunk_usn
-            ):
-                highest_chunk_usn = chunk_usn
-            for nb in getattr(chunk, "notebooks", None) or []:
-                notebook_map[nb.guid] = nb.name
-            for tag in getattr(chunk, "tags", None) or []:
-                tag_map[tag.guid] = tag.name
-            for note in getattr(chunk, "notes", None) or []:
-                note_meta[note.guid] = note
-            for guid in getattr(chunk, "expungedNotes", None) or []:
-                expunged_guids.add(guid)
-                note_meta.pop(guid, None)
-            for nb_guid in getattr(chunk, "expungedNotebooks", None) or []:
-                expunged_nb_guids.add(nb_guid)
-                notebook_map.pop(nb_guid, None)
-            for tag_guid in getattr(chunk, "expungedTags", None) or []:
-                tag_map.pop(tag_guid, None)
+        try:
+            for chunk in iter_sync_chunks(api_client, after_usn=after_usn, max_entries=250):
+                chunk_usn = getattr(chunk, "chunkHighUSN", None)
+                if chunk_usn is not None and (
+                    highest_chunk_usn is None or chunk_usn > highest_chunk_usn
+                ):
+                    highest_chunk_usn = chunk_usn
+                for nb in getattr(chunk, "notebooks", None) or []:
+                    notebook_map[nb.guid] = nb.name
+                for tag in getattr(chunk, "tags", None) or []:
+                    tag_map[tag.guid] = tag.name
+                for note in getattr(chunk, "notes", None) or []:
+                    note_meta[note.guid] = note
+                for guid in getattr(chunk, "expungedNotes", None) or []:
+                    expunged_guids.add(guid)
+                    note_meta.pop(guid, None)
+                for nb_guid in getattr(chunk, "expungedNotebooks", None) or []:
+                    expunged_nb_guids.add(nb_guid)
+                    notebook_map.pop(nb_guid, None)
+                for tag_guid in getattr(chunk, "expungedTags", None) or []:
+                    tag_map.pop(tag_guid, None)
+        except EvernoteRateLimitError as e:
+            log.warning(
+                "Evernote rate limit reached during pass 1: %s (retry_after=%s)",
+                e,
+                getattr(e, "retry_after", None),
+            )
+            yield dlt.mark.materialize_table_schema()
+            return
 
         # Validate requested notebook_names and tag_names against MERGED maps
         if notebook_names is not None:
@@ -639,8 +700,9 @@ def _sync_records(
                 guid_scope_changed = True
 
         if guid_scope_changed and not is_full_resync:
-            log.info("Evernote scope GUIDs changed, triggering full resync.")
+            log.info("Evernote scope GUIDs changed, restarting full resync from USN 0.")
             is_full_resync = True
+            resume_usn = 0
             continue
 
         break
@@ -699,21 +761,61 @@ def _sync_records(
         tombstoned_count += 1
         updated_note_ids.pop(guid, None)
 
-    # 2. Changed / snapshot note metadata
+    # 2. Changed note metadata: inactive / out-of-scope notes yield tombstones
     for note in note_meta.values():
-        guid = getattr(note, "guid", "")
         if not _is_live_and_in_scope(note):
+            guid = getattr(note, "guid", "")
             yield {"id": guid, "title": "", "content": "", "_deleted": True}
             tombstoned_count += 1
             updated_note_ids.pop(guid, None)
+
+    # 3. Live in-scope notes sorted by updateSequenceNum ascending
+    candidate_notes = [note for note in note_meta.values() if _is_live_and_in_scope(note)]
+    candidate_notes.sort(key=lambda n: getattr(n, "updateSequenceNum", 0) or 0)
+
+    watermark_usn = resume_usn
+    body_fetches = 0
+    is_unfinished = False
+
+    for idx, note in enumerate(candidate_notes):
+        note_usn = getattr(note, "updateSequenceNum", 0) or 0
+        if resume_usn > 0 and note_usn > 0 and note_usn <= resume_usn:
+            watermark_usn = max(watermark_usn, note_usn)
             continue
 
+        if max_notes_per_run is not None and body_fetches >= max_notes_per_run:
+            notes_remaining = len(candidate_notes) - idx
+            log.warning(
+                "Reached max_notes_per_run limit (%d); %d note(s) remaining for next run.",
+                max_notes_per_run,
+                notes_remaining,
+            )
+            is_unfinished = True
+            break
+
+        guid = getattr(note, "guid", "")
         try:
             enml = api_client.get_note_content(guid)
+            body_fetches += 1
+        except EvernoteRateLimitError as e:
+            notes_remaining = len(candidate_notes) - idx
+            retry_after = getattr(e, "retry_after", None)
+            log.warning(
+                "Evernote rate limit reached while fetching note %s: %s "
+                "(%d note(s) remaining, retry_after=%s)",
+                guid,
+                e,
+                notes_remaining,
+                retry_after,
+            )
+            is_unfinished = True
+            break
         except NoteNotFoundError:
+            body_fetches += 1
             yield {"id": guid, "title": "", "content": "", "_deleted": True}
             tombstoned_count += 1
             updated_note_ids.pop(guid, None)
+            watermark_usn = max(watermark_usn, note_usn)
             continue
 
         content_text = enml_to_text(enml)
@@ -723,6 +825,7 @@ def _sync_records(
             yield {"id": guid, "title": "", "content": "", "_deleted": True}
             tombstoned_count += 1
             updated_note_ids.pop(guid, None)
+            watermark_usn = max(watermark_usn, note_usn)
             continue
 
         row = note_to_row(
@@ -734,6 +837,7 @@ def _sync_records(
         yield row
         yielded_count += 1
         updated_note_ids[guid] = getattr(note, "notebookGuid", "")
+        watermark_usn = max(watermark_usn, note_usn)
 
     log.info(
         "Evernote sync complete: %d row(s) yielded, %d tombstone(s) emitted.",
@@ -744,9 +848,10 @@ def _sync_records(
     if yielded_count == 0 and tombstoned_count == 0:
         yield dlt.mark.materialize_table_schema()
 
-    # Step 6: State is mutated ONLY after all rows and tombstones have been yielded
-    # without error. Dlt persists resource state only when the run completes
-    # successfully, ensuring that any mid-run failure leaves cursor and state untouched.
+    # Step 6: State persistence
+    if is_old_or_foreign:
+        state.clear()
+
     new_v = STATE_VERSION
     new_account = bind
     fallback_usn = state.get("last_usn", after_usn)
@@ -754,46 +859,72 @@ def _sync_records(
     new_notebooks = notebook_map
     new_tags = tag_map
     new_note_ids = dict(sorted(updated_note_ids.items()))
-    new_scope = {
-        "notebooks": current_nb_names,
-        "tags": current_tag_names,
-        "notebook_guids": resolved_nb_guids,
-        "tag_guids": resolved_tag_guids,
-    }
 
-    something_changed = (
-        is_full_resync
-        or "last_sync_time" not in state
-        or state.get("last_usn") != new_last_usn
-        or yielded_count > 0
-        or tombstoned_count > 0
-        or state.get("notebooks") != new_notebooks
-        or state.get("tags") != new_tags
-        or state.get("scope") != new_scope
-        or state.get("note_ids") != new_note_ids
-    )
+    is_full = is_full_resync or not has_last_usn
 
-    if is_old_or_foreign:
-        state.clear()
+    if is_unfinished:
+        # While a pass is unfinished:
+        # - do NOT advance last_usn or last_sync_time
+        # - do NOT write the new state["scope"]
+        # - DO persist note_ids for notes loaded so far, notebook/tag maps, and state["partial"]
+        new_partial = {
+            "resume_usn": watermark_usn,
+            "full": is_full,
+            "scope": current_scope_signature,
+        }
+        if state.get("v") != new_v:
+            state["v"] = new_v
+        if state.get("account") != new_account:
+            state["account"] = new_account
+        if state.get("notebooks") != new_notebooks:
+            state["notebooks"] = new_notebooks
+        if state.get("tags") != new_tags:
+            state["tags"] = new_tags
+        if state.get("note_ids") != new_note_ids:
+            state["note_ids"] = new_note_ids
+        if state.get("partial") != new_partial:
+            state["partial"] = new_partial
+    else:
+        # Pass 2 completed: delete state["partial"], write last_usn / last_sync_time / scope
+        state.pop("partial", None)
 
-    if state.get("v") != new_v:
-        state["v"] = new_v
-    if state.get("account") != new_account:
-        state["account"] = new_account
-    if state.get("last_usn") != new_last_usn:
-        state["last_usn"] = new_last_usn
-    if something_changed and current_sync_time is not None:
-        new_sync_time = int(current_sync_time)
-        if state.get("last_sync_time") != new_sync_time:
-            state["last_sync_time"] = new_sync_time
-    if state.get("notebooks") != new_notebooks:
-        state["notebooks"] = new_notebooks
-    if state.get("tags") != new_tags:
-        state["tags"] = new_tags
-    if state.get("note_ids") != new_note_ids:
-        state["note_ids"] = new_note_ids
-    if state.get("scope") != new_scope:
-        state["scope"] = new_scope
+        new_scope = {
+            "notebooks": current_nb_names,
+            "tags": current_tag_names,
+            "notebook_guids": resolved_nb_guids,
+            "tag_guids": resolved_tag_guids,
+        }
+
+        something_changed = (
+            is_full_resync
+            or "last_sync_time" not in state
+            or state.get("last_usn") != new_last_usn
+            or yielded_count > 0
+            or tombstoned_count > 0
+            or state.get("notebooks") != new_notebooks
+            or state.get("tags") != new_tags
+            or state.get("scope") != new_scope
+            or state.get("note_ids") != new_note_ids
+        )
+
+        if state.get("v") != new_v:
+            state["v"] = new_v
+        if state.get("account") != new_account:
+            state["account"] = new_account
+        if state.get("last_usn") != new_last_usn:
+            state["last_usn"] = new_last_usn
+        if something_changed and current_sync_time is not None:
+            new_sync_time = int(current_sync_time)
+            if state.get("last_sync_time") != new_sync_time:
+                state["last_sync_time"] = new_sync_time
+        if state.get("notebooks") != new_notebooks:
+            state["notebooks"] = new_notebooks
+        if state.get("tags") != new_tags:
+            state["tags"] = new_tags
+        if state.get("note_ids") != new_note_ids:
+            state["note_ids"] = new_note_ids
+        if state.get("scope") != new_scope:
+            state["scope"] = new_scope
 
 
 def evernote_source(
@@ -804,12 +935,23 @@ def evernote_source(
     resource_name: str = "evernote_notes",
     client: Any = None,
     full_resync: bool = False,
+    max_notes_per_run: int | None = 100,
 ):
     """Create an Evernote dlt resource for cognee memory ingestion.
 
     Extracts active notes filtered by optional notebook and tag scopes,
     emitting merge records and tombstones for trashed or expunged notes.
+
+    `max_notes_per_run` limits the number of note bodies fetched in a single run
+    (default 100, a conservative batch limit not derived from Evernote's published
+    limits; pass None for unlimited). If rate-limited or the limit is reached, the
+    run finishes cleanly and persists a progress watermark so the next run continues.
     """
+    if notebook_names is not None and not notebook_names:
+        notebook_names = None
+    if tag_names is not None and not tag_names:
+        tag_names = None
+
     resolved_token = token or os.environ.get("EVERNOTE_TOKEN")
     if client is None and not resolved_token:
         raise ValueError(
@@ -845,6 +987,7 @@ def evernote_source(
             tag_names=tag_names,
             sandbox=sandbox,
             full_resync=full_resync,
+            max_notes_per_run=max_notes_per_run,
         )
 
     resource = records()

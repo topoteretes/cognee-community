@@ -531,3 +531,63 @@ async def test_expunged_notebook_deletes_notes_in_cognee(persistent_environment)
     data2 = await _get_evernote_dataset_data(dataset)
     assert len(data2) == 1
     assert {_get_metadata(d)["external_id"] for d in data2} == {"b1"}
+
+
+@pytest.mark.asyncio
+async def test_interrupted_batch_resumes_cleanly_in_cognee(persistent_environment):
+    """Two runs with bounded batching end with all 10 Data records, nothing duplicated."""
+    dataset = "test_batched_ingestion_dataset"
+    nb = SimpleNamespace(guid="nb-1", name="Engineering")
+    notes = [
+        SimpleNamespace(
+            guid=f"n{i}",
+            title=f"Note {i}",
+            notebookGuid="nb-1",
+            updateSequenceNum=i,
+            tagGuids=[],
+            active=True,
+            created=1609459200000,
+            updated=1609459200000,
+        )
+        for i in range(1, 11)
+    ]
+    contents = {f"n{i}": f"<en-note><div>Body {i}</div></en-note>" for i in range(1, 11)}
+
+    chunk1 = SyncChunk(
+        chunkHighUSN=10,
+        updateCount=10,
+        notebooks=[nb],
+        notes=notes,
+    )
+    client = FakeEvernoteClient(chunks=[chunk1], note_contents=contents, update_count=10)
+
+    # Run 1: max_notes_per_run=5 fetches the first 5 notes
+    source1 = evernote_source(
+        token="fake-token",
+        client=client,
+        max_notes_per_run=5,
+    )
+    await cognee.add(source1, dataset_name=dataset, write_disposition="merge")
+
+    data1 = await _get_evernote_dataset_data(dataset)
+    assert len(data1) == 5
+    assert {_get_metadata(d)["external_id"] for d in data1} == {f"n{i}" for i in range(1, 6)}
+
+    # Run 2: finishes remaining notes
+    chunk2 = SyncChunk(
+        chunkHighUSN=10,
+        updateCount=10,
+        notebooks=[nb],
+        notes=notes,
+    )
+    client.chunks = [chunk2]
+    source2 = evernote_source(
+        token="fake-token",
+        client=client,
+        max_notes_per_run=100,
+    )
+    await cognee.add(source2, dataset_name=dataset, write_disposition="merge")
+
+    data2 = await _get_evernote_dataset_data(dataset)
+    assert len(data2) == 10
+    assert {_get_metadata(d)["external_id"] for d in data2} == {f"n{i}" for i in range(1, 11)}
