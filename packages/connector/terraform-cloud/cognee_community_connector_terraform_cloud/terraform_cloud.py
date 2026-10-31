@@ -116,7 +116,15 @@ _TEXT_CHANGE = re.compile(
 )
 _TEXT_SUMMARY = re.compile(r"^(Plan: .*|No changes\..*|Apply complete!.*)$")
 _TEXT_DIAGNOSTIC = re.compile(r"^(Error|Warning): (.+)$")
-_STATS = ("emitted", "deleted", "pending", "redacted", "failed")
+_STATS = (
+    "emitted",
+    "deleted",
+    "pending",
+    "redacted",
+    "failed",
+    "failed_rate_limit",
+    "failed_budget",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -170,20 +178,23 @@ class TerraformCloudClient:
         http: Any = None,
         sleep: Callable[[float], None] = time.sleep,
         max_sleep: float = DEFAULT_MAX_SLEEP,
+        check_active: Callable[[], None] | None = None,
     ):
         token = (token or "").strip()
         # Reject early and without echoing the value: httpx would put an invalid
         # header value, token included, into its exception.
         if not token or not token.isascii() or not token.isprintable() or " " in token:
             raise ValueError("The HCP Terraform token is empty or has an invalid format")
-        import httpx
 
         self.api_url = f"https://{hostname}/api/v2"
         self._headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/vnd.api+json",
         }
-        self._http = http or httpx.Client(timeout=_TIMEOUT)
+        # An injected client belongs to the caller; one made here is closed by close().
+        self._http = http
+        self._owned = http is None
+        self._check_active = check_active
         self._sleep = sleep
         self._max_sleep = max_sleep
         self._slept = 0.0
@@ -195,17 +206,30 @@ class TerraformCloudClient:
         """Start a new run's retry wait budget."""
         self._slept = 0.0
 
+    def close(self) -> None:
+        """Close the HTTP client this object made; the next request opens a new one."""
+        if self._owned and self._http is not None:
+            self._http.close()
+            self._http = None
+
     def _wait(self, delay: float) -> None:
         if self._slept + delay > self._max_sleep:
             raise TerraformCloudRateLimitedError(
                 "HCP Terraform retries used up the wait budget of this run"
             )
         self._slept += delay
+        # The host may revoke access while a request waits, so ask before and after.
+        if self._check_active is not None:
+            self._check_active()
         self._sleep(delay)
+        if self._check_active is not None:
+            self._check_active()
 
     def _send(self, url: str, params: dict[str, Any] | None, headers: dict[str, str]) -> Any:
         import httpx
 
+        if self._http is None:
+            self._http = httpx.Client(timeout=_TIMEOUT)
         attempt = 0
         while True:
             last = attempt == _RETRIES - 1
@@ -720,9 +744,8 @@ def _iter_rows(
     try:
         walker.walk()
     except _CutShortError as cut:
-        # A spent budget is a planned pause, not a failure; failed_budget says why.
-        if cut.reason != "budget":
-            stats["failed"] = 1
+        # Every cut leaves the sync incomplete, so failed is set; failed_<reason> says why.
+        stats["failed"] = 1
         stats[f"failed_{cut.reason}"] = 1
         logger.warning(
             "HCP Terraform sync stopped early (%s); it resumes on the next run.", cut.reason
@@ -743,13 +766,39 @@ def _iter_rows(
 # ---------------------------------------------------------------------------
 # Public factory
 # ---------------------------------------------------------------------------
+# dlt table names stay readable up to this length; the merged Asana connector uses it too.
+_MAX_RESOURCE_NAME = 64
+
+
 def _default_resource_name(organization: str, hostname: str) -> str:
     scope = organization if hostname == DEFAULT_HOSTNAME else f"{hostname}_{organization}"
     slug = re.sub(r"[^a-z0-9]+", "_", scope.lower()).strip("_")
+    digest = hashlib.sha256(scope.encode()).hexdigest()[:8]
     if slug != scope:
-        # Keep names that differ only in case or punctuation apart.
-        slug += "_" + hashlib.sha256(scope.encode()).hexdigest()[:8]
-    return "terraform_cloud_" + slug
+        # Keep names that differ only in case or punctuation apart. A scope with no
+        # ASCII letter or digit keeps only the hash.
+        slug = f"{slug}_{digest}" if slug else digest
+    name = "terraform_cloud_" + slug
+    if len(name) > _MAX_RESOURCE_NAME:
+        # A long organization or host is cut, and the hash keeps cut names apart.
+        name = name[: _MAX_RESOURCE_NAME - len(digest) - 1].rstrip("_") + "_" + digest
+    return name
+
+
+def _check_resource_name(name: Any) -> None:
+    """A non-empty name of at most 64 characters that dlt keeps as it is.
+
+    It names the table and scopes the state: an empty name would lose that scope,
+    and two names dlt normalizes alike ("Foo-Bar", "foo_bar") would share a table.
+    """
+    from dlt.common.normalizers.naming.snake_case import NamingConvention
+
+    if not isinstance(name, str) or not name:
+        raise ValueError("resource_name must be a non-empty string")
+    if len(name) > _MAX_RESOURCE_NAME:
+        raise ValueError(f"resource_name must be at most {_MAX_RESOURCE_NAME} characters")
+    if NamingConvention().normalize_table_identifier(name) != name:
+        raise ValueError("resource_name must be lowercase snake_case (letters, digits, _)")
 
 
 def terraform_cloud_source(
@@ -791,12 +840,14 @@ def terraform_cloud_source(
         since_days: How far back the first sync reads runs.
         max_requests: Request budget of one run, checked once a run is emitted. A
             bigger organization finishes over several runs; a spent budget sets
-            ``failed_budget`` but not ``failed``.
+            ``failed`` and ``failed_budget``.
         resource_name: Staging table name, which scopes this sync's state and
             cleanup. Defaults to one derived from the organization (and the host,
-            when it is not the default).
+            when it is not the default). A name you pass must be lowercase
+            snake_case of at most 64 characters.
         check_active: Optional host authorization checkpoint, called before each
-            request and around each row.
+            request and around each row, and in the client built here around every
+            retry wait.
         service: Pre-built client (see :class:`TerraformCloudClient`). Mainly an
             injection point for tests and hosts. ``client`` is accepted as an alias.
 
@@ -819,11 +870,15 @@ def terraform_cloud_source(
     if not organization:
         raise ValueError("organization is required.")
     service = service or client
-    if service is None:
+    owned = service is None
+    if owned:
         if not token:
             raise ValueError("An API token is required: pass token=, or a pre-built service.")
-        service = TerraformCloudClient(token=token, hostname=hostname)
-    name = resource_name or _default_resource_name(organization, hostname)
+        service = TerraformCloudClient(token=token, hostname=hostname, check_active=check_active)
+    name = resource_name
+    if name is None:
+        name = _default_resource_name(organization, hostname)
+    _check_resource_name(name)
 
     config = _TerraformCloudConfig(
         organization=organization,
@@ -849,7 +904,12 @@ def terraform_cloud_source(
         stats.clear()
         state = dlt.current.resource_state()
         rows = _iter_rows(service, config, state, stats, check_active=check_active)
-        yield from dlt_utils.guarded_rows(rows, check_active)
+        try:
+            yield from dlt_utils.guarded_rows(rows, check_active)
+        finally:
+            # Also on errors and when dlt stops early; an injected service is the caller's.
+            if owned:
+                service.close()
 
     resource = terraform_cloud()
     setattr(resource, DOCUMENT_SOURCE_ATTR, "terraform_cloud")

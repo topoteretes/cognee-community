@@ -67,7 +67,7 @@ Run the same call again to sync only what changed. See `examples/example.py`.
 | `since_days` | `90` | How far back the first sync reads runs. |
 | `hostname` | `app.terraform.io` | Or `app.eu.terraform.io`, or a Terraform Enterprise host. |
 | `max_requests` | `1000` | Request budget of one run. A bigger organization finishes over several runs. |
-| `resource_name` | `terraform_cloud_<organization>` | Staging table, which scopes this sync's state and cleanup (the host is added when it is not the default). Use a different name per sync scope that shares a dataset. |
+| `resource_name` | `terraform_cloud_<organization>` | Staging table, which scopes this sync's state and cleanup (the host is added when it is not the default). Use a different name per sync scope that shares a dataset. A name you pass must be lowercase snake_case (letters, digits, `_`) of at most 64 characters. |
 
 ## Plan output and the scrubbing step
 
@@ -124,13 +124,17 @@ sent to it.
   the next run confirms it, and an answer without its `data` list raises.
 - **A run is bounded.** 429 and 5xx are retried, honoring `Retry-After`. A `Retry-After`
   over 60 seconds, a 429 that outlasts the retries, or more than five minutes of retry
-  waits stops the run cleanly with `failed` and `failed_rate_limit`; a spent
-  `max_requests` budget is a planned pause and sets only `failed_budget`. The runs
+  waits stops the run cleanly with `failed` and `failed_rate_limit`, and a spent
+  `max_requests` budget with `failed` and `failed_budget`, since the sync is incomplete
+  either way. The runs
   finished so far are kept and the cursor stays where it was, so the next run picks up the
   rest. Any other error raises, so dlt keeps the previous state.
 
 `cognee_sync_stats` counts `emitted` and `deleted` rows, `pending` runs and `redacted`
-secrets, and `failed` plus `failed_*` for a stopped run.
+secrets, and `failed` plus `failed_*` for a stopped run; every key is present on every
+run. `check_active` is called before every request, and the client built from `token`
+also calls it before and after each retry wait. That client is closed at the end of every
+run, also on errors; a `service` you pass in stays yours to close.
 
 ## Privacy
 

@@ -502,14 +502,15 @@ def test_rate_limit_stops_cleanly_keeping_finished_runs(org):
     assert state["cursor"]
 
 
-def test_budget_pauses_without_failing_and_resumes(org):
+def test_budget_pauses_and_resumes(org):
     org.add_run("ws-1", "run-1", _hours_ago(3), plan_log=TEXT_LOG)
     org.add_run("ws-1", "run-2", _hours_ago(2), plan_log=TEXT_LOG)
     state = {}
     stats = {}
     rows = _run(org, state, stats=stats, max_requests=1)
     assert [r["id"] for r in rows if r["id"].startswith("run:")] == ["run:run-2"]
-    assert stats["failed_budget"] == 1 and stats["failed"] == 0
+    # A cut run is incomplete, so failed is set with the budget as the reason.
+    assert stats["failed_budget"] == 1 and stats["failed"] == 1
     rows = _run(org, state, max_requests=1)
     assert [r["id"] for r in rows if r["id"].startswith("run:")] == ["run:run-1"]
 
@@ -589,7 +590,80 @@ def test_client_is_built_with_keyword_arguments(monkeypatch):
         tfc_module, "TerraformCloudClient", lambda **kwargs: seen.update(kwargs) or "c"
     )
     terraform_cloud_source(ORG, token="tok", hostname="tfe.example.com")
-    assert seen == {"token": "tok", "hostname": "tfe.example.com"}
+    assert seen == {"token": "tok", "hostname": "tfe.example.com", "check_active": None}
+
+
+@pytest.mark.parametrize("name", ["", "Terraform-Team", "tf team", "t" * 65, 7])
+def test_invalid_resource_name_is_rejected(org, name):
+    with pytest.raises(ValueError, match="resource_name"):
+        terraform_cloud_source(ORG, service=org, resource_name=name)
+
+
+@pytest.mark.parametrize("organization", ["\u65e5\u672c", "---", "o" * 80])
+def test_derived_resource_name_stays_valid(org, organization):
+    name = terraform_cloud_source(organization, service=org).name
+    assert name.startswith("terraform_cloud_") and "__" not in name and len(name) <= 64
+
+
+def test_client_checks_access_around_every_wait():
+    checks, requests = [], []
+
+    def revoke_after_the_first_check():
+        checks.append(True)
+        if len(checks) > 1:
+            raise PermissionError("access revoked")
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(503)
+
+    client = TerraformCloudClient(
+        "tok-1",
+        http=httpx.Client(transport=httpx.MockTransport(handler)),
+        sleep=lambda seconds: None,
+        check_active=revoke_after_the_first_check,
+    )
+    with pytest.raises(PermissionError):
+        client.get("/organizations")
+    # Checked before the wait and again after it, so the retry never goes out.
+    assert len(requests) == 1 and len(checks) == 2
+
+
+def test_client_closes_only_the_http_client_it_made():
+    def transport():
+        return httpx.MockTransport(lambda request: httpx.Response(200, json={}))
+
+    injected = httpx.Client(transport=transport())
+    TerraformCloudClient("tok-1", http=injected).close()
+    assert not injected.is_closed
+
+    owned = TerraformCloudClient("tok-1")
+    owned._http = made = httpx.Client(transport=transport())
+    owned.close()
+    assert made.is_closed and owned._http is None
+
+
+def test_owned_client_is_closed_and_stats_carry_every_key(org, monkeypatch):
+    closed = []
+
+    class Owned:
+        def __init__(self, **kwargs):
+            pass
+
+        def get(self, path, params=None):
+            return org.get(path, params)
+
+        def download(self, url):
+            return org.download(url)
+
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(tfc_module, "TerraformCloudClient", Owned)
+    source = terraform_cloud_source(ORG, token="tok")
+    list(source)
+    assert closed == [True]
+    assert {"failed_rate_limit", "failed_budget"} <= set(source.cognee_sync_stats)
 
 
 # ---------------------------------------------------------------------------
