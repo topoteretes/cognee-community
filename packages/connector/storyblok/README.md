@@ -101,7 +101,9 @@ credentials and secret-looking `key = value` pairs. Redaction counts land in
 - **Cache version first.** Each run asks `GET /v2/cdn/spaces/me` for the space's cache version
   (`cv`), which Storyblok moves whenever something is published, unpublished or deleted. While
   syncing published content and that version has not moved since the last complete run, the run
-  stops there: one request.
+  stops there: one request. `/spaces/me` is cached for a few seconds (measured live: the
+  version moved 4 to 8 seconds after a publish), so a run started right after a publish picks
+  the change up on the next run. Nothing is lost, it only arrives one run later.
 - **Then one listing.** Otherwise `GET /v2/cdn/stories` is read 100 stories a page with that
   `cv`, so the CDN answers fresh content. Drafts do not move the cache version, so
   `version="draft"` lists on every run.

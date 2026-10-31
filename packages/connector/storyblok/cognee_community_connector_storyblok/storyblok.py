@@ -98,6 +98,11 @@ _META_KEYS = {
     "focus",
     "meta_data",
 }
+# Option and color fields hold settings, not text: one lowercase token
+# ("primary-dark", "white", "medium") or a color code ("#80efac").
+_SETTING = re.compile(r"^(?:[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*|#[0-9a-fA-F]{3,8})$")
+# A number field ("999", "12.5") only means something next to its field name.
+_NUMBER = re.compile(r"^-?\d+(?:\.\d+)?$")
 _UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
 # Rich text nodes that end a paragraph of their own.
 _BLOCK_NODES = {"paragraph", "heading", "blockquote", "code_block", "list_item"}
@@ -311,9 +316,16 @@ def _texts(value: Any, key: str | None = None) -> Iterator[str]:
     """Every text a field holds, in field order, without block metadata or links."""
     if key in _META_KEYS:
         return
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        value = str(value)
     if isinstance(value, str):
         text = value.strip()
-        if text and not text.startswith(("http://", "https://", "//")) and not _UUID.match(text):
+        if not text or text.startswith(("http://", "https://", "//")) or _UUID.match(text):
+            return
+        if _NUMBER.match(text):
+            if key:
+                yield f"{key.replace('_', ' ')}: {text}"
+        elif not _SETTING.match(text):
             yield text
     elif isinstance(value, list):
         for item in value:

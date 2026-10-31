@@ -235,6 +235,33 @@ def test_nested_blocks_are_read_in_field_order():
     assert content.endswith("Welcome\nFast docs\nOne")
 
 
+def test_settings_are_left_out_and_numbers_keep_their_field_name():
+    story = {
+        "id": 3,
+        "name": "Pricing",
+        "content": {
+            "component": "default-page",
+            "body": [
+                {
+                    "component": "price-card",
+                    "headline": "Starter",
+                    "price": "999",
+                    "seats": 5,
+                    "most_popular": True,
+                    "background_color": "primary-dark",
+                    "size": "medium",
+                    "accent": "#80efac",
+                    "text": "Perfect for small teams.",
+                }
+            ],
+        },
+    }
+    content = render_story(story, SPACE_ID)["content"]
+    assert content.endswith("Starter\nprice: 999\nseats: 5\nPerfect for small teams.")
+    for setting in ("primary-dark", "medium", "#80efac", "True"):
+        assert setting not in content
+
+
 def test_secrets_in_story_text_are_scrubbed(blok):
     blok.add("Ops", body="Use AKIAABCDEFGHIJKLMNOP for the bucket")
     stats = {}
