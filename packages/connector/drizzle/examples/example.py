@@ -1,4 +1,4 @@
-"""Drizzle ORM connector demo — sync TypeScript database models into agent memory.
+"""Drizzle ORM connector demo: sync TypeScript database models into agent memory.
 
 This example reads Drizzle ORM schema files (pgTable, mysqlTable, sqliteTable, relations, enums)
 and indexes them into Cognee memory.

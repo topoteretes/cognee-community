@@ -334,7 +334,7 @@ def _format_table_document(
                 ref_str += f" [ON DELETE: {col['on_delete']}]"
             attributes.append(ref_str)
 
-        attr_str = f" — {', '.join(attributes)}" if attributes else ""
+        attr_str = f" : {', '.join(attributes)}" if attributes else ""
         lines.append(f"- `{col['sql_name']}` ({col['type_function']}){attr_str}")
 
     if relations:

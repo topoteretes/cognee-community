@@ -1,7 +1,7 @@
 [project]
 name = "cognee-community-connector-drizzle"
 version = "0.1.0"
-description = "Drizzle ORM schema data-source connector for Cognee — sync TypeScript database models & relations into agent memory"
+description = "Drizzle ORM schema data-source connector for Cognee: sync TypeScript database models & relations into agent memory"
 readme = "README.md"
 requires-python = ">=3.11,<=3.13"
 dependencies = [
