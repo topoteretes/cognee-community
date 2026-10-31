@@ -223,13 +223,17 @@ def _iter_rows(service: Any, config: _CalendarConfig, state: dict, stats: dict |
     rows: list[dict] = []
     deletes: list[str] = []
 
+    calendars = list_calendars(service)
+    names = _calendar_names(calendars)
+    primary_id = next((c["id"] for c in calendars if c["primary"]), None)
+    calendar_ids = _without_primary_alias(config.calendar_ids, primary_id)
+
     # Calendars dropped from the config: their events are out of scope now.
     for calendar_id, calendar_state in old_calendars.items():
-        if calendar_id not in config.calendar_ids:
+        if calendar_id not in calendar_ids:
             _forget_all(calendar_id, calendar_state.get("known", []), deletes, stats)
 
-    names = _calendar_names(service)
-    for calendar_id in config.calendar_ids:
+    for calendar_id in calendar_ids:
         result = _sync_calendar(
             service,
             calendar_id,
@@ -251,14 +255,36 @@ def _iter_rows(service: Any, config: _CalendarConfig, state: dict, stats: dict |
     logger.info("Google Calendar: sync stats %s", stats)
 
 
-def _calendar_names(service: Any) -> dict[str, str]:
+def _calendar_names(calendars: list[dict]) -> dict[str, str]:
     """Calendar id -> display name, with "primary" mapped to the primary calendar."""
     names: dict[str, str] = {}
-    for calendar in list_calendars(service):
+    for calendar in calendars:
         names[calendar["id"]] = calendar["name"]
         if calendar["primary"]:
             names["primary"] = calendar["name"]
     return names
+
+
+def _without_primary_alias(
+    calendar_ids: tuple[str, ...], primary_id: str | None
+) -> tuple[str, ...]:
+    """Drop a second spelling of the primary calendar, keeping the first one configured.
+
+    "primary" and the primary calendar's own id (the account's email address) name
+    one calendar. Syncing both would store every event twice under two row ids.
+    Keeping the spelling that comes first leaves an existing "primary" setup
+    exactly as it was, and a leftover second copy is forgotten as a dropped calendar.
+    """
+    if primary_id is None:
+        return calendar_ids
+    seen: set[str] = set()
+    kept: list[str] = []
+    for calendar_id in calendar_ids:
+        key = primary_id if calendar_id == "primary" else calendar_id
+        if key not in seen:
+            seen.add(key)
+            kept.append(calendar_id)
+    return tuple(kept)
 
 
 def _sync_calendar(service, calendar_id, name, calendar_state, rows, deletes, stats):
