@@ -7,14 +7,18 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+from cognee.tasks.ingestion import dlt_utils
 from dlt.extract.resource import DltResource
 from evernote.edam.notestore.ttypes import SyncChunk
 
 from cognee_community_connector_evernote import (
+    EvernoteAuthError,
     EvernoteError,
+    EvernoteRateLimitError,
     NoteNotFoundError,
     evernote_source,
 )
+from cognee_community_connector_evernote.evernote import _check_cognee_version
 
 
 class FakeEvernoteClient:
@@ -47,24 +51,44 @@ class FakeEvernoteClient:
         return f"<en-note><div>Default content for {guid}</div></en-note>"
 
 
-def test_missing_token_raises_value_error(monkeypatch):
-    """When no token is provided and EVERNOTE_TOKEN is not set, ValueError is raised."""
-    monkeypatch.delenv("EVERNOTE_TOKEN", raising=False)
-    with pytest.raises(ValueError, match="Evernote authentication token required"):
+def test_blank_or_missing_token_raises_auth_error(monkeypatch):
+    """When token is missing or blank, EvernoteAuthError is raised even if env is set."""
+    with pytest.raises(EvernoteAuthError, match="Evernote authentication token required"):
+        evernote_source(token="")
+
+    with pytest.raises(EvernoteAuthError, match="Evernote authentication token required"):
+        evernote_source(token="   ")
+
+    monkeypatch.setenv("EVERNOTE_TOKEN", "some-env-token")
+    with pytest.raises(EvernoteAuthError, match="Evernote authentication token required"):
         evernote_source()
 
 
-def test_token_never_appears_in_repr_or_error(monkeypatch):
+def test_token_never_appears_in_repr_or_error():
     """Sensitive token string must never appear in repr or error messages."""
     secret_token = "super-secret-token-12345-xyz"
     source = evernote_source(token=secret_token)
     assert secret_token not in repr(source)
     assert secret_token not in str(source)
 
-    monkeypatch.delenv("EVERNOTE_TOKEN", raising=False)
-    with pytest.raises(ValueError) as exc_info:
-        evernote_source()
+    with pytest.raises(EvernoteAuthError) as exc_info:
+        evernote_source(token="")
     assert secret_token not in str(exc_info.value)
+
+
+def test_old_cognee_hint_raises_import_error(monkeypatch):
+    """When DOCUMENT_SYNC_VERSION < 1, _check_cognee_version raises ImportError."""
+    monkeypatch.setattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 0)
+    with pytest.raises(
+        ImportError, match="requires a cognee version with DOCUMENT_SYNC_VERSION >= 1"
+    ):
+        _check_cognee_version()
+
+    monkeypatch.delattr(dlt_utils, "DOCUMENT_SYNC_VERSION", raising=False)
+    with pytest.raises(
+        ImportError, match="requires a cognee version with DOCUMENT_SYNC_VERSION >= 1"
+    ):
+        _check_cognee_version()
 
 
 def test_construction_rules_makes_no_network_call():
@@ -73,13 +97,13 @@ def test_construction_rules_makes_no_network_call():
     fake_client.get_filtered_sync_chunk = MagicMock(side_effect=AssertionError("Network called!"))
     fake_client.get_note_content = MagicMock(side_effect=AssertionError("Network called!"))
 
-    source = evernote_source(token="tok-123", client=fake_client)
+    source = evernote_source(token="tok-123", service=fake_client)
     assert isinstance(source, DltResource)
     assert source.name == "evernote_notes"
     assert source.write_disposition == "merge"
     assert source.cognee_document_source == "evernote"
     assert source.cognee_pipeline_scope == "evernote_notes"
-    assert source.client is fake_client
+    assert source.service is fake_client
     # No network calls were triggered during construction
     fake_client.get_filtered_sync_chunk.assert_not_called()
     fake_client.get_note_content.assert_not_called()
@@ -92,7 +116,7 @@ def test_scope_validation_unknown_notebook_name_raises():
     client = FakeEvernoteClient(chunks=[chunk])
 
     source = evernote_source(
-        token="tok", notebook_names=["Marketing", "Engineering"], client=client
+        token="tok", notebook_names=["Marketing", "Engineering"], service=client
     )
 
     with pytest.raises(
@@ -114,7 +138,7 @@ def test_scope_validation_unknown_tag_name_raises():
     chunk = SyncChunk(chunkHighUSN=10, updateCount=10, tags=[tag], notes=[])
     client = FakeEvernoteClient(chunks=[chunk])
 
-    source = evernote_source(token="tok", tag_names=["Urgent", "Archive"], client=client)
+    source = evernote_source(token="tok", tag_names=["Urgent", "Archive"], service=client)
 
     with pytest.raises(
         Exception,
@@ -168,7 +192,7 @@ def test_scope_filtering_rows():
         token="tok",
         notebook_names=["Work"],
         tag_names=["Projects"],
-        client=client,
+        service=client,
     )
     rows = list(source)
 
@@ -204,7 +228,7 @@ def test_out_of_scope_notes_yield_tombstones():
         note_contents={"n-1": "<en-note><div>Doc content</div></en-note>"},
     )
 
-    source = evernote_source(token="tok", notebook_names=["Docs"], client=client)
+    source = evernote_source(token="tok", notebook_names=["Docs"], service=client)
     rows = list(source)
 
     row_by_id = {r["id"]: r for r in rows}
@@ -229,7 +253,7 @@ def test_trashed_and_expunged_notes_yield_tombstones():
     )
     client = FakeEvernoteClient(chunks=[chunk])
 
-    source = evernote_source(token="tok", client=client)
+    source = evernote_source(token="tok", service=client)
     rows = list(source)
 
     deleted_ids = {r["id"] for r in rows if r.get("_deleted")}
@@ -249,7 +273,7 @@ def test_note_not_found_yields_tombstone():
         note_contents={"n-vanished": NoteNotFoundError("Note vanished")},
     )
 
-    source = evernote_source(token="tok", client=client)
+    source = evernote_source(token="tok", service=client)
     rows = list(source)
 
     assert len(rows) == 1
@@ -267,7 +291,7 @@ def test_abort_on_other_error():
         note_contents={"n-err": RuntimeError("Database disk failure")},
     )
 
-    source = evernote_source(token="tok", client=client)
+    source = evernote_source(token="tok", service=client)
     with pytest.raises(Exception, match="Database disk failure") as exc_info:
         list(source)
     assert isinstance(exc_info.value.__cause__, RuntimeError) or isinstance(
@@ -294,7 +318,7 @@ def test_notebook_before_note_ordering_across_chunks():
         note_contents={"n-cross": "<en-note><div>Body text</div></en-note>"},
     )
 
-    source = evernote_source(token="tok", client=client)
+    source = evernote_source(token="tok", service=client)
     rows = list(source)
 
     assert len(rows) == 1
@@ -319,7 +343,7 @@ def test_no_body_fetch_for_tombstoned_notes():
     )
     client = FakeEvernoteClient(chunks=[chunk])
 
-    source = evernote_source(token="tok", notebook_names=["Scope1"], client=client)
+    source = evernote_source(token="tok", notebook_names=["Scope1"], service=client)
     rows = list(source)
 
     assert len(rows) == 3
@@ -348,7 +372,7 @@ def test_empty_content_fallback_to_title_or_skip():
         },
     )
 
-    source = evernote_source(token="tok", client=client)
+    source = evernote_source(token="tok", service=client)
     rows = list(source)
 
     # note_empty_all yields a tombstone; note_title_only has its title as content
@@ -384,7 +408,7 @@ def test_empty_body_and_title_yields_tombstone():
         },
     )
 
-    source = evernote_source(token="tok", client=client)
+    source = evernote_source(token="tok", service=client)
     rows = list(source)
 
     tombstones = [r for r in rows if r.get("_deleted")]
@@ -414,9 +438,160 @@ def test_trashed_note_not_in_state_still_yields_tombstone():
     client = FakeEvernoteClient(chunks=[chunk])
 
     # First run: empty state, note was never in state["note_ids"]
-    source = evernote_source(token="tok", client=client)
+    source = evernote_source(token="tok", service=client)
     rows = list(source)
 
     assert len(rows) == 1
     assert rows[0]["id"] == "n-new-trash"
     assert rows[0]["_deleted"] is True
+
+
+def test_sync_stats_counters_after_normal_run():
+    """cognee_sync_stats starts empty and records notes_synced after normal run."""
+    note1 = SimpleNamespace(guid="n-1", title="N1", active=True, updateSequenceNum=1)
+    note2 = SimpleNamespace(guid="n-2", title="N2", active=True, updateSequenceNum=2)
+    chunk = SyncChunk(chunkHighUSN=2, updateCount=2, notes=[note1, note2])
+    client = FakeEvernoteClient(
+        chunks=[chunk],
+        note_contents={
+            "n-1": "<en-note><div>Body 1</div></en-note>",
+            "n-2": "<en-note><div>Body 2</div></en-note>",
+        },
+    )
+
+    source = evernote_source(token="tok", service=client)
+    # Starts empty before run
+    assert source.cognee_sync_stats == {}
+
+    rows = list(source)
+    assert len(rows) == 2
+    assert source.cognee_sync_stats == {
+        "notes_synced": 2,
+        "tombstones": 0,
+        "failed_rate_limit": 0,
+        "failed_auth": 0,
+    }
+
+
+def test_sync_stats_counters_after_trashed_tombstones():
+    """cognee_sync_stats records tombstones count when trashed notes are encountered."""
+    note_live = SimpleNamespace(guid="n-live", title="Live", active=True, updateSequenceNum=1)
+    note_trash = SimpleNamespace(guid="n-trash", title="Trash", active=False, updateSequenceNum=2)
+    chunk = SyncChunk(chunkHighUSN=2, updateCount=2, notes=[note_live, note_trash])
+    client = FakeEvernoteClient(
+        chunks=[chunk],
+        note_contents={"n-live": "<en-note><div>Live body</div></en-note>"},
+    )
+
+    source = evernote_source(token="tok", service=client)
+    rows = list(source)
+    assert len(rows) == 2
+    assert source.cognee_sync_stats["notes_synced"] == 1
+    assert source.cognee_sync_stats["tombstones"] == 1
+
+
+def test_sync_stats_counters_after_rate_limited_run():
+    """cognee_sync_stats records failed_rate_limit when rate limited during run."""
+    note = SimpleNamespace(guid="n-rl", title="RL", active=True, updateSequenceNum=1)
+    chunk = SyncChunk(chunkHighUSN=1, updateCount=1, notes=[note])
+    client = FakeEvernoteClient(
+        chunks=[chunk],
+        note_contents={
+            "n-rl": EvernoteRateLimitError("Rate limit exceeded", retry_after=30),
+        },
+    )
+
+    source = evernote_source(token="tok", service=client)
+    rows = list(source)
+    assert [r for r in rows if isinstance(r, dict)] == []
+    assert source.cognee_sync_stats["failed_rate_limit"] == 1
+
+
+def test_sync_stats_counters_after_auth_failure():
+    """cognee_sync_stats records failed_auth and re-raises error on auth failure."""
+    client = FakeEvernoteClient()
+    client.get_sync_state = MagicMock(side_effect=EvernoteAuthError("Invalid auth token"))
+
+    source = evernote_source(token="tok", service=client)
+    with pytest.raises(Exception) as exc_info:
+        list(source)
+    assert isinstance(exc_info.value.__cause__, EvernoteAuthError) or isinstance(
+        exc_info.value, EvernoteAuthError
+    )
+    assert source.cognee_sync_stats["failed_auth"] == 1
+
+
+def test_check_active_false_from_start_zero_api_calls_and_clean_end():
+    """check_active returning False from the start makes zero API calls and ends cleanly."""
+    client = FakeEvernoteClient()
+    client.get_user_id = MagicMock(side_effect=AssertionError("get_user_id called!"))
+    client.get_sync_state = MagicMock(side_effect=AssertionError("get_sync_state called!"))
+    client.get_filtered_sync_chunk = MagicMock(
+        side_effect=AssertionError("get_filtered_sync_chunk called!")
+    )
+    client.get_note_content = MagicMock(side_effect=AssertionError("get_note_content called!"))
+
+    source = evernote_source(token="tok", service=client, check_active=lambda: False)
+    rows = list(source)
+
+    # Ended cleanly with zero API calls
+    assert [r for r in rows if isinstance(r, dict)] == []
+    client.get_user_id.assert_not_called()
+    client.get_sync_state.assert_not_called()
+    client.get_filtered_sync_chunk.assert_not_called()
+    client.get_note_content.assert_not_called()
+
+
+def test_check_active_turning_false_midway_pauses_cleanly_and_resumes():
+    """check_active turning False midway saves partial progress and next run resumes."""
+    notes = [
+        SimpleNamespace(guid=f"n-{i}", title=f"N{i}", active=True, updateSequenceNum=i)
+        for i in range(1, 4)
+    ]
+    chunk = SyncChunk(chunkHighUSN=3, updateCount=3, notes=notes)
+    client = FakeEvernoteClient(
+        chunks=[chunk],
+        note_contents={f"n-{i}": f"<en-note><div>Body {i}</div></en-note>" for i in range(1, 4)},
+    )
+
+    state: dict = {}
+    active_fetches = 0
+
+    def check_active_switch():
+        nonlocal active_fetches
+        # Allow pass 1 (start, get_sync_state, chunk 1) and first note body fetch (call 4),
+        # then return False before 2nd note body fetch (call 5)
+        active_fetches += 1
+        return active_fetches <= 4
+
+    # Run 1: pauses midway
+    from cognee_community_connector_evernote.evernote import _sync_records
+
+    rows1 = list(
+        _sync_records(
+            service=client,
+            state=state,
+            check_active=check_active_switch,
+        )
+    )
+    data1 = [r for r in rows1 if isinstance(r, dict) and not r.get("_deleted")]
+    assert len(data1) == 1
+    assert data1[0]["id"] == "n-1"
+    assert "partial" in state
+    assert state["partial"]["resume_usn"] == 1
+    assert "last_usn" not in state
+
+    # Run 2: continues with check_active returning True
+    client.chunks = [SyncChunk(chunkHighUSN=3, updateCount=3, notes=notes)]
+    rows2 = list(
+        _sync_records(
+            service=client,
+            state=state,
+            check_active=lambda: True,
+        )
+    )
+    data2 = [r for r in rows2 if isinstance(r, dict) and not r.get("_deleted")]
+    assert len(data2) == 2
+    assert [r["id"] for r in data2] == ["n-2", "n-3"]
+    assert "partial" not in state
+    assert state["last_usn"] == 3

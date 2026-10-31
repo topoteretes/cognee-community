@@ -4,7 +4,6 @@ Extracts notes, notebooks, and tags from Evernote into cognee memory with
 incremental synchronization via Evernote sync chunks and forget-on-delete.
 """
 
-import os
 import time
 from collections.abc import Callable, Generator
 from html.parser import HTMLParser
@@ -12,7 +11,7 @@ from typing import Any
 
 import dlt
 from cognee.shared.logging_utils import get_logger
-from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR, PIPELINE_SCOPE_ATTR
+from cognee.tasks.ingestion import dlt_utils
 from dlt.common.normalizers.naming.snake_case import NamingConvention
 from evernote.edam.error.ttypes import (
     EDAMErrorCode,
@@ -27,6 +26,19 @@ from thrift.protocol.TBinaryProtocol import TBinaryProtocol
 from thrift.Thrift import TException
 from thrift.transport.THttpClient import THttpClient
 from thrift.transport.TTransport import TTransportException
+
+
+def _check_cognee_version() -> None:
+    if getattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 0) < 1:
+        raise ImportError(
+            "cognee-community-connector-evernote requires a cognee version with "
+            "DOCUMENT_SYNC_VERSION >= 1; please upgrade cognee."
+        )
+
+
+_check_cognee_version()
+
+from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR, PIPELINE_SCOPE_ATTR  # noqa: E402
 
 logger = get_logger(__name__)
 
@@ -55,6 +67,10 @@ class EvernoteRateLimitError(EvernoteError):
     def __init__(self, message: str, retry_after: float | int | None = None) -> None:
         super().__init__(message)
         self.retry_after = retry_after
+
+
+class _SyncCancelledError(Exception):
+    """Internal sentinel raised when check_active returns False during chunk iteration."""
 
 
 def _error_code_name(code: Any) -> str:
@@ -396,7 +412,10 @@ def note_to_row(
 
 
 def iter_sync_chunks(
-    api: Any, after_usn: int = 0, max_entries: int = 250
+    api: Any,
+    after_usn: int = 0,
+    max_entries: int = 250,
+    check_active: Callable[[], bool] | None = None,
 ) -> Generator[Any, None, None]:
     """Yield incremental SyncChunk objects from Evernote until caught up.
 
@@ -413,6 +432,8 @@ def iter_sync_chunks(
     )
 
     while True:
+        if check_active is not None and not check_active():
+            raise _SyncCancelledError()
         chunk = api.get_filtered_sync_chunk(current_after_usn, max_entries, chunk_filter)
         high_usn = getattr(chunk, "chunkHighUSN", None)
         if high_usn is None:
@@ -433,13 +454,15 @@ def iter_sync_chunks(
 
 
 def _sync_records(
-    api_client: Any,
+    service: Any,
     state: dict[str, Any],
     notebook_names: list[str] | None = None,
     tag_names: list[str] | None = None,
     sandbox: bool = False,
     full_resync: bool = False,
     max_notes_per_run: int | None = 100,
+    check_active: Callable[[], bool] | None = None,
+    stats: dict[str, int] | None = None,
 ) -> Generator[Any, None, None]:
     """Execute the two-pass sync algorithm using the provided state dict.
 
@@ -449,6 +472,16 @@ def _sync_records(
     """
     log = get_logger("evernote_connector")
 
+    if stats is not None:
+        stats.clear()
+        stats.update(notes_synced=0, tombstones=0, failed_rate_limit=0, failed_auth=0)
+
+    # Check active from the start: zero API calls, clean end
+    if check_active is not None and not check_active():
+        log.warning("Evernote sync stopped before start by check_active callback.")
+        yield dlt.mark.materialize_table_schema()
+        return
+
     # An empty configured list [] behaves identically to None (no filter)
     if notebook_names is not None and not notebook_names:
         notebook_names = None
@@ -456,7 +489,12 @@ def _sync_records(
         tag_names = None
 
     # Step 0: Account binding
-    user_id = api_client.get_user_id()
+    try:
+        user_id = service.get_user_id()
+    except (EvernoteAuthError, EvernotePermissionError):
+        if stats is not None:
+            stats["failed_auth"] = stats.get("failed_auth", 0) + 1
+        raise
     bind = f"{'sandbox' if sandbox else 'production'}:{user_id}"
 
     if "account" in state and state["account"] != bind:
@@ -474,9 +512,16 @@ def _sync_records(
         state.pop("partial", None)
 
     # Step 1: Call api.get_sync_state() first and read after_usn
+    if check_active is not None and not check_active():
+        log.warning("Evernote sync stopped before get_sync_state by check_active callback.")
+        yield dlt.mark.materialize_table_schema()
+        return
+
     try:
-        sync_state = api_client.get_sync_state() if hasattr(api_client, "get_sync_state") else None
+        sync_state = service.get_sync_state() if hasattr(service, "get_sync_state") else None
     except EvernoteRateLimitError as e:
+        if stats is not None:
+            stats["failed_rate_limit"] = stats.get("failed_rate_limit", 0) + 1
         log.warning(
             "Evernote rate limit reached getting sync state: %s (retry_after=%s)",
             e,
@@ -484,6 +529,10 @@ def _sync_records(
         )
         yield dlt.mark.materialize_table_schema()
         return
+    except (EvernoteAuthError, EvernotePermissionError):
+        if stats is not None:
+            stats["failed_auth"] = stats.get("failed_auth", 0) + 1
+        raise
 
     current_sync_time = getattr(sync_state, "currentTime", None)
     server_update_count = getattr(sync_state, "updateCount", None)
@@ -618,7 +667,9 @@ def _sync_records(
         highest_chunk_usn: int | None = None
 
         try:
-            for chunk in iter_sync_chunks(api_client, after_usn=after_usn, max_entries=250):
+            for chunk in iter_sync_chunks(
+                service, after_usn=after_usn, max_entries=250, check_active=check_active
+            ):
                 chunk_usn = getattr(chunk, "chunkHighUSN", None)
                 if chunk_usn is not None and (
                     highest_chunk_usn is None or chunk_usn > highest_chunk_usn
@@ -639,6 +690,8 @@ def _sync_records(
                 for tag_guid in getattr(chunk, "expungedTags", None) or []:
                     tag_map.pop(tag_guid, None)
         except EvernoteRateLimitError as e:
+            if stats is not None:
+                stats["failed_rate_limit"] = stats.get("failed_rate_limit", 0) + 1
             log.warning(
                 "Evernote rate limit reached during pass 1: %s (retry_after=%s)",
                 e,
@@ -646,6 +699,14 @@ def _sync_records(
             )
             yield dlt.mark.materialize_table_schema()
             return
+        except _SyncCancelledError:
+            log.warning("Evernote sync stopped during pass 1 by check_active callback.")
+            yield dlt.mark.materialize_table_schema()
+            return
+        except (EvernoteAuthError, EvernotePermissionError):
+            if stats is not None:
+                stats["failed_auth"] = stats.get("failed_auth", 0) + 1
+            raise
 
         # Validate requested notebook_names and tag_names against MERGED maps
         if notebook_names is not None:
@@ -753,12 +814,16 @@ def _sync_records(
         for stale_id in sorted(stale):
             yield {"id": stale_id, "title": "", "content": "", "_deleted": True}
             tombstoned_count += 1
+            if stats is not None:
+                stats["tombstones"] = stats.get("tombstones", 0) + 1
             updated_note_ids.pop(stale_id, None)
 
     # 1. Expunged notes always yield tombstones
     for guid in sorted(expunged_guids):
         yield {"id": guid, "title": "", "content": "", "_deleted": True}
         tombstoned_count += 1
+        if stats is not None:
+            stats["tombstones"] = stats.get("tombstones", 0) + 1
         updated_note_ids.pop(guid, None)
 
     # 2. Changed note metadata: inactive / out-of-scope notes yield tombstones
@@ -767,6 +832,8 @@ def _sync_records(
             guid = getattr(note, "guid", "")
             yield {"id": guid, "title": "", "content": "", "_deleted": True}
             tombstoned_count += 1
+            if stats is not None:
+                stats["tombstones"] = stats.get("tombstones", 0) + 1
             updated_note_ids.pop(guid, None)
 
     # 3. Live in-scope notes sorted by updateSequenceNum ascending
@@ -783,6 +850,15 @@ def _sync_records(
             watermark_usn = max(watermark_usn, note_usn)
             continue
 
+        if check_active is not None and not check_active():
+            notes_remaining = len(candidate_notes) - idx
+            log.warning(
+                "Evernote sync stopped by check_active; %d note(s) remaining for next run.",
+                notes_remaining,
+            )
+            is_unfinished = True
+            break
+
         if max_notes_per_run is not None and body_fetches >= max_notes_per_run:
             notes_remaining = len(candidate_notes) - idx
             log.warning(
@@ -795,9 +871,11 @@ def _sync_records(
 
         guid = getattr(note, "guid", "")
         try:
-            enml = api_client.get_note_content(guid)
+            enml = service.get_note_content(guid)
             body_fetches += 1
         except EvernoteRateLimitError as e:
+            if stats is not None:
+                stats["failed_rate_limit"] = stats.get("failed_rate_limit", 0) + 1
             notes_remaining = len(candidate_notes) - idx
             retry_after = getattr(e, "retry_after", None)
             log.warning(
@@ -810,10 +888,16 @@ def _sync_records(
             )
             is_unfinished = True
             break
+        except (EvernoteAuthError, EvernotePermissionError):
+            if stats is not None:
+                stats["failed_auth"] = stats.get("failed_auth", 0) + 1
+            raise
         except NoteNotFoundError:
             body_fetches += 1
             yield {"id": guid, "title": "", "content": "", "_deleted": True}
             tombstoned_count += 1
+            if stats is not None:
+                stats["tombstones"] = stats.get("tombstones", 0) + 1
             updated_note_ids.pop(guid, None)
             watermark_usn = max(watermark_usn, note_usn)
             continue
@@ -824,6 +908,8 @@ def _sync_records(
         if not content_text:
             yield {"id": guid, "title": "", "content": "", "_deleted": True}
             tombstoned_count += 1
+            if stats is not None:
+                stats["tombstones"] = stats.get("tombstones", 0) + 1
             updated_note_ids.pop(guid, None)
             watermark_usn = max(watermark_usn, note_usn)
             continue
@@ -836,6 +922,8 @@ def _sync_records(
         )
         yield row
         yielded_count += 1
+        if stats is not None:
+            stats["notes_synced"] = stats.get("notes_synced", 0) + 1
         updated_note_ids[guid] = getattr(note, "notebookGuid", "")
         watermark_usn = max(watermark_usn, note_usn)
 
@@ -933,9 +1021,10 @@ def evernote_source(
     notebook_names: list[str] | None = None,
     tag_names: list[str] | None = None,
     resource_name: str = "evernote_notes",
-    client: Any = None,
+    service: Any = None,
     full_resync: bool = False,
     max_notes_per_run: int | None = 100,
+    check_active: Callable[[], bool] | None = None,
 ):
     """Create an Evernote dlt resource for cognee memory ingestion.
 
@@ -947,24 +1036,24 @@ def evernote_source(
     limits; pass None for unlimited). If rate-limited or the limit is reached, the
     run finishes cleanly and persists a progress watermark so the next run continues.
     """
+    _check_cognee_version()
+
+    if not token or not isinstance(token, str) or not token.strip():
+        raise EvernoteAuthError(
+            "Evernote authentication token required: pass a non-empty token string."
+        )
+
     if notebook_names is not None and not notebook_names:
         notebook_names = None
     if tag_names is not None and not tag_names:
         tag_names = None
 
-    resolved_token = token or os.environ.get("EVERNOTE_TOKEN")
-    if client is None and not resolved_token:
-        raise ValueError(
-            "Evernote authentication token required: pass token= or set EVERNOTE_TOKEN."
-        )
-
     if not isinstance(resource_name, str) or not resource_name.strip():
         raise ValueError("resource_name must be a nonempty string")
 
     name = NamingConvention().normalize_table_identifier(resource_name)
-    api_client = (
-        client if client is not None else EvernoteApi(token=resolved_token, sandbox=sandbox)
-    )
+    api_service = service if service is not None else EvernoteApi(token=token, sandbox=sandbox)
+    stats: dict[str, int] = {}
 
     @dlt.resource(
         name=name,
@@ -980,18 +1069,22 @@ def evernote_source(
     )
     def records():
         state = dlt.current.resource_state()
-        yield from _sync_records(
-            api_client=api_client,
+        rows = _sync_records(
+            service=api_service,
             state=state,
             notebook_names=notebook_names,
             tag_names=tag_names,
             sandbox=sandbox,
             full_resync=full_resync,
             max_notes_per_run=max_notes_per_run,
+            check_active=check_active,
+            stats=stats,
         )
+        yield from dlt_utils.guarded_rows(rows, check_active)
 
     resource = records()
     setattr(resource, DOCUMENT_SOURCE_ATTR, "evernote")
     setattr(resource, PIPELINE_SCOPE_ATTR, name)
-    resource.client = api_client
+    resource.service = api_service
+    resource.cognee_sync_stats = stats
     return resource

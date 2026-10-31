@@ -184,7 +184,7 @@ async def test_evernote_ingestion_lifecycle(persistent_environment):
     )
     client = FakeEvernoteClient(chunks=[chunk_initial], note_contents=contents)
 
-    source1 = evernote_source(token="fake-token", client=client)
+    source1 = evernote_source(token="fake-token", service=client)
     await cognee.add(source1, dataset_name=DATASET_NAME, write_disposition="merge")
 
     # Assert 1: Data records created with source == "evernote"
@@ -203,7 +203,7 @@ async def test_evernote_ingestion_lifecycle(persistent_environment):
         notes=[note_a, note_b, note_c],
     )
     client.chunks = [chunk_unchanged]
-    source2 = evernote_source(token="fake-token", client=client)
+    source2 = evernote_source(token="fake-token", service=client)
     await cognee.add(source2, dataset_name=DATASET_NAME, write_disposition="merge")
 
     second_data = await _get_evernote_dataset_data(DATASET_NAME)
@@ -230,7 +230,7 @@ async def test_evernote_ingestion_lifecycle(persistent_environment):
         notes=[note_a_edited, note_b, note_c],
     )
     client.chunks = [chunk_edited]
-    source3 = evernote_source(token="fake-token", client=client)
+    source3 = evernote_source(token="fake-token", service=client)
     await cognee.add(source3, dataset_name=DATASET_NAME, write_disposition="merge")
 
     third_data = await _get_evernote_dataset_data(DATASET_NAME)
@@ -259,7 +259,7 @@ async def test_evernote_ingestion_lifecycle(persistent_environment):
         expungedNotes=["noteC"],
     )
     client.chunks = [chunk_deletion]
-    source4 = evernote_source(token="fake-token", client=client)
+    source4 = evernote_source(token="fake-token", service=client)
     await cognee.add(source4, dataset_name=DATASET_NAME, write_disposition="merge")
 
     final_data = await _get_evernote_dataset_data(DATASET_NAME)
@@ -317,7 +317,7 @@ async def test_evernote_incremental_ingestion_with_cursor(persistent_environment
         notes=[note1, note2, note3],
     )
     client = FakeEvernoteClient(chunks=[chunk1], note_contents=contents, update_count=10)
-    source1 = evernote_source(token="fake-token", client=client)
+    source1 = evernote_source(token="fake-token", service=client)
     await cognee.add(source1, dataset_name=dataset, write_disposition="merge")
 
     # Assert 3 data records created on Run 1
@@ -353,7 +353,7 @@ async def test_evernote_incremental_ingestion_with_cursor(persistent_environment
     client.chunks = [chunk2]
     client.update_count = 20
 
-    source2 = evernote_source(token="fake-token", client=client)
+    source2 = evernote_source(token="fake-token", service=client)
     await cognee.add(source2, dataset_name=dataset, write_disposition="merge")
 
     # Assert that the fake api saw afterUSN > 0 on run 2
@@ -394,7 +394,7 @@ async def test_evernote_ingestion_large_batch(persistent_environment):
         notes=notes,
     )
     client = FakeEvernoteClient(chunks=[chunk], note_contents=contents, update_count=10)
-    source = evernote_source(token="fake-token", client=client)
+    source = evernote_source(token="fake-token", service=client)
     await cognee.add(
         source,
         dataset_name=dataset,
@@ -446,7 +446,7 @@ async def test_evernote_scope_change_triggers_resync_in_cognee(persistent_enviro
         notes=[note_a, note_b],
     )
     client1 = FakeEvernoteClient(chunks=[chunk1], note_contents=contents, update_count=10)
-    source1 = evernote_source(token="fake-token", client=client1, notebook_names=["NotebookA"])
+    source1 = evernote_source(token="fake-token", service=client1, notebook_names=["NotebookA"])
     await cognee.add(source1, dataset_name=dataset, write_disposition="merge")
 
     data1 = await _get_evernote_dataset_data(dataset)
@@ -462,7 +462,7 @@ async def test_evernote_scope_change_triggers_resync_in_cognee(persistent_enviro
     )
     client2 = FakeEvernoteClient(chunks=[chunk2], note_contents=contents, update_count=10)
     source2 = evernote_source(
-        token="fake-token", client=client2, notebook_names=["NotebookA", "NotebookB"]
+        token="fake-token", service=client2, notebook_names=["NotebookA", "NotebookB"]
     )
     await cognee.add(source2, dataset_name=dataset, write_disposition="merge")
 
@@ -478,7 +478,7 @@ async def test_evernote_scope_change_triggers_resync_in_cognee(persistent_enviro
         notes=[note_a, note_b],
     )
     client3 = FakeEvernoteClient(chunks=[chunk3], note_contents=contents, update_count=10)
-    source3 = evernote_source(token="fake-token", client=client3, notebook_names=["NotebookA"])
+    source3 = evernote_source(token="fake-token", service=client3, notebook_names=["NotebookA"])
     await cognee.add(source3, dataset_name=dataset, write_disposition="merge")
 
     data3 = await _get_evernote_dataset_data(dataset)
@@ -510,7 +510,7 @@ async def test_expunged_notebook_deletes_notes_in_cognee(persistent_environment)
         notes=[note_a1, note_a2, note_b1],
     )
     client1 = FakeEvernoteClient(chunks=[chunk1], note_contents=contents, update_count=10)
-    source1 = evernote_source(token="fake-token", client=client1)
+    source1 = evernote_source(token="fake-token", service=client1)
     await cognee.add(source1, dataset_name=dataset, write_disposition="merge")
 
     data1 = await _get_evernote_dataset_data(dataset)
@@ -524,7 +524,7 @@ async def test_expunged_notebook_deletes_notes_in_cognee(persistent_environment)
         expungedNotebooks=["nb-a"],
     )
     client2 = FakeEvernoteClient(chunks=[chunk2], note_contents=contents, update_count=20)
-    source2 = evernote_source(token="fake-token", client=client2)
+    source2 = evernote_source(token="fake-token", service=client2)
     await cognee.add(source2, dataset_name=dataset, write_disposition="merge")
 
     # The Data records of a1 and a2 disappear; b1 stays
@@ -564,7 +564,7 @@ async def test_interrupted_batch_resumes_cleanly_in_cognee(persistent_environmen
     # Run 1: max_notes_per_run=5 fetches the first 5 notes
     source1 = evernote_source(
         token="fake-token",
-        client=client,
+        service=client,
         max_notes_per_run=5,
     )
     await cognee.add(source1, dataset_name=dataset, write_disposition="merge")
@@ -583,7 +583,7 @@ async def test_interrupted_batch_resumes_cleanly_in_cognee(persistent_environmen
     client.chunks = [chunk2]
     source2 = evernote_source(
         token="fake-token",
-        client=client,
+        service=client,
         max_notes_per_run=100,
     )
     await cognee.add(source2, dataset_name=dataset, write_disposition="merge")

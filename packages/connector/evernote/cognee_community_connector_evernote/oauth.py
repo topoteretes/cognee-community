@@ -101,7 +101,7 @@ class EvernoteOAuth:
             return text or ""
         except EvernoteAuthError:
             raise
-        except Exception as exc:
+        except httpx.HTTPError as exc:
             # Mask any internal details to prevent secret/token leakage
             raise EvernoteAuthError(f"OAuth request failed: {type(exc).__name__}") from None
 
@@ -120,7 +120,9 @@ class EvernoteOAuth:
             callback_uri=callback_url,
             signature_method=SIGNATURE_HMAC_SHA1,
         )
-        _, headers, body = client.sign(request_url, http_method="POST")
+        # matches Evernote's JS client; not verified against the live service
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        _, headers, body = client.sign(request_url, http_method="POST", headers=headers, body="")
 
         response_text = self._send_request(request_url, headers=headers, body=body)
 
@@ -163,7 +165,9 @@ class EvernoteOAuth:
             verifier=verifier,
             signature_method=SIGNATURE_HMAC_SHA1,
         )
-        _, headers, body = client.sign(access_url, http_method="POST")
+        # matches Evernote's JS client; not verified against the live service
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        _, headers, body = client.sign(access_url, http_method="POST", headers=headers, body="")
 
         response_text = self._send_request(access_url, headers=headers, body=body)
 

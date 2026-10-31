@@ -193,7 +193,7 @@ async def run_fake_demo() -> None:
                 update_count=10,
             )
 
-            source1 = evernote_source(token="fake-token", client=client)
+            source1 = evernote_source(token="fake-token", service=client)
             await cognee.add(
                 source1,
                 dataset_name=DATASET_NAME,
@@ -230,7 +230,7 @@ async def run_fake_demo() -> None:
             ]
             client.update_count = 20
 
-            source2 = evernote_source(token="fake-token", client=client)
+            source2 = evernote_source(token="fake-token", service=client)
             await cognee.add(
                 source2,
                 dataset_name=DATASET_NAME,

@@ -429,8 +429,8 @@ def test_current_time_none_leaves_last_sync_time_unchanged():
 def test_evernote_source_accepts_full_resync_parameter():
     """evernote_source accepts full_resync parameter and sets it on the generator."""
     client = FakeResyncEvernoteClient(update_count=10)
-    source = evernote_source(token="tok", client=client, full_resync=True)
-    assert hasattr(source, "client")
+    source = evernote_source(token="tok", service=client, full_resync=True)
+    assert hasattr(source, "service")
 
 
 def test_trashed_note_not_in_state_note_ids_still_yields_tombstone():

@@ -546,14 +546,14 @@ def test_token_never_appears_in_str_or_repr_of_raised_errors():
     assert sensitive_token not in str(api)
 
 
-def test_evernote_source_builds_evernote_api_when_client_is_none():
+def test_evernote_source_builds_evernote_api_when_service_is_none():
     """evernote_source initializes EvernoteApi with token and sandbox flag."""
     source = evernote_source(token="tok-abc", sandbox=True)
-    assert isinstance(source.client, EvernoteApi)
-    assert source.client._token == "tok-abc"
-    assert source.client.sandbox is True
+    assert isinstance(source.service, EvernoteApi)
+    assert source.service._token == "tok-abc"
+    assert source.service.sandbox is True
     # Construction made no network calls:
-    assert source.client._note_store_url is None
+    assert source.service._note_store_url is None
 
 
 def test_get_user_id_lazy_resolution_and_caching():

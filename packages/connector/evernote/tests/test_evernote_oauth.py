@@ -6,6 +6,7 @@ All tests run offline using fake/mock HTTP clients.
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import httpx
 import pytest
 
 from cognee_community_connector_evernote import (
@@ -107,6 +108,7 @@ def test_request_token_signing_parameters_present():
     assert len(fake_http.calls) == 1
     call = fake_http.calls[0]
     assert call["url"] == "https://sandbox.evernote.com/oauth"
+    assert call["headers"]["Content-Type"] == "application/x-www-form-urlencoded"
 
     auth_header = call["headers"]["Authorization"]
     assert auth_header.startswith("OAuth ")
@@ -152,6 +154,7 @@ def test_get_access_token_parsing():
     assert access_token.expires == 1700000000000
 
     call = fake_http.calls[0]
+    assert call["headers"]["Content-Type"] == "application/x-www-form-urlencoded"
     auth_header = call["headers"]["Authorization"]
     assert 'oauth_token="req-tok"' in auth_header
     assert 'oauth_verifier="verifier-123"' in auth_header
@@ -238,7 +241,7 @@ def test_error_mapping_network_errors():
     """Underlying network / client errors raise EvernoteAuthError."""
 
     def raise_err(url, headers=None, content=None):
-        raise ConnectionResetError("Connection lost to server")
+        raise httpx.ConnectError("Connection lost to server")
 
     fake_http = FakeHttpClient(handler=raise_err)
 
@@ -248,7 +251,22 @@ def test_error_mapping_network_errors():
         http=fake_http,
     )
 
-    with pytest.raises(EvernoteAuthError, match=r"ConnectionResetError"):
+    with pytest.raises(EvernoteAuthError, match=r"ConnectError"):
+        oauth.get_request_token("https://example.com/cb")
+
+
+def test_type_error_in_fake_propagates_unchanged():
+    """A TypeError raised inside the HTTP client propagates unchanged."""
+    failing_http = MagicMock()
+    failing_http.post.side_effect = TypeError("Unexpected argument type inside client")
+
+    oauth = EvernoteOAuth(
+        consumer_key="key",
+        consumer_secret="secret",
+        http=failing_http,
+    )
+
+    with pytest.raises(TypeError, match="Unexpected argument type inside client"):
         oauth.get_request_token("https://example.com/cb")
 
 
@@ -298,7 +316,9 @@ def test_no_secret_or_token_leaks_in_repr_or_exceptions():
 
     # Network failure error message must not contain secret
     failing_http = MagicMock()
-    failing_http.post.side_effect = RuntimeError(f"Failed with secret {secret_consumer_secret}")
+    failing_http.post.side_effect = httpx.ConnectError(
+        f"Failed with secret {secret_consumer_secret}"
+    )
 
     oauth._http = failing_http
     with pytest.raises(EvernoteAuthError) as exc_info:

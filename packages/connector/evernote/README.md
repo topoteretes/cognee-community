@@ -33,12 +33,8 @@ You can authenticate in two ways:
 
 ### 1. Existing Access Token or Developer Token
 
-Provide your token directly to `evernote_source(token=...)` or set the `EVERNOTE_TOKEN`
-environment variable:
-
-```bash
-export EVERNOTE_TOKEN="your-token"
-```
+Provide your token directly to `evernote_source(token=...)`. Note that `token` is a required
+argument; pass your token string directly.
 
 ### 2. 3-Legged OAuth 1.0a
 
@@ -88,13 +84,16 @@ from cognee_community_connector_evernote import evernote_source
 
 # Create the Evernote dlt resource
 source = evernote_source(
-    token=None,  # Falls back to EVERNOTE_TOKEN env var
+    token="your-token",  # Required Evernote access token
     sandbox=False,  # True for sandbox.evernote.com
-    notebook_names=["Engineering", "Projects"],  # Optional notebook filter
-    tag_names=["cognee", "docs"],  # Optional tag filter
+    notebook_names=[
+        "Engineering",
+        "Projects",
+    ],  # Optional notebook filter (empty list means no filter)
+    tag_names=["cognee", "docs"],  # Optional tag filter (empty list means no filter)
     resource_name="evernote_notes",  # DLT resource and table name
     full_resync=False,  # Set True to force a full resync
-    client=None,  # Optional custom EvernoteApi client for testing
+    service=None,  # Optional custom EvernoteApi service for testing
 )
 
 # Ingest into cognee using merge write disposition (matching sibling connectors)
@@ -115,14 +114,15 @@ answer = await cognee.search(
 
 ### Parameters for `evernote_source(...)`
 
-- `token` (`str | None`): Evernote developer or OAuth access token (falls back to `EVERNOTE_TOKEN`).
+- `token` (`str`): Evernote developer or OAuth access token (required; blank token raises `EvernoteAuthError`).
 - `sandbox` (`bool`): When `True`, connects to `sandbox.evernote.com` instead of `www.evernote.com`.
-- `notebook_names` (`list[str] | None`): List of notebook names to include (case-sensitive).
-- `tag_names` (`list[str] | None`): List of tag names to include (case-sensitive).
+- `notebook_names` (`list[str] | None`): List of notebook names to include (case-sensitive; empty list or `None` means no filter).
+- `tag_names` (`list[str] | None`): List of tag names to include (case-sensitive; empty list or `None` means no filter).
 - `resource_name` (`str`): DLT resource and table name (defaults to `"evernote_notes"`). Bound to account/sandbox to prevent cross-account pollution.
 - `full_resync` (`bool`): When `True`, forces a full pass from USN 0 and deletion reconciliation.
-- `client` (`EvernoteApi | None`): Injected API client for offline testing.
+- `service` (`EvernoteApi | None`): Injected API service for offline testing.
 - `max_notes_per_run` (`int | None`): Maximum note bodies to fetch per run (defaults to `100`, a conservative batch limit not derived from Evernote's published limits; `None` for unlimited).
+- `check_active` (`Callable[[], bool] | None`): Optional callback invoked before each API call; returning `False` pauses the run cleanly, committing rows fetched so far and saving partial progress to resume on the next run.
 
 ## How Incremental Sync Works
 
@@ -160,9 +160,9 @@ Filter ingested notes with `notebook_names` and `tag_names`:
 
 - **No live-API validation**: Tested exclusively offline against fake clients and simulated sync chunks; has not been run against a live Evernote account.
 - **Pre-release dependency**: Relies on `evernote-plus==1.28.1.dev2` for Python 3 EDAM Thrift bindings.
-- **Notebook/tag renames**: Renaming a notebook or tag changes the rendered text of its notes (`Notebook:` and `Tags:` header lines) only when those notes are next edited on the server or when `full_resync=True` is explicitly used.
+- **Notebook/tag renames**: notebook and tags are rendered as Notebook:/Tags: lines at the top of each note; a rename changes that text, but the notes are only re-emitted when edited or with full_resync=True; a rename can also change which notes are in scope (see the scope/guid text).
 - **USN cursor advances on filtered objects**: If changes on the server only affect unrequested object types (e.g. saved searches or resources), the cursor in state may remain below the server's `updateCount` (this is harmless and may trigger one extra empty sync chunk check).
-- **Attachments**: Images, audio, PDFs, and binary attachments in ENML are replaced with text placeholders (`[Attachment: type=...]`) and their raw bytes are not ingested.
+- **Attachments**: Images, audio, PDFs, and binary attachments in ENML are replaced with text placeholders (`[attachment: {media_type}]`) and their raw bytes are not ingested.
 
 ## Running the Tests
 

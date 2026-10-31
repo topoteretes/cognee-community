@@ -439,7 +439,7 @@ def test_dlt_pipeline_real_persistence_across_runs(tmp_path):
     )
 
     # Run 1: initial ingestion
-    source1 = evernote_source(token="fake-tok", client=client)
+    source1 = evernote_source(token="fake-tok", service=client)
     pipeline.run(source1, write_disposition="merge")
 
     # Read state from pipeline
@@ -453,7 +453,7 @@ def test_dlt_pipeline_real_persistence_across_runs(tmp_path):
     client.update_count = 50
     client.current_time = 1609500000000
     v1 = pipeline.state.get("_state_version")
-    source2 = evernote_source(token="fake-tok", client=client)
+    source2 = evernote_source(token="fake-tok", service=client)
     pipeline.run(source2, write_disposition="merge")
     v2 = pipeline.state.get("_state_version")
 
