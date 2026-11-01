@@ -132,8 +132,16 @@ class ExcalidrawParser:
                     src_node = node_lookup.get(resolved_src_id)
                     tgt_node = node_lookup.get(resolved_tgt_id)
 
-                    src_label = src_node.label if src_node else f"Node-{resolved_src_id[:6]}"
-                    tgt_label = tgt_node.label if tgt_node else f"Node-{resolved_tgt_id[:6]}"
+                    src_label = (
+                        src_node.label
+                        if src_node and src_node.label
+                        else f"Node-{resolved_src_id[:6]}"
+                    )
+                    tgt_label = (
+                        tgt_node.label
+                        if tgt_node and tgt_node.label
+                        else f"Node-{resolved_tgt_id[:6]}"
+                    )
 
                     edge_label = container_to_text.get(elem.get("id", "")) or _clean_text(
                         elem.get("text")
