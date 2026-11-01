@@ -156,4 +156,5 @@ def diagram_to_cognee_document(
         "nodes_count": len(diag.nodes),
         "connections_count": len(diag.connections),
         "_deleted": False,
+        "document_source": True,
     }
