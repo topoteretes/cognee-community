@@ -1,7 +1,7 @@
 [project]
 name = "cognee-community-connector-polar"
 version = "0.1.0"
-description = "Polar data-source connector for cognee — sync customers, subscriptions, benefit-grants, and products into AI memory"
+description = "Polar data-source connector for cognee - sync customers, subscriptions, benefit-grants, and products into AI memory"
 readme = "README.md"
 requires-python = ">=3.10,<3.15"
 dependencies = [
@@ -10,6 +10,9 @@ dependencies = [
     "httpx>=0.25.0,<1.0.0",
     "pydantic>=2.0.0,<3.0.0",
 ]
+
+[project.scripts]
+cognee-polar = "cognee_community_connector_polar.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/topoteretes/cognee"

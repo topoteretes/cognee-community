@@ -136,3 +136,29 @@ def test_sandbox_routing():
 
     prod_client = PolarClient(access_token="test_tok", is_sandbox=False)
     assert prod_client.base_url == "https://api.polar.sh/v1"
+
+
+def test_cli_execution_with_token(monkeypatch, capsys):
+    from unittest.mock import patch
+    from cognee_community_connector_polar.cli import main
+
+    fake_client = create_fake_client()
+    with patch("cognee_community_connector_polar.cli.PolarClient", return_value=fake_client):
+        monkeypatch.setattr("sys.argv", ["cognee-polar", "--token", "fake_test_token", "--org-id", ORG_ID])
+        main()
+        captured = capsys.readouterr()
+        assert "[SUCCESS] Ingested 7 Polar document(s)" in captured.out
+        assert "customer: 2" in captured.out
+        assert "subscription: 2" in captured.out
+
+
+def test_cli_missing_token_exits(monkeypatch, capsys):
+    from cognee_community_connector_polar.cli import main
+
+    monkeypatch.delenv("POLAR_ACCESS_TOKEN", raising=False)
+    monkeypatch.setattr("sys.argv", ["cognee-polar", "--token", ""])
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    assert "Polar Access Token required" in captured.err
