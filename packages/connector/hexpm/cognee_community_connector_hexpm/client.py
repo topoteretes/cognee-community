@@ -51,6 +51,10 @@ class HexClient:
         self.transport = transport
         self.timeout = timeout
 
+    def __repr__(self) -> str:
+        key_repr = "'***'" if self.api_key else "None"
+        return f"HexClient(base_url={self.base_url!r}, api_key={key_repr})"
+
     def _create_client(self) -> httpx.AsyncClient:
         headers = {
             "User-Agent": self.user_agent,

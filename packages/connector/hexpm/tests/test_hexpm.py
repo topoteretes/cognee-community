@@ -341,3 +341,22 @@ def test_cli_benchmark_command(capsys):
     captured = capsys.readouterr()
     assert "Cognee Hex.pm Microbenchmark" in captured.out
     assert "Throughput:" in captured.out
+
+
+def test_hex_client_repr_redacts_api_key():
+    client = HexClient(api_key="secret_hex_token_12345")
+    repr_str = repr(client)
+    assert "secret_hex_token" not in repr_str
+    assert "'***'" in repr_str
+
+
+def test_hex_connector_records_sync_stats():
+    async def _run():
+        client = HexClient(transport=create_fake_transport())
+        connector = HexConnector(client=client)
+        docs = await connector.fetch_documents(package_names=["phoenix", "nonexistent"])
+        assert len(docs) == 1
+        assert connector.sync_stats["processed"] == 1
+        assert connector.sync_stats["skipped"] == 1
+
+    asyncio.run(_run())

@@ -24,6 +24,11 @@ class HexConnector:
     ) -> None:
         self.client = client or HexClient()
         self.options = options or RenderOptions()
+        self.sync_stats: dict[str, int] = {
+            "processed": 0,
+            "skipped": 0,
+            "failed": 0,
+        }
 
     async def fetch_documents(
         self,
@@ -50,6 +55,11 @@ class HexConnector:
 
         packages = await self.client.fetch_packages_batch(unique_targets)
         documents = [hex_to_cognee_document(pkg, options=self.options) for pkg in packages]
+        self.sync_stats = {
+            "processed": len(documents),
+            "skipped": len(unique_targets) - len(packages),
+            "failed": 0,
+        }
         return documents
 
     def fetch_documents_sync(
