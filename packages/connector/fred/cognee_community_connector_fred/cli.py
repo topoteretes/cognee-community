@@ -1,80 +1,107 @@
-"""Command-Line Interface (CLI) for testing and previewing the Cognee FRED Connector."""
+"""Command-Line Interface (CLI) for testing and querying the Cognee FRED Connector."""
 
 import argparse
 import os
 import sys
 
-from .fred import FredClient, FredRenderOptions, sync_fred_records
+from .fred import (
+    FredClient,
+    FredRenderOptions,
+    sync_fred_records,
+)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Cognee Community FRED Economic Data Connector CLI",
+        description="Cognee Community FRED Macroeconomic Data Connector CLI",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--series",
+        default="GDP,UNRATE,CPIAUCSL",
+        help="Comma-separated list of FRED series symbols",
     )
     parser.add_argument(
         "--api-key",
         default=os.getenv("FRED_API_KEY", ""),
-        help="FRED API key (or set FRED_API_KEY environment variable)",
-    )
-    parser.add_argument(
-        "--series",
-        default="GDP,UNRATE",
-        help="Comma-separated FRED series identifiers (e.g. 'GDP,UNRATE,FEDFUNDS')",
+        help="FRED API Key (or FRED_API_KEY environment variable)",
     )
     parser.add_argument(
         "--search",
-        help="Search query to discover series instead of passing IDs",
+        help="Search query to discover FRED series automatically",
     )
     parser.add_argument(
-        "--limit",
+        "--category-id",
         type=int,
-        default=10,
-        help="Maximum recent observations to show per series",
+        help="FRED Category ID to fetch top indicators from (e.g. 106 for GDP)",
+    )
+    parser.add_argument(
+        "--max-obs",
+        type=int,
+        default=5,
+        help="Maximum recent observations to include in the document content",
     )
 
     args = parser.parse_args()
 
     api_key = args.api_key.strip()
     if not api_key:
-        print("[ERROR] FRED API key missing. Please provide --api-key or set FRED_API_KEY in your environment.", file=sys.stderr)
-        print("Obtain a free instant key at: https://fred.stlouisfed.org/docs/api/api_key.html", file=sys.stderr)
+        print(
+            "[ERROR] FRED API key missing. Provide --api-key or set FRED_API_KEY.",
+            file=sys.stderr,
+        )
+        print(
+            "Obtain a free instant key at: https://fred.stlouisfed.org/docs/api/api_key.html",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     client = FredClient(api_key=api_key)
 
-    target_series = [s.strip() for s in args.series.split(",") if s.strip()]
+    series_list = [s.strip() for s in args.series.split(",") if s.strip()]
+
+    if args.category_id:
+        print(f">> Fetching series from FRED Category ID: {args.category_id}...")
+        try:
+            cat_series = client.get_category_series(args.category_id, limit=5)
+            cat_ids = [s.get("id") for s in cat_series if s.get("id")]
+            print(f">> Discovered {len(cat_ids)} series: {', '.join(cat_ids)}")
+            for sid in cat_ids:
+                if sid not in series_list:
+                    series_list.append(sid)
+        except Exception as exc:
+            print(f"[ERROR] Category fetch failed: {exc}", file=sys.stderr)
+            sys.exit(1)
 
     if args.search:
         print(f">> Searching FRED for query: '{args.search}'...")
         try:
             results = client.search_series(args.search, limit=5)
-            print(f">> Found {len(results)} matches:")
-            for item in results:
-                s_id = item.get("id")
-                s_title = item.get("title")
-                print(f"   * [{s_id}] {s_title}")
-                if s_id and s_id not in target_series:
-                    target_series.append(s_id)
+            sids = [s.get("id") for s in results if s.get("id")]
+            print(f">> Discovered {len(sids)} series: {', '.join(sids)}")
+            for sid in sids:
+                if sid not in series_list:
+                    series_list.append(sid)
         except Exception as exc:
             print(f"[ERROR] Search failed: {exc}", file=sys.stderr)
             sys.exit(1)
 
-    print(f">> Fetching and rendering documents for series: {target_series}...")
-    options = FredRenderOptions(max_observations=args.limit)
+    print(f">> Syncing and rendering documents for {len(series_list)} series: {series_list}...\n")
+    options = FredRenderOptions(max_observations=args.max_obs)
 
     count = 0
-    for doc in sync_fred_records(client, target_series, options=options):
+    for doc in sync_fred_records(client, series_list, options=options):
         count += 1
-        print("\n" + "=" * 70)
+        print("=" * 70)
         print(f"DOCUMENT ID : {doc['id']}")
         print(f"TITLE       : {doc['title']}")
-        print(f"URL         : {doc['url']}")
         print(f"LATEST DATE : {doc.get('latest_observation_date')}")
+        print(f"FREQUENCY   : {doc.get('frequency')}")
+        print(f"UNITS       : {doc.get('units')}")
         print("=" * 70)
         print(doc["content"])
 
-    print(f"\n[SUCCESS] Successfully fetched and rendered {count} FRED document(s) for Cognee AI Memory.")
+    print(f"\n[SUCCESS] Rendered {count} FRED document(s) for Cognee AI Memory.")
 
 
 if __name__ == "__main__":

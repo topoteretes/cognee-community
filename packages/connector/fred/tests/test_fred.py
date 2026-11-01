@@ -1,13 +1,11 @@
 """Hermetic unit test suite for the Cognee FRED Economic Data Connector."""
 
-import json
-import pytest
 import httpx
+import pytest
 
 from cognee_community_connector_fred.fred import (
     FredClient,
     FredConnectorError,
-    FredRenderOptions,
     fred_source,
     render_fred_document,
     sync_fred_records,
@@ -32,7 +30,7 @@ MOCK_SERIES_GDP = {
             "seasonal_adjustment": "Seasonally Adjusted Annual Rate",
             "seasonal_adjustment_short": "SAAR",
             "last_updated": "2026-10-25 07:33:02-05",
-            "notes": "Information regarding the Gross Domestic Product of the United States economy.",
+            "notes": "Information regarding the Gross Domestic Product of the US economy.",
         }
     ],
 }
@@ -51,8 +49,18 @@ MOCK_OBSERVATIONS_GDP = {
     "offset": 0,
     "limit": 60,
     "observations": [
-        {"realtime_start": "2026-11-01", "realtime_end": "2026-11-01", "date": "2026-07-01", "value": "29350.2"},
-        {"realtime_start": "2026-11-01", "realtime_end": "2026-11-01", "date": "2026-04-01", "value": "29012.8"},
+        {
+            "realtime_start": "2026-11-01",
+            "realtime_end": "2026-11-01",
+            "date": "2026-07-01",
+            "value": "29350.2",
+        },
+        {
+            "realtime_start": "2026-11-01",
+            "realtime_end": "2026-11-01",
+            "date": "2026-04-01",
+            "value": "29012.8",
+        },
     ],
 }
 
@@ -95,7 +103,9 @@ class FakeFredTransport(httpx.BaseTransport):
 
         if "/series" in url_str:
             if "series_id=NOTFOUND" in url_str:
-                return httpx.Response(status_code=404, json={"error_code": 404, "error_message": "Series not found"})
+                return httpx.Response(
+                    status_code=404, json={"error_code": 404, "error_message": "Series not found"}
+                )
             return httpx.Response(status_code=200, json=MOCK_SERIES_GDP)
 
         return httpx.Response(status_code=404, json={"error": "Not Found"})
@@ -186,11 +196,13 @@ def test_sync_fred_records():
 def test_incremental_sync_skips_unchanged():
     client = create_mock_client()
     # If the latest date seen is already "2026-07-01", it should skip syncing
-    docs = list(sync_fred_records(
-        client,
-        ["GDP"],
-        last_observation_dates={"GDP": "2026-07-01"},
-    ))
+    docs = list(
+        sync_fred_records(
+            client,
+            ["GDP"],
+            last_observation_dates={"GDP": "2026-07-01"},
+        )
+    )
     assert len(docs) == 0
 
 

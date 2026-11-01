@@ -99,6 +99,7 @@ import os
 import cognee
 from cognee_community_connector_fred import fred_source, FredRenderOptions
 
+
 async def main():
     api_key = os.getenv("FRED_API_KEY", "your_fred_api_key")
 
@@ -112,6 +113,7 @@ async def main():
         source,
         dataset_name="us_macroeconomic_data",
     )
+
 
 if __name__ == "__main__":
     asyncio.run(main())
