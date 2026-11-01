@@ -111,11 +111,10 @@ class ExcalidrawParser:
         # 3. Extract standalone text blocks (annotations, headings)
         standalone_texts: list[str] = []
         for elem in raw_elements:
-            if elem.get("type") == "text":
-                if not elem.get("containerId"):
-                    txt = _clean_text(elem.get("text", ""))
-                    if txt:
-                        standalone_texts.append(txt)
+            if elem.get("type") == "text" and not elem.get("containerId"):
+                txt = _clean_text(elem.get("text", ""))
+                if txt:
+                    standalone_texts.append(txt)
 
         # 4. Extract relationships / arrows (connections)
         connections: list[ExcalidrawConnection] = []
