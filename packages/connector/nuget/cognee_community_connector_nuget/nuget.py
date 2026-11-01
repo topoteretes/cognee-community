@@ -11,7 +11,11 @@ import json
 import logging
 import re
 import time
-import xml.etree.ElementTree as ET
+
+try:
+    from defusedxml import ElementTree
+except ImportError:
+    from xml.etree import ElementTree  # nosec: B405
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -219,7 +223,7 @@ def extract_packages_from_dotnet_file(file_path: str | Path) -> list[str]:
     else:
         try:
             clean_xml = re.sub(r'\sxmlns="[^"]+"', "", content, count=1)
-            root = ET.fromstring(clean_xml)
+            root = ElementTree.fromstring(clean_xml)  # nosec: B314
             for elem in root.iter():
                 tag = elem.tag.split("}")[-1]
                 if tag in ("PackageReference", "PackageVersion"):
