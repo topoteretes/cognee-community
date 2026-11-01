@@ -1,0 +1,13 @@
+{
+  "issueTypes": [
+    "exception"
+  ],
+  "limit": 5,
+  "severity": "any",
+  "triageStatuses": [
+    "untriaged",
+    "highImpact",
+    "lowImpact",
+    "ignored"
+  ]
+}
