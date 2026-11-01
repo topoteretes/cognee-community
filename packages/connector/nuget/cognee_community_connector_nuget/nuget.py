@@ -189,8 +189,9 @@ class NugetClient:
     def search_packages(self, query: str, limit: int = 10) -> list[str]:
         """Search NuGet for packages matching query string."""
         self.discover_endpoints()
-        data = self.request(self.search_query_url, params={"q": query.strip(), "take": limit})
-        return [item.get("id") for item in data.get("data", []) if item.get("id")]
+        url = self.search_query_url or "https://azuresearch-usnc.nuget.org/query"
+        data = self.request(url, params={"q": query.strip(), "take": limit})
+        return [str(item["id"]) for item in data.get("data", []) if item.get("id")]
 
 
 def extract_packages_from_dotnet_file(file_path: str | Path) -> list[str]:
