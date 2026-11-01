@@ -51,9 +51,11 @@ The source is a **full snapshot**: `write_disposition="replace"` rewrites stagin
 exactly the pages currently visible to the integration on each run. Notion has no delete
 feed and hides archived/trashed/unshared pages from listings, so a deleted page simply
 drops out of the snapshot and cognee's existing `orphan_cleanup` removes it from the graph
-and vector stores. Unchanged pages keep a stable content-hash `data_id`, so they are not
-re-ingested or re-cognified. A render error aborts the run (leaving memory untouched)
+and vector stores. A render error aborts the run (leaving memory untouched)
 rather than letting a partial snapshot forget live pages.
+
+To optimize sync speed, the connector maintains a **watermark** (mapping each page ID to its `last_edited_time` and rendered content), persisted natively in the pipeline's `dlt.current.source_state()`. Unchanged pages bypass re-rendering and keep a stable content-hash `data_id` so they are not re-cognified.
+*Note: Notion does not always bump a page's `last_edited_time` when a deeply nested block is modified; such changes may not trigger an incremental re-render until the page itself is edited.*
 
 ## Setup
 
