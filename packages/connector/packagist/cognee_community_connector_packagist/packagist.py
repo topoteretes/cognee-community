@@ -1,21 +1,9 @@
-"""Packagist / Composer (PHP package registry) data-source connector for cognee.
+"""Packagist / Composer PHP ecosystem connector for Cognee.
 
-Syncs PHP packages, releases, dependency requirements, upstream abandonment notices,
-and Packagist security advisories into Cognee AI graph & vector memory.
-
-Key Features:
-- Direct REST integration with Packagist API (https://packagist.org)
-- Adheres to Packagist API policies (descriptive User-Agent header)
-- Support for selecting packages by explicit name or vendor prefix
-- Ingests package metadata, version constraints, and maintainer details
-- Ingests official security advisories (PKSA-*, CVE, affected versions)
-- Tracks package abandonment replacement notices (e.g., abandoned: "symfony/mailer")
-- Incremental sync support via Packagist's /metadata/changes.json cursor
-- Tombstoning of deleted or unmonitored packages (_deleted: True)
-- Standardized DLT resource with DOCUMENT_SOURCE_ATTR="packagist"
+Ingests package metadata, version release streams, license expressions, download statistics,
+upstream abandonment notices with replacement recommendations, and GitHub Security Advisories
+from Packagist.org into Cognee graph & vector AI memory.
 """
-
-from __future__ import annotations
 
 import json
 import logging
@@ -32,21 +20,18 @@ try:
 except ImportError:
     dlt = None
 
-try:
-    from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
-except ImportError:
-    DOCUMENT_SOURCE_ATTR = "cognee_document_source"
+DOCUMENT_SOURCE_ATTR = "document_source"
 
 logger = logging.getLogger("cognee_connector_packagist")
 
 PACKAGIST_API_BASE = "https://packagist.org"
-PACKAGIST_REPO_BASE = "https://repo.packagist.org"
+PACKAGIST_SECURITY_BASE = "https://packagist.org/api/security-advisories"
 
 _MAX_RETRIES = 3
 
 
 class PackagistConnectorError(RuntimeError):
-    """Raised when a Packagist API request fails unrecoverably."""
+    """Raised when an unrecoverable Packagist API failure occurs."""
 
     def __init__(self, message: str, status_code: int = 0):
         super().__init__(message)
@@ -64,13 +49,13 @@ class PackagistRenderOptions:
 
 
 class PackagistClient:
-    """Client for Packagist public and private REST API."""
+    """HTTP client for interacting with the official Packagist.org v2 and security APIs."""
 
     def __init__(
         self,
         token: str | None = None,
-        base_url: str | None = None,
         client: httpx.Client | None = None,
+        base_url: str | None = None,
     ):
         self.token = token
         self.base_url = (base_url or PACKAGIST_API_BASE).rstrip("/")
@@ -78,20 +63,25 @@ class PackagistClient:
         self._owns_client = client is None
 
     def close(self):
-        """Close underlying HTTP client if owned."""
         if self._owns_client:
             self._client.close()
 
     def _get_headers(self) -> dict[str, str]:
         headers = {
             "Accept": "application/json",
-            "User-Agent": "cognee-community-connector-packagist/0.1.0 (Cognee AI Memory; +https://github.com/topoteretes/cognee)",
+            "User-Agent": "cognee-community-connector-packagist/0.1.0",
         }
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
         return headers
 
-    def request(self, method: str, endpoint: str, params: dict[str, Any] | None = None, data: Any = None) -> dict[str, Any]:
+    def request(
+        self,
+        method: str,
+        endpoint: str,
+        params: dict[str, Any] | None = None,
+        data: Any = None,
+    ) -> dict[str, Any]:
         """Send authenticated or public request with automatic backoff on 429."""
         url = f"{self.base_url}/{endpoint.lstrip('/')}"
         params = params or {}
@@ -99,7 +89,7 @@ class PackagistClient:
         for attempt in range(1, _MAX_RETRIES + 1):
             try:
                 resp = self._client.request(
-                    method=method.upper(),
+                    method=method,
                     url=url,
                     headers=self._get_headers(),
                     params=params,
@@ -109,40 +99,52 @@ class PackagistClient:
 
                 if resp.status_code == 429:
                     retry_after = int(resp.headers.get("Retry-After", "2"))
-                    logger.warning("Packagist rate limit hit, backing off for %ds", retry_after)
+                    logger.warning("Packagist API rate limit hit, backing off for %ds", retry_after)
                     time.sleep(retry_after)
                     continue
 
                 if resp.status_code == 404:
-                    raise PackagistConnectorError(f"Resource not found on Packagist: {endpoint}", 404)
+                    raise PackagistConnectorError(
+                        f"Resource not found on Packagist: {endpoint}", 404
+                    )
 
                 if resp.status_code in (401, 403):
-                    raise PackagistConnectorError("Unauthorized/Forbidden on Packagist", resp.status_code)
+                    raise PackagistConnectorError(
+                        "Unauthorized/Forbidden on Packagist", resp.status_code
+                    )
 
                 if resp.status_code >= 400:
-                    raise PackagistConnectorError(f"Packagist API error ({resp.status_code}): {resp.text}", resp.status_code)
+                    raise PackagistConnectorError(
+                        f"Packagist API error ({resp.status_code}): {resp.text}", resp.status_code
+                    )
 
                 return resp.json()
 
             except (httpx.NetworkError, httpx.TimeoutException) as exc:
                 if attempt == _MAX_RETRIES:
-                    raise PackagistConnectorError(f"Packagist connection failed after {attempt} attempts: {exc}") from exc
+                    raise PackagistConnectorError(
+                        f"Packagist connection failed after {attempt} attempts: {exc}"
+                    ) from exc
                 time.sleep(1.0 * attempt)
 
         raise PackagistConnectorError("Max retries exceeded for Packagist request")
 
     def get_package(self, package_name: str) -> dict[str, Any]:
-        """Fetch package metadata from GET /packages/{vendor}/{package}.json."""
-        pkg = package_name.strip()
-        data = self.request("GET", f"packages/{pkg}.json")
-        return data.get("package", {})
+        """Fetch package metadata from GET /packages/{vendor}/{name}.json."""
+        endpoint = f"packages/{package_name.strip()}.json"
+        data = self.request("GET", endpoint)
+        pkg = data.get("package")
+        if not pkg:
+            raise PackagistConnectorError(f"Package '{package_name}' missing payload.", 404)
+        return pkg
 
     def get_security_advisories(self, package_names: list[str]) -> dict[str, list[dict[str, Any]]]:
-        """Fetch security advisories via POST /api/security-advisories/."""
-        if not package_names:
+        """Batch fetch security advisories for a list of packages."""
+        clean_names = [p.strip() for p in package_names if p.strip()]
+        if not clean_names:
             return {}
 
-        form_data = {"packages[]": [pkg.strip() for pkg in package_names]}
+        form_data = {"packages[]": clean_names}
         try:
             data = self.request("POST", "api/security-advisories/", data=form_data)
             return data.get("advisories", {})
@@ -151,7 +153,7 @@ class PackagistClient:
             return {}
 
     def list_vendor_packages(self, vendor: str) -> list[str]:
-        """Fetch package names for a given vendor prefix from GET /packages/list.json?vendor={vendor}."""
+        """Fetch package names for a given vendor prefix from GET /packages/list.json."""
         data = self.request("GET", "packages/list.json", params={"vendor": vendor.strip()})
         return data.get("packageNames", [])
 
@@ -189,7 +191,6 @@ def extract_packages_from_composer_file(file_path: str | Path) -> list[str]:
     # Case 2: composer.json file
     if "require" in data or "require-dev" in data:
         for dep in list(data.get("require", {}).keys()) + list(data.get("require-dev", {}).keys()):
-            # Filter out platform packages (php, ext-*, lib-*)
             if dep.lower() == "php" or dep.startswith("ext-") or dep.startswith("lib-"):
                 continue
             if "/" in dep:
@@ -201,9 +202,10 @@ def extract_packages_from_composer_file(file_path: str | Path) -> list[str]:
 def render_packagist_document(
     pkg: dict[str, Any],
     advisories: list[dict[str, Any]] | None = None,
-    options: PackagistRenderOptions = PackagistRenderOptions(),
+    options: PackagistRenderOptions | None = None,
 ) -> dict[str, Any]:
     """Convert Packagist package metadata and advisories into a structured Cognee document."""
+    options = options or PackagistRenderOptions()
     pkg_name = pkg.get("name", "").strip()
     description = pkg.get("description", "No description provided.")
     repo_url = pkg.get("repository", "")
@@ -219,7 +221,6 @@ def render_packagist_document(
     # Version analysis
     versions = pkg.get("versions", {})
     recent_versions = []
-    # Sort or collect non-dev versions
     for v_name, v_data in versions.items():
         if isinstance(v_data, dict):
             recent_versions.append((v_name, v_data))
@@ -239,7 +240,9 @@ def render_packagist_document(
 
     if is_abandoned:
         if replacement:
-            content_lines.append(f"- Status: ⚠️ ABANDONED (Author recommends replacement: '{replacement}')")
+            content_lines.append(
+                f"- Status: ⚠️ ABANDONED (Author recommends replacement: '{replacement}')"
+            )
         else:
             content_lines.append("- Status: ⚠️ ABANDONED (No official replacement recommended)")
     else:
@@ -252,7 +255,9 @@ def render_packagist_document(
             reqs = v_meta.get("require", {})
             php_req = reqs.get("php", "Unspecified")
             lic = ", ".join(v_meta.get("license", [])) or "None listed"
-            content_lines.append(f"- Version {v_name}: License [{lic}] | PHP requirement: {php_req}")
+            content_lines.append(
+                f"- Version {v_name}: License [{lic}] | PHP requirement: {php_req}"
+            )
 
     # Security Advisories
     adv_list = advisories or []
@@ -265,7 +270,9 @@ def render_packagist_document(
                 cve = adv.get("cve", "CVE Pending")
                 affected = adv.get("affectedVersions", "Unknown")
                 link = adv.get("link", web_url)
-                content_lines.append(f"- [{adv_id}] {adv_title} ({cve}) | Affected: {affected} | Link: {link}")
+                content_lines.append(
+                    f"- [{adv_id}] {adv_title} ({cve}) | Affected: {affected} | Link: {link}"
+                )
         else:
             content_lines.append("- No known security advisories on file.")
 
@@ -288,14 +295,16 @@ def render_packagist_document(
 def sync_packagist_records(
     client: PackagistClient,
     package_names: list[str],
-    options: PackagistRenderOptions = PackagistRenderOptions(),
+    options: PackagistRenderOptions | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Yield all rendered documents for selected Composer packages and their security advisories."""
+    options = options or PackagistRenderOptions()
     if not package_names:
         return
 
-    # Bulk fetch advisories for all packages in one call
-    advisories_map = client.get_security_advisories(package_names) if options.include_security_advisories else {}
+    advisories_map = (
+        client.get_security_advisories(package_names) if options.include_security_advisories else {}
+    )
 
     for raw_name in package_names:
         pkg_name = raw_name.strip()
@@ -306,8 +315,9 @@ def sync_packagist_records(
             pkg_data = client.get_package(pkg_name)
         except PackagistConnectorError as exc:
             if exc.status_code == 404:
-                # Package was deleted or renamed upstream -> emit tombstone
-                logger.info("Packagist package '%s' returned 404; emitting deletion tombstone.", pkg_name)
+                logger.info(
+                    "Packagist package '%s' returned 404; emitting deletion tombstone.", pkg_name
+                )
                 yield {
                     "id": f"packagist:{pkg_name}",
                     "title": f"Packagist: {pkg_name} (Deleted)",
@@ -339,9 +349,6 @@ def sync_packagist_records(
         yield render_packagist_document(pkg_data, adv_list, options)
 
 
-# ─── DLT Source & Fallback Generator ──────────────────────────────────────────
-
-
 if dlt is not None:
 
     @dlt.source(name="packagist")
@@ -350,17 +357,10 @@ if dlt is not None:
         vendor: str | None = None,
         composer_file: str | Path | None = None,
         token: str | None = None,
-        options: PackagistRenderOptions = PackagistRenderOptions(),
+        options: PackagistRenderOptions | None = None,
     ):
-        """DLT source to sync Packagist PHP packages and advisories into Cognee AI memory.
-
-        Args:
-            packages: List of 'vendor/package' names (e.g. ['monolog/monolog', 'symfony/http-foundation']).
-            vendor: Optional vendor prefix to auto-discover all packages (e.g. 'laravel' or 'symfony').
-            composer_file: Optional path to a composer.json or composer.lock file to extract dependencies.
-            token: Optional Private Packagist API token.
-            options: PackagistRenderOptions.
-        """
+        """DLT source to sync Packagist PHP packages and advisories into Cognee AI memory."""
+        options = options or PackagistRenderOptions()
         client = PackagistClient(token=token)
         target_packages = list(packages or [])
 
@@ -371,7 +371,9 @@ if dlt is not None:
                     if p not in target_packages:
                         target_packages.append(p)
             except Exception as e:
-                logger.error("Failed extracting packages from composer file '%s': %s", composer_file, e)
+                logger.error(
+                    "Failed extracting packages from composer file '%s': %s", composer_file, e
+                )
 
         if vendor:
             try:
@@ -387,7 +389,6 @@ if dlt is not None:
 
         @dlt.resource(name="packagist_packages", primary_key="id", write_disposition="merge")
         def packagist_packages():
-            # Check high-res cursor for incremental updates
             try:
                 state = dlt.current.resource_state()
                 last_cursor = state.get("cursor")
@@ -415,9 +416,10 @@ else:
         vendor: str | None = None,
         composer_file: str | Path | None = None,
         token: str | None = None,
-        options: PackagistRenderOptions = PackagistRenderOptions(),
+        options: PackagistRenderOptions | None = None,
     ):
         """Fallback generator when dlt is not loaded."""
+        options = options or PackagistRenderOptions()
         client = PackagistClient(token=token)
         target_packages = list(packages or [])
 

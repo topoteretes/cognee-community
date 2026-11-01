@@ -1,17 +1,12 @@
-"""Example: Ingesting Packagist / Composer PHP packages into Cognee memory."""
+"""Example demonstration: Ingesting Packagist PHP package metadata into Cognee."""
 
-import asyncio
-import os
 import sys
 from pathlib import Path
 
-# Enable direct script execution without prior installation
+# Ensure local package is in sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from cognee_community_connector_packagist import (
-    PackagistRenderOptions,
-    packagist_source,
-)
+from cognee_community_connector_packagist import PackagistRenderOptions, packagist_source
 
 try:
     import cognee
@@ -20,31 +15,24 @@ except ImportError:
 
 
 async def main():
-    # Popular packages to demonstrate active, abandoned, and security advisory handling
-    packages_to_track = [
-        "monolog/monolog",          # Popular logging library
-        "guzzlehttp/guzzle",        # HTTP client
+    packages_to_index = [
+        "monolog/monolog",  # Popular logging library
+        "guzzlehttp/guzzle",  # HTTP client
         "swiftmailer/swiftmailer",  # Famous abandoned library (replaced by symfony/mailer)
     ]
 
-    print("======================================================================")
-    print(">> COGNEE COMMUNITY CONNECTOR: Packagist / Composer (PHP Registry)")
-    print(f">> Selected Packages: {', '.join(packages_to_track)}")
-    print("======================================================================\n")
-
-    options = PackagistRenderOptions(
-        include_security_advisories=True,
-        include_version_requirements=True,
-        max_recent_versions=3,
-    )
-
+    print(f">> Initializing Packagist Data Connector for packages: {packages_to_index}...")
     source = packagist_source(
-        packages=packages_to_track,
-        options=options,
+        packages=packages_to_index,
+        options=PackagistRenderOptions(
+            include_security_advisories=True,
+            include_abandonment_info=True,
+            include_requirements=True,
+        ),
     )
 
     if cognee is not None:
-        print(">> Ingesting PHP package ecosystem into Cognee Graph Memory...")
+        print(">> Ingesting Packagist packages into Cognee AI knowledge graph...")
         await cognee.remember(
             source,
             dataset_name="php_package_registry",
@@ -53,7 +41,7 @@ async def main():
     else:
         print("[INFO] Running in inspection mode (Cognee core optional dependency not present):")
         docs = []
-        if isinstance(source, list) and len(source) > 0 and hasattr(source[0], "__call__"):
+        if isinstance(source, list) and len(source) > 0 and callable(source[0]):
             docs = list(source[0]())
         elif isinstance(source, list):
             docs = source
@@ -63,16 +51,16 @@ async def main():
             except Exception:
                 docs = []
 
-        print(f"\n+-------------------------+----------------------+---------------+----------------------------+")
-        print(f"| Package Name            | Status               | Advisories    | Replacement Package        |")
-        print(f"+-------------------------+----------------------+---------------+----------------------------+")
+        print("\n+-------------------------+------------+------------+-----------------------+")
+        print("| Package Name            | Status     | Advisories | Replacement Package   |")
+        print("+-------------------------+------------+------------+-----------------------+")
         for doc in docs:
             pkg = doc.get("package_name", "")[:23].ljust(23)
-            status = ("Abandoned" if doc.get("is_abandoned") else "Active")[:20].ljust(20)
-            adv = str(doc.get("advisory_count", 0)).rjust(13)
-            rep = str(doc.get("replacement_package") or "N/A")[:26].ljust(26)
+            status = ("Abandoned" if doc.get("is_abandoned") else "Active")[:10].ljust(10)
+            adv = str(doc.get("advisory_count", 0)).rjust(10)
+            rep = str(doc.get("replacement_package") or "N/A")[:21].ljust(21)
             print(f"| {pkg} | {status} | {adv} | {rep} |")
-        print(f"+-------------------------+----------------------+---------------+----------------------------+\n")
+        print("+-------------------------+------------+------------+-----------------------+\n")
 
         if docs:
             print(f"Document Snapshot [ID: {docs[0]['id']}]:")
@@ -81,4 +69,6 @@ async def main():
 
 
 if __name__ == "__main__":
+    import asyncio
+
     asyncio.run(main())

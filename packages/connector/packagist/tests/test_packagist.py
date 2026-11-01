@@ -1,8 +1,9 @@
 """Hermetic unit test suite for the Cognee Packagist / Composer Connector."""
 
 import json
-import pytest
+
 import httpx
+import pytest
 
 from cognee_community_connector_packagist.packagist import (
     PackagistClient,
@@ -18,7 +19,7 @@ from cognee_community_connector_packagist.packagist import (
 MOCK_PKG_MONOLOG = {
     "package": {
         "name": "monolog/monolog",
-        "description": "Sends your logs to files, sockets, inboxes, databases and various web services",
+        "description": "Sends your logs to files, sockets, and various web services",
         "time": "2026-10-01T12:00:00+00:00",
         "maintainers": [{"name": "Seldaek"}],
         "versions": {
@@ -87,9 +88,7 @@ MOCK_VENDOR_LIST = {
 
 MOCK_CHANGES = {
     "timestamp": 17934536320011,
-    "actions": [
-        {"type": "update", "package": "monolog/monolog", "time": 17934536320000}
-    ],
+    "actions": [{"type": "update", "package": "monolog/monolog", "time": 17934536320000}],
 }
 
 
@@ -123,7 +122,9 @@ class FakePackagistTransport(httpx.BaseTransport):
             return httpx.Response(status_code=200, json=MOCK_CHANGES)
 
         if "packages/nonexistent/package.json" in url_str:
-            return httpx.Response(status_code=404, json={"status": "error", "message": "Package not found"})
+            return httpx.Response(
+                status_code=404, json={"status": "error", "message": "Package not found"}
+            )
 
         return httpx.Response(status_code=404, json={"error": "Not Found"})
 
@@ -255,16 +256,21 @@ def test_packagist_source_execution():
 
 def test_extract_packages_from_composer_json(tmp_path):
     composer_file = tmp_path / "composer.json"
-    composer_file.write_text(json.dumps({
-        "require": {
-            "php": ">=8.1",
-            "ext-json": "*",
-            "monolog/monolog": "^3.0",
-        },
-        "require-dev": {
-            "phpunit/phpunit": "^10.0",
-        }
-    }), encoding="utf-8")
+    composer_file.write_text(
+        json.dumps(
+            {
+                "require": {
+                    "php": ">=8.1",
+                    "ext-json": "*",
+                    "monolog/monolog": "^3.0",
+                },
+                "require-dev": {
+                    "phpunit/phpunit": "^10.0",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     pkgs = extract_packages_from_composer_file(composer_file)
     assert pkgs == ["monolog/monolog", "phpunit/phpunit"]
@@ -272,15 +278,20 @@ def test_extract_packages_from_composer_json(tmp_path):
 
 def test_extract_packages_from_composer_lock(tmp_path):
     lock_file = tmp_path / "composer.lock"
-    lock_file.write_text(json.dumps({
-        "packages": [
-            {"name": "guzzlehttp/guzzle", "version": "7.8.0"},
-            {"name": "psr/log", "version": "3.0.0"},
-        ],
-        "packages-dev": [
-            {"name": "mockery/mockery", "version": "1.6.0"},
-        ]
-    }), encoding="utf-8")
+    lock_file.write_text(
+        json.dumps(
+            {
+                "packages": [
+                    {"name": "guzzlehttp/guzzle", "version": "7.8.0"},
+                    {"name": "psr/log", "version": "3.0.0"},
+                ],
+                "packages-dev": [
+                    {"name": "mockery/mockery", "version": "1.6.0"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
 
     pkgs = extract_packages_from_composer_file(lock_file)
     assert pkgs == ["guzzlehttp/guzzle", "mockery/mockery", "psr/log"]
@@ -293,9 +304,7 @@ def test_extract_packages_file_not_found():
 
 def test_packagist_source_with_composer_file(tmp_path):
     composer_file = tmp_path / "composer.json"
-    composer_file.write_text(json.dumps({
-        "require": {"monolog/monolog": "^3.0"}
-    }), encoding="utf-8")
+    composer_file.write_text(json.dumps({"require": {"monolog/monolog": "^3.0"}}), encoding="utf-8")
 
     source = packagist_source(composer_file=composer_file)
     assert source is not None

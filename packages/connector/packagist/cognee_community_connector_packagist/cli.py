@@ -1,4 +1,4 @@
-"""Command-Line Interface (CLI) for testing and inspecting the Cognee Packagist Connector."""
+"""Command-Line Interface (CLI) for testing and querying the Cognee Packagist Connector."""
 
 import argparse
 import sys
@@ -19,7 +19,7 @@ def main():
     parser.add_argument(
         "--packages",
         default="monolog/monolog,swiftmailer/swiftmailer",
-        help="Comma-separated list of Composer package names (e.g. 'monolog/monolog,laravel/framework')",
+        help="Comma-separated Composer package names (e.g. 'monolog/monolog,laravel/framework')",
     )
     parser.add_argument(
         "--vendor",
@@ -46,30 +46,31 @@ def main():
     target_packages = [p.strip() for p in args.packages.split(",") if p.strip()]
 
     if args.composer_file:
-        print(f">> Extracting packages from composer file '{args.composer_file}'...")
+        print(f">> Extracting dependencies from composer file '{args.composer_file}'...")
         try:
-            file_pkgs = extract_packages_from_composer_file(args.composer_file)
-            print(f">> Extracted {len(file_pkgs)} dependencies: {', '.join(file_pkgs)}")
-            for p in file_pkgs:
+            extracted = extract_packages_from_composer_file(args.composer_file)
+            print(f">> Found {len(extracted)} dependencies: {', '.join(extracted)}")
+            for p in extracted:
                 if p not in target_packages:
                     target_packages.append(p)
         except Exception as exc:
-            print(f"[ERROR] Failed reading composer file: {exc}", file=sys.stderr)
+            print(f"[ERROR] Failed extracting dependencies: {exc}", file=sys.stderr)
             sys.exit(1)
 
     if args.vendor:
-        print(f">> Fetching package list for vendor '{args.vendor}'...")
+        print(f">> Discovering packages for vendor '{args.vendor}'...")
         try:
             vendor_pkgs = client.list_vendor_packages(args.vendor)
-            print(f">> Found {len(vendor_pkgs)} packages for vendor '{args.vendor}':")
+            print(f">> Discovered {len(vendor_pkgs)} packages under '{args.vendor}':")
             for p in vendor_pkgs[:10]:
                 print(f"   * {p}")
-                if p not in target_packages:
-                    target_packages.append(p)
             if len(vendor_pkgs) > 10:
                 print(f"   ... and {len(vendor_pkgs) - 10} more.")
+            for p in vendor_pkgs:
+                if p not in target_packages:
+                    target_packages.append(p)
         except Exception as exc:
-            print(f"[ERROR] Failed fetching vendor packages: {exc}", file=sys.stderr)
+            print(f"[ERROR] Vendor listing failed: {exc}", file=sys.stderr)
             sys.exit(1)
 
     print(f">> Syncing and rendering documents for: {target_packages}...\n")
@@ -78,10 +79,12 @@ def main():
     count = 0
     for doc in sync_packagist_records(client, target_packages, options=options):
         count += 1
+        rep = doc.get("replacement_package")
+        is_ab = doc.get("is_abandoned", False)
         print("=" * 70)
         print(f"DOCUMENT ID : {doc['id']}")
         print(f"TITLE       : {doc['title']}")
-        print(f"ABANDONED   : {doc.get('is_abandoned', False)} (Replacement: {doc.get('replacement_package')})")
+        print(f"ABANDONED   : {is_ab} (Replacement: {rep})")
         print(f"ADVISORIES  : {doc.get('advisory_count', 0)}")
         print(f"TOMBSTONE   : {doc.get('_deleted', False)}")
         print("=" * 70)

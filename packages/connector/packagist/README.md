@@ -88,6 +88,7 @@ import asyncio
 import cognee
 from cognee_community_connector_packagist import packagist_source, PackagistRenderOptions
 
+
 async def main():
     # Pass a composer.json / composer.lock file or specific package list
     source = packagist_source(
@@ -103,6 +104,7 @@ async def main():
         source,
         dataset_name="php_package_registry",
     )
+
 
 if __name__ == "__main__":
     asyncio.run(main())
