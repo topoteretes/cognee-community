@@ -86,6 +86,7 @@ import asyncio
 import cognee
 from cognee_community_connector_nuget import nuget_source, NugetRenderOptions
 
+
 async def main():
     # Pass a .csproj file or specific package list
     source = nuget_source(
@@ -100,6 +101,7 @@ async def main():
         source,
         dataset_name="dotnet_package_registry",
     )
+
 
 if __name__ == "__main__":
     asyncio.run(main())

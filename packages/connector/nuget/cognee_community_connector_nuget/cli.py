@@ -27,7 +27,7 @@ def main():
     )
     parser.add_argument(
         "--project-file",
-        help="Path to .csproj, Directory.Packages.props, or packages.lock.json to extract dependencies",
+        help="Path to .csproj, Directory.Packages.props, or packages.lock.json file",
     )
     parser.add_argument(
         "--exclude-deprecated",
@@ -72,11 +72,13 @@ def main():
     count = 0
     for doc in sync_nuget_records(client, target_packages, options=options):
         count += 1
+        is_dep = doc.get("is_deprecated", False)
+        alt = doc.get("alternate_package")
         print("=" * 70)
         print(f"DOCUMENT ID : {doc['id']}")
         print(f"TITLE       : {doc['title']}")
         print(f"VERSION     : {doc.get('latest_version')}")
-        print(f"DEPRECATED  : {doc.get('is_deprecated', False)} (Alternate: {doc.get('alternate_package')})")
+        print(f"DEPRECATED  : {is_dep} (Alternate: {alt})")
         print(f"ADVISORIES  : {doc.get('vulnerability_count', 0)}")
         print(f"TOMBSTONE   : {doc.get('_deleted', False)}")
         print("=" * 70)

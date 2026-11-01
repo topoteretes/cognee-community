@@ -1,8 +1,9 @@
 """Hermetic unit test suite for the Cognee NuGet v3 Connector."""
 
 import json
-import pytest
+
 import httpx
+import pytest
 
 from cognee_community_connector_nuget.nuget import (
     NugetClient,
@@ -43,7 +44,7 @@ MOCK_REGISTRATION_NEWTONSOFT = {
                         "id": "Newtonsoft.Json",
                         "version": "13.0.3",
                         "authors": "James Newton-King",
-                        "description": "Json.NET is a popular high-performance JSON framework for .NET",
+                        "description": "Json.NET is a popular JSON framework for .NET",
                         "projectUrl": "https://www.newtonsoft.com/json",
                         "licenseExpression": "MIT",
                         "totalDownloads": 4500000000,
@@ -56,9 +57,7 @@ MOCK_REGISTRATION_NEWTONSOFT = {
                             },
                             {
                                 "targetFramework": "netstandard2.0",
-                                "dependencies": [
-                                    {"id": "Microsoft.CSharp", "range": "[4.3.0, )"}
-                                ],
+                                "dependencies": [{"id": "Microsoft.CSharp", "range": "[4.3.0, )"}],
                             },
                         ],
                         "vulnerabilities": [
@@ -92,7 +91,7 @@ MOCK_REGISTRATION_DEPRECATED = {
                         "published": "2018-08-01T00:00:00+00:00",
                         "deprecation": {
                             "reasons": ["Legacy"],
-                            "message": "This client library has been split into individual packages.",
+                            "message": "Library split into individual packages.",
                             "alternatePackage": {
                                 "id": "Azure.Storage.Common",
                                 "range": "*",
@@ -102,7 +101,7 @@ MOCK_REGISTRATION_DEPRECATED = {
                 }
             ]
         }
-    ]
+    ],
 }
 
 MOCK_REGISTRATION_UNLISTED = {
@@ -121,7 +120,7 @@ MOCK_REGISTRATION_UNLISTED = {
                 }
             ]
         }
-    ]
+    ],
 }
 
 MOCK_SEARCH_RESULTS = {
@@ -284,12 +283,15 @@ def test_sync_nuget_records_exclude_deprecated():
 
 def test_extract_packages_from_csproj(tmp_path):
     csproj_file = tmp_path / "Service.csproj"
-    csproj_file.write_text("""<Project Sdk="Microsoft.NET.Sdk">
+    csproj_file.write_text(
+        """<Project Sdk="Microsoft.NET.Sdk">
   <ItemGroup>
     <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
     <PackageReference Include="Serilog" Version="3.1.1" />
   </ItemGroup>
-</Project>""", encoding="utf-8")
+</Project>""",
+        encoding="utf-8",
+    )
 
     pkgs = extract_packages_from_dotnet_file(csproj_file)
     assert pkgs == ["Newtonsoft.Json", "Serilog"]
@@ -297,12 +299,15 @@ def test_extract_packages_from_csproj(tmp_path):
 
 def test_extract_packages_from_props(tmp_path):
     props_file = tmp_path / "Directory.Packages.props"
-    props_file.write_text("""<Project>
+    props_file.write_text(
+        """<Project>
   <ItemGroup>
     <PackageVersion Include="Microsoft.Extensions.Logging" Version="8.0.0" />
     <PackageVersion Include="xunit" Version="2.6.2" />
   </ItemGroup>
-</Project>""", encoding="utf-8")
+</Project>""",
+        encoding="utf-8",
+    )
 
     pkgs = extract_packages_from_dotnet_file(props_file)
     assert pkgs == ["Microsoft.Extensions.Logging", "xunit"]
@@ -310,15 +315,20 @@ def test_extract_packages_from_props(tmp_path):
 
 def test_extract_packages_from_lock_json(tmp_path):
     lock_file = tmp_path / "packages.lock.json"
-    lock_file.write_text(json.dumps({
-        "version": 1,
-        "dependencies": {
-            "net8.0": {
-                "Newtonsoft.Json": {"type": "Direct", "resolved": "13.0.3"},
-                "Polly": {"type": "Direct", "resolved": "8.3.0"}
+    lock_file.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "dependencies": {
+                    "net8.0": {
+                        "Newtonsoft.Json": {"type": "Direct", "resolved": "13.0.3"},
+                        "Polly": {"type": "Direct", "resolved": "8.3.0"},
+                    }
+                },
             }
-        }
-    }), encoding="utf-8")
+        ),
+        encoding="utf-8",
+    )
 
     pkgs = extract_packages_from_dotnet_file(lock_file)
     assert pkgs == ["Newtonsoft.Json", "Polly"]
@@ -331,8 +341,10 @@ def test_extract_packages_file_not_found():
 
 def test_nuget_source_execution(tmp_path):
     csproj_file = tmp_path / "App.csproj"
-    csproj_file.write_text("""<Project><ItemGroup><PackageReference Include="Newtonsoft.Json" /></ItemGroup></Project>""", encoding="utf-8")
-
+    xml_snippet = (
+        '<Project><ItemGroup><PackageReference Include="Newtonsoft.Json" /></ItemGroup></Project>'
+    )
+    csproj_file.write_text(xml_snippet, encoding="utf-8")
     source = nuget_source(
         project_file=csproj_file,
         packages=["Serilog"],
