@@ -1,0 +1,42 @@
+[project]
+name = "cognee-community-connector-klaviyo"
+version = "0.1.0"
+description = "Klaviyo data-source connector for cognee: sync campaigns, flows and email templates into memory (incremental + forget-on-delete)"
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    # Needs document-mode routing (DOCUMENT_SOURCE_ATTR), the table-scoped
+    # orphan cleanup marked by DOCUMENT_SYNC_VERSION, PIPELINE_SCOPE_ATTR,
+    # guarded_rows and the cognee_node_set column, all in cognee 1.6.3 and later 1.x.
+    "cognee>=1.6.3,<2",
+    "dlt[sqlalchemy]>=1.9.0,<2",
+    "requests>=2.31.0,<3",
+]
+
+[dependency-groups]
+dev = ["pytest>=8,<9", "pytest-asyncio>=1,<2", "ruff>=0.13,<1"]
+
+[project.urls]
+Homepage = "https://github.com/topoteretes/cognee"
+Repository = "https://github.com/topoteretes/cognee-community"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cognee_community_connector_klaviyo"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "N", "B", "UP", "C4", "PGH", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
