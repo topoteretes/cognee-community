@@ -17,10 +17,12 @@ Key Features:
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -159,6 +161,41 @@ class PackagistClient:
         if since:
             params["since"] = since
         return self.request("GET", "metadata/changes.json", params=params)
+
+
+def extract_packages_from_composer_file(file_path: str | Path) -> list[str]:
+    """Extract Composer package dependencies from a composer.json or composer.lock file.
+
+    Filters out PHP runtime and platform extension requirements (e.g. 'php', 'ext-curl').
+    """
+    path = Path(file_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Composer file not found: {path}")
+
+    with path.open(encoding="utf-8") as f:
+        data = json.load(f)
+
+    packages: set[str] = set()
+
+    # Case 1: composer.lock file
+    if "packages" in data or "packages-dev" in data:
+        for pkg in data.get("packages", []):
+            if isinstance(pkg, dict) and "name" in pkg:
+                packages.add(pkg["name"])
+        for pkg in data.get("packages-dev", []):
+            if isinstance(pkg, dict) and "name" in pkg:
+                packages.add(pkg["name"])
+
+    # Case 2: composer.json file
+    if "require" in data or "require-dev" in data:
+        for dep in list(data.get("require", {}).keys()) + list(data.get("require-dev", {}).keys()):
+            # Filter out platform packages (php, ext-*, lib-*)
+            if dep.lower() == "php" or dep.startswith("ext-") or dep.startswith("lib-"):
+                continue
+            if "/" in dep:
+                packages.add(dep)
+
+    return sorted(packages)
 
 
 def render_packagist_document(
@@ -311,6 +348,7 @@ if dlt is not None:
     def packagist_source(
         packages: list[str] | None = None,
         vendor: str | None = None,
+        composer_file: str | Path | None = None,
         token: str | None = None,
         options: PackagistRenderOptions = PackagistRenderOptions(),
     ):
@@ -319,11 +357,21 @@ if dlt is not None:
         Args:
             packages: List of 'vendor/package' names (e.g. ['monolog/monolog', 'symfony/http-foundation']).
             vendor: Optional vendor prefix to auto-discover all packages (e.g. 'laravel' or 'symfony').
+            composer_file: Optional path to a composer.json or composer.lock file to extract dependencies.
             token: Optional Private Packagist API token.
             options: PackagistRenderOptions.
         """
         client = PackagistClient(token=token)
         target_packages = list(packages or [])
+
+        if composer_file:
+            try:
+                extracted = extract_packages_from_composer_file(composer_file)
+                for p in extracted:
+                    if p not in target_packages:
+                        target_packages.append(p)
+            except Exception as e:
+                logger.error("Failed extracting packages from composer file '%s': %s", composer_file, e)
 
         if vendor:
             try:
@@ -365,12 +413,22 @@ else:
     def packagist_source(
         packages: list[str] | None = None,
         vendor: str | None = None,
+        composer_file: str | Path | None = None,
         token: str | None = None,
         options: PackagistRenderOptions = PackagistRenderOptions(),
     ):
         """Fallback generator when dlt is not loaded."""
         client = PackagistClient(token=token)
         target_packages = list(packages or [])
+
+        if composer_file:
+            try:
+                for p in extract_packages_from_composer_file(composer_file):
+                    if p not in target_packages:
+                        target_packages.append(p)
+            except Exception:
+                pass
+
         if vendor:
             try:
                 for p in client.list_vendor_packages(vendor):
@@ -378,6 +436,8 @@ else:
                         target_packages.append(p)
             except Exception:
                 pass
+
         if not target_packages:
             target_packages = ["monolog/monolog", "guzzlehttp/guzzle"]
+
         return list(sync_packagist_records(client, target_packages, options=options))

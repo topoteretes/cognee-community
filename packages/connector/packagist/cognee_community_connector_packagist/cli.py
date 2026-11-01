@@ -3,7 +3,12 @@
 import argparse
 import sys
 
-from .packagist import PackagistClient, PackagistRenderOptions, sync_packagist_records
+from .packagist import (
+    PackagistClient,
+    PackagistRenderOptions,
+    extract_packages_from_composer_file,
+    sync_packagist_records,
+)
 
 
 def main():
@@ -21,6 +26,10 @@ def main():
         help="Vendor prefix to auto-discover packages (e.g. 'symfony' or 'guzzlehttp')",
     )
     parser.add_argument(
+        "--composer-file",
+        help="Path to composer.json or composer.lock to automatically extract dependencies",
+    )
+    parser.add_argument(
         "--token",
         help="Optional Private Packagist API token",
     )
@@ -35,6 +44,18 @@ def main():
     client = PackagistClient(token=args.token)
 
     target_packages = [p.strip() for p in args.packages.split(",") if p.strip()]
+
+    if args.composer_file:
+        print(f">> Extracting packages from composer file '{args.composer_file}'...")
+        try:
+            file_pkgs = extract_packages_from_composer_file(args.composer_file)
+            print(f">> Extracted {len(file_pkgs)} dependencies: {', '.join(file_pkgs)}")
+            for p in file_pkgs:
+                if p not in target_packages:
+                    target_packages.append(p)
+        except Exception as exc:
+            print(f"[ERROR] Failed reading composer file: {exc}", file=sys.stderr)
+            sys.exit(1)
 
     if args.vendor:
         print(f">> Fetching package list for vendor '{args.vendor}'...")

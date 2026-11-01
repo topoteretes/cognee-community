@@ -1,5 +1,6 @@
 """Hermetic unit test suite for the Cognee Packagist / Composer Connector."""
 
+import json
 import pytest
 import httpx
 
@@ -7,6 +8,7 @@ from cognee_community_connector_packagist.packagist import (
     PackagistClient,
     PackagistConnectorError,
     PackagistRenderOptions,
+    extract_packages_from_composer_file,
     packagist_source,
     render_packagist_document,
     sync_packagist_records,
@@ -248,4 +250,52 @@ def test_packagist_source_execution():
         packages=["monolog/monolog"],
         vendor="guzzlehttp",
     )
+    assert source is not None
+
+
+def test_extract_packages_from_composer_json(tmp_path):
+    composer_file = tmp_path / "composer.json"
+    composer_file.write_text(json.dumps({
+        "require": {
+            "php": ">=8.1",
+            "ext-json": "*",
+            "monolog/monolog": "^3.0",
+        },
+        "require-dev": {
+            "phpunit/phpunit": "^10.0",
+        }
+    }), encoding="utf-8")
+
+    pkgs = extract_packages_from_composer_file(composer_file)
+    assert pkgs == ["monolog/monolog", "phpunit/phpunit"]
+
+
+def test_extract_packages_from_composer_lock(tmp_path):
+    lock_file = tmp_path / "composer.lock"
+    lock_file.write_text(json.dumps({
+        "packages": [
+            {"name": "guzzlehttp/guzzle", "version": "7.8.0"},
+            {"name": "psr/log", "version": "3.0.0"},
+        ],
+        "packages-dev": [
+            {"name": "mockery/mockery", "version": "1.6.0"},
+        ]
+    }), encoding="utf-8")
+
+    pkgs = extract_packages_from_composer_file(lock_file)
+    assert pkgs == ["guzzlehttp/guzzle", "mockery/mockery", "psr/log"]
+
+
+def test_extract_packages_file_not_found():
+    with pytest.raises(FileNotFoundError):
+        extract_packages_from_composer_file("nonexistent_composer.json")
+
+
+def test_packagist_source_with_composer_file(tmp_path):
+    composer_file = tmp_path / "composer.json"
+    composer_file.write_text(json.dumps({
+        "require": {"monolog/monolog": "^3.0"}
+    }), encoding="utf-8")
+
+    source = packagist_source(composer_file=composer_file)
     assert source is not None
