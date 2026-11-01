@@ -17,9 +17,9 @@ __all__ = [
     "PolarConnectorError",
     "RenderOptions",
     "polar_source",
-    "render_customer",
-    "render_subscription",
-    "render_product",
     "render_benefit",
+    "render_customer",
+    "render_product",
+    "render_subscription",
     "sync_polar_records",
 ]

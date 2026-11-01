@@ -1,7 +1,7 @@
 """Unit tests for the Polar data connector."""
 
 import pytest
-from fake_polar import FAKE_TOKEN, ORG_ID, create_fake_client
+from fake_polar import ORG_ID, create_fake_client
 
 from cognee_community_connector_polar.polar import (
     PolarClient,
@@ -140,11 +140,14 @@ def test_sandbox_routing():
 
 def test_cli_execution_with_token(monkeypatch, capsys):
     from unittest.mock import patch
+
     from cognee_community_connector_polar.cli import main
 
     fake_client = create_fake_client()
     with patch("cognee_community_connector_polar.cli.PolarClient", return_value=fake_client):
-        monkeypatch.setattr("sys.argv", ["cognee-polar", "--token", "fake_test_token", "--org-id", ORG_ID])
+        monkeypatch.setattr(
+            "sys.argv", ["cognee-polar", "--token", "fake_test_token", "--org-id", ORG_ID]
+        )
         main()
         captured = capsys.readouterr()
         assert "[SUCCESS] Ingested 7 Polar document(s)" in captured.out

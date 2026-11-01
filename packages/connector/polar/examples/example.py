@@ -1,6 +1,7 @@
 """Example usage of the Polar data connector for Cognee."""
 
 import os
+
 from cognee_community_connector_polar.polar import (
     PolarClient,
     RenderOptions,

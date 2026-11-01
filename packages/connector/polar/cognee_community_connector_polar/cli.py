@@ -42,7 +42,10 @@ def main():
 
     token = args.token or os.getenv("POLAR_ACCESS_TOKEN")
     if not token:
-        print("[ERROR] Polar Access Token required. Provide via --token or POLAR_ACCESS_TOKEN env var.", file=sys.stderr)
+        print(
+            "[ERROR] Polar Access Token required. Provide via --token or POLAR_ACCESS_TOKEN.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     print(f">> Initializing Polar Client (Sandbox={args.sandbox})...")
@@ -53,7 +56,7 @@ def main():
         mask_pii=not args.include_email,
     )
 
-    print(f">> Ingesting Polar resources (Customers, Subscriptions, Products, Benefits)...\n")
+    print(">> Ingesting Polar resources (Customers, Subscriptions, Products, Benefits)...\n")
     count = 0
     type_counts = {}
 

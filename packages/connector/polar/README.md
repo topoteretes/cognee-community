@@ -113,6 +113,7 @@ import asyncio
 import cognee
 from cognee_community_connector_polar.polar import polar_source, RenderOptions
 
+
 async def main():
     token = os.environ["POLAR_ACCESS_TOKEN"]
     org_id = os.environ.get("POLAR_ORGANIZATION_ID")
@@ -130,10 +131,9 @@ async def main():
     )
 
     # Ask questions about customer subscription status
-    result = await cognee.search(
-        "What subscription tier and benefits does customer cust_123 have?"
-    )
+    result = await cognee.search("What subscription tier and benefits does customer cust_123 have?")
     print(result)
+
 
 if __name__ == "__main__":
     asyncio.run(main())

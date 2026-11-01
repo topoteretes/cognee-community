@@ -1,7 +1,5 @@
 """In-memory mock Polar API server for testing the Polar connector."""
 
-import json
-from typing import Any
 import httpx
 
 FAKE_TOKEN = "polar_oat_test_token_123456"
@@ -94,13 +92,37 @@ class FakePolarTransport(httpx.BaseTransport):
 
         path = request.url.path
         if path.endswith("/customers"):
-            return httpx.Response(200, json={"items": self.customers, "pagination": {"total_count": len(self.customers), "max_page": 1}})
+            return httpx.Response(
+                200,
+                json={
+                    "items": self.customers,
+                    "pagination": {"total_count": len(self.customers), "max_page": 1},
+                },
+            )
         elif path.endswith("/subscriptions"):
-            return httpx.Response(200, json={"items": self.subscriptions, "pagination": {"total_count": len(self.subscriptions), "max_page": 1}})
+            return httpx.Response(
+                200,
+                json={
+                    "items": self.subscriptions,
+                    "pagination": {"total_count": len(self.subscriptions), "max_page": 1},
+                },
+            )
         elif path.endswith("/products"):
-            return httpx.Response(200, json={"items": self.products, "pagination": {"total_count": len(self.products), "max_page": 1}})
+            return httpx.Response(
+                200,
+                json={
+                    "items": self.products,
+                    "pagination": {"total_count": len(self.products), "max_page": 1},
+                },
+            )
         elif path.endswith("/benefits"):
-            return httpx.Response(200, json={"items": self.benefits, "pagination": {"total_count": len(self.benefits), "max_page": 1}})
+            return httpx.Response(
+                200,
+                json={
+                    "items": self.benefits,
+                    "pagination": {"total_count": len(self.benefits), "max_page": 1},
+                },
+            )
         else:
             return httpx.Response(404, json={"error": "Endpoint not found"})
 
