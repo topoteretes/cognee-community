@@ -1,0 +1,48 @@
+[
+ {
+  "type": "meeting",
+  "id": "1",
+  "attributes": {
+   "state": "booked",
+   "startsAt": "2026-03-11T00:00:00.000Z",
+   "title": "Meeting TITLE1",
+   "description": "agenda",
+   "createdAt": "2026-01-01T00:00:00.000Z",
+   "updatedAt": "2026-03-01T00:00:00.000Z"
+  },
+  "links": {
+   "self": "https://api.outreach.example.test/api/v2/meetings/1"
+  },
+  "relationships": {
+   "prospect": {
+    "data": {
+     "type": "prospect",
+     "id": "1"
+    }
+   }
+  }
+ },
+ {
+  "type": "meeting",
+  "id": "2",
+  "attributes": {
+   "state": "booked",
+   "startsAt": "2026-03-12T00:00:00.000Z",
+   "title": "Meeting TITLE2",
+   "description": "agenda",
+   "createdAt": "2026-01-01T00:00:00.000Z",
+   "updatedAt": "2026-03-02T00:00:00.000Z"
+  },
+  "links": {
+   "self": "https://api.outreach.example.test/api/v2/meetings/2"
+  },
+  "relationships": {
+   "prospect": {
+    "data": {
+     "type": "prospect",
+     "id": "2"
+    }
+   }
+  }
+ }
+]
