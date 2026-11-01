@@ -308,3 +308,39 @@ def test_packagist_source_with_composer_file(tmp_path):
 
     source = packagist_source(composer_file=composer_file)
     assert source is not None
+
+
+def test_packagist_cli_main_composer_file(tmp_path, monkeypatch):
+    from cognee_community_connector_packagist.cli import main as cli_main
+
+    composer_json = tmp_path / "composer.json"
+    composer_json.write_text('{"require": {"monolog/monolog": "^2.0"}}', encoding="utf-8")
+
+    def mock_request(self, endpoint, params=None):
+        if "monolog/monolog" in endpoint:
+            return MOCK_PKG_MONOLOG
+        if "security-advisories" in endpoint:
+            return {"advisories": {}}
+        return {}
+
+    monkeypatch.setattr(PackagistClient, "request", mock_request)
+    ret = cli_main(["--composer-file", str(composer_json), "--packages", ""])
+    assert ret == 0
+
+
+def test_packagist_cli_main_vendor_and_abandoned(monkeypatch):
+    from cognee_community_connector_packagist.cli import main as cli_main
+
+    def mock_list_vendor(self, vendor):
+        return ["swiftmailer/swiftmailer"]
+
+    def mock_request(self, endpoint, params=None):
+        if "swiftmailer" in endpoint:
+            return MOCK_PKG_SWIFTMAILER
+        return {"advisories": {}}
+
+    monkeypatch.setattr(PackagistClient, "list_vendor_packages", mock_list_vendor)
+    monkeypatch.setattr(PackagistClient, "request", mock_request)
+
+    ret = cli_main(["--vendor", "swiftmailer", "--packages", "", "--exclude-abandoned"])
+    assert ret == 0
