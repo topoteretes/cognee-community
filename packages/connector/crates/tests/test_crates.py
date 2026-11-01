@@ -154,7 +154,7 @@ def test_client_get_crate_empty_name_raises():
 def test_client_get_crate_not_found():
     async def _run():
         client = CratesClient(transport=create_fake_transport())
-        with pytest.raises(CrateNotFoundError, match="not found on crates.io"):
+        with pytest.raises(CrateNotFoundError, match=r"not found on crates\.io"):
             await client.get_crate("nonexistent")
 
     asyncio.run(_run())
