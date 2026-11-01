@@ -84,6 +84,9 @@ class FakeFredTransport(httpx.BaseTransport):
                 json={"error_code": 429, "error_message": "Rate limit exceeded"},
             )
 
+        if "/category/series" in url_str:
+            return httpx.Response(status_code=200, json=MOCK_SERIES_SEARCH)
+
         if "/series/observations" in url_str:
             return httpx.Response(status_code=200, json=MOCK_OBSERVATIONS_GDP)
 
@@ -197,4 +200,19 @@ def test_fred_source_fallback_execution():
         series_ids=["GDP"],
     )
     # Ensure source object is created with correct name/type
+    assert source is not None
+
+
+def test_get_category_series():
+    client = create_mock_client()
+    series_list = client.get_category_series(category_id=10, limit=5)
+    assert len(series_list) == 2
+    assert series_list[0]["id"] == "UNRATE"
+
+
+def test_fred_source_with_category():
+    source = fred_source(
+        api_key="test_dummy_key",
+        category_id=10,
+    )
     assert source is not None

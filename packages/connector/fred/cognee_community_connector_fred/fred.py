@@ -164,6 +164,12 @@ class FredClient:
         data = self.request("series/search", params=params)
         return data.get("seriess", [])
 
+    def get_category_series(self, category_id: int | str, limit: int = 10) -> list[dict[str, Any]]:
+        """Fetch series belonging to a FRED economic category."""
+        params = {"category_id": str(category_id).strip(), "limit": limit}
+        data = self.request("category/series", params=params)
+        return data.get("seriess", [])
+
 
 def render_fred_document(
     series: dict[str, Any],
@@ -282,6 +288,7 @@ if dlt is not None:
         api_key: str,
         series_ids: list[str] | None = None,
         search_query: str | None = None,
+        category_id: int | str | None = None,
         options: FredRenderOptions = FredRenderOptions(),
     ):
         """DLT source to sync Federal Reserve Economic Data into Cognee AI memory.
@@ -290,10 +297,21 @@ if dlt is not None:
             api_key: Free FRED API key.
             series_ids: List of FRED series symbols (e.g. ['GDP', 'UNRATE', 'FEDFUNDS', 'CPIAUCSL']).
             search_query: Optional search keyword to discover series automatically.
+            category_id: Optional FRED category ID to ingest top series from that category.
             options: FredRenderOptions for document formatting.
         """
         client = FredClient(api_key=api_key)
         target_ids = list(series_ids or [])
+
+        if category_id:
+            try:
+                cat_results = client.get_category_series(category_id, limit=10)
+                for item in cat_results:
+                    s_id = item.get("id")
+                    if s_id and s_id not in target_ids:
+                        target_ids.append(s_id)
+            except Exception as e:
+                logger.warning("Failed fetching series for FRED category %s: %s", category_id, e)
 
         if search_query:
             try:
@@ -332,9 +350,28 @@ else:
         api_key: str,
         series_ids: list[str] | None = None,
         search_query: str | None = None,
+        category_id: int | str | None = None,
         options: FredRenderOptions = FredRenderOptions(),
     ):
         """Fallback generator when dlt is not loaded."""
         client = FredClient(api_key=api_key)
-        target_ids = list(series_ids or ["GDP", "UNRATE"])
+        target_ids = list(series_ids or [])
+        if category_id:
+            try:
+                for item in client.get_category_series(category_id, limit=10):
+                    s_id = item.get("id")
+                    if s_id and s_id not in target_ids:
+                        target_ids.append(s_id)
+            except Exception:
+                pass
+        if search_query:
+            try:
+                for item in client.search_series(search_query, limit=5):
+                    s_id = item.get("id")
+                    if s_id and s_id not in target_ids:
+                        target_ids.append(s_id)
+            except Exception:
+                pass
+        if not target_ids:
+            target_ids = ["GDP", "UNRATE"]
         return list(sync_fred_records(client, target_ids, options=options))

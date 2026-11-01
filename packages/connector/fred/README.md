@@ -67,9 +67,30 @@ if __name__ == "__main__":
 
 ---
 
+## CLI Usage
+
+The package includes a standalone CLI tool (`cognee-fred`) to quickly inspect, test, or search FRED series from the terminal:
+
+```bash
+# Set your API key
+export FRED_API_KEY="your_api_key_here"
+
+# Fetch default macroeconomic series (GDP, UNRATE)
+python -m cognee_community_connector_fred.cli --limit 5
+
+# Inspect specific economic indicators
+python -m cognee_community_connector_fred.cli --series "GDP,FEDFUNDS,CPIAUCSL" --limit 10
+
+# Search for relevant series
+python -m cognee_community_connector_fred.cli --search "unemployment"
+```
+
+---
+
 ## Acceptance & Quality Criteria
 
-- [x] Supports `series_ids` list and optional keyword search.
+- [x] Supports `series_ids` list, category IDs, and keyword search.
+- [x] Includes standalone CLI (`cognee-fred` / `python -m cognee_community_connector_fred.cli`).
 - [x] Emits canonical `{id, title, content, url, _deleted}` rows.
 - [x] Hermetic unit tests with mocked FRED API fixtures (100% pass without network access).
 - [x] Zero floating-point drift or formatting degradation.

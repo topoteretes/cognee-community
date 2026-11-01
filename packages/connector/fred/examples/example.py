@@ -2,6 +2,11 @@
 
 import asyncio
 import os
+import sys
+from pathlib import Path
+
+# Enable direct execution without requiring pip install
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from cognee_community_connector_fred import FredRenderOptions, fred_source
 
@@ -18,14 +23,17 @@ async def main():
     series_to_track = [
         "GDP",       # Gross Domestic Product
         "UNRATE",    # Civilian Unemployment Rate
-        "CPIAUCSL",  # Consumer Price Index for All Urban Consumers (Inflation)
+        "CPIAUCSL",  # Consumer Price Index (Inflation)
         "FEDFUNDS",  # Federal Funds Effective Rate
     ]
 
-    print(f"Initializing FRED connector for series: {series_to_track}...")
+    print("======================================================================")
+    print(">> COGNEE COMMUNITY CONNECTOR: FRED (Federal Reserve Economic Data)")
+    print(f">> Tracking Indicators: {', '.join(series_to_track)}")
+    print("======================================================================\n")
 
     options = FredRenderOptions(
-        max_observations=30,
+        max_observations=20,
         include_notes=True,
     )
 
@@ -36,27 +44,46 @@ async def main():
     )
 
     if cognee is not None:
-        print("Ingesting economic series into Cognee AI memory...")
+        print(">> Handing source to Cognee AI Knowledge Graph Engine...")
         await cognee.remember(
             source,
             dataset_name="us_macroeconomic_data",
         )
-        print("FRED economic data successfully ingested into Cognee memory!")
+        print("\n[SUCCESS] Macroeconomic series remembered in Cognee graph and vector memory!")
     else:
-        print("Cognee not installed. Inspecting generated source documents directly:")
-        # If source is generator or dlt source
-        if isinstance(source, list) and hasattr(source[0], "__call__"):
+        print("[INFO] Running in inspection mode (Cognee core optional dependency not present):")
+        docs = []
+        if isinstance(source, list) and len(source) > 0 and hasattr(source[0], "__call__"):
             docs = list(source[0]())
         elif isinstance(source, list):
             docs = source
         else:
-            docs = list(source)
+            try:
+                docs = list(source)
+            except Exception:
+                docs = []
 
+        if not docs:
+            print("\n[NOTE] No documents returned. When running against live FRED endpoints,")
+            print("please provide a valid 32-character FRED API key via:")
+            print("  export FRED_API_KEY='your_32_character_api_key'")
+            print("Get a free instant key at: https://fred.stlouisfed.org/docs/api/api_key.html")
+            return
+
+        print(f"\n+---------------+--------------------------------------+-------------+--------------+")
+        print(f"| Series ID     | Indicator Title                      | Latest Date | Observations |")
+        print(f"+---------------+--------------------------------------+-------------+--------------+")
         for doc in docs:
-            print(f"\nDocument ID: {doc['id']}")
-            print(f"Title: {doc['title']}")
-            print(f"Latest Date: {doc.get('latest_observation_date')}")
-            print(f"Preview:\n{doc['content'][:250]}...\n")
+            s_id = doc.get("series_id", "")[:13].ljust(13)
+            title = doc.get("title", "")[:36].ljust(36)
+            latest = str(doc.get("latest_observation_date", "N/A"))[:11].ljust(11)
+            count = str(doc.get("observation_count", 0)).rjust(12)
+            print(f"| {s_id} | {title} | {latest} | {count} |")
+        print(f"+---------------+--------------------------------------+-------------+--------------+\n")
+
+        print(f"Document Snapshot [ID: {docs[0]['id']}]:")
+        print("-" * 50)
+        print(docs[0]["content"][:350] + "...\n")
 
 
 if __name__ == "__main__":
