@@ -156,7 +156,7 @@ def test_backfill_yields_all_pages_and_records_cursor_and_ids():
 
     assert {r["id"] for r in rows} == {"1", "2"}
     assert all(r["_deleted"] is False for r in rows)
-    assert {r["body"] for r in rows} == {"alpha", "beta"}
+    assert {r["content"] for r in rows} == {"alpha", "beta"}
     # Cursor + id set captured for the next incremental run.
     assert state["last_when"] == "2024-01-02T10:00:00.000Z"
     assert state["known_ids"] == ["1", "2"]
@@ -236,7 +236,7 @@ def test_comments_are_folded_into_page_body_when_requested():
         ]
     )
     rows_with = list(sync_pages(session, BASE_URL, {}, include_comments=True))
-    assert rows_with[0]["body"] == "page\n\nComments:\nfirst\n\nsecond"
+    assert rows_with[0]["content"] == "page\n\nComments:\nfirst\n\nsecond"
 
     rows_without = list(
         sync_pages(
@@ -246,7 +246,7 @@ def test_comments_are_folded_into_page_body_when_requested():
             include_comments=False,
         )
     )
-    assert rows_without[0]["body"] == "page"
+    assert rows_without[0]["content"] == "page"
 
 
 def test_space_keys_are_pushed_down_as_a_repeated_array_param():
@@ -287,6 +287,28 @@ def test_confluence_source_resource_is_configured_for_merge_and_hard_delete():
     columns = schema["columns"]
     assert columns["id"].get("primary_key") is True
     assert columns["_deleted"].get("hard_delete") is True
+
+
+def test_confluence_source_declares_document_mode_marker():
+    # Regression guard for cognee#5564: without DOCUMENT_SOURCE_ATTR the pages
+    # land on the relational manifest path (no entity extraction, and the stable
+    # manifest id stops later edits/deletions from syncing). The marker is what
+    # routes each page through normal cognify, so keep it set and stable.
+    pytest.importorskip("dlt")
+    from cognee.tasks.ingestion.dlt_utils import document_source_tag
+
+    resource = confluence_source(base_url=BASE_URL, session=_make_session([]))
+    assert document_source_tag(resource) == "confluence"
+
+
+def test_page_row_carries_content_not_body():
+    # cognee#5564: document-mode ingestion reads the row's `content` column; the
+    # page text used to sit under `body`, which it never reads, so pages were
+    # ingested empty. Pin the column name.
+    session = _make_session([_page("1", when="2024-01-01T10:00:00.000Z", body="<p>hello</p>")])
+    row = next(iter(sync_pages(session, BASE_URL, {}, include_comments=False)))
+    assert row["content"] == "hello"
+    assert "body" not in row
 
 
 def test_confluence_source_requires_credentials_or_session():
