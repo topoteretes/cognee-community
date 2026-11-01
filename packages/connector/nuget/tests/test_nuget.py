@@ -350,3 +350,33 @@ def test_nuget_source_execution(tmp_path):
         packages=["Serilog"],
     )
     assert source is not None
+
+
+def test_cli_main_with_project_file(tmp_path, monkeypatch):
+    from cognee_community_connector_nuget.cli import main as cli_main
+
+    csproj = tmp_path / "Test.csproj"
+    csproj.write_text(
+        '<Project><ItemGroup><PackageReference Include="Newtonsoft.Json" /></ItemGroup></Project>',
+        encoding="utf-8",
+    )
+
+    def mock_request(self, url, params=None):
+        if "query" in url:
+            return {"data": [{"id": "Newtonsoft.Json"}]}
+        return MOCK_REGISTRATION_NEWTONSOFT
+
+    monkeypatch.setattr(NugetClient, "request", mock_request)
+    ret = cli_main(["--project-file", str(csproj), "--search", "json"])
+    assert ret == 0
+
+
+def test_cli_main_exclude_deprecated(monkeypatch):
+    from cognee_community_connector_nuget.cli import main as cli_main
+
+    def mock_request(self, url, params=None):
+        return MOCK_REGISTRATION_DEPRECATED
+
+    monkeypatch.setattr(NugetClient, "request", mock_request)
+    ret = cli_main(["--packages", "WindowsAzure.Storage", "--exclude-deprecated"])
+    assert ret == 0

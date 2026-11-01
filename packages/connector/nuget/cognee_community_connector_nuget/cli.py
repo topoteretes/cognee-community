@@ -11,7 +11,7 @@ from .nuget import (
 )
 
 
-def main():
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Cognee Community NuGet v3 Connector CLI",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -35,7 +35,7 @@ def main():
         help="Filter out and tombstone deprecated packages",
     )
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     client = NugetClient()
 
@@ -87,6 +87,8 @@ def main():
 
     print(f"[SUCCESS] Processed {count} NuGet package document(s) for Cognee AI Memory.")
 
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
