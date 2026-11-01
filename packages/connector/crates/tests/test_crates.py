@@ -344,3 +344,22 @@ def test_cli_benchmark_command(capsys):
     captured = capsys.readouterr()
     assert "Cognee Crates Microbenchmark" in captured.out
     assert "Throughput:" in captured.out
+
+
+def test_crates_client_repr():
+    client = CratesClient()
+    repr_str = repr(client)
+    assert "CratesClient" in repr_str
+    assert "crates.io" in repr_str
+
+
+def test_crates_connector_records_sync_stats():
+    async def _run():
+        client = CratesClient(transport=create_fake_transport())
+        connector = CratesConnector(client=client)
+        docs = await connector.fetch_documents(crate_names=["tokio", "nonexistent"])
+        assert len(docs) == 1
+        assert connector.sync_stats["processed"] == 1
+        assert connector.sync_stats["skipped"] == 1
+
+    asyncio.run(_run())

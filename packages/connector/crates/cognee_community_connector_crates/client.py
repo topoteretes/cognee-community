@@ -47,6 +47,9 @@ class CratesClient:
         self.transport = transport
         self.timeout = timeout
 
+    def __repr__(self) -> str:
+        return f"CratesClient(base_url={self.base_url!r}, user_agent={self.user_agent!r})"
+
     def _create_client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(
             base_url=self.base_url,
