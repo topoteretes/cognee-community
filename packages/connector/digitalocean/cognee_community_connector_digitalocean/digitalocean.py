@@ -8,6 +8,7 @@ AI graph and vector memory as structured, searchable knowledge documents.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -28,6 +29,21 @@ DO_API_BASE = "https://api.digitalocean.com/v2"
 
 _MAX_RETRIES = 3
 _PAGE_SIZE = 100
+
+_ESCAPES = re.compile(
+    r"\x1b\[[0-?]*[ -/]*[@-~]"
+    r"|\x1b\][^\x07\x1b\n]*(?:\x07|\x1b\\)"
+    r"|\x1b[ -/]+[0-~]"
+    r"|\x1b[0-Z\\^-~]"
+)
+_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+
+
+def _clean_text(text: str) -> str:
+    """Drop ANSI terminal escapes and control characters for database safety."""
+    cleaned = _ESCAPES.sub("", text)
+    cleaned = _CONTROL.sub("", cleaned)
+    return cleaned.encode("utf-8", "replace").decode("utf-8")
 
 
 class DigitalOceanConnectorError(RuntimeError):
@@ -113,7 +129,8 @@ class DigitalOceanClient:
                         "Forbidden: Token lacks required read scopes", 403
                     )
                 if resp.status_code == 404:
-                    raise DigitalOceanConnectorError(f"Resource not found: {endpoint}", 404)
+                    endpoint_clean = endpoint.split("?")[0]
+                    raise DigitalOceanConnectorError(f"Resource not found: {endpoint_clean}", 404)
                 if resp.status_code >= 400:
                     raise DigitalOceanConnectorError(
                         f"DigitalOcean API error ({resp.status_code}): {resp.text}",
@@ -197,7 +214,7 @@ def render_droplet(
     return {
         "id": f"do:droplet:{d_id}",
         "title": f"Droplet: {name} ({status})",
-        "content": content.strip(),
+        "content": _clean_text(content.strip()),
         "url": f"https://cloud.digitalocean.com/droplets/{d_id}",
         "_deleted": False,
         "type": "droplet",
@@ -240,7 +257,7 @@ def render_app(
             cause = dep.get("cause", "Commit")
             created = dep.get("created_at", "")
             progress = dep.get("progress", {})
-            summary = progress.get("summary", "")
+            summary = _clean_text(progress.get("summary", ""))
             lines.append(
                 f"- Deployment {dep_id[:8]} [{phase}]: Cause: {cause} | Time: {created} | {summary}"
             )
@@ -248,7 +265,7 @@ def render_app(
     return {
         "id": f"do:app:{app_id}",
         "title": f"App Platform: {name} ({deploy_phase})",
-        "content": "\n".join(lines).strip(),
+        "content": _clean_text("\n".join(lines).strip()),
         "url": f"https://cloud.digitalocean.com/apps/{app_id}",
         "_deleted": False,
         "type": "app",
@@ -288,7 +305,7 @@ def render_database(
     return {
         "id": f"do:database:{db_id}",
         "title": f"Database: {name} ({engine} v{version})",
-        "content": content.strip(),
+        "content": _clean_text(content.strip()),
         "url": f"https://cloud.digitalocean.com/databases/{db_id}",
         "_deleted": False,
         "type": "database",
@@ -322,7 +339,7 @@ def render_kubernetes_cluster(
     return {
         "id": f"do:k8s:{cluster_id}",
         "title": f"Kubernetes: {name} ({version})",
-        "content": content.strip(),
+        "content": _clean_text(content.strip()),
         "url": f"https://cloud.digitalocean.com/kubernetes/clusters/{cluster_id}",
         "_deleted": False,
         "type": "kubernetes",
@@ -361,7 +378,7 @@ def render_project(
     return {
         "id": f"do:project:{proj_id}",
         "title": f"Project: {name}",
-        "content": "\n".join(lines).strip(),
+        "content": _clean_text("\n".join(lines).strip()),
         "url": f"https://cloud.digitalocean.com/projects/{proj_id}",
         "_deleted": False,
         "type": "project",

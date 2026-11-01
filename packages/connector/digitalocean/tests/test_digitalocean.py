@@ -228,3 +228,14 @@ def test_digitalocean_source_execution():
         else:
             docs = list(source)
         assert len(docs) == 6
+
+
+def test_clean_text_strips_ansi_and_control_characters():
+    from cognee_community_connector_digitalocean.digitalocean import _clean_text
+
+    raw_text = "\x1b[31mRed Alert\x1b[0m with NUL \x00 byte and \x07 bell"
+    cleaned = _clean_text(raw_text)
+    assert "\x1b[31m" not in cleaned
+    assert "\x00" not in cleaned
+    assert "\x07" not in cleaned
+    assert "Red Alert with NUL  byte and  bell" in cleaned
