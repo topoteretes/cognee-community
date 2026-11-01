@@ -139,7 +139,7 @@ def test_client_get_package_empty_name_raises():
 def test_client_get_package_not_found():
     async def _run():
         client = HexClient(transport=create_fake_transport())
-        with pytest.raises(HexPackageNotFoundError, match="not found on Hex.pm"):
+        with pytest.raises(HexPackageNotFoundError, match=r"not found on Hex\.pm"):
             await client.get_package("nonexistent")
 
     asyncio.run(_run())
