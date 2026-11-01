@@ -107,6 +107,12 @@ poetry run python ./examples/example.py
 | `cognee-community-hybrid-adapter-duckdb`     | Hybrid   | DuckDB hybrid database adapter for cognee          |
 | `cognee-community-hybrid-adapter-falkor`     | Hybrid   | FalkorDB hybrid database adapter for cognee        |
 
+## Data-source connectors
+
+| Package Name | Source | Description |
+|--------------|--------|-------------|
+| [`cognee-community-connector-airtable`](packages/connector/airtable/README.md) | Airtable | Records, table schema, and comments with incremental document emission and deletion reconciliation |
+
 ## Custom Packages
 
 Custom packages are also a part of this repo, containing, for example, custom pipelines, tasks, and retrievers.

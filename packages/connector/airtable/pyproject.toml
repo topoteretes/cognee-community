@@ -1,0 +1,44 @@
+[project]
+name = "cognee-community-connector-airtable"
+version = "0.1.0"
+description = "Airtable records, schema, and comments as incremental Cognee documents"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "cognee==1.6.3",
+    "dlt[sqlalchemy]>=1.9.0,<1.31",
+    "requests>=2.32.0,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<9",
+    "pytest-asyncio>=0.25,<2",
+    "ruff>=0.9,<1",
+]
+
+[project.urls]
+Homepage = "https://github.com/topoteretes/cognee"
+Repository = "https://github.com/topoteretes/cognee-community"
+Issues = "https://github.com/topoteretes/cognee/issues/4766"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+constraint-dependencies = ["dlt==1.30.0"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["cognee_community_connector_airtable"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP"]
