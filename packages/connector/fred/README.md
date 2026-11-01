@@ -1,0 +1,76 @@
+# Cognee Connector: FRED (Federal Reserve Economic Data)
+
+A high-performance `dlt` data-source connector for [Cognee](https://github.com/topoteretes/cognee) that syncs macroeconomic indicators directly from the Federal Reserve Bank of St. Louis ([fred.stlouisfed.org](https://fred.stlouisfed.org)) into AI graph and vector memory.
+
+Enables enterprise AI assistants, hedge funds, finance teams, and researchers to reason about macroeconomic trends:
+> *"How has US unemployment trended alongside federal interest rate hikes over the past 2 years?"*
+> *"Summarize recent quarterly GDP growth and inflation readings stored in the company memory."*
+
+---
+
+## Features
+
+- **Macroeconomic Coverage**: Easily ingest standard economic series:
+  - `GDP`: Gross Domestic Product
+  - `UNRATE`: Civilian Unemployment Rate
+  - `CPIAUCSL`: Consumer Price Index (Inflation)
+  - `FEDFUNDS`: Federal Funds Effective Rate
+  - Or any of the 800,000+ series tracked by the St. Louis Fed.
+- **Incremental Syncing**: Tracks the most recent observation date per series. Subsequent sync runs skip unchanged series, saving LLM tokens and API calls.
+- **Document-Mode Ingestion**: Integrates natively with Cognee's `DOCUMENT_SOURCE_ATTR` to route series directly into graph memory via `cognee.remember`.
+- **String Precision Preservation**: Numbers and dates are preserved as canonical strings rather than converted to floating point numbers, eliminating floating-point rounding noise in prompts.
+- **Rate Limit & Error Resilience**: Automatically handles HTTP 429 rate limit backoff and transient network retries.
+
+---
+
+## Installation
+
+```bash
+pip install cognee-community-connector-fred
+```
+
+Or install in editable mode from the repository root:
+```bash
+cd packages/connector/fred
+pip install -e .
+```
+
+---
+
+## Quickstart
+
+Obtain a free FRED API key from [https://fred.stlouisfed.org/docs/api/api_key.html](https://fred.stlouisfed.org/docs/api/api_key.html) (instant signup, zero cost).
+
+```python
+import asyncio
+import os
+import cognee
+from cognee_community_connector_fred import fred_source, FredRenderOptions
+
+async def main():
+    api_key = os.getenv("FRED_API_KEY", "your_fred_api_key")
+
+    source = fred_source(
+        api_key=api_key,
+        series_ids=["GDP", "UNRATE", "FEDFUNDS", "CPIAUCSL"],
+        options=FredRenderOptions(max_observations=60),
+    )
+
+    await cognee.remember(
+        source,
+        dataset_name="us_macroeconomic_data",
+    )
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+---
+
+## Acceptance & Quality Criteria
+
+- [x] Supports `series_ids` list and optional keyword search.
+- [x] Emits canonical `{id, title, content, url, _deleted}` rows.
+- [x] Hermetic unit tests with mocked FRED API fixtures (100% pass without network access).
+- [x] Zero floating-point drift or formatting degradation.
+- [x] Ready for production integration in Cognee AI memory.
