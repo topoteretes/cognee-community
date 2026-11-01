@@ -113,7 +113,7 @@ class CratesClient:
     async def search_crates(self, query: str, limit: int = 10) -> list[dict[str, Any]]:
         """Search crates.io for packages matching query string."""
         url = "/crates"
-        params = {"q": query, "per_page": min(limit, 50)}
+        params: dict[str, str | int] = {"q": query, "per_page": min(limit, 50)}
         async with self._create_client() as client:
             resp = await client.get(url, params=params)
             resp.raise_for_status()
