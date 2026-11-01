@@ -17,7 +17,6 @@ from cognee.infrastructure.databases.vector.embeddings.LiteLLMEmbeddingEngine im
     LiteLLMEmbeddingEngine,
 )
 from cognee.infrastructure.llm import LLMGateway
-
 from cognee_community_connector_google_drive import google_drive as gd_source
 
 add_data_points_module = importlib.import_module("cognee.tasks.storage.add_data_points")
