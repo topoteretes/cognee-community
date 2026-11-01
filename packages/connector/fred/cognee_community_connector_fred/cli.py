@@ -11,7 +11,7 @@ from .fred import (
 )
 
 
-def main():
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Cognee Community FRED Macroeconomic Data Connector CLI",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -42,7 +42,7 @@ def main():
         help="Maximum recent observations to include in the document content",
     )
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     api_key = args.api_key.strip()
     if not api_key:
@@ -54,7 +54,7 @@ def main():
             "Obtain a free instant key at: https://fred.stlouisfed.org/docs/api/api_key.html",
             file=sys.stderr,
         )
-        sys.exit(1)
+        return 1
 
     client = FredClient(api_key=api_key)
 
@@ -71,7 +71,7 @@ def main():
                     series_list.append(sid)
         except Exception as exc:
             print(f"[ERROR] Category fetch failed: {exc}", file=sys.stderr)
-            sys.exit(1)
+            return 1
 
     if args.search:
         print(f">> Searching FRED for query: '{args.search}'...")
@@ -84,7 +84,7 @@ def main():
                     series_list.append(sid)
         except Exception as exc:
             print(f"[ERROR] Search failed: {exc}", file=sys.stderr)
-            sys.exit(1)
+            return 1
 
     print(f">> Syncing and rendering documents for {len(series_list)} series: {series_list}...\n")
     options = FredRenderOptions(max_observations=args.max_obs)
@@ -103,6 +103,8 @@ def main():
 
     print(f"\n[SUCCESS] Rendered {count} FRED document(s) for Cognee AI Memory.")
 
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

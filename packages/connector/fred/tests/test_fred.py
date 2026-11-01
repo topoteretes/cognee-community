@@ -228,3 +228,27 @@ def test_fred_source_with_category():
         category_id=10,
     )
     assert source is not None
+
+
+def test_fred_cli_main_missing_key(capsys):
+    from cognee_community_connector_fred.cli import main as cli_main
+
+    ret = cli_main(["--api-key", "", "--series", "GDP"])
+    assert ret == 1
+    out = capsys.readouterr().err
+    assert "FRED API key missing" in out
+
+
+def test_fred_cli_main_success(monkeypatch):
+    from cognee_community_connector_fred.cli import main as cli_main
+
+    def mock_request(self, endpoint, params=None):
+        if "series/observations" in endpoint:
+            return MOCK_OBSERVATIONS_GDP
+        if "series" in endpoint:
+            return MOCK_SERIES_GDP
+        return {}
+
+    monkeypatch.setattr(FredClient, "request", mock_request)
+    ret = cli_main(["--api-key", "test_key", "--series", "GDP", "--max-obs", "3"])
+    assert ret == 0
