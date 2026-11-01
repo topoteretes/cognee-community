@@ -1,0 +1,15 @@
+{
+  "id": "task-003",
+  "project_id": "proj-002",
+  "section_id": null,
+  "content": "Investigate API latency spike — RESOLVED",
+  "description": "Root cause was missing index on the events table. Added index and P95 back to 175ms.",
+  "priority": 4,
+  "due": {"date": "2026-10-08", "is_recurring": false, "string": "Oct 8"},
+  "labels": ["performance", "backend", "resolved"],
+  "assignee_ids": ["user-bob"],
+  "created_at": "2026-10-03T09:15:00Z",
+  "url": "https://todoist.com/showTask?id=task-003",
+  "comment_count": 8,
+  "is_completed": true
+}
