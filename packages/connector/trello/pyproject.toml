@@ -1,0 +1,23 @@
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+name = "cognee-community-connector-trello"
+version = "0.1.0"
+description = "Trello boards, lists, cards, checklists, and comments data-source connector for Cognee"
+authors = ["Rizul Chauhan <227848501+RizulChauhan@users.noreply.github.com>"]
+readme = "README.md"
+license = "Apache-2.0"
+repository = "https://github.com/topoteretes/cognee-community"
+keywords = ["cognee", "trello", "task-management", "connector", "productivity"]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0.0"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
