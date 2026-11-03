@@ -1,12 +1,12 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.11, <3.14"
 resolution-markers = [
     "(python_full_version >= '3.13' and 'Darwin Kernel Version 22.' not in platform_version and 'Darwin Kernel Version 23.' not in platform_version) or (python_full_version >= '3.13' and sys_platform != 'darwin')",
-    "(python_full_version == '3.12.*' and 'Darwin Kernel Version 22.' not in platform_version and 'Darwin Kernel Version 23.' not in platform_version) or (python_full_version == '3.12.*' and sys_platform != 'darwin')",
-    "(python_full_version < '3.12' and 'Darwin Kernel Version 22.' not in platform_version and 'Darwin Kernel Version 23.' not in platform_version) or (python_full_version < '3.12' and sys_platform != 'darwin')",
     "(python_full_version >= '3.13' and 'Darwin Kernel Version 22.' in platform_version and sys_platform == 'darwin') or (python_full_version >= '3.13' and 'Darwin Kernel Version 23.' in platform_version and sys_platform == 'darwin')",
+    "(python_full_version == '3.12.*' and 'Darwin Kernel Version 22.' not in platform_version and 'Darwin Kernel Version 23.' not in platform_version) or (python_full_version == '3.12.*' and sys_platform != 'darwin')",
     "(python_full_version == '3.12.*' and 'Darwin Kernel Version 22.' in platform_version and sys_platform == 'darwin') or (python_full_version == '3.12.*' and 'Darwin Kernel Version 23.' in platform_version and sys_platform == 'darwin')",
+    "(python_full_version < '3.12' and 'Darwin Kernel Version 22.' not in platform_version and 'Darwin Kernel Version 23.' not in platform_version) or (python_full_version < '3.12' and sys_platform != 'darwin')",
     "(python_full_version < '3.12' and 'Darwin Kernel Version 22.' in platform_version and sys_platform == 'darwin') or (python_full_version < '3.12' and 'Darwin Kernel Version 23.' in platform_version and sys_platform == 'darwin')",
 ]
 
@@ -2621,11 +2621,11 @@ wheels = [
 
 [[package]]
 name = "pypdf"
-version = "6.6.2"
+version = "6.21.4"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/b8/bb/a44bab1ac3c54dbcf653d7b8bcdee93dddb2d3bf025a3912cacb8149a2f2/pypdf-6.6.2.tar.gz", hash = "sha256:0a3ea3b3303982333404e22d8f75d7b3144f9cf4b2970b96856391a516f9f016", size = 5281850, upload-time = "2026-01-26T11:57:55.964Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/1e/e1/ec8f4d155c997c45917153a5521e60d6ee6389d68abdcbc8e44e564caffc/pypdf-6.21.4.tar.gz", hash = "sha256:c8817e3f888d47a087872ded69812c1ef30cacb871d6e053e0c00bbaf0bc2163", size = 7109255, upload-time = "2026-10-28T17:00:54.81Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/7d/be/549aaf1dfa4ab4aed29b09703d2fb02c4366fc1f05e880948c296c5764b9/pypdf-6.6.2-py3-none-any.whl", hash = "sha256:44c0c9811cfb3b83b28f1c3d054531d5b8b81abaedee0d8cb403650d023832ba", size = 329132, upload-time = "2026-01-26T11:57:54.099Z" },
+    { url = "https://files.pythonhosted.org/packages/3f/4b/77e8ad4ac42c9d93600f40541a50e9feb3a61d2bbee2d76f659346072051/pypdf-6.21.4-py3-none-any.whl", hash = "sha256:33e4fb41ca352810eb4e9838aa0d82d6888a5f8bf682f43e99cce5faa666255c", size = 410430, upload-time = "2026-10-28T17:00:53.146Z" },
 ]
 
 [[package]]
