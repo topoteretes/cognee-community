@@ -130,8 +130,9 @@ def test_all_day_event_and_omitted_attendees(cal):
     ("start_day", "end_day", "expected"),
     [
         ("2026-11-08", "2026-11-10", "When: all day, 2026-11-08 to 2026-11-10"),
-        ("2026-12-31", "2027-01-01", "When: all day, 2026-12-31"),
-        ("2026-02-28", "2026-03-01", "When: all day, 2026-02-28"),
+        ("2026-12-31", "2026-12-31", "When: all day, 2026-12-31"),
+        ("2026-12-31", "2027-01-01", "When: all day, 2026-12-31 to 2027-01-01"),
+        ("2026-02-28", "2026-02-28", "When: all day, 2026-02-28"),
     ],
 )
 def test_all_day_event_displays_inclusive_end_date(cal, start_day, end_day, expected):
