@@ -109,7 +109,10 @@ contentful_source(
 
 Entry titles come from their content model's `displayField`, using the first usable selected
 locale (or the actual environment default when no locales are selected), then the entry ID.
-The default comes from the environment-scoped Delivery `/locales` inventory.
+The default comes from the environment-scoped Delivery `/locales` inventory, fetched on
+every run even with `locales=None` so default-language titles and changes remain correct.
+The CDA returns all locales in one response and ignores `skip`/`limit`; the connector
+validates the complete response rather than requiring the requested page size.
 Entries include regional Contentful editor URLs, including `app.eu.contentful.com` for EU spaces. Document
 text leads with the title and fields, then provenance. Rich text becomes plain text with
 paragraph boundaries and linked entry/asset IDs. Field IDs and locale labels remain visible;
@@ -124,10 +127,12 @@ Asset documents contain localized titles/descriptions, filenames, MIME types, HT
 sizes, and available dimensions. Models are separate documents; unchanged models are not
 rendered again. Changing an existing model's display field triggers a full refresh to update
 entry titles; adding an unrelated model keeps the incremental Sync token. If selected entries
-arrive before their model, the checkpoint records the missing model ID. When that model
-appears, a full refresh repairs their titles and field rendering. Failed refreshes leave
+arrive before their model, the checkpoint records the missing model ID and its entry members.
+When that model appears, a full refresh repairs their titles and field rendering; a completed
+repair returns to delta sync. Deleting the last such entry removes the pending repair. Failed refreshes leave
 this repair pending. Older checkpoints without this tracking perform one full refresh to establish it
-and apply the corrected locale-selection policy. A changed environment
+and apply the corrected locale-selection policy. Older checkpoints with missing model IDs
+but no entry membership also refresh once to establish that mapping. A changed environment
 default locale also refreshes titles. This connector
 reads published Delivery content; drafts, Preview access, binary extraction, and built-in
 scheduling are outside its scope.

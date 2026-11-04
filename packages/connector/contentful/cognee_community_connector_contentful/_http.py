@@ -218,39 +218,28 @@ class DeliveryClient:
 
     def default_locale(self):
         """Read the environment's actual default, never infer it from key order."""
-        skip, expected_total = 0, None
+        # CDA /locales returns the whole inventory and ignores skip/limit.
+        payload = self.get("locales")
+        total, offset, limit = (payload.get(key) for key in ("total", "skip", "limit"))
+        items = self.items(payload)
+        if (
+            any(type(value) is not int for value in (total, offset, limit))
+            or total < 0
+            or offset != 0
+            or limit < 1
+            or total > limit
+            or len(items) != total
+        ):
+            raise ContentfulResponseError("Contentful returned an incomplete locale inventory.")
         codes, defaults = set(), []
-        while True:
-            payload = self.get("locales", {"skip": skip, "limit": 100})
-            total, offset, limit = (payload.get(key) for key in ("total", "skip", "limit"))
-            if (
-                any(type(value) is not int for value in (total, offset, limit))
-                or total < 0
-                or offset != skip
-                or not 1 <= limit <= 100
-                or (expected_total is not None and total != expected_total)
-            ):
-                raise ContentfulResponseError("Contentful returned inconsistent locale pagination.")
-            expected_total = total
-            items = self.items(payload)
-            if len(items) != min(limit, max(0, total - skip)):
-                raise ContentfulResponseError("Contentful returned an incomplete locale inventory.")
-            for item in items:
-                self.validate_item(item, {"Locale"})
-                code, default = item.get("code"), item.get("default")
-                if (
-                    not isinstance(code, str)
-                    or not code
-                    or code in codes
-                    or type(default) is not bool
-                ):
-                    raise ContentfulResponseError("Contentful returned invalid locale metadata.")
-                codes.add(code)
-                if default:
-                    defaults.append(code)
-            skip += len(items)
-            if skip >= total:
-                break
+        for item in items:
+            self.validate_item(item, {"Locale"})
+            code, default = item.get("code"), item.get("default")
+            if not isinstance(code, str) or not code or code in codes or type(default) is not bool:
+                raise ContentfulResponseError("Contentful returned invalid locale metadata.")
+            codes.add(code)
+            if default:
+                defaults.append(code)
         if len(defaults) != 1:
             raise ContentfulResponseError("Contentful must identify exactly one default locale.")
         return defaults[0]

@@ -77,6 +77,14 @@ def _rows(pipeline, table):
         }
 
 
+def _resource_state(pipeline, table):
+    return next(
+        source["resources"][table]
+        for source in pipeline.state["sources"].values()
+        if table in source.get("resources", {})
+    )
+
+
 def _text(rows):
     return "\n".join(row["content"] for row in rows.values())
 
@@ -1801,7 +1809,6 @@ def test_locale_selection_keeps_single_locale_fields_and_asset_file(pipeline, fa
 
 def test_default_locale_precedes_alphabetical_order_and_uses_environment_endpoint(pipeline, fake):
     fake.models = [fake.model()]
-    fake.locale_page_size = 1
     fake.initial_items = [
         fake.entry(
             "one",
@@ -1815,7 +1822,7 @@ def test_default_locale_precedes_alphabetical_order_and_uses_environment_endpoin
     row = next(row for row in _rows(pipeline, table).values() if ":Entry:" in row["id"])
     assert row["title"] == "English"
     requests = [request for request in fake.requests if request.url.path.endswith("/locales")]
-    assert [request.url.params["skip"] for request in requests] == ["0", "1"]
+    assert len(requests) == 1 and not requests[0].url.params
     assert all("/environments/master/locales" in request.url.path for request in requests)
     fake.initial_items[0]["fields"]["title"] = {"en-US": "English", "de-DE": "Deutsch"}
     other = _run(pipeline, fake, source_id="reordered")
@@ -1971,13 +1978,22 @@ def test_nonfinite_retry_reset_uses_bounded_default(fake, monkeypatch, reset):
 
 @pytest.mark.parametrize(
     "fault",
-    ["no_default", "two_defaults", "duplicate", "missing_page", "changed_total", "wrong_scope"],
+    [
+        "no_default",
+        "two_defaults",
+        "duplicate",
+        "missing_item",
+        "wrong_total",
+        "wrong_scope",
+        "wrong_skip",
+        "invalid_limit",
+        "noninteger_total",
+    ],
 )
 def test_invalid_locale_inventory_preserves_previous_staging_and_checkpoint(pipeline, fake, fault):
     fake.initial_items = [fake.entry("retained", "RETAINED")]
     table = _run(pipeline, fake)
     before = _rows(pipeline, table)
-    fake.locale_page_size = 1
     if fault == "no_default":
         fake.locales[0]["default"] = False
     elif fault == "two_defaults":
@@ -1989,16 +2005,25 @@ def test_invalid_locale_inventory_preserves_previous_staging_and_checkpoint(pipe
     else:
 
         def override(request):
-            if request.url.path.endswith("/locales") and request.url.params.get("skip") == "1":
-                return httpx.Response(
-                    200,
-                    json={
-                        "items": [] if fault == "missing_page" else [fake.locales[1]],
-                        "skip": 1,
-                        "limit": 1,
-                        "total": 3 if fault == "changed_total" else 2,
-                    },
-                )
+            if request.url.path.endswith("/locales"):
+                payload = {
+                    "sys": {"type": "Array"},
+                    "items": fake.locales,
+                    "skip": 0,
+                    "limit": 1000,
+                    "total": 2,
+                }
+                if fault == "missing_item":
+                    payload["items"] = fake.locales[:1]
+                else:
+                    key, value = {
+                        "wrong_total": ("total", 3),
+                        "wrong_skip": ("skip", 1),
+                        "invalid_limit": ("limit", 0),
+                        "noninteger_total": ("total", True),
+                    }[fault]
+                    payload[key] = value
+                return httpx.Response(200, json=payload)
             return None
 
         fake.override = override
@@ -2061,6 +2086,7 @@ def test_late_model_repairs_previously_rendered_entries(pipeline, fake, failed_r
             },
         )
     ]
+    fake.initial_items.append(fake.entry("vanished", "removed before the repair snapshot"))
     table = _run(pipeline, fake)
     assert next(iter(_rows(pipeline, table).values()))["title"] == "late"
     fake.models = [
@@ -2071,6 +2097,7 @@ def test_late_model_repairs_previously_rendered_entries(pipeline, fake, failed_r
             ]
         )
     ]
+    fake.initial_items = fake.initial_items[:1]
     fake.delta("t1", [], "t2")
     if failed_refresh:
         before = _rows(pipeline, table)
@@ -2083,9 +2110,14 @@ def test_late_model_repairs_previously_rendered_entries(pipeline, fake, failed_r
         fake.override = None
     _run(pipeline, fake)
     row = next(row for row in _rows(pipeline, table).values() if ":Entry:" in row["id"])
+    assert not any(key.endswith(":Entry:vanished") for key in _rows(pipeline, table))
     assert row["title"] == "Recovered title"
     assert "body [en-US]:\nReadable body" in row["content"]
     assert '"nodeType"' not in row["content"]
+    assert _resource_state(pipeline, table)["missing_models"] == []
+    _run(pipeline, fake)
+    assert _sync_requests(fake)[-1].url.params.get("sync_token") == "t1"
+    assert _resource_state(pipeline, table)["missing_models"] == []
 
 
 @pytest.mark.parametrize("locale", ["de-DE", "fr-FR"])
@@ -2157,7 +2189,8 @@ def test_missing_model_from_delta_is_remembered_until_inventory_catches_up(pipel
     )
 
 
-def test_old_checkpoint_without_missing_model_tracking_refreshes_once(pipeline, fake):
+@pytest.mark.parametrize("missing_key", ["missing_models", "missing_model_members"])
+def test_old_checkpoint_without_missing_model_tracking_refreshes_once(pipeline, fake, missing_key):
     import dlt
 
     fake.initial_items = [fake.entry("one", "body")]
@@ -2165,7 +2198,7 @@ def test_old_checkpoint_without_missing_model_tracking_refreshes_once(pipeline, 
 
     @dlt.resource(name=table)
     def old_checkpoint():
-        dlt.current.resource_state().pop("missing_models")
+        dlt.current.resource_state().pop(missing_key)
         yield from ()
 
     pipeline.run(old_checkpoint())
@@ -2173,3 +2206,103 @@ def test_old_checkpoint_without_missing_model_tracking_refreshes_once(pipeline, 
     assert _sync_requests(fake)[-1].url.params.get("initial") == "true"
     _run(pipeline, fake)
     assert _sync_requests(fake)[-1].url.params.get("sync_token") == "t1"
+
+
+@pytest.mark.parametrize("remaining", [False, True])
+def test_missing_model_tracks_only_surviving_entries(pipeline, fake, remaining):
+    fake.initial_items = [fake.entry("gone", "body")]
+    if remaining:
+        fake.initial_items.append(fake.entry("kept", "body"))
+    table = _run(pipeline, fake)
+    fake.delta("t1", [fake.deleted("gone")], "t2")
+    _run(pipeline, fake)
+    assert _resource_state(pipeline, table)["missing_models"] == (["article"] if remaining else [])
+    fake.initial_items = [item for item in fake.initial_items if item["sys"]["id"] != "gone"]
+    fake.models = [fake.model()]
+    _run(pipeline, fake)
+    params = _sync_requests(fake)[-1].url.params
+    assert params.get("initial") == ("true" if remaining else None)
+    if not remaining:
+        assert params["sync_token"] == "t2"
+    assert _resource_state(pipeline, table)["missing_models"] == []
+    assert not any(":Entry:gone" in key for key in _rows(pipeline, table))
+
+
+def test_nonlocalized_field_without_current_default_locale(pipeline, fake):
+    fake.models = [fake.model(fields=[{"id": "title", "type": "Symbol", "localized": False}])]
+    fake.initial_items = [fake.entry("one", "", fields={"title": {"de-DE": "Vorhanden"}})]
+    table = _run(pipeline, fake, locales=["de-DE"])
+    row = next(row for row in _rows(pipeline, table).values() if ":Entry:" in row["id"])
+    assert row["title"] == "Vorhanden"
+    assert "title [de-DE]:\nVorhanden" in row["content"]
+    table = _run(pipeline, fake, locales=["fr-FR"])
+    row = next(row for row in _rows(pipeline, table).values() if ":Entry:" in row["id"])
+    assert row["title"] == "one"
+    assert "Vorhanden" not in row["content"]
+
+
+def test_single_locale_asset_title_survives_other_locale_selection(pipeline, fake):
+    asset = fake.asset("a1", "metadata")
+    asset["fields"]["title"] = {"en-US": "Asset display title"}
+    fake.initial_items = [asset]
+    table = _run(pipeline, fake, locales=["de-DE"])
+    row = next(iter(_rows(pipeline, table).values()))
+    assert row["title"] == "Asset display title"
+    assert row["content"].startswith("Asset display title\n")
+
+
+@pytest.mark.parametrize("kind", ["embedded-entry-inline", "embedded-resource-inline"])
+@pytest.mark.parametrize(
+    "before,after,expected",
+    [
+        ("see ", " here", "see Entry: E6 here"),
+        ("", " here", "Entry: E6 here"),
+        ("see ", "", "see Entry: E6"),
+        ("", "", "Entry: E6"),
+        ("x", "y", "x Entry: E6 y"),
+        ("keep  spaces ", " here", "keep  spaces Entry: E6 here"),
+    ],
+)
+def test_inline_reference_spacing_respects_neighboring_text(kind, before, after, expected):
+    from cognee_community_connector_contentful._render import _rich_text
+
+    rich = _node(
+        "document",
+        _node(
+            "paragraph",
+            _node("text", value=before),
+            _node(
+                kind, data={"target": {"sys": {"type": "Link", "linkType": "Entry", "id": "E6"}}}
+            ),
+            _node("text", value=after),
+        ),
+    )
+    assert _rich_text(rich) == expected
+
+
+def test_locale_inventory_accepts_live_cda_envelope(fake):
+    from cognee_community_connector_contentful._http import DeliveryClient
+
+    # Observed against Contentful's public cfexampleapi/master space:
+    # /locales ignores limit=100 and reports skip=0, limit=1000, total=2.
+    with DeliveryClient(fake.host, fake.space, fake.environment, "token", fake.client) as delivery:
+        assert delivery.default_locale() == "en-US"
+    assert len(fake.requests) == 1
+    assert fake.requests[0].url.path.endswith("/environments/master/locales")
+    assert not fake.requests[0].url.params
+
+
+def test_complete_locale_inventory_can_exceed_requested_model_page_size(fake):
+    from cognee_community_connector_contentful._http import DeliveryClient
+
+    fake.locales = [
+        {
+            "sys": {"type": "Locale", "id": f"locale{index}"},
+            "code": f"locale-{index}",
+            "default": index == 100,
+        }
+        for index in range(101)
+    ]
+    with DeliveryClient(fake.host, fake.space, fake.environment, "token", fake.client) as delivery:
+        assert delivery.default_locale() == "locale-100"
+    assert len(fake.requests) == 1

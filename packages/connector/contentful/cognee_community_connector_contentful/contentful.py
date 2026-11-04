@@ -201,6 +201,7 @@ def contentful_source(
                 or state.get("default_locale") != default_locale
                 # Old checkpoints cannot identify entries rendered without a schema.
                 or "missing_models" not in state
+                or (state.get("missing_models") and "missing_model_members" not in state)
                 or bool(set(display_fields) & set(state["missing_models"]))
                 or any(
                     key in state["display_fields"] and state["display_fields"][key] != value
@@ -211,7 +212,9 @@ def contentful_source(
             for attempt in range(2):
                 priority = attempt * 2
                 members = set() if refresh else old_members.copy()
-                missing_models = set() if refresh else set(state.get("missing_models", []))
+                missing_model_members = (
+                    {} if refresh else dict(state.get("missing_model_members", {}))
+                )
                 synced = set()
                 spool.clear()
                 terminal_token = None
@@ -237,6 +240,7 @@ def contentful_source(
             for kind, upstream_id, count in spool.identities():
                 item = resolve_event(delivery, spool, kind, upstream_id, count)
                 key = row_id(space, environment, kind, upstream_id)
+                missing_model_members.pop(key, None)
                 if item["sys"]["type"].startswith("Deleted") or not selected(item):
                     members.discard(key)
                     if key in old_members or key in emitted:
@@ -246,7 +250,7 @@ def contentful_source(
                 if kind == "Entry":
                     model_id = item["sys"]["contentType"]["sys"]["id"]
                     if model_id not in models:
-                        missing_models.add(model_id)
+                        missing_model_members[key] = model_id
                 synced.add(key)
                 if count > 1:
                     row = render(item)
@@ -284,7 +288,8 @@ def contentful_source(
                 models=selected_models,
                 display_fields=display_fields,
                 default_locale=default_locale,
-                missing_models=sorted(missing_models),
+                missing_models=sorted(set(missing_model_members.values())),
+                missing_model_members=missing_model_members,
             )
             # Provisional rows still need tombstones, but they were never part
             # of the previous selection and must not inflate reported removals.

@@ -98,7 +98,21 @@ def _rich_text(value):
         "hr",
     ):
         # Text and inline nodes inside a paragraph must retain their adjacency.
-        body = "".join(rendered)
+        body = ""
+        previous_inline = False
+        for child, text in zip(children, rendered, strict=True):
+            if not text:
+                continue
+            inline = child.get("nodeType") in ("embedded-entry-inline", "embedded-resource-inline")
+            if (
+                body
+                and (inline or previous_inline)
+                and not body[-1].isspace()
+                and not text[0].isspace()
+            ):
+                body += " "
+            body += text
+            previous_inline = inline
     else:
         raise _invalid("an unsupported rich-text node")
     if node == "hyperlink":
@@ -111,12 +125,7 @@ def _rich_text(value):
         if not isinstance(target, dict):
             raise _invalid("an invalid rich-text reference")
         reference = _reference(target)
-        result = f"{body} ({reference})" if body else reference
-        return (
-            f" {result} "
-            if node in ("embedded-entry-inline", "embedded-resource-inline")
-            else result
-        )
+        return f"{body} ({reference})" if body else reference
     return "---" if node == "hr" else body
 
 

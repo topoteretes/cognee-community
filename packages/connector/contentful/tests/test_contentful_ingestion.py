@@ -470,14 +470,22 @@ async def test_unchanged_delta_retries_failed_cognification(local_stores, monkey
         await _remember(fake)
     assert {_id_suffix(record) for record in await _records()} == {"alpha", "beta", "article"}
     nodes, _, vectors = await _snapshot()
-    assert "CATALOGALPHA" not in json.dumps(nodes, default=str)
-    assert "CATALOGALPHA" not in json.dumps(vectors, default=str)
+    # Cognee 1.6.6 may index raw chunks before LLM extraction. Verify the
+    # missing derived entities, not marker text inside those source chunks.
+    expected = {"catalogalpha", "catalogbeta", "sharedcatalog"}
+    assert expected.isdisjoint((properties.get("name") or "").casefold() for _, properties in nodes)
+    assert expected.isdisjoint(
+        row["payload"]["text"].casefold() for row in vectors.get("Entity_name", [])
+    )
 
     monkeypatch.setattr(LLMGateway, "acreate_structured_output", _offline_llm)
     fake.requests.clear()
     await _remember(fake)
     assert _sync_requests(fake)[0].url.params["sync_token"] == "t1"
     await _assert_present("CATALOGALPHA", "CATALOGBETA")
+    nodes, _, vectors = await _snapshot()
+    assert expected <= {(properties.get("name") or "").casefold() for _, properties in nodes}
+    assert expected <= {row["payload"]["text"].casefold() for row in vectors.get("Entity_name", [])}
 
 
 @pytest.mark.asyncio

@@ -33,7 +33,6 @@ class FakeContentful:
             {"sys": {"id": "english", "type": "Locale"}, "code": "en-US", "default": True},
             {"sys": {"id": "german", "type": "Locale"}, "code": "de-DE", "default": False},
         ]
-        self.locale_page_size = 100
         self.model_passes: list[list[dict[str, Any]]] = []
         self.model_page_size = 100
         self.model_pass_count = 0
@@ -187,16 +186,15 @@ class FakeContentful:
                 return overridden
         path = request.url.path
         if path.endswith("/locales"):
-            skip = int(request.url.params.get("skip", "0"))
-            limit = min(int(request.url.params.get("limit", "100")), self.locale_page_size)
+            # The live CDA endpoint ignores pagination and returns all locales.
             return httpx.Response(
                 200,
                 json={
                     "sys": {"type": "Array"},
-                    "items": self.locales[skip : skip + limit],
+                    "items": deepcopy(self.locales),
                     "total": len(self.locales),
-                    "skip": skip,
-                    "limit": limit,
+                    "skip": 0,
+                    "limit": 1000,
                 },
             )
         if path.endswith("/sync"):
