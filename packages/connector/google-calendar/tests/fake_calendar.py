@@ -87,13 +87,19 @@ class FakeCalendar:
         }
         return self._save(calendar, event)
 
-    def put_all_day(self, calendar: str, summary: str, day: str, **fields) -> str:
+    def put_all_day(
+        self, calendar: str, summary: str, day: str, end_day: str | None = None, **fields
+    ) -> str:
+        # The helper accepts an inclusive final day; Google stores the next day
+        # as the exclusive end date for all-day events.
+        inclusive_end = datetime.fromisoformat(end_day or day).date()
+        exclusive_end = (inclusive_end + timedelta(days=1)).isoformat()
         return self.put_event(
             calendar,
             summary,
             datetime(2026, 1, 1),
             start={"date": day},
-            end={"date": day},
+            end={"date": exclusive_end},
             **fields,
         )
 
