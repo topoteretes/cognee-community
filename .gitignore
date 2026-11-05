@@ -14,7 +14,6 @@ install.log
 # NetworkX adapter graph snapshots written during local runs
 cognee_graph.pkl
 # Env config
-.env
 
 # Cognee system
 # for backward compatibility
@@ -27,3 +26,5 @@ cognee_graph.pkl
 .data_storage
 *.log.DS_Store
 .DS_Store
+config.bat
+node_modules
