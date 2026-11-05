@@ -176,7 +176,7 @@ class TwitchClient:
         for key, value in params.items():
             if value is None:
                 continue
-            values = value if isinstance(value, (list, tuple)) else [value]
+            values = value if isinstance(value, list | tuple) else [value]
             pairs.extend((key, item) for item in values)
         url = f"{_API_BASE}/{path.lstrip('/')}"
         if pairs:
@@ -418,7 +418,7 @@ def video_to_row(video: dict) -> dict[str, Any] | None:
         video.get("type"), video.get("type")
     )
     lines = [
-        f"Twitch VOD \"{video.get('title') or ''}\" by {name} ({login}).",
+        f'Twitch VOD "{video.get("title") or ""}" by {name} ({login}).',
         _field("Type", kind),
         _field("Description", video.get("description")),
         _field("Created", _fmt_timestamp(video.get("created_at"))),
@@ -449,9 +449,9 @@ def clip_to_row(clip: dict, login: str | None) -> dict[str, Any] | None:
     channel = f"{name} ({login})" if login and name else (login or name)
     title = clip.get("title") or ""
     if channel:
-        first = f"Twitch clip \"{title}\" from channel {channel}."
+        first = f'Twitch clip "{title}" from channel {channel}.'
     else:
-        first = f"Twitch clip \"{title}\"."
+        first = f'Twitch clip "{title}".'
     lines = [
         first,
         _field("Created by", clip.get("creator_name")),
@@ -617,7 +617,8 @@ def sync_channels(
                 row for row in (video_to_row(v) for v in list_videos(client, broadcaster_id)) if row
             ]
             clips = [
-                row for row in (clip_to_row(c, login) for c in list_clips(client, broadcaster_id))
+                row
+                for row in (clip_to_row(c, login) for c in list_clips(client, broadcaster_id))
                 if row
             ]
             row = channel_to_row(

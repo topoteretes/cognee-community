@@ -179,9 +179,7 @@ def clip(clip_id, title, creator_name, view_count, created_at):
     }
 
 
-CLIP_PARSER = clip(
-    "RandomClip1", "The parser finally works", "ClipFan", 10, "2025-08-20T22:34:18Z"
-)
+CLIP_PARSER = clip("RandomClip1", "The parser finally works", "ClipFan", 10, "2025-08-20T22:34:18Z")
 CLIP_TYPES = clip(
     "RandomClip2", "Explaining variance in 30 seconds", "TypeNerd", 9, "2025-08-25T19:00:00Z"
 )
@@ -210,8 +208,7 @@ class FakeTwitch:
         self.users = {key: dict(value) for key, value in USERS.items()}
         self.videos = {
             "2001": [
-                dict(item)
-                for item in (VIDEO_RUST_ARCHIVE, VIDEO_RUST_HIGHLIGHT, VIDEO_RUST_UPLOAD)
+                dict(item) for item in (VIDEO_RUST_ARCHIVE, VIDEO_RUST_HIGHLIGHT, VIDEO_RUST_UPLOAD)
             ]
         }
         self.clips = {"2002": [dict(CLIP_PARSER), dict(CLIP_TYPES)]}
@@ -308,7 +305,9 @@ class Response(io.BytesIO):
         return False
 
 
-def http_error(status, payload=None, remaining=None, reset=None, url="https://api.twitch.tv/helix/videos"):
+def http_error(
+    status, payload=None, remaining=None, reset=None, url="https://api.twitch.tv/helix/videos"
+):
     """An HTTPError the way urlopen raises it, with rate-limit headers."""
     headers = Headers()
     if remaining is not None:
