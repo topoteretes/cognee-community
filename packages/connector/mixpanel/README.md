@@ -166,6 +166,12 @@ budget SQLite database and sync locks, not credentials or provider bodies. Pass
 `state_directory=` to change it. Budget state must be shared if multiple processes
 use the same account. The sync helper requires a POSIX host (macOS/Linux) for file locks.
 
+If separate runtimes use the same Mixpanel scope with different Cognee database roots,
+set a distinct `DLT_DATA_DIR` for each runtime before importing/configuring Cognee.
+Otherwise dlt's default global pipeline directory can mix their local checkpoints.
+Keep the connector's request-budget state shared across those runtimes; isolating dlt
+working directories does not give the service account additional request quota.
+
 ## Development and validation status
 
 ```sh
@@ -180,19 +186,46 @@ responses from a dedicated EU synthetic project. Offline tests isolate Cognee's 
 file so local model credentials do not override the mocked model configuration.
 
 Live service-account/project/workspace reads and rendering passed for two registered event
-schemas and one saved funnel. The report's baseline, unchanged run and seven-to-three-day
-semantic edit passed with Azure GPT extraction, local Fastembed embeddings and real
-SQLite/Ladybug/LanceDB stores. Public CHUNKS search returned the definition; the update
-replaced the Data identity, retained one chunk and removed the prior window and document
-references. Schema ingestion/lifecycle has not yet been exercised against the live source.
+schemas and one saved funnel. The report's baseline, unchanged run, seven-to-three-day
+semantic edit, reset, deletion and recreation passed with Azure GPT extraction, local
+Fastembed embeddings and real SQLite/Ladybug/LanceDB stores. Public CHUNKS search returned
+the current definition. Updates removed old document references and query rules; deletion
+left zero Data records, graph nodes, edges and vector chunks. Recreating the report with
+a new provider ID restored the original seven-day definition as a searchable document.
+The individual report DELETE route initially returned HTTP 500; the SDK's bulk-delete
+route succeeded when restricted to that one synthetic report.
 
-Live deletion remains unverified: the synthetic report DELETE route returned HTTP 500,
-and a subsequent inventory still contained the report. This is an upstream mutation-test
-failure, not a successful disappearance/cleanup check. Full inventory/UI comparison,
-permission-loss behavior and live cohort predicates also remain validation gates. The
-current test-project plan does not allow saving cohorts. The report's original seven-day
-definition was reset and verified with a fresh GET. Post-reset Cognee sync remains
-pending the next hourly request-budget window.
+The two registered schemas passed live ingestion, unchanged sync, description update,
+single-schema deletion/restoration and final deletion/restoration of both selected
+schemas. Unchanged Purchase retained its Data ID during the Signup update; both original
+IDs returned on restoration. The empty selected corpus left zero Data records, graph
+nodes, edges and vector chunks, with no stale definition in public search.
+A live invalid-credential request returned HTTP 401 and left the existing report's
+Data, graph, vector and search observations unchanged. This checks authentication
+failure; it does not establish per-object sharing or permission-loss behavior.
+
+The selected synthetic definitions also passed rendered UI comparison: the board
+shows one report card; its ordered Signup/Purchase steps, seven-day conversion
+window, `plan = test` filter and 30-day date range match the saved query. Both
+events' names, descriptions, visibility and tags, and their `plan`/`test_run`
+property names, String types and descriptions match the registered schemas.
+Fresh API readback after the UI inspection matched all three retained Cognee
+documents. This verifies these selected definitions, not every report structure
+or tenant inventory.
+
+Live cross-project isolation also passed in a second authorized EU Free project
+(`4081075`): baseline ingestion, deletion to zero Data/graph/vector content and
+restoration of the same schema Data ID, using the same real Cognee stores.
+The original project's report observations stayed unchanged at every stage.
+The new project also rejects saved cohorts and requires Growth for granular
+board sharing. Creating another Free project did not unlock those live gates.
+
+Per-object permission-loss/sharing behavior and live cohort predicates remain
+validation gates. The Share dialog requires the Growth plan to control who can
+view/edit boards; project-wide Editor access and public sharing off were observed,
+with no sharing settings changed. The current test-project plan rejected
+cohort creation again with `plan does not allow saving cohorts`; no trial or upgrade
+was enabled. Successful report/schema lifecycle checks do not establish cohort support.
 The Cognee integration test uses real SQLite, Ladybug and LanceDB, mocked LLM output,
 and deterministic local token embeddings. It checks public chunk search, updates,
 final deletion, restoration, cross-project isolation and unchanged-data replay after
