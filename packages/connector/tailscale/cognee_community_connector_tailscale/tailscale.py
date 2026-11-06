@@ -1,4 +1,4 @@
-"""Tailscale connector for cognee: a ``dlt`` source that turns Tailscale devices, ACLs, and routes into memory.
+"""Tailscale connector for cognee: a ``dlt`` source syncing devices, ACLs, and routes.
 
 Sync Tailscale tailnet devices, ACL access policies, and subnet routes into cognee,
 incrementally and with forget-on-delete. The resource is handed directly to
@@ -19,7 +19,7 @@ Design
 ------
 * **Rows** are flat ``{id, title, content, url, _deleted}``, one per entity
   (``tailscale:device:<id>``, ``tailscale:acl:<tailnet>``, ``tailscale:route:<id>``).
-* **Incremental.** Listings track high-watermark ``last_seen`` timestamps in ``dlt.current.resource_state()``.
+* **Incremental.** Listings track high-watermark timestamps in ``dlt.current.resource_state()``.
   Full details are fetched only for changed items, and rendered markdown is hashed with SHA-256
   to ensure unchanged content is not re-emitted.
 * **Forget-on-delete.** Entities deleted upstream emit hard-delete ``_deleted=True`` tombstones
@@ -28,9 +28,9 @@ Design
   windows, and sanitizes API keys on all error paths.
 """
 
+import contextlib
 import hashlib
 import json
-import re
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -132,7 +132,9 @@ class TailscaleClient:
                 response = client.get(path, headers=headers, params=params)
             except Exception as err:
                 if attempt == max_retries:
-                    raise TailscaleAPIError(f"Transport error connecting to Tailscale: {err.__class__.__name__}") from err
+                    raise TailscaleAPIError(
+                        f"Transport error connecting to Tailscale: {err.__class__.__name__}"
+                    ) from err
                 time.sleep(backoff)
                 total_retry_wait += backoff
                 backoff *= 2.0
@@ -145,18 +147,20 @@ class TailscaleClient:
                     raise TailscaleAPIError("Tailscale returned non-JSON response") from err
 
             if response.status_code in (401, 403):
-                raise TailscaleAuthError(f"Tailscale rejected the API key (HTTP {response.status_code})")
+                raise TailscaleAuthError(
+                    f"Tailscale rejected the API key (HTTP {response.status_code})"
+                )
 
             if response.status_code == 429:
                 retry_after_hdr = response.headers.get("Retry-After")
                 wait = backoff
                 if retry_after_hdr:
-                    try:
+                    with contextlib.suppress(ValueError):
                         wait = max(wait, float(retry_after_hdr))
-                    except ValueError:
-                        pass
                 if wait > 60.0 or (total_retry_wait + wait) > 120.0:
-                    raise TailscaleRateLimitedError(f"Tailscale rate limit back-off too long: {wait}s")
+                    raise TailscaleRateLimitedError(
+                        f"Tailscale rate limit back-off too long: {wait}s"
+                    )
                 time.sleep(wait)
                 total_retry_wait += wait
                 backoff = max(backoff * 2.0, wait * 1.5)
@@ -164,7 +168,10 @@ class TailscaleClient:
 
             if response.status_code in (500, 502, 503, 504):
                 if attempt == max_retries:
-                    raise TailscaleAPIError(f"Tailscale server error: HTTP {response.status_code}", status=response.status_code)
+                    raise TailscaleAPIError(
+                        f"Tailscale server error: HTTP {response.status_code}",
+                        status=response.status_code,
+                    )
                 time.sleep(backoff)
                 total_retry_wait += backoff
                 backoff *= 2.0
@@ -197,18 +204,18 @@ def _render_device_markdown(device: dict[str, Any]) -> tuple[str, str, str]:
 
 - **Node ID**: {d_id}
 - **Operating System**: {os_name}
-- **Tailscale IP(s)**: {ip_str or 'None assigned'}
-- **Tags**: {tags_str or 'None'}
+- **Tailscale IP(s)**: {ip_str or "None assigned"}
+- **Tags**: {tags_str or "None"}
 - **Authorized**: {authorized}
 - **Last Seen**: {last_seen}
-- **Client Version**: {device.get('clientVersion', 'Unknown')}
+- **Client Version**: {device.get("clientVersion", "Unknown")}
 
 ## Description
-{description or 'No device description provided.'}
+{description or "No device description provided."}
 
 ## Network Attributes & Capabilities
-- **Subnet Routes**: {device.get('advertisedRoutes', 'None')}
-- **Key Expiry**: {device.get('keyExpiryDisabled', False)}
+- **Subnet Routes**: {device.get("advertisedRoutes", "None")}
+- **Key Expiry**: {device.get("keyExpiryDisabled", False)}
 """
     return doc_id, title, content
 
@@ -262,7 +269,7 @@ def _render_route_markdown(route: dict[str, Any]) -> tuple[str, str, str]:
 - **Gateway Node**: {node_name}
 - **Enabled**: {enabled}
 - **Advertised**: {advertised}
-- **Primary**: {route.get('isPrimary', False)}
+- **Primary**: {route.get("isPrimary", False)}
 """
     return doc_id, title, content
 
@@ -292,7 +299,11 @@ def _iter_rows(
         if r_type == "devices":
             path = f"/tailnet/{tailnet}/devices"
             data = client.get(path)
-            devices = data.get("devices", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+            devices = (
+                data.get("devices", [])
+                if isinstance(data, dict)
+                else (data if isinstance(data, list) else [])
+            )
 
             for dev in devices:
                 if check_active is not None:
@@ -326,7 +337,9 @@ def _iter_rows(
             current_type_ids.add(acl_id)
             known_state[acl_id] = True
 
-            doc_id, title, content = _render_acl_markdown(acl_data if isinstance(acl_data, dict) else {}, tailnet)
+            doc_id, title, content = _render_acl_markdown(
+                acl_data if isinstance(acl_data, dict) else {}, tailnet
+            )
             sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
             prev_sha = hashes.get(doc_id)
 
@@ -346,7 +359,11 @@ def _iter_rows(
         elif r_type == "routes":
             path = f"/tailnet/{tailnet}/routes"
             data = client.get(path)
-            routes = data.get("routes", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+            routes = (
+                data.get("routes", [])
+                if isinstance(data, dict)
+                else (data if isinstance(data, list) else [])
+            )
 
             for rt in routes:
                 if check_active is not None:
@@ -367,13 +384,15 @@ def _iter_rows(
                         "id": doc_id,
                         "title": title,
                         "content": content,
-                        "url": f"https://login.tailscale.com/admin/machines",
+                        "url": "https://login.tailscale.com/admin/machines",
                         "_deleted": False,
                     }
                 else:
                     stats["unchanged"] += 1
 
-        type_singular = "device" if r_type == "devices" else ("acl" if r_type == "acls" else "route")
+        type_singular = (
+            "device" if r_type == "devices" else ("acl" if r_type == "acls" else "route")
+        )
         prev_ids = set(known_state.keys())
         deleted_ids = prev_ids - current_type_ids
         for del_id in deleted_ids:
@@ -404,13 +423,17 @@ def tailscale_source(
     selected = tuple(resources or SUPPORTED_RESOURCES)
     for r in selected:
         if r not in SUPPORTED_RESOURCES:
-            raise ValueError(f"Unknown Tailscale resource '{r}'. Must be one of {SUPPORTED_RESOURCES}")
+            raise ValueError(
+                f"Unknown Tailscale resource '{r}'. Must be one of {SUPPORTED_RESOURCES}"
+            )
 
     active_client = client or service
     if active_client is None:
         if not api_key or not api_key.strip():
             raise TailscaleAuthError("Tailscale API key is required when no client is supplied")
-        active_client = TailscaleClient(api_key=api_key.strip(), tailnet=tailnet, base_url=base_url, check_active=check_active)
+        active_client = TailscaleClient(
+            api_key=api_key.strip(), tailnet=tailnet, base_url=base_url, check_active=check_active
+        )
 
     name = resource_name or ("tailscale_" + "_".join(sorted(selected)))
     stats: dict[str, int] = {}

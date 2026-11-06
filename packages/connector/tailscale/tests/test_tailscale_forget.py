@@ -1,6 +1,7 @@
 """End-to-end verification through cognee: deleted Tailscale devices leave the memory graph."""
 
 import importlib
+
 import cognee
 import pytest
 import pytest_asyncio
@@ -9,6 +10,7 @@ from cognee.infrastructure.databases.vector.embeddings.LiteLLMEmbeddingEngine im
     LiteLLMEmbeddingEngine,
 )
 from cognee.infrastructure.llm import LLMGateway
+
 from cognee_community_connector_tailscale import tailscale_source
 
 try:
@@ -25,14 +27,18 @@ ALPHA_NODE = "AlphaGatewayNode"
 BETA_NODE = "BetaAnalyticsNode"
 
 
-async def _mock_structured_output(text_input=None, system_prompt=None, response_model=str, **_kwargs):
+async def _mock_structured_output(
+    text_input=None, system_prompt=None, response_model=str, **_kwargs
+):
     from cognee.shared.data_models import KnowledgeGraph, SummarizedContent
     from cognee.shared.data_models import Node as KGNode
 
     if response_model is str:
         return "Mocked Tailscale insight."
     if response_model == SummarizedContent:
-        return SummarizedContent(summary="Tailscale device summary", description="Tailscale device description")
+        return SummarizedContent(
+            summary="Tailscale device summary", description="Tailscale device description"
+        )
     if response_model == KnowledgeGraph:
         name = next((t for t in (ALPHA_NODE, BETA_NODE) if text_input and t in text_input), None)
         nodes = (
@@ -95,8 +101,14 @@ async def _sync(tailscale):
 
 @pytest.mark.asyncio
 async def test_deleting_device_forgets_its_graph_content(clean_environment, tailscale):
-    tailscale.add_device("node_alpha", "Alpha Gateway Machine", f"{ALPHA_NODE} routes primary production VPC traffic.")
-    beta = tailscale.add_device("node_beta", "Beta Analytics Machine", f"{BETA_NODE} serves internal analytics workloads.")
+    tailscale.add_device(
+        "node_alpha",
+        "Alpha Gateway Machine",
+        f"{ALPHA_NODE} routes primary production VPC traffic.",
+    )
+    beta = tailscale.add_device(
+        "node_beta", "Beta Analytics Machine", f"{BETA_NODE} serves internal analytics workloads."
+    )
 
     await _sync(tailscale)
     assert await _graph_has(ALPHA_NODE), "Alpha node entity should be present in memory graph"
@@ -106,4 +118,6 @@ async def test_deleting_device_forgets_its_graph_content(clean_environment, tail
     await _sync(tailscale)
 
     assert await _graph_has(ALPHA_NODE), "Alpha node should remain in memory graph"
-    assert not await _graph_has(BETA_NODE), "Deleted Beta node entity must be forgotten from memory graph"
+    assert not await _graph_has(BETA_NODE), (
+        "Deleted Beta node entity must be forgotten from memory graph"
+    )

@@ -34,6 +34,7 @@ import os
 import cognee
 from cognee_community_connector_tailscale import tailscale_source
 
+
 async def main():
     api_key = os.environ["TAILSCALE_API_KEY"]
     tailnet = os.environ.get("TAILSCALE_TAILNET", "-")
@@ -52,6 +53,7 @@ async def main():
         write_disposition="merge",
         max_rows_per_table=0,
     )
+
 
 if __name__ == "__main__":
     asyncio.run(main())

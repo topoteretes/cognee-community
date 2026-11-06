@@ -1,6 +1,7 @@
 """In-memory stand-in for the Tailscale API, shared by test modules."""
 
 import pytest
+
 from cognee_community_connector_tailscale.tailscale import (
     TailscaleAPIError,
     TailscaleAuthError,
@@ -26,7 +27,16 @@ class FakeTailscale:
         self.quota_exhausted = False
         self.server_error = False
 
-    def add_device(self, d_id: str, name: str, description: str = "", hostname: str = "prod-node", os: str = "linux", addresses=None, tags=None):
+    def add_device(
+        self,
+        d_id: str,
+        name: str,
+        description: str = "",
+        hostname: str = "prod-node",
+        os: str = "linux",
+        addresses=None,
+        tags=None,
+    ):
         dev = {
             "id": d_id,
             "name": name,
@@ -68,7 +78,6 @@ class FakeTailscale:
         parts = clean.split("/")
 
         if len(parts) >= 3 and parts[0] == "tailnet":
-            tailnet = parts[1]
             resource = parts[2]
             if resource == "devices":
                 return {"devices": list(self.devices.values())}

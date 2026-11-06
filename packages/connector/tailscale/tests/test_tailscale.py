@@ -2,6 +2,7 @@
 
 import httpx
 import pytest
+
 from cognee_community_connector_tailscale.tailscale import (
     TailscaleAPIError,
     TailscaleAuthError,
@@ -11,7 +12,6 @@ from cognee_community_connector_tailscale.tailscale import (
     _render_acl_markdown,
     _render_device_markdown,
     _render_route_markdown,
-    tailscale_source,
 )
 
 
@@ -53,7 +53,9 @@ def test_client_401_raises_auth_error():
 
 def test_client_429_long_retry_after_raises_rate_limited():
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(429, headers={"Retry-After": "120"}, json={"message": "Rate limit exceeded"})
+        return httpx.Response(
+            429, headers={"Retry-After": "120"}, json={"message": "Rate limit exceeded"}
+        )
 
     transport = httpx.MockTransport(handler)
     client = TailscaleClient(api_key="test_key")
