@@ -1,4 +1,4 @@
-"""Retool connector for cognee: a ``dlt`` source that turns Retool apps, workflows, and resources into memory.
+"""Retool connector for cognee: a ``dlt`` source syncing Retool entities into memory.
 
 Sync Retool internal tools, workflows, and data source metadata into cognee,
 incrementally and with forget-on-delete. The resource is handed directly to
@@ -31,8 +31,6 @@ Design
 """
 
 import hashlib
-import json
-import re
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -133,7 +131,9 @@ class RetoolClient:
                 response = client.get(path, headers=headers, params=params)
             except Exception as err:
                 if attempt == max_retries:
-                    raise RetoolAPIError(f"Transport error connecting to Retool: {err.__class__.__name__}") from err
+                    raise RetoolAPIError(
+                        f"Transport error connecting to Retool: {err.__class__.__name__}"
+                    ) from err
                 time.sleep(backoff)
                 total_retry_wait += backoff
                 backoff *= 2.0
@@ -161,7 +161,9 @@ class RetoolClient:
                     except ValueError:
                         pass
                 if attempt == max_retries or (total_retry_wait + wait_sec) > 300.0:
-                    raise RetoolRateLimitedError("Retool rate limit exceeded after retries (HTTP 429)")
+                    raise RetoolRateLimitedError(
+                        "Retool rate limit exceeded after retries (HTTP 429)"
+                    )
                 time.sleep(wait_sec)
                 total_retry_wait += wait_sec
                 backoff *= 2.0
@@ -169,16 +171,23 @@ class RetoolClient:
 
             if response.status_code in (500, 502, 503, 504):
                 if attempt == max_retries:
-                    raise RetoolAPIError(f"Retool server error: HTTP {response.status_code}", status=response.status_code)
+                    raise RetoolAPIError(
+                        f"Retool server error: HTTP {response.status_code}",
+                        status=response.status_code,
+                    )
                 time.sleep(backoff)
                 total_retry_wait += backoff
                 backoff *= 2.0
                 continue
 
-            raise RetoolAPIError(f"Retool API error: HTTP {response.status_code}", status=response.status_code)
+            raise RetoolAPIError(
+                f"Retool API error: HTTP {response.status_code}", status=response.status_code
+            )
 
 
-def _render_app_markdown(app: dict[str, Any], base_web_url: str = "https://retool.com") -> tuple[str, str, str]:
+def _render_app_markdown(
+    app: dict[str, Any], base_web_url: str = "https://retool.com"
+) -> tuple[str, str, str]:
     app_id = str(app.get("id") or "")
     name = str(app.get("name") or "Untitled App")
     description = str(app.get("description") or "No description provided.")
@@ -207,7 +216,9 @@ def _render_app_markdown(app: dict[str, Any], base_web_url: str = "https://retoo
     return f"retool:app:{app_id}", f"Retool App: {name}", body
 
 
-def _render_workflow_markdown(wf: dict[str, Any], base_web_url: str = "https://retool.com") -> tuple[str, str, str]:
+def _render_workflow_markdown(
+    wf: dict[str, Any], base_web_url: str = "https://retool.com"
+) -> tuple[str, str, str]:
     wf_id = str(wf.get("id") or "")
     name = str(wf.get("name") or "Untitled Workflow")
     description = str(wf.get("description") or "No description provided.")
@@ -216,7 +227,11 @@ def _render_workflow_markdown(wf: dict[str, Any], base_web_url: str = "https://r
     updated_at = str(wf.get("updatedAt") or "")
 
     blocks = wf.get("blocks") or []
-    block_summary = "\n".join(f"- `{b.get('name', 'block')}` ({b.get('type', 'step')})" for b in blocks[:20]) if blocks else "- Standard workflow steps"
+    block_summary = (
+        "\n".join(f"- `{b.get('name', 'block')}` ({b.get('type', 'step')})" for b in blocks[:20])
+        if blocks
+        else "- Standard workflow steps"
+    )
 
     url = f"{base_web_url}/workflows/{wf_id}"
 
@@ -259,6 +274,7 @@ def _iter_rows(
 ) -> Iterator[dict[str, Any]]:
     if state is None:
         import dlt
+
         state = dlt.current.resource_state() if dlt else {}
     if stats is None:
         stats = {}
@@ -277,7 +293,11 @@ def _iter_rows(
             raise RetoolAPIError(f"Failed to query /{r_type}: {err}") from err
 
         if not isinstance(listing, list):
-            if isinstance(listing, dict) and "data" in listing and isinstance(listing["data"], list):
+            if (
+                isinstance(listing, dict)
+                and "data" in listing
+                and isinstance(listing["data"], list)
+            ):
                 listing = listing["data"]
             else:
                 raise RetoolAPIError(f"Retool listing for /{r_type} did not return a list")
@@ -296,7 +316,11 @@ def _iter_rows(
 
             # Fetch details if needed
             detail = item
-            if r_type in ("apps", "workflows") and not item.get("components") and not item.get("blocks"):
+            if (
+                r_type in ("apps", "workflows")
+                and not item.get("components")
+                and not item.get("blocks")
+            ):
                 try:
                     detail_res = client.get(f"/{r_type}/{item_id}")
                     if isinstance(detail_res, dict):
@@ -332,7 +356,9 @@ def _iter_rows(
 
         # Check for tombstones (forget-on-delete)
         # Type singular: apps -> app, workflows -> workflow, resources -> resource
-        type_singular = "app" if r_type == "apps" else ("workflow" if r_type == "workflows" else "resource")
+        type_singular = (
+            "app" if r_type == "apps" else ("workflow" if r_type == "workflows" else "resource")
+        )
         prev_ids = set(known_state.keys())
         deleted_ids = prev_ids - current_type_ids
         for del_id in deleted_ids:
@@ -368,7 +394,9 @@ def retool_source(
     if active_client is None:
         if not token or not token.strip():
             raise RetoolAuthError("Retool API token is required when no client is supplied")
-        active_client = RetoolClient(token=token.strip(), base_url=base_url, check_active=check_active)
+        active_client = RetoolClient(
+            token=token.strip(), base_url=base_url, check_active=check_active
+        )
 
     name = resource_name or ("retool_" + "_".join(sorted(selected)))
     stats: dict[str, int] = {}

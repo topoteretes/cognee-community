@@ -1,6 +1,7 @@
 """End-to-end verification through cognee: deleted Retool apps leave the memory graph."""
 
 import importlib
+
 import cognee
 import pytest
 import pytest_asyncio
@@ -9,6 +10,7 @@ from cognee.infrastructure.databases.vector.embeddings.LiteLLMEmbeddingEngine im
     LiteLLMEmbeddingEngine,
 )
 from cognee.infrastructure.llm import LLMGateway
+
 from cognee_community_connector_retool import retool_source
 
 try:
@@ -25,7 +27,9 @@ ALPHA_CORP = "AlphaLogistics"
 BETA_CORP = "BetaFintech"
 
 
-async def _mock_structured_output(text_input=None, system_prompt=None, response_model=str, **_kwargs):
+async def _mock_structured_output(
+    text_input=None, system_prompt=None, response_model=str, **_kwargs
+):
     from cognee.shared.data_models import KnowledgeGraph, SummarizedContent
     from cognee.shared.data_models import Node as KGNode
 
@@ -96,7 +100,9 @@ async def _sync(retool):
 @pytest.mark.asyncio
 async def test_deleting_app_forgets_its_graph_content(clean_environment, retool):
     retool.add_app("app_alpha", "Alpha Operations", f"{ALPHA_CORP} manages transport logistics.")
-    beta = retool.add_app("app_beta", "Beta Finance", f"{BETA_CORP} processes billing reconciliations.")
+    beta = retool.add_app(
+        "app_beta", "Beta Finance", f"{BETA_CORP} processes billing reconciliations."
+    )
 
     await _sync(retool)
     assert await _graph_has(ALPHA_CORP), "Alpha app entity should be present in memory graph"
@@ -106,4 +112,6 @@ async def test_deleting_app_forgets_its_graph_content(clean_environment, retool)
     await _sync(retool)
 
     assert await _graph_has(ALPHA_CORP), "Alpha app should remain in memory graph"
-    assert not await _graph_has(BETA_CORP), "Deleted Beta app entity must be forgotten from memory graph"
+    assert not await _graph_has(BETA_CORP), (
+        "Deleted Beta app entity must be forgotten from memory graph"
+    )

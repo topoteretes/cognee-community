@@ -2,6 +2,7 @@
 
 import httpx
 import pytest
+
 from cognee_community_connector_retool.retool import (
     RetoolAPIError,
     RetoolAuthError,
@@ -53,7 +54,9 @@ def test_client_401_raises_auth_error():
 
 def test_client_429_long_retry_after_raises_rate_limited():
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(429, headers={"Retry-After": "120"}, json={"error": "Too Many Requests"})
+        return httpx.Response(
+            429, headers={"Retry-After": "120"}, json={"error": "Too Many Requests"}
+        )
 
     transport = httpx.MockTransport(handler)
     client = RetoolClient(token="test_token")
@@ -182,8 +185,8 @@ def test_source_incremental_sync_skips_unchanged(retool):
 
 
 def test_source_forgets_deleted_items(retool):
-    app1 = retool.add_app("app_1", "Billing Portal")
-    app2 = retool.add_app("app_2", "Legacy Portal")
+    retool.add_app("app_1", "Billing Portal")
+    retool.add_app("app_2", "Legacy Portal")
 
     state = {}
     stats1 = {}

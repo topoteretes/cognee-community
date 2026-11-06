@@ -35,6 +35,7 @@ import os
 import cognee
 from cognee_community_connector_retool import retool_source
 
+
 async def main():
     token = os.environ["RETOOL_API_KEY"]
 
@@ -51,6 +52,7 @@ async def main():
         write_disposition="merge",
         max_rows_per_table=0,
     )
+
 
 if __name__ == "__main__":
     asyncio.run(main())

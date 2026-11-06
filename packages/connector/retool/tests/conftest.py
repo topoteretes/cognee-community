@@ -1,12 +1,14 @@
 """In-memory stand-in for the Retool API, shared by test modules."""
 
 import pytest
+
 from cognee_community_connector_retool.retool import (
     RetoolAPIError,
     RetoolAuthError,
     RetoolQuotaError,
     RetoolRateLimitedError,
 )
+
 
 class FakeRetool:
     """Implements ``get`` for Retool endpoints: /apps, /workflows, /resources."""
@@ -21,7 +23,15 @@ class FakeRetool:
         self.quota_exhausted = False
         self.server_error = False
 
-    def add_app(self, app_id: str, name: str, description: str = "", folder: str = "Root", components=None, queries=None):
+    def add_app(
+        self,
+        app_id: str,
+        name: str,
+        description: str = "",
+        folder: str = "Root",
+        components=None,
+        queries=None,
+    ):
         app = {
             "id": app_id,
             "name": name,
@@ -35,7 +45,9 @@ class FakeRetool:
         self.apps[app_id] = app
         return app
 
-    def add_workflow(self, wf_id: str, name: str, description: str = "", triggers=None, blocks=None):
+    def add_workflow(
+        self, wf_id: str, name: str, description: str = "", triggers=None, blocks=None
+    ):
         wf = {
             "id": wf_id,
             "name": name,
@@ -43,7 +55,8 @@ class FakeRetool:
             "folder": "Automations",
             "triggers": triggers or ["webhook"],
             "updatedAt": "2026-10-25T10:00:00.000Z",
-            "blocks": blocks or [{"name": "validatePayload", "type": "code"}, {"name": "insertDb", "type": "query"}],
+            "blocks": blocks
+            or [{"name": "validatePayload", "type": "code"}, {"name": "insertDb", "type": "query"}],
         }
         self.workflows[wf_id] = wf
         return wf
