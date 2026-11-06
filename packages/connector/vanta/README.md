@@ -34,6 +34,7 @@ import os
 import cognee
 from cognee_community_connector_vanta import vanta_source
 
+
 async def main():
     token = os.environ["VANTA_API_TOKEN"]
 
@@ -50,6 +51,7 @@ async def main():
         write_disposition="merge",
         max_rows_per_table=0,
     )
+
 
 if __name__ == "__main__":
     asyncio.run(main())

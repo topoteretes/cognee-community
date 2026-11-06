@@ -1,6 +1,7 @@
 """In-memory stand-in for the Vanta API, shared by test modules."""
 
 import pytest
+
 from cognee_community_connector_vanta.vanta import (
     VantaAPIError,
     VantaAuthError,
@@ -22,7 +23,14 @@ class FakeVanta:
         self.quota_exhausted = False
         self.server_error = False
 
-    def add_control(self, c_id: str, name: str, description: str = "", category: str = "Access Control", frameworks=None):
+    def add_control(
+        self,
+        c_id: str,
+        name: str,
+        description: str = "",
+        category: str = "Access Control",
+        frameworks=None,
+    ):
         ctrl = {
             "id": c_id,
             "name": name,
@@ -35,7 +43,9 @@ class FakeVanta:
         self.controls[c_id] = ctrl
         return ctrl
 
-    def add_policy(self, p_id: str, title: str, description: str = "", category: str = "Information Security"):
+    def add_policy(
+        self, p_id: str, title: str, description: str = "", category: str = "Information Security"
+    ):
         policy = {
             "id": p_id,
             "title": title,

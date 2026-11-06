@@ -1,6 +1,7 @@
 """End-to-end verification through cognee: deleted Vanta controls leave the memory graph."""
 
 import importlib
+
 import cognee
 import pytest
 import pytest_asyncio
@@ -9,6 +10,7 @@ from cognee.infrastructure.databases.vector.embeddings.LiteLLMEmbeddingEngine im
     LiteLLMEmbeddingEngine,
 )
 from cognee.infrastructure.llm import LLMGateway
+
 from cognee_community_connector_vanta import vanta_source
 
 try:
@@ -25,18 +27,29 @@ ALPHA_CTRL = "AlphaAccessControl"
 BETA_CTRL = "BetaDataRetention"
 
 
-async def _mock_structured_output(text_input=None, system_prompt=None, response_model=str, **_kwargs):
+async def _mock_structured_output(
+    text_input=None, system_prompt=None, response_model=str, **_kwargs
+):
     from cognee.shared.data_models import KnowledgeGraph, SummarizedContent
     from cognee.shared.data_models import Node as KGNode
 
     if response_model is str:
         return "Mocked Vanta insight."
     if response_model == SummarizedContent:
-        return SummarizedContent(summary="Vanta control summary", description="Vanta control description")
+        return SummarizedContent(
+            summary="Vanta control summary", description="Vanta control description"
+        )
     if response_model == KnowledgeGraph:
         name = next((t for t in (ALPHA_CTRL, BETA_CTRL) if text_input and t in text_input), None)
         nodes = (
-            [KGNode(id=name, name=name, type="ComplianceControl", description=f"{name} security requirement")]
+            [
+                KGNode(
+                    id=name,
+                    name=name,
+                    type="ComplianceControl",
+                    description=f"{name} security requirement",
+                )
+            ]
             if name
             else []
         )
@@ -95,8 +108,14 @@ async def _sync(vanta):
 
 @pytest.mark.asyncio
 async def test_deleting_control_forgets_its_graph_content(clean_environment, vanta):
-    vanta.add_control("ctrl_alpha", "Alpha Access Requirement", f"{ALPHA_CTRL} enforces multi-factor authentication.")
-    beta = vanta.add_control("ctrl_beta", "Beta Data Retention", f"{BETA_CTRL} enforces 90-day log retention.")
+    vanta.add_control(
+        "ctrl_alpha",
+        "Alpha Access Requirement",
+        f"{ALPHA_CTRL} enforces multi-factor authentication.",
+    )
+    beta = vanta.add_control(
+        "ctrl_beta", "Beta Data Retention", f"{BETA_CTRL} enforces 90-day log retention."
+    )
 
     await _sync(vanta)
     assert await _graph_has(ALPHA_CTRL), "Alpha control entity should be present in memory graph"
@@ -106,4 +125,6 @@ async def test_deleting_control_forgets_its_graph_content(clean_environment, van
     await _sync(vanta)
 
     assert await _graph_has(ALPHA_CTRL), "Alpha control should remain in memory graph"
-    assert not await _graph_has(BETA_CTRL), "Deleted Beta control entity must be forgotten from memory graph"
+    assert not await _graph_has(BETA_CTRL), (
+        "Deleted Beta control entity must be forgotten from memory graph"
+    )

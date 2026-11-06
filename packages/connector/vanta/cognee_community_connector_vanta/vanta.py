@@ -1,4 +1,4 @@
-"""Vanta connector for cognee: a ``dlt`` source that turns Vanta controls, policies, and vendors into memory.
+"""Vanta connector for cognee: a ``dlt`` source syncing controls, policies, and vendors.
 
 Sync Vanta compliance controls, governance policies, and vendor risk inventory into cognee,
 incrementally and with forget-on-delete. The resource is handed directly to
@@ -19,7 +19,7 @@ Design
 ------
 * **Rows** are flat ``{id, title, content, url, _deleted}``, one per entity
   (``vanta:control:<id>``, ``vanta:policy:<id>``, ``vanta:vendor:<id>``).
-* **Incremental.** Listings track high-watermark ``updated_at`` timestamps in ``dlt.current.resource_state()``.
+* **Incremental.** Listings track high-watermark timestamps in ``dlt.current.resource_state()``.
   Full details are fetched only for changed items, and rendered markdown is hashed with SHA-256
   to ensure unchanged content is not re-emitted.
 * **Forget-on-delete.** Entities deleted upstream emit hard-delete ``_deleted=True`` tombstones
@@ -28,9 +28,8 @@ Design
   windows, and sanitizes API tokens on all error paths.
 """
 
+import contextlib
 import hashlib
-import json
-import re
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -131,7 +130,9 @@ class VantaClient:
                 response = client.get(path, headers=headers, params=params)
             except Exception as err:
                 if attempt == max_retries:
-                    raise VantaAPIError(f"Transport error connecting to Vanta: {err.__class__.__name__}") from err
+                    raise VantaAPIError(
+                        f"Transport error connecting to Vanta: {err.__class__.__name__}"
+                    ) from err
                 time.sleep(backoff)
                 total_retry_wait += backoff
                 backoff *= 2.0
@@ -150,10 +151,8 @@ class VantaClient:
                 retry_after_hdr = response.headers.get("Retry-After")
                 wait = backoff
                 if retry_after_hdr:
-                    try:
+                    with contextlib.suppress(ValueError):
                         wait = max(wait, float(retry_after_hdr))
-                    except ValueError:
-                        pass
                 if wait > 60.0 or (total_retry_wait + wait) > 120.0:
                     raise VantaRateLimitedError(f"Vanta rate limit back-off too long: {wait}s")
                 time.sleep(wait)
@@ -163,7 +162,10 @@ class VantaClient:
 
             if response.status_code in (500, 502, 503, 504):
                 if attempt == max_retries:
-                    raise VantaAPIError(f"Vanta server error: HTTP {response.status_code}", status=response.status_code)
+                    raise VantaAPIError(
+                        f"Vanta server error: HTTP {response.status_code}",
+                        status=response.status_code,
+                    )
                 time.sleep(backoff)
                 total_retry_wait += backoff
                 backoff *= 2.0
@@ -196,8 +198,8 @@ def _render_control_markdown(control: dict[str, Any]) -> tuple[str, str, str]:
 - **ID**: {c_id}
 - **Category**: {category}
 - **Status**: {status}
-- **Compliance Frameworks**: {frameworks_str or 'None specified'}
-- **Last Updated**: {control.get('updated_at', 'unknown')}
+- **Compliance Frameworks**: {frameworks_str or "None specified"}
+- **Last Updated**: {control.get("updated_at", "unknown")}
 
 ## Description
 {description}
@@ -221,7 +223,7 @@ def _render_policy_markdown(policy: dict[str, Any]) -> tuple[str, str, str]:
 - **Category**: {category}
 - **Status**: {status}
 - **Renewal / Review Date**: {renewal_date}
-- **Last Updated**: {policy.get('updated_at', 'unknown')}
+- **Last Updated**: {policy.get("updated_at", "unknown")}
 
 ## Summary & Policy Provisions
 {body}
@@ -234,9 +236,13 @@ def _render_vendor_markdown(vendor: dict[str, Any]) -> tuple[str, str, str]:
     doc_id = f"vanta:vendor:{v_id}"
     name = vendor.get("name") or "Unnamed Vendor"
     risk_level = vendor.get("risk_level") or vendor.get("risk") or "Low"
-    service_category = vendor.get("service_category") or vendor.get("category") or "Cloud Infrastructure"
+    service_category = (
+        vendor.get("service_category") or vendor.get("category") or "Cloud Infrastructure"
+    )
     review_status = vendor.get("review_status") or vendor.get("status") or "Approved"
-    notes = vendor.get("security_notes") or vendor.get("description") or "No security notes recorded."
+    notes = (
+        vendor.get("security_notes") or vendor.get("description") or "No security notes recorded."
+    )
 
     title = f"# Vanta Vendor: {name}"
     content = f"""# Vanta Vendor: {name}
@@ -245,7 +251,7 @@ def _render_vendor_markdown(vendor: dict[str, Any]) -> tuple[str, str, str]:
 - **Risk Level**: {risk_level}
 - **Service Category**: {service_category}
 - **Security Review Status**: {review_status}
-- **Last Updated**: {vendor.get('updated_at', 'unknown')}
+- **Last Updated**: {vendor.get("updated_at", "unknown")}
 
 ## Security Assessment & Notes
 {notes}
@@ -312,7 +318,9 @@ def _iter_rows(
             else:
                 stats["unchanged"] += 1
 
-        type_singular = "control" if r_type == "controls" else ("policy" if r_type == "policies" else "vendor")
+        type_singular = (
+            "control" if r_type == "controls" else ("policy" if r_type == "policies" else "vendor")
+        )
         prev_ids = set(known_state.keys())
         deleted_ids = prev_ids - current_type_ids
         for del_id in deleted_ids:
@@ -348,7 +356,9 @@ def vanta_source(
     if active_client is None:
         if not api_token or not api_token.strip():
             raise VantaAuthError("Vanta API token is required when no client is supplied")
-        active_client = VantaClient(api_token=api_token.strip(), base_url=base_url, check_active=check_active)
+        active_client = VantaClient(
+            api_token=api_token.strip(), base_url=base_url, check_active=check_active
+        )
 
     name = resource_name or ("vanta_" + "_".join(sorted(selected)))
     stats: dict[str, int] = {}

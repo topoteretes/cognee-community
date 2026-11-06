@@ -2,6 +2,7 @@
 
 import httpx
 import pytest
+
 from cognee_community_connector_vanta.vanta import (
     VantaAPIError,
     VantaAuthError,
@@ -11,7 +12,6 @@ from cognee_community_connector_vanta.vanta import (
     _render_control_markdown,
     _render_policy_markdown,
     _render_vendor_markdown,
-    vanta_source,
 )
 
 
@@ -52,7 +52,9 @@ def test_client_401_raises_auth_error():
 
 def test_client_429_long_retry_after_raises_rate_limited():
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(429, headers={"Retry-After": "120"}, json={"error": "Rate limit exceeded"})
+        return httpx.Response(
+            429, headers={"Retry-After": "120"}, json={"error": "Rate limit exceeded"}
+        )
 
     transport = httpx.MockTransport(handler)
     client = VantaClient(api_token="test_token")
