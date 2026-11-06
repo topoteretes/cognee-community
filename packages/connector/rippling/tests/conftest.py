@@ -1,6 +1,7 @@
 """In-memory stand-in for the Rippling API, shared by test modules."""
 
 import pytest
+
 from cognee_community_connector_rippling.rippling import (
     RipplingAPIError,
     RipplingAuthError,
@@ -22,7 +23,14 @@ class FakeRippling:
         self.quota_exhausted = False
         self.server_error = False
 
-    def add_employee(self, e_id: str, name: str, description: str = "", title: str = "Software Engineer", department: str = "Engineering"):
+    def add_employee(
+        self,
+        e_id: str,
+        name: str,
+        description: str = "",
+        title: str = "Software Engineer",
+        department: str = "Engineering",
+    ):
         emp = {
             "id": e_id,
             "name": name,
@@ -50,7 +58,9 @@ class FakeRippling:
         self.departments[d_id] = dept
         return dept
 
-    def add_policy(self, p_id: str, title: str, description: str = "", category: str = "Remote Work"):
+    def add_policy(
+        self, p_id: str, title: str, description: str = "", category: str = "Remote Work"
+    ):
         policy = {
             "id": p_id,
             "title": title,

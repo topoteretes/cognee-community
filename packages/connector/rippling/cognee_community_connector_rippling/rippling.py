@@ -1,4 +1,4 @@
-"""Rippling connector for cognee: a ``dlt`` source that turns Rippling employees, departments, and policies into memory.
+"""Rippling connector for cognee: a ``dlt`` source syncing workforce, departments, and policies.
 
 Sync Rippling workforce directory, organizational departments, and company policies into cognee,
 incrementally and with forget-on-delete. The resource is handed directly to
@@ -19,7 +19,7 @@ Design
 ------
 * **Rows** are flat ``{id, title, content, url, _deleted}``, one per entity
   (``rippling:employee:<id>``, ``rippling:department:<id>``, ``rippling:policy:<id>``).
-* **Incremental.** Listings track high-watermark ``updated_at`` timestamps in ``dlt.current.resource_state()``.
+* **Incremental.** Listings track high-watermark timestamps in ``dlt.current.resource_state()``.
   Full details are fetched only for changed items, and rendered markdown is hashed with SHA-256
   to ensure unchanged content is not re-emitted.
 * **Forget-on-delete.** Entities deleted upstream emit hard-delete ``_deleted=True`` tombstones
@@ -28,9 +28,8 @@ Design
   windows, and sanitizes API tokens on all error paths.
 """
 
+import contextlib
 import hashlib
-import json
-import re
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -131,7 +130,9 @@ class RipplingClient:
                 response = client.get(path, headers=headers, params=params)
             except Exception as err:
                 if attempt == max_retries:
-                    raise RipplingAPIError(f"Transport error connecting to Rippling: {err.__class__.__name__}") from err
+                    raise RipplingAPIError(
+                        f"Transport error connecting to Rippling: {err.__class__.__name__}"
+                    ) from err
                 time.sleep(backoff)
                 total_retry_wait += backoff
                 backoff *= 2.0
@@ -150,12 +151,12 @@ class RipplingClient:
                 retry_after_hdr = response.headers.get("Retry-After")
                 wait = backoff
                 if retry_after_hdr:
-                    try:
+                    with contextlib.suppress(ValueError):
                         wait = max(wait, float(retry_after_hdr))
-                    except ValueError:
-                        pass
                 if wait > 60.0 or (total_retry_wait + wait) > 120.0:
-                    raise RipplingRateLimitedError(f"Rippling rate limit back-off too long: {wait}s")
+                    raise RipplingRateLimitedError(
+                        f"Rippling rate limit back-off too long: {wait}s"
+                    )
                 time.sleep(wait)
                 total_retry_wait += wait
                 backoff = max(backoff * 2.0, wait * 1.5)
@@ -163,7 +164,10 @@ class RipplingClient:
 
             if response.status_code in (500, 502, 503, 504):
                 if attempt == max_retries:
-                    raise RipplingAPIError(f"Rippling server error: HTTP {response.status_code}", status=response.status_code)
+                    raise RipplingAPIError(
+                        f"Rippling server error: HTTP {response.status_code}",
+                        status=response.status_code,
+                    )
                 time.sleep(backoff)
                 total_retry_wait += backoff
                 backoff *= 2.0
@@ -180,7 +184,11 @@ class RipplingClient:
 def _render_employee_markdown(employee: dict[str, Any]) -> tuple[str, str, str]:
     e_id = str(employee.get("id") or "unknown")
     doc_id = f"rippling:employee:{e_id}"
-    name = employee.get("name") or f"{employee.get('first_name', '')} {employee.get('last_name', '')}".strip() or "Unnamed Employee"
+    name = (
+        employee.get("name")
+        or f"{employee.get('first_name', '')} {employee.get('last_name', '')}".strip()
+        or "Unnamed Employee"
+    )
     title_text = employee.get("title") or employee.get("role") or "Team Member"
     department = employee.get("department") or "Unassigned"
     manager = employee.get("manager") or "None"
@@ -197,11 +205,11 @@ def _render_employee_markdown(employee: dict[str, Any]) -> tuple[str, str, str]:
 - **Manager**: {manager}
 - **Work Email**: {email}
 - **Employment Status**: {status}
-- **Start Date**: {employee.get('start_date', 'Unknown')}
-- **Last Updated**: {employee.get('updated_at', 'unknown')}
+- **Start Date**: {employee.get("start_date", "Unknown")}
+- **Last Updated**: {employee.get("updated_at", "unknown")}
 
 ## Summary & Responsibilities
-{description or 'No employee summary available.'}
+{description or "No employee summary available."}
 """
     return doc_id, title, content
 
@@ -220,10 +228,10 @@ def _render_department_markdown(department: dict[str, Any]) -> tuple[str, str, s
 - **Department ID**: {d_id}
 - **Parent Department**: {parent}
 - **Department Head**: {head}
-- **Last Updated**: {department.get('updated_at', 'unknown')}
+- **Last Updated**: {department.get("updated_at", "unknown")}
 
 ## Overview
-{description or 'No department description provided.'}
+{description or "No department description provided."}
 """
     return doc_id, title, content
 
@@ -242,7 +250,7 @@ def _render_policy_markdown(policy: dict[str, Any]) -> tuple[str, str, str]:
 - **Policy ID**: {p_id}
 - **Category**: {category}
 - **Effective Date**: {effective_date}
-- **Last Updated**: {policy.get('updated_at', 'unknown')}
+- **Last Updated**: {policy.get("updated_at", "unknown")}
 
 ## Provisions & Guidelines
 {body}
@@ -309,7 +317,11 @@ def _iter_rows(
             else:
                 stats["unchanged"] += 1
 
-        type_singular = "employee" if r_type == "employees" else ("department" if r_type == "departments" else "policy")
+        type_singular = (
+            "employee"
+            if r_type == "employees"
+            else ("department" if r_type == "departments" else "policy")
+        )
         prev_ids = set(known_state.keys())
         deleted_ids = prev_ids - current_type_ids
         for del_id in deleted_ids:
@@ -339,13 +351,17 @@ def rippling_source(
     selected = tuple(resources or SUPPORTED_RESOURCES)
     for r in selected:
         if r not in SUPPORTED_RESOURCES:
-            raise ValueError(f"Unknown Rippling resource '{r}'. Must be one of {SUPPORTED_RESOURCES}")
+            raise ValueError(
+                f"Unknown Rippling resource '{r}'. Must be one of {SUPPORTED_RESOURCES}"
+            )
 
     active_client = client or service
     if active_client is None:
         if not api_token or not api_token.strip():
             raise RipplingAuthError("Rippling API token is required when no client is supplied")
-        active_client = RipplingClient(api_token=api_token.strip(), base_url=base_url, check_active=check_active)
+        active_client = RipplingClient(
+            api_token=api_token.strip(), base_url=base_url, check_active=check_active
+        )
 
     name = resource_name or ("rippling_" + "_".join(sorted(selected)))
     stats: dict[str, int] = {}

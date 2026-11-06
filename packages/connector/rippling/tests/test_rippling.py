@@ -2,6 +2,7 @@
 
 import httpx
 import pytest
+
 from cognee_community_connector_rippling.rippling import (
     RipplingAPIError,
     RipplingAuthError,
@@ -11,7 +12,6 @@ from cognee_community_connector_rippling.rippling import (
     _render_department_markdown,
     _render_employee_markdown,
     _render_policy_markdown,
-    rippling_source,
 )
 
 
@@ -27,7 +27,9 @@ def test_client_sends_bearer_token():
 
     transport = httpx.MockTransport(handler)
     client = RipplingClient(api_token="rippling_test_token")
-    client._client = httpx.Client(transport=transport, base_url="https://api.rippling.com/platform/api")
+    client._client = httpx.Client(
+        transport=transport, base_url="https://api.rippling.com/platform/api"
+    )
     client._owns_client = True
 
     data = client.get("/employees")
@@ -42,7 +44,9 @@ def test_client_401_raises_auth_error():
 
     transport = httpx.MockTransport(handler)
     client = RipplingClient(api_token="invalid_token")
-    client._client = httpx.Client(transport=transport, base_url="https://api.rippling.com/platform/api")
+    client._client = httpx.Client(
+        transport=transport, base_url="https://api.rippling.com/platform/api"
+    )
     client._owns_client = True
 
     with pytest.raises(RipplingAuthError):
@@ -52,11 +56,15 @@ def test_client_401_raises_auth_error():
 
 def test_client_429_long_retry_after_raises_rate_limited():
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(429, headers={"Retry-After": "120"}, json={"error": "Rate limit exceeded"})
+        return httpx.Response(
+            429, headers={"Retry-After": "120"}, json={"error": "Rate limit exceeded"}
+        )
 
     transport = httpx.MockTransport(handler)
     client = RipplingClient(api_token="test_token")
-    client._client = httpx.Client(transport=transport, base_url="https://api.rippling.com/platform/api")
+    client._client = httpx.Client(
+        transport=transport, base_url="https://api.rippling.com/platform/api"
+    )
     client._owns_client = True
 
     with pytest.raises(RipplingRateLimitedError):
@@ -124,7 +132,9 @@ def test_render_policy_markdown():
         "title": "Global Remote Work Policy",
         "category": "Workplace Guidelines",
         "effective_date": "2026-01-01",
-        "description": "Guidelines on home office stipends, equipment, and core collaboration hours.",
+        "description": (
+            "Guidelines on home office stipends, equipment, and core collaboration hours."
+        ),
         "updated_at": "2026-10-25T12:00:00Z",
     }
     doc_id, title, content = _render_policy_markdown(policy)

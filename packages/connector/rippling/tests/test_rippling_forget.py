@@ -1,6 +1,7 @@
 """End-to-end verification through cognee: deleted Rippling employees leave the memory graph."""
 
 import importlib
+
 import cognee
 import pytest
 import pytest_asyncio
@@ -9,6 +10,7 @@ from cognee.infrastructure.databases.vector.embeddings.LiteLLMEmbeddingEngine im
     LiteLLMEmbeddingEngine,
 )
 from cognee.infrastructure.llm import LLMGateway
+
 from cognee_community_connector_rippling import rippling_source
 
 try:
@@ -25,14 +27,18 @@ ALPHA_EMP = "AlphaDeveloper"
 BETA_EMP = "BetaDesigner"
 
 
-async def _mock_structured_output(text_input=None, system_prompt=None, response_model=str, **_kwargs):
+async def _mock_structured_output(
+    text_input=None, system_prompt=None, response_model=str, **_kwargs
+):
     from cognee.shared.data_models import KnowledgeGraph, SummarizedContent
     from cognee.shared.data_models import Node as KGNode
 
     if response_model is str:
         return "Mocked Rippling insight."
     if response_model == SummarizedContent:
-        return SummarizedContent(summary="Rippling employee summary", description="Rippling employee description")
+        return SummarizedContent(
+            summary="Rippling employee summary", description="Rippling employee description"
+        )
     if response_model == KnowledgeGraph:
         name = next((t for t in (ALPHA_EMP, BETA_EMP) if text_input and t in text_input), None)
         nodes = (
@@ -95,8 +101,12 @@ async def _sync(rippling):
 
 @pytest.mark.asyncio
 async def test_deleting_employee_forgets_its_graph_content(clean_environment, rippling):
-    rippling.add_employee("emp_alpha", "Alpha Developer", f"{ALPHA_EMP} builds backend data engines.")
-    beta = rippling.add_employee("emp_beta", "Beta Designer", f"{BETA_EMP} creates UI design systems.")
+    rippling.add_employee(
+        "emp_alpha", "Alpha Developer", f"{ALPHA_EMP} builds backend data engines."
+    )
+    beta = rippling.add_employee(
+        "emp_beta", "Beta Designer", f"{BETA_EMP} creates UI design systems."
+    )
 
     await _sync(rippling)
     assert await _graph_has(ALPHA_EMP), "Alpha employee entity should be present in memory graph"
@@ -106,4 +116,6 @@ async def test_deleting_employee_forgets_its_graph_content(clean_environment, ri
     await _sync(rippling)
 
     assert await _graph_has(ALPHA_EMP), "Alpha employee should remain in memory graph"
-    assert not await _graph_has(BETA_EMP), "Deleted Beta employee entity must be forgotten from memory graph"
+    assert not await _graph_has(BETA_EMP), (
+        "Deleted Beta employee entity must be forgotten from memory graph"
+    )
