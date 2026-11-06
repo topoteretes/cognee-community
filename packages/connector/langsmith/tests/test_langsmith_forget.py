@@ -1,6 +1,7 @@
 """End-to-end verification through cognee: deleted LangSmith prompts leave the memory graph."""
 
 import importlib
+
 import cognee
 import pytest
 import pytest_asyncio
@@ -9,6 +10,7 @@ from cognee.infrastructure.databases.vector.embeddings.LiteLLMEmbeddingEngine im
     LiteLLMEmbeddingEngine,
 )
 from cognee.infrastructure.llm import LLMGateway
+
 from cognee_community_connector_langsmith import langsmith_source
 
 try:
@@ -25,16 +27,22 @@ ALPHA_PROMPT = "AlphaPromptExtractor"
 BETA_PROMPT = "BetaPromptClassifier"
 
 
-async def _mock_structured_output(text_input=None, system_prompt=None, response_model=str, **_kwargs):
+async def _mock_structured_output(
+    text_input=None, system_prompt=None, response_model=str, **_kwargs
+):
     from cognee.shared.data_models import KnowledgeGraph, SummarizedContent
     from cognee.shared.data_models import Node as KGNode
 
     if response_model is str:
         return "Mocked LangSmith insight."
     if response_model == SummarizedContent:
-        return SummarizedContent(summary="LangSmith prompt summary", description="LangSmith prompt description")
+        return SummarizedContent(
+            summary="LangSmith prompt summary", description="LangSmith prompt description"
+        )
     if response_model == KnowledgeGraph:
-        name = next((t for t in (ALPHA_PROMPT, BETA_PROMPT) if text_input and t in text_input), None)
+        name = next(
+            (t for t in (ALPHA_PROMPT, BETA_PROMPT) if text_input and t in text_input), None
+        )
         nodes = (
             [KGNode(id=name, name=name, type="Prompt", description=f"{name} template")]
             if name
@@ -95,8 +103,12 @@ async def _sync(langsmith):
 
 @pytest.mark.asyncio
 async def test_deleting_prompt_forgets_its_graph_content(clean_environment, langsmith):
-    langsmith.add_prompt("alpha_handle", "Extract JSON from text", f"{ALPHA_PROMPT} handles ingestion extraction.")
-    beta = langsmith.add_prompt("beta_handle", "Classify incoming intent", f"{BETA_PROMPT} classifies queries.")
+    langsmith.add_prompt(
+        "alpha_handle", "Extract JSON from text", f"{ALPHA_PROMPT} handles ingestion extraction."
+    )
+    beta = langsmith.add_prompt(
+        "beta_handle", "Classify incoming intent", f"{BETA_PROMPT} classifies queries."
+    )
 
     await _sync(langsmith)
     assert await _graph_has(ALPHA_PROMPT), "Alpha prompt entity should be present in memory graph"
@@ -106,4 +118,6 @@ async def test_deleting_prompt_forgets_its_graph_content(clean_environment, lang
     await _sync(langsmith)
 
     assert await _graph_has(ALPHA_PROMPT), "Alpha prompt should remain in memory graph"
-    assert not await _graph_has(BETA_PROMPT), "Deleted Beta prompt entity must be forgotten from memory graph"
+    assert not await _graph_has(BETA_PROMPT), (
+        "Deleted Beta prompt entity must be forgotten from memory graph"
+    )

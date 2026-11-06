@@ -1,7 +1,10 @@
 import asyncio
 import os
+
 import cognee
+
 from cognee_community_connector_langsmith import langsmith_source
+
 
 async def main():
     api_key = os.environ.get("LANGSMITH_API_KEY", "mock_langsmith_key")
@@ -21,6 +24,7 @@ async def main():
         max_rows_per_table=0,
     )
     print("LangSmith prompts and datasets indexed into Cognee successfully!")
+
 
 if __name__ == "__main__":
     asyncio.run(main())

@@ -1,4 +1,4 @@
-"""LangSmith connector for cognee: a ``dlt`` source that turns LangSmith prompts, datasets, and traces into memory.
+"""LangSmith connector for cognee: a ``dlt`` source syncing prompts, datasets, and traces.
 
 Sync LangSmith prompt templates, evaluation datasets, and run feedback into cognee,
 incrementally and with forget-on-delete. The resource is handed directly to
@@ -18,8 +18,8 @@ incrementally and with forget-on-delete. The resource is handed directly to
 Design
 ------
 * **Rows** are flat ``{id, title, content, url, _deleted}``, one per entity
-  (``langsmith:prompt:<prompt handle>``, ``langsmith:dataset:<dataset id>``, ``langsmith:run:<run id>``).
-* **Incremental.** Listings track high-watermark ``updated_at`` timestamps in ``dlt.current.resource_state()``.
+  (``langsmith:prompt:<handle>``, ``langsmith:dataset:<id>``, ``langsmith:run:<id>``).
+* **Incremental.** Listings track high-watermark timestamps in ``dlt.current.resource_state()``.
   Full details are fetched only for changed items, and rendered markdown is hashed with SHA-256
   to ensure unchanged content is not re-emitted.
 * **Forget-on-delete.** Entities deleted upstream emit hard-delete ``_deleted=True`` tombstones
@@ -29,8 +29,6 @@ Design
 """
 
 import hashlib
-import json
-import re
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -131,7 +129,9 @@ class LangSmithClient:
                 response = client.get(path, headers=headers, params=params)
             except Exception as err:
                 if attempt == max_retries:
-                    raise LangSmithAPIError(f"Transport error connecting to LangSmith: {err.__class__.__name__}") from err
+                    raise LangSmithAPIError(
+                        f"Transport error connecting to LangSmith: {err.__class__.__name__}"
+                    ) from err
                 time.sleep(backoff)
                 total_retry_wait += backoff
                 backoff *= 2.0
@@ -155,11 +155,15 @@ class LangSmithClient:
                         if 0 <= parsed_wait <= 60.0:
                             wait_sec = parsed_wait
                         elif parsed_wait > 60.0:
-                            raise LangSmithRateLimitedError("LangSmith Retry-After header exceeds 60s")
+                            raise LangSmithRateLimitedError(
+                                "LangSmith Retry-After header exceeds 60s"
+                            )
                     except ValueError:
                         pass
                 if attempt == max_retries or (total_retry_wait + wait_sec) > 300.0:
-                    raise LangSmithRateLimitedError("LangSmith rate limit exceeded after retries (HTTP 429)")
+                    raise LangSmithRateLimitedError(
+                        "LangSmith rate limit exceeded after retries (HTTP 429)"
+                    )
                 time.sleep(wait_sec)
                 total_retry_wait += wait_sec
                 backoff *= 2.0
@@ -167,13 +171,18 @@ class LangSmithClient:
 
             if response.status_code in (500, 502, 503, 504):
                 if attempt == max_retries:
-                    raise LangSmithAPIError(f"LangSmith server error: HTTP {response.status_code}", status=response.status_code)
+                    raise LangSmithAPIError(
+                        f"LangSmith server error: HTTP {response.status_code}",
+                        status=response.status_code,
+                    )
                 time.sleep(backoff)
                 total_retry_wait += backoff
                 backoff *= 2.0
                 continue
 
-            raise LangSmithAPIError(f"LangSmith API error: HTTP {response.status_code}", status=response.status_code)
+            raise LangSmithAPIError(
+                f"LangSmith API error: HTTP {response.status_code}", status=response.status_code
+            )
 
 
 def _render_prompt_markdown(prompt: dict[str, Any]) -> tuple[str, str, str]:
@@ -239,6 +248,7 @@ def _iter_rows(
 ) -> Iterator[dict[str, Any]]:
     if state is None:
         import dlt
+
         state = dlt.current.resource_state() if dlt else {}
     if stats is None:
         stats = {}
@@ -257,7 +267,11 @@ def _iter_rows(
             raise LangSmithAPIError(f"Failed to query /{r_type}: {err}") from err
 
         if not isinstance(listing, list):
-            if isinstance(listing, dict) and "data" in listing and isinstance(listing["data"], list):
+            if (
+                isinstance(listing, dict)
+                and "data" in listing
+                and isinstance(listing["data"], list)
+            ):
                 listing = listing["data"]
             else:
                 raise LangSmithAPIError(f"LangSmith listing for /{r_type} did not return a list")
@@ -300,7 +314,9 @@ def _iter_rows(
             else:
                 stats["unchanged"] += 1
 
-        type_singular = "prompt" if r_type == "prompts" else ("dataset" if r_type == "datasets" else "run")
+        type_singular = (
+            "prompt" if r_type == "prompts" else ("dataset" if r_type == "datasets" else "run")
+        )
         prev_ids = set(known_state.keys())
         deleted_ids = prev_ids - current_type_ids
         for del_id in deleted_ids:
@@ -330,13 +346,17 @@ def langsmith_source(
     selected = tuple(resources or SUPPORTED_RESOURCES)
     for r in selected:
         if r not in SUPPORTED_RESOURCES:
-            raise ValueError(f"Unknown LangSmith resource '{r}'. Must be one of {SUPPORTED_RESOURCES}")
+            raise ValueError(
+                f"Unknown LangSmith resource '{r}'. Must be one of {SUPPORTED_RESOURCES}"
+            )
 
     active_client = client or service
     if active_client is None:
         if not api_key or not api_key.strip():
             raise LangSmithAuthError("LangSmith API key is required when no client is supplied")
-        active_client = LangSmithClient(api_key=api_key.strip(), base_url=base_url, check_active=check_active)
+        active_client = LangSmithClient(
+            api_key=api_key.strip(), base_url=base_url, check_active=check_active
+        )
 
     name = resource_name or ("langsmith_" + "_".join(sorted(selected)))
     stats: dict[str, int] = {}

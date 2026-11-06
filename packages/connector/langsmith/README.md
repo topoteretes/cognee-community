@@ -34,6 +34,7 @@ import os
 import cognee
 from cognee_community_connector_langsmith import langsmith_source
 
+
 async def main():
     api_key = os.environ["LANGSMITH_API_KEY"]
 
@@ -50,6 +51,7 @@ async def main():
         write_disposition="merge",
         max_rows_per_table=0,
     )
+
 
 if __name__ == "__main__":
     asyncio.run(main())
