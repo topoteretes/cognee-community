@@ -100,8 +100,8 @@ def clay_source(
 | :--- | :--- | :--- | :--- |
 | `table_id` | `str \| None` | `None` | Target table ID. Falls back to `CLAY_TABLE_ID`. |
 | `api_key` | `str \| Callable[[], str] \| None` | `None` | API key or token provider callable. Falls back to `CLAY_API_KEY`. Never logged. |
-| `fields` | `list[str] \| None` | `None` | Columns to include. Formatted into the `query.select` payload. If omitted, all columns are queried and a warning is logged. |
-| `primary_key` | `str \| None` | `None` | Column to use as business identifier. Takes precedence over system IDs; falls back to system record ID if absent/null, or deterministic hash. |
+| `fields` | `list[str] \| None` | `None` | Columns to include (1–20 column names). Formatted into the `query.select` payload. If omitted, all columns are queried and a warning is logged. Empty lists are rejected. |
+| `primary_key` | `str \| None` | `None` | Column to use as unique record identifier (e.g., `primary_key="domain"`). Takes precedence over system IDs. Required when Clay table rows lack an inherent `record_id`/`id` column to prevent duplicate entities in the Knowledge Graph. |
 | `write_disposition` | `str` | `"replace"` | `dlt` sync disposition. `"replace"` performs full table snapshot sync. |
 | `limit` | `int` | `100` | Rows requested per page (1–100). |
 | `base_url` | `str` | `"https://api.clay.com/public/v0"` | Base URL for Clay public API. |

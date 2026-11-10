@@ -166,7 +166,7 @@ def test_fields_filter_payload(sample_table_id: str, sample_api_key: str) -> Non
 
 
 def test_primary_key_strategies(sample_table_id: str) -> None:
-    """Test system record ID, custom business column, and deterministic hash fallback."""
+    """Test system record ID, custom business column, and strict validation when missing."""
     # 1. System ID present
     row_with_sys_id = {"record_id": "rec_999", "name": "Test"}
     norm1 = _normalize_clay_row(row_with_sys_id, table_id=sample_table_id)
@@ -185,7 +185,7 @@ def test_primary_key_strategies(sample_table_id: str) -> None:
     )
     assert norm2["id"] == f"clay:{sample_table_id}:alpha.io"
 
-    # 3. Custom business column with null value falls back to system record_id
+    # 3. Custom business column with null value falls back to system record_id if available
     row_with_null_pk = {
         "record_id": "rec_999",
         "domain": None,
@@ -198,15 +198,19 @@ def test_primary_key_strategies(sample_table_id: str) -> None:
     )
     assert norm_fallback["id"] == f"clay:{sample_table_id}:rec_999"
 
-    # 3. Deterministic hash fallback when neither is available
+    # 4. Row with neither system ID nor primary_key raises ValueError
     row_plain = {"company_name": "No ID Co"}
-    norm3 = _normalize_clay_row(row_plain, table_id=sample_table_id)
-    assert norm3["id"].startswith(f"clay:{sample_table_id}:")
-    assert len(norm3["id"]) > len(f"clay:{sample_table_id}:")
+    with pytest.raises(ValueError, match="has no stable system record identifier"):
+        _normalize_clay_row(row_plain, table_id=sample_table_id)
 
-    # Hash must be deterministic for identical content
-    norm3_dup = _normalize_clay_row(row_plain, table_id=sample_table_id)
-    assert norm3["id"] == norm3_dup["id"]
+    # 5. Row with designated primary_key but null value and no system ID raises ValueError
+    row_no_id_null_pk = {"company_name": "No ID Co", "domain": None}
+    with pytest.raises(ValueError, match="missing designated primary_key"):
+        _normalize_clay_row(
+            row_no_id_null_pk,
+            table_id=sample_table_id,
+            primary_key_field="domain",
+        )
 
 
 def test_empty_table_ingestion(sample_table_id: str, sample_api_key: str) -> None:
@@ -255,31 +259,38 @@ def test_api_key_security(sample_table_id: str, sample_api_key: str) -> None:
     assert sample_api_key not in res_repr
 
 
-def test_primary_key_null_and_blank_fallback(sample_table_id: str) -> None:
-    """Verify that null/empty/blank business keys do NOT collide into 'null'."""
+def test_primary_key_null_and_blank_validation(sample_table_id: str) -> None:
+    """Verify that null/empty/blank business keys without system ID raise ValueError."""
     row_a = {"company_name": "Alpha Corp", "domain": None}
-    row_b = {"company_name": "Beta Corp", "domain": None}
+    row_b = {"company_name": "Beta Corp", "domain": ""}
     row_c = {"company_name": "Gamma Corp", "domain": "   "}
 
-    norm_a = _normalize_clay_row(row_a, table_id=sample_table_id, primary_key_field="domain")
-    norm_b = _normalize_clay_row(row_b, table_id=sample_table_id, primary_key_field="domain")
-    norm_c = _normalize_clay_row(row_c, table_id=sample_table_id, primary_key_field="domain")
+    for invalid_row in (row_a, row_b, row_c):
+        with pytest.raises(ValueError, match="missing designated primary_key"):
+            _normalize_clay_row(
+                invalid_row,
+                table_id=sample_table_id,
+                primary_key_field="domain",
+            )
 
-    # None of them should be "clay:table:null"
-    assert norm_a["id"] != f"clay:{sample_table_id}:null"
-    assert norm_b["id"] != f"clay:{sample_table_id}:null"
-    assert norm_c["id"] != f"clay:{sample_table_id}:null"
-    assert not norm_c["id"].endswith(":")
+    # When system ID is present, null/blank business key falls back to system ID safely
+    row_with_fallback = {"company_name": "Delta Corp", "domain": "  ", "record_id": "rec_delta"}
+    norm = _normalize_clay_row(
+        row_with_fallback,
+        table_id=sample_table_id,
+        primary_key_field="domain",
+    )
+    assert norm["id"] == f"clay:{sample_table_id}:rec_delta"
 
-    # Distinct rows with null domain must NOT collide
-    assert norm_a["id"] != norm_b["id"]
-    assert norm_a["id"] != norm_c["id"]
+    # Blank primary_key parameter in clay_source must fail fast
+    with pytest.raises(ValueError, match="primary_key cannot be an empty or blank string"):
+        clay_source(table_id=sample_table_id, api_key="secret", primary_key="   ")
 
 
 def test_structured_cell_system_id(sample_table_id: str) -> None:
     """Verify system IDs wrapped in structured cell objects are extracted cleanly."""
     row_wrapped_record_id = {
-        "record_id": {"value": "rec_struct_001", "status": "successful"},
+        "record_id": {"value": "rec_struct_001", "status": "success"},
         "company_name": "Delta Co",
     }
     norm1 = _normalize_clay_row(row_wrapped_record_id, table_id=sample_table_id)
@@ -288,7 +299,7 @@ def test_structured_cell_system_id(sample_table_id: str) -> None:
 
     row_field_level_id = {
         "fields": {
-            "id": {"value": "rec_struct_002", "status": "successful"},
+            "id": {"value": "rec_struct_002", "status": "success"},
             "company_name": "Epsilon Inc",
         }
     }
@@ -342,19 +353,100 @@ def test_http_429_rate_limit(sample_table_id: str, sample_api_key: str) -> None:
             list(resource)
 
 
-def test_extract_cell_value_protects_nested_dictionaries() -> None:
-    """Verify that general dict columns with 'status' are not wiped out."""
+def test_extract_cell_value_all_statuses() -> None:
+    """Verify that all documented Clay cell statuses are extracted or unwrapped correctly."""
+    # 1. Success status
+    assert _extract_cell_value({"status": "success", "value": "Acme"}) == "Acme"
+    assert _extract_cell_value({"status": "successful", "value": "Acme"}) == "Acme"
+    assert _extract_cell_value({"status": "success", "value": 0}) == 0
+    assert _extract_cell_value({"status": "success", "value": False}) is False
+
+    # 2. Empty status (evaluated but no value)
+    assert _extract_cell_value({"status": "empty"}) is None
+    assert _extract_cell_value({"status": "empty", "value": None}) is None
+
+    # 3. Error status (enrichment or calculation failed)
+    assert _extract_cell_value({"status": "error", "error": "Provider timeout"}) is None
+    assert _extract_cell_value({"status": "error", "error": "Not found", "type": "lookup"}) is None
+
+    # 4. Running status (enrichment in progress)
+    assert _extract_cell_value({"status": "running"}) is None
+
+    # 5. Non-cell dictionary preserving arbitrary fields
     arbitrary_dict = {"status": "active", "priority": "high", "score": 95}
     assert _extract_cell_value(arbitrary_dict) == arbitrary_dict
 
-    clay_empty_cell = {"status": "empty"}
-    assert _extract_cell_value(clay_empty_cell) is None
+    # 6. Primitive values pass through
+    assert _extract_cell_value("simple_string") == "simple_string"
+    assert _extract_cell_value(42) == 42
+    assert _extract_cell_value(None) is None
 
-    clay_val_cell = {"value": "Acme", "status": "successful"}
-    assert _extract_cell_value(clay_val_cell) == "Acme"
 
-    clay_zero_cell = {"value": 0, "status": "successful"}
-    assert _extract_cell_value(clay_zero_cell) == 0
+def test_cell_statuses_ingestion(
+    sample_table_id: str,
+    sample_api_key: str,
+    mock_cell_statuses_data: dict[str, Any],
+) -> None:
+    """Test full table ingestion with rows containing success, empty, error, and running cells."""
+
+    def mock_send(self, request, **kwargs):
+        return _make_mock_response(200, mock_cell_statuses_data)
+
+    with patch("requests.adapters.HTTPAdapter.send", new=mock_send):
+        resource = clay_source(table_id=sample_table_id, api_key=sample_api_key)
+        rows = list(resource)
+
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["id"] == f"clay:{sample_table_id}:rec_multi_status_01"
+        assert row["company_name"] == "Status Corp"
+        assert row["domain"] == "status.io"
+        assert row["funding"] is None  # empty status
+        assert row["enrichment"] is None  # error status
+        assert row["verified"] is None  # running status
+
+
+def test_exceed_max_fields_raises_error(sample_table_id: str, sample_api_key: str) -> None:
+    """Test that specifying more than 20 fields raises ValueError locally."""
+    too_many_fields = [f"Field_{i}" for i in range(21)]
+    with pytest.raises(ValueError, match="allows a maximum of 20 selected fields"):
+        clay_source(
+            table_id=sample_table_id,
+            api_key=sample_api_key,
+            fields=too_many_fields,
+        )
+
+
+def test_empty_fields_list_rejected(sample_table_id: str, sample_api_key: str) -> None:
+    """Test that passing an empty fields list fails fast instead of syncing all columns."""
+    with pytest.raises(ValueError, match="fields cannot be an empty list"):
+        clay_source(
+            table_id=sample_table_id,
+            api_key=sample_api_key,
+            fields=[],
+        )
+
+    with pytest.raises(ValueError, match="fields cannot be an empty list"):
+        clay_source(
+            table_id=sample_table_id,
+            api_key=sample_api_key,
+            fields=["   ", ""],
+        )
+
+
+def test_http_422_unprocessable_entity(sample_table_id: str, sample_api_key: str) -> None:
+    """Test HTTP 422 response raises descriptive RuntimeError for invalid payload or schema."""
+
+    def mock_send(self, request, **kwargs):
+        return _make_mock_response(422, {"message": "Invalid field: NonExistentColumn"})
+
+    with patch("requests.adapters.HTTPAdapter.send", new=mock_send):
+        resource = clay_source(table_id=sample_table_id, api_key=sample_api_key)
+        with pytest.raises(
+            Exception,
+            match=r"Clay API unprocessable entity \(HTTP 422\): Invalid field: NonExistentColumn",
+        ):
+            list(resource)
 
 
 def test_api_key_callable_and_whitespace_sanitization(

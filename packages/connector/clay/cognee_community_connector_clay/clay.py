@@ -33,17 +33,17 @@ Design
   (e.g. ``{"status": "successful", "value": "Acme Corp"}``). The connector
   normalizes these into flat, clean dictionaries.
 * **Primary Key & Identity** — If a system record ID is returned in the response,
-  it is utilized. Alternatively, callers can designate a unique business key
-  column (e.g. ``primary_key="domain"``), with fallback to a deterministic content
-  hash. IDs are namespaced as ``clay:<table_id>:<row_id>``.
+  it is utilized. Alternatively, callers designate a unique business key column
+  (e.g. ``primary_key="domain"``). Because Clay table rows do not provide stable
+  record IDs by default, a stable identifier is required to ensure field updates do
+  not generate duplicate or stale entities in the Knowledge Graph. IDs are
+  namespaced as ``clay:<table_id>:<row_id>``.
 * **Data Licensing & Selective Sync** — Because Clay tables often contain data
   enriched by third-party providers under strict redistribution terms, callers
   are encouraged to specify the ``fields`` list to sync only their own first-party
   customer data.
 """
 
-import hashlib
-import json
 import os
 import re
 from collections.abc import Callable
@@ -66,6 +66,7 @@ except ImportError:
     logger = logging.getLogger("clay_connector")
 
 DEFAULT_BASE_URL = "https://api.clay.com/public/v0"
+MAX_CLAY_FIELDS = 20
 
 
 def _normalize_field_name(field_name: str) -> str:
@@ -75,13 +76,24 @@ def _normalize_field_name(field_name: str) -> str:
 
 
 def _extract_cell_value(cell_data: Any) -> Any:
-    """Extract unwrapped value from a structured Clay cell dictionary if present."""
+    """Extract unwrapped value from a structured Clay cell dictionary if present.
+
+    Handles documented Clay cell statuses:
+    - 'success': contains the evaluated value under 'value'.
+    - 'empty': cell evaluated with no value (returns None).
+    - 'error': enrichment or calculation failed (returns None).
+    - 'running': enrichment is currently in progress (returns None).
+    Also supports unwrapped dictionaries or legacy 'successful' status.
+    """
     if isinstance(cell_data, dict):
+        status = cell_data.get("status")
+        if status in ("empty", "error", "running"):
+            return None
+        if status in ("success", "successful"):
+            return cell_data.get("value")
         if "value" in cell_data:
             return cell_data["value"]
-        if "status" in cell_data and set(cell_data.keys()).issubset(
-            {"status", "error", "format", "type"}
-        ):
+        if status and set(cell_data.keys()).issubset({"status", "error", "format", "type"}):
             return None
     return cell_data
 
@@ -128,7 +140,8 @@ def _normalize_clay_row(
         norm_key = _normalize_field_name(str(col_name))
         normalized[norm_key] = val
 
-    # Resolve primary key: user-designated business key takes precedence over system ID
+    # Resolve primary key:
+    # 1. User-designated business key takes precedence
     if primary_key_field:
         norm_pk = _normalize_field_name(primary_key_field)
         val = normalized.get(norm_pk)
@@ -137,15 +150,21 @@ def _normalize_clay_row(
         elif system_id:
             key_part = system_id
         else:
-            # Fall back to deterministic SHA-256 of normalized row when business key is null/empty
-            hash_input = json.dumps(normalized, sort_keys=True, default=str)
-            key_part = hashlib.sha256(hash_input.encode("utf-8")).hexdigest()[:16]
+            raise ValueError(
+                f"Row is missing designated primary_key '{primary_key_field}' "
+                f"(normalized: '{norm_pk}'). Clay rows require a valid non-empty "
+                "primary key value to prevent duplicate graph entities."
+            )
     elif system_id:
         key_part = system_id
     else:
-        # Deterministic SHA-256 fallback of normalized payload
-        hash_input = json.dumps(normalized, sort_keys=True, default=str)
-        key_part = hashlib.sha256(hash_input.encode("utf-8")).hexdigest()[:16]
+        raise ValueError(
+            f"Clay record in table '{table_id}' has no stable system record identifier "
+            "('record_id', 'id') and no 'primary_key' was specified. Please provide a "
+            "primary_key column (e.g. primary_key='domain' or primary_key='email') to "
+            "ensure stable entity identity and prevent duplicate/stale entities in the "
+            "Knowledge Graph."
+        )
 
     normalized["id"] = f"clay:{table_id}:{key_part}"
     normalized["_deleted"] = False
@@ -180,6 +199,16 @@ def _handle_clay_response_errors(response: Response, *args: Any, **kwargs: Any) 
         raise RuntimeError(
             "Clay table not found (HTTP 404). "
             "Please verify that the table_id exists and is accessible."
+        )
+    if response.status_code == 422:
+        try:
+            err_json = response.json()
+            detail = err_json.get("message") or err_json.get("error") or response.text
+        except Exception:
+            detail = response.text
+        raise RuntimeError(
+            f"Clay API unprocessable entity (HTTP 422): {detail}. "
+            "Please verify that requested fields exist in the table and query payload is valid."
         )
     if response.status_code == 429:
         raise RuntimeError(
@@ -216,8 +245,9 @@ def clay_source(
             columns are selected via the query payload. If omitted, all table
             columns are fetched, and a warning is logged regarding third-party data licensing.
         primary_key: Optional business column name to use as the record identifier
-            (e.g. 'domain', 'email'). Takes precedence over system IDs. If omitted or empty,
-            system IDs or deterministic content hashes are used.
+            (e.g. 'domain', 'email'). Takes precedence over system IDs. Required when
+            Clay table rows do not provide a system record ID ('record_id', 'id') to
+            prevent duplicate graph entities.
         write_disposition: ``dlt`` write disposition. Defaults to ``"replace"``
             (recommended full table snapshot sync).
         limit: Number of records to request per page (1-100, default 100).
@@ -258,13 +288,26 @@ def clay_source(
     if not (1 <= limit <= 100):
         raise ValueError("limit must be between 1 and 100 as specified by Clay's Table Query API.")
 
+    if primary_key is not None and not primary_key.strip():
+        raise ValueError("primary_key cannot be an empty or blank string.")
+
     query_payload: dict[str, Any] = {
         "tables": [{"id": resolved_table_id}],
         "field_mode": "names",
     }
 
-    if fields:
+    if fields is not None:
         sanitized_fields = [f.strip() for f in fields if isinstance(f, str) and f.strip()]
+        if not sanitized_fields:
+            raise ValueError(
+                "fields cannot be an empty list. Specify 1 to 20 field names, "
+                "or pass fields=None to fetch all table columns."
+            )
+        if len(sanitized_fields) > MAX_CLAY_FIELDS:
+            raise ValueError(
+                f"Clay's Table Query API allows a maximum of {MAX_CLAY_FIELDS} selected fields, "
+                f"but {len(sanitized_fields)} were provided: {sanitized_fields}."
+            )
         query_payload["select"] = [
             {"field": f, "as": _normalize_field_name(f)} for f in sanitized_fields
         ]
