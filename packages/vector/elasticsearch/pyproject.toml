@@ -1,0 +1,43 @@
+[project]
+name = "cognee-community-vector-adapter-elasticsearch"
+version = "0.1.0"
+description = "Elasticsearch vector database adapter for cognee"
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    # Install the client major that matches your cluster: 8.x for Elasticsearch 8,
+    # 9.x for Elasticsearch 9. The adapter only uses APIs both majors share.
+    "elasticsearch>=8.17,<10",
+    "cognee==1.6.1",
+    # Transitive via cognee; pinned to the version cognee 1.6.1 locks, so CI
+    # resolves the litellm the upstream release was tested against. cognee 1.6.x
+    # caps the range itself (>=1.83.7,<1.97.0); 1.96.2 ships abi3 wheels that
+    # install on every Python this package supports.
+    "litellm==1.96.2",
+    "starlette>=0.48.0",
+    "instructor>=1.11",
+]
+
+[project.urls]
+Homepage = "https://www.cognee.ai"
+Repository = "https://github.com/topoteretes/cognee-community"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build]
+exclude = [
+  "/dist",
+  "/.venv",
+  "/tests",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["cognee_community_vector_adapter_elasticsearch"]

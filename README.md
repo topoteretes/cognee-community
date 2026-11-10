@@ -91,6 +91,7 @@ poetry run python ./examples/example.py
 | Package Name                                 | Type     | Description                                        |
 |----------------------------------------------|----------|----------------------------------------------------|
 | `cognee-community-vector-adapter-azure`      | Vector   | Azure AI search vector database adapter for cognee |
+| `cognee-community-vector-adapter-elasticsearch` | Vector | Elasticsearch vector database adapter for cognee |
 | `cognee-community-vector-adapter-milvus`     | Vector   | Milvus vector database adapter for cognee          |
 | `cognee-community-vector-adapter-opensearch` | Vector   | Opensearch vector database adapter for cognee      |
 | `cognee-community-vector-adapter-pinecone`   | Vector   | Pinecone vector database adapter for cognee        |
