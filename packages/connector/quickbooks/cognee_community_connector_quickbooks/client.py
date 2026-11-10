@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import math
 import os
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import requests
@@ -78,16 +79,24 @@ class QuickBooksClient:
         client_secret: str | None = None,
         refresh_token: str | None = None,
         access_token: str | None = None,
-        sandbox: bool = True,
+        sandbox: bool | None = None,
         session: requests.Session | None = None,
         max_retries: int = DEFAULT_MAX_RETRIES,
+        on_token_refreshed: Callable[[str, str], None] | None = None,
     ):
         self.realm_id = realm_id or os.environ.get("QB_REALM_ID")
         self.client_id = client_id or os.environ.get("QB_CLIENT_ID")
         self.client_secret = client_secret or os.environ.get("QB_CLIENT_SECRET")
         self.refresh_token = refresh_token or os.environ.get("QB_REFRESH_TOKEN")
         self.access_token = access_token or os.environ.get("QB_ACCESS_TOKEN")
-        self.sandbox = sandbox
+        self.on_token_refreshed = on_token_refreshed
+
+        if sandbox is None:
+            env_sb = os.environ.get("QB_SANDBOX")
+            self.sandbox = env_sb.lower() in ("true", "1", "yes") if env_sb else True
+        else:
+            self.sandbox = bool(sandbox)
+
         self.max_retries = max_retries
 
         if not self.realm_id:
@@ -140,6 +149,10 @@ class QuickBooksClient:
         if new_refresh:
             self.refresh_token = new_refresh
 
+        if self.on_token_refreshed:
+            with contextlib.suppress(Exception):
+                self.on_token_refreshed(self.access_token, self.refresh_token or "")
+
         return self.access_token
 
     def _get_auth_headers(self) -> dict[str, str]:
@@ -167,11 +180,9 @@ class QuickBooksClient:
         retried_auth: bool = False,
     ) -> dict[str, Any]:
         """Send authenticated request to QuickBooks V3 API with retry logic."""
-        url = (
-            path_or_url
-            if path_or_url.startswith("http")
-            else f"{self.api_base}/{path_or_url.lstrip('/')}"
-        )
+        if path_or_url.startswith(("http://", "https://")):
+            raise ValueError("QuickBooks API requests must use a relative path.")
+        url = f"{self.api_base}/{path_or_url.lstrip('/')}"
         headers = self._get_auth_headers()
 
         for attempt in range(self.max_retries + 1):
@@ -240,6 +251,10 @@ class QuickBooksClient:
 
         raise QuickBooksAPIError("Max retries exceeded.")
 
+    def get_tokens(self) -> tuple[str | None, str | None]:
+        """Return current (access_token, refresh_token) tuple."""
+        return self.access_token, self.refresh_token
+
     def query(self, query_str: str) -> list[dict[str, Any]]:
         """Run a QuickBooks Online query (SQL-like syntax)."""
         data = self.request("GET", "query", params={"query": query_str})
@@ -256,6 +271,7 @@ class QuickBooksClient:
         page_size: int = 100,
     ) -> Iterator[dict[str, Any]]:
         """Paginate through all entities, optionally filtering by LastUpdatedTime."""
+        clamped_page_size = min(max(page_size, 1), 1000)
         start_position = 1
 
         while True:
@@ -266,12 +282,13 @@ class QuickBooksClient:
                     f"SELECT * FROM {entity_name} "
                     f"WHERE Metadata.LastUpdatedTime >= '{last_updated_time}' "
                     f"ORDER BY Metadata.LastUpdatedTime "
-                    f"STARTPOSITION {start_position} MAXRESULTS {page_size}"
+                    f"STARTPOSITION {start_position} MAXRESULTS {clamped_page_size}"
                 )
             else:
                 q = (
                     f"SELECT * FROM {entity_name} "
-                    f"STARTPOSITION {start_position} MAXRESULTS {page_size}"
+                    f"ORDER BY Id "
+                    f"STARTPOSITION {start_position} MAXRESULTS {clamped_page_size}"
                 )
 
             items = self.query(q)
@@ -280,20 +297,22 @@ class QuickBooksClient:
 
             yield from items
 
-            if len(items) < page_size:
+            if len(items) < clamped_page_size:
                 break
 
             start_position += len(items)
 
     def fetch_active_ids(self, entity_name: str, page_size: int = 500) -> set[str]:
         """Fetch all currently active entity IDs via lightweight ID projection queries."""
+        clamped_page_size = min(max(page_size, 1), 1000)
         active_ids: set[str] = set()
         start_position = 1
 
         while True:
             q = (
                 f"SELECT Id FROM {entity_name} "
-                f"STARTPOSITION {start_position} MAXRESULTS {page_size}"
+                f"ORDER BY Id "
+                f"STARTPOSITION {start_position} MAXRESULTS {clamped_page_size}"
             )
             items = self.query(q)
             if not items:
@@ -303,7 +322,7 @@ class QuickBooksClient:
                 if "Id" in item:
                     active_ids.add(str(item["Id"]))
 
-            if len(items) < page_size:
+            if len(items) < clamped_page_size:
                 break
 
             start_position += len(items)
@@ -314,6 +333,7 @@ class QuickBooksClient:
         """Query Change Data Capture (CDC) endpoint for modified and deleted items.
 
         Returns list of entity records, including deleted records with status="Deleted".
+        Raises QuickBooksAPIError if Intuit returns a CDC Fault (e.g. 30-day window expired).
         """
         entities_param = ",".join(entities)
         data = self.request(
@@ -323,6 +343,18 @@ class QuickBooksClient:
 
         records: list[dict[str, Any]] = []
         for container in cdc_response:
+            fault = container.get("Fault")
+            if fault:
+                errors = fault.get("Error") or []
+                err_item = errors[0] if isinstance(errors, list) and errors else {}
+                code = err_item.get("code", "")
+                msg = err_item.get("Message", "QuickBooks CDC fault")
+                detail = err_item.get("Detail", "")
+                err_text = f"QuickBooks CDC fault ({code}): {msg}"
+                if detail:
+                    err_text += f" - {detail}"
+                raise QuickBooksAPIError(err_text, response_body=str(fault))
+
             query_response = container.get("QueryResponse", [])
             for qr in query_response:
                 for key, val in qr.items():

@@ -117,6 +117,19 @@ def sample_credit_memo():
             "value": "SLA downtime credit.",
         },
         "PrivateNote": "Internal discount approval.",
+        "Line": [
+            {
+                "Id": "1",
+                "DetailType": "SalesItemLineDetail",
+                "Amount": 250.0,
+                "SalesItemLineDetail": {
+                    "ItemRef": {"name": "Service Outage Credit"},
+                    "UnitPrice": 250.0,
+                    "Qty": 1,
+                },
+                "Description": "Downtime credit compensation",
+            }
+        ],
         "MetaData": {
             "CreateTime": "2024-04-10T14:00:00Z",
             "LastUpdatedTime": "2024-04-10T14:05:00Z",

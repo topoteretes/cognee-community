@@ -48,18 +48,31 @@ _EXTRA_HINT = (
 )
 
 
+CURRENCY_SYMBOLS: dict[str, str] = {
+    "USD": "$",
+    "CAD": "CA$",
+    "EUR": "€",
+    "GBP": "£",
+    "JPY": "¥",
+    "AUD": "A$",
+    "CHF": "CHF ",
+    "INR": "₹",
+}
+
+
 def _format_currency(amount: float | int | None, currency: str | None = None) -> str:
     """Format an amount and currency for human-readable display."""
-    curr = currency or "USD"
+    curr = (currency or "USD").upper().strip()
+    sym = CURRENCY_SYMBOLS.get(curr, f"{curr} ")
     if amount is None:
-        return f"$0.00 {curr}"
+        return f"{sym}0.00 {curr}".strip()
     try:
         val = float(amount)
         if val < 0:
-            return f"-${abs(val):,.2f} {curr}"
-        return f"${val:,.2f} {curr}"
+            return f"-{sym}{abs(val):,.2f} {curr}".strip()
+        return f"{sym}{val:,.2f} {curr}".strip()
     except (ValueError, TypeError):
-        return f"{amount} {curr}"
+        return f"{amount} {curr}".strip()
 
 
 def _get_nested(obj: dict[str, Any], *keys: str, default: Any = "") -> Any:
@@ -112,7 +125,7 @@ def _invoice_to_card(
         lines.extend(["", "## Private Notes", private_note])
 
     # Extract sales line items
-    raw_lines = invoice.get("Line", [])
+    raw_lines = invoice.get("Line") or []
     item_rows: list[str] = []
     for line in raw_lines:
         detail_type = line.get("DetailType", "")
@@ -189,7 +202,7 @@ def _bill_to_card(
     if include_private_notes and private_note:
         lines.extend(["", "## Notes", private_note])
 
-    raw_lines = bill.get("Line", [])
+    raw_lines = bill.get("Line") or []
     item_rows: list[str] = []
     for line in raw_lines:
         detail_type = line.get("DetailType", "")
@@ -255,6 +268,37 @@ def _credit_memo_to_card(
     if include_private_notes and private_note:
         lines.extend(["", "## Private Notes", private_note])
 
+    # Extract credit memo line items
+    raw_lines = memo.get("Line") or []
+    item_rows: list[str] = []
+    for line in raw_lines:
+        detail_type = line.get("DetailType", "")
+        amt = line.get("Amount")
+        desc = line.get("Description") or ""
+
+        if detail_type == "SalesItemLineDetail":
+            item_detail = line.get("SalesItemLineDetail", {})
+            item_name = _get_nested(item_detail, "ItemRef", "name") or desc or "Item"
+            unit_price = item_detail.get("UnitPrice")
+            qty = item_detail.get("Qty", 1)
+
+            entry = f"- **{item_name}**"
+            if unit_price is not None:
+                entry += f" - {qty} @ {_format_currency(unit_price, currency)}"
+            if amt is not None:
+                entry += f" (Total: {_format_currency(amt, currency)})"
+            if desc and desc != item_name:
+                entry += f" — *{desc}*"
+            item_rows.append(entry)
+        elif detail_type == "SubTotalLineDetail":
+            continue
+        elif desc or amt:
+            fallback_label = desc or "Line item"
+            item_rows.append(f"- {fallback_label}: {_format_currency(amt, currency)}")
+
+    if item_rows:
+        lines.extend(["", "## Line Items", *item_rows])
+
     return {
         "id": f"{id_prefix}:creditmemo:{raw_id}",
         "qbo_id": raw_id,
@@ -271,7 +315,7 @@ def quickbooks_source(
     refresh_token: str | None = None,
     access_token: str | None = None,
     realm_id: str | None = None,
-    sandbox: bool = True,
+    sandbox: bool | None = None,
     entities: list[str] | None = None,
     id_prefix: str | None = None,
     client: Any = None,
@@ -412,8 +456,23 @@ def quickbooks_source(
                     # Query confirmed active IDs for this entity
                     if hasattr(active_client, "fetch_active_ids"):
                         active_ids = active_client.fetch_active_ids(entity_name)
-                    else:
+                    elif not last_updated:
+                        # Full backfill / refresh: current_sync_ids contains full corpus
                         active_ids = current_sync_ids
+                    else:
+                        # Incremental run without fetch_active_ids: current_sync_ids is delta only.
+                        # Fail closed: skip deletion reconciliation to prevent false tombstones.
+                        logger.warning(
+                            "QuickBooks %s: Client lacks fetch_active_ids and CDC was unavailable "
+                            "during incremental sync. Skipping deletion reconciliation to prevent "
+                            "false tombstones for unchanged records.",
+                            entity_name,
+                        )
+                        known_ids.update(current_sync_ids)
+                        state["known_ids"] = sorted(known_ids)
+                        if newest_updated:
+                            state["last_updated_time"] = newest_updated
+                        return
 
                     # Anti-corruption safeguard: abort if 0 records returned while known
                     if len(active_ids) == 0 and known_ids and not allow_empty_sweep:

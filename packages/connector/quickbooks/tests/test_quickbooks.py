@@ -19,6 +19,9 @@ import dlt
 import pytest
 
 from cognee_community_connector_quickbooks.client import (
+    PRODUCTION_BASE_URL,
+    SANDBOX_BASE_URL,
+    QuickBooksAPIError,
     QuickBooksClient,
     _retry_after,
 )
@@ -38,8 +41,9 @@ from tests.conftest import FakeQuickBooksClient
 
 def test_format_currency():
     assert _format_currency(1234.5, "USD") == "$1,234.50 USD"
-    assert _format_currency(-45.2, "USD") == "-$45.20 USD"
-    assert _format_currency(0, "EUR") == "$0.00 EUR"
+    assert _format_currency(-45.2, "GBP") == "-£45.20 GBP"
+    assert _format_currency(0, "EUR") == "€0.00 EUR"
+    assert _format_currency(100, "JPY") == "¥100.00 JPY"
     assert _format_currency(None) == "$0.00 USD"
 
 
@@ -90,6 +94,8 @@ def test_credit_memo_to_card(sample_credit_memo):
     assert card["id"] == "qb_test:creditmemo:301"
     assert card["title"] == "Credit Memo #CM-10 - Acme Corp"
     assert "$250.00 USD" in card["content"]
+    assert "## Line Items" in card["content"]
+    assert "Service Outage Credit" in card["content"]
     assert "## Private Notes" not in card["content"]
 
 
@@ -384,3 +390,155 @@ def test_retry_after_invalid_fallback_to_exponential():
     assert _retry_after({}, attempt=0) == default_attempt_0
     assert _retry_after(None, attempt=1) == default_attempt_1
     assert _retry_after({"other-header": "foo"}, attempt=2) == default_attempt_2
+
+
+def test_client_rejects_absolute_url():
+    """Verify QuickBooksClient rejects arbitrary absolute URLs to protect bearer token."""
+    client = QuickBooksClient(
+        realm_id="12345",
+        access_token="secret_token",
+    )
+    with pytest.raises(ValueError, match="QuickBooks API requests must use a relative path"):
+        client.request("GET", "https://malicious-site.com/steal_token")
+
+
+def test_incremental_sync_without_fetch_active_ids_does_not_tombstone(sample_invoice, tmp_path):
+    """Regression test: client without fetch_active_ids must not treat delta as snapshot."""
+
+    class DeltaOnlyClient:
+        def __init__(self, invoices):
+            self.invoices = list(invoices)
+            self.realm_id = "delta_company"
+
+        def fetch_all(self, entity_name: str, last_updated_time: str | None = None):
+            for inv in self.invoices:
+                meta = inv.get("MetaData") or {}
+                updated = meta.get("LastUpdatedTime", "")
+                if last_updated_time:
+                    if updated >= last_updated_time:
+                        yield inv
+                else:
+                    yield inv
+
+        def fetch_cdc(self, entities: list[str], changed_since: str):
+            # CDC unavailable or fails
+            raise RuntimeError("Intuit CDC temporarily unavailable")
+
+    inv1 = dict(sample_invoice)
+    inv2 = dict(sample_invoice)
+    inv2["Id"] = "102"
+    inv2["DocNumber"] = "INV-1002"
+    inv2["MetaData"] = {
+        "CreateTime": "2024-04-02T10:00:00Z",
+        "LastUpdatedTime": "2024-04-02T11:00:00Z",
+    }
+
+    client = DeltaOnlyClient(invoices=[inv1, inv2])
+
+    db_path = (tmp_path / "qb_delta_safe.db").as_posix()
+    pipeline = dlt.pipeline(
+        pipeline_name="test_qb_delta_safe",
+        destination=dlt.destinations.sqlalchemy(f"sqlite:///{db_path}"),
+        pipelines_dir=str(tmp_path / "pipelines"),
+    )
+
+    # Run 1: backfill 2 invoices
+    pipeline.run(quickbooks_source(client=client, entities=["Invoice"]))
+
+    with (
+        pipeline.sql_client() as sql_client,
+        sql_client.execute_query("SELECT id FROM quickbooks_invoices WHERE _deleted = 0") as cur,
+    ):
+        assert len(cur.fetchall()) == 2
+
+    # Run 2: Only inv2 was updated; inv1 is unchanged. Client has NO fetch_active_ids.
+    inv2_mod = dict(inv2)
+    inv2_mod["MetaData"] = {
+        "CreateTime": "2024-04-02T10:00:00Z",
+        "LastUpdatedTime": "2024-04-03T18:00:00Z",
+    }
+    client.invoices = [inv2_mod]
+
+    pipeline.run(quickbooks_source(client=client, entities=["Invoice"]))
+
+    with (
+        pipeline.sql_client() as sql_client,
+        sql_client.execute_query("SELECT id FROM quickbooks_invoices WHERE _deleted = 0") as cur,
+    ):
+        rows = cur.fetchall()
+        # CRITICAL ASSERTION: inv1 MUST NOT be deleted! Both records preserved.
+        assert len(rows) == 2
+
+
+def test_sandbox_env_resolution(monkeypatch):
+    """Verify QB_SANDBOX environment variable resolves correctly."""
+    monkeypatch.setenv("QB_REALM_ID", "12345")
+    monkeypatch.setenv("QB_SANDBOX", "false")
+    monkeypatch.setenv("QB_ACCESS_TOKEN", "tok")
+
+    prod_client = QuickBooksClient()
+    assert prod_client.sandbox is False
+    assert prod_client.api_base == f"{PRODUCTION_BASE_URL}/v3/company/12345"
+
+    monkeypatch.setenv("QB_SANDBOX", "true")
+    sb_client = QuickBooksClient()
+    assert sb_client.sandbox is True
+    assert sb_client.api_base == f"{SANDBOX_BASE_URL}/v3/company/12345"
+
+
+def test_cdc_fault_raises_quickbooks_api_error(monkeypatch):
+    """Verify Intuit CDC Fault response raises QuickBooksAPIError."""
+    client = QuickBooksClient(realm_id="12345", access_token="tok")
+
+    fault_payload = {
+        "CDCResponse": [
+            {
+                "Fault": {
+                    "Error": [
+                        {
+                            "Message": "The changedSince date cannot be older than 30 days",
+                            "code": "3220",
+                        }
+                    ],
+                    "type": "ValidationFault",
+                }
+            }
+        ]
+    }
+
+    monkeypatch.setattr(client, "request", lambda method, path, params=None: fault_payload)
+
+    with pytest.raises(QuickBooksAPIError, match="QuickBooks CDC fault"):
+        client.fetch_cdc(["Invoice"], changed_since="2020-01-01T00:00:00Z")
+
+
+def test_token_refresh_callback_invoked(monkeypatch):
+    """Verify on_token_refreshed callback receives rotated credentials."""
+    refreshed_tokens = []
+
+    def callback(access, refresh):
+        refreshed_tokens.append((access, refresh))
+
+    client = QuickBooksClient(
+        realm_id="12345",
+        client_id="cid",
+        client_secret="csec",
+        refresh_token="old_refresh",
+        on_token_refreshed=callback,
+    )
+
+    class DummyResponse:
+        status_code = 200
+
+        def json(self):
+            return {
+                "access_token": "new_access_token_123",
+                "refresh_token": "new_refresh_token_456",
+            }
+
+    monkeypatch.setattr(client.session, "post", lambda *args, **kwargs: DummyResponse())
+
+    new_token = client.refresh_access_token()
+    assert new_token == "new_access_token_123"
+    assert client.get_tokens() == ("new_access_token_123", "new_refresh_token_456")
+    assert refreshed_tokens == [("new_access_token_123", "new_refresh_token_456")]
