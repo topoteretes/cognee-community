@@ -5,10 +5,23 @@ Supports:
    receipt annotations, and user justification memos into rich semantic document cards
    for LLM entity extraction and knowledge graph construction. Use `brex_memos_source()`.
 2. brex_expenses: Structured relational mode. Emits normalized transaction rows with stable
-   namespaced IDs, foreign keys, and incremental sync via `posted_at_start`.
-3. brex_budgets: Structured relational mode. Ingests budget definitions and hierarchies.
+   namespaced IDs, foreign keys, and incremental sync via `updated_at_start`.
+3. brex_budgets: Structured relational mode. Ingests budget definitions and hierarchies
+   from Brex Budgets API (v2).
 
-Anti-corruption & Empty-Sweep Guardrails:
+Synchronization & Deletion Reconciliation Model:
+- Incremental Runs (default): Scans modified records using Brex `updated_at_start` cursor.
+  Captures transaction edits, refunds, receipts, and status transitions, accumulating newly
+  seen IDs into `known_ids`. Deletion reconciliation does NOT occur during incremental runs
+  to avoid false tombstones on delta sets.
+- Full Refresh Runs (`full_refresh=True`): Bypasses watermark cursor, sweeps all active
+  upstream records, and reconciles against accumulated `known_ids`. Missing or voided IDs
+  emit tombstone rows (`{"_deleted": True}`) that trigger orphan cleanup across Cognee's
+  relational, vector, and graph stores.
+- Scheduled Recommendation: Run incremental syncs regularly (e.g. hourly) and schedule a
+  periodic full refresh (e.g. daily or weekly) to reconcile deletions and archive old records.
+
+Anti-Corruption & Empty-Sweep Guardrails:
 - If any API request, pagination step, or network call fails during reconciliation, deletion
   tombstone emission is aborted immediately to protect graph state from transient failures.
 - If a full sweep returns 0 records when previous records were known, deletion tombstones
@@ -123,8 +136,9 @@ def _expense_to_row(
         "budget_id": f"{id_prefix}:budget:{budget_id}" if budget_id else None,
         "department_id": dept_obj.get("id"),
         "department_name": dept_obj.get("name"),
-        "posted_at": expense.get("posted_at"),
+        "posted_at": expense.get("payment_posted_at") or expense.get("posted_at"),
         "purchased_at": expense.get("purchased_at"),
+        "updated_at": expense.get("updated_at"),
         "_deleted": False,
     }
 
@@ -156,7 +170,13 @@ def _expense_to_memo_card(
 
     category = expense.get("category") or "Uncategorized"
     status = expense.get("status") or "APPROVED"
-    posted_date = expense.get("posted_at") or expense.get("purchased_at") or "Unknown Date"
+    posted_date = (
+        expense.get("updated_at")
+        or expense.get("payment_posted_at")
+        or expense.get("posted_at")
+        or expense.get("purchased_at")
+        or "Unknown Date"
+    )
     memo_text = expense.get("memo") or "No business justification memo provided."
     budget_id = expense.get("budget_id")
 
@@ -194,11 +214,18 @@ def _budget_to_row(
     budget: dict[str, Any],
     id_prefix: str = DEFAULT_ID_PREFIX,
 ) -> dict[str, Any]:
-    """Convert raw Brex budget record into structured relational row."""
-    budget_id = str(budget["id"])
-    limit_val, limit_curr = _normalize_amount(budget.get("limit"))
+    """Convert raw Brex budget record (v2) into structured relational row."""
+    raw_b_id = budget.get("budget_id") or budget.get("id")
+    if not raw_b_id:
+        raise KeyError("Brex budget record missing 'budget_id' or 'id'")
+    budget_id = str(raw_b_id)
+
+    # Brex v2 returns configured amount in minor currency units under 'amount'
+    amount_val, amount_curr = _normalize_amount(budget.get("amount") or budget.get("limit"))
+    # Brex v2 budget definitions do not return current spent amount
     spent_val, spent_curr = _normalize_amount(budget.get("spent"))
     parent_id = budget.get("parent_budget_id")
+    recurrence = budget.get("period_recurrence_type") or budget.get("period_type")
 
     return {
         "id": f"{id_prefix}:budget:{budget_id}",
@@ -206,13 +233,14 @@ def _budget_to_row(
         "name": budget.get("name") or "Unnamed Budget",
         "description": budget.get("description") or "",
         "budget_type": budget.get("budget_type"),
-        "period_type": budget.get("period_type"),
-        "limit_amount": limit_val,
+        "period_type": recurrence,
+        "limit_amount": amount_val,
         "spent_amount": spent_val,
-        "currency": limit_curr or spent_curr or "USD",
+        "currency": amount_curr or spent_curr or "USD",
         "parent_budget_id": f"{id_prefix}:budget:{parent_id}" if parent_id else None,
         "start_date": budget.get("start_date"),
         "end_date": budget.get("end_date"),
+        "status": budget.get("status") or "ACTIVE",
         "_deleted": False,
     }
 
@@ -223,6 +251,7 @@ def brex_source(
     include: list[str] | None = None,
     base_url: str = DEFAULT_BASE_URL,
     id_prefix: str = DEFAULT_ID_PREFIX,
+    account_id: str | None = None,
     client: Any = None,
     full_refresh: bool = False,
     allow_empty_sweep: bool = False,
@@ -234,11 +263,12 @@ def brex_source(
         token: Brex API User or Admin token. Falls back to BREX_API_TOKEN environment variable.
         include: List of resources to sync (defaults to ["expenses", "budgets"]).
                  Valid values: "expenses", "memos", "budgets".
-        base_url: Brex API base URL (default: 'https://platform.brexapis.com/v1').
+        base_url: Brex API base URL (default: 'https://api.brex.com').
         id_prefix: Namespace prefix for global IDs (default: 'brex').
+        account_id: Optional account ID to scope global IDs and DLT state for multi-account.
         client: Pre-built BrexClient instance (for offline testing injection).
         full_refresh: If True, bypasses watermark cursor and runs a full sweep with deletion
-                     reconciliation.
+                     reconciliation. Recommended periodically (e.g. daily/weekly).
         allow_empty_sweep: If True, permits empty API responses to tombstone existing records.
         resource_name: Optional pipeline scope identifier for multi-account / isolated state.
 
@@ -277,6 +307,8 @@ def brex_source(
     else:
         active_client = client
 
+    effective_prefix = f"{id_prefix}:{account_id}" if account_id else id_prefix
+
     @dlt.resource(
         name=BREX_EXPENSES_TABLE,
         primary_key="id",
@@ -297,32 +329,37 @@ def brex_source(
             "department_name": {"data_type": "text"},
             "posted_at": {"data_type": "text"},
             "purchased_at": {"data_type": "text"},
+            "updated_at": {"data_type": "text"},
             "_deleted": {"data_type": "bool", "hard_delete": True},
         },
     )
     def brex_expenses() -> Iterator[dict[str, Any]]:
         """Yield structured rows for card expenses with incremental sync and reconciliation."""
         state = dlt.current.resource_state()
-        last_posted = None if full_refresh else state.get("last_posted_at")
+        last_updated = (
+            None if full_refresh else (state.get("last_updated_at") or state.get("last_posted_at"))
+        )
         known_ids = set(state.get("known_ids", []))
 
         current_sync_keys = set()
-        newest_posted = last_posted
+        newest_updated = last_updated
 
         try:
-            for exp in active_client.fetch_all_expenses(posted_at_start=last_posted):
-                row = _expense_to_row(exp, id_prefix=id_prefix)
+            for exp in active_client.fetch_all_expenses(updated_at_start=last_updated):
+                row = _expense_to_row(exp, id_prefix=effective_prefix)
                 exp_id = str(exp["id"])
                 current_sync_keys.add(exp_id)
 
-                posted = exp.get("posted_at")
-                if posted and (newest_posted is None or posted > newest_posted):
-                    newest_posted = posted
+                updated = (
+                    exp.get("updated_at") or exp.get("payment_posted_at") or exp.get("posted_at")
+                )
+                if updated and (newest_updated is None or updated > newest_updated):
+                    newest_updated = updated
 
                 yield row
 
             # Full sweep reconciliation of deleted records
-            if not last_posted:
+            if not last_updated:
                 if known_ids and not current_sync_keys and not allow_empty_sweep:
                     logger.warning(
                         "Brex: expense sweep returned 0 records but %d were known; "
@@ -334,7 +371,7 @@ def brex_source(
                 deleted_ids = known_ids - current_sync_keys
                 for d_id in sorted(deleted_ids):
                     yield {
-                        "id": f"{id_prefix}:expense:{d_id}",
+                        "id": f"{effective_prefix}:expense:{d_id}",
                         "_deleted": True,
                     }
                 state["known_ids"] = sorted(current_sync_keys)
@@ -342,8 +379,9 @@ def brex_source(
                 # Incremental delta run: add newly seen records to known_ids
                 state["known_ids"] = sorted(known_ids | current_sync_keys)
 
-            if newest_posted:
-                state["last_posted_at"] = newest_posted
+            if newest_updated:
+                state["last_updated_at"] = newest_updated
+                state["last_posted_at"] = newest_updated
 
         except Exception as exc:
             logger.error("Brex expenses sync failed: %s. Aborting reconciliation.", exc)
@@ -364,26 +402,30 @@ def brex_source(
     def brex_memos() -> Iterator[dict[str, Any]]:
         """Yield Markdown document cards for expenses with memos (Document Mode)."""
         state = dlt.current.resource_state()
-        last_posted = None if full_refresh else state.get("last_posted_at")
+        last_updated = (
+            None if full_refresh else (state.get("last_updated_at") or state.get("last_posted_at"))
+        )
         known_memo_ids = set(state.get("known_ids", []))
 
         current_sync_keys = set()
-        newest_posted = last_posted
+        newest_updated = last_updated
 
         try:
-            for exp in active_client.fetch_all_expenses(posted_at_start=last_posted):
-                card = _expense_to_memo_card(exp, id_prefix=id_prefix)
+            for exp in active_client.fetch_all_expenses(updated_at_start=last_updated):
+                card = _expense_to_memo_card(exp, id_prefix=effective_prefix)
                 exp_id = str(exp["id"])
                 current_sync_keys.add(exp_id)
 
-                posted = exp.get("posted_at")
-                if posted and (newest_posted is None or posted > newest_posted):
-                    newest_posted = posted
+                updated = (
+                    exp.get("updated_at") or exp.get("payment_posted_at") or exp.get("posted_at")
+                )
+                if updated and (newest_updated is None or updated > newest_updated):
+                    newest_updated = updated
 
                 yield card
 
             # Full sweep reconciliation of deleted memos
-            if not last_posted:
+            if not last_updated:
                 if known_memo_ids and not current_sync_keys and not allow_empty_sweep:
                     logger.warning(
                         "Brex: memo sweep returned 0 records but %d were known; "
@@ -395,7 +437,7 @@ def brex_source(
                 deleted_ids = known_memo_ids - current_sync_keys
                 for d_id in sorted(deleted_ids):
                     yield {
-                        "id": f"{id_prefix}:memo:{d_id}",
+                        "id": f"{effective_prefix}:memo:{d_id}",
                         "_deleted": True,
                     }
                 state["known_ids"] = sorted(current_sync_keys)
@@ -403,8 +445,9 @@ def brex_source(
                 # Incremental delta run: add newly seen memo records to known_ids
                 state["known_ids"] = sorted(known_memo_ids | current_sync_keys)
 
-            if newest_posted:
-                state["last_posted_at"] = newest_posted
+            if newest_updated:
+                state["last_updated_at"] = newest_updated
+                state["last_posted_at"] = newest_updated
 
         except Exception as exc:
             logger.error("Brex memos sync failed: %s. Aborting reconciliation.", exc)
@@ -427,6 +470,7 @@ def brex_source(
             "parent_budget_id": {"data_type": "text"},
             "start_date": {"data_type": "text"},
             "end_date": {"data_type": "text"},
+            "status": {"data_type": "text"},
             "_deleted": {"data_type": "bool", "hard_delete": True},
         },
     )
@@ -438,9 +482,11 @@ def brex_source(
 
         try:
             for budget in active_client.fetch_all_budgets():
-                row = _budget_to_row(budget, id_prefix=id_prefix)
-                b_id = str(budget["id"])
-                current_sync_keys.add(b_id)
+                row = _budget_to_row(budget, id_prefix=effective_prefix)
+                raw_b_id = budget.get("budget_id") or budget.get("id")
+                b_id = str(raw_b_id) if raw_b_id else ""
+                if b_id:
+                    current_sync_keys.add(b_id)
                 yield row
 
             # Empty sweep protection
@@ -456,7 +502,7 @@ def brex_source(
             deleted_ids = known_budget_ids - current_sync_keys
             for d_id in sorted(deleted_ids):
                 yield {
-                    "id": f"{id_prefix}:budget:{d_id}",
+                    "id": f"{effective_prefix}:budget:{d_id}",
                     "_deleted": True,
                 }
 
@@ -479,9 +525,10 @@ def brex_source(
 
     source = _brex()
 
-    # Isolate dlt pipeline state if resource_name is provided
-    if resource_name:
-        setattr(source, PIPELINE_SCOPE_ATTR, resource_name)
+    # Isolate dlt pipeline state if resource_name or account_id is provided
+    scope_name = resource_name or (f"brex_{account_id}" if account_id else None)
+    if scope_name:
+        setattr(source, PIPELINE_SCOPE_ATTR, scope_name)
 
     # Route brex_memos specifically through document mode
     if "memos" in resources_to_sync:
@@ -500,6 +547,7 @@ def brex_memos_source(
     *,
     base_url: str = DEFAULT_BASE_URL,
     id_prefix: str = DEFAULT_ID_PREFIX,
+    account_id: str | None = None,
     client: Any = None,
     full_refresh: bool = False,
     allow_empty_sweep: bool = False,
@@ -514,6 +562,7 @@ def brex_memos_source(
         include=["memos"],
         base_url=base_url,
         id_prefix=id_prefix,
+        account_id=account_id,
         client=client,
         full_refresh=full_refresh,
         allow_empty_sweep=allow_empty_sweep,

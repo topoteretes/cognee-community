@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import datetime
 import time
 from collections.abc import Iterator
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import requests
 
-DEFAULT_BASE_URL = "https://platform.brexapis.com/v1"
+DEFAULT_BASE_URL = "https://api.brex.com"
 DEFAULT_TIMEOUT = 30
+DEFAULT_MAX_RETRY_SLEEP = 60.0
 
 
 class BrexAPIError(Exception):
@@ -35,8 +38,32 @@ class BrexRateLimitError(BrexAPIError):
     """Raised when Brex rate limits are exceeded (HTTP 429)."""
 
 
+def _parse_retry_after(retry_header: str | None, default_backoff: float) -> float:
+    """Parse Retry-After header safely handling numeric seconds and RFC 7231 HTTP-dates."""
+    if not retry_header or not retry_header.strip():
+        return default_backoff
+
+    cleaned = retry_header.strip()
+
+    # 1. Try integer or float seconds
+    try:
+        seconds = float(cleaned)
+        return min(max(0.0, seconds), DEFAULT_MAX_RETRY_SLEEP)
+    except ValueError:
+        pass
+
+    # 2. Try RFC 7231 / RFC 2822 HTTP-date format (e.g. "Wed, 21 Oct 2026 07:28:00 GMT")
+    try:
+        target_dt = parsedate_to_datetime(cleaned)
+        now_dt = datetime.datetime.now(datetime.UTC)
+        delta = (target_dt - now_dt).total_seconds()
+        return min(max(0.0, delta), DEFAULT_MAX_RETRY_SLEEP)
+    except Exception:
+        return default_backoff
+
+
 class BrexClient:
-    """HTTP client for Brex Platform API (v1)."""
+    """HTTP client for official Brex API (v1 expenses, v2 budgets)."""
 
     def __init__(
         self,
@@ -104,7 +131,7 @@ class BrexClient:
 
                 if response.status_code == 429:
                     retry_after = response.headers.get("Retry-After")
-                    sleep_time = float(retry_after) if retry_after else backoff
+                    sleep_time = _parse_retry_after(retry_after, backoff)
                     if retries < self.max_retries:
                         retries += 1
                         time.sleep(sleep_time)
@@ -141,33 +168,45 @@ class BrexClient:
 
     def fetch_expenses(
         self,
+        updated_at_start: str | None = None,
         posted_at_start: str | None = None,
         cursor: str | None = None,
         limit: int = 50,
     ) -> dict[str, Any]:
-        """Fetch a single page of card expenses.
+        """Fetch a single page of expenses from Brex API (GET /v1/expenses).
 
         Args:
-            posted_at_start: RFC 3339 timestamp filter for incremental sync.
+            updated_at_start: RFC 3339 timestamp filter for incremental sync (captures edits).
+            posted_at_start: Backward-compatible alias for incremental sync cursor.
             cursor: Opaque pagination cursor.
-            limit: Page size (up to 100).
+            limit: Page size (1 to 100).
         """
+        if not (1 <= limit <= 100):
+            raise ValueError(f"limit must be between 1 and 100, got {limit}.")
+
+        sync_cursor = updated_at_start or posted_at_start
         params: dict[str, Any] = {
             "limit": limit,
             "cursor": cursor,
-            "posted_at_start": posted_at_start,
+            "updated_at_start": sync_cursor,
         }
-        return self._request("GET", "expenses/card", params=params)
+        return self._request("GET", "v1/expenses", params=params)
 
     def fetch_all_expenses(
         self,
+        updated_at_start: str | None = None,
         posted_at_start: str | None = None,
         limit: int = 50,
     ) -> Iterator[dict[str, Any]]:
-        """Iterate through all card expenses across pages."""
+        """Iterate through all expenses across pages using cursor pagination."""
         cursor: str | None = None
         while True:
-            data = self.fetch_expenses(posted_at_start=posted_at_start, cursor=cursor, limit=limit)
+            data = self.fetch_expenses(
+                updated_at_start=updated_at_start,
+                posted_at_start=posted_at_start,
+                cursor=cursor,
+                limit=limit,
+            )
             items = data.get("items") or []
             yield from items
 
@@ -180,12 +219,20 @@ class BrexClient:
         cursor: str | None = None,
         limit: int = 50,
     ) -> dict[str, Any]:
-        """Fetch a single page of budget hierarchies."""
+        """Fetch a single page of budget hierarchies from Brex Budgets API (GET /v2/budgets).
+
+        Args:
+            cursor: Opaque pagination cursor.
+            limit: Page size (1 to 100).
+        """
+        if not (1 <= limit <= 100):
+            raise ValueError(f"limit must be between 1 and 100, got {limit}.")
+
         params: dict[str, Any] = {
             "limit": limit,
             "cursor": cursor,
         }
-        return self._request("GET", "budgets", params=params)
+        return self._request("GET", "v2/budgets", params=params)
 
     def fetch_all_budgets(self, limit: int = 50) -> Iterator[dict[str, Any]]:
         """Iterate through all budgets across pages."""

@@ -21,6 +21,7 @@ def sample_token() -> str:
 
 @pytest.fixture
 def mock_expenses_data() -> list[dict[str, Any]]:
+    """Representative Brex Expenses API (v1) payload with updated_at timestamps."""
     return [
         {
             "id": "exp_001",
@@ -32,8 +33,9 @@ def mock_expenses_data() -> list[dict[str, Any]]:
             "memo": "Monthly infrastructure log indexing and Kubernetes cluster monitoring.",
             "status": "APPROVED",
             "budget_id": "bgt_cloud_q2",
-            "posted_at": "2026-04-12T14:30:00Z",
             "purchased_at": "2026-04-12T14:00:00Z",
+            "payment_posted_at": "2026-04-12T14:30:00Z",
+            "updated_at": "2026-04-12T15:00:00Z",
         },
         {
             "id": "exp_002",
@@ -45,35 +47,37 @@ def mock_expenses_data() -> list[dict[str, Any]]:
             "memo": "Production compute and database hosting.",
             "status": "APPROVED",
             "budget_id": "bgt_cloud_q2",
-            "posted_at": "2026-04-15T18:00:00Z",
             "purchased_at": "2026-04-15T17:30:00Z",
+            "payment_posted_at": "2026-04-15T18:00:00Z",
+            "updated_at": "2026-04-15T18:30:00Z",
         },
     ]
 
 
 @pytest.fixture
 def mock_budgets_data() -> list[dict[str, Any]]:
+    """Representative Brex Budgets API (v2) payload conforming to Brex OpenAPI spec."""
     return [
         {
-            "id": "bgt_cloud_q2",
+            "budget_id": "bgt_cloud_q2",
             "name": "Q2 Cloud & Infrastructure Budget",
             "description": "Quarterly cloud hosting, SaaS tooling, and infrastructure spend.",
             "budget_type": "DEPARTMENT",
-            "period_type": "QUARTERLY",
-            "limit": {"amount": 5000000, "currency": "USD"},  # $50,000.00
-            "spent": {"amount": 1842000, "currency": "USD"},  # $18,420.00
+            "period_recurrence_type": "QUARTERLY",
+            "status": "ACTIVE",
+            "amount": {"amount": 5000000, "currency": "USD"},  # $50,000.00 in minor units
             "parent_budget_id": "bgt_parent_eng",
             "start_date": "2026-04-01",
             "end_date": "2026-06-30",
         },
         {
-            "id": "bgt_parent_eng",
+            "budget_id": "bgt_parent_eng",
             "name": "Engineering Master Budget",
             "description": "Annual overall budget for Engineering.",
             "budget_type": "DEPARTMENT",
-            "period_type": "YEARLY",
-            "limit": {"amount": 50000000, "currency": "USD"},  # $500,000.00
-            "spent": {"amount": 12000000, "currency": "USD"},  # $120,000.00
+            "period_recurrence_type": "YEARLY",
+            "status": "ACTIVE",
+            "amount": {"amount": 50000000, "currency": "USD"},  # $500,000.00
             "parent_budget_id": None,
             "start_date": "2026-01-01",
             "end_date": "2026-12-31",
@@ -97,22 +101,33 @@ class MockBrexClient:
 
     def fetch_expenses(
         self,
+        updated_at_start: str | None = None,
         posted_at_start: str | None = None,
         cursor: str | None = None,
         limit: int = 50,
     ) -> dict[str, Any]:
+        sync_cursor = updated_at_start or posted_at_start
         self.calls_made.append(
             {
-                "endpoint": "expenses/card",
-                "posted_at_start": posted_at_start,
+                "endpoint": "v1/expenses",
+                "updated_at_start": sync_cursor,
                 "cursor": cursor,
                 "limit": limit,
             }
         )
 
         filtered = self.expenses
-        if posted_at_start:
-            filtered = [exp for exp in self.expenses if exp.get("posted_at", "") >= posted_at_start]
+        if sync_cursor:
+            filtered = [
+                exp
+                for exp in self.expenses
+                if (
+                    exp.get("updated_at")
+                    or exp.get("payment_posted_at")
+                    or exp.get("posted_at", "")
+                )
+                >= sync_cursor
+            ]
 
         return {
             "items": filtered,
@@ -121,10 +136,15 @@ class MockBrexClient:
 
     def fetch_all_expenses(
         self,
+        updated_at_start: str | None = None,
         posted_at_start: str | None = None,
         limit: int = 50,
     ):
-        data = self.fetch_expenses(posted_at_start=posted_at_start, limit=limit)
+        data = self.fetch_expenses(
+            updated_at_start=updated_at_start,
+            posted_at_start=posted_at_start,
+            limit=limit,
+        )
         yield from data.get("items", [])
 
     def fetch_budgets(
@@ -134,7 +154,7 @@ class MockBrexClient:
     ) -> dict[str, Any]:
         self.calls_made.append(
             {
-                "endpoint": "budgets",
+                "endpoint": "v2/budgets",
                 "cursor": cursor,
                 "limit": limit,
             }
