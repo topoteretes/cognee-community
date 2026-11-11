@@ -83,9 +83,75 @@ async def test_update_payload_keeps_vectors_and_skips_missing_ids(adapters, clie
     stored = client.store["cognee-documentchunk_text"]["docs"][a._doc_id(chunk)]
     assert stored["vector"] == [1.0, 0.0]
     (b_record,) = await b.retrieve("DocumentChunk_text", [str(chunk)])
-    assert "chunk_index" not in b_record.payload
+    assert b_record.payload["chunk_index"] is None
     await a.update_payload("Missing_text", {str(chunk): {"x": 1}})
     assert a.supports_payload_update is True
+
+
+@pytest.mark.asyncio
+async def test_update_payload_refuses_unknown_fields_and_changes_nothing(adapters):
+    a, _ = adapters
+    chunk = uuid4()
+    await a.create_data_points("DocumentChunk_text", [IndexSchema(id=chunk, text="east")])
+    await a.update_payload("DocumentChunk_text", {str(chunk): {"chunk_index": 41}})
+
+    with pytest.raises(ValueError, match="not_a_payload_field"):
+        await a.update_payload(
+            "DocumentChunk_text",
+            {str(chunk): {"chunk_index": 7, "not_a_payload_field": 1}},
+        )
+
+    (record,) = await a.retrieve("DocumentChunk_text", [str(chunk)])
+    assert record.payload["chunk_index"] == 41, "a refused update must change nothing"
+    assert "not_a_payload_field" not in record.payload
+    # A missing id is skipped, not refused, whatever its fields.
+    await a.update_payload("DocumentChunk_text", {str(uuid4()): {"not_a_payload_field": 1}})
+
+
+@pytest.mark.asyncio
+async def test_reindexing_merges_node_set_tags(adapters):
+    a, b = adapters
+    entity = uuid4()
+    await a.create_data_points(
+        "Entity_name", [IndexSchema(id=entity, text="east", belongs_to_set=["A"])]
+    )
+    await b.create_data_points(
+        "Entity_name", [IndexSchema(id=entity, text="east", belongs_to_set=["other"])]
+    )
+    await a.create_data_points(
+        "Entity_name", [IndexSchema(id=entity, text="east", belongs_to_set=["B"])]
+    )
+
+    (record,) = await a.retrieve("Entity_name", [str(entity)])
+    assert record.payload["belongs_to_set"] == ["A", "B"]
+    east = [1.0, 0.0]
+    assert [h.id for h in await a.search("Entity_name", query_vector=east, node_name=["A"])] == [
+        entity
+    ]
+    # Another dataset's tags never leak in.
+    (b_record,) = await b.retrieve("Entity_name", [str(entity)])
+    assert b_record.payload["belongs_to_set"] == ["other"]
+
+    # Deleting node set B keeps the row: node set A still owns it.
+    await a.remove_belongs_to_set_tags(["B"])
+    (record,) = await a.retrieve("Entity_name", [str(entity)])
+    assert record.payload["belongs_to_set"] == ["A"]
+
+
+@pytest.mark.asyncio
+async def test_duplicate_ids_in_one_batch_union_their_tags(adapters):
+    a, _ = adapters
+    entity = uuid4()
+    await a.create_data_points(
+        "Entity_name",
+        [
+            IndexSchema(id=entity, text="east", belongs_to_set=["A"]),
+            IndexSchema(id=entity, text="east", belongs_to_set=["B"]),
+        ],
+    )
+
+    (record,) = await a.retrieve("Entity_name", [str(entity)])
+    assert record.payload["belongs_to_set"] == ["A", "B"]
 
 
 @pytest.mark.asyncio

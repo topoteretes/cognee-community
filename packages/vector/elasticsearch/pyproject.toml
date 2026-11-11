@@ -8,12 +8,11 @@ dependencies = [
     # Install the client major that matches your cluster: 8.x for Elasticsearch 8,
     # 9.x for Elasticsearch 9. The adapter only uses APIs both majors share.
     "elasticsearch>=8.17,<10",
-    "cognee==1.6.1",
-    # Transitive via cognee; pinned to the version cognee 1.6.1 locks, so CI
-    # resolves the litellm the upstream release was tested against. cognee 1.6.x
-    # caps the range itself (>=1.83.7,<1.97.0); 1.96.2 ships abi3 wheels that
-    # install on every Python this package supports.
-    "litellm==1.96.2",
+    "cognee==1.6.7",
+    # Transitive via cognee; pinned to the version cognee 1.6.7 locks, so CI
+    # resolves the litellm the upstream release was tested against. cognee 1.6.7
+    # requires >=1.102.2,<2.0.0 (1.97.0 through 1.100.x do not import on Python 3.10).
+    "litellm==1.105.0",
     "starlette>=0.48.0",
     "instructor>=1.11",
 ]

@@ -52,15 +52,20 @@ docker run -d --name cognee-es -p 9200:9200 \
 
 ## Configuration
 
-Set the usual cognee vector variables (see `.env.example`):
+Set the usual cognee vector variables (see `.env.example`). Configure them
+explicitly: cognee's defaults point at LanceDB, not at Elasticsearch.
 
 | Variable | Meaning |
 |----------|---------|
 | `VECTOR_DB_PROVIDER` | `elasticsearch` |
-| `VECTOR_DB_URL` | One or more node URLs, comma-separated. Falls back to `http://VECTOR_DB_HOST:VECTOR_DB_PORT`, then `http://localhost:9200`. |
+| `VECTOR_DB_URL` | **Required** (unless `ELASTICSEARCH_CLOUD_ID` is set). One or more full node URLs, comma-separated, e.g. `http://localhost:9200`. `VECTOR_DB_HOST` / `VECTOR_DB_PORT` are not used. |
 | `VECTOR_DB_KEY` | An Elasticsearch API key: the encoded value the API returns, or `<id>:<api_key>`. Takes precedence over basic auth. |
 | `VECTOR_DB_USERNAME` / `VECTOR_DB_PASSWORD` | HTTP basic auth, when no API key is set. |
-| `VECTOR_DATASET_DATABASE_HANDLER` | `elasticsearch`, to give every cognee dataset its own scope. |
+| `VECTOR_DATASET_DATABASE_HANDLER` | **Required**: `elasticsearch`, which gives every cognee dataset its own scope. cognee's default handler (`lancedb`) does not work with this provider, so with access control on (cognee's default) startup fails without it. Only `ENABLE_BACKEND_ACCESS_CONTROL=false` (single tenant) lets you omit it. |
+
+The dataset handler never stores credentials: each dataset's row keeps an empty
+API key and no username or password, and cognee fills them from these variables
+whenever it connects.
 
 Elasticsearch-specific extras:
 
@@ -126,8 +131,24 @@ cognee does this for you.
 
 Elasticsearch reports kNN hits as `(1 + cosine) / 2`. The adapter converts this
 back to cosine distance (`0` identical, `2` opposite) so lower is better, as the
-cognee contract requires. Result sets are capped at Elasticsearch's result
-window of 10,000 rows.
+cognee contract requires.
+
+### Limits
+
+- **10,000 results per search.** A search without a limit (`limit=None`, which
+  cognee's batch triplet search uses) returns at most the nearest 10,000 rows of
+  a collection, Elasticsearch's result window. cognee's core adapters return every
+  row. The adapter logs a warning when a collection holds more matching rows.
+- **Approximate search.** Searches use HNSW kNN over the index's default
+  `dense_vector` settings, which quantize vectors (`int8_hnsw` on 8.x, `bbq_hnsw`
+  on 9.x for 384+ dimensions). Scores and order can differ slightly from the exact
+  search of cognee's core adapters. `score_by_ids` is exact.
+
+### Node sets
+
+Indexing a data point that already exists in the dataset merges its node-set tags
+(`belongs_to_set`) with the stored ones, as cognee's core adapters do, so an entity
+reached from several node sets keeps all of them.
 
 ## Tests
 

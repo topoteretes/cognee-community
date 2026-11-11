@@ -73,9 +73,22 @@ def _env_flag(name: str) -> bool | None:
 
 
 class IndexSchema(DataPoint):
-    """Row shape cognee indexes per embedded field: the text plus its node-set tags."""
+    """Row shape cognee indexes per embedded field, mirroring cognee core's IndexSchema.
+
+    Besides the text and its node-set tags it carries the reference scalars that
+    retrieval reads back from search payloads (evidence, references, hybrid
+    context). They stay None for data points that lack them.
+    """
 
     text: str
+
+    document_id: str | None = None
+    document_name: str | None = None
+    chunk_index: int | None = None
+    source_chunk_id: str | None = None
+    importance_weight: float | None = 0.5
+    # The document's external_metadata as JSON text, copied onto chunks at ingest.
+    external_metadata: str | None = None
 
     metadata: dict = {"index_fields": ["text"]}
     belongs_to_set: list[str] = []
@@ -105,9 +118,13 @@ class ElasticsearchAdapter(VectorDBInterface):
     ):
         """
         Parameters:
-            url: Elasticsearch endpoint(s); comma-separate several nodes. Falls back
-                to ``http://<vector_db_host>:<vector_db_port>`` and then to
-                ``http://localhost:9200``. Ignored when a cloud id is set.
+            url: Elasticsearch endpoint(s), each a full ``http(s)://`` URL;
+                comma-separate several nodes. Required unless a cloud id is set,
+                which takes precedence. Through cognee this is ``VECTOR_DB_URL``:
+                cognee never passes an empty url (it substitutes its LanceDB path),
+                so the ``http://<vector_db_host>:<vector_db_port>`` and
+                ``http://localhost:9200`` fallbacks apply only when the adapter is
+                constructed directly with no url.
             api_key: Elasticsearch API key, either the encoded form the API returns
                 or ``"<id>:<api_key>"``. Takes precedence over basic auth.
             embedding_engine: cognee embedding engine used for all text.
@@ -256,6 +273,14 @@ class ElasticsearchAdapter(VectorDBInterface):
         if limit is None:
             response = await self.client.count(index=index, query={"bool": {"filter": filters}})
             limit = _body(response)["count"]
+            if limit > MAX_RESULT_WINDOW:
+                logger.warning(
+                    "Index %s holds %d matching rows; a search without a limit returns only "
+                    "the nearest %d (Elasticsearch's result window).",
+                    index,
+                    limit,
+                    MAX_RESULT_WINDOW,
+                )
         if limit <= 0:
             return 0
         return min(limit, MAX_RESULT_WINDOW)
@@ -280,12 +305,55 @@ class ElasticsearchAdapter(VectorDBInterface):
                 + "; ".join(failures[:5])
             )
 
+    async def _stored_belongs_to_set(self, index: str, doc_ids: list[str]) -> dict[str, list]:
+        """This dataset's non-empty stored ``belongs_to_set`` per Elasticsearch ``_id``."""
+        response = _body(
+            await self.client.mget(
+                index=index, ids=doc_ids, source_includes=["database_name", "belongs_to_set"]
+            )
+        )
+        stored = {}
+        for doc in response.get("docs", []):
+            source = doc.get("_source") or {}
+            if not doc.get("found") or source.get("database_name") != self.database_name:
+                continue
+            if source.get("belongs_to_set"):
+                stored[doc["_id"]] = list(source["belongs_to_set"])
+        return stored
+
     async def _bulk_index(self, index: str, documents: list[dict]) -> None:
-        operations = []
+        """Write *documents*, merging ``belongs_to_set`` with what each row already carries.
+
+        Re-indexing a data point (the same entity reached from another node set)
+        must not drop the tags it already has, as in cognee core's LanceDB and
+        pgvector adapters: duplicates within the batch and the stored row are
+        unioned. The read and the write share VECTOR_DB_LOCK so concurrent
+        writers in this process cannot interleave between them.
+        """
+        merged: dict[str, dict] = {}
         for document in documents:
-            operations.append({"index": {"_index": index, "_id": self._doc_id(document["id"])}})
-            operations.append(document)
-        await self._bulk(operations)
+            doc_id = self._doc_id(document["id"])
+            previous = merged.get(doc_id)
+            if previous is not None:
+                document["belongs_to_set"] = list(
+                    dict.fromkeys(previous["belongs_to_set"] + document["belongs_to_set"])
+                )
+            merged[doc_id] = document
+        if not merged:
+            return
+
+        async with self.VECTOR_DB_LOCK:
+            stored = await self._stored_belongs_to_set(index, list(merged))
+            operations = []
+            for doc_id, document in merged.items():
+                tags = list(dict.fromkeys(stored.get(doc_id, []) + document["belongs_to_set"]))
+                document["belongs_to_set"] = tags
+                payload = document.get("payload")
+                if isinstance(payload, dict) and ("belongs_to_set" in payload or tags):
+                    payload["belongs_to_set"] = tags
+                operations.append({"index": {"_index": index, "_id": doc_id}})
+                operations.append(document)
+            await self._bulk(operations)
 
     async def _managed_indices(self) -> dict[str, dict]:
         """Every index under the prefix, mapped to its index body (settings, mappings)."""
@@ -376,6 +444,14 @@ class ElasticsearchAdapter(VectorDBInterface):
                 IndexSchema(
                     id=data_point.id,
                     text=DataPoint.get_embeddable_data(data_point),
+                    # Reference scalars, read with getattr as cognee core does so
+                    # non-chunk data points fall back to None instead of raising.
+                    document_id=getattr(data_point, "document_id", None),
+                    document_name=getattr(data_point, "document_name", None),
+                    chunk_index=getattr(data_point, "chunk_index", None),
+                    source_chunk_id=getattr(data_point, "source_chunk_id", None),
+                    importance_weight=getattr(data_point, "importance_weight", None),
+                    external_metadata=getattr(data_point, "external_metadata", None),
                     belongs_to_set=(data_point.belongs_to_set or []),
                 )
                 for data_point in data_points
@@ -440,12 +516,36 @@ class ElasticsearchAdapter(VectorDBInterface):
     async def update_payload(
         self, collection_name: str, payload_updates: dict[str, dict[str, Any]]
     ) -> None:
-        """Merge fields into stored payloads; vectors are untouched, missing ids skipped."""
+        """Overwrite payload fields on stored rows; vectors are untouched, missing ids skipped.
+
+        Every field must already exist in the payload schema (the cognee interface
+        contract). Payloads are stored unmapped, so the schema is read from the
+        rows themselves: a field missing from a stored row's payload raises
+        ``ValueError`` before anything is written, instead of drifting into it.
+        """
         if not payload_updates:
             return
         if not await self.has_collection(collection_name):
             return
         index = self._index(collection_name)
+        stored = _body(
+            await self.client.mget(
+                index=index,
+                ids=[self._doc_id(point_id) for point_id in payload_updates],
+                source_includes=["database_name", "payload"],
+            )
+        )
+        unknown_fields = set()
+        for fields, doc in zip(payload_updates.values(), stored.get("docs", []), strict=True):
+            source = doc.get("_source") or {}
+            if not doc.get("found") or source.get("database_name") != self.database_name:
+                continue  # missing ids are skipped, not refused
+            unknown_fields |= set(fields) - set(source.get("payload") or {})
+        if unknown_fields:
+            raise ValueError(
+                f"update_payload: fields {sorted(unknown_fields)} do not exist in the "
+                f"payload schema of collection {collection_name!r}"
+            )
         operations = []
         for point_id, fields in payload_updates.items():
             doc: dict[str, Any] = {"payload": dict(fields)}

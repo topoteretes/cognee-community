@@ -1,4 +1,4 @@
-"""Offline cognee-1.6.1 conformance tests. No Elasticsearch server, no secrets."""
+"""Offline cognee-1.6.7 conformance tests. No Elasticsearch server, no secrets."""
 
 from cognee_community_vector_adapter_elasticsearch.elasticsearch_adapter import (
     ElasticsearchAdapter,

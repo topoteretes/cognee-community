@@ -280,6 +280,18 @@ async def main():
     )[0]
     random_node_name = random_node.payload["text"]
 
+    # Chunk rows carry the reference fields retrieval reads back (evidence, references).
+    chunk_hit = (
+        await vector_engine.search(
+            collection_name="DocumentChunk_text",
+            query_text="Quantum computer",
+            include_payload=True,
+            limit=1,
+        )
+    )[0]
+    assert chunk_hit.payload["document_name"], "DocumentChunk payload lacks document_name"
+    assert chunk_hit.payload["chunk_index"] is not None, "DocumentChunk payload lacks chunk_index"
+
     search_results = await cognee.search(
         query_type=SearchType.GRAPH_COMPLETION, query_text=random_node_name
     )
