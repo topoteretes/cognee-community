@@ -24,6 +24,8 @@ async def main():
             "vector_db_provider": "elasticsearch",
             "vector_db_url": os.getenv("VECTOR_DB_URL", "http://localhost:9200"),
             "vector_db_key": os.getenv("VECTOR_DB_KEY", ""),
+            # Required while access control is on (cognee's default).
+            "vector_dataset_database_handler": "elasticsearch",
         }
     )
 

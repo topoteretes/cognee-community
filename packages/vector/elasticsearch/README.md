@@ -72,7 +72,7 @@ Elasticsearch-specific extras:
 | Variable | Meaning |
 |----------|---------|
 | `ELASTICSEARCH_CLOUD_ID` | Elastic Cloud deployment id; replaces `VECTOR_DB_URL`. |
-| `ELASTICSEARCH_INDEX_PREFIX` | Prefix of every index the adapter manages (default `cognee`). `prune()` and collection listing only ever touch `<prefix>-*`. |
+| `ELASTICSEARCH_INDEX_PREFIX` | Prefix of every index the adapter manages (default `cognee`). `prune()`, tag removal and collection listing only touch indices this adapter created under exactly this prefix, so deployments with nested prefixes (`cognee` and `cognee-staging`) can share a cluster. Avoid collection names containing `-`: prefix `cognee` with collection `x-y` and prefix `cognee-x` with collection `y` both map to the index `cognee-x-y`. cognee's own collection names never contain one. |
 | `ELASTICSEARCH_VERIFY_CERTS` / `ELASTICSEARCH_CA_CERTS` | TLS settings for self-signed clusters. |
 
 ## Usage
@@ -94,6 +94,8 @@ cognee.config.set_vector_db_config(
         "vector_db_provider": "elasticsearch",
         "vector_db_url": "http://localhost:9200",
         "vector_db_key": "",
+        # Required while access control is on (cognee's default).
+        "vector_dataset_database_handler": "elasticsearch",
     }
 )
 ```

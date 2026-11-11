@@ -26,6 +26,9 @@ from cognee.infrastructure.databases.vector.embeddings.EmbeddingEngine import (
 )
 from cognee.infrastructure.databases.vector.exceptions import CollectionNotFoundError
 from cognee.infrastructure.databases.vector.models.ScoredResult import ScoredResult
+from cognee.infrastructure.databases.vector.vector_db_interface import (
+    validate_raw_vector_points,
+)
 from cognee.infrastructure.engine import DataPoint
 from cognee.infrastructure.engine.utils import parse_id
 from cognee.shared.logging_utils import get_logger
@@ -356,12 +359,27 @@ class ElasticsearchAdapter(VectorDBInterface):
             await self._bulk(operations)
 
     async def _managed_indices(self) -> dict[str, dict]:
-        """Every index under the prefix, mapped to its index body (settings, mappings)."""
+        """This adapter's indices, mapped to their index body (settings, mappings).
+
+        The ``<prefix>-*`` pattern alone also matches another deployment whose
+        prefix extends this one (``cognee-staging-*`` under ``cognee``) and any
+        unrelated ``<prefix>-...`` index. Only indices this adapter created are
+        kept: managed by cognee, and named exactly ``self._index(collection)``
+        for the collection recorded in their ``_meta``.
+        """
         try:
             response = await self.client.indices.get(index=f"{self.index_prefix}-*")
         except NotFoundError:
             return {}
-        return dict(_body(response))
+        managed = {}
+        for index, body in _body(response).items():
+            meta = (body.get("mappings") or {}).get("_meta") or {}
+            collection_name = meta.get("collection_name")
+            if meta.get("managed_by") != "cognee" or not collection_name:
+                continue
+            if self._index(collection_name) == index:
+                managed[index] = body
+        return managed
 
     # ------------------------------------------------------------ collections
 
@@ -467,28 +485,24 @@ class ElasticsearchAdapter(VectorDBInterface):
         """Upsert caller-provided vectors without invoking the embedding engine."""
         if not points:
             return
-        vector_size = self.embedding_engine.get_vector_size()
+        # Validate every point (id, vector width, dict payload) before the
+        # collection is created, so a rejected call leaves nothing behind.
+        rows = validate_raw_vector_points(points, self.embedding_engine.get_vector_size())
         if not await self.has_collection(collection_name):
             await self.create_collection(collection_name, payload_schema)
         documents = []
-        for point in points:
-            point_id = point.get("id")
-            vector = point.get("vector")
-            payload = point.get("payload")
-            if point_id is None:
-                raise ValueError("Raw vector point is missing id")
-            if not isinstance(vector, list):
-                raise ValueError("Raw vector point vector must be a list")
-            if len(vector) != vector_size:
-                raise ValueError(
-                    f"Raw vector size {len(vector)} does not match expected size {vector_size}"
-                )
+        for row in rows.values():
+            payload = row["payload"]
             if payload_schema is not None:
                 payload = payload_schema.model_validate(payload).model_dump(mode="json")
-            documents.append(self._document(point_id, dict(payload or {}), vector))
+            documents.append(self._document(row["id"], dict(payload), row["vector"]))
         await self._bulk_index(self._index(collection_name), documents)
 
-    async def retrieve(self, collection_name: str, data_point_ids: list[str]):
+    async def retrieve(
+        self, collection_name: str, data_point_ids: list[str], *, include_vector: bool = False
+    ):
+        """Rows of this dataset by id; with ``include_vector`` each payload also
+        carries its stored embedding under ``"vector"``."""
         if not data_point_ids:
             return []
         if not await self.has_collection(collection_name):
@@ -498,7 +512,8 @@ class ElasticsearchAdapter(VectorDBInterface):
             await self.client.mget(
                 index=self._index(collection_name),
                 ids=[self._doc_id(point_id) for point_id in ids],
-                source_includes=["id", "database_name", "payload"],
+                source_includes=["id", "database_name", "payload"]
+                + (["vector"] if include_vector else []),
             )
         )
         results = []
@@ -508,9 +523,10 @@ class ElasticsearchAdapter(VectorDBInterface):
             source = doc["_source"]
             if source.get("database_name") != self.database_name:
                 continue
-            results.append(
-                ScoredResult(id=parse_id(source["id"]), payload=source.get("payload"), score=0)
-            )
+            payload = source.get("payload")
+            if include_vector:
+                payload = {**(payload or {}), "vector": source.get("vector")}
+            results.append(ScoredResult(id=parse_id(source["id"]), payload=payload, score=0))
         return results
 
     async def update_payload(

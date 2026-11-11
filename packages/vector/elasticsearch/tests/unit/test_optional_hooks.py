@@ -236,3 +236,33 @@ async def test_close_closes_the_client(adapters, client):
     a, _ = adapters
     await a.close()
     assert client.closed
+
+
+@pytest.mark.asyncio
+async def test_retrieve_includes_the_stored_vector_only_when_asked(adapters):
+    a, _ = adapters
+    point = uuid4()
+    await a.create_data_points("Entity_name", [IndexSchema(id=point, text="north")])
+
+    (plain,) = await a.retrieve("Entity_name", [str(point)])
+    assert "vector" not in plain.payload
+    (with_vector,) = await a.retrieve("Entity_name", [str(point)], include_vector=True)
+    assert with_vector.payload["vector"] == [0.0, 1.0]
+    assert with_vector.payload["text"] == "north"
+
+
+@pytest.mark.asyncio
+async def test_upsert_raw_vectors_validates_before_creating_the_collection(adapters, client):
+    a, _ = adapters
+    bad_batches = [
+        [{"id": uuid4(), "vector": [1.0, 0.0], "payload": None}],
+        [
+            {"id": uuid4(), "vector": [1.0, 0.0], "payload": {}},
+            {"id": uuid4(), "vector": [1.0], "payload": {}},
+        ],
+    ]
+    for points in bad_batches:
+        with pytest.raises(ValueError):
+            await a.upsert_raw_vectors("Fresh_vector", points)
+    assert not await a.has_collection("Fresh_vector")
+    assert "cognee-fresh_vector" not in client.store
