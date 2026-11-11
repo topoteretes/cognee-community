@@ -161,6 +161,16 @@ server or keys:
 uv run pytest tests/unit
 ```
 
+`tests/test_adapter_live.py` calls every adapter hook (search, batch search,
+exact scoring, payload updates, tag removal, deletes, prune, `delete_collection`)
+against a real cluster with a stub embedder, so it needs only `VECTOR_DB_URL`:
+
+```bash
+VECTOR_DB_URL=http://localhost:9200 uv run python tests/test_adapter_live.py
+```
+
 `tests/test_elasticsearch.py` and `example.py` run the full pipeline against a
-real cluster and need LLM and embedding credentials; CI runs them in
-`.github/workflows/test_elasticsearch.yml`.
+real cluster and need LLM and embedding credentials; `tests/test_elasticsearch.py`
+expects `ENABLE_BACKEND_ACCESS_CONTROL=false`. CI runs all three in
+`.github/workflows/test_elasticsearch.yml`, and `example.py` a second time with
+access control on.

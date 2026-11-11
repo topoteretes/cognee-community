@@ -68,3 +68,33 @@ async def test_listing_and_detag_stay_within_the_prefix(prod_and_staging, client
 
     (record,) = await staging.retrieve("Entity_name", [str(staging_id)])
     assert record.payload["belongs_to_set"] == ["A"]
+
+
+@pytest.mark.asyncio
+async def test_delete_collection_drops_only_its_own_managed_index(prod_and_staging, client):
+    prod, staging = prod_and_staging
+    _, staging_id = await _seed(prod, staging, client)
+    (other_dataset,) = make_adapters(client, ("other",), Embeddings, index_prefix="cognee")
+    await other_dataset.create_data_points(
+        "Entity_name", [IndexSchema(id=uuid4(), text="o", belongs_to_set=["A"])]
+    )
+
+    await prod.delete_collection("Entity_name")
+
+    # The whole index goes, other datasets' rows included: it is the collection.
+    assert "cognee-entity_name" not in client.store
+    assert not await other_dataset.has_collection("Entity_name")
+    # A nested prefix and an unmanaged index with a matching name stay.
+    assert "cognee-foo" in client.store
+    assert [r.id for r in await staging.retrieve("Entity_name", [str(staging_id)])] == [staging_id]
+
+
+@pytest.mark.asyncio
+async def test_delete_collection_ignores_missing_and_unmanaged_indices(prod_and_staging, client):
+    prod, _ = prod_and_staging
+    client.store["cognee-foo"] = {"mappings": {}, "dims": 2, "docs": {}}
+
+    await prod.delete_collection("Never_created")
+    await prod.delete_collection("foo")
+
+    assert "cognee-foo" in client.store

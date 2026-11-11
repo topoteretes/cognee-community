@@ -86,6 +86,13 @@ jobs:
           poetry run pip install "${{ matrix.es-client }}"
           poetry run python -c "import elasticsearch; print('elasticsearch client', elasticsearch.__versionstr__)"
 
+      # LLM-free: every adapter hook against the real cluster, with a stub embedder.
+      - name: Run Elasticsearch Adapter Live Tests
+        env:
+          VECTOR_DB_URL: 'http://localhost:9200'
+        working-directory: ./packages/vector/elasticsearch
+        run: poetry run python tests/test_adapter_live.py
+
       - name: Run Elasticsearch Example
         env:
           ENV: 'dev'
@@ -121,3 +128,24 @@ jobs:
           VECTOR_DB_KEY: ''
         working-directory: ./packages/vector/elasticsearch
         run: poetry run python tests/test_elasticsearch.py
+
+      # Access control on (cognee's default): the dataset handler and per-dataset
+      # database_name scoping against the real cluster.
+      - name: Run Elasticsearch Example (access control on)
+        env:
+          ENV: 'dev'
+          ENABLE_BACKEND_ACCESS_CONTROL: True
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+          LLM_ENDPOINT: ${{ secrets.LLM_ENDPOINT }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_API_VERSION: ${{ secrets.LLM_API_VERSION }}
+          EMBEDDING_MODEL: ${{ secrets.EMBEDDING_MODEL }}
+          EMBEDDING_ENDPOINT: ${{ secrets.EMBEDDING_ENDPOINT }}
+          EMBEDDING_API_KEY: ${{ secrets.EMBEDDING_API_KEY }}
+          EMBEDDING_API_VERSION: ${{ secrets.EMBEDDING_API_VERSION }}
+          VECTOR_DB_PROVIDER: 'elasticsearch'
+          VECTOR_DB_URL: 'http://localhost:9200'
+          VECTOR_DB_KEY: ''
+          VECTOR_DATASET_DATABASE_HANDLER: 'elasticsearch'
+        working-directory: ./packages/vector/elasticsearch
+        run: poetry run python example.py

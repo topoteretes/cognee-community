@@ -422,6 +422,21 @@ class ElasticsearchAdapter(VectorDBInterface):
     async def create_vector_index(self, index_name: str, index_property_name: str):
         await self.create_collection(f"{index_name}_{index_property_name}")
 
+    async def delete_collection(self, collection_name: str) -> None:
+        """Drop the collection's index and every row in it, whatever dataset wrote them.
+
+        Indices are shared by datasets, so unlike ``prune`` this is not scoped to
+        ``database_name``: it does what the interface says, drop the collection.
+        cognee calls it only for the deployment-wide dataset-routing collection
+        (``prune_dataset_routes`` under access control), so the next build can
+        recreate it at a new embedding width. Only an index this adapter manages
+        is dropped; a missing one is not an error.
+        """
+        index = self._index(collection_name)
+        if index not in await self._managed_indices():
+            return
+        await self.client.indices.delete(index=index, ignore_unavailable=True)
+
     async def get_collection_names(self) -> list[str]:
         """Collections holding at least one row of this dataset."""
         names = []

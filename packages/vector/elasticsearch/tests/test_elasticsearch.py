@@ -186,25 +186,25 @@ async def test_vector_engine_search_with_nodeset_filtering():
 
 
 async def test_vector_nodeset_filtering_retriever_integration():
+    # Chunks, not graph completion, as in cognee core's LanceDB/pgvector tests: a chunk
+    # belongs to exactly one document, so an AND over two documents' node sets matches
+    # nothing. Graph completion can't assert that: entities shared by both documents
+    # rightly carry both node sets, and since cognee 1.6.3 it no longer returns early
+    # when the node collections have no AND match (edge types are searched unfiltered).
     node_set = ["NLP", "Quantum"]
     query_text = "Tell me about Quantum computers"
 
-    from cognee.modules.retrieval.graph_completion_retriever import GraphCompletionRetriever
+    from cognee.modules.retrieval.chunks_retriever import ChunksRetriever
 
     # Search with "OR" operator
-    retriever = GraphCompletionRetriever(
-        node_name=node_set, node_name_filter_operator="OR", top_k=250
-    )
+    retriever = ChunksRetriever(node_name=node_set, node_name_filter_operator="OR")
     retrieved_objects = await retriever.get_retrieved_objects(query=query_text)
-    context = await retriever.get_context_from_objects(
-        query=query_text, retrieved_objects=retrieved_objects
-    )
 
-    assert "Quantum" in context
-    assert "NLP" in context
+    assert any("NLP" in chunk.payload["text"] for chunk in retrieved_objects)
+    assert any("Quantum" in chunk.payload["text"] for chunk in retrieved_objects)
 
     # Search with "AND" operator
-    retriever = GraphCompletionRetriever(node_name=node_set, node_name_filter_operator="AND")
+    retriever = ChunksRetriever(node_name=node_set, node_name_filter_operator="AND")
     retrieved_objects = await retriever.get_retrieved_objects(query=query_text)
 
     assert len(retrieved_objects) == 0, (
@@ -214,26 +214,16 @@ async def test_vector_nodeset_filtering_retriever_integration():
     node_set = ["Quantum", "Computers"]
 
     # Search with "OR" operator
-    retriever = GraphCompletionRetriever(
-        node_name=node_set, node_name_filter_operator="OR", top_k=250
-    )
+    retriever = ChunksRetriever(node_name=node_set, node_name_filter_operator="OR")
     retrieved_objects = await retriever.get_retrieved_objects(query=query_text)
-    context = await retriever.get_context_from_objects(
-        query=query_text, retrieved_objects=retrieved_objects
-    )
 
-    assert "Alice" in context
+    assert any("Alice" in chunk.payload["text"] for chunk in retrieved_objects)
 
     # Search with "AND" operator
-    retriever = GraphCompletionRetriever(
-        node_name=node_set, node_name_filter_operator="AND", top_k=250
-    )
+    retriever = ChunksRetriever(node_name=node_set, node_name_filter_operator="AND")
     retrieved_objects = await retriever.get_retrieved_objects(query=query_text)
-    context = await retriever.get_context_from_objects(
-        query=query_text, retrieved_objects=retrieved_objects
-    )
 
-    assert "Alice" not in context
+    assert all("Alice" not in chunk.payload["text"] for chunk in retrieved_objects)
 
 
 async def main():
