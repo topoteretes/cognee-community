@@ -45,8 +45,10 @@ async def main():
 
     search_results = await search(query_type=SearchType.GRAPH_COMPLETION, query_text=query_text)
 
-    for result_text in search_results:
-        print("\nSearch result: \n" + result_text)
+    # A string per result with access control off; one dict per searched dataset
+    # (dataset id, name and its results) with access control on.
+    for result in search_results:
+        print(f"\nSearch result: \n{result}")
 
 
 if __name__ == "__main__":
