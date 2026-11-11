@@ -110,6 +110,13 @@ async def test_vector_engine_search_none_limit():
 
 
 async def test_vector_engine_search_with_nodeset_filtering():
+    # test_vector_engine_search_none_limit already cognified these two files without
+    # node sets. Re-adding identical content only updates its node_set; cognee keeps
+    # the pipeline status, so cognify skips it and its chunks stay untagged. Start
+    # clean so every row carries the node sets this test asserts on.
+    await cognee.prune.prune_data()
+    await cognee.prune.prune_system(metadata=True)
+
     node_set_a = ["NLP"]
     node_set_b = ["Quantum", "Computers"]
     node_set_c = ["Quantum"]
