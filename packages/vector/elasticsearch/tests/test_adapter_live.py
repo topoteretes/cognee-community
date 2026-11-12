@@ -82,6 +82,15 @@ async def main():
         )
         await b.upsert_raw_vectors(collection, [point(r1, E1, "b-r1", ["A"])])
 
+        # New indices get the adapter's index_options (int8_hnsw unless configured),
+        # not the server default (bbq_hnsw on 9.x for 384+ dims).
+        mapping = (await a.client.indices.get_mapping(index=a._index(collection))).body
+        vector_mapping = next(iter(mapping.values()))["mappings"]["properties"]["vector"]
+        if a.index_options is not None:  # "server" leaves the choice to Elasticsearch
+            assert vector_mapping["index_options"]["type"] == a.index_options["type"], (
+                vector_mapping
+            )
+
         (a_r1,) = await a.retrieve(collection, [r1])
         (b_r1,) = await b.retrieve(collection, [r1])
         assert (a_r1.payload["text"], b_r1.payload["text"]) == ("a-r1", "b-r1")

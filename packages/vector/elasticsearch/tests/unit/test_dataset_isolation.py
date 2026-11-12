@@ -124,6 +124,7 @@ async def test_create_collection_is_idempotent_and_records_the_name(adapters, cl
         "dims": 8,
         "index": True,
         "similarity": "cosine",
+        "index_options": {"type": "int8_hnsw"},
     }
     assert mappings["properties"]["payload"] == {"type": "object", "enabled": False}
 

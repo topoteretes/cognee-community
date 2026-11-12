@@ -98,3 +98,21 @@ async def test_delete_collection_ignores_missing_and_unmanaged_indices(prod_and_
     await prod.delete_collection("foo")
 
     assert "cognee-foo" in client.store
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("index_options", "expected"),
+    [(None, {"type": "int8_hnsw"}), ("hnsw", {"type": "hnsw"}), ("server", None)],
+)
+async def test_new_indices_get_the_configured_index_options(
+    client, monkeypatch, index_options, expected
+):
+    monkeypatch.delenv("ELASTICSEARCH_INDEX_OPTIONS", raising=False)
+    (adapter,) = make_adapters(client, ("",), Embeddings, index_options=index_options)
+
+    await adapter.create_collection("Entity_name")
+
+    vector = client.store["cognee-entity_name"]["mappings"]["properties"]["vector"]
+    assert vector.get("index_options") == expected
+    assert vector["similarity"] == "cosine" and vector["dims"] == 2

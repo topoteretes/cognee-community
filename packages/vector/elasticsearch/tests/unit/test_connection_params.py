@@ -31,6 +31,7 @@ def recording_client(monkeypatch):
         "ELASTICSEARCH_INDEX_PREFIX",
         "ELASTICSEARCH_VERIFY_CERTS",
         "ELASTICSEARCH_CA_CERTS",
+        "ELASTICSEARCH_INDEX_OPTIONS",
     ):
         monkeypatch.delenv(name, raising=False)
     RecordingClient.last_kwargs = None
@@ -166,3 +167,46 @@ def test_injected_client_is_used_as_is():
 
     assert adapter.client is client
     assert RecordingClient.last_kwargs is None
+
+
+def test_index_options_default_to_int8_hnsw():
+    assert _adapter().index_options == {"type": "int8_hnsw"}
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("hnsw", {"type": "hnsw"}),
+        (" bbq_hnsw ", {"type": "bbq_hnsw"}),
+        (
+            '{"type": "hnsw", "m": 32, "ef_construction": 200}',
+            {"type": "hnsw", "m": 32, "ef_construction": 200},
+        ),
+        ("server", None),
+        ("DEFAULT", None),
+        ("", {"type": "int8_hnsw"}),
+    ],
+)
+def test_index_options_from_environment(monkeypatch, value, expected):
+    monkeypatch.setenv("ELASTICSEARCH_INDEX_OPTIONS", value)
+    assert _adapter().index_options == expected
+
+
+def test_explicit_index_options_win_over_environment(monkeypatch):
+    monkeypatch.setenv("ELASTICSEARCH_INDEX_OPTIONS", "bbq_hnsw")
+    assert _adapter(index_options="hnsw").index_options == {"type": "hnsw"}
+    assert _adapter(index_options={"type": "int4_hnsw", "m": 8}).index_options == {
+        "type": "int4_hnsw",
+        "m": 8,
+    }
+
+
+@pytest.mark.parametrize("value", ["{not json", '{"m": 32}', '{"type": 5}', {"m": 32}])
+def test_malformed_index_options_are_refused(monkeypatch, value):
+    if isinstance(value, str):
+        monkeypatch.setenv("ELASTICSEARCH_INDEX_OPTIONS", value)
+        with pytest.raises(ValueError):
+            _adapter()
+    else:
+        with pytest.raises(ValueError):
+            _adapter(index_options=value)

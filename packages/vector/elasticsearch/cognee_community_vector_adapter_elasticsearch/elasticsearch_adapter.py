@@ -14,6 +14,7 @@ cognee vector contract requires.
 """
 
 import asyncio
+import json
 import os
 import re
 from typing import Any
@@ -42,6 +43,12 @@ DEFAULT_INDEX_PREFIX = "cognee"
 MAX_RESULT_WINDOW = 10_000
 MIN_NUM_CANDIDATES = 100
 SCORE_ID_BATCH_SIZE = 1_000
+# HNSW over int8-quantized vectors. Pinned rather than left to the server so 8.x
+# and 9.x build the same index: 9.x would otherwise pick bbq_hnsw (1-bit) for
+# 384+ dims, which measured about 3.5 points lower recall@10 on real embeddings.
+DEFAULT_INDEX_OPTIONS = "int8_hnsw"
+# ELASTICSEARCH_INDEX_OPTIONS values that leave index_options to the server.
+SERVER_DEFAULT_INDEX_OPTIONS = ("server", "default")
 
 # Characters Elasticsearch rejects in index names; a name must also be lowercase
 # and must not start with ``-``, ``_`` or ``+``.
@@ -66,6 +73,38 @@ if (ctx._source.belongs_to_set == null || ctx._source.belongs_to_set.isEmpty()) 
 def _body(response: Any) -> Any:
     """Unwrap an elastic_transport ApiResponse into its plain body."""
     return getattr(response, "body", response)
+
+
+def _parse_index_options(value: str | dict | None) -> dict | None:
+    """``dense_vector`` ``index_options`` for new indices; None means the server's default.
+
+    Accepts a type name (``int8_hnsw``, ``hnsw``, ``int4_hnsw``, ``bbq_hnsw``, ...),
+    a JSON object or dict with at least a ``type`` (e.g. ``{"type": "hnsw", "m": 32}``),
+    or ``server`` / ``default`` to send none. Empty or unset gives ``int8_hnsw``.
+    """
+    if isinstance(value, dict):
+        options = dict(value)
+    else:
+        text = (value or "").strip()
+        if not text:
+            return {"type": DEFAULT_INDEX_OPTIONS}
+        if text.lower() in SERVER_DEFAULT_INDEX_OPTIONS:
+            return None
+        if text.startswith("{"):
+            try:
+                options = json.loads(text)
+            except json.JSONDecodeError as error:
+                raise ValueError(
+                    f"ELASTICSEARCH_INDEX_OPTIONS is not valid JSON: {error}"
+                ) from error
+        else:
+            options = {"type": text}
+    if not isinstance(options, dict) or not isinstance(options.get("type"), str):
+        raise ValueError(
+            "Elasticsearch index_options needs a 'type', e.g. int8_hnsw or "
+            '{"type": "hnsw", "m": 32}; use "server" for the server default.'
+        )
+    return options
 
 
 def _env_flag(name: str) -> bool | None:
@@ -115,6 +154,7 @@ class ElasticsearchAdapter(VectorDBInterface):
         index_prefix: str | None = None,
         verify_certs: bool | None = None,
         ca_certs: str | None = None,
+        index_options: str | dict | None = None,
         request_timeout: int = 120,
         client: AsyncElasticsearch | None = None,
         **kwargs,
@@ -141,6 +181,11 @@ class ElasticsearchAdapter(VectorDBInterface):
                 and collection listing only ever touch ``<prefix>-*``.
             verify_certs / ca_certs: TLS settings (or ``ELASTICSEARCH_VERIFY_CERTS``
                 / ``ELASTICSEARCH_CA_CERTS``).
+            index_options: the ``dense_vector`` ``index_options`` of indices this
+                adapter creates (or ``ELASTICSEARCH_INDEX_OPTIONS``): a type name,
+                a JSON object / dict with a ``type``, or ``server`` for the server's
+                default. Default ``int8_hnsw`` (needs Elasticsearch 8.12+). Existing
+                indices keep the options they were created with.
             request_timeout: per-request timeout in seconds.
             client: an existing ``AsyncElasticsearch`` to use instead of building one.
         """
@@ -174,6 +219,9 @@ class ElasticsearchAdapter(VectorDBInterface):
             verify_certs = _env_flag("ELASTICSEARCH_VERIFY_CERTS")
         self.verify_certs = verify_certs
         self.ca_certs = ca_certs or os.getenv("ELASTICSEARCH_CA_CERTS") or None
+        self.index_options = _parse_index_options(
+            index_options if index_options is not None else os.getenv("ELASTICSEARCH_INDEX_OPTIONS")
+        )
         self.request_timeout = request_timeout
 
         self.client = client if client is not None else self._build_client()
@@ -393,6 +441,14 @@ class ElasticsearchAdapter(VectorDBInterface):
         async with self.VECTOR_DB_LOCK:
             if await self.has_collection(collection_name):
                 return
+            vector_mapping = {
+                "type": "dense_vector",
+                "dims": self.embedding_engine.get_vector_size(),
+                "index": True,
+                "similarity": "cosine",
+            }
+            if self.index_options is not None:
+                vector_mapping["index_options"] = dict(self.index_options)
             mappings = {
                 "_meta": {"collection_name": collection_name, "managed_by": "cognee"},
                 "dynamic": False,
@@ -403,12 +459,7 @@ class ElasticsearchAdapter(VectorDBInterface):
                     # Stored in _source for retrieval, never indexed: payloads
                     # are free-form and would otherwise explode the mapping.
                     "payload": {"type": "object", "enabled": False},
-                    "vector": {
-                        "type": "dense_vector",
-                        "dims": self.embedding_engine.get_vector_size(),
-                        "index": True,
-                        "similarity": "cosine",
-                    },
+                    "vector": vector_mapping,
                 },
             }
             try:
