@@ -51,6 +51,7 @@ Limitations
 import html
 import os
 import re
+from datetime import date, timedelta
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -382,7 +383,17 @@ def _event_row(calendar_id: str, calendar_name: str, event: dict) -> dict:
     lines = [f"Calendar event: {title}", f"Calendar: {calendar_name}"]
     start, end = event.get("start") or {}, event.get("end") or {}
     if start.get("date"):
-        lines.append(f"When: all day, {start['date']} to {end.get('date', start['date'])}")
+        start_date = date.fromisoformat(start["date"])
+        end_date = date.fromisoformat(end.get("date") or start["date"])
+        # Google Calendar's all-day end date is exclusive. Convert it to the
+        # last included day for display, and avoid showing a range for one day.
+        inclusive_end = end_date - timedelta(days=1) if end_date > start_date else start_date
+        if inclusive_end == start_date:
+            lines.append(f"When: all day, {start_date.isoformat()}")
+        else:
+            lines.append(
+                f"When: all day, {start_date.isoformat()} to {inclusive_end.isoformat()}"
+            )
     else:
         lines.append(f"When: {_when(start)} to {_when(end)}")
     if event.get("location"):
