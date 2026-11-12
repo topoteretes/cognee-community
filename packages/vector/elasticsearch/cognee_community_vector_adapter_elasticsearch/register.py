@@ -1,0 +1,8 @@
+from cognee.infrastructure.databases.dataset_database_handler import use_dataset_database_handler
+from cognee.infrastructure.databases.vector import use_vector_adapter
+
+from .elasticsearch_adapter import ElasticsearchAdapter
+from .ElasticsearchDatasetDatabaseHandler import ElasticsearchDatasetDatabaseHandler
+
+use_vector_adapter("elasticsearch", ElasticsearchAdapter)
+use_dataset_database_handler("elasticsearch", ElasticsearchDatasetDatabaseHandler, "elasticsearch")
