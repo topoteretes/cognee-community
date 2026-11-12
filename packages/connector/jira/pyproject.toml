@@ -1,0 +1,23 @@
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+name = "cognee-community-connector-jira"
+version = "0.1.0"
+description = "Atlassian Jira project issues, sprint velocity, and technical task tracking connector for Cognee"
+authors = ["Rizul Chauhan <227848501+RizulChauhan@users.noreply.github.com>"]
+readme = "README.md"
+license = "Apache-2.0"
+repository = "https://github.com/topoteretes/cognee-community"
+keywords = ["cognee", "jira", "atlassian", "agile", "connector", "issue-tracking"]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0.0"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
