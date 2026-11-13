@@ -1,0 +1,293 @@
+{
+  "items": [
+    {
+      "classname": "tests.test_broken",
+      "file": "tests/test_broken.py",
+      "name": "test_add_wrong_expectation",
+      "result": "failure",
+      "message": "assert 4 == 5\n +  where 4 = add(2, 2)\ndef test_add_wrong_expectation():\n        # Plain assertion failure: short, readable message.\n>       assert add(2, 2) == 5\nE       assert 4 == 5\nE        +  where 4 = add(2, 2)\n\ntests/test_broken.py:20: AssertionError",
+      "run_time": 0.001,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_broken",
+      "file": "tests/test_broken.py",
+      "name": "test_parse_config_missing_key",
+      "result": "failure",
+      "message": "def test_parse_config_missing_key():\n        # Uncaught exception instead of an assertion.\n        config = parse_config(\"retries = 3\")\n>       assert config[\"timeout\"] == \"30\"\nE       KeyError: 'timeout'\n\ntests/test_broken.py:26: KeyError",
+      "run_time": 0,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_broken",
+      "file": "tests/test_broken.py",
+      "name": "test_long_failure_message",
+      "result": "failure",
+      "message": "AssertionError: payload mismatch: expected 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx', got 'yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy'\nassert 'yyyyyyyyyyyy...yyyyyyyyyyyyy' == 'xxxxxxxxxxxx...xxxxxxxxxxxxx'\n  \n  - xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n  + yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy\ndef test_long_failure_message():\n        # Message well over 500 chars, to test that the connector truncates it.\n        expected = \"x\" * 400\n        actual = \"y\" * 400\n>       assert actual == expected, f\"payload mismatch: expected {expected!r}, got {actual!r}\"\nE       AssertionError: payload mismatch: expected 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx', got 'yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy'\nE       assert 'yyyyyyyyyyyy...yyyyyyyyyyyyy' == 'xxxxxxxxxxxx...xxxxxxxxxxxxx'\nE         \nE         - xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\nE         + yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy\n\ntests/test_broken.py:33: AssertionError",
+      "run_time": 0.001,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_calc",
+      "file": "tests/test_calc.py",
+      "name": "test_add",
+      "result": "success",
+      "message": "",
+      "run_time": 0,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_calc",
+      "file": "tests/test_calc.py",
+      "name": "test_divide",
+      "result": "success",
+      "message": "",
+      "run_time": 0,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_calc",
+      "file": "tests/test_calc.py",
+      "name": "test_divide_by_zero",
+      "result": "success",
+      "message": "",
+      "run_time": 0,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_calc",
+      "file": "tests/test_calc.py",
+      "name": "test_parse_config",
+      "result": "success",
+      "message": "",
+      "run_time": 0,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[0]",
+      "result": "failure",
+      "message": "AssertionError: case 0 failed on purpose\nassert 0 < 0\nn = 0\n\n    @pytest.mark.parametrize(\"n\", range(25))\n    def test_case_fails(n):\n>       assert n < 0, f\"case {n} failed on purpose\"\nE       AssertionError: case 0 failed on purpose\nE       assert 0 < 0\n\ntests/test_many_failures.py:18: AssertionError",
+      "run_time": 0.001,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[1]",
+      "result": "failure",
+      "message": "AssertionError: case 1 failed on purpose\nassert 1 < 0\nn = 1\n\n    @pytest.mark.parametrize(\"n\", range(25))\n    def test_case_fails(n):\n>       assert n < 0, f\"case {n} failed on purpose\"\nE       AssertionError: case 1 failed on purpose\nE       assert 1 < 0\n\ntests/test_many_failures.py:18: AssertionError",
+      "run_time": 0.001,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[2]",
+      "result": "failure",
+      "message": "AssertionError: case 2 failed on purpose\nassert 2 < 0\nn = 2\n\n    @pytest.mark.parametrize(\"n\", range(25))\n    def test_case_fails(n):\n>       assert n < 0, f\"case {n} failed on purpose\"\nE       AssertionError: case 2 failed on purpose\nE       assert 2 < 0\n\ntests/test_many_failures.py:18: AssertionError",
+      "run_time": 0.001,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[3]",
+      "result": "failure",
+      "message": "AssertionError: case 3 failed on purpose\nassert 3 < 0\nn = 3\n\n    @pytest.mark.parametrize(\"n\", range(25))\n    def test_case_fails(n):\n>       assert n < 0, f\"case {n} failed on purpose\"\nE       AssertionError: case 3 failed on purpose\nE       assert 3 < 0\n\ntests/test_many_failures.py:18: AssertionError",
+      "run_time": 0.001,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[4]",
+      "result": "failure",
+      "message": "AssertionError: case 4 failed on purpose\nassert 4 < 0\nn = 4\n\n    @pytest.mark.parametrize(\"n\", range(25))\n    def test_case_fails(n):\n>       assert n < 0, f\"case {n} failed on purpose\"\nE       AssertionError: case 4 failed on purpose\nE       assert 4 < 0\n\ntests/test_many_failures.py:18: AssertionError",
+      "run_time": 0.001,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[5]",
+      "result": "failure",
+      "message": "AssertionError: case 5 failed on purpose\nassert 5 < 0\nn = 5\n\n    @pytest.mark.parametrize(\"n\", range(25))\n    def test_case_fails(n):\n>       assert n < 0, f\"case {n} failed on purpose\"\nE       AssertionError: case 5 failed on purpose\nE       assert 5 < 0\n\ntests/test_many_failures.py:18: AssertionError",
+      "run_time": 0.001,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[6]",
+      "result": "failure",
+      "message": "AssertionError: case 6 failed on purpose\nassert 6 < 0\nn = 6\n\n    @pytest.mark.parametrize(\"n\", range(25))\n    def test_case_fails(n):\n>       assert n < 0, f\"case {n} failed on purpose\"\nE       AssertionError: case 6 failed on purpose\nE       assert 6 < 0\n\ntests/test_many_failures.py:18: AssertionError",
+      "run_time": 0.001,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[7]",
+      "result": "failure",
+      "message": "AssertionError: case 7 failed on purpose\nassert 7 < 0\nn = 7\n\n    @pytest.mark.parametrize(\"n\", range(25))\n    def test_case_fails(n):\n>       assert n < 0, f\"case {n} failed on purpose\"\nE       AssertionError: case 7 failed on purpose\nE       assert 7 < 0\n\ntests/test_many_failures.py:18: AssertionError",
+      "run_time": 0.001,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[8]",
+      "result": "failure",
+      "message": "AssertionError: case 8 failed on purpose\nassert 8 < 0\nn = 8\n\n    @pytest.mark.parametrize(\"n\", range(25))\n    def test_case_fails(n):\n>       assert n < 0, f\"case {n} failed on purpose\"\nE       AssertionError: case 8 failed on purpose\nE       assert 8 < 0\n\ntests/test_many_failures.py:18: AssertionError",
+      "run_time": 0.001,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[9]",
+      "result": "failure",
+      "message": "AssertionError: case 9 failed on purpose\nassert 9 < 0\nn = 9\n\n    @pytest.mark.parametrize(\"n\", range(25))\n    def test_case_fails(n):\n>       assert n < 0, f\"case {n} failed on purpose\"\nE       AssertionError: case 9 failed on purpose\nE       assert 9 < 0\n\ntests/test_many_failures.py:18: AssertionError",
+      "run_time": 0.001,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[10]",
+      "result": "failure",
+      "message": "AssertionError: case 10 failed on purpose\nassert 10 < 0\nn = 10\n\n    @pytest.mark.parametrize(\"n\", range(25))\n    def test_case_fails(n):\n>       assert n < 0, f\"case {n} failed on purpose\"\nE       AssertionError: case 10 failed on purpose\nE       assert 10 < 0\n\ntests/test_many_failures.py:18: AssertionError",
+      "run_time": 0.001,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[11]",
+      "result": "failure",
+      "message": "AssertionError: case 11 failed on purpose\nassert 11 < 0\nn = 11\n\n    @pytest.mark.parametrize(\"n\", range(25))\n    def test_case_fails(n):\n>       assert n < 0, f\"case {n} failed on purpose\"\nE       AssertionError: case 11 failed on purpose\nE       assert 11 < 0\n\ntests/test_many_failures.py:18: AssertionError",
+      "run_time": 0,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[12]",
+      "result": "failure",
+      "message": "AssertionError: case 12 failed on purpose\nassert 12 < 0\nn = 12\n\n    @pytest.mark.parametrize(\"n\", range(25))\n    def test_case_fails(n):\n>       assert n < 0, f\"case {n} failed on purpose\"\nE       AssertionError: case 12 failed on purpose\nE       assert 12 < 0\n\ntests/test_many_failures.py:18: AssertionError",
+      "run_time": 0.001,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[13]",
+      "result": "failure",
+      "message": "AssertionError: case 13 failed on purpose\nassert 13 < 0\nn = 13\n\n    @pytest.mark.parametrize(\"n\", range(25))\n    def test_case_fails(n):\n>       assert n < 0, f\"case {n} failed on purpose\"\nE       AssertionError: case 13 failed on purpose\nE       assert 13 < 0\n\ntests/test_many_failures.py:18: AssertionError",
+      "run_time": 0,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[14]",
+      "result": "failure",
+      "message": "AssertionError: case 14 failed on purpose\nassert 14 < 0\nn = 14\n\n    @pytest.mark.parametrize(\"n\", range(25))\n    def test_case_fails(n):\n>       assert n < 0, f\"case {n} failed on purpose\"\nE       AssertionError: case 14 failed on purpose\nE       assert 14 < 0\n\ntests/test_many_failures.py:18: AssertionError",
+      "run_time": 0.001,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[15]",
+      "result": "failure",
+      "message": "AssertionError: case 15 failed on purpose\nassert 15 < 0\nn = 15\n\n    @pytest.mark.parametrize(\"n\", range(25))\n    def test_case_fails(n):\n>       assert n < 0, f\"case {n} failed on purpose\"\nE       AssertionError: case 15 failed on purpose\nE       assert 15 < 0\n\ntests/test_many_failures.py:18: AssertionError",
+      "run_time": 0.001,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[16]",
+      "result": "failure",
+      "message": "AssertionError: case 16 failed on purpose\nassert 16 < 0\nn = 16\n\n    @pytest.mark.parametrize(\"n\", range(25))\n    def test_case_fails(n):\n>       assert n < 0, f\"case {n} failed on purpose\"\nE       AssertionError: case 16 failed on purpose\nE       assert 16 < 0\n\ntests/test_many_failures.py:18: AssertionError",
+      "run_time": 0,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[17]",
+      "result": "failure",
+      "message": "AssertionError: case 17 failed on purpose\nassert 17 < 0\nn = 17\n\n    @pytest.mark.parametrize(\"n\", range(25))\n    def test_case_fails(n):\n>       assert n < 0, f\"case {n} failed on purpose\"\nE       AssertionError: case 17 failed on purpose\nE       assert 17 < 0\n\ntests/test_many_failures.py:18: AssertionError",
+      "run_time": 0.001,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[18]",
+      "result": "failure",
+      "message": "AssertionError: case 18 failed on purpose\nassert 18 < 0\nn = 18\n\n    @pytest.mark.parametrize(\"n\", range(25))\n    def test_case_fails(n):\n>       assert n < 0, f\"case {n} failed on purpose\"\nE       AssertionError: case 18 failed on purpose\nE       assert 18 < 0\n\ntests/test_many_failures.py:18: AssertionError",
+      "run_time": 0.001,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[19]",
+      "result": "failure",
+      "message": "AssertionError: case 19 failed on purpose\nassert 19 < 0\nn = 19\n\n    @pytest.mark.parametrize(\"n\", range(25))\n    def test_case_fails(n):\n>       assert n < 0, f\"case {n} failed on purpose\"\nE       AssertionError: case 19 failed on purpose\nE       assert 19 < 0\n\ntests/test_many_failures.py:18: AssertionError",
+      "run_time": 0.001,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[20]",
+      "result": "failure",
+      "message": "AssertionError: case 20 failed on purpose\nassert 20 < 0\nn = 20\n\n    @pytest.mark.parametrize(\"n\", range(25))\n    def test_case_fails(n):\n>       assert n < 0, f\"case {n} failed on purpose\"\nE       AssertionError: case 20 failed on purpose\nE       assert 20 < 0\n\ntests/test_many_failures.py:18: AssertionError",
+      "run_time": 0.001,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[21]",
+      "result": "failure",
+      "message": "AssertionError: case 21 failed on purpose\nassert 21 < 0\nn = 21\n\n    @pytest.mark.parametrize(\"n\", range(25))\n    def test_case_fails(n):\n>       assert n < 0, f\"case {n} failed on purpose\"\nE       AssertionError: case 21 failed on purpose\nE       assert 21 < 0\n\ntests/test_many_failures.py:18: AssertionError",
+      "run_time": 0.001,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[22]",
+      "result": "failure",
+      "message": "AssertionError: case 22 failed on purpose\nassert 22 < 0\nn = 22\n\n    @pytest.mark.parametrize(\"n\", range(25))\n    def test_case_fails(n):\n>       assert n < 0, f\"case {n} failed on purpose\"\nE       AssertionError: case 22 failed on purpose\nE       assert 22 < 0\n\ntests/test_many_failures.py:18: AssertionError",
+      "run_time": 0.001,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[23]",
+      "result": "failure",
+      "message": "AssertionError: case 23 failed on purpose\nassert 23 < 0\nn = 23\n\n    @pytest.mark.parametrize(\"n\", range(25))\n    def test_case_fails(n):\n>       assert n < 0, f\"case {n} failed on purpose\"\nE       AssertionError: case 23 failed on purpose\nE       assert 23 < 0\n\ntests/test_many_failures.py:18: AssertionError",
+      "run_time": 0.001,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[24]",
+      "result": "failure",
+      "message": "AssertionError: case 24 failed on purpose\nassert 24 < 0\nn = 24\n\n    @pytest.mark.parametrize(\"n\", range(25))\n    def test_case_fails(n):\n>       assert n < 0, f\"case {n} failed on purpose\"\nE       AssertionError: case 24 failed on purpose\nE       assert 24 < 0\n\ntests/test_many_failures.py:18: AssertionError",
+      "run_time": 0.001,
+      "source": "unknown"
+    }
+  ],
+  "next_page_token": null
+}

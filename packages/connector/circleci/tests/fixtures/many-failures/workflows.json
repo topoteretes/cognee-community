@@ -1,0 +1,16 @@
+{
+  "next_page_token": null,
+  "items": [
+    {
+      "pipeline_id": "08931e5d-1eea-4bca-be5f-6d0ed9ebac99",
+      "id": "0aaa9d17-b110-4cca-b804-4252c16c4484",
+      "name": "build-and-test",
+      "project_slug": "gh/rokadepiyush49-rgb/cognee-circleci-fixture",
+      "status": "failed",
+      "started_by": "405f1dda-b196-404c-b8fb-a3128bdd413d",
+      "pipeline_number": 3,
+      "created_at": "2026-10-07T21:33:11Z",
+      "stopped_at": "2026-10-07T21:33:18Z"
+    }
+  ]
+}

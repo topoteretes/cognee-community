@@ -1,0 +1,98 @@
+{
+  "/pipeline/08931e5d-1eea-4bca-be5f-6d0ed9ebac99": {
+    "file": "many-failures/pipeline.json",
+    "status": 200
+  },
+  "/pipeline/08931e5d-1eea-4bca-be5f-6d0ed9ebac99/workflow": {
+    "file": "many-failures/workflows.json",
+    "status": 200
+  },
+  "/pipeline/1b70b7ee-4034-4f6c-924c-0f16bf30d03b": {
+    "file": "green/pipeline.json",
+    "status": 200
+  },
+  "/pipeline/1b70b7ee-4034-4f6c-924c-0f16bf30d03b/workflow": {
+    "file": "green/workflows.json",
+    "status": 200
+  },
+  "/pipeline/2ddad363-2d2e-4476-9cd1-aed100049957": {
+    "file": "main/pipeline.json",
+    "status": 200
+  },
+  "/pipeline/2ddad363-2d2e-4476-9cd1-aed100049957/workflow": {
+    "file": "main/workflows.json",
+    "status": 200
+  },
+  "/pipeline/b7918e16-820b-40e1-9ae0-717c119ce676": {
+    "file": "hold/pipeline.json",
+    "status": 200
+  },
+  "/pipeline/b7918e16-820b-40e1-9ae0-717c119ce676/workflow": {
+    "file": "hold/workflows.json",
+    "status": 200
+  },
+  "/pipeline/f71b0043-6b6e-4cef-8aca-b96b822bfa0d": {
+    "file": "slow/pipeline.json",
+    "status": 200
+  },
+  "/pipeline/f71b0043-6b6e-4cef-8aca-b96b822bfa0d/workflow": {
+    "file": "slow/workflows.json",
+    "status": 200
+  },
+  "/project/gh/rokadepiyush49-rgb/cognee-circleci-fixture/1/tests": {
+    "file": "main/tests_build-and-test_test.json",
+    "status": 200
+  },
+  "/project/gh/rokadepiyush49-rgb/cognee-circleci-fixture/13/tests": {
+    "file": "slow/tests_build-and-test_test.json",
+    "status": 200
+  },
+  "/project/gh/rokadepiyush49-rgb/cognee-circleci-fixture/19/tests": {
+    "file": "hold/tests_build-and-test_test.json",
+    "status": 200
+  },
+  "/project/gh/rokadepiyush49-rgb/cognee-circleci-fixture/3/tests": {
+    "file": "main/tests_build-and-test_smoke.json",
+    "status": 200
+  },
+  "/project/gh/rokadepiyush49-rgb/cognee-circleci-fixture/9/tests": {
+    "file": "many-failures/tests_build-and-test_test.json",
+    "status": 200
+  },
+  "/project/gh/rokadepiyush49-rgb/cognee-circleci-fixture/pipeline": {
+    "file": "pipelines.json",
+    "status": 200
+  },
+  "/project/gh/rokadepiyush49-rgb/does-not-exist/pipeline": {
+    "file": "errors/project_not_found.json",
+    "status": 404
+  },
+  "/workflow/0aaa9d17-b110-4cca-b804-4252c16c4484/job": {
+    "file": "many-failures/jobs_build-and-test.json",
+    "status": 200
+  },
+  "/workflow/1f7abda3-bda9-425e-9804-08bdff09c19e/job": {
+    "file": "slow/jobs_slow-check.json",
+    "status": 200
+  },
+  "/workflow/8567a462-4545-46c3-8b61-b45b3f9050c8/job": {
+    "file": "green/jobs_build-and-test.json",
+    "status": 200
+  },
+  "/workflow/906568c1-e678-4111-9294-e2e432173b92/job": {
+    "file": "main/jobs_build-and-test.json",
+    "status": 200
+  },
+  "/workflow/ae05edee-e09e-4321-8b8c-30d563450608/job": {
+    "file": "hold/jobs_needs-approval.json",
+    "status": 200
+  },
+  "/workflow/c0187f41-f1e6-4687-8941-389330b06b83/job": {
+    "file": "hold/jobs_build-and-test.json",
+    "status": 200
+  },
+  "/workflow/c7808883-54b5-472d-b1ef-9e2b665cb35f/job": {
+    "file": "slow/jobs_build-and-test.json",
+    "status": 200
+  }
+}
