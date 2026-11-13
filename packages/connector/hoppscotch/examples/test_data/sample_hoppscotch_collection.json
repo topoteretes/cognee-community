@@ -1,0 +1,114 @@
+{
+  "v": 2,
+  "name": "E-Commerce & Billing API",
+  "folders": [
+    {
+      "v": 2,
+      "name": "Payments",
+      "folders": [],
+      "requests": [
+        {
+          "v": 1,
+          "name": "Create Charge",
+          "method": "POST",
+          "endpoint": "<<baseUrl>>/v1/charges",
+          "headers": [
+            {
+              "key": "Content-Type",
+              "value": "application/json",
+              "active": true
+            },
+            {
+              "key": "Idempotency-Key",
+              "value": "<<idempotencyKey>>",
+              "active": true,
+              "description": "Unique key to prevent duplicate charges"
+            }
+          ],
+          "params": [],
+          "body": {
+            "contentType": "application/json",
+            "body": "{\n  \"amount\": 4999,\n  \"currency\": \"usd\",\n  \"customer_id\": \"cus_987654\",\n  \"description\": \"Monthly Pro Subscription\"\n}"
+          },
+          "auth": {
+            "authType": "bearer",
+            "authActive": true
+          }
+        },
+        {
+          "v": 1,
+          "name": "Refund Charge",
+          "method": "POST",
+          "endpoint": "<<baseUrl>>/v1/refunds",
+          "headers": [
+            {
+              "key": "Content-Type",
+              "value": "application/json",
+              "active": true
+            }
+          ],
+          "body": {
+            "contentType": "application/json",
+            "body": "{\n  \"charge_id\": \"ch_123456\",\n  \"reason\": \"requested_by_customer\"\n}"
+          },
+          "auth": {
+            "authType": "bearer",
+            "authActive": true
+          }
+        }
+      ]
+    },
+    {
+      "v": 2,
+      "name": "Products",
+      "folders": [],
+      "requests": [
+        {
+          "v": 1,
+          "name": "List Products",
+          "method": "GET",
+          "endpoint": "<<baseUrl>>/v1/products",
+          "params": [
+            {
+              "key": "limit",
+              "value": "20",
+              "active": true,
+              "description": "Number of results to return"
+            },
+            {
+              "key": "active",
+              "value": "true",
+              "active": true,
+              "description": "Filter by active products only"
+            }
+          ],
+          "headers": [
+            {
+              "key": "Accept",
+              "value": "application/json",
+              "active": true
+            }
+          ],
+          "auth": {
+            "authType": "bearer",
+            "authActive": true
+          }
+        }
+      ]
+    }
+  ],
+  "requests": [
+    {
+      "v": 1,
+      "name": "API Health Check",
+      "method": "GET",
+      "endpoint": "<<baseUrl>>/healthz",
+      "params": [],
+      "headers": [],
+      "auth": {
+        "authType": "none",
+        "authActive": false
+      }
+    }
+  ]
+}
