@@ -1,0 +1,36 @@
+[project]
+name = "cognee-community-connector-digitalocean"
+version = "0.1.0"
+description = "DigitalOcean data-source connector for Cognee - sync Droplets, App Platform, databases, Kubernetes, and projects into AI memory"
+readme = "README.md"
+requires-python = ">=3.10,<3.15"
+dependencies = [
+    "cognee>=1.6.4,<2",
+    "dlt[sqlalchemy]>=1.9.0,<2",
+    "httpx>=0.25.0,<1.0.0",
+    "pydantic>=2.0.0,<3.0.0",
+]
+
+[project.scripts]
+cognee-digitalocean = "cognee_community_connector_digitalocean.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/topoteretes/cognee"
+Repository = "https://github.com/topoteretes/cognee-community"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cognee_community_connector_digitalocean"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "N", "B", "UP", "C4", "PGH", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
