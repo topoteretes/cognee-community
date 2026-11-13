@@ -1,0 +1,29 @@
+# Global options
+{
+  email ops@company.com
+}
+
+# Production web app & API gateway
+app.company.com {
+  encode gzip zstd
+  tls ops@company.com
+
+  @api {
+    path /api/*
+  }
+  reverse_proxy @api 127.0.0.1:8080 {
+    header_up Host {upstream_hostport}
+  }
+
+  handle_path /static/* {
+    root * /var/www/static
+    file_server
+  }
+
+  reverse_proxy 127.0.0.1:3000
+}
+
+# Admin & monitoring portal
+admin.company.internal:9443 {
+  reverse_proxy 10.0.0.15:9443
+}
