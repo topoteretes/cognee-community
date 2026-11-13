@@ -27,3 +27,5 @@ cognee_graph.pkl
 .data_storage
 *.log.DS_Store
 .DS_Store
+# private keys
+*.pem
