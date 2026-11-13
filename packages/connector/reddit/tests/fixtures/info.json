@@ -1,0 +1,249 @@
+{
+ "request": "GET https://oauth.reddit.com/api/info/?id=t1_d7ltv00%2Ct3_5dec00%2Ct5_2qk00%2Ct1_d7ltv01%2Ct3_5dec01%2Ct5_2qk01%2Ct1_d7ltv02%2Ct3_5dec02%2Ct5_2q",
+ "response": {
+  "data": {
+   "after": null,
+   "before": null,
+   "children": [
+    {
+     "data": {
+      "approved_by": null,
+      "archived": false,
+      "author": "mp4downloader",
+      "author_flair_css_class": null,
+      "author_flair_text": null,
+      "banned_by": null,
+      "clicked": false,
+      "contest_mode": false,
+      "created": 1479391996.0,
+      "created_utc": 1479363196.0,
+      "distinguished": null,
+      "domain": "self.androidapps",
+      "downs": 0,
+      "edited": false,
+      "gilded": 0,
+      "hidden": false,
+      "hide_score": true,
+      "id": "5dec21",
+      "is_self": true,
+      "likes": null,
+      "link_flair_css_class": null,
+      "link_flair_text": null,
+      "locked": false,
+      "media": null,
+      "media_embed": {},
+      "mod_reports": [],
+      "name": "t3_5dec21",
+      "num_comments": 0,
+      "num_reports": null,
+      "over_18": false,
+      "permalink": "/r/androidapps/comments/5dec21/hold_onto_your_fairy_bread_foodies_chocolate/",
+      "post_hint": "self",
+      "preview": {
+       "images": [
+        {
+         "id": "fT_fPfDxONVbtsfd5bmoHs-SenWDW3k_0_sQ787lQfU",
+         "resolutions": [
+          {
+           "height": 67,
+           "url": "https://i.redditmedia.com/ngkngFQXpggsAVU5i_GU3lr53gaQfa7uR01nq0GFHU4.jpg?fit=crop&crop=faces%2Centropy&arh=2&w=108&s=eb97cef6e65a5a3d8854a0e4533bd401",
+           "width": 108
+          },
+          {
+           "height": 135,
+           "url": "https://i.redditmedia.com/ngkngFQXpggsAVU5i_GU3lr53gaQfa7uR01nq0GFHU4.jpg?fit=crop&crop=faces%2Centropy&arh=2&w=216&s=070c3a853324d18926c814f8323bcf51",
+           "width": 216
+          },
+          {
+           "height": 200,
+           "url": "https://i.redditmedia.com/ngkngFQXpggsAVU5i_GU3lr53gaQfa7uR01nq0GFHU4.jpg?fit=crop&crop=faces%2Centropy&arh=2&w=320&s=29ee413ab70308a1f48eb1942a4d4179",
+           "width": 320
+          },
+          {
+           "height": 400,
+           "url": "https://i.redditmedia.com/ngkngFQXpggsAVU5i_GU3lr53gaQfa7uR01nq0GFHU4.jpg?fit=crop&crop=faces%2Centropy&arh=2&w=640&s=86136eb8f29dd266b242d13598d0144e",
+           "width": 640
+          },
+          {
+           "height": 600,
+           "url": "https://i.redditmedia.com/ngkngFQXpggsAVU5i_GU3lr53gaQfa7uR01nq0GFHU4.jpg?fit=crop&crop=faces%2Centropy&arh=2&w=960&s=5c2bd50fa494a08dbeca1037dc345955",
+           "width": 960
+          },
+          {
+           "height": 675,
+           "url": "https://i.redditmedia.com/ngkngFQXpggsAVU5i_GU3lr53gaQfa7uR01nq0GFHU4.jpg?fit=crop&crop=faces%2Centropy&arh=2&w=1080&s=1beb78c9c0b73d2024fcd63df8c3562c",
+           "width": 1080
+          }
+         ],
+         "source": {
+          "height": 800,
+          "url": "https://i.redditmedia.com/ngkngFQXpggsAVU5i_GU3lr53gaQfa7uR01nq0GFHU4.jpg?s=3cf0d1d7a2e72592336698d115a040ff",
+          "width": 1280
+         },
+         "variants": {}
+        }
+       ]
+      },
+      "quarantine": false,
+      "removal_reason": null,
+      "report_reasons": null,
+      "saved": false,
+      "score": 1,
+      "secure_media": null,
+      "secure_media_embed": {},
+      "selftext": "[removed]",
+      "selftext_html": "<!-- SC_OFF --><div class=\"md\"><p>[removed]</p>\n</div><!-- SC_ON -->",
+      "spoiler": false,
+      "stickied": false,
+      "subreddit": "androidapps",
+      "subreddit_id": "t5_2reen",
+      "suggested_sort": null,
+      "thumbnail": "self",
+      "title": "Hold onto your fairy bread, foodies. Chocolate cheese is a thing now. https://t.co/JQiydhuo0z #downloader #androidapps",
+      "ups": 1,
+      "url": "https://www.reddit.com/r/androidapps/comments/5dec21/hold_onto_your_fairy_bread_foodies_chocolate/",
+      "user_reports": [],
+      "visited": false
+     },
+     "kind": "t3"
+    },
+    {
+     "data": {
+      "approved_by": null,
+      "archived": false,
+      "author": "MyKale98",
+      "author_flair_css_class": null,
+      "author_flair_text": null,
+      "banned_by": null,
+      "clicked": false,
+      "contest_mode": false,
+      "created": 1479391964.0,
+      "created_utc": 1479363164.0,
+      "distinguished": null,
+      "domain": "self.UIUC",
+      "downs": 0,
+      "edited": false,
+      "gilded": 0,
+      "hidden": false,
+      "hide_score": true,
+      "id": "5dec00",
+      "is_self": true,
+      "likes": null,
+      "link_flair_css_class": null,
+      "link_flair_text": null,
+      "locked": false,
+      "media": null,
+      "media_embed": {},
+      "mod_reports": [],
+      "name": "t3_5dec00",
+      "num_comments": 0,
+      "num_reports": null,
+      "over_18": false,
+      "permalink": "/r/UIUC/comments/5dec00/class_choice_question/",
+      "quarantine": false,
+      "removal_reason": null,
+      "report_reasons": null,
+      "saved": false,
+      "score": 1,
+      "secure_media": null,
+      "secure_media_embed": {},
+      "selftext": "Is cs 105 worth it to take or should I take fin 221 instead? \nHow is fin 221 if you have taken it and what is the work load like?",
+      "selftext_html": "<!-- SC_OFF --><div class=\"md\"><p>Is cs 105 worth it to take or should I take fin 221 instead? \nHow is fin 221 if you have taken it and what is the work load like?</p>\n</div><!-- SC_ON -->",
+      "spoiler": false,
+      "stickied": false,
+      "subreddit": "UIUC",
+      "subreddit_id": "t5_2qkxs",
+      "suggested_sort": null,
+      "thumbnail": "self",
+      "title": "Class choice question",
+      "ups": 1,
+      "url": "https://www.reddit.com/r/UIUC/comments/5dec00/class_choice_question/",
+      "user_reports": [],
+      "visited": false
+     },
+     "kind": "t3"
+    },
+    {
+     "data": {
+      "approved_by": null,
+      "archived": false,
+      "author": "metalclassicrock123",
+      "author_flair_css_class": null,
+      "author_flair_text": null,
+      "banned_by": null,
+      "clicked": false,
+      "contest_mode": false,
+      "created": 1479391965.0,
+      "created_utc": 1479363165.0,
+      "distinguished": null,
+      "domain": "en.wikipedia.org",
+      "downs": 0,
+      "edited": false,
+      "gilded": 0,
+      "hidden": false,
+      "hide_score": true,
+      "id": "5dec02",
+      "is_self": false,
+      "likes": null,
+      "link_flair_css_class": null,
+      "link_flair_text": null,
+      "locked": false,
+      "media": null,
+      "media_embed": {},
+      "mod_reports": [],
+      "name": "t3_5dec02",
+      "num_comments": 4,
+      "num_reports": null,
+      "over_18": false,
+      "permalink": "/r/todayilearned/comments/5dec02/til_that_the_japaneseamerican_internment_was/",
+      "post_hint": "link",
+      "preview": {
+       "images": [
+        {
+         "id": "ctGYA_c2hrqFyuPm_BaiNz5fRrclltiDEpgYgEE_WOg",
+         "resolutions": [
+          {
+           "height": 73,
+           "url": "https://i.redditmedia.com/ZV5DTkQ48Pmu2DmzMQbaw9I6nigri5W-39rdXu96UG0.jpg?fit=crop&crop=faces%2Centropy&arh=2&w=108&s=10e5648d289d0a178d2620c0a5b3f37e",
+           "width": 108
+          }
+         ],
+         "source": {
+          "height": 136,
+          "url": "https://i.redditmedia.com/ZV5DTkQ48Pmu2DmzMQbaw9I6nigri5W-39rdXu96UG0.jpg?s=fdd0fa4a4ed5bc2b5a4373e2b7fe02d1",
+          "width": 200
+         },
+         "variants": {}
+        }
+       ]
+      },
+      "quarantine": false,
+      "removal_reason": null,
+      "report_reasons": null,
+      "saved": false,
+      "score": 6,
+      "secure_media": null,
+      "secure_media_embed": {},
+      "selftext": "",
+      "selftext_html": null,
+      "spoiler": false,
+      "stickied": false,
+      "subreddit": "todayilearned",
+      "subreddit_id": "t5_2qqjc",
+      "suggested_sort": null,
+      "thumbnail": "http://b.thumbs.redditmedia.com/WYKVr2ynYtGa4YsrgsAPW6kvma-DzLbjkQbbKs7nzjw.jpg",
+      "title": "TIL that the Japanese-American internment was ruled constitutional in a 1944 Supreme Court case.",
+      "ups": 6,
+      "url": "https://en.wikipedia.org/wiki/Korematsu_v._United_States",
+      "user_reports": [],
+      "visited": false
+     },
+     "kind": "t3"
+    }
+   ],
+   "modhash": ""
+  },
+  "kind": "Listing"
+ },
+ "source": "TestReddit.test_info (3 of the posts)"
+}

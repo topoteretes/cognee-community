@@ -1,0 +1,8 @@
+{
+ "request": "GET https://oauth.reddit.com/r/ferguson/hot?limit=100&raw_json=1 -> 403",
+ "response": {
+  "error": 403,
+  "message": "Forbidden"
+ },
+ "source": "TestSubredditQuarantine.test_opt_in"
+}
