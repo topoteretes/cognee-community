@@ -1,0 +1,29 @@
+{
+  "snapshot_version": 1,
+  "endpoint": "public-documentation-only",
+  "protocol_version": null,
+  "server_info": null,
+  "server_capabilities": {
+    "tools": {}
+  },
+  "tools": [
+    {
+      "name": "find_sessions",
+      "description": "Public documentation says this tool filters LogRocket sessions. Its live schemas have not been captured.",
+      "input_schema": {
+        "type": "object",
+        "properties": {}
+      },
+      "output_schema": null
+    },
+    {
+      "name": "find_issues",
+      "description": "Public documentation says this tool queries LogRocket issues. Its live schemas have not been captured.",
+      "input_schema": {
+        "type": "object",
+        "properties": {}
+      },
+      "output_schema": null
+    }
+  ]
+}
