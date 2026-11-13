@@ -1,0 +1,18 @@
+WEBVTT - Client Sprint Retrospective
+
+NOTE
+This is an automated Zoom / Whisper export note.
+
+STYLE
+::cue {
+  color: #fff;
+}
+
+00:00:02.100 --> 00:00:04.900 line:0% position:50%
+<v Carol>The checkout conversion funnel saw a 15% increase after the PR merge.</v>
+
+00:00:05.100 --> 00:00:07.800
+<v Carol>Specifically, the Stripe micropayment flow completed in 1.2 seconds.</v>
+
+00:00:10.500 --> 00:00:13.200
+<v David>Awesome work Carol. Let's make sure telemetry reports are enabled by default.</v>
