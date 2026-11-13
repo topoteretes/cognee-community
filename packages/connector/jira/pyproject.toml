@@ -1,0 +1,28 @@
+[project]
+name = "cognee-community-connector-jira"
+version = "0.1.0"
+description = "Scoped Jira Cloud document snapshots and incremental refresh for Cognee"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = ["cognee>=1.6.5,<1.7", "dlt[sqlalchemy]>=1.30,<1.31", "pypdf>=6,<7"]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10", "ruff>=0.9"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cognee_community_connector_jira"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"VERIFIED_SOURCE_LICENSE" = "cognee_community_connector_jira/VERIFIED_SOURCE_LICENSE"
+"VERIFIED_SOURCE.md" = "cognee_community_connector_jira/VERIFIED_SOURCE.md"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
