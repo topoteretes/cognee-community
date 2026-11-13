@@ -1,0 +1,64 @@
+[
+ {
+  "type": "call",
+  "id": "1",
+  "attributes": {
+   "direction": "outbound",
+   "outcome": "Connected",
+   "state": "completed",
+   "note": "Call note NOTE1",
+   "to": "+15559991",
+   "from": "+15550000",
+   "createdAt": "2026-01-01T00:00:00.000Z",
+   "updatedAt": "2026-03-01T00:00:00.000Z"
+  },
+  "links": {
+   "self": "https://api.outreach.example.test/api/v2/calls/1"
+  },
+  "relationships": {
+   "prospect": {
+    "data": {
+     "type": "prospect",
+     "id": "1"
+    }
+   },
+   "user": {
+    "data": {
+     "type": "user",
+     "id": "1"
+    }
+   }
+  }
+ },
+ {
+  "type": "call",
+  "id": "2",
+  "attributes": {
+   "direction": "outbound",
+   "outcome": "Connected",
+   "state": "completed",
+   "note": "Call note NOTE2",
+   "to": "+15559992",
+   "from": "+15550000",
+   "createdAt": "2026-01-01T00:00:00.000Z",
+   "updatedAt": "2026-03-02T00:00:00.000Z"
+  },
+  "links": {
+   "self": "https://api.outreach.example.test/api/v2/calls/2"
+  },
+  "relationships": {
+   "prospect": {
+    "data": {
+     "type": "prospect",
+     "id": "2"
+    }
+   },
+   "user": {
+    "data": {
+     "type": "user",
+     "id": "1"
+    }
+   }
+  }
+ }
+]

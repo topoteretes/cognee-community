@@ -1,0 +1,113 @@
+[
+ {
+  "type": "mailing",
+  "id": "1",
+  "attributes": {
+   "state": "delivered",
+   "mailingType": "sequence",
+   "subject": "Hello SUBJECT1",
+   "bodyText": "Body text BODY1",
+   "bodyHtml": "<b>x</b>",
+   "openCount": 1,
+   "createdAt": "2026-01-01T00:00:00.000Z",
+   "updatedAt": "2026-03-01T00:00:00.000Z"
+  },
+  "links": {
+   "self": "https://api.outreach.example.test/api/v2/mailings/1"
+  },
+  "relationships": {
+   "prospect": {
+    "data": {
+     "type": "prospect",
+     "id": "1"
+    }
+   },
+   "sequence": {
+    "data": {
+     "type": "sequence",
+     "id": "1"
+    }
+   },
+   "user": {
+    "data": {
+     "type": "user",
+     "id": "1"
+    }
+   }
+  }
+ },
+ {
+  "type": "mailing",
+  "id": "2",
+  "attributes": {
+   "state": "delivered",
+   "mailingType": "sequence",
+   "subject": "Hello SUBJECT2",
+   "bodyText": "Body text BODY2",
+   "bodyHtml": "<b>x</b>",
+   "openCount": 2,
+   "createdAt": "2026-01-01T00:00:00.000Z",
+   "updatedAt": "2026-03-02T00:00:00.000Z"
+  },
+  "links": {
+   "self": "https://api.outreach.example.test/api/v2/mailings/2"
+  },
+  "relationships": {
+   "prospect": {
+    "data": {
+     "type": "prospect",
+     "id": "2"
+    }
+   },
+   "sequence": {
+    "data": {
+     "type": "sequence",
+     "id": "1"
+    }
+   },
+   "user": {
+    "data": {
+     "type": "user",
+     "id": "1"
+    }
+   }
+  }
+ },
+ {
+  "type": "mailing",
+  "id": "3",
+  "attributes": {
+   "state": "delivered",
+   "mailingType": "sequence",
+   "subject": "Hello SUBJECT3",
+   "bodyText": "Body text BODY3",
+   "bodyHtml": "<b>x</b>",
+   "openCount": 3,
+   "createdAt": "2026-01-01T00:00:00.000Z",
+   "updatedAt": "2026-03-03T00:00:00.000Z"
+  },
+  "links": {
+   "self": "https://api.outreach.example.test/api/v2/mailings/3"
+  },
+  "relationships": {
+   "prospect": {
+    "data": {
+     "type": "prospect",
+     "id": "3"
+    }
+   },
+   "sequence": {
+    "data": {
+     "type": "sequence",
+     "id": "1"
+    }
+   },
+   "user": {
+    "data": {
+     "type": "user",
+     "id": "1"
+    }
+   }
+  }
+ }
+]
