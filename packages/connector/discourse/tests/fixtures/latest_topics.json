@@ -1,0 +1,37 @@
+{
+  "topic_list": {
+    "topics": [
+      {
+        "id": 1042,
+        "title": "How do I configure the authentication plugin?",
+        "slug": "how-to-configure-auth-plugin",
+        "category_id": 3,
+        "tags": ["plugin", "authentication", "setup"],
+        "created_at": "2026-09-10T08:15:00Z",
+        "bumped_at": "2026-09-12T16:42:00Z",
+        "posts_count": 7,
+        "views": 342,
+        "like_count": 5,
+        "posters": [
+          {"user": {"username": "forum_admin"}, "description": "Original Poster"},
+          {"user": {"username": "dev_user1"}, "description": "Most Recent Poster"}
+        ]
+      },
+      {
+        "id": 1058,
+        "title": "Release notes: v2.5.0 now available",
+        "slug": "release-notes-v2-5-0",
+        "category_id": 1,
+        "tags": ["announcement", "release"],
+        "created_at": "2026-09-15T12:00:00Z",
+        "bumped_at": "2026-09-15T12:00:00Z",
+        "posts_count": 12,
+        "views": 1287,
+        "like_count": 42,
+        "posters": [
+          {"user": {"username": "team_lead"}, "description": "Original Poster"}
+        ]
+      }
+    ]
+  }
+}
