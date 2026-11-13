@@ -1,0 +1,51 @@
+[project]
+name = "cognee-community-connector-mongodb"
+version = "0.1.0"
+description = "MongoDB data-source connector for cognee — sync a collection into memory (incremental + forget-on-delete)"
+readme = "README.md"
+requires-python = ">=3.11,<=3.13"
+dependencies = [
+    # Requires cognee "document-mode" (DOCUMENT_SOURCE_ATTR + resolve_dlt_sources
+    # routing each row through cognify instead of the dlt-row schema path), first
+    # shipped in cognee 1.4.0. Pinned to the version this connector is tested
+    # against; move it forward in step with the other connectors.
+    "cognee==1.6.3",
+    "dlt[sqlalchemy]>=1.9.0,<2",
+    "pymongo>=4.6.0,<5",
+]
+
+[dependency-groups]
+# Declared so the test suite — including the end-to-end dlt merge and the
+# forget-on-delete graph test — actually runs. Sibling connectors leave these
+# undeclared, so their equivalent tests skip silently wherever an extra is absent.
+dev = [
+    "pytest>=8,<9",
+    "pytest-asyncio>=0.24,<1",
+    "mongomock>=4.1,<5",
+    "duckdb>=1,<2",
+    "ruff>=0.16,<1",
+]
+
+[project.urls]
+Homepage = "https://github.com/topoteretes/cognee"
+Repository = "https://github.com/topoteretes/cognee-community"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cognee_community_connector_mongodb"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "N", "B", "UP", "C4", "PGH", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
