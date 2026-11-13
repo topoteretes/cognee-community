@@ -1,0 +1,88 @@
+name: Supabase Connector Tests
+
+on:
+  pull_request:
+    paths:
+      - "packages/connector/supabase/**"
+      - ".github/workflows/supabase_connector_tests.yml"
+      - "ruff.toml"
+  push:
+    branches: [main, dev]
+    paths:
+      - "packages/connector/supabase/**"
+      - ".github/workflows/supabase_connector_tests.yml"
+      - "ruff.toml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: supabase-connector-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  connector:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: packages/connector/supabase
+    env:
+      DLT_TELEMETRY: "false"
+      SUPABASE_TEST_LIVE_SMOKE: "0"
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: connector_admin
+          POSTGRES_DB: postgres
+          # Synthetic data only; new SELECT-only roles have no password. The
+          # disposable service is reachable only on this runner's loopback.
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - "127.0.0.1:55455:5432"
+        options: >-
+          --health-cmd "pg_isready -U connector_admin -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install locked runtime and pinned test tools
+        run: |
+          python -m pip install uv==0.12.5
+          uv sync --locked
+          uv pip install pytest==9.1.1 pytest-asyncio==1.4.0 ruff==0.16.10
+          uv pip check
+      - name: Lint and format
+        run: |
+          uv run --no-sync ruff check .
+          uv run --no-sync ruff format --check .
+      - name: Unit and state regressions
+        env:
+          SYSTEM_ROOT_DIRECTORY: ${{ runner.temp }}/supabase-cognee/system
+          DATA_ROOT_DIRECTORY: ${{ runner.temp }}/supabase-cognee/data
+          COGNEE_LOGS_DIR: ${{ runner.temp }}/supabase-cognee/logs
+        run: uv run --no-sync pytest tests -m "not integration" -v -rA
+      - name: PostgreSQL and Cognee storage lifecycle
+        env:
+          SYSTEM_ROOT_DIRECTORY: ${{ runner.temp }}/supabase-cognee/system
+          DATA_ROOT_DIRECTORY: ${{ runner.temp }}/supabase-cognee/data
+          COGNEE_LOGS_DIR: ${{ runner.temp }}/supabase-cognee/logs
+          SUPABASE_TEST_DISPOSABLE: "1"
+          SUPABASE_TEST_ADMIN_URL: postgresql+psycopg://connector_admin@127.0.0.1:55455/postgres
+        run: |
+          uv run --no-sync pytest tests/test_postgres.py tests/test_cognee_e2e.py -v -rA --junitxml=storage-results.xml
+          uv run --no-sync python - <<'PY'
+          import xml.etree.ElementTree as ET
+
+          cases = ET.parse("storage-results.xml").findall(".//testcase")
+          assert len(cases) == 2, "Both storage tests must execute"
+          assert all(case.find("skipped") is None for case in cases), "Storage tests must not skip"
+          PY
