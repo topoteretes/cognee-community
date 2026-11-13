@@ -1,0 +1,17 @@
+# Local workaround for ladybug's missing native shared library on some
+# installs (see README "Testing" section / cognee_chatgpt.md issues log).
+# Never commit this - it's a 19MB third-party binary, fetched per-machine.
+lib/
+
+# Tool/editor caches - also covered by the repo-root .gitignore for the
+# common ones, but kept explicit here since this package gets developed
+# standalone too (uv venv/sync, pytest, ruff all run directly in this dir).
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.pyc
+
+# VS Code "Competitive Programming Helper" extension cache - unrelated to
+# this project, created automatically next to test files it indexes.
+.cph/
+**/.cph/
