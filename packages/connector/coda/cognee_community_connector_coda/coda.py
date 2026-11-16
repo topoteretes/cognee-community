@@ -32,10 +32,11 @@ Design
   are emitted as hard-delete tombstones; a 404 from a child listing is confirmed
   on the doc first, and an empty table listing by the next run. A 403 (access
   removed) is never read as deletion: that doc, page or table is left as it is.
-* **A run is bounded.** A long rate limit, a spent retry wait budget or a spent
-  request budget stops the run cleanly, keeps the docs, pages and tables it
-  finished and reports why in ``cognee_sync_stats``. Any other failure raises,
-  and dlt rolls the state of a failed run back.
+* **A run is bounded.** A long rate limit, a spent retry wait budget, a spent
+  request budget or a token revoked after a doc is finished stops the run
+  cleanly, keeps the docs, pages and tables it finished and reports why in
+  ``cognee_sync_stats``. Any other failure raises, and dlt rolls the state of a
+  failed run back.
 
 Privacy
 -------
@@ -68,6 +69,8 @@ _RETRIES = 5
 _MAX_RETRY_SLEEP = 60.0
 # Total time one run may wait on retries before it stops cleanly.
 DEFAULT_MAX_SLEEP = 300.0
+# Waits are slept in steps this long, asking the host's check_active in between.
+_WAIT_STEP = 1.0
 # Requests per run; a page export counts as one. Bigger accounts finish over several runs.
 DEFAULT_MAX_REQUESTS = 1000
 # Page exports run in the background; a large page finishes well within two minutes.
@@ -80,6 +83,7 @@ _TABLE_TYPES = "table,database"
 _DELETED = (404, 410)
 _FORBIDDEN = 403
 _STATS = (
+    "scanned",
     "emitted",
     "unchanged",
     "exported",
@@ -87,6 +91,7 @@ _STATS = (
     "gone",
     "unreadable",
     "failed",
+    "failed_auth",
     "failed_rate_limit",
     "failed_budget",
 )
@@ -175,12 +180,17 @@ class CodaClient:
         self._slept = 0.0
 
     def _pause(self, delay: float) -> None:
-        # The host may revoke access while a request waits, so ask before and after.
-        if self._check_active is not None:
-            self._check_active()
-        self._sleep(delay)
-        if self._check_active is not None:
-            self._check_active()
+        # The host may revoke access while a request waits (cognee holds its staging
+        # lock meanwhile), so ask before, between short steps, and after.
+        left = delay
+        while True:
+            if self._check_active is not None:
+                self._check_active()
+            if left <= 0:
+                return
+            step = min(_WAIT_STEP, left)
+            self._sleep(step)
+            left -= step
 
     def _wait(self, delay: float) -> None:
         if self._slept + delay > self._max_sleep:
@@ -359,6 +369,12 @@ class _Walker:
             return method(*args)
         except CodaRateLimitedError:
             raise _CutShortError("rate_limit") from None
+        except CodaAuthError:
+            # Revoked midway: keep the docs finished so far. A token rejected before
+            # any doc is finished still raises, so a bad token is never a quiet run.
+            if self.progressed:
+                raise _CutShortError("auth") from None
+            raise
 
     def _items(self, path: str, params: dict[str, Any] | None = None) -> Iterator[dict]:
         """Yield every item of a paginated Coda list."""
@@ -452,6 +468,7 @@ class _Walker:
         known: dict[str, dict] = entry.setdefault(kind, {})
         listed: set[str] = set()
         for item in items:
+            self.stats["scanned"] += 1
             listed.add(item["id"])
             previous = known.get(item["id"])
             if previous and previous["updated"] == item.get("updatedAt") and not renamed:
@@ -606,7 +623,8 @@ def _iter_rows(
 ) -> Iterator[dict]:
     """Yield changed rows and tombstones. Pure of dlt, so tests drive it with a dict.
 
-    A rejected token raises :class:`CodaAuthError`, which is never read as "gone".
+    A token rejected before any doc is finished raises :class:`CodaAuthError`;
+    later it stops the run like a rate limit. It is never read as "gone".
     """
     for key in _STATS:
         stats.setdefault(key, 0)
@@ -646,10 +664,9 @@ def _slug(value: str) -> str:
     return slug
 
 
-def _default_resource_name(
-    doc_ids: list[str] | None, workspace_id: str | None, folder_id: str | None
-) -> str:
-    if (doc_ids and len(doc_ids) > 1) or not (doc_ids or workspace_id or folder_id):
+def _default_resource_name(config: _CodaConfig) -> str:
+    doc_ids, workspace_id, folder_id = config.doc_ids, config.workspace_id, config.folder_id
+    if len(doc_ids) > 1 or not (doc_ids or workspace_id or folder_id):
         raise ValueError(
             "Pass a resource_name when syncing several docs or every doc of the token: "
             "it scopes this sync's state and cleanup, and two sources sharing one would "
@@ -659,6 +676,10 @@ def _default_resource_name(
         name = "coda_" + _slug(str(doc_ids[0]))
     else:
         name = "coda_" + "_".join(_slug(part) for part in (workspace_id, folder_id) if part)
+    filters = [config.include_tables, config.include_hidden_pages, config.include_sync_pages]
+    if filters != [True, False, False]:
+        # Two syncs of one doc that take different pages would forget each other's.
+        name += "_" + hashlib.sha256(json.dumps(filters).encode()).hexdigest()[:8]
     if len(name) > _MAX_RESOURCE_NAME:
         # A long id is cut, and a hash of the whole name keeps cut names apart.
         digest = hashlib.sha256(name.encode()).hexdigest()[:8]
@@ -680,6 +701,31 @@ def _check_resource_name(name: Any) -> None:
         raise ValueError(f"resource_name must be at most {_MAX_RESOURCE_NAME} characters")
     if NamingConvention().normalize_table_identifier(name) != name:
         raise ValueError("resource_name must be lowercase snake_case (letters, digits, _)")
+
+
+def _check_id(value: Any, label: str) -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{label} must be a non-empty string")
+
+
+def _check_settings(
+    doc_ids: Any, workspace_id: Any, folder_id: Any, base_url: Any, max_requests: Any
+) -> None:
+    """Fail at construction on settings a run would misread."""
+    if isinstance(doc_ids, str):
+        raise TypeError("doc_ids must be a list of doc ids, not a string")
+    for doc_id in doc_ids or ():
+        _check_id(doc_id, "every doc id in doc_ids")
+    for value, label in ((workspace_id, "workspace_id"), (folder_id, "folder_id")):
+        if value is not None:
+            _check_id(value, label)
+    # The token is sent to this address, so it must be an https URL.
+    if base_url is not None and (
+        not isinstance(base_url, str) or not re.fullmatch(r"https://[^\s/]+(/\S*)?", base_url)
+    ):
+        raise ValueError("base_url must be an https:// URL")
+    if isinstance(max_requests, bool) or not isinstance(max_requests, int) or max_requests < 1:
+        raise ValueError("max_requests must be an integer of at least 1")
 
 
 def coda_source(
@@ -704,27 +750,28 @@ def coda_source(
     and ``primary_key="id"``.
 
     Args:
-        doc_ids: Docs to sync. A listed doc that cannot be read on its first sync
-            raises. Defaults to every doc the token can see, narrowed by
-            ``workspace_id`` and ``folder_id``.
+        doc_ids: Docs to sync, a list of ids (a bare string raises). A listed doc
+            that cannot be read on its first sync raises. Defaults to every doc
+            the token can see, narrowed by ``workspace_id`` and ``folder_id``.
         token: Coda API token.
         workspace_id: Only docs of this workspace, when ``doc_ids`` is not given.
         folder_id: Only docs of this folder, when ``doc_ids`` is not given.
         include_tables: Ingest each table (not views) as one document.
         include_hidden_pages: Also ingest hidden pages.
         include_sync_pages: Also ingest sync pages, which mirror a page of another doc.
-        base_url: API base URL, default ``https://coda.io/apis/v1``.
-        max_requests: Request budget of one run, checked once a doc is finished. A
-            bigger account finishes over several runs; a spent budget sets
-            ``failed`` and ``failed_budget``.
+        base_url: API base URL (https only), default ``https://coda.io/apis/v1``.
+        max_requests: Request budget of one run (at least 1), checked once a doc
+            is finished. A bigger account finishes over several runs; a spent
+            budget sets ``failed`` and ``failed_budget``.
         resource_name: Staging table name, which scopes this sync's state and
-            cleanup. Defaults to one derived from the doc, workspace or folder;
-            required when ``doc_ids`` lists several docs or nothing narrows the
-            selection. A name you pass must be lowercase snake_case of at most 64
-            characters.
+            cleanup. Defaults to one derived from the doc, workspace or folder,
+            plus a short hash when the ``include_*`` options differ from their
+            defaults; required when ``doc_ids`` lists several docs or nothing
+            narrows the selection. A name you pass must be lowercase snake_case
+            of at most 64 characters.
         check_active: Optional host authorization checkpoint, called before each
-            request and around each row, and in the client built here around every
-            retry wait and export poll.
+            request and around each row, and in the client built here before,
+            after and once a second during every retry wait and export poll.
         service: Pre-built client (see :class:`CodaClient`). Mainly an injection
             point for tests and hosts. ``client`` is accepted as an alias.
 
@@ -742,11 +789,19 @@ def coda_source(
             "Coda sync requires a cognee build with table-scoped DLT document cleanup."
         )
 
-    if isinstance(doc_ids, str):
-        raise TypeError("doc_ids must be a list of doc ids, not a string")
+    _check_settings(doc_ids, workspace_id, folder_id, base_url, max_requests)
+    config = _CodaConfig(
+        doc_ids=tuple(doc_ids or ()),
+        workspace_id=workspace_id,
+        folder_id=folder_id,
+        include_tables=include_tables,
+        include_hidden_pages=include_hidden_pages,
+        include_sync_pages=include_sync_pages,
+        max_requests=max_requests,
+    )
     name = resource_name
     if name is None:
-        name = _default_resource_name(doc_ids, workspace_id, folder_id)
+        name = _default_resource_name(config)
     _check_resource_name(name)
     service = service or client
     owned = service is None
@@ -757,15 +812,6 @@ def coda_source(
             token=token, base_url=base_url or DEFAULT_BASE_URL, check_active=check_active
         )
 
-    config = _CodaConfig(
-        doc_ids=tuple(doc_ids or ()),
-        workspace_id=workspace_id,
-        folder_id=folder_id,
-        include_tables=include_tables,
-        include_hidden_pages=include_hidden_pages,
-        include_sync_pages=include_sync_pages,
-        max_requests=int(max_requests),
-    )
     stats: dict[str, int] = {}
 
     @dlt.resource(

@@ -113,7 +113,8 @@ def test_export_polls_until_complete_and_downloads_without_the_token():
     assert requests[0].headers["Authorization"] == "Bearer tok-1"
     assert requests[1].url.path.endswith("/export/req-1")
     assert "Authorization" not in requests[-1].headers
-    assert sleeps == [1.0, 2.0]
+    # Polls wait 1 s, then 2 s, slept in 1 s steps.
+    assert sleeps == [1.0] * 3
 
 
 def test_failed_or_stuck_exports_raise():
@@ -146,7 +147,7 @@ def test_client_retries_429_and_raises_status_only_errors():
     )
     client, _, sleeps = _client(lambda request: next(responses))
     assert client.get("/docs") == {"items": []}
-    assert sleeps == [4.0]
+    assert sleeps == [1.0] * 4
 
     client, _, _ = _client(lambda request: httpx.Response(401))
     with pytest.raises(CodaAuthError):
@@ -181,7 +182,25 @@ def test_client_retry_waits_stop_at_the_budget_until_reset():
         client.get("/docs")
     client.reset_sleep_budget()
     assert client.get("/docs") == {"items": []}
-    assert sleeps == [40.0]
+    assert sleeps == [1.0] * 40
+
+
+def test_client_waits_in_short_steps_asking_check_active_between():
+    checks = []
+
+    def revoke_on_the_fifth_check():
+        checks.append(True)
+        if len(checks) == 5:
+            raise PermissionError("access revoked")
+
+    responses = iter([httpx.Response(429, headers={"Retry-After": "30"})])
+    client, requests, sleeps = _client(
+        lambda request: next(responses), check_active=revoke_on_the_fifth_check
+    )
+    with pytest.raises(PermissionError):
+        client.get("/docs")
+    # A 30 s wait stops within a second of the revocation, not after 30 s.
+    assert sleeps == [1.0] * 4 and len(requests) == 1
 
 
 def test_client_rejects_bad_tokens_without_echoing_them():
@@ -619,6 +638,37 @@ def test_bad_token_raises_and_forgets_nothing(doc):
     assert state["docs"][DOC]["pages"]
 
 
+def test_token_revoked_after_a_finished_doc_stops_cleanly(doc):
+    doc.add_doc("ZzOther1", "Other")
+    doc.add_page("p-other", "Notes", "text", doc_id="ZzOther1")
+    state, stats = {}, {}
+    real_get = doc.get
+
+    def revoke_on_the_second_doc(path, params=None):
+        if path.startswith("/docs/ZzOther1/"):
+            doc.bad_token = True
+        return real_get(path, params)
+
+    doc.get = revoke_on_the_second_doc
+    rows = _run(doc, state, stats=stats, doc_ids=(DOC, "ZzOther1"))
+    # The finished doc is kept and nothing is forgotten.
+    assert _ids(rows) == [f"page:{DOC}:canvas-1", f"table:{DOC}:grid-1"]
+    assert stats["failed"] == 1 and stats["failed_auth"] == 1
+    assert DOC in state["docs"] and "ZzOther1" not in state["docs"]
+
+    # The next run with the same revoked token raises at once.
+    with pytest.raises(CodaAuthError):
+        _run(doc, state, doc_ids=(DOC, "ZzOther1"))
+
+
+def test_stats_count_scanned_and_unchanged_items(doc):
+    state, stats = {}, {}
+    _run(doc, state)
+    _run(doc, state, stats=stats)
+    assert stats["scanned"] == 2 and stats["unchanged"] == 2 and stats["emitted"] == 0
+    assert stats["failed_auth"] == 0
+
+
 def test_other_errors_raise_instead_of_forgetting(doc):
     state = {}
     _run(doc, state)
@@ -661,6 +711,49 @@ def test_invalid_resource_name_is_rejected(coda, name):
 def test_doc_ids_as_a_bare_string_raises(coda):
     with pytest.raises(TypeError, match="not a string"):
         coda_source(DOC, service=coda)
+
+
+@pytest.mark.parametrize(
+    "kwargs, message",
+    [
+        ({"doc_ids": [""]}, "doc_ids"),
+        ({"doc_ids": [DOC, 7]}, "doc_ids"),
+        ({"doc_ids": None, "workspace_id": " "}, "workspace_id"),
+        ({"doc_ids": None, "folder_id": 5}, "folder_id"),
+        ({"base_url": "http://coda.io/apis/v1"}, "base_url"),
+        ({"base_url": "coda.io"}, "base_url"),
+        ({"max_requests": 0}, "max_requests"),
+        ({"max_requests": True}, "max_requests"),
+        ({"max_requests": "100"}, "max_requests"),
+    ],
+)
+def test_invalid_settings_are_rejected(coda, kwargs, message):
+    kwargs = {"doc_ids": [DOC], **kwargs}
+    # A name is passed, so each case fails on its own check, not on the derived name.
+    with pytest.raises(ValueError, match=message):
+        coda_source(kwargs.pop("doc_ids"), service=coda, resource_name="coda_x", **kwargs)
+
+
+def test_superhuman_base_url_is_accepted(coda):
+    for url in ("https://coda.io/apis/v1", "https://docs.superhuman.com/apis/v1"):
+        assert (
+            coda_source([DOC], service=coda, base_url=url).name
+            == coda_source([DOC], service=coda).name
+        )
+
+
+def test_syncs_of_one_doc_with_different_pages_get_their_own_names(coda):
+    names = {
+        coda_source([DOC], service=coda, **flags).name
+        for flags in (
+            {},
+            {"include_hidden_pages": True},
+            {"include_sync_pages": True},
+            {"include_tables": False},
+        )
+    }
+    assert len(names) == 4
+    assert coda_source([DOC], service=coda).name == coda_source([DOC], client=coda).name
 
 
 @pytest.mark.parametrize("value", ["日本", "---", "x" * 80])
@@ -794,7 +887,8 @@ def test_owned_client_is_closed_and_stats_carry_every_key(dlt_mod, tmp_path, doc
     _pipeline(dlt_mod, tmp_path).run(source)
     assert closed == [True]
     assert source.cognee_sync_stats["failed"] == 0
-    assert {"failed_rate_limit", "failed_budget"} <= set(source.cognee_sync_stats)
+    keys = {"scanned", "failed_auth", "failed_rate_limit", "failed_budget"}
+    assert keys <= set(source.cognee_sync_stats)
 
 
 def test_two_sources_in_one_dataset_leave_each_other_alone(dlt_mod, tmp_path, doc):

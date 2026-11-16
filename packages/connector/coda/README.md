@@ -58,15 +58,15 @@ id `AbCDeFGH`). Run the same call again to sync only what changed. See `examples
 
 | Argument | Default | Meaning |
 | --- | --- | --- |
-| `doc_ids` | all your docs | Docs to sync. Without it, every doc the token can see, narrowed by `workspace_id` and `folder_id`. A listed doc that cannot be read on its first sync raises. |
+| `doc_ids` | all your docs | Docs to sync, as a list of ids (a bare string raises). Without it, every doc the token can see, narrowed by `workspace_id` and `folder_id`. A listed doc that cannot be read on its first sync raises. |
 | `workspace_id` | none | Only docs of this workspace. |
 | `folder_id` | none | Only docs of this folder. |
 | `include_tables` | `True` | Ingest each table as one document. Views are always skipped. |
 | `include_hidden_pages` | `False` | Also ingest hidden pages. |
 | `include_sync_pages` | `False` | Also ingest sync pages, which mirror a page of another doc. |
-| `base_url` | `https://coda.io/apis/v1` | API address. |
-| `max_requests` | `1000` | Request budget of one run (a page export counts as one). A bigger account finishes over several runs. |
-| `resource_name` | derived | Staging table, which scopes this sync's state and cleanup. Derived from the doc, or the workspace and folder; **required** when `doc_ids` lists several docs or when no doc, workspace or folder is given, since two sources sharing one would delete each other's documents. A name you pass must be lowercase snake_case (letters, digits, `_`) of at most 64 characters. |
+| `base_url` | `https://coda.io/apis/v1` | API address; must be `https://`, since the token is sent to it. |
+| `max_requests` | `1000` | Request budget of one run, at least 1 (a page export counts as one). A bigger account finishes over several runs. |
+| `resource_name` | derived | Staging table, which scopes this sync's state and cleanup. Derived from the doc, or the workspace and folder, plus a short hash when an `include_*` option differs from its default (two syncs of one doc that take different pages would otherwise forget each other's); **required** when `doc_ids` lists several docs or when no doc, workspace or folder is given, since two sources sharing one would delete each other's documents. A name you pass must be lowercase snake_case (letters, digits, `_`) of at most 64 characters. |
 
 ## What a table looks like
 
@@ -114,14 +114,16 @@ pages carry no content of their own and are skipped too.
   waits stops the run cleanly with `failed` and `failed_rate_limit`, and a spent
   `max_requests` budget with `failed` and `failed_budget`: the sync is incomplete either
   way. The finished docs are kept, and so are the finished pages and tables of a doc the
-  stop cut in two; the next run starts again from that doc. A rejected token
-  always raises, and any other error raises so dlt keeps the previous state.
+  stop cut in two; the next run starts again from that doc. A token rejected once a doc
+  is finished (revoked midway) stops the run the same way, with `failed` and
+  `failed_auth`; a token rejected before that raises, so a bad token never passes as a
+  quiet run. Any other error raises so dlt keeps the previous state.
 
-`cognee_sync_stats` counts `emitted`, `unchanged`, `deleted` and `gone` documents,
-`exported` pages, `unreadable` docs, pages and tables, and `failed` plus `failed_*` for a
-stopped run; every key is present on every run. `check_active` is called before every
-request, and the client built from `token` also calls it around every retry wait and
-export poll. That client is closed at the end of every run; a `service` you pass in stays
+`cognee_sync_stats` counts `scanned` (listed pages and tables), `emitted`, `unchanged`,
+`deleted` and `gone` documents, `exported` pages, `unreadable` docs, pages and tables,
+and `failed` plus `failed_*` for a stopped run; every key is present on every run.
+`check_active` is called before every request, and the client built from `token` also
+calls it before, after and once a second during every retry wait and export poll. That client is closed at the end of every run; a `service` you pass in stays
 yours.
 
 The export download link is a short-lived signed URL; the token is never sent to it.
@@ -142,7 +144,7 @@ uv run pytest tests/
 The tests need no Coda account. They run the client against a mocked HTTP transport
 (the page export flow, retries and their limits, no token sent to the download link),
 check page and table rendering, drive the sync against a fake Coda API (changed and
-unchanged pages and tables, renames, deletions, access removed, empty answers, rate limit
-and budget stops, `check_active`) and through a real dlt pipeline (two sources in one
+unchanged pages and tables, renames, deletions, access removed, empty answers, rate limit,
+budget and revoked-token stops, `check_active`, invalid settings) and through a real dlt pipeline (two sources in one
 dataset, failed runs), and run `cognee.remember` end to end to prove a deleted page leaves
 the graph.
