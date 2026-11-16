@@ -91,6 +91,7 @@ poetry run python ./examples/example.py
 | Package Name                                 | Type     | Description                                        |
 |----------------------------------------------|----------|----------------------------------------------------|
 | `cognee-community-vector-adapter-azure`      | Vector   | Azure AI search vector database adapter for cognee |
+| `cognee-community-vector-adapter-elasticsearch` | Vector | Elasticsearch vector database adapter for cognee |
 | `cognee-community-vector-adapter-milvus`     | Vector   | Milvus vector database adapter for cognee          |
 | `cognee-community-vector-adapter-opensearch` | Vector   | Opensearch vector database adapter for cognee      |
 | `cognee-community-vector-adapter-pinecone`   | Vector   | Pinecone vector database adapter for cognee        |
@@ -117,6 +118,7 @@ are contained in one package (i.e. all tasks used in one pipeline are packaged t
 
 | Package Name                       | Type       | Description                    |
 |------------------------------------|------------|--------------------------------|
+| `cognee-community-connector-onenote` | Connector | [Selected OneNote notebooks with incremental content fetching](packages/connector/onenote/README.md) |
 | `cognee-community-pipeline-codify`     | Pipeline   | Custom codify pipeline package                                        |
 | `cognee-community-retriever-code`      | Retriever  | Custom CODE retriever package                                         |
 | `cognee-community-tasks-codify`        | Task       | Custom codify tasks package                                           |
@@ -124,6 +126,7 @@ are contained in one package (i.e. all tasks used in one pipeline are packaged t
 | `cognee-community-tasks-exa`           | Task       | Web search tasks powered by [Exa](https://exa.ai)                     |
 | `cognee-community-tasks-firecrawl`     | Task       | Web scraping and search tasks powered by [Firecrawl](https://www.firecrawl.dev/?utm_source=cognee-community&utm_medium=github&utm_campaign=cognee-firecrawl-tasks) |
 | `cognee-community-connector-wrike`     | Connector  | Wrike folders and tasks, synced incrementally with forget-on-delete   |
+| `cognee-community-connector-vercel`    | Connector  | Vercel projects, deployments and failed-build output                  |
 
 ## Repository Structure
 
