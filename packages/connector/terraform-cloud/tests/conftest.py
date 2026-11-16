@@ -8,6 +8,7 @@ import pytest
 
 from cognee_community_connector_terraform_cloud.terraform_cloud import (
     TerraformCloudAPIError,
+    TerraformCloudAuthError,
     TerraformCloudRateLimitedError,
 )
 
@@ -161,6 +162,8 @@ class FakeTerraformCloud:
             raise TerraformCloudRateLimitedError("HCP Terraform rate limit exceeded (HTTP 429)")
         for key, status in self.errors.items():
             if key in path:
+                if status == 401:
+                    raise TerraformCloudAuthError("HCP Terraform rejected the token (HTTP 401)")
                 raise TerraformCloudAPIError(f"HTTP {status}", status=status)
         if path == f"/organizations/{ORG}":
             return {"data": {"id": ORG, "type": "organizations"}}

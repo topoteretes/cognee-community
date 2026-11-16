@@ -134,7 +134,8 @@ def test_client_retry_waits_stop_at_the_budget_until_reset():
         client.get("/x")
     client.reset_sleep_budget()
     assert client.get("/x") == {"data": []}
-    assert sleeps == [40.0]
+    # One 40 second wait, slept in one-second steps; the second would pass the budget.
+    assert sleeps == [1.0] * 40
 
 
 def test_client_sends_bearer_token_to_the_api_only():
@@ -157,7 +158,8 @@ def test_client_retries_rate_limits_and_server_errors():
         ]
     )
     assert client.get("/organizations/acme/runs") == {"data": []}
-    assert sleeps == [7.0, 2.0]
+    # Retry-After's 7 seconds, then 2 seconds of backoff, each in one-second steps.
+    assert sleeps == [1.0] * 9
 
 
 def test_client_errors_carry_status_only():
@@ -502,6 +504,37 @@ def test_rate_limit_stops_cleanly_keeping_finished_runs(org):
     assert state["cursor"]
 
 
+def test_token_revoked_after_a_finished_run_stops_cleanly(org):
+    org.add_run("ws-1", "run-1", _hours_ago(3), plan_log=TEXT_LOG)
+    org.add_run("ws-1", "run-2", _hours_ago(2), plan_log=TEXT_LOG)
+    state = {}
+    org.errors["/runs/run-1"] = 401  # run-2 is read first, newest first
+    stats = {}
+    rows = _run(org, state, stats=stats)
+    assert "run:run-2" in _ids(rows) and "run:run-1" not in _ids(rows)
+    assert stats["failed"] == 1 and stats["failed_auth"] == 1
+    assert "cursor" not in state
+
+    org.errors.clear()
+    assert _ids(_run(org, state)) == ["run:run-1"]
+
+
+def test_token_rejected_before_any_run_raises(org):
+    org.errors[f"/organizations/{ORG}"] = 401
+    with pytest.raises(TerraformCloudAuthError):
+        _run(org, {})
+
+
+def test_stats_count_listed_and_unchanged_workspaces(org):
+    state = {}
+    stats = {}
+    _run(org, state, stats=stats)
+    assert stats["scanned"] == 2 and stats["unchanged"] == 0
+    stats = {}
+    _run(org, state, stats=stats)
+    assert stats["scanned"] == 2 and stats["unchanged"] == 2 and stats["emitted"] == 0
+
+
 def test_budget_pauses_and_resumes(org):
     org.add_run("ws-1", "run-1", _hours_ago(3), plan_log=TEXT_LOG)
     org.add_run("ws-1", "run-2", _hours_ago(2), plan_log=TEXT_LOG)
@@ -584,6 +617,43 @@ def test_default_resource_name_follows_the_organization(tfc):
     assert eu.startswith("terraform_cloud_app_eu_terraform_io_acme_")
 
 
+def test_filtered_syncs_get_a_name_of_their_own(tfc):
+    plain = terraform_cloud_source(ORG, service=tfc).name
+    prod = terraform_cloud_source(ORG, service=tfc, workspace_tags=["prod", "aws"]).name
+    dev = terraform_cloud_source(ORG, service=tfc, workspace_tags=["dev"]).name
+    named = terraform_cloud_source(ORG, service=tfc, workspace_names=["a", "b"]).name
+    assert len({plain, prod, dev, named}) == 4 and prod.startswith("terraform_cloud_acme_")
+    # The same selection in another order is the same sync.
+    assert terraform_cloud_source(ORG, service=tfc, workspace_tags=["aws", "prod"]).name == prod
+
+
+@pytest.mark.parametrize("option", ["workspace_names", "workspace_tags"])
+def test_bare_string_is_rejected_where_a_list_is_expected(tfc, option):
+    # tuple("prod") would select the letters p, r, o, d.
+    with pytest.raises(TypeError, match=option):
+        terraform_cloud_source(ORG, service=tfc, **{option: "prod"})
+    with pytest.raises(ValueError, match=option):
+        terraform_cloud_source(ORG, service=tfc, **{option: ["prod", " "]})
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"organization": "   "},
+        {"hostname": "https://app.terraform.io"},
+        {"hostname": "app.terraform.io/api"},
+        {"since_days": 0},
+        {"since_days": True},
+        {"max_requests": 0},
+        {"max_requests": 1.5},
+    ],
+)
+def test_invalid_settings_are_rejected(tfc, settings):
+    arguments = {"organization": ORG, "service": tfc, **settings}
+    with pytest.raises(ValueError):
+        terraform_cloud_source(**arguments)
+
+
 def test_client_is_built_with_keyword_arguments(monkeypatch):
     seen = {}
     monkeypatch.setattr(
@@ -627,6 +697,17 @@ def test_client_checks_access_around_every_wait():
         client.get("/organizations")
     # Checked before the wait and again after it, so the retry never goes out.
     assert len(requests) == 1 and len(checks) == 2
+
+
+def test_client_waits_in_short_steps_asking_check_active_between():
+    checks = []
+    client, requests, sleeps = _client(
+        [httpx.Response(429, headers={"Retry-After": "3"}), httpx.Response(200, json={})],
+        check_active=lambda: checks.append(True),
+    )
+    client.get("/organizations")
+    # A three second wait is three one-second steps, with access checked around each.
+    assert sleeps == [1.0, 1.0, 1.0] and len(checks) == 4 and len(requests) == 2
 
 
 def test_client_closes_only_the_http_client_it_made():
@@ -731,6 +812,20 @@ def test_two_sources_in_one_dataset_leave_each_other_alone(dlt_mod, tmp_path, or
     pipeline.run(terraform_cloud_source(ORG, service=other, resource_name="tfc_b"))
     assert _staged(pipeline, "tfc_a") == {"workspace:ws-1"}
     assert _staged(pipeline, "tfc_b") == {"workspace:ws-9"}
+
+
+def test_two_filtered_syncs_of_one_organization_leave_each_other_alone(
+    dlt_mod, tmp_path, org, recent
+):
+    pipeline = _pipeline(dlt_mod, tmp_path)
+    prod = terraform_cloud_source(ORG, service=org, workspace_tags=["prod"])
+    staging = terraform_cloud_source(ORG, service=org, workspace_tags=["staging"])
+    assert prod.name != staging.name
+    for _ in range(2):  # the second pass would forget the other sync's workspace
+        pipeline.run(terraform_cloud_source(ORG, service=org, workspace_tags=["prod"]))
+        pipeline.run(terraform_cloud_source(ORG, service=org, workspace_tags=["staging"]))
+    assert _staged(pipeline, prod.name) == {"workspace:ws-1"}
+    assert _staged(pipeline, staging.name) == {"workspace:ws-2"}
 
 
 def test_failed_run_keeps_staging_and_cursor(dlt_mod, tmp_path, org, recent):

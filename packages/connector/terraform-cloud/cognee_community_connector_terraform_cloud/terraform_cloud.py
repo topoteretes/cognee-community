@@ -35,10 +35,10 @@ Design
   is deleted, no longer visible or no longer selected is emitted as a hard-delete
   tombstone together with all of its runs. A workspace listing that comes back
   empty is confirmed by the next run before anything is forgotten.
-* **A run is bounded.** A long rate limit, a spent retry wait budget or a spent
-  request budget stops the run cleanly, keeps the runs it finished and reports
-  why in ``cognee_sync_stats``. Any other failure raises, and dlt rolls the state
-  of a failed run back.
+* **A run is bounded.** A long rate limit, a spent retry wait budget, a spent
+  request budget or a token revoked after the first finished run stops the run
+  cleanly, keeps the runs it finished and reports why in ``cognee_sync_stats``.
+  Any other failure raises, and dlt rolls the state of a failed run back.
 
 Privacy
 -------
@@ -81,6 +81,8 @@ _TIMEOUT = 30.0
 _RETRIES = 6
 # Rate limit windows are one minute; a longer Retry-After stops the run.
 _MAX_RETRY_SLEEP = 60.0
+# Waits are slept in steps this long, asking the host's check_active in between.
+_WAIT_STEP = 1.0
 # A margin against runs created in the same second as the cursor.
 _CURSOR_MARGIN = timedelta(minutes=5)
 # Workspace names per run listing, so the filter stays well inside URL length limits.
@@ -117,11 +119,14 @@ _TEXT_CHANGE = re.compile(
 _TEXT_SUMMARY = re.compile(r"^(Plan: .*|No changes\..*|Apply complete!.*)$")
 _TEXT_DIAGNOSTIC = re.compile(r"^(Error|Warning): (.+)$")
 _STATS = (
+    "scanned",
     "emitted",
+    "unchanged",
     "deleted",
     "pending",
     "redacted",
     "failed",
+    "failed_auth",
     "failed_rate_limit",
     "failed_budget",
 )
@@ -218,12 +223,17 @@ class TerraformCloudClient:
                 "HCP Terraform retries used up the wait budget of this run"
             )
         self._slept += delay
-        # The host may revoke access while a request waits, so ask before and after.
-        if self._check_active is not None:
-            self._check_active()
-        self._sleep(delay)
-        if self._check_active is not None:
-            self._check_active()
+        # Slept in short steps, asking the host in between, so access revoked during
+        # a long wait stops it within a second instead of at its end.
+        left = delay
+        while True:
+            if self._check_active is not None:
+                self._check_active()
+            if left <= 0:
+                return
+            step = min(_WAIT_STEP, left)
+            self._sleep(step)
+            left -= step
 
     def _send(self, url: str, params: dict[str, Any] | None, headers: dict[str, str]) -> Any:
         import httpx
@@ -535,6 +545,12 @@ class _Walker:
             return method(*args)
         except TerraformCloudRateLimitedError:
             raise _CutShortError("rate_limit") from None
+        except TerraformCloudAuthError:
+            # Revoked during the run: keep the runs already finished. Before any of
+            # them it is a wrong token, which raises.
+            if self.progressed:
+                raise _CutShortError("auth") from None
+            raise
 
     def _pages(self, path: str, params: dict[str, Any]) -> Iterator[dict]:
         """Yield JSON:API documents page by page."""
@@ -674,6 +690,7 @@ class _Walker:
             wid: str((w.get("attributes") or {}).get("name") or wid)
             for wid, w in workspaces.items()
         }
+        self.stats["scanned"] = len(workspaces)
         for wid, workspace in workspaces.items():
             entry = self.known.setdefault(wid, {"hash": None, "runs": []})
             entry["name"] = names[wid]
@@ -681,6 +698,8 @@ class _Walker:
             if _digest(row) != entry["hash"]:
                 entry["hash"] = _digest(row)
                 self.rows.append(row)
+            else:
+                self.stats["unchanged"] += 1
 
         cursor = self.state.get("cursor")
         if cursor:
@@ -770,17 +789,29 @@ def _iter_rows(
 _MAX_RESOURCE_NAME = 64
 
 
-def _default_resource_name(organization: str, hostname: str) -> str:
+def _default_resource_name(config: _TerraformCloudConfig) -> str:
+    organization, hostname = config.organization, config.hostname
     scope = organization if hostname == DEFAULT_HOSTNAME else f"{hostname}_{organization}"
     slug = re.sub(r"[^a-z0-9]+", "_", scope.lower()).strip("_")
-    digest = hashlib.sha256(scope.encode()).hexdigest()[:8]
     if slug != scope:
         # Keep names that differ only in case or punctuation apart. A scope with no
         # ASCII letter or digit keeps only the hash.
+        digest = hashlib.sha256(scope.encode()).hexdigest()[:8]
         slug = f"{slug}_{digest}" if slug else digest
     name = "terraform_cloud_" + slug
+    if config.filtered:
+        # Two differently filtered syncs of one organization in one dataset must not
+        # share state and cleanup, or each would forget the other's workspaces.
+        selection = [
+            sorted(config.workspace_names),
+            config.workspace_wildcard,
+            sorted(config.workspace_tags),
+            config.project_id,
+        ]
+        name += "_" + hashlib.sha256(json.dumps(selection).encode()).hexdigest()[:8]
     if len(name) > _MAX_RESOURCE_NAME:
         # A long organization or host is cut, and the hash keeps cut names apart.
+        digest = hashlib.sha256(name.encode()).hexdigest()[:8]
         name = name[: _MAX_RESOURCE_NAME - len(digest) - 1].rstrip("_") + "_" + digest
     return name
 
@@ -843,11 +874,12 @@ def terraform_cloud_source(
             ``failed`` and ``failed_budget``.
         resource_name: Staging table name, which scopes this sync's state and
             cleanup. Defaults to one derived from the organization (and the host,
-            when it is not the default). A name you pass must be lowercase
-            snake_case of at most 64 characters.
+            when it is not the default, and a hash of the workspace selection,
+            when one is set). A name you pass must be lowercase snake_case of at
+            most 64 characters.
         check_active: Optional host authorization checkpoint, called before each
-            request and around each row, and in the client built here around every
-            retry wait.
+            request and around each row, and in the client built here at least
+            once a second during every retry wait.
         service: Pre-built client (see :class:`TerraformCloudClient`). Mainly an
             injection point for tests and hosts. ``client`` is accepted as an alias.
 
@@ -867,31 +899,50 @@ def terraform_cloud_source(
             "Terraform Cloud sync requires a cognee build with table-scoped DLT document cleanup."
         )
 
-    if not organization:
+    if not isinstance(organization, str) or not organization.strip():
         raise ValueError("organization is required.")
+    if not isinstance(hostname, str) or not re.fullmatch(r"[A-Za-z0-9.-]+(:\d+)?", hostname):
+        raise ValueError("hostname must be a bare host name, such as app.terraform.io")
+    for option, value in (("since_days", since_days), ("max_requests", max_requests)):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"{option} must be a whole number of at least 1")
+    selection = {}
+    for option, values in (
+        ("workspace_names", workspace_names),
+        ("workspace_tags", workspace_tags),
+    ):
+        # tuple("prod") would split a bare string into letters and select nothing.
+        if isinstance(values, str):
+            raise TypeError(f"{option} must be a list, not a string")
+        items = tuple(dict.fromkeys(str(item).strip() for item in values or ()))
+        if any(not item for item in items):
+            raise ValueError(f"{option} must not contain empty names")
+        selection[option] = items
+
+    config = _TerraformCloudConfig(
+        organization=organization.strip(),
+        hostname=hostname,
+        workspace_names=selection["workspace_names"],
+        workspace_wildcard=workspace_wildcard or None,
+        workspace_tags=selection["workspace_tags"],
+        project_id=project_id or None,
+        include_speculative=bool(include_speculative),
+        include_plan_output=bool(include_plan_output),
+        since_days=since_days,
+        max_requests=max_requests,
+    )
+    name = resource_name
+    if name is None:
+        name = _default_resource_name(config)
+    _check_resource_name(name)
     service = service or client
     owned = service is None
     if owned:
         if not token:
             raise ValueError("An API token is required: pass token=, or a pre-built service.")
-        service = TerraformCloudClient(token=token, hostname=hostname, check_active=check_active)
-    name = resource_name
-    if name is None:
-        name = _default_resource_name(organization, hostname)
-    _check_resource_name(name)
-
-    config = _TerraformCloudConfig(
-        organization=organization,
-        hostname=hostname,
-        workspace_names=tuple(workspace_names or ()),
-        workspace_wildcard=workspace_wildcard,
-        workspace_tags=tuple(workspace_tags or ()),
-        project_id=project_id,
-        include_speculative=include_speculative,
-        include_plan_output=include_plan_output,
-        since_days=int(since_days),
-        max_requests=int(max_requests),
-    )
+        service = TerraformCloudClient(
+            token=token, hostname=config.hostname, check_active=check_active
+        )
     stats: dict[str, int] = {}
 
     @dlt.resource(

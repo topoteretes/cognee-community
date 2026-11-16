@@ -58,16 +58,16 @@ Run the same call again to sync only what changed. See `examples/example.py`.
 
 | Argument | Default | Meaning |
 | --- | --- | --- |
-| `workspace_names` | all | Exact workspace names to sync. A name that was never synced and is not in the organization raises. |
+| `workspace_names` | all | A list of exact workspace names to sync. A name that was never synced and is not in the organization raises. |
 | `workspace_wildcard` | none | Name pattern with `*`, for example `"*-prod"`. |
-| `workspace_tags` | none | Only workspaces with all of these tags. |
+| `workspace_tags` | none | A list of tags; only workspaces with all of them are synced. |
 | `project_id` | none | Only workspaces of this project. |
 | `include_speculative` | `False` | Also ingest plan-only (speculative) runs, such as pull request plans. |
 | `include_plan_output` | `True` | Add the plan summary to each run. |
-| `since_days` | `90` | How far back the first sync reads runs. |
-| `hostname` | `app.terraform.io` | Or `app.eu.terraform.io`, or a Terraform Enterprise host. |
-| `max_requests` | `1000` | Request budget of one run. A bigger organization finishes over several runs. |
-| `resource_name` | `terraform_cloud_<organization>` | Staging table, which scopes this sync's state and cleanup (the host is added when it is not the default). Use a different name per sync scope that shares a dataset. A name you pass must be lowercase snake_case (letters, digits, `_`) of at most 64 characters. |
+| `since_days` | `90` | How far back the first sync reads runs (at least 1). |
+| `hostname` | `app.terraform.io` | Or `app.eu.terraform.io`, or a Terraform Enterprise host. A bare host name, without `https://`. |
+| `max_requests` | `1000` | Request budget of one run (at least 1). A bigger organization finishes over several runs. |
+| `resource_name` | `terraform_cloud_<organization>` | Staging table, which scopes this sync's state and cleanup. The host is added when it is not the default, and a hash of the workspace selection when one is set, so two differently filtered syncs of one organization never share state. A name you pass must be lowercase snake_case (letters, digits, `_`) of at most 64 characters. |
 
 ## Plan output and the scrubbing step
 
@@ -124,17 +124,19 @@ sent to it.
   the next run confirms it, and an answer without its `data` list raises.
 - **A run is bounded.** 429 and 5xx are retried, honoring `Retry-After`. A `Retry-After`
   over 60 seconds, a 429 that outlasts the retries, or more than five minutes of retry
-  waits stops the run cleanly with `failed` and `failed_rate_limit`, and a spent
-  `max_requests` budget with `failed` and `failed_budget`, since the sync is incomplete
-  either way. The runs
-  finished so far are kept and the cursor stays where it was, so the next run picks up the
-  rest. Any other error raises, so dlt keeps the previous state.
+  waits stops the run cleanly with `failed` and `failed_rate_limit`, a spent
+  `max_requests` budget with `failed` and `failed_budget`, and a token revoked after the
+  first finished run with `failed` and `failed_auth`, since the sync is incomplete either
+  way. The runs finished so far are kept and the cursor stays where it was, so the next run
+  picks up the rest. A token rejected before any run raises, and so does any other error,
+  so dlt keeps the previous state.
 
-`cognee_sync_stats` counts `emitted` and `deleted` rows, `pending` runs and `redacted`
-secrets, and `failed` plus `failed_*` for a stopped run; every key is present on every
-run. `check_active` is called before every request, and the client built from `token`
-also calls it before and after each retry wait. That client is closed at the end of every
-run, also on errors; a `service` you pass in stays yours to close.
+`cognee_sync_stats` counts `scanned` (workspaces listed) and `unchanged` workspaces,
+`emitted` and `deleted` rows, `pending` runs and `redacted` secrets, and `failed` plus
+`failed_*` for a stopped run; every key is present on every run. `check_active` is called
+before every request, and the client built from `token` also calls it at least once a
+second during each retry wait. That client is closed at the end of every run, also on
+errors; a `service` you pass in stays yours to close.
 
 ## Privacy
 
