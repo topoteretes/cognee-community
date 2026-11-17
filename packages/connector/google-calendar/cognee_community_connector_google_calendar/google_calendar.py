@@ -53,6 +53,7 @@ import os
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import date, timedelta
 from typing import Any
 
 from cognee.modules.integrations.google import GoogleAuthError, GoogleSettings
@@ -377,12 +378,27 @@ def _row_id(calendar_id: str, event_id: str) -> str:
 # ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
+def _all_day(first_day: str, exclusive_end: str) -> str:
+    """The span of an all-day event, with its last day inclusive.
+
+    Google's ``end.date`` is the day after the event: a one-day event on
+    2026-11-08 ends on 2026-11-09, so a multi-day one reads "2026-11-08 to
+    2026-11-10" for three days, and a one-day one needs no "to".
+    """
+    start = date.fromisoformat(first_day)
+    last = date.fromisoformat(exclusive_end) - timedelta(days=1)
+    if last == start:
+        return f"all day, {start}"
+    return f"all day, {start} to {last}"
+
+
 def _event_row(calendar_id: str, calendar_name: str, event: dict) -> dict:
     title = event.get("summary") or "(no title)"
     lines = [f"Calendar event: {title}", f"Calendar: {calendar_name}"]
     start, end = event.get("start") or {}, event.get("end") or {}
     if start.get("date"):
-        lines.append(f"When: all day, {start['date']} to {end.get('date', start['date'])}")
+        # A confirmed event always has an end, so a missing one is a bug to see, not hide.
+        lines.append(f"When: {_all_day(start['date'], end['date'])}")
     else:
         lines.append(f"When: {_when(start)} to {_when(end)}")
     if event.get("location"):
