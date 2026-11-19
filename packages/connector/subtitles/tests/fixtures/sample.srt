@@ -1,0 +1,15 @@
+1
+00:00:01,200 --> 00:00:03,450
+Alice: Welcome everyone to the quarterly architecture review.
+
+2
+00:00:03,500 --> 00:00:05,800
+Alice: Today we are discussing the new connector roadmap.
+
+3
+00:00:07,100 --> 00:00:10,250
+Bob: Thanks Alice. I have prepared the benchmarking results for vector indexing.
+
+4
+00:00:10,300 --> 00:00:12,900
+Bob: Latency dropped by 42% after enabling batch ingestion.
