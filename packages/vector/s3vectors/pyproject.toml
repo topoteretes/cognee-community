@@ -1,0 +1,38 @@
+[project]
+name = "cognee-community-vector-adapter-s3vectors"
+version = "0.1.0"
+description = "Amazon S3 Vectors vector database adapter for cognee"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    # First botocore release with the s3vectors service model.
+    "boto3>=1.40.68",
+    "cognee==1.6.1",
+    # Transitive via cognee; pinned to the version cognee 1.6.1 locks, so CI
+    # resolves the litellm the upstream release was tested against. cognee 1.6.x
+    # caps the range itself (>=1.83.7,<1.97.0); 1.96.2 ships abi3 wheels that
+    # install on every Python this package supports.
+    "litellm==1.96.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=4.0.0",
+    "anyio>=4.0",
+    "mypy>=1.17.1",
+]
+
+test = [
+    "pytest>=7.4",
+    "pytest-asyncio>=0.23",
+    "boto3>=1.40.68",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
