@@ -1,0 +1,57 @@
+{
+  "items": [
+    {
+      "id": "pipeline-001",
+      "project_slug": "gh/your-org/your-repo",
+      "branch": "main",
+      "commit": {
+        "subject": "Fix authentication token validation",
+        "body": "Ensure expired tokens are properly rejected",
+        "author": {"name": "Developer", "email": "dev@example.com"}
+      },
+      "state": "failed",
+      "number": 452,
+      "created_at": "2026-09-20T14:30:00Z",
+      "stopped_at": "2026-09-20T14:33:12Z",
+      "duration": 192,
+      "workflows": [
+        {
+          "name": "build-and-test",
+          "status": "failed",
+          "jobs": [
+            {"name": "lint", "status": "success", "number": 1, "duration": 45},
+            {"name": "unit-tests", "status": "failed", "number": 2, "duration": 127},
+            {"name": "build", "status": "success", "number": 3, "duration": 150}
+          ]
+        }
+      ]
+    },
+    {
+      "id": "pipeline-002",
+      "project_slug": "gh/your-org/your-repo",
+      "branch": "feature/new-endpoint",
+      "commit": {
+        "subject": "Add rate limiting to API endpoints",
+        "author": {"name": "Developer", "email": "dev@example.com"}
+      },
+      "state": "success",
+      "number": 451,
+      "created_at": "2026-09-20T10:15:00Z",
+      "stopped_at": "2026-09-20T10:18:30Z",
+      "duration": 210,
+      "workflows": [
+        {
+          "name": "build-and-test",
+          "status": "success",
+          "jobs": [
+            {"name": "lint", "status": "success", "number": 1, "duration": 42},
+            {"name": "unit-tests", "status": "success", "number": 2, "duration": 118},
+            {"name": "integration-tests", "status": "success", "number": 3, "duration": 185},
+            {"name": "build", "status": "success", "number": 4, "duration": 145}
+          ]
+        }
+      ]
+    }
+  ],
+  "next_page_token": null
+}
