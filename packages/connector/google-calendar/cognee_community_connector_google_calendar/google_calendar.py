@@ -53,6 +53,7 @@ import os
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import date, timedelta
 from typing import Any
 
 from cognee.modules.integrations.google import GoogleAuthError, GoogleSettings
@@ -382,7 +383,7 @@ def _event_row(calendar_id: str, calendar_name: str, event: dict) -> dict:
     lines = [f"Calendar event: {title}", f"Calendar: {calendar_name}"]
     start, end = event.get("start") or {}, event.get("end") or {}
     if start.get("date"):
-        lines.append(f"When: all day, {start['date']} to {end.get('date', start['date'])}")
+        lines.append(f"When: {_all_day(start['date'], end.get('date'))}")
     else:
         lines.append(f"When: {_when(start)} to {_when(end)}")
     if event.get("location"):
@@ -424,6 +425,20 @@ def _person(person: dict) -> str:
     if name and email and name != email:
         return f"{name} <{email}>"
     return email or name or "unknown"
+
+
+def _all_day(first_day: str, exclusive_end: str | None) -> str:
+    """The span of an all-day event, with its last day inclusive.
+
+    Google's ``end.date`` is exclusive (the day after the event): a one-day
+    event on 2026-11-08 ends on 2026-11-09 and reads "all day, 2026-11-08",
+    a three-day one reads "all day, 2026-11-08 to 2026-11-10".
+    """
+    start = date.fromisoformat(first_day)
+    last = date.fromisoformat(exclusive_end) - timedelta(days=1) if exclusive_end else start
+    if last <= start:
+        return f"all day, {start}"
+    return f"all day, {start} to {last}"
 
 
 def _when(value: dict) -> str:
