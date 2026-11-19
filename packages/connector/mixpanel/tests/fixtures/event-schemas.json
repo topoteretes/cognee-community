@@ -1,0 +1,110 @@
+[
+  {
+    "entityType": "event",
+    "name": "ConnectorTestPurchase",
+    "schemaJson": {
+      "$schema": "http://json-schema.org/draft-07/schema",
+      "description": "Synthetic connector validation: purchase.",
+      "metadata": {
+        "com.mixpanel": {
+          "displayName": "ConnectorTestPurchase",
+          "dropped": false,
+          "hidden": false,
+          "platforms": [],
+          "tags": [
+            "connector-test"
+          ],
+          "contacts": [],
+          "teamContacts": []
+        }
+      },
+      "properties": {
+        "plan": {
+          "metadata": {
+            "com.mixpanel": {
+              "displayName": "",
+              "hidden": false,
+              "dropped": false,
+              "sensitive": false
+            }
+          },
+          "type": "string",
+          "description": "Synthetic plan: test or control.",
+          "examples": []
+        },
+        "test_run": {
+          "metadata": {
+            "com.mixpanel": {
+              "displayName": "",
+              "hidden": false,
+              "dropped": false,
+              "sensitive": false
+            }
+          },
+          "type": "string",
+          "description": "Synthetic validation run identifier.",
+          "examples": []
+        }
+      },
+      "additionalProperties": true,
+      "required": [
+        "plan",
+        "test_run"
+      ]
+    }
+  },
+  {
+    "entityType": "event",
+    "name": "ConnectorTestSignup",
+    "schemaJson": {
+      "$schema": "http://json-schema.org/draft-07/schema",
+      "description": "Synthetic connector validation: signup.",
+      "metadata": {
+        "com.mixpanel": {
+          "displayName": "ConnectorTestSignup",
+          "dropped": false,
+          "hidden": false,
+          "platforms": [],
+          "tags": [
+            "connector-test"
+          ],
+          "contacts": [],
+          "teamContacts": []
+        }
+      },
+      "properties": {
+        "plan": {
+          "metadata": {
+            "com.mixpanel": {
+              "displayName": "",
+              "hidden": false,
+              "dropped": false,
+              "sensitive": false
+            }
+          },
+          "type": "string",
+          "description": "Synthetic plan: test or control.",
+          "examples": []
+        },
+        "test_run": {
+          "metadata": {
+            "com.mixpanel": {
+              "displayName": "",
+              "hidden": false,
+              "dropped": false,
+              "sensitive": false
+            }
+          },
+          "type": "string",
+          "description": "Synthetic validation run identifier.",
+          "examples": []
+        }
+      },
+      "additionalProperties": true,
+      "required": [
+        "plan",
+        "test_run"
+      ]
+    }
+  }
+]
