@@ -93,18 +93,55 @@ def notion_source(
         # forgets them from the graph + vector stores. Unchanged pages keep a
         # stable content-hash data_id, so they are not re-ingested/re-cognified.
         #
+        # Incremental block rendering: we store rendered pages in dlt's
+        # persistent source_state keyed by page id and last_edited_time.
+        # On subsequent syncs, unchanged pages reuse cached content and avoid
+        # recursive blocks.children API calls.
+        #
         # A render error is NOT swallowed: because staging is authoritative
         # (replace), a page missing from a partial snapshot would be forgotten as
         # if deleted. Letting the error abort the run leaves staging — and memory
         # — untouched, which is the safe failure. Transient blips are already
         # retried in _request; only a persistent failure reaches here.
+        state = dlt.current.source_state()
+        cache = state.setdefault("notion_page_cache", {})
+        live_page_ids = set()
         count = 0
+        cache_hits = 0
+
         for page in _iter_pages(client, page_ids, database_ids):
             if page.get("archived") or page.get("in_trash"):
                 continue
+            page_id = page.get("id")
+            live_page_ids.add(page_id)
             count += 1
-            yield _page_to_row(client, page)
-        logger.info("Notion: synced %d page(s).", count)
+            last_edited = page.get("last_edited_time")
+
+            cached_entry = cache.get(page_id)
+            if cached_entry and cached_entry.get("last_edited_time") == last_edited:
+                cache_hits += 1
+                row = {
+                    "id": page_id,
+                    "url": cached_entry.get("url") or page.get("url"),
+                    "title": cached_entry.get("title") or _page_title(page),
+                    "content": cached_entry.get("content", ""),
+                }
+            else:
+                row = _page_to_row(client, page)
+                cache[page_id] = {
+                    "last_edited_time": last_edited,
+                    "title": row["title"],
+                    "content": row["content"],
+                    "url": row["url"],
+                }
+            yield row
+
+        # Evict deleted or unshared pages from cache
+        stale_ids = [pid for pid in cache if pid not in live_page_ids]
+        for pid in stale_ids:
+            del cache[pid]
+
+        logger.info("Notion: synced %d page(s) (%d from cache).", count, cache_hits)
 
     @dlt.source(name=NOTION_SOURCE_NAME)
     def _notion():
