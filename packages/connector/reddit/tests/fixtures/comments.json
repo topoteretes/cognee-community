@@ -1,0 +1,169 @@
+{
+ "request": "GET https://oauth.reddit.com/comments/2gmzqe/?sort=confidence&limit=2048&raw_json=1",
+ "response": [
+  {
+   "data": {
+    "after": null,
+    "before": null,
+    "children": [
+     {
+      "data": {
+       "approved_by": null,
+       "archived": true,
+       "author": "bboe",
+       "author_flair_css_class": null,
+       "author_flair_text": null,
+       "banned_by": null,
+       "clicked": false,
+       "created": 1410964471.0,
+       "created_utc": 1410935671.0,
+       "distinguished": null,
+       "domain": "self.redditdev",
+       "downs": 0,
+       "edited": false,
+       "from": null,
+       "from_id": null,
+       "from_kind": null,
+       "gilded": 1,
+       "hidden": false,
+       "hide_score": false,
+       "id": "2gmzqe",
+       "is_self": true,
+       "likes": null,
+       "link_flair_css_class": null,
+       "link_flair_text": null,
+       "locked": false,
+       "media": null,
+       "media_embed": {},
+       "mod_reports": [],
+       "name": "t3_2gmzqe",
+       "num_comments": 2,
+       "num_reports": null,
+       "over_18": false,
+       "permalink": "/r/redditdev/comments/2gmzqe/praw_https_enabled_praw_testing_needed/",
+       "quarantine": false,
+       "removal_reason": null,
+       "report_reasons": null,
+       "saved": false,
+       "score": 11,
+       "secure_media": null,
+       "secure_media_embed": {},
+       "selftext": "PRAW client developers,\n\nI have made a PRAW branch to test using only HTTPS over the API. This change requires some testers to see if there any issues that did not come up from our set of unit tests. This is the first of a few improvements that will (hopefully soon) be released with PRAW version 3. If you want to start using HTTPS exclusively through PRAW please update via the following:\n\n    pip install git+git://github.com/praw-dev/praw.git@praw3\n\nIf you experience any issues feel free to report them here, however filing a bug on github (https://github.com/praw-dev/praw/issues) would be ideal. Thanks!",
+       "selftext_html": "<!-- SC_OFF --><div class=\"md\"><p>PRAW client developers,</p>\n\n<p>I have made a PRAW branch to test using only HTTPS over the API. This change requires some testers to see if there any issues that did not come up from our set of unit tests. This is the first of a few improvements that will (hopefully soon) be released with PRAW version 3. If you want to start using HTTPS exclusively through PRAW please update via the following:</p>\n\n<pre><code>pip install git+git://github.com/praw-dev/praw.git@praw3\n</code></pre>\n\n<p>If you experience any issues feel free to report them here, however filing a bug on github (<a href=\"https://github.com/praw-dev/praw/issues\">https://github.com/praw-dev/praw/issues</a>) would be ideal. Thanks!</p>\n</div><!-- SC_ON -->",
+       "stickied": false,
+       "subreddit": "redditdev",
+       "subreddit_id": "t5_2qizd",
+       "suggested_sort": null,
+       "thumbnail": "",
+       "title": "[PRAW] HTTPS enabled PRAW testing needed",
+       "ups": 11,
+       "upvote_ratio": 0.84,
+       "url": "https://www.reddit.com/r/redditdev/comments/2gmzqe/praw_https_enabled_praw_testing_needed/",
+       "user_reports": [],
+       "visited": false
+      },
+      "kind": "t3"
+     }
+    ],
+    "modhash": ""
+   },
+   "kind": "Listing"
+  },
+  {
+   "data": {
+    "after": null,
+    "before": null,
+    "children": [
+     {
+      "data": {
+       "approved_by": null,
+       "archived": true,
+       "author": "paneer_burrito",
+       "author_flair_css_class": null,
+       "author_flair_text": null,
+       "banned_by": null,
+       "body": "Quick question: I remember reading about an issue where the proxy settings for https requests were not getting picked up from the environment variables. Does this branch have that fix? Thanks",
+       "body_html": "<div class=\"md\"><p>Quick question: I remember reading about an issue where the proxy settings for https requests were not getting picked up from the environment variables. Does this branch have that fix? Thanks</p>\n</div>",
+       "controversiality": 0,
+       "created": 1411033912.0,
+       "created_utc": 1411005112.0,
+       "distinguished": null,
+       "downs": 0,
+       "edited": false,
+       "gilded": 0,
+       "id": "cklfmye",
+       "likes": null,
+       "link_id": "t3_2gmzqe",
+       "mod_reports": [],
+       "name": "t1_cklfmye",
+       "num_reports": null,
+       "parent_id": "t3_2gmzqe",
+       "removal_reason": null,
+       "replies": {
+        "data": {
+         "after": null,
+         "before": null,
+         "children": [
+          {
+           "data": {
+            "approved_by": null,
+            "archived": true,
+            "author": "bboe",
+            "author_flair_css_class": null,
+            "author_flair_text": null,
+            "banned_by": null,
+            "body": "Yes it does. That fix is also in the master branch, we just haven't made a release for it (and we probably won't until 3.0).",
+            "body_html": "<div class=\"md\"><p>Yes it does. That fix is also in the master branch, we just haven&#39;t made a release for it (and we probably won&#39;t until 3.0).</p>\n</div>",
+            "controversiality": 0,
+            "created": 1411038834.0,
+            "created_utc": 1411010034.0,
+            "distinguished": null,
+            "downs": 0,
+            "edited": false,
+            "gilded": 0,
+            "id": "cklhv0f",
+            "likes": null,
+            "link_id": "t3_2gmzqe",
+            "mod_reports": [],
+            "name": "t1_cklhv0f",
+            "num_reports": null,
+            "parent_id": "t1_cklfmye",
+            "removal_reason": null,
+            "replies": "",
+            "report_reasons": null,
+            "saved": false,
+            "score": 1,
+            "score_hidden": false,
+            "stickied": false,
+            "subreddit": "redditdev",
+            "subreddit_id": "t5_2qizd",
+            "ups": 1,
+            "user_reports": []
+           },
+           "kind": "t1"
+          }
+         ],
+         "modhash": ""
+        },
+        "kind": "Listing"
+       },
+       "report_reasons": null,
+       "saved": false,
+       "score": 1,
+       "score_hidden": false,
+       "stickied": false,
+       "subreddit": "redditdev",
+       "subreddit_id": "t5_2qizd",
+       "ups": 1,
+       "user_reports": []
+      },
+      "kind": "t1"
+     }
+    ],
+    "modhash": ""
+   },
+   "kind": "Listing"
+  }
+ ],
+ "source": "TestSubmission.test_comments"
+}
