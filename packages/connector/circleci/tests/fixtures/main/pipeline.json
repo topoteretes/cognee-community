@@ -1,0 +1,31 @@
+{
+  "id": "2ddad363-2d2e-4476-9cd1-aed100049957",
+  "errors": [],
+  "project_slug": "gh/rokadepiyush49-rgb/cognee-circleci-fixture",
+  "updated_at": "2026-10-07T21:32:18.737Z",
+  "number": 1,
+  "state": "created",
+  "created_at": "2026-10-07T21:32:18.514Z",
+  "warnings": [],
+  "trigger": {
+    "received_at": "2026-10-07T21:32:16.086Z",
+    "type": "api",
+    "actor": {
+      "login": "rokadepiyush49-rgb",
+      "avatar_url": "https://avatars.githubusercontent.com/u/236336623?v=4"
+    }
+  },
+  "vcs": {
+    "origin_repository_url": "https://github.com/rokadepiyush49-rgb/cognee-circleci-fixture",
+    "target_repository_url": "https://github.com/rokadepiyush49-rgb/cognee-circleci-fixture",
+    "review_url": "",
+    "revision": "f154c09fa8464f1345078af255501fe0b3897da5",
+    "review_id": "",
+    "provider_name": "GitHub",
+    "commit": {
+      "body": "",
+      "subject": "Update README for renamed repo"
+    },
+    "branch": "main"
+  }
+}

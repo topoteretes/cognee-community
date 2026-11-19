@@ -1,0 +1,27 @@
+{
+  "next_page_token": null,
+  "items": [
+    {
+      "pipeline_id": "b7918e16-820b-40e1-9ae0-717c119ce676",
+      "id": "ae05edee-e09e-4321-8b8c-30d563450608",
+      "name": "needs-approval",
+      "project_slug": "gh/rokadepiyush49-rgb/cognee-circleci-fixture",
+      "status": "on_hold",
+      "started_by": "405f1dda-b196-404c-b8fb-a3128bdd413d",
+      "pipeline_number": 5,
+      "created_at": "2026-10-07T21:33:15Z",
+      "stopped_at": null
+    },
+    {
+      "pipeline_id": "b7918e16-820b-40e1-9ae0-717c119ce676",
+      "id": "c0187f41-f1e6-4687-8941-389330b06b83",
+      "name": "build-and-test",
+      "project_slug": "gh/rokadepiyush49-rgb/cognee-circleci-fixture",
+      "status": "failed",
+      "started_by": "405f1dda-b196-404c-b8fb-a3128bdd413d",
+      "pipeline_number": 5,
+      "created_at": "2026-10-07T21:33:15Z",
+      "stopped_at": "2026-10-07T21:33:25Z"
+    }
+  ]
+}

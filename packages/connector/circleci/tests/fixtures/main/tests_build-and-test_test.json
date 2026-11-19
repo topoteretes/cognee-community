@@ -1,0 +1,293 @@
+{
+  "items": [
+    {
+      "classname": "tests.test_broken",
+      "file": "tests/test_broken.py",
+      "name": "test_add_wrong_expectation",
+      "result": "failure",
+      "message": "assert 4 == 5\n +  where 4 = add(2, 2)\ndef test_add_wrong_expectation():\n        # Plain assertion failure: short, readable message.\n>       assert add(2, 2) == 5\nE       assert 4 == 5\nE        +  where 4 = add(2, 2)\n\ntests/test_broken.py:20: AssertionError",
+      "run_time": 0.001,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_broken",
+      "file": "tests/test_broken.py",
+      "name": "test_parse_config_missing_key",
+      "result": "failure",
+      "message": "def test_parse_config_missing_key():\n        # Uncaught exception instead of an assertion.\n        config = parse_config(\"retries = 3\")\n>       assert config[\"timeout\"] == \"30\"\nE       KeyError: 'timeout'\n\ntests/test_broken.py:26: KeyError",
+      "run_time": 0.001,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_broken",
+      "file": "tests/test_broken.py",
+      "name": "test_long_failure_message",
+      "result": "failure",
+      "message": "AssertionError: payload mismatch: expected 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx', got 'yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy'\nassert 'yyyyyyyyyyyy...yyyyyyyyyyyyy' == 'xxxxxxxxxxxx...xxxxxxxxxxxxx'\n  \n  - xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n  + yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy\ndef test_long_failure_message():\n        # Message well over 500 chars, to test that the connector truncates it.\n        expected = \"x\" * 400\n        actual = \"y\" * 400\n>       assert actual == expected, f\"payload mismatch: expected {expected!r}, got {actual!r}\"\nE       AssertionError: payload mismatch: expected 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx', got 'yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy'\nE       assert 'yyyyyyyyyyyy...yyyyyyyyyyyyy' == 'xxxxxxxxxxxx...xxxxxxxxxxxxx'\nE         \nE         - xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\nE         + yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy\n\ntests/test_broken.py:33: AssertionError",
+      "run_time": 0.001,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_calc",
+      "file": "tests/test_calc.py",
+      "name": "test_add",
+      "result": "success",
+      "message": "",
+      "run_time": 0,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_calc",
+      "file": "tests/test_calc.py",
+      "name": "test_divide",
+      "result": "success",
+      "message": "",
+      "run_time": 0,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_calc",
+      "file": "tests/test_calc.py",
+      "name": "test_divide_by_zero",
+      "result": "success",
+      "message": "",
+      "run_time": 0,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_calc",
+      "file": "tests/test_calc.py",
+      "name": "test_parse_config",
+      "result": "success",
+      "message": "",
+      "run_time": 0,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[0]",
+      "result": "skipped",
+      "message": "/home/circleci/project/tests/test_many_failures.py:16: only runs on the many-failures branch",
+      "run_time": 0,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[1]",
+      "result": "skipped",
+      "message": "/home/circleci/project/tests/test_many_failures.py:16: only runs on the many-failures branch",
+      "run_time": 0,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[2]",
+      "result": "skipped",
+      "message": "/home/circleci/project/tests/test_many_failures.py:16: only runs on the many-failures branch",
+      "run_time": 0,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[3]",
+      "result": "skipped",
+      "message": "/home/circleci/project/tests/test_many_failures.py:16: only runs on the many-failures branch",
+      "run_time": 0,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[4]",
+      "result": "skipped",
+      "message": "/home/circleci/project/tests/test_many_failures.py:16: only runs on the many-failures branch",
+      "run_time": 0,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[5]",
+      "result": "skipped",
+      "message": "/home/circleci/project/tests/test_many_failures.py:16: only runs on the many-failures branch",
+      "run_time": 0,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[6]",
+      "result": "skipped",
+      "message": "/home/circleci/project/tests/test_many_failures.py:16: only runs on the many-failures branch",
+      "run_time": 0,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[7]",
+      "result": "skipped",
+      "message": "/home/circleci/project/tests/test_many_failures.py:16: only runs on the many-failures branch",
+      "run_time": 0,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[8]",
+      "result": "skipped",
+      "message": "/home/circleci/project/tests/test_many_failures.py:16: only runs on the many-failures branch",
+      "run_time": 0,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[9]",
+      "result": "skipped",
+      "message": "/home/circleci/project/tests/test_many_failures.py:16: only runs on the many-failures branch",
+      "run_time": 0,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[10]",
+      "result": "skipped",
+      "message": "/home/circleci/project/tests/test_many_failures.py:16: only runs on the many-failures branch",
+      "run_time": 0,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[11]",
+      "result": "skipped",
+      "message": "/home/circleci/project/tests/test_many_failures.py:16: only runs on the many-failures branch",
+      "run_time": 0,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[12]",
+      "result": "skipped",
+      "message": "/home/circleci/project/tests/test_many_failures.py:16: only runs on the many-failures branch",
+      "run_time": 0,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[13]",
+      "result": "skipped",
+      "message": "/home/circleci/project/tests/test_many_failures.py:16: only runs on the many-failures branch",
+      "run_time": 0,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[14]",
+      "result": "skipped",
+      "message": "/home/circleci/project/tests/test_many_failures.py:16: only runs on the many-failures branch",
+      "run_time": 0,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[15]",
+      "result": "skipped",
+      "message": "/home/circleci/project/tests/test_many_failures.py:16: only runs on the many-failures branch",
+      "run_time": 0,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[16]",
+      "result": "skipped",
+      "message": "/home/circleci/project/tests/test_many_failures.py:16: only runs on the many-failures branch",
+      "run_time": 0,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[17]",
+      "result": "skipped",
+      "message": "/home/circleci/project/tests/test_many_failures.py:16: only runs on the many-failures branch",
+      "run_time": 0,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[18]",
+      "result": "skipped",
+      "message": "/home/circleci/project/tests/test_many_failures.py:16: only runs on the many-failures branch",
+      "run_time": 0,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[19]",
+      "result": "skipped",
+      "message": "/home/circleci/project/tests/test_many_failures.py:16: only runs on the many-failures branch",
+      "run_time": 0,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[20]",
+      "result": "skipped",
+      "message": "/home/circleci/project/tests/test_many_failures.py:16: only runs on the many-failures branch",
+      "run_time": 0,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[21]",
+      "result": "skipped",
+      "message": "/home/circleci/project/tests/test_many_failures.py:16: only runs on the many-failures branch",
+      "run_time": 0,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[22]",
+      "result": "skipped",
+      "message": "/home/circleci/project/tests/test_many_failures.py:16: only runs on the many-failures branch",
+      "run_time": 0,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[23]",
+      "result": "skipped",
+      "message": "/home/circleci/project/tests/test_many_failures.py:16: only runs on the many-failures branch",
+      "run_time": 0,
+      "source": "unknown"
+    },
+    {
+      "classname": "tests.test_many_failures",
+      "file": "tests/test_many_failures.py",
+      "name": "test_case_fails[24]",
+      "result": "skipped",
+      "message": "/home/circleci/project/tests/test_many_failures.py:16: only runs on the many-failures branch",
+      "run_time": 0,
+      "source": "unknown"
+    }
+  ],
+  "next_page_token": null
+}

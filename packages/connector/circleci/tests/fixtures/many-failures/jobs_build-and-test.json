@@ -1,0 +1,67 @@
+{
+  "next_page_token": null,
+  "items": [
+    {
+      "job_number": 9,
+      "stopped_at": "2026-10-07T21:33:18Z",
+      "started_at": "2026-10-07T21:33:13Z",
+      "name": "test",
+      "project_slug": "gh/rokadepiyush49-rgb/cognee-circleci-fixture",
+      "type": "build",
+      "requires": {},
+      "status": "failed",
+      "id": "16ad0909-6e60-4f2b-a732-2e0cd968d10d",
+      "dependencies": []
+    },
+    {
+      "job_number": 11,
+      "stopped_at": "2026-10-07T21:33:15Z",
+      "started_at": "2026-10-07T21:33:13Z",
+      "name": "smoke",
+      "project_slug": "gh/rokadepiyush49-rgb/cognee-circleci-fixture",
+      "type": "build",
+      "requires": {},
+      "status": "success",
+      "id": "15f57114-fb3a-4693-a68e-9132595f7210",
+      "dependencies": []
+    },
+    {
+      "job_number": 10,
+      "stopped_at": "2026-10-07T21:33:17Z",
+      "started_at": "2026-10-07T21:33:13Z",
+      "name": "lint",
+      "project_slug": "gh/rokadepiyush49-rgb/cognee-circleci-fixture",
+      "type": "build",
+      "requires": {},
+      "status": "success",
+      "id": "42d2bcef-870a-43d7-8a8b-e2725c0dd99d",
+      "dependencies": []
+    },
+    {
+      "job_number": 12,
+      "stopped_at": "2026-10-07T21:33:18Z",
+      "started_at": "2026-10-07T21:33:18Z",
+      "name": "deploy",
+      "project_slug": "gh/rokadepiyush49-rgb/cognee-circleci-fixture",
+      "type": "build",
+      "requires": {
+        "42d2bcef-870a-43d7-8a8b-e2725c0dd99d": [
+          "success"
+        ],
+        "16ad0909-6e60-4f2b-a732-2e0cd968d10d": [
+          "success"
+        ],
+        "15f57114-fb3a-4693-a68e-9132595f7210": [
+          "success"
+        ]
+      },
+      "status": "not_run",
+      "id": "9f820a94-c520-4902-b95b-f7c792a8fb6f",
+      "dependencies": [
+        "15f57114-fb3a-4693-a68e-9132595f7210",
+        "16ad0909-6e60-4f2b-a732-2e0cd968d10d",
+        "42d2bcef-870a-43d7-8a8b-e2725c0dd99d"
+      ]
+    }
+  ]
+}
