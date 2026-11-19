@@ -15,7 +15,6 @@ libraries and no live credentials are required, so these run in CI. Coverage:
 import base64
 
 import pytest
-
 from cognee_community_connector_gmail.gmail import (
     full_backfill,
     gmail_source,
