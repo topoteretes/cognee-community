@@ -1,0 +1,217 @@
+[
+  {
+    "id": "c1",
+    "type": "ongoing_time_based",
+    "title": "Fake Role 1",
+    "status": "in_progress",
+    "created_at": "2025-01-01T00:00:00Z",
+    "termination_date": null,
+    "is_archived": false,
+    "is_shielded": false,
+    "scale": "hourly",
+    "notice_period": 30,
+    "external_id": "ext-1",
+    "client": {
+      "team": {
+        "id": "t1",
+        "name": "Fake Team"
+      },
+      "legal_entity": {
+        "id": "le1",
+        "name": "Fake Entity"
+      }
+    },
+    "worker": {
+      "id": "w1",
+      "email": "worker1@example.invalid",
+      "full_name": "Fake Worker 1",
+      "image": null,
+      "alternate_email": []
+    },
+    "signatures": {
+      "client_signed_at": "2025-01-02T00:00:00Z",
+      "worker_signed_at": null,
+      "worker_signature": "FAKE-SIG"
+    },
+    "invitations": {
+      "client_email": "boss@example.invalid",
+      "worker_email": "worker1@example.invalid"
+    },
+    "compensation_details": {
+      "amount": 99999
+    },
+    "brand_new_api_field": "must-not-leak"
+  },
+  {
+    "id": "c2",
+    "type": "eor",
+    "title": "Fake Role 2",
+    "status": "in_progress",
+    "created_at": "2025-01-02T00:00:00Z",
+    "termination_date": null,
+    "is_archived": false,
+    "is_shielded": false,
+    "scale": "hourly",
+    "notice_period": 30,
+    "external_id": "ext-2",
+    "client": {
+      "team": {
+        "id": "t1",
+        "name": "Fake Team"
+      },
+      "legal_entity": {
+        "id": "le1",
+        "name": "Fake Entity"
+      }
+    },
+    "worker": {
+      "id": "w2",
+      "email": "worker2@example.invalid",
+      "full_name": "Fake Worker 2",
+      "image": null,
+      "alternate_email": []
+    },
+    "signatures": {
+      "client_signed_at": "2025-01-02T00:00:00Z",
+      "worker_signed_at": null,
+      "worker_signature": "FAKE-SIG"
+    },
+    "invitations": {
+      "client_email": "boss@example.invalid",
+      "worker_email": "worker2@example.invalid"
+    },
+    "compensation_details": {
+      "amount": 99999
+    },
+    "brand_new_api_field": "must-not-leak"
+  },
+  {
+    "id": "c3",
+    "type": "ongoing_time_based",
+    "title": "Fake Role 3",
+    "status": "in_progress",
+    "created_at": "2025-01-03T00:00:00Z",
+    "termination_date": null,
+    "is_archived": false,
+    "is_shielded": false,
+    "scale": "hourly",
+    "notice_period": 30,
+    "external_id": "ext-3",
+    "client": {
+      "team": {
+        "id": "t1",
+        "name": "Fake Team"
+      },
+      "legal_entity": {
+        "id": "le1",
+        "name": "Fake Entity"
+      }
+    },
+    "worker": {
+      "id": "w3",
+      "email": "worker3@example.invalid",
+      "full_name": "Fake Worker 3",
+      "image": null,
+      "alternate_email": []
+    },
+    "signatures": {
+      "client_signed_at": "2025-01-02T00:00:00Z",
+      "worker_signed_at": null,
+      "worker_signature": "FAKE-SIG"
+    },
+    "invitations": {
+      "client_email": "boss@example.invalid",
+      "worker_email": "worker3@example.invalid"
+    },
+    "compensation_details": {
+      "amount": 99999
+    },
+    "brand_new_api_field": "must-not-leak"
+  },
+  {
+    "id": "c4",
+    "type": "eor",
+    "title": "Fake Role 4",
+    "status": "in_progress",
+    "created_at": "2025-01-04T00:00:00Z",
+    "termination_date": null,
+    "is_archived": false,
+    "is_shielded": false,
+    "scale": "hourly",
+    "notice_period": 30,
+    "external_id": "ext-4",
+    "client": {
+      "team": {
+        "id": "t1",
+        "name": "Fake Team"
+      },
+      "legal_entity": {
+        "id": "le1",
+        "name": "Fake Entity"
+      }
+    },
+    "worker": {
+      "id": "w4",
+      "email": "worker4@example.invalid",
+      "full_name": "Fake Worker 4",
+      "image": null,
+      "alternate_email": []
+    },
+    "signatures": {
+      "client_signed_at": "2025-01-02T00:00:00Z",
+      "worker_signed_at": null,
+      "worker_signature": "FAKE-SIG"
+    },
+    "invitations": {
+      "client_email": "boss@example.invalid",
+      "worker_email": "worker4@example.invalid"
+    },
+    "compensation_details": {
+      "amount": 99999
+    },
+    "brand_new_api_field": "must-not-leak"
+  },
+  {
+    "id": "c5",
+    "type": "ongoing_time_based",
+    "title": "Fake Role 5",
+    "status": "in_progress",
+    "created_at": "2025-01-05T00:00:00Z",
+    "termination_date": null,
+    "is_archived": false,
+    "is_shielded": false,
+    "scale": "hourly",
+    "notice_period": 30,
+    "external_id": "ext-5",
+    "client": {
+      "team": {
+        "id": "t1",
+        "name": "Fake Team"
+      },
+      "legal_entity": {
+        "id": "le1",
+        "name": "Fake Entity"
+      }
+    },
+    "worker": {
+      "id": "w5",
+      "email": "worker5@example.invalid",
+      "full_name": "Fake Worker 5",
+      "image": null,
+      "alternate_email": []
+    },
+    "signatures": {
+      "client_signed_at": "2025-01-02T00:00:00Z",
+      "worker_signed_at": null,
+      "worker_signature": "FAKE-SIG"
+    },
+    "invitations": {
+      "client_email": "boss@example.invalid",
+      "worker_email": "worker5@example.invalid"
+    },
+    "compensation_details": {
+      "amount": 99999
+    },
+    "brand_new_api_field": "must-not-leak"
+  }
+]
