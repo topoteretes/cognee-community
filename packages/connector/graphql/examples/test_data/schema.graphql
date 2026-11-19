@@ -1,0 +1,60 @@
+"""
+User authorization role in the system
+"""
+enum Role {
+  ADMIN
+  EDITOR
+  SUBSCRIBER
+}
+
+"""
+Base entity interface with a unique identifier
+"""
+interface Node {
+  id: ID!
+}
+
+"""
+Platform user account
+"""
+type User implements Node {
+  id: ID!
+  email: String!
+  fullName: String
+  role: Role!
+  articles(limit: Int = 10, offset: Int = 0): [Article!]!
+  createdAt: String!
+}
+
+"""
+Blog article published on the site
+"""
+type Article implements Node {
+  id: ID!
+  title: String!
+  slug: String!
+  content: String!
+  published: Boolean!
+  author: User!
+  tags: [String!]!
+}
+
+input CreateArticleInput {
+  title: String!
+  content: String!
+  published: Boolean = false
+  tags: [String!] = []
+}
+
+type Query {
+  me: User
+  article(id: ID!): Article
+  articles(limit: Int = 20, offset: Int = 0): [Article!]!
+  search(query: String!): [Node!]!
+}
+
+type Mutation {
+  createArticle(input: CreateArticleInput!): Article!
+  publishArticle(id: ID!): Article!
+  deleteArticle(id: ID!): Boolean!
+}
