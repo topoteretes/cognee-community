@@ -121,8 +121,26 @@ def test_all_day_event_and_omitted_attendees(cal):
 
     upserts, _, _ = sync(cal, {})
 
-    assert "When: all day, 2026-11-08 to 2026-11-08" in upserts[rid(holiday)]["content"]
+    assert "When: all day, 2026-11-08" in upserts[rid(holiday)]["content"]
+    assert "2026-11-08 to 2026-11-08" not in upserts[rid(holiday)]["content"]
     assert "and more not listed by Google" in upserts[rid(big)]["content"]
+
+
+@pytest.mark.parametrize(
+    ("start_day", "end_day", "expected"),
+    [
+        ("2026-11-08", "2026-11-10", "When: all day, 2026-11-08 to 2026-11-10"),
+        ("2026-12-31", "2026-12-31", "When: all day, 2026-12-31"),
+        ("2026-12-31", "2027-01-01", "When: all day, 2026-12-31 to 2027-01-01"),
+        ("2026-02-28", "2026-02-28", "When: all day, 2026-02-28"),
+    ],
+)
+def test_all_day_event_displays_inclusive_end_date(cal, start_day, end_day, expected):
+    event_id = cal.put_all_day("primary", "Holiday range", start_day, end_day=end_day)
+
+    upserts, _, _ = sync(cal, {})
+
+    assert expected in upserts[rid(event_id)]["content"]
 
 
 def test_working_location_events_are_skipped(cal):
