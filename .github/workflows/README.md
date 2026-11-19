@@ -22,6 +22,9 @@ Every graph/vector/hybrid adapter package structures its tests as:
 ## Workflow files
 
 ### Main orchestration
+- `connector_package_validation.yml` — pull-request matrix that discovers changed
+  connector packages and runs their tests, Ruff lint/format checks, Python
+  compilation, and wheel build without external credentials.
 - `community_test_suite.yml` — main workflow that runs everything: contract
   tests + vector/graph fan-outs + pipelines/retrievers/tasks. Triggers on push
   to `main`/`dev`, `repository_dispatch: new-main-release`, and manual dispatch.
