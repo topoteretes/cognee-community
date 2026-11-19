@@ -1,0 +1,9 @@
+[project]
+name = "cognee-community-connector-mixpanel"
+version = "0.1.0"
+description = "Mixpanel data-source connector for cognee"
+requires-python = ">=3.10"
+dependencies = ["cognee>=1.4.2", "dlt>=1.0", "requests>=2.31"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
