@@ -1,0 +1,19 @@
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+name = "cognee-community-connector-pypi"
+version = "0.1.0"
+description = "Cognee community data-source connector for Python Package Index (PyPI) metadata and documentation"
+authors = ["Sudhir <satanic47@users.noreply.github.com>"]
+readme = "README.md"
+license = "Apache-2.0"
+packages = [{ include = "cognee_community_connector_pypi" }]
+
+[tool.poetry.dependencies]
+python = ">=3.10,<3.13"
+pydantic = ">=2.0.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=7.0.0"
