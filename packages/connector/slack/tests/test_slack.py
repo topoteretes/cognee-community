@@ -7,7 +7,6 @@ and do not depend on any checked-in fixtures.
 import json
 
 import pytest
-
 from cognee_community_connector_slack.slack_export import (
     iter_slack_export_messages,
     slack_export_source,
