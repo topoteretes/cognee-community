@@ -1,0 +1,207 @@
+[
+ {
+  "type": "prospect",
+  "id": "1",
+  "attributes": {
+   "firstName": "Pat1",
+   "lastName": "Example",
+   "title": "Buyer",
+   "company": "Acme Fake",
+   "emails": [
+    "pat1@example.test"
+   ],
+   "workPhones": [
+    "+15550001"
+   ],
+   "addressStreet": "1 Fake St",
+   "addressCity": "Faketown",
+   "ssn": "000-00-0000",
+   "tags": [
+    "demo"
+   ],
+   "createdAt": "2026-01-01T00:00:00.000Z",
+   "updatedAt": "2026-03-01T00:00:00.000Z"
+  },
+  "links": {
+   "self": "https://api.outreach.example.test/api/v2/prospects/1"
+  },
+  "relationships": {
+   "account": {
+    "data": {
+     "type": "account",
+     "id": "9"
+    }
+   },
+   "owner": {
+    "data": {
+     "type": "owner",
+     "id": "1"
+    }
+   }
+  }
+ },
+ {
+  "type": "prospect",
+  "id": "2",
+  "attributes": {
+   "firstName": "Pat2",
+   "lastName": "Example",
+   "title": "Buyer",
+   "company": "Acme Fake",
+   "emails": [
+    "pat2@example.test"
+   ],
+   "workPhones": [
+    "+15550002"
+   ],
+   "addressStreet": "2 Fake St",
+   "addressCity": "Faketown",
+   "ssn": "000-00-0000",
+   "tags": [
+    "demo"
+   ],
+   "createdAt": "2026-01-01T00:00:00.000Z",
+   "updatedAt": "2026-03-02T00:00:00.000Z"
+  },
+  "links": {
+   "self": "https://api.outreach.example.test/api/v2/prospects/2"
+  },
+  "relationships": {
+   "account": {
+    "data": {
+     "type": "account",
+     "id": "9"
+    }
+   },
+   "owner": {
+    "data": {
+     "type": "owner",
+     "id": "1"
+    }
+   }
+  }
+ },
+ {
+  "type": "prospect",
+  "id": "3",
+  "attributes": {
+   "firstName": "Pat3",
+   "lastName": "Example",
+   "title": "Buyer",
+   "company": "Acme Fake",
+   "emails": [
+    "pat3@example.test"
+   ],
+   "workPhones": [
+    "+15550003"
+   ],
+   "addressStreet": "3 Fake St",
+   "addressCity": "Faketown",
+   "ssn": "000-00-0000",
+   "tags": [
+    "demo"
+   ],
+   "createdAt": "2026-01-01T00:00:00.000Z",
+   "updatedAt": "2026-03-03T00:00:00.000Z"
+  },
+  "links": {
+   "self": "https://api.outreach.example.test/api/v2/prospects/3"
+  },
+  "relationships": {
+   "account": {
+    "data": {
+     "type": "account",
+     "id": "9"
+    }
+   },
+   "owner": {
+    "data": {
+     "type": "owner",
+     "id": "1"
+    }
+   }
+  }
+ },
+ {
+  "type": "prospect",
+  "id": "4",
+  "attributes": {
+   "firstName": "Pat4",
+   "lastName": "Example",
+   "title": "Buyer",
+   "company": "Acme Fake",
+   "emails": [
+    "pat4@example.test"
+   ],
+   "workPhones": [
+    "+15550004"
+   ],
+   "addressStreet": "4 Fake St",
+   "addressCity": "Faketown",
+   "ssn": "000-00-0000",
+   "tags": [
+    "demo"
+   ],
+   "createdAt": "2026-01-01T00:00:00.000Z",
+   "updatedAt": "2026-03-04T00:00:00.000Z"
+  },
+  "links": {
+   "self": "https://api.outreach.example.test/api/v2/prospects/4"
+  },
+  "relationships": {
+   "account": {
+    "data": {
+     "type": "account",
+     "id": "9"
+    }
+   },
+   "owner": {
+    "data": {
+     "type": "owner",
+     "id": "1"
+    }
+   }
+  }
+ },
+ {
+  "type": "prospect",
+  "id": "5",
+  "attributes": {
+   "firstName": "Pat5",
+   "lastName": "Example",
+   "title": "Buyer",
+   "company": "Acme Fake",
+   "emails": [
+    "pat5@example.test"
+   ],
+   "workPhones": [
+    "+15550005"
+   ],
+   "addressStreet": "5 Fake St",
+   "addressCity": "Faketown",
+   "ssn": "000-00-0000",
+   "tags": [
+    "demo"
+   ],
+   "createdAt": "2026-01-01T00:00:00.000Z",
+   "updatedAt": "2026-03-05T00:00:00.000Z"
+  },
+  "links": {
+   "self": "https://api.outreach.example.test/api/v2/prospects/5"
+  },
+  "relationships": {
+   "account": {
+    "data": {
+     "type": "account",
+     "id": "9"
+    }
+   },
+   "owner": {
+    "data": {
+     "type": "owner",
+     "id": "1"
+    }
+   }
+  }
+ }
+]

@@ -1,0 +1,60 @@
+[
+ {
+  "type": "task",
+  "id": "1",
+  "attributes": {
+   "action": "call",
+   "state": "incomplete",
+   "dueAt": "2026-03-06T00:00:00.000Z",
+   "note": "Task note TASKNOTE1",
+   "createdAt": "2026-01-01T00:00:00.000Z",
+   "updatedAt": "2026-03-01T00:00:00.000Z"
+  },
+  "links": {
+   "self": "https://api.outreach.example.test/api/v2/tasks/1"
+  },
+  "relationships": {
+   "prospect": {
+    "data": {
+     "type": "prospect",
+     "id": "1"
+    }
+   },
+   "owner": {
+    "data": {
+     "type": "owner",
+     "id": "1"
+    }
+   }
+  }
+ },
+ {
+  "type": "task",
+  "id": "2",
+  "attributes": {
+   "action": "call",
+   "state": "incomplete",
+   "dueAt": "2026-03-07T00:00:00.000Z",
+   "note": "Task note TASKNOTE2",
+   "createdAt": "2026-01-01T00:00:00.000Z",
+   "updatedAt": "2026-03-02T00:00:00.000Z"
+  },
+  "links": {
+   "self": "https://api.outreach.example.test/api/v2/tasks/2"
+  },
+  "relationships": {
+   "prospect": {
+    "data": {
+     "type": "prospect",
+     "id": "2"
+    }
+   },
+   "owner": {
+    "data": {
+     "type": "owner",
+     "id": "1"
+    }
+   }
+  }
+ }
+]

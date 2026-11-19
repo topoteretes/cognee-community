@@ -1,0 +1,83 @@
+[
+ {
+  "type": "sequence",
+  "id": "1",
+  "attributes": {
+   "name": "Sequence 1",
+   "description": "Cadence 1",
+   "sequenceType": "interval",
+   "enabled": true,
+   "tags": [
+    "fake"
+   ],
+   "internalNote": "SECRET-UNLISTED",
+   "createdAt": "2026-01-01T00:00:00.000Z",
+   "updatedAt": "2026-03-01T00:00:00.000Z"
+  },
+  "links": {
+   "self": "https://api.outreach.example.test/api/v2/sequences/1"
+  },
+  "relationships": {
+   "owner": {
+    "data": {
+     "type": "owner",
+     "id": "1"
+    }
+   }
+  }
+ },
+ {
+  "type": "sequence",
+  "id": "2",
+  "attributes": {
+   "name": "Sequence 2",
+   "description": "Cadence 2",
+   "sequenceType": "interval",
+   "enabled": true,
+   "tags": [
+    "fake"
+   ],
+   "internalNote": "SECRET-UNLISTED",
+   "createdAt": "2026-01-01T00:00:00.000Z",
+   "updatedAt": "2026-03-02T00:00:00.000Z"
+  },
+  "links": {
+   "self": "https://api.outreach.example.test/api/v2/sequences/2"
+  },
+  "relationships": {
+   "owner": {
+    "data": {
+     "type": "owner",
+     "id": "1"
+    }
+   }
+  }
+ },
+ {
+  "type": "sequence",
+  "id": "3",
+  "attributes": {
+   "name": "Sequence 3",
+   "description": "Cadence 3",
+   "sequenceType": "interval",
+   "enabled": true,
+   "tags": [
+    "fake"
+   ],
+   "internalNote": "SECRET-UNLISTED",
+   "createdAt": "2026-01-01T00:00:00.000Z",
+   "updatedAt": "2026-03-03T00:00:00.000Z"
+  },
+  "links": {
+   "self": "https://api.outreach.example.test/api/v2/sequences/3"
+  },
+  "relationships": {
+   "owner": {
+    "data": {
+     "type": "owner",
+     "id": "1"
+    }
+   }
+  }
+ }
+]
