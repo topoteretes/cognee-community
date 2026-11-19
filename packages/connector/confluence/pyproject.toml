@@ -5,7 +5,10 @@ description = "Confluence data-source connector for cognee — sync your wiki in
 readme = "README.md"
 requires-python = ">=3.11,<=3.13"
 dependencies = [
-    "cognee==1.3.0",
+    # Document mode (DOCUMENT_SOURCE_ATTR routing + the add() orphan_cleanup
+    # await that makes forget-on-delete work for a foreground remember()) first
+    # shipped in cognee 1.4.0; the old 1.3.0 pin predates it (see cognee#5564).
+    "cognee>=1.4.0",
     "dlt[sqlalchemy]>=1.9.0,<2",
     "requests>=2.31.0,<3",
 ]
