@@ -64,14 +64,26 @@ class FakeNotionClient:
         self._blocks = blocks or {}
         self.blocks = SimpleNamespace(children=SimpleNamespace(list=self._blocks_list))
         self.pages = SimpleNamespace(retrieve=self._pages_retrieve)
-        self.databases = SimpleNamespace(query=self._db_query)
+        # Mirror notion-client>=2.6: DatabasesEndpoint has no ``query`` method
+        # (data-source endpoints refactor). The connector must go through
+        # ``Client.request`` instead, so ``query`` is deliberately absent here:
+        # a regression back to ``client.databases.query`` fails loudly.
+        self.databases = SimpleNamespace()
+
+    def request(self, path=None, method=None, body=None, **kwargs):
+        # The real SDK's generic request entry point.
+        if (
+            method == "POST"
+            and isinstance(path, str)
+            and path.startswith("databases/")
+            and path.endswith("/query")
+        ):
+            return {"results": self._live_pages(), "has_more": False}
+        raise AssertionError(f"unexpected Notion API call: {method} {path}")
 
     def search(self, **kwargs):
         # The real Notion API omits archived/trashed pages from search results,
         # so the connector detects deletion by their absence — mirror that here.
-        return {"results": self._live_pages(), "has_more": False}
-
-    def _db_query(self, **kwargs):
         return {"results": self._live_pages(), "has_more": False}
 
     def _live_pages(self):
@@ -394,6 +406,70 @@ def test_page_ids_skips_gone_but_reraises_other():
     # A non-"gone" error must abort, not silently drop (would forget under replace).
     with pytest.raises(ValueError):
         list(_iter_pages(client, ["boom"], None))
+
+
+# ---------------------------------------------------------------------------
+# database_ids path: notion-client>=2.6 removed DatabasesEndpoint.query (#6032)
+# ---------------------------------------------------------------------------
+
+
+def test_database_ids_path_uses_generic_request():
+    """Regression test for topoteretes/cognee#6032.
+
+    Drives ``_iter_pages`` down the ``database_ids`` path with a REAL
+    ``notion_client.Client`` (HTTP stubbed via httpx MockTransport). This is
+    the test that would have caught the notion-client 2.6.0 removal of
+    ``DatabasesEndpoint.query``: with the old ``client.databases.query`` call
+    the real client raises AttributeError before any HTTP happens.
+    """
+    httpx = pytest.importorskip("httpx")
+    notion_client = pytest.importorskip("notion_client")
+
+    from cognee_community_connector_notion.notion import _iter_pages
+
+    page = _page("p1", "2024-01-01T00:00:00.000Z", "Alpha")
+    seen = []
+
+    def handler(request):
+        seen.append((request.method, request.url.path))
+        assert request.url.path == "/v1/databases/db1/query"
+        assert request.headers["Notion-Version"] == "2022-06-28"
+        return httpx.Response(200, json={"results": [page], "has_more": False})
+
+    http = httpx.Client(transport=httpx.MockTransport(handler), trust_env=False)
+    client = notion_client.Client(auth="secret_test", notion_version="2022-06-28", client=http)
+
+    # notion-client 2.6+ removed DatabasesEndpoint.query — the crash in #6032.
+    assert not hasattr(client.databases, "query")
+
+    pages = list(_iter_pages(client, None, ["db1"]))
+    assert [p["id"] for p in pages] == ["p1"]
+    assert seen == [("POST", "/v1/databases/db1/query")]
+
+
+def test_database_ids_sync_loads_pages(dlt_mod, tmp_path):
+    """The database_ids path syncs pages end-to-end through a dlt pipeline.
+
+    Uses the fake client, which (like notion-client>=2.6) has no
+    ``databases.query`` — a regression back to it would fail here too.
+    """
+    from cognee_community_connector_notion.notion import notion_source
+
+    pages = [_page("p1", "2024-01-01T00:00:00.000Z", "Alpha")]
+    blocks = {"p1": [_block("paragraph", "alpha body")]}
+
+    db_path = (tmp_path / "notion_db.db").as_posix()
+    pipeline = dlt_mod.pipeline(
+        pipeline_name="notion_db_test",
+        destination=dlt_mod.destinations.sqlalchemy(f"sqlite:///{db_path}"),
+        dataset_name="notion_ds",
+        pipelines_dir=str(tmp_path / "state"),
+    )
+    pipeline.run(notion_source(client=FakeNotionClient(pages, blocks), database_ids=["db1"]))
+
+    rows = _read_pages(pipeline)
+    assert set(rows) == {"p1"}
+    assert "alpha body" in rows["p1"]["content"]
 
 
 def test_render_error_aborts_sync(dlt_mod, tmp_path):
