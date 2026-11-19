@@ -1,0 +1,38 @@
+name: RSS Connector Tests
+
+on:
+  pull_request:
+    paths:
+      - 'packages/connector/rss/**'
+      - '.github/workflows/test_rss.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'packages/connector/rss/**'
+      - '.github/workflows/test_rss.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  test-rss:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      TELEMETRY_DISABLED: '1'
+      RUNTIME__DLTHUB_TELEMETRY: 'false'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install connector and test dependencies
+        run: python -m pip install -e ./packages/connector/rss pytest
+      - name: Test parsing and snapshot preservation with local fixtures
+        env:
+          DATA_ROOT_DIRECTORY: ${{ runner.temp }}/rss-data
+          SYSTEM_ROOT_DIRECTORY: ${{ runner.temp }}/rss-system
+          CACHE_ROOT_DIRECTORY: ${{ runner.temp }}/rss-cache
+        run: python -m pytest packages/connector/rss/tests -q
