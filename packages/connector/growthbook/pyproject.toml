@@ -1,0 +1,18 @@
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+name = "cognee-community-connector-growthbook"
+version = "0.1.0"
+description = "GrowthBook feature flags, A/B experiments, and metric definitions connector for Cognee"
+authors = ["Bhomvrat Rai <bhomvratrai@gmail.com>"]
+readme = "README.md"
+packages = [{ include = "cognee_community_connector_growthbook" }]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+aiohttp = ">=3.9.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=7.0.0"
