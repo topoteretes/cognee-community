@@ -1,0 +1,1 @@
+"""Etherpad connector test suite."""
