@@ -1,0 +1,70 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+/// User account in the SaaS platform
+model User {
+  id           String        @id @default(uuid())
+  email        String        @unique
+  name         String?
+  role         Role          @default(MEMBER)
+  organization Organization? @relation(fields: [orgId], references: [id])
+  orgId        String?
+  orders       Order[]
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  @@map("users")
+  @@index([email])
+}
+
+/// Organization / Team workspace
+model Organization {
+  id        String   @id @default(uuid())
+  name      String
+  slug      String   @unique
+  members   User[]
+  plan      Plan     @default(STARTER)
+  createdAt DateTime @default(now())
+
+  @@map("organizations")
+}
+
+/// Purchase order placed by a customer
+model Order {
+  id         String      @id @default(cuid())
+  orderNumber String     @unique
+  totalCents Int
+  status     OrderStatus @default(PENDING)
+  user       User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId     String
+  createdAt  DateTime    @default(now())
+
+  @@map("orders")
+  @@index([userId])
+}
+
+enum Role {
+  OWNER
+  ADMIN
+  MEMBER
+}
+
+enum Plan {
+  FREE
+  STARTER
+  PRO
+  ENTERPRISE
+}
+
+enum OrderStatus {
+  PENDING
+  PAID
+  CANCELLED
+  REFUNDED
+}
