@@ -1,0 +1,104 @@
+{
+  "snapshot_version": 1,
+  "endpoint": "project-scoped-live-capture",
+  "protocol_version": "2026-07-28",
+  "server_info": {
+    "name": "logrocket-mcp"
+  },
+  "server_capabilities": {
+    "tools": {
+      "listChanged": true
+    }
+  },
+  "tools": [
+    {
+      "name": "find_sessions",
+      "description": "Live capture: natural-language session search.",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "query": {
+            "description": "Natural language query describing the sessions to find.",
+            "type": "string"
+          },
+          "limit": {
+            "description": "Maximum number of sessions to return. Defaults to 10.",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          }
+        },
+        "required": [
+          "query"
+        ]
+      },
+      "output_schema": null
+    },
+    {
+      "name": "find_issues",
+      "description": "Live capture: filtered issue search.",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "startDate": {
+            "description": "Optional ISO 8601 start; retained issue data is limited to 30 days.",
+            "type": "string"
+          },
+          "endDate": {
+            "description": "Optional ISO 8601 end.",
+            "type": "string"
+          },
+          "issueTypes": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string",
+              "enum": [
+                "exception",
+                "networkError",
+                "mobileCrash",
+                "rageClick",
+                "deadClick",
+                "frustratingNetworkRequest",
+                "errorState"
+              ]
+            }
+          },
+          "limit": {
+            "description": "Maximum number of issues to return. Defaults to 30.",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          },
+          "query": {
+            "type": "string"
+          },
+          "severity": {
+            "type": "string",
+            "enum": [
+              "severe",
+              "notSevere",
+              "any"
+            ]
+          },
+          "triageStatuses": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string",
+              "enum": [
+                "untriaged",
+                "highImpact",
+                "lowImpact",
+                "ignored"
+              ]
+            }
+          }
+        }
+      },
+      "output_schema": null
+    }
+  ]
+}
