@@ -57,6 +57,13 @@ class NetworkXAdapter(GraphDBInterface):
         database_name="",
         **kwargs,
     ):
+        # Skip re-initialization when the singleton instance already exists.
+        # __new__ returns the same _instance every time, so without this guard
+        # every construction would overwrite database_name, filename and graph,
+        # retargeting existing handles to a different database file (#493).
+        if hasattr(self, "graph") and self.graph is not None:
+            return
+
         self.database_name = database_name if database_name else "cognee_graph"
         self.filename = f"{self.database_name}.pkl"
         self.graph = nx.MultiDiGraph()
