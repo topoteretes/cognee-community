@@ -148,6 +148,7 @@ Connectors sync an external tool into cognee memory. Each one returns a `dlt` so
 | `cognee-community-connector-notion`              | Notion              | Full snapshot, forget-on-delete |
 | `cognee-community-connector-onenote`             | OneNote             | Incremental, forget-on-delete   |
 | `cognee-community-connector-slack`               | Slack export        | Full snapshot, forget-on-delete |
+| `cognee-community-connector-triggerdev`          | Trigger.dev         | Incremental, forget-on-delete   |
 
 ## Repository Structure
 
