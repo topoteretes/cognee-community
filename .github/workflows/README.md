@@ -34,8 +34,8 @@ Every graph/vector/hybrid adapter package structures its tests as:
 
 ### Individual adapter tests (docker service or hosted instance)
 - `test_qdrant.yml`, `test_redis.yml`, `test_valkey.yml`, `test_milvus.yml`,
-  `test_opensearch.yml`, `test_singlestore.yml`, `test_weaviate.yml` (hosted,
-  needs `WEAVIATE_API_URL`/`WEAVIATE_API_KEY`) — vector
+  `test_opensearch.yml`, `test_elasticsearch.yml`, `test_singlestore.yml`,
+  `test_weaviate.yml` (hosted, needs `WEAVIATE_API_URL`/`WEAVIATE_API_KEY`) — vector
 - `test_memgraph.yml`, `test_falkordb.yml`, `test_turingdb.yml`,
   `test_pggraph.yml` — graph (NetworkX runs inline in
   `graph_db_community_tests.yml`; it needs no server)

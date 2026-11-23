@@ -67,6 +67,14 @@ jobs:
     uses: ./.github/workflows/test_opensearch.yml
     secrets: inherit
 
+  test-elasticsearch:
+    name: "Elasticsearch Community Adapter Test"
+    if: ${{ inputs.databases == 'all' || contains(inputs.databases, 'elasticsearch') }}
+    with:
+      event-type: ${{ inputs.event-type }}
+    uses: ./.github/workflows/test_elasticsearch.yml
+    secrets: inherit
+
   test-redis:
     name: "Redis Community Adapter Test"
     if: ${{ inputs.databases == 'all' || contains(inputs.databases, 'redis') }}

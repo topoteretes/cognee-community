@@ -1,0 +1,151 @@
+name: Test Elasticsearch Community Adapter
+
+on:
+  workflow_call:
+    inputs:
+      event-type:
+        required: false
+        type: string
+        default: "regular-testing-event"
+    secrets:
+      LLM_MODEL:
+        required: true
+      LLM_ENDPOINT:
+        required: true
+      LLM_API_KEY:
+        required: true
+      LLM_API_VERSION:
+        required: true
+      EMBEDDING_MODEL:
+        required: true
+      EMBEDDING_ENDPOINT:
+        required: true
+      EMBEDDING_API_KEY:
+        required: true
+      EMBEDDING_API_VERSION:
+        required: true
+  workflow_dispatch:
+  pull_request:
+    branches: [ main, dev ]
+    paths:
+      - 'packages/vector/elasticsearch/**'
+
+concurrency:
+  group: elasticsearch-test-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+env:
+  RUNTIME__LOG_LEVEL: ERROR
+
+jobs:
+  test-elasticsearch:
+    name: "Elasticsearch Community Adapter Test (${{ matrix.name }})"
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The lock file resolves the 9.x client, matching the 9.x server.
+          - name: "9.x"
+            es-image: docker.elastic.co/elasticsearch/elasticsearch:9.5.6
+            es-client: ""
+          # The README supports 8.x clusters with the 8.x client; swap it in after setup.
+          - name: "8.x"
+            es-image: docker.elastic.co/elasticsearch/elasticsearch:8.19.25
+            es-client: "elasticsearch>=8.17,<9"
+    services:
+      elasticsearch:
+        image: ${{ matrix.es-image }}
+        env:
+          discovery.type: single-node
+          xpack.security.enabled: "false"
+          ES_JAVA_OPTS: "-Xms1g -Xmx1g"
+        options: >-
+          --health-cmd="curl -f http://localhost:9200/_cluster/health || exit 1"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=20
+        ports:
+          - 9200:9200
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Community Setup
+        uses: ./.github/actions/community_setup
+        with:
+          python-version: '3.11.x'
+          package-path: packages/vector/elasticsearch
+          event-type: ${{ inputs.event-type }}
+
+      - name: Install the matching Elasticsearch client
+        if: matrix.es-client != ''
+        working-directory: ./packages/vector/elasticsearch
+        run: |
+          poetry run pip install "${{ matrix.es-client }}"
+          poetry run python -c "import elasticsearch; print('elasticsearch client', elasticsearch.__versionstr__)"
+
+      # LLM-free: every adapter hook against the real cluster, with a stub embedder.
+      - name: Run Elasticsearch Adapter Live Tests
+        env:
+          VECTOR_DB_URL: 'http://localhost:9200'
+        working-directory: ./packages/vector/elasticsearch
+        run: poetry run python tests/test_adapter_live.py
+
+      - name: Run Elasticsearch Example
+        env:
+          ENV: 'dev'
+          ENABLE_BACKEND_ACCESS_CONTROL: False
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+          LLM_ENDPOINT: ${{ secrets.LLM_ENDPOINT }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_API_VERSION: ${{ secrets.LLM_API_VERSION }}
+          EMBEDDING_MODEL: ${{ secrets.EMBEDDING_MODEL }}
+          EMBEDDING_ENDPOINT: ${{ secrets.EMBEDDING_ENDPOINT }}
+          EMBEDDING_API_KEY: ${{ secrets.EMBEDDING_API_KEY }}
+          EMBEDDING_API_VERSION: ${{ secrets.EMBEDDING_API_VERSION }}
+          VECTOR_DB_PROVIDER: 'elasticsearch'
+          VECTOR_DB_URL: 'http://localhost:9200'
+          VECTOR_DB_KEY: ''
+        working-directory: ./packages/vector/elasticsearch
+        run: poetry run python example.py
+
+      - name: Run Elasticsearch Tests
+        env:
+          ENV: 'dev'
+          ENABLE_BACKEND_ACCESS_CONTROL: False
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+          LLM_ENDPOINT: ${{ secrets.LLM_ENDPOINT }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_API_VERSION: ${{ secrets.LLM_API_VERSION }}
+          EMBEDDING_MODEL: ${{ secrets.EMBEDDING_MODEL }}
+          EMBEDDING_ENDPOINT: ${{ secrets.EMBEDDING_ENDPOINT }}
+          EMBEDDING_API_KEY: ${{ secrets.EMBEDDING_API_KEY }}
+          EMBEDDING_API_VERSION: ${{ secrets.EMBEDDING_API_VERSION }}
+          VECTOR_DB_PROVIDER: 'elasticsearch'
+          VECTOR_DB_URL: 'http://localhost:9200'
+          VECTOR_DB_KEY: ''
+        working-directory: ./packages/vector/elasticsearch
+        run: poetry run python tests/test_elasticsearch.py
+
+      # Access control on (cognee's default): the dataset handler and per-dataset
+      # database_name scoping against the real cluster.
+      - name: Run Elasticsearch Example (access control on)
+        env:
+          ENV: 'dev'
+          ENABLE_BACKEND_ACCESS_CONTROL: True
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+          LLM_ENDPOINT: ${{ secrets.LLM_ENDPOINT }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_API_VERSION: ${{ secrets.LLM_API_VERSION }}
+          EMBEDDING_MODEL: ${{ secrets.EMBEDDING_MODEL }}
+          EMBEDDING_ENDPOINT: ${{ secrets.EMBEDDING_ENDPOINT }}
+          EMBEDDING_API_KEY: ${{ secrets.EMBEDDING_API_KEY }}
+          EMBEDDING_API_VERSION: ${{ secrets.EMBEDDING_API_VERSION }}
+          VECTOR_DB_PROVIDER: 'elasticsearch'
+          VECTOR_DB_URL: 'http://localhost:9200'
+          VECTOR_DB_KEY: ''
+          VECTOR_DATASET_DATABASE_HANDLER: 'elasticsearch'
+        working-directory: ./packages/vector/elasticsearch
+        run: poetry run python example.py
