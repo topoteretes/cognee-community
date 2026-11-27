@@ -107,6 +107,7 @@ poetry run python ./examples/example.py
 | `cognee-community-graph-adapter-pggraph`    | Graph    | pgGraph adapter for cognee (Postgres + graph extension, experimental) |
 | `cognee-community-hybrid-adapter-duckdb`     | Hybrid   | DuckDB hybrid database adapter for cognee          |
 | `cognee-community-hybrid-adapter-falkor`     | Hybrid   | FalkorDB hybrid database adapter for cognee        |
+| `cognee-community-hybrid-adapter-neptune`    | Hybrid   | Amazon Neptune graph and Neptune Analytics hybrid adapters for cognee |
 
 ## Custom Packages
 
