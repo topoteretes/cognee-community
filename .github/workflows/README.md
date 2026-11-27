@@ -44,7 +44,7 @@ Every graph/vector/hybrid adapter package structures its tests as:
 
 ### Adapters covered by contract tests only
 azureaisearch, moss, pinecone, turbopuffer (graph + vector), spanner,
-arcadedb (graph + hybrid), opengauss, helixdb — their backing services are
+arcadedb (graph + hybrid), opengauss, helixdb, neptune — their backing services are
 cloud-only or have no reliable CI docker story yet. Their unit tier (contract
 conformance + any mocked suites, e.g. openGauss's fully-mocked adapter tests
 and Spanner's mocked suite) runs on every PR; live tests are documented in

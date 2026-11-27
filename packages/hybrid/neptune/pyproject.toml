@@ -1,0 +1,41 @@
+[project]
+name = "cognee-community-hybrid-adapter-neptune"
+version = "0.1.0"
+description = "Amazon Neptune graph and Neptune Analytics hybrid (graph + vector) adapters for cognee"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    # The adapters moved here from cognee core as of this release line, and use
+    # interfaces (EmbeddingGateway, EdgeIdentity) that older cognee releases lack.
+    "cognee==1.6.10",
+    # Transitive via cognee; pinned to the version cognee 1.6.10 locks, so CI
+    # resolves the litellm the upstream release was tested against.
+    "litellm==1.105.0",
+    "langchain_aws>=0.2.22",
+    "boto3>=1.43.1,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "mypy>=1.0.0",
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+]
+
+[[tool.mypy.overrides]]
+module = [
+  "cognee.*",
+  "langchain_aws.*",
+  "botocore.*",
+]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cognee_community_hybrid_adapter_neptune"]
